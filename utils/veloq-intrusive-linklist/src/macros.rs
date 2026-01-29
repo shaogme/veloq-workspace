@@ -29,7 +29,7 @@ macro_rules! container_of {
 /// # Example
 ///
 /// ```rust
-/// use intrusive_linklist::{intrusive_adapter, Link};
+/// use veloq_intrusive_linklist::{intrusive_adapter, Link};
 ///
 /// pub struct MyNode {
 ///     link: Link,
