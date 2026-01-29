@@ -67,9 +67,15 @@ pub mod error {
 
 use self::error::*;
 
+#[cfg(feature = "loom")]
+use loom::sync::Mutex;
+
 struct Inner<T> {
     /// Manages the state of the inner cell.
     state: AtomicUsize,
+
+    #[cfg(feature = "loom")]
+    rx_lock: Mutex<()>,
 
     /// The value. This is set by `Sender` and read by `Receiver`. The state of
     /// the cell is tracked by `state`.
@@ -167,6 +173,8 @@ struct State(usize);
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Inner {
         state: AtomicUsize::new(State::new().as_usize()),
+        #[cfg(feature = "loom")]
+        rx_lock: Mutex::new(()),
         value: UnsafeCell::new(None),
         tx_task: Task(UnsafeCell::new(MaybeUninit::uninit())),
         rx_task: Task(UnsafeCell::new(MaybeUninit::uninit())),
@@ -360,7 +368,36 @@ impl<T> Future for Receiver<T> {
     }
 }
 
+struct RxLockGuard<'a> {
+    #[cfg(feature = "loom")]
+    _guard: loom::sync::MutexGuard<'a, ()>,
+    #[cfg(not(feature = "loom"))]
+    state: &'a AtomicUsize,
+}
+
+impl<'a> Drop for RxLockGuard<'a> {
+    fn drop(&mut self) {
+        #[cfg(not(feature = "loom"))]
+        State::release_rx_lock(self.state);
+    }
+}
+
 impl<T> Inner<T> {
+    fn lock_rx_task(&self) -> RxLockGuard<'_> {
+        #[cfg(feature = "loom")]
+        {
+            RxLockGuard {
+                _guard: self.rx_lock.lock().unwrap(),
+            }
+        }
+
+        #[cfg(not(feature = "loom"))]
+        {
+            State::acquire_rx_lock(&self.state);
+            RxLockGuard { state: &self.state }
+        }
+    }
+
     fn complete(&self) -> bool {
         let prev = State::set_complete(&self.state);
 
@@ -369,17 +406,15 @@ impl<T> Inner<T> {
         }
 
         if prev.is_rx_task_set() {
-            State::acquire_rx_lock(&self.state);
+            let guard = self.lock_rx_task();
 
             let state = State::load(&self.state, Ordering::Relaxed);
 
             if state.is_rx_task_set() {
                 State::unset_rx_task(&self.state);
                 let waker = unsafe { self.rx_task.take_task() };
-                State::release_rx_lock(&self.state);
+                drop(guard);
                 waker.wake();
-            } else {
-                State::release_rx_lock(&self.state);
             }
         }
 
@@ -399,7 +434,7 @@ impl<T> Inner<T> {
             Ready(Err(RecvError(())))
         } else {
             if state.is_rx_task_set() {
-                State::acquire_rx_lock(&self.state);
+                let guard = self.lock_rx_task();
 
                 let current_state = State::load(&self.state, Ordering::Relaxed);
 
@@ -410,7 +445,7 @@ impl<T> Inner<T> {
                     if !will_notify {
                         // Unset the task
                         state = State::unset_rx_task(&self.state);
-                        State::release_rx_lock(&self.state);
+                        drop(guard);
 
                         if state.is_complete() {
                             // The sender has set the `VALUE_SENT` bit.
@@ -431,11 +466,9 @@ impl<T> Inner<T> {
                         } else {
                             unsafe { self.rx_task.drop_task() };
                         }
-                    } else {
-                        State::release_rx_lock(&self.state);
                     }
                 } else {
-                    State::release_rx_lock(&self.state);
+                    drop(guard);
 
                     // The task was unset, likely by `complete`.
                     state = current_state;
@@ -579,6 +612,7 @@ const CLOSED: usize = 0b00100;
 /// If this bit is not set, the `tx_task` field may be uninitialized.
 const TX_TASK_SET: usize = 0b01000;
 
+#[cfg(not(feature = "loom"))]
 const RX_TASK_LOCKED: usize = 0b10000;
 
 impl State {
@@ -676,39 +710,27 @@ impl State {
         State(val)
     }
 
+    #[cfg(not(feature = "loom"))]
     fn acquire_rx_lock(cell: &AtomicUsize) {
-        #[cfg(feature = "loom")]
-        {
-            loop {
-                let state = cell.fetch_or(RX_TASK_LOCKED, Acquire);
-                if state & RX_TASK_LOCKED == 0 {
-                    return;
-                }
-                crate::shim::yield_now();
+        // Simple spinlock implementation
+        let mut backoff = 1;
+        loop {
+            let state = cell.fetch_or(RX_TASK_LOCKED, Acquire);
+            if state & RX_TASK_LOCKED == 0 {
+                return;
             }
-        }
-
-        #[cfg(not(feature = "loom"))]
-        {
-            // Simple spinlock implementation
-            let mut backoff = 1;
-            loop {
-                let state = cell.fetch_or(RX_TASK_LOCKED, Acquire);
-                if state & RX_TASK_LOCKED == 0 {
-                    return;
+            while cell.load(Ordering::Relaxed) & RX_TASK_LOCKED != 0 {
+                for _ in 0..backoff {
+                    std::hint::spin_loop();
                 }
-                while cell.load(Ordering::Relaxed) & RX_TASK_LOCKED != 0 {
-                    for _ in 0..backoff {
-                        std::hint::spin_loop();
-                    }
-                    if backoff < 8 {
-                        backoff <<= 1;
-                    }
+                if backoff < 8 {
+                    backoff <<= 1;
                 }
             }
         }
     }
 
+    #[cfg(not(feature = "loom"))]
     fn release_rx_lock(cell: &AtomicUsize) {
         cell.fetch_and(!RX_TASK_LOCKED, Ordering::Release);
     }
