@@ -99,16 +99,20 @@ pkgs.dockerTools.buildLayeredImage {
     # 3. 确保其他 PAM 配置存在
     cp etc/pam.d/sshd etc/pam.d/other
     
-    # 4. FHS 兼容性 (VS Code Server 等需要)
-    mkdir -p lib64 usr/lib64 usr/lib usr/bin
+    # FHS 兼容性 (VS Code Server 等需要)
+    mkdir -p lib64 usr/lib64 usr/lib usr/bin usr/lib/x86_64-linux-gnu
 
-    # 链接动态加载器到 glibc (最可靠的方式)
-    # 虽然 nix-ld 提供了 shim，但直接链接 glibc loader 通常能解决大部分 "file not found" 问题
+    # 1. 动态加载器 (ld-linux)
     ln -sf ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2
     
-    # libstdc++ 兼容
-    ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 usr/lib/libstdc++.so.6
-    ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 usr/lib64/libstdc++.so.6
+    # 2. 核心库 (libstdc++, libgcc_s)
+    # 链接到多个常见位置以确保兼容性
+    for lib in libstdc++.so.6 libgcc_s.so.1; do
+      ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/$lib lib64/$lib
+      ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib/$lib
+      ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib64/$lib
+      ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib/x86_64-linux-gnu/$lib
+    done
     
     # bin/bash 软链接
     ln -sf ${pkgs.bashInteractive}/bin/bash bin/bash
