@@ -1,14 +1,15 @@
 use crate::shim::Arc;
-use crate::shim::atomic::{AtomicUsize, fence};
+use crate::shim::atomic::AtomicUsize;
 use crate::shim::cell::UnsafeCell;
+
+use veloq_atomic_waker::AtomicWaker;
 
 use std::fmt;
 use std::future::Future;
-use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::sync::atomic::Ordering::{self, AcqRel, Acquire};
+use std::sync::atomic::Ordering::{self, Acquire};
 use std::task::Poll::{Pending, Ready};
-use std::task::{Context, Poll, Waker, ready};
+use std::task::{Context, Poll, ready};
 
 #[derive(Debug)]
 pub struct Sender<T> {
@@ -67,104 +68,19 @@ pub mod error {
 
 use self::error::*;
 
-#[cfg(feature = "loom")]
-use loom::sync::Mutex;
-
 struct Inner<T> {
     /// Manages the state of the inner cell.
     state: AtomicUsize,
-
-    #[cfg(feature = "loom")]
-    rx_lock: Mutex<()>,
 
     /// The value. This is set by `Sender` and read by `Receiver`. The state of
     /// the cell is tracked by `state`.
     value: UnsafeCell<Option<T>>,
 
     /// The task to notify when the receiver drops without consuming the value.
-    ///
-    /// ## Safety
-    ///
-    /// The `TX_TASK_SET` bit in the `state` field is set if this field is
-    /// initialized. If that bit is unset, this field may be uninitialized.
-    tx_task: Task,
+    tx_task: AtomicWaker,
 
     /// The task to notify when the value is sent.
-    ///
-    /// ## Safety
-    ///
-    /// The `RX_TASK_SET` bit in the `state` field is set if this field is
-    /// initialized. If that bit is unset, this field may be uninitialized.
-    rx_task: Task,
-}
-
-struct Task(UnsafeCell<MaybeUninit<Waker>>);
-
-impl Task {
-    /// # Safety
-    ///
-    /// The caller must do the necessary synchronization to ensure that
-    /// the [`Self::0`] contains the valid [`Waker`] during the call.
-    unsafe fn will_wake(&self, cx: &mut Context<'_>) -> bool {
-        unsafe { self.with_task(|w| w.will_wake(cx.waker())) }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must do the necessary synchronization to ensure that
-    /// the [`Self::0`] contains the valid [`Waker`] during the call.
-    unsafe fn with_task<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&Waker) -> R,
-    {
-        unsafe {
-            self.0.with(|ptr| {
-                let waker: *const Waker = (*ptr).as_ptr();
-                f(&*waker)
-            })
-        }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must do the necessary synchronization to ensure that
-    /// the [`Self::0`] contains the valid [`Waker`] during the call.
-    unsafe fn drop_task(&self) {
-        unsafe {
-            self.0.with_mut(|ptr| {
-                let ptr: *mut Waker = (*ptr).as_mut_ptr();
-                ptr.drop_in_place();
-            });
-        }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must do the necessary synchronization to ensure that
-    /// the [`Self::0`] contains the valid [`Waker`] during the call.
-    unsafe fn set_task(&self, cx: &mut Context<'_>) {
-        unsafe {
-            self.0.with_mut(|ptr| {
-                let ptr: *mut Waker = (*ptr).as_mut_ptr();
-                ptr.write(cx.waker().clone());
-            });
-        }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must ensure that the `UnsafeCell` contains a valid `Waker`
-    /// and that no other thread is accessing it concurrently.
-    /// The caller effectively takes ownership of the `Waker`, so the
-    /// `UnsafeCell` should be considered uninitialized after this call.
-    unsafe fn take_task(&self) -> Waker {
-        unsafe {
-            self.0.with_mut(|ptr| {
-                let ptr: *mut Waker = (*ptr).as_mut_ptr();
-                ptr.read()
-            })
-        }
-    }
+    rx_task: AtomicWaker,
 }
 
 #[derive(Clone, Copy)]
@@ -173,11 +89,9 @@ struct State(usize);
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Inner {
         state: AtomicUsize::new(State::new().as_usize()),
-        #[cfg(feature = "loom")]
-        rx_lock: Mutex::new(()),
         value: UnsafeCell::new(None),
-        tx_task: Task(UnsafeCell::new(MaybeUninit::uninit())),
-        rx_task: Task(UnsafeCell::new(MaybeUninit::uninit())),
+        tx_task: AtomicWaker::new(),
+        rx_task: AtomicWaker::new(),
     });
 
     let tx = Sender {
@@ -227,40 +141,17 @@ impl<T> Sender<T> {
     pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         let inner = self.inner.as_ref().unwrap();
 
-        let mut state = State::load(&inner.state, Acquire);
+        let state = State::load(&inner.state, Acquire);
 
         if state.is_closed() {
             return Ready(());
         }
 
-        if state.is_tx_task_set() {
-            let will_notify = unsafe { inner.tx_task.will_wake(cx) };
+        inner.tx_task.register(cx.waker());
 
-            if !will_notify {
-                state = State::unset_tx_task(&inner.state);
-
-                if state.is_closed() {
-                    // Set the flag again so that the waker is released in drop
-                    State::set_tx_task(&inner.state);
-                    return Ready(());
-                } else {
-                    unsafe { inner.tx_task.drop_task() };
-                }
-            }
-        }
-
-        if !state.is_tx_task_set() {
-            // Attempt to set the task
-            unsafe {
-                inner.tx_task.set_task(cx);
-            }
-
-            // Update the state
-            state = State::set_tx_task(&inner.state);
-
-            if state.is_closed() {
-                return Ready(());
-            }
+        let state = State::load(&inner.state, Acquire);
+        if state.is_closed() {
+            return Ready(());
         }
 
         Pending
@@ -368,36 +259,7 @@ impl<T> Future for Receiver<T> {
     }
 }
 
-struct RxLockGuard<'a> {
-    #[cfg(feature = "loom")]
-    _guard: loom::sync::MutexGuard<'a, ()>,
-    #[cfg(not(feature = "loom"))]
-    state: &'a AtomicUsize,
-}
-
-impl<'a> Drop for RxLockGuard<'a> {
-    fn drop(&mut self) {
-        #[cfg(not(feature = "loom"))]
-        State::release_rx_lock(self.state);
-    }
-}
-
 impl<T> Inner<T> {
-    fn lock_rx_task(&self) -> RxLockGuard<'_> {
-        #[cfg(feature = "loom")]
-        {
-            RxLockGuard {
-                _guard: self.rx_lock.lock().unwrap(),
-            }
-        }
-
-        #[cfg(not(feature = "loom"))]
-        {
-            State::acquire_rx_lock(&self.state);
-            RxLockGuard { state: &self.state }
-        }
-    }
-
     fn complete(&self) -> bool {
         let prev = State::set_complete(&self.state);
 
@@ -405,17 +267,10 @@ impl<T> Inner<T> {
             return false;
         }
 
-        if prev.is_rx_task_set() {
-            let guard = self.lock_rx_task();
-
-            let state = State::load(&self.state, Ordering::Relaxed);
-
-            if state.is_rx_task_set() {
-                State::unset_rx_task(&self.state);
-                let waker = unsafe { self.rx_task.take_task() };
-                drop(guard);
-                waker.wake();
-            }
+        // Try to consume the waker to avoid cloning it.
+        // AtomicWaker::take() handles the synchronization.
+        if let Some(waker) = self.rx_task.take() {
+            waker.wake();
         }
 
         true
@@ -433,71 +288,24 @@ impl<T> Inner<T> {
         } else if state.is_closed() {
             Ready(Err(RecvError(())))
         } else {
-            if state.is_rx_task_set() {
-                let guard = self.lock_rx_task();
+            self.rx_task.register(cx.waker());
 
-                let current_state = State::load(&self.state, Ordering::Relaxed);
+            // Check the state again to avoid race conditions.
+            // If the state became complete while we were registering,
+            // the wake might have been missed or we might have overwritten
+            // the waker that was about to be woken.
+            // However, AtomicWaker handles the lost wake case: if wake() was called
+            // concurrently with register(), AtomicWaker ensures the task is woken.
+            // We just need to check if the value is ready now.
+            state = State::load(&self.state, Acquire);
 
-                if current_state.is_rx_task_set() {
-                    let will_notify = unsafe { self.rx_task.will_wake(cx) };
-
-                    // Check if the task is still the same
-                    if !will_notify {
-                        // Unset the task
-                        state = State::unset_rx_task(&self.state);
-                        drop(guard);
-
-                        if state.is_complete() {
-                            // The sender has set the `VALUE_SENT` bit.
-                            // Since we held the lock and unset the `RX_TASK_SET` bit,
-                            // the sender did not consume the waker.
-                            // We are responsible for dropping it.
-                            unsafe { self.rx_task.drop_task() };
-
-                            // SAFETY: If `state.is_complete()` returns true, then the
-                            // `VALUE_SENT` bit has been set and the sender side of the
-                            // channel will no longer attempt to access the inner
-                            // `UnsafeCell`. Therefore, it is now safe for us to access the
-                            // cell.
-                            return match unsafe { self.consume_value() } {
-                                Some(value) => Ready(Ok(value)),
-                                None => Ready(Err(RecvError(()))),
-                            };
-                        } else {
-                            unsafe { self.rx_task.drop_task() };
-                        }
-                    }
-                } else {
-                    drop(guard);
-
-                    // The task was unset, likely by `complete`.
-                    state = current_state;
-                    if state.is_complete() {
-                        return match unsafe { self.consume_value() } {
-                            Some(value) => Ready(Ok(value)),
-                            None => Ready(Err(RecvError(()))),
-                        };
-                    }
+            if state.is_complete() {
+                match unsafe { self.consume_value() } {
+                    Some(value) => Ready(Ok(value)),
+                    None => Ready(Err(RecvError(()))),
                 }
-            }
-
-            if !state.is_rx_task_set() {
-                // Attempt to set the task
-                unsafe {
-                    self.rx_task.set_task(cx);
-                }
-
-                // Update the state
-                state = State::set_rx_task(&self.state);
-
-                if state.is_complete() {
-                    match unsafe { self.consume_value() } {
-                        Some(value) => Ready(Ok(value)),
-                        None => Ready(Err(RecvError(()))),
-                    }
-                } else {
-                    Pending
-                }
+            } else if state.is_closed() {
+                Ready(Err(RecvError(())))
             } else {
                 Pending
             }
@@ -508,11 +316,8 @@ impl<T> Inner<T> {
     fn close(&self) -> State {
         let prev = State::set_closed(&self.state);
 
-        if prev.is_tx_task_set() && !prev.is_complete() {
-            unsafe {
-                self.tx_task.with_task(Waker::wake_by_ref);
-            }
-        }
+        // We can just wake by ref or take here. AtomicWaker::wake() is safe.
+        self.tx_task.wake();
 
         prev
     }
@@ -547,26 +352,8 @@ impl<T> Inner<T> {
 unsafe impl<T: Send> Send for Inner<T> {}
 unsafe impl<T: Send> Sync for Inner<T> {}
 
-fn mut_load(this: &mut AtomicUsize) -> usize {
-    this.with_mut(|v| *v)
-}
-
 impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
-        let state = State(mut_load(&mut self.state));
-
-        if state.is_rx_task_set() {
-            unsafe {
-                self.rx_task.drop_task();
-            }
-        }
-
-        if state.is_tx_task_set() {
-            unsafe {
-                self.tx_task.drop_task();
-            }
-        }
-
         // SAFETY: we have `&mut self`, and therefore we have
         // exclusive access to the value.
         unsafe {
@@ -588,12 +375,6 @@ impl<T: fmt::Debug> fmt::Debug for Inner<T> {
     }
 }
 
-/// Indicates that a waker for the receiving task has been set.
-///
-/// # Safety
-///
-/// If this bit is not set, the `rx_task` field may be uninitialized.
-const RX_TASK_SET: usize = 0b00001;
 /// Indicates that a value has been stored in the channel's inner `UnsafeCell`.
 ///
 /// # Safety
@@ -604,16 +385,6 @@ const RX_TASK_SET: usize = 0b00001;
 /// the sender.
 const VALUE_SENT: usize = 0b00010;
 const CLOSED: usize = 0b00100;
-
-/// Indicates that a waker for the sending task has been set.
-///
-/// # Safety
-///
-/// If this bit is not set, the `tx_task` field may be uninitialized.
-const TX_TASK_SET: usize = 0b01000;
-
-#[cfg(not(feature = "loom"))]
-const RX_TASK_LOCKED: usize = 0b10000;
 
 impl State {
     fn new() -> State {
@@ -651,29 +422,12 @@ impl State {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    if State(state).is_rx_task_set() {
-                        fence(Ordering::Acquire);
-                    }
                     break;
                 }
                 Err(actual) => state = actual,
             }
         }
         State(state)
-    }
-
-    fn is_rx_task_set(self) -> bool {
-        self.0 & RX_TASK_SET == RX_TASK_SET
-    }
-
-    fn set_rx_task(cell: &AtomicUsize) -> State {
-        let val = cell.fetch_or(RX_TASK_SET, AcqRel);
-        State(val | RX_TASK_SET)
-    }
-
-    fn unset_rx_task(cell: &AtomicUsize) -> State {
-        let val = cell.fetch_and(!RX_TASK_SET, AcqRel);
-        State(val & !RX_TASK_SET)
     }
 
     fn is_closed(self) -> bool {
@@ -687,20 +441,6 @@ impl State {
         State(val)
     }
 
-    fn set_tx_task(cell: &AtomicUsize) -> State {
-        let val = cell.fetch_or(TX_TASK_SET, AcqRel);
-        State(val | TX_TASK_SET)
-    }
-
-    fn unset_tx_task(cell: &AtomicUsize) -> State {
-        let val = cell.fetch_and(!TX_TASK_SET, AcqRel);
-        State(val & !TX_TASK_SET)
-    }
-
-    fn is_tx_task_set(self) -> bool {
-        self.0 & TX_TASK_SET == TX_TASK_SET
-    }
-
     fn as_usize(self) -> usize {
         self.0
     }
@@ -709,31 +449,6 @@ impl State {
         let val = cell.load(order);
         State(val)
     }
-
-    #[cfg(not(feature = "loom"))]
-    fn acquire_rx_lock(cell: &AtomicUsize) {
-        // Simple spinlock implementation
-        let mut backoff = 1;
-        loop {
-            let state = cell.fetch_or(RX_TASK_LOCKED, Acquire);
-            if state & RX_TASK_LOCKED == 0 {
-                return;
-            }
-            while cell.load(Ordering::Relaxed) & RX_TASK_LOCKED != 0 {
-                for _ in 0..backoff {
-                    std::hint::spin_loop();
-                }
-                if backoff < 8 {
-                    backoff <<= 1;
-                }
-            }
-        }
-    }
-
-    #[cfg(not(feature = "loom"))]
-    fn release_rx_lock(cell: &AtomicUsize) {
-        cell.fetch_and(!RX_TASK_LOCKED, Ordering::Release);
-    }
 }
 
 impl fmt::Debug for State {
@@ -741,8 +456,6 @@ impl fmt::Debug for State {
         fmt.debug_struct("State")
             .field("is_complete", &self.is_complete())
             .field("is_closed", &self.is_closed())
-            .field("is_rx_task_set", &self.is_rx_task_set())
-            .field("is_tx_task_set", &self.is_tx_task_set())
             .finish()
     }
 }
