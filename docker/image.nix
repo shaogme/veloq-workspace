@@ -96,10 +96,6 @@ pkgs.dockerTools.buildLayeredImage {
     # 3. 确保其他 PAM 配置存在
     cp etc/pam.d/sshd etc/pam.d/other
     
-    # libstdc++ 兼容
-    ln -s ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 usr/lib/libstdc++.so.6
-    ln -s ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 usr/lib64/libstdc++.so.6
-    
     # bin/bash 软链接
     ln -sf ${pkgs.bashInteractive}/bin/bash bin/bash
   '';
