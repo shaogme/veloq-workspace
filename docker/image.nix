@@ -5,10 +5,10 @@
 let
   deps = import ./deps.nix { inherit pkgs; };
 
-  # 使用 pkgs.writeTextDir 创建标准配置文件
-  # 注意: shadow 文件如果在 store 中通常是全局可读的 (444)，
-  # 为了安全，shadow 将在 extraCommands 中生成，而不是放在 contents 中。
-  
+  # 将 entrypoint 脚本打包
+  # 这样它会被放入 nix store，并且其 bin 目录会合并到 image 的 /bin
+  entrypoint = pkgs.writeScriptBin "entrypoint.sh" (builtins.readFile ./entrypoint.sh);
+
   passwd = pkgs.writeTextDir "etc/passwd" ''
     root:x:0:0:System Administrator:/root:/bin/bash
     sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin
@@ -57,10 +57,13 @@ pkgs.dockerTools.buildLayeredImage {
   name = "veloq-dev";
   tag = "latest";
   
-  # 优化: 启用 Nix 数据库支持，允许容器内使用 nix 命令
+  # 启用 Nix 数据库支持
   includeNixDB = true;
 
   contents = deps.all ++ [
+    # 放入 entrypoint 脚本
+    entrypoint
+
     # 基础配置包
     pkgs.iana-etc
     pkgs.dockerTools.caCertificates
@@ -96,8 +99,12 @@ pkgs.dockerTools.buildLayeredImage {
     # 3. 确保其他 PAM 配置存在
     cp etc/pam.d/sshd etc/pam.d/other
     
-    # bin/bash 软链接
+    # bin/bash 软链接 (确保 /bin/bash 存在)
     ln -sf ${pkgs.bashInteractive}/bin/bash bin/bash
+
+    # 兼容性: 确保 /usr/bin/env 存在 (entrypoint 使用 #!/usr/bin/env bash)
+    mkdir -p usr/bin
+    ln -sf ${pkgs.coreutils}/bin/env usr/bin/env
   '';
 
   config = {

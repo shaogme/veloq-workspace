@@ -7,12 +7,20 @@ on:
       - '.zed/**'
       - 'docs/**'
       - '**.md'
+      - 'docker/**'
+      - '.config/**'
+      - '.agent/**'
+      - '.vscode/**'
   pull_request:
     branches: [ "main" ]
     paths-ignore:
       - '.zed/**'
       - 'docs/**'
       - '**.md'
+      - 'docker/**'
+      - '.config/**'
+      - '.agent/**'
+      - '.vscode/**'
   workflow_dispatch:
 
 env:

@@ -1,11 +1,7 @@
 services:
   # Base configuration for the application
   app-base: &app-base
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    image: veloq-dev
-    pull_policy: never
+    image: ghcr.io/shaogme/veloq:latest
     environment:
       - ROOT_PASSWORD=root # Set your secure password here
     security_opt:
