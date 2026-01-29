@@ -87,6 +87,10 @@ pkgs.dockerTools.buildLayeredImage {
     chmod 700 root/.ssh
     
     mkdir -p var/run/sshd var/empty/sshd
+    mkdir -p var/lock
+    chmod 1777 var/lock
+    mkdir -p var/tmp
+    chmod 1777 var/tmp
     
     # 2. 生成 /etc/shadow (避免 store 文件世界可读的问题)
     # root 密码留空 (::)，配合 PermitEmptyPasswords yes 使用
@@ -145,9 +149,9 @@ pkgs.dockerTools.buildLayeredImage {
       "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
       "RUST_SRC_PATH=${rustSrc}"
       "PKG_CONFIG_PATH=${pkgConfigPath}"
-      "NIX_LD_LIBRARY_PATH=${nixLdLibPath}"
+      "NIX_LD_LIBRARY_PATH=${nixLdLibPath}:/usr/lib:/usr/lib64"
       "NIX_LD=${nixLd}"
-      "LD_LIBRARY_PATH=${nixLdLibPath}"
+      "LD_LIBRARY_PATH=${nixLdLibPath}:/usr/lib:/usr/lib64"
       "PATH=/bin:/usr/bin:/usr/local/bin"
     ];
   };

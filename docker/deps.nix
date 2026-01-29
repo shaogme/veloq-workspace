@@ -17,6 +17,7 @@ let
   devTools = with pkgs; [
     # Core
     glibc
+    glibc.bin # Contains ldd, required for version checks
     coreutils
     findutils
     gnugrep

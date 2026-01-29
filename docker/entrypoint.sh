@@ -40,6 +40,11 @@ if [ -f "/tmp/id_ed25519.pub" ]; then
     fi
 fi
 
+# 3.1 Ensure Metadata Directories
+# In case these are mounted as tmpfs or valid directories are missing
+mkdir -p /var/lock /var/tmp
+chmod 1777 /var/lock /var/tmp
+
 # 4. Export Environment for SSH Sessions
 env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /root/.ssh/environment || true
 chmod 600 /root/.ssh/environment
