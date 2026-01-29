@@ -136,6 +136,8 @@ pkgs.dockerTools.buildLayeredImage {
     
     # bin/bash Wrapper
     # Use the wrapper to ensure env vars are present even in SSH sessions
+    # Remove existing symlink created by dockerTools (from contents)
+    rm -f bin/bash
     cp ${bashWrapper} bin/bash
     chmod +x bin/bash
 
