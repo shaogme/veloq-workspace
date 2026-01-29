@@ -99,6 +99,14 @@ pkgs.dockerTools.buildLayeredImage {
     # 3. 确保其他 PAM 配置存在
     cp etc/pam.d/sshd etc/pam.d/other
     
+    # 4. FHS 兼容性 (VS Code Server 等需要)
+    mkdir -p lib64 usr/lib64 usr/lib
+    ln -sf ${pkgs.nix-ld}/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2
+    
+    # libstdc++ 兼容
+    ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 usr/lib/libstdc++.so.6
+    ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 usr/lib64/libstdc++.so.6
+    
     # bin/bash 软链接 (确保 /bin/bash 存在)
     ln -sf ${pkgs.bashInteractive}/bin/bash bin/bash
 
