@@ -52,6 +52,19 @@ let
   nixLdLibPath = pkgs.lib.makeLibraryPath deps.runtimeLibs;
   nixLd = pkgs.lib.fileContents "${pkgs.stdenv.cc}/nix-support/dynamic-linker";
 
+  # Wrapper script to enforce environment variables in SSH sessions
+  # This solves the issue where SSH wipes LD_LIBRARY_PATH
+  bashWrapper = pkgs.writeScript "bash-wrapper" ''
+    #!${pkgs.bashInteractive}/bin/bash
+    export NIX_LD_LIBRARY_PATH="${nixLdLibPath}:/usr/lib:/usr/lib64"
+    export NIX_LD="${nixLd}"
+    export LD_LIBRARY_PATH="${nixLdLibPath}:/usr/lib:/usr/lib64"
+    export RUST_SRC_PATH="${rustSrc}"
+    export PKG_CONFIG_PATH="${pkgConfigPath}"
+    export PATH=$PATH:/usr/bin:/bin
+    exec ${pkgs.bashInteractive}/bin/bash "$@"
+  '';
+
 in
 pkgs.dockerTools.buildLayeredImage {
   name = "veloq-dev";
@@ -121,8 +134,10 @@ pkgs.dockerTools.buildLayeredImage {
       ln -sf /usr/lib/$lib usr/lib/x86_64-linux-gnu/$lib
     done
     
-    # bin/bash 软链接
-    ln -sf ${pkgs.bashInteractive}/bin/bash bin/bash
+    # bin/bash Wrapper
+    # Use the wrapper to ensure env vars are present even in SSH sessions
+    cp ${bashWrapper} bin/bash
+    chmod +x bin/bash
 
     # /usr/bin/env
     ln -sf ${pkgs.coreutils}/bin/env usr/bin/env
