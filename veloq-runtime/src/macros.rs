@@ -69,7 +69,7 @@ where
 #[macro_export]
 macro_rules! select {
     // Case: Single branch
-    ($pat:pat = $fut:expr => $handler:block $(,)?) => {
+    ($pat:pat = $fut:expr => $handler:expr $(,)?) => {
         {
             let $pat = $fut.await;
             $handler
@@ -77,7 +77,7 @@ macro_rules! select {
     };
 
     // Case: Multiple branches
-    ($pat:pat = $fut:expr => $handler:block, $($r_pat:pat = $r_fut:expr => $r_handler:block),+ $(,)?) => {
+    ($pat:pat = $fut:expr => $handler:expr, $($r_pat:pat = $r_fut:expr => $r_handler:expr),+ $(,)?) => {
         {
             use $crate::macros::{Select2, Either};
             // Construct the composed future
@@ -100,11 +100,11 @@ macro_rules! select {
 
     // Internal Helper: Build future chain
     // Base case: last one
-    (@recurse_future $pat:pat = $fut:expr => $handler:block) => {
+    (@recurse_future $pat:pat = $fut:expr => $handler:expr) => {
         $fut
     };
     // Recursive case
-    (@recurse_future $pat:pat = $fut:expr => $handler:block, $($rest:tt)*) => {
+    (@recurse_future $pat:pat = $fut:expr => $handler:expr, $($rest:tt)*) => {
         $crate::macros::Select2 {
             a: $fut,
             b: $crate::select!(@recurse_future $($rest)*)
@@ -113,14 +113,14 @@ macro_rules! select {
 
     // Internal Helper: Match chain
     // Base case: One remaining
-    (@recurse_match $val:ident, $pat:pat = $fut:expr => $handler:block) => {
+    (@recurse_match $val:ident, $pat:pat = $fut:expr => $handler:expr) => {
         {
             let $pat = $val;
             $handler
         }
     };
     // Recursive case
-    (@recurse_match $val:ident, $pat:pat = $fut:expr => $handler:block, $($rest:tt)*) => {
+    (@recurse_match $val:ident, $pat:pat = $fut:expr => $handler:expr, $($rest:tt)*) => {
         match $val {
             $crate::macros::Either::Left(res) => {
                  let $pat = res;

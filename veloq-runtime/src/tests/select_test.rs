@@ -51,8 +51,8 @@ fn test_select_basic() {
     let mut exec = create_local_executor();
     exec.block_on(async {
         let res = select! {
-            val = ready(1) => { val },
-            _ = PendingFuture => { 2 },
+            val = ready(1) => val,
+            _ = PendingFuture => 2,
         };
         assert_eq!(res, 1);
     });
@@ -64,8 +64,8 @@ fn test_select_biased() {
     let mut exec = create_local_executor();
     exec.block_on(async {
         let res = select! {
-            val = ready(10) => { val },
-            val2 = ready(20) => { val2 },
+            val = ready(10) => val,
+            val2 = ready(20) => val2,
         };
         assert_eq!(res, 10);
     });
@@ -77,8 +77,8 @@ fn test_select_biased_reverse() {
     let mut exec = create_local_executor();
     exec.block_on(async {
         let res = select! {
-            val = ready(20) => { val },
-            val2 = ready(10) => { val2 },
+            val = ready(20) => val,
+            val2 = ready(10) => val2,
         };
         assert_eq!(res, 20);
     });
@@ -90,8 +90,8 @@ fn test_select_expression() {
     let mut exec = create_local_executor();
     exec.block_on(async {
         let res = select! {
-            v = async { 5 + 5 } => { v },
-            _ = PendingFuture => { 0 }
+            v = async { 5 + 5 } => v,
+            _ = PendingFuture => 0,
         };
         assert_eq!(res, 10);
     });

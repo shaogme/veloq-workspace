@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod sync {
     pub use veloq_sync::*;
 }
+pub mod time;
 
 // Re-export key functions for convenient access
 pub use runtime::{JoinHandle, LocalJoinHandle};
@@ -23,5 +24,6 @@ mod tests {
     mod select_test;
     mod spawn_to_test;
     mod tcp;
+    mod time;
     mod udp;
 }

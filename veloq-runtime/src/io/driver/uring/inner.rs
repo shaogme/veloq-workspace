@@ -259,16 +259,40 @@ impl UringDriver {
             self.wheel.advance(elapsed, &mut self.timer_buffer);
 
             for &user_data in &self.timer_buffer {
-                if let Some(entry) = self.ops.get_mut(user_data) {
-                    // Mark timer task as completed
-                    if matches!(entry.platform_data.lifecycle, OpLifecycle::InFlight) {
-                        entry.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
-                        if let Some(waker) = entry.waker.take() {
-                            waker.wake();
+                let is_detached = if let Some(entry) = self.ops.get(user_data) {
+                    entry.platform_data.detached_completer.is_some()
+                } else {
+                    continue;
+                };
+
+                if is_detached {
+                    // Handle detached timer
+                    if let Some(entry) = self.ops.get_mut(user_data) {
+                        if matches!(entry.platform_data.lifecycle, OpLifecycle::InFlight) {
+                            if let Some(completer) = entry.platform_data.detached_completer.take() {
+                                entry.platform_data.lifecycle = OpLifecycle::Detached;
+                                entry.platform_data.timer_id = None; // clear timer id
+                                if let Some(resources) = entry.resources.take() {
+                                    completer.complete(Ok(0), resources);
+                                }
+                            }
                         }
                     }
-                    entry.platform_data.timer_id = None;
-                    // Note: We don't remove it here. The task will poll_op, see Ready, and remove it.
+                    // Remove from registry
+                    self.ops.remove(user_data);
+                } else {
+                    // Handle local timer
+                    if let Some(entry) = self.ops.get_mut(user_data) {
+                        // Mark timer task as completed
+                        if matches!(entry.platform_data.lifecycle, OpLifecycle::InFlight) {
+                            entry.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
+                            if let Some(waker) = entry.waker.take() {
+                                waker.wake();
+                            }
+                        }
+                        entry.platform_data.timer_id = None;
+                        // Note: We don't remove it here. The task will poll_op, see Ready, and remove it.
+                    }
                 }
             }
             self.timer_buffer.clear();

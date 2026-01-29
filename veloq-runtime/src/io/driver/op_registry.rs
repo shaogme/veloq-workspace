@@ -34,7 +34,6 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
         self.slab.insert(entry)
     }
 
-    #[cfg(target_os = "windows")]
     pub fn get(&self, user_data: usize) -> Option<&OpEntry<Op, P>> {
         self.slab.get(user_data)
     }

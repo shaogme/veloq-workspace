@@ -187,15 +187,38 @@ impl IocpDriver {
         // Process expired timers
         self.wheel.advance(elapsed, &mut self.timer_buffer);
         for &user_data in &self.timer_buffer {
-            if let Some(op) = self.ops.get_mut(user_data) {
-                // Mark timer as completed if it was in flight
-                if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                    op.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
-                    if let Some(waker) = op.waker.take() {
-                        waker.wake();
+            let is_detached = if let Some(op) = self.ops.get_mut(user_data) {
+                op.platform_data.detached_completer.is_some()
+            } else {
+                continue;
+            };
+
+            if is_detached {
+                // Handle detached timer
+                if let Some(op) = self.ops.get_mut(user_data) {
+                    if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                        if let Some(completer) = op.platform_data.detached_completer.take() {
+                            op.platform_data.lifecycle = OpLifecycle::Detached;
+                            op.platform_data.timer_id = None; // clear timer id
+                            if let Some(resources) = op.resources.take() {
+                                completer.complete(Ok(0), resources);
+                            }
+                        }
                     }
                 }
-                op.platform_data.timer_id = None;
+                // Remove from registry
+                self.ops.remove(user_data);
+            } else {
+                if let Some(op) = self.ops.get_mut(user_data) {
+                    // Mark timer as completed if it was in flight
+                    if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                        op.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
+                        if let Some(waker) = op.waker.take() {
+                            waker.wake();
+                        }
+                    }
+                    op.platform_data.timer_id = None;
+                }
             }
         }
         self.timer_buffer.clear();
@@ -433,6 +456,17 @@ impl Drop for IocpDriver {
         let mut pending_count = 0;
         for (_user_data, op) in self.ops.iter_mut() {
             if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                // Attempt to cancel timer
+                if let Some(tid) = op.platform_data.timer_id {
+                    self.wheel.cancel(tid);
+                    op.platform_data.timer_id = None;
+                    // Mark as cancelled so we don't consider it anymore
+                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
+                    // Software timers don't generate IOCP completion packets when cancelled here,
+                    // so we don't need to increment pending_count.
+                    continue;
+                }
+
                 if let Some(res) = op.resources.as_mut()
                     && let Some(fd) = res.get_fd()
                     && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files)
