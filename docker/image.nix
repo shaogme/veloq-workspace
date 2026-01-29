@@ -5,8 +5,8 @@
 let
   deps = import ./deps.nix { inherit pkgs; };
 
-  # 将 entrypoint 脚本打包
-  # 这样它会被放入 nix store，并且其 bin 目录会合并到 image 的 /bin
+  # Bundle the entrypoint script
+  # It will be placed in the nix store, and its bin directory will be merged into /bin
   entrypoint = pkgs.writeScriptBin "entrypoint.sh" (builtins.readFile ./entrypoint.sh);
 
   passwd = pkgs.writeTextDir "etc/passwd" ''
@@ -46,7 +46,7 @@ let
     hosts:     files dns
   '';
 
-  # 提取环境变量逻辑
+  # Extract environment logic
   rustSrc = "${pkgs.rustPlatform.rustLibSrc}";
   pkgConfigPath = "${pkgs.openssl.dev}/lib/pkgconfig";
   nixLdLibPath = pkgs.lib.makeLibraryPath deps.runtimeLibs;
@@ -70,18 +70,18 @@ pkgs.dockerTools.buildLayeredImage {
   name = "veloq-dev";
   tag = "latest";
   
-  # 启用 Nix 数据库支持
+  # Enable Nix database support
   includeNixDB = true;
 
   contents = deps.all ++ [
-    # 放入 entrypoint 脚本
+    # Include entrypoint script
     entrypoint
 
-    # 基础配置包
+    # Basic configuration packages
     pkgs.iana-etc
     pkgs.dockerTools.caCertificates
     
-    # 配置文件 (非敏感)
+    # Configuration files (non-sensitive)
     passwd
     group
     sshdConfig
@@ -89,10 +89,10 @@ pkgs.dockerTools.buildLayeredImage {
     nsswitchConf
   ];
 
-  # 使用 extraCommands 进行目录创建和敏感文件生成
-  # 这里的命令在构建镜像层时以 Fakeroot 环境执行
+  # Use extraCommands for directory creation and sensitive file generation
+  # These commands run in a Fakeroot environment during layer construction
   extraCommands = ''
-    # 1. 基础系统目录
+    # 1. Base System Directories
     mkdir -p tmp
     chmod 1777 tmp
     
@@ -105,46 +105,51 @@ pkgs.dockerTools.buildLayeredImage {
     mkdir -p var/tmp
     chmod 1777 var/tmp
     
-    # 2. 生成 /etc/shadow (避免 store 文件世界可读的问题)
-    # root 密码留空 (::)，配合 PermitEmptyPasswords yes 使用
+    # 2. Generate /etc/shadow
+    # We generate this here to avoid world-readable permissions in the Nix store.
+    # Root password is empty (::) to work with PermitEmptyPasswords yes.
     cat > etc/shadow <<EOF
     root::19733:0:99999:7:::
     sshd:*:19733:0:99999:7:::
     EOF
     chmod 600 etc/shadow
 
-    # 3. 确保其他 PAM 配置存在
+    # 3. Ensure PAM Configuration
+    # Copy sshd PAM config to 'other' as a fallback
     cp etc/pam.d/sshd etc/pam.d/other
     
-    # FHS 兼容性 (VS Code Server 等需要)
+    # 4. FHS Compatibility (Required for VS Code Server, etc.)
+    # Create standard directory structure
     mkdir -p lib64 usr/lib64 usr/lib usr/bin usr/lib/x86_64-linux-gnu
 
-    # 1. 动态加载器 (ld-linux)
+    # Link Dynamic Linker (ld-linux)
     ln -sf ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2
     
-    # 2. 核心库 (libstdc++, libgcc_s)
-    # 使用 cp -L 复制实际文件，避免软链接权限或解析问题 (解决 "cannot open shared object file" 错误)
+    # Link Core Libraries (libstdc++, libgcc_s)
+    # We copy the actual files (cp -L) to ensure they work even if symlinks fail
+    # or if applications don't follow Nix store links correctly.
     for lib in libstdc++.so.6 libgcc_s.so.1; do
-      # 复制到主要路径
+      # Copy to primary paths
       cp -L ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib/$lib
       cp -L ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib64/$lib
       
-      # 其他路径使用软链接指向已复制的文件
+      # Symlink for other common paths
       ln -sf /usr/lib/$lib lib64/$lib
       ln -sf /usr/lib/$lib usr/lib/x86_64-linux-gnu/$lib
     done
     
-    # bin/bash Wrapper
-    # Use the wrapper to ensure env vars are present even in SSH sessions
-    # Remove existing symlink created by dockerTools (from contents)
+    # 5. Bash Wrapper
+    # Replace the default bash symlink with our wrapper script.
+    # This ensures LD_LIBRARY_PATH is set for all sessions, including SSH.
     rm -f bin/bash
     cp ${bashWrapper} bin/bash
     chmod +x bin/bash
 
-    # /usr/bin/env
+    # 6. Setup /usr/bin/env
     ln -sf ${pkgs.coreutils}/bin/env usr/bin/env
     
-    # 常用工具 (VS Code Server 硬编码路径兼容)
+    # 7. Common Tools Symlinks
+    # Some tools check specific paths (like VS Code Server checking /usr/bin/ps)
     ln -sf ${pkgs.procps}/bin/pgrep usr/bin/pgrep
     ln -sf ${pkgs.procps}/bin/pkill usr/bin/pkill
     ln -sf ${pkgs.procps}/bin/ps usr/bin/ps

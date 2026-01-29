@@ -29,8 +29,8 @@ let
     which
     xz
     cacert
-    bashInteractive # Included here and linked in image.nix
-    
+    bashInteractive
+
     # Network & Utils
     curl
     git
@@ -40,7 +40,7 @@ let
     procps
     tcpdump
     vim
-    shadow # For user management utilities if needed
+    shadow
 
     # Debugging
     gdb
