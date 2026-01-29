@@ -154,8 +154,8 @@ fn test_interval_basic_burst() {
         .unwrap();
 
     runtime.block_on(async {
-        let mut interval = interval(Duration::from_millis(20));
         let start = Instant::now();
+        let mut interval = interval(Duration::from_millis(20));
 
         // Tick 0: Immediate (usually)
         interval.tick().await;
@@ -223,9 +223,9 @@ fn test_interval_missed_delay() {
         sleep(Duration::from_millis(50)).await;
 
         // This tick should happen immediately but reset schedule based on NOW
+        let start = Instant::now();
         interval.tick().await;
 
-        let start = Instant::now();
         // This next tick should be 20ms from NOW (Delay behavior), not catching up
         interval.tick().await;
         let elapsed = start.elapsed();
