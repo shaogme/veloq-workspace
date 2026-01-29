@@ -1,7 +1,7 @@
 { pkgs }:
 let
-  # 1. Define libraries for System Compatibility (nix-ld)
-  # These are commonly required by VS Code Server, Copilot, and other unpatched binaries
+  # 1. System Compatibility Libraries (nix-ld)
+  # Commonly required by VS Code Server, Copilot, etc.
   runtimeLibs = with pkgs; [
     stdenv.cc.cc.lib
     zlib
@@ -15,35 +15,37 @@ let
 
   # 2. Development Tools
   devTools = with pkgs; [
-    # Standard Linux Utilities
-    glibc     # Standard C Library
-    coreutils # ls, cp, mv, mkdir, etc.
-    findutils # find, xargs
-    gnugrep   # grep
-    gnused    # sed
-    gawk      # awk
-    gnutar    # tar
-    gzip      # gzip
+    # Core
+    glibc
+    coreutils
+    findutils
+    gnugrep
+    gnused
+    gawk
+    gnutar
+    gzip
     wget
     which
     xz
     cacert
-
-    # Shell & Utilities
-    bashInteractive
+    bashInteractive # Included here and linked in image.nix
+    
+    # Network & Utils
     curl
     git
-    gdb
-    lldb
+    openssh
     iproute2
     net-tools
-    procps # pgrep, ps
-    openssh
-    shadow
+    procps
     tcpdump
     vim
+    shadow # For user management utilities if needed
 
-    # Rust Dependencies
+    # Debugging
+    gdb
+    lldb
+
+    # Rust Ecosystem
     cargo
     rustc
     rust-analyzer

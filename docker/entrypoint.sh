@@ -14,45 +14,39 @@ if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
     ssh-keygen -f /etc/ssh/ssh_host_ed25519_key -N '' -t ed25519 >/dev/null 2>&1
 fi
 
-# 2. System Configuration (Unlock Read-Only Files)
-# Decouple system files from Nix store to allow modification
-for file in /etc/passwd /etc/shadow /etc/group; do
+# 2. Fix Permissions for Config Files (Symlink Handling)
+# Files from 'contents' in image.nix are usually symlinks to the Nix Store (read-only).
+# If we need them to be writable (e.g., for user management), we must copy them.
+for file in /etc/passwd /etc/group; do
     if [ -L "$file" ] || [ ! -w "$file" ]; then
-        cp "$file" "${file}.tmp" && rm -f "$file" && mv "${file}.tmp" "$file"
+        cp --remove-destination "$(readlink -f $file)" "$file"
+        chmod 644 "$file"
     fi
 done
-chmod 644 /etc/passwd /etc/group
+
+# Shadow is created via extraCommands so it should be a file, but ensuring permissions is safe.
+if [ -L "/etc/shadow" ]; then
+    cp --remove-destination "$(readlink -f /etc/shadow)" /etc/shadow
+fi
 chmod 600 /etc/shadow
 
-# 3. Setup Root Access (Ensure passwordless/root access works)
-# If root has a locked password ("!"), clear it to allow "PermitEmptyPasswords yes" to work
-sed -i "s|^root:[^:]*|root:|" /etc/shadow
-
-# 4. Setup Authorized Keys
-# Installs the host's public key for seamless SSH access if mounted
+# 3. Setup Authorized Keys
 if [ -f "/tmp/id_ed25519.pub" ]; then
     mkdir -p /root/.ssh
-    cp /tmp/id_ed25519.pub /root/.ssh/authorized_keys
-    chmod 700 /root/.ssh
-    chmod 600 /root/.ssh/authorized_keys
-fi
-
-# 5. Export Environment for SSH Sessions
-# Captures current environment (Nix paths) and saves it to ~/.ssh/environment.
-env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /root/.ssh/environment || true
-
-# 6. Prepare Runtime Directories
-mkdir -p /run/sshd
-
-# 7. Execute Command
-if [ $# -gt 0 ]; then
-    if command -v "$1" >/dev/null 2>&1; then
-        exec "$@"
-    else
-        exec bash -c "$*"
+    if [ ! -f /root/.ssh/authorized_keys ]; then
+        cp /tmp/id_ed25519.pub /root/.ssh/authorized_keys
+        chmod 700 /root/.ssh
+        chmod 600 /root/.ssh/authorized_keys
     fi
 fi
 
-# Default: Start SSH Server
-echo "Starting SSH server..."
-exec $(which sshd) -D -e
+# 4. Export Environment for SSH Sessions
+env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /root/.ssh/environment || true
+
+# 5. Execute Command or Start SSHD
+if [ $# -gt 0 ]; then
+    exec "$@"
+else
+    echo "Starting SSH server..."
+    exec $(which sshd) -D -e
+fi
