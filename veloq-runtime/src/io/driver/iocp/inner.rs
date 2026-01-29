@@ -141,7 +141,7 @@ impl IocpDriver {
         // Pre-register existing pages (created by with_capacity)
         if let Some(rio) = &mut rio_state {
             for i in 0..ops.page_count() {
-                rio.ensure_slab_page_registration(i, &ops, &extensions);
+                rio.ensure_slab_page_registration(i, &ops);
             }
         }
 
@@ -204,7 +204,7 @@ impl IocpDriver {
         let user_data = if completion_key == RIO_EVENT_KEY {
             // RIO event is triggered. Process RIO CQ.
             if let Some(rio) = &mut self.rio_state {
-                return rio.process_completions(&mut self.ops, &self.extensions);
+                return rio.process_completions(&mut self.ops);
             } else {
                 return Ok(());
             }
@@ -290,7 +290,7 @@ impl IocpDriver {
         regions: &[crate::io::buffer::BufferRegion],
     ) -> io::Result<Vec<usize>> {
         if let Some(rio) = &mut self.rio_state {
-            rio.register_buffers(regions, &self.extensions)?;
+            rio.register_buffers(regions)?;
             // RIO state stores IDs sequentially in registered_bufs matching the regions input
             return Ok((0..regions.len()).collect());
         }

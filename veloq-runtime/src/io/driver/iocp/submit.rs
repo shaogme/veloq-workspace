@@ -197,9 +197,7 @@ pub(crate) unsafe fn submit_recv(
 
     // Try RIO upgrade
     if let Some(rio) = &mut ctx.rio {
-        if let Some(res) =
-            rio.try_submit_recv(val.fd, handle, &mut val.buf, op.header.user_data, ctx.ext)?
-        {
+        if let Some(res) = rio.try_submit_recv(val.fd, handle, &mut val.buf, op.header.user_data)? {
             return Ok(res);
         }
     }
@@ -244,9 +242,7 @@ pub(crate) unsafe fn submit_send(
 
     // Try RIO upgrade
     if let Some(rio) = &mut ctx.rio {
-        if let Some(res) =
-            rio.try_submit_send(val.fd, handle, &val.buf, op.header.user_data, ctx.ext)?
-        {
+        if let Some(res) = rio.try_submit_send(val.fd, handle, &val.buf, op.header.user_data)? {
             return Ok(res);
         }
     }
@@ -518,7 +514,6 @@ pub(crate) unsafe fn submit_send_to(
             &payload.addr as *const _ as *const std::ffi::c_void,
             payload.addr_len,
             op.header.user_data,
-            ctx.ext,
         )? {
             return Ok(res);
         }
@@ -577,7 +572,6 @@ pub(crate) unsafe fn submit_recv_from(
             &payload.addr as *const _ as *const std::ffi::c_void,
             &payload.addr_len,
             op.header.user_data,
-            ctx.ext,
         )? {
             return Ok(res);
         }

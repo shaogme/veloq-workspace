@@ -22,6 +22,50 @@ pub struct RioBufferInfo {
     pub(crate) id: RIO_BUFFERID,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RioDispatch {
+    pub create_cq: unsafe extern "system" fn(u32, *const RIO_NOTIFICATION_COMPLETION) -> RIO_CQ,
+    pub create_rq: unsafe extern "system" fn(
+        usize,
+        u32,
+        u32,
+        u32,
+        u32,
+        RIO_CQ,
+        RIO_CQ,
+        *const std::ffi::c_void,
+    ) -> RIO_RQ,
+    pub register_buffer: unsafe extern "system" fn(*const u8, u32) -> RIO_BUFFERID,
+    pub dequeue: unsafe extern "system" fn(RIO_CQ, *mut RIORESULT, u32) -> u32,
+    pub notify: unsafe extern "system" fn(RIO_CQ) -> i32,
+    pub receive:
+        unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
+    pub send:
+        unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
+    pub send_ex: unsafe extern "system" fn(
+        RIO_RQ,
+        *const RIO_BUF,
+        u32,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        u32,
+        *const std::ffi::c_void,
+    ) -> i32,
+    pub receive_ex: unsafe extern "system" fn(
+        RIO_RQ,
+        *const RIO_BUF,
+        u32,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        u32,
+        *const std::ffi::c_void,
+    ) -> i32,
+}
+
 pub struct RioState {
     pub(crate) cq: RIO_CQ,
     pub(crate) registered_bufs: Vec<RioBufferInfo>,
@@ -32,6 +76,7 @@ pub struct RioState {
     // RIO Registration for Slab Pages (for Address Buffers)
     // Maps PageIndex -> (RIO_BUFFERID, BaseAddress)
     pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize)>>,
+    pub(crate) dispatch: RioDispatch,
 }
 
 impl RioState {
@@ -41,7 +86,38 @@ impl RioState {
             None => return Ok(None),
         };
 
-        if let Some(create_fn) = table.RIOCreateCompletionQueue {
+        // Construct dispatch table, failing if any required function is missing
+        let dispatch = RioDispatch {
+            create_cq: table.RIOCreateCompletionQueue.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "RIOCreateCompletionQueue missing")
+            })?,
+            create_rq: table.RIOCreateRequestQueue.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "RIOCreateRequestQueue missing")
+            })?,
+            register_buffer: table
+                .RIORegisterBuffer
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIORegisterBuffer missing"))?,
+            dequeue: table.RIODequeueCompletion.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "RIODequeueCompletion missing")
+            })?,
+            notify: table
+                .RIONotify
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIONotify missing"))?,
+            receive: table
+                .RIOReceive
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIOReceive missing"))?,
+            send: table
+                .RIOSend
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIOSend missing"))?,
+            send_ex: table
+                .RIOSendEx
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIOSendEx missing"))?,
+            receive_ex: table
+                .RIOReceiveEx
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIOReceiveEx missing"))?,
+        };
+
+        if let Some(create_fn) = Some(dispatch.create_cq) {
             // RIO_EVENT_KEY is defined in iocp.rs as usize::MAX - 1
             const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
@@ -70,6 +146,7 @@ impl RioState {
                 rio_rqs: FxHashMap::default(),
                 registered_rio_rqs: Vec::new(),
                 slab_rio_pages: Vec::new(),
+                dispatch,
             }))
         } else {
             Ok(None)
@@ -91,27 +168,21 @@ impl RioState {
     pub fn register_buffers(
         &mut self,
         regions: &[crate::io::buffer::BufferRegion],
-        ext: &Extensions,
     ) -> io::Result<()> {
-        let reg_fn = match &ext.rio_table {
-            Some(table) => table.RIORegisterBuffer,
-            None => return Ok(()),
-        };
+        let reg_fn = self.dispatch.register_buffer;
 
-        if let Some(reg_fn) = reg_fn {
-            self.registered_bufs.clear();
-            self.registered_bufs.reserve(regions.len());
+        self.registered_bufs.clear();
+        self.registered_bufs.reserve(regions.len());
 
-            for region in regions {
-                let len = region.len();
-                let id = unsafe { reg_fn(region.as_ptr() as *const u8, len as u32) };
+        for region in regions {
+            let len = region.len();
+            let id = unsafe { reg_fn(region.as_ptr() as *const u8, len as u32) };
 
-                if id == RIO_INVALID_BUFFERID {
-                    return Err(io::Error::last_os_error());
-                }
-
-                self.registered_bufs.push(RioBufferInfo { id });
+            if id == RIO_INVALID_BUFFERID {
+                return Err(io::Error::last_os_error());
             }
+
+            self.registered_bufs.push(RioBufferInfo { id });
         }
         Ok(())
     }
@@ -119,13 +190,8 @@ impl RioState {
     pub fn process_completions(
         &mut self,
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
-        ext: &Extensions,
     ) -> io::Result<()> {
-        let dequeue_fn = ext
-            .rio_table
-            .as_ref()
-            .and_then(|t| t.RIODequeueCompletion)
-            .ok_or(io::Error::new(io::ErrorKind::Other, "RIO not initialized"))?;
+        let dequeue_fn = self.dispatch.dequeue;
 
         // Stack buffer for completions
         const MAX_RIO_RESULTS: usize = 128;
@@ -175,7 +241,7 @@ impl RioState {
             }
         }
 
-        let notify_fn = ext.rio_table.as_ref().unwrap().RIONotify.unwrap();
+        let notify_fn = self.dispatch.notify;
         let ret = unsafe { notify_fn(self.cq) };
         if ret != 0 {
             return Err(io::Error::from_raw_os_error(ret as i32));
@@ -188,7 +254,6 @@ impl RioState {
         &mut self,
         page_idx: usize,
         ops: &OpRegistry<IocpOp, IocpOpState>,
-        ext: &Extensions,
     ) {
         if page_idx >= self.slab_rio_pages.len() {
             self.slab_rio_pages.resize(page_idx + 1, None);
@@ -196,19 +261,16 @@ impl RioState {
 
         if self.slab_rio_pages[page_idx].is_none() {
             if let Some((ptr, len)) = ops.get_page_slice(page_idx) {
-                if let Some(table) = &ext.rio_table
-                    && let Some(reg_fn) = table.RIORegisterBuffer
-                {
-                    let id = unsafe { reg_fn(ptr, len as u32) };
-                    if id != RIO_INVALID_BUFFERID {
-                        self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
-                    }
+                let reg_fn = self.dispatch.register_buffer;
+                let id = unsafe { reg_fn(ptr, len as u32) };
+                if id != RIO_INVALID_BUFFERID {
+                    self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
                 }
             }
         }
     }
 
-    fn ensure_rq(&mut self, handle: HANDLE, fd: IoFd, ext: &Extensions) -> io::Result<RIO_RQ> {
+    fn ensure_rq(&mut self, handle: HANDLE, fd: IoFd) -> io::Result<RIO_RQ> {
         // fast path for registered files
         if let IoFd::Fixed(idx) = fd {
             let idx = idx as usize;
@@ -222,12 +284,7 @@ impl RioState {
             }
         }
 
-        let table = ext.rio_table.as_ref().ok_or(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "RIO not initialized",
-        ))?;
-
-        let create_fn = table.RIOCreateRequestQueue.unwrap();
+        let create_fn = self.dispatch.create_rq;
 
         // Queue sizes
         const MAX_OUTSTANDING_RECVS: u32 = 1024;
@@ -267,7 +324,6 @@ impl RioState {
         handle: HANDLE,
         buf: &mut FixedBuf,
         user_data: usize,
-        ext: &Extensions,
     ) -> io::Result<Option<SubmissionResult>> {
         if buf.buf_index().is_some() {
             let (idx, offset) = buf.resolve_region_info();
@@ -279,7 +335,7 @@ impl RioState {
             };
 
             // Now self.registered_bufs borrow has ended
-            let rq = self.ensure_rq(handle, fd, ext)?;
+            let rq = self.ensure_rq(handle, fd)?;
 
             let rio_buf = RIO_BUF {
                 BufferId: buffer_id,
@@ -287,8 +343,7 @@ impl RioState {
                 Length: buf.capacity() as u32,
             };
 
-            let table = ext.rio_table.as_ref().unwrap();
-            let recv_fn = table.RIOReceive.unwrap();
+            let recv_fn = self.dispatch.receive;
             let request_context = user_data as *mut std::ffi::c_void;
 
             let ret = unsafe { recv_fn(rq, &rio_buf, 1, 0, request_context) };
@@ -307,7 +362,6 @@ impl RioState {
         handle: HANDLE,
         buf: &FixedBuf,
         user_data: usize,
-        ext: &Extensions,
     ) -> io::Result<Option<SubmissionResult>> {
         if buf.buf_index().is_some() {
             let (idx, offset) = buf.resolve_region_info();
@@ -318,7 +372,7 @@ impl RioState {
                 return Ok(None);
             };
 
-            let rq = self.ensure_rq(handle, fd, ext)?;
+            let rq = self.ensure_rq(handle, fd)?;
 
             let rio_buf = RIO_BUF {
                 BufferId: buffer_id,
@@ -326,8 +380,7 @@ impl RioState {
                 Length: buf.len() as u32,
             };
 
-            let table = ext.rio_table.as_ref().unwrap();
-            let send_fn = table.RIOSend.unwrap();
+            let send_fn = self.dispatch.send;
             let request_context = user_data as *mut std::ffi::c_void;
 
             let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
@@ -349,7 +402,6 @@ impl RioState {
         addr_len: i32,
         user_data: usize,
         // Removed `ops` here. Caller must ensure slab registration.
-        ext: &Extensions,
     ) -> io::Result<Option<SubmissionResult>> {
         if buf.buf_index().is_none() {
             return Ok(None);
@@ -377,7 +429,7 @@ impl RioState {
             return Ok(None);
         };
 
-        let rq = self.ensure_rq(handle, fd, ext)?;
+        let rq = self.ensure_rq(handle, fd)?;
 
         let data_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -392,8 +444,7 @@ impl RioState {
             Length: addr_len as u32,
         };
 
-        let table = ext.rio_table.as_ref().unwrap();
-        let send_ex_fn = table.RIOSendEx.unwrap();
+        let send_ex_fn = self.dispatch.send_ex;
         let request_context = user_data as *mut std::ffi::c_void;
 
         let ret = unsafe {
@@ -425,7 +476,6 @@ impl RioState {
         len_ptr: *const i32,
         user_data: usize,
         // Removed `ops`
-        ext: &Extensions,
     ) -> io::Result<Option<SubmissionResult>> {
         if buf.buf_index().is_none() {
             return Ok(None);
@@ -452,7 +502,7 @@ impl RioState {
             return Ok(None);
         };
 
-        let rq = self.ensure_rq(handle, fd, ext)?;
+        let rq = self.ensure_rq(handle, fd)?;
 
         let data_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -474,8 +524,7 @@ impl RioState {
             Length: 4,
         };
 
-        let table = ext.rio_table.as_ref().unwrap();
-        let recv_ex_fn = table.RIOReceiveEx.unwrap();
+        let recv_ex_fn = self.dispatch.receive_ex;
         let request_context = user_data as *mut std::ffi::c_void;
 
         let ret = unsafe {

@@ -30,7 +30,7 @@ impl Driver for IocpDriver {
             // New page allocated, register it immediately
             if let Some(rio) = &mut self.rio_state {
                 let new_page_idx = self.ops.page_count() - 1;
-                rio.ensure_slab_page_registration(new_page_idx, &self.ops, &self.extensions);
+                rio.ensure_slab_page_registration(new_page_idx, &self.ops);
             }
         }
         user_data
