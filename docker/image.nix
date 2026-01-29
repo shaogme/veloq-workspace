@@ -100,19 +100,30 @@ pkgs.dockerTools.buildLayeredImage {
     cp etc/pam.d/sshd etc/pam.d/other
     
     # 4. FHS 兼容性 (VS Code Server 等需要)
-    mkdir -p lib64 usr/lib64 usr/lib
-    ln -sf ${pkgs.nix-ld}/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2
+    mkdir -p lib64 usr/lib64 usr/lib usr/bin
+
+    # 链接动态加载器到 glibc (最可靠的方式)
+    # 虽然 nix-ld 提供了 shim，但直接链接 glibc loader 通常能解决大部分 "file not found" 问题
+    ln -sf ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2
     
     # libstdc++ 兼容
     ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 usr/lib/libstdc++.so.6
     ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 usr/lib64/libstdc++.so.6
     
-    # bin/bash 软链接 (确保 /bin/bash 存在)
+    # bin/bash 软链接
     ln -sf ${pkgs.bashInteractive}/bin/bash bin/bash
 
-    # 兼容性: 确保 /usr/bin/env 存在 (entrypoint 使用 #!/usr/bin/env bash)
-    mkdir -p usr/bin
+    # /usr/bin/env
     ln -sf ${pkgs.coreutils}/bin/env usr/bin/env
+    
+    # 常用工具 (VS Code Server 硬编码路径兼容)
+    ln -sf ${pkgs.procps}/bin/pgrep usr/bin/pgrep
+    ln -sf ${pkgs.procps}/bin/pkill usr/bin/pkill
+    ln -sf ${pkgs.procps}/bin/ps usr/bin/ps
+    ln -sf ${pkgs.coreutils}/bin/uname usr/bin/uname
+    ln -sf ${pkgs.coreutils}/bin/dirname usr/bin/dirname
+    ln -sf ${pkgs.coreutils}/bin/readlink usr/bin/readlink
+    ln -sf ${pkgs.coreutils}/bin/wc usr/bin/wc
   '';
 
   config = {
