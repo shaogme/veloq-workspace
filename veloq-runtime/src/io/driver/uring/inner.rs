@@ -423,27 +423,83 @@ impl UringDriver {
                 continue;
             }
 
-            // 2. Generate SQE
-            let sqe = {
-                let entry = self.ops.get_mut(user_data).unwrap();
-                let res = entry.resources.as_mut().unwrap();
-                unsafe {
-                    (res.vtable.make_sqe)(res, self.waker_fd as usize).user_data(user_data as u64)
-                }
-            };
+            // 2. Check Strategy & Generate SQE
+            // We use a scope here to borrow entry, check things, and potentially generate SQE.
+            // If we can't get what we need, we set a flag to skip.
 
-            // 3. Push
-            if self.push_entry(sqe) {
+            // We need to be careful with borrowing. We can't hold `entry` while calling `push_entry` (which takes &mut self).
+            // So we must extract necessary info or generate SQE first.
+
+            let waker_fd = self.waker_fd;
+            let (sqe_opt, strategy_opt, duration_opt) = self
+                .ops
+                .get_mut(user_data)
+                .and_then(|entry| entry.resources.as_mut())
+                .map(|res| {
+                    let strategy = res.vtable.strategy;
+                    match strategy {
+                        crate::io::driver::uring::op::SubmissionStrategy::SubmitSqe => {
+                            let s = unsafe {
+                                (res.vtable.make_sqe)(res, waker_fd as usize)
+                                    .user_data(user_data as u64)
+                            };
+                            (Some(s), Some(strategy), None)
+                        }
+                        crate::io::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
+                            let d = unsafe { (res.vtable.get_timeout)(res) };
+                            (None, Some(strategy), d)
+                        }
+                        _ => (None, Some(strategy), None),
+                    }
+                })
+                .unwrap_or((None, None, None));
+
+            // Handle missing entry/resources
+            if strategy_opt.is_none() {
                 self.pop_backlog();
-                if let Some(entry) = self.ops.get_mut(user_data) {
-                    entry.platform_data.submitted = true;
-                    if let Some(waker) = entry.waker.take() {
-                        waker.wake();
+                continue;
+            }
+
+            match strategy_opt.unwrap() {
+                crate::io::driver::uring::op::SubmissionStrategy::SubmitSqe => {
+                    if let Some(sqe) = sqe_opt {
+                        // 3. Push
+                        if self.push_entry(sqe) {
+                            self.pop_backlog();
+                            if let Some(entry) = self.ops.get_mut(user_data) {
+                                entry.platform_data.submitted = true;
+                                if let Some(waker) = entry.waker.take() {
+                                    waker.wake();
+                                }
+                            }
+                        } else {
+                            // Full
+                            break;
+                        }
+                    } else {
+                        // Should be unreachable given prior check
+                        self.pop_backlog();
+                        continue;
                     }
                 }
-            } else {
-                // Full
-                break;
+                crate::io::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
+                    if let Some(duration) = duration_opt {
+                        let task_id = self.wheel.insert(user_data, duration);
+                        self.pop_backlog();
+                        if let Some(entry) = self.ops.get_mut(user_data) {
+                            entry.platform_data.submitted = true;
+                            entry.platform_data.timer_id = Some(task_id);
+                        }
+                    } else {
+                        self.pop_backlog();
+                        continue;
+                    }
+                }
+                _ => {
+                    // unexpected strategy in backlog
+                    self.pop_backlog();
+                    continue;
+                }
             }
         }
     }

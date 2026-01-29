@@ -456,3 +456,16 @@ pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp, _driver_id: usize) -> squ
 
 impl_default_completion!(on_complete_wakeup);
 impl_lifecycle!(drop_wakeup, get_fd_wakeup, wakeup, no_fd);
+
+// ============================================================================
+// VTable Helpers
+// ============================================================================
+
+pub(crate) unsafe fn get_timeout_timeout(op: &UringOp) -> Option<std::time::Duration> {
+    let payload = unsafe { &*op.payload.timeout };
+    Some(payload.op.duration)
+}
+
+pub(crate) unsafe fn get_timeout_none(_op: &UringOp) -> Option<std::time::Duration> {
+    None
+}

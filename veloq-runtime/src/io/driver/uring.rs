@@ -38,60 +38,113 @@ impl Driver for UringDriver {
         user_data: usize,
         op: Self::Op,
     ) -> Result<Poll<()>, (io::Error, Self::Op)> {
-        // 1. Store resources
-        if let Some(entry) = self.ops.get_mut(user_data) {
-            entry.resources = Some(op);
-        }
+        match op.vtable.strategy {
+            op::SubmissionStrategy::BackgroundOnly => Err((
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "background op cannot be submitted normally",
+                ),
+                op,
+            )),
+            op::SubmissionStrategy::SubmitSqe => {
+                // 1. Store resources FIRST to ensure stable address
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    entry.resources = Some(op);
+                } else {
+                    return Err((io::Error::other("op slot not found"), op));
+                }
 
-        // Intercept Timer Op (Software Timer)
-        let timer_duration = if let Some(entry) = self.ops.get_mut(user_data) {
-            let op_ref = entry.resources.as_ref().expect("resources missing");
-            if op_ref.vtable.make_sqe as usize == submit::make_sqe_timeout as usize {
-                unsafe { Some(op_ref.payload.timeout.op.duration) }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+                // 2. Generate SQE from STABLE location
+                let sqe_res = if let Some(entry) = self.ops.get_mut(user_data) {
+                    if let Some(res) = entry.resources.as_mut() {
+                        unsafe {
+                            // We construct the SQE referencing the stable 'res'
+                            Some(
+                                (res.vtable.make_sqe)(res, self.waker_fd as usize)
+                                    .user_data(user_data as u64),
+                            )
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
-        if let Some(duration) = timer_duration {
-            let task_id = self.wheel.insert(user_data, duration);
-            if let Some(entry) = self.ops.get_mut(user_data) {
-                entry.platform_data.submitted = true;
-                entry.platform_data.timer_id = Some(task_id);
+                // 3. Push
+                if let Some(sqe) = sqe_res {
+                    if self.push_entry(sqe) {
+                        trace!(user_data, "Submitted to SQ");
+                        if let Some(entry) = self.ops.get_mut(user_data) {
+                            entry.platform_data.submitted = true;
+                        }
+                        Ok(Poll::Ready(()))
+                    } else {
+                        debug!(user_data, "SQ full, pushing to backlog");
+                        if let Some(entry) = self.ops.get_mut(user_data) {
+                            entry.platform_data.submitted = false;
+                        }
+                        self.push_backlog(user_data);
+                        Ok(Poll::Pending)
+                    }
+                } else {
+                    // Logic error: resource missing immediately after insertion or slot gone
+                    // Try to recover op to return error, but it's tricky since we put it in.
+                    // If we can take it back, good.
+                    if let Some(entry) = self.ops.get_mut(user_data) {
+                        if let Some(op) = entry.resources.take() {
+                            return Err((io::Error::other("failed to access stored op"), op));
+                        }
+                    }
+                    panic!("Critical driver error: Ops resource lost during submission!");
+                }
             }
-            trace!(user_data, ?duration, "Registered software timer");
-            return Ok(Poll::Pending);
-        }
+            op::SubmissionStrategy::SoftwareTimer => {
+                // 1. Store resources FIRST
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    entry.resources = Some(op);
+                } else {
+                    return Err((io::Error::other("op slot not found"), op));
+                }
 
-        // 2. Generate SQE
-        let sqe = {
-            let entry = self.ops.get_mut(user_data).expect("invalid user_data");
-            let op = entry.resources.as_mut().expect("resources missing");
-            unsafe { (op.vtable.make_sqe)(op, self.waker_fd as usize).user_data(user_data as u64) }
-        };
+                // 2. Extract duration from STABLE location (via helper or direct access)
+                let duration_opt = if let Some(entry) = self.ops.get_mut(user_data) {
+                    if let Some(res) = entry.resources.as_ref() {
+                        unsafe { (res.vtable.get_timeout)(res) }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
-        // 3. Push
-        if self.push_entry(sqe) {
-            trace!(user_data, "Submitted to SQ");
-            if let Some(entry) = self.ops.get_mut(user_data) {
-                entry.platform_data.submitted = true;
+                if let Some(duration) = duration_opt {
+                    let task_id = self.wheel.insert(user_data, duration);
+                    if let Some(entry) = self.ops.get_mut(user_data) {
+                        entry.platform_data.submitted = true;
+                        entry.platform_data.timer_id = Some(task_id);
+                    }
+                    trace!(user_data, ?duration, "Registered software timer");
+                    Ok(Poll::Pending)
+                } else {
+                    // Should not happen for SoftwareTimer strategy
+                    // Recover op
+                    if let Some(entry) = self.ops.get_mut(user_data) {
+                        if let Some(op) = entry.resources.take() {
+                            return Err((
+                                io::Error::other("failed to get duration from timer op"),
+                                op,
+                            ));
+                        }
+                    }
+                    panic!("Critical driver error: Ops resource lost during timer submission!");
+                }
             }
-            Ok(Poll::Ready(()))
-        } else {
-            debug!(user_data, "SQ full, pushing to backlog");
-            // SQ Full. Add to backlog.
-            if let Some(entry) = self.ops.get_mut(user_data) {
-                entry.platform_data.submitted = false;
-            }
-            self.push_backlog(user_data);
-            Ok(Poll::Pending)
         }
     }
 
     fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
-        if op.vtable.make_sqe as usize == submit::make_sqe_close as usize {
+        if op.vtable.strategy == op::SubmissionStrategy::BackgroundOnly {
             let sqe = unsafe {
                 (op.vtable.make_sqe)(&mut op, self.waker_fd as usize)
                     .user_data(inner::BACKGROUND_USER_DATA)
@@ -104,7 +157,7 @@ impl Driver for UringDriver {
         } else {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "background op only supports Close",
+                "background op only supports BackgroundOnly strategy",
             ))
         }
     }

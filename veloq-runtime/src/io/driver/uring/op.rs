@@ -15,6 +15,7 @@ use crate::io::op::{
 use io_uring::squeue;
 use std::io;
 use std::mem::ManuallyDrop;
+use std::time::Duration;
 
 // ============================================================================
 // VTable Definition
@@ -24,12 +25,25 @@ pub type MakeSqeFn = unsafe fn(op: &mut UringOp, driver_id: usize) -> squeue::En
 pub type OnCompleteFn = unsafe fn(op: &mut UringOp, result: i32) -> io::Result<usize>;
 pub type DropFn = unsafe fn(op: &mut UringOp);
 pub type GetFdFn = unsafe fn(op: &UringOp) -> Option<IoFd>;
+pub type GetTimeoutFn = unsafe fn(op: &UringOp) -> Option<Duration>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionStrategy {
+    /// Submit a Standard SQE to the ring
+    SubmitSqe,
+    /// Handled by software timer wheel (no SQE submitted)
+    SoftwareTimer,
+    /// Only for background operations (e.g. Close)
+    BackgroundOnly,
+}
 
 pub struct OpVTable {
     pub make_sqe: MakeSqeFn,
     pub on_complete: OnCompleteFn,
     pub drop: DropFn,
     pub get_fd: GetFdFn,
+    pub strategy: SubmissionStrategy,
+    pub get_timeout: GetTimeoutFn,
 }
 
 // ============================================================================
@@ -73,6 +87,8 @@ macro_rules! define_uring_ops {
                 on_complete: $complete:path,
                 drop: $drop:path,
                 get_fd: $get_fd:path,
+                $(strategy: $strategy:expr,)?
+                $(get_timeout: $get_timeout:expr,)?
                 $(construct: $construct:expr,)?
                 $(destruct: $destruct:expr,)?
             }
@@ -94,6 +110,8 @@ macro_rules! define_uring_ops {
                         on_complete: $complete,
                         drop: $drop,
                         get_fd: $get_fd,
+                        strategy: define_uring_ops!(@strategy $($strategy)?),
+                        get_timeout: define_uring_ops!(@get_timeout $($get_timeout)?),
                     };
 
                     let payload = define_uring_ops!(@construct self, $($construct)?, $OpType $(, $Payload)?);
@@ -119,6 +137,14 @@ macro_rules! define_uring_ops {
 
     (@payload_type $OpType:ty) => { $OpType };
     (@payload_type $OpType:ty, $Payload:ty) => { $Payload };
+
+    // Default strategy: SubmitSqe
+    (@strategy ) => { SubmissionStrategy::SubmitSqe };
+    (@strategy $strategy:expr) => { $strategy };
+
+    // Default get_timeout: return None
+    (@get_timeout ) => { submit::get_timeout_none };
+    (@get_timeout $func:expr) => { $func };
 
     // Default construct: return self
     (@construct $self:expr, , $OpType:ty) => { $self };
@@ -215,6 +241,7 @@ define_uring_ops! {
         on_complete: submit::on_complete_close,
         drop: submit::drop_close,
         get_fd: submit::get_fd_close,
+        strategy: SubmissionStrategy::BackgroundOnly,
     }, // Kernel 5.6+
     Fsync {
         field: fsync,
@@ -309,6 +336,8 @@ define_uring_ops! {
         on_complete: submit::on_complete_timeout,
         drop: submit::drop_timeout,
         get_fd: submit::get_fd_timeout,
+        strategy: SubmissionStrategy::SoftwareTimer,
+        get_timeout: submit::get_timeout_timeout,
         construct: |op| TimeoutPayload { op, ts: [0; 2] },
         destruct: |p: TimeoutPayload| p.op,
     }, // Kernel 5.4+
