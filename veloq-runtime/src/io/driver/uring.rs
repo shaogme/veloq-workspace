@@ -104,7 +104,13 @@ impl Driver for UringDriver {
             let entry = self.ops.get_mut(user_data).unwrap();
             if !entry.platform_data.submitted {
                 // Still not in ring. Register waker.
-                entry.waker = Some(cx.waker().clone());
+                if entry
+                    .waker
+                    .as_ref()
+                    .map_or(true, |w| !w.will_wake(cx.waker()))
+                {
+                    entry.waker = Some(cx.waker().clone());
+                }
                 return Poll::Pending;
             }
         }
