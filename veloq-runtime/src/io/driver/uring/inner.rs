@@ -17,6 +17,7 @@ pub struct UringOpState {
     pub submitted: bool,
     pub next: Option<usize>,
     pub detached_completer: Option<Box<dyn DetachedCompleter<UringOp>>>,
+    pub timer_id: Option<veloq_wheel::TaskId>,
 }
 
 impl UringOpState {
@@ -79,6 +80,9 @@ pub struct UringDriver {
     pub(crate) waker_token: Option<usize>,
     pub(crate) buffers_registered: bool,
     pub(crate) is_waked: Arc<AtomicBool>,
+
+    pub(crate) wheel: veloq_wheel::Wheel<usize>,
+    pub(crate) timer_buffer: Vec<usize>,
 }
 
 impl UringDriver {
@@ -126,6 +130,9 @@ impl UringDriver {
             waker_token: None,
             buffers_registered: false,
             is_waked,
+
+            wheel: veloq_wheel::Wheel::new(veloq_wheel::WheelConfig::default()),
+            timer_buffer: Vec::new(),
         };
 
         driver.submit_waker();
@@ -202,10 +209,51 @@ impl UringDriver {
 
         if !self.ring.completion().is_empty() {
             self.process_completions_internal();
-            return Ok(());
+            // Also process timers even if we have IO completions to be fair?
+            // Fall through to timer processing below
+        } else {
+            // Need to wait. Calculate timeout.
+            let next_timeout = self.wheel.next_timeout();
+            let start = std::time::Instant::now();
+
+            if let Some(duration) = next_timeout {
+                let ts = io_uring::types::Timespec::new()
+                    .sec(duration.as_secs())
+                    .nsec(duration.subsec_nanos());
+
+                // Use submit_with_args to pass timeout
+                let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+                match self.ring.submitter().submit_with_args(1, &args) {
+                    Ok(_) => {}
+                    Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => {
+                        // Timeout expired without IO
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                self.ring.submit_and_wait(1)?;
+            }
+
+            // Advance wheel
+            let elapsed = start.elapsed();
+            self.wheel.advance(elapsed, &mut self.timer_buffer);
+
+            for &user_data in &self.timer_buffer {
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    // Mark timer task as completed
+                    if !entry.cancelled && entry.result.is_none() {
+                        entry.result = Some(Ok(0));
+                        if let Some(waker) = entry.waker.take() {
+                            waker.wake();
+                        }
+                    }
+                    entry.platform_data.timer_id = None;
+                    // Note: We don't remove it here. The task will poll_op, see Ready, and remove it.
+                }
+            }
+            self.timer_buffer.clear();
         }
 
-        self.ring.submit_and_wait(1)?;
         self.process_completions_internal();
 
         // After wait (which implies submit), we might have space
@@ -479,6 +527,24 @@ impl UringDriver {
         if let Some(op) = self.ops.get_mut(user_data) {
             op.cancelled = true;
             op.waker = None;
+
+            if let Some(tid) = op.platform_data.timer_id.take() {
+                self.wheel.cancel(tid);
+                // If it was a pure timer (no SQE), we are done.
+                // We should probably check if we need to remove it from ops immediately?
+                // IOCP behavior: yes, but here we can just leave it cancelled.
+                // flush_backlog handles cancelled ops by completing them with ECANCELED.
+                // But this op is marked "submitted" (fake submission).
+                // So it won't be in backlog.
+                // We must ensure subsequent poll returns error or we remove it now.
+                // If we remove it now, subsequent poll helper panics if not found?
+                // OpRegistry::poll_op panics if not found.
+                // So we should leave it, but set result to ECANCELED?
+                if op.result.is_none() {
+                    op.result = Some(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                }
+                return;
+            }
 
             let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
                 .build()

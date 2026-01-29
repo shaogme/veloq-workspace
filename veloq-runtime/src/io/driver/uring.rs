@@ -43,6 +43,28 @@ impl Driver for UringDriver {
             entry.resources = Some(op);
         }
 
+        // Intercept Timer Op (Software Timer)
+        let timer_duration = if let Some(entry) = self.ops.get_mut(user_data) {
+            let op_ref = entry.resources.as_ref().expect("resources missing");
+            if op_ref.vtable.make_sqe as usize == submit::make_sqe_timeout as usize {
+                unsafe { Some(op_ref.payload.timeout.op.duration) }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(duration) = timer_duration {
+            let task_id = self.wheel.insert(user_data, duration);
+            if let Some(entry) = self.ops.get_mut(user_data) {
+                entry.platform_data.submitted = true;
+                entry.platform_data.timer_id = Some(task_id);
+            }
+            trace!(user_data, ?duration, "Registered software timer");
+            return Ok(Poll::Pending);
+        }
+
         // 2. Generate SQE
         let sqe = {
             let entry = self.ops.get_mut(user_data).expect("invalid user_data");
