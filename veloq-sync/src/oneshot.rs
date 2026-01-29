@@ -144,6 +144,21 @@ impl Task {
             });
         }
     }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that the `UnsafeCell` contains a valid `Waker`
+    /// and that no other thread is accessing it concurrently.
+    /// The caller effectively takes ownership of the `Waker`, so the
+    /// `UnsafeCell` should be considered uninitialized after this call.
+    unsafe fn take_task(&self) -> Waker {
+        unsafe {
+            self.0.with_mut(|ptr| {
+                let ptr: *mut Waker = (*ptr).as_mut_ptr();
+                ptr.read()
+            })
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -354,9 +369,17 @@ impl<T> Inner<T> {
         }
 
         if prev.is_rx_task_set() {
-            // TODO: Consume waker?
-            unsafe {
-                self.rx_task.with_task(Waker::wake_by_ref);
+            State::acquire_rx_lock(&self.state);
+
+            let state = State::load(&self.state, Ordering::Relaxed);
+
+            if state.is_rx_task_set() {
+                State::unset_rx_task(&self.state);
+                let waker = unsafe { self.rx_task.take_task() };
+                State::release_rx_lock(&self.state);
+                waker.wake();
+            } else {
+                State::release_rx_lock(&self.state);
             }
         }
 
@@ -376,27 +399,51 @@ impl<T> Inner<T> {
             Ready(Err(RecvError(())))
         } else {
             if state.is_rx_task_set() {
-                let will_notify = unsafe { self.rx_task.will_wake(cx) };
+                State::acquire_rx_lock(&self.state);
 
-                // Check if the task is still the same
-                if !will_notify {
-                    // Unset the task
-                    state = State::unset_rx_task(&self.state);
+                let current_state = State::load(&self.state, Ordering::Relaxed);
+
+                if current_state.is_rx_task_set() {
+                    let will_notify = unsafe { self.rx_task.will_wake(cx) };
+
+                    // Check if the task is still the same
+                    if !will_notify {
+                        // Unset the task
+                        state = State::unset_rx_task(&self.state);
+                        State::release_rx_lock(&self.state);
+
+                        if state.is_complete() {
+                            // The sender has set the `VALUE_SENT` bit.
+                            // Since we held the lock and unset the `RX_TASK_SET` bit,
+                            // the sender did not consume the waker.
+                            // We are responsible for dropping it.
+                            unsafe { self.rx_task.drop_task() };
+
+                            // SAFETY: If `state.is_complete()` returns true, then the
+                            // `VALUE_SENT` bit has been set and the sender side of the
+                            // channel will no longer attempt to access the inner
+                            // `UnsafeCell`. Therefore, it is now safe for us to access the
+                            // cell.
+                            return match unsafe { self.consume_value() } {
+                                Some(value) => Ready(Ok(value)),
+                                None => Ready(Err(RecvError(()))),
+                            };
+                        } else {
+                            unsafe { self.rx_task.drop_task() };
+                        }
+                    } else {
+                        State::release_rx_lock(&self.state);
+                    }
+                } else {
+                    State::release_rx_lock(&self.state);
+
+                    // The task was unset, likely by `complete`.
+                    state = current_state;
                     if state.is_complete() {
-                        // Set the flag again so that the waker is released in drop
-                        State::set_rx_task(&self.state);
-
-                        // SAFETY: If `state.is_complete()` returns true, then the
-                        // `VALUE_SENT` bit has been set and the sender side of the
-                        // channel will no longer attempt to access the inner
-                        // `UnsafeCell`. Therefore, it is now safe for us to access the
-                        // cell.
                         return match unsafe { self.consume_value() } {
                             Some(value) => Ready(Ok(value)),
                             None => Ready(Err(RecvError(()))),
                         };
-                    } else {
-                        unsafe { self.rx_task.drop_task() };
                     }
                 }
             }
@@ -532,6 +579,8 @@ const CLOSED: usize = 0b00100;
 /// If this bit is not set, the `tx_task` field may be uninitialized.
 const TX_TASK_SET: usize = 0b01000;
 
+const RX_TASK_LOCKED: usize = 0b10000;
+
 impl State {
     fn new() -> State {
         State(0)
@@ -625,6 +674,43 @@ impl State {
     fn load(cell: &AtomicUsize, order: Ordering) -> State {
         let val = cell.load(order);
         State(val)
+    }
+
+    fn acquire_rx_lock(cell: &AtomicUsize) {
+        #[cfg(feature = "loom")]
+        {
+            loop {
+                let state = cell.fetch_or(RX_TASK_LOCKED, Acquire);
+                if state & RX_TASK_LOCKED == 0 {
+                    return;
+                }
+                crate::shim::yield_now();
+            }
+        }
+
+        #[cfg(not(feature = "loom"))]
+        {
+            // Simple spinlock implementation
+            let mut backoff = 1;
+            loop {
+                let state = cell.fetch_or(RX_TASK_LOCKED, Acquire);
+                if state & RX_TASK_LOCKED == 0 {
+                    return;
+                }
+                while cell.load(Ordering::Relaxed) & RX_TASK_LOCKED != 0 {
+                    for _ in 0..backoff {
+                        std::hint::spin_loop();
+                    }
+                    if backoff < 8 {
+                        backoff <<= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn release_rx_lock(cell: &AtomicUsize) {
+        cell.fetch_and(!RX_TASK_LOCKED, Ordering::Release);
     }
 }
 

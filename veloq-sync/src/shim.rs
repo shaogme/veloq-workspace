@@ -1,5 +1,15 @@
 pub use veloq_shim::*;
 
+#[cfg(feature = "loom")]
+pub fn yield_now() {
+    loom::thread::yield_now();
+}
+
+#[cfg(not(feature = "loom"))]
+pub fn yield_now() {
+    std::thread::yield_now();
+}
+
 pub mod queue {
     #[cfg(not(feature = "loom"))]
     pub use crossbeam_queue::{ArrayQueue, SegQueue};
