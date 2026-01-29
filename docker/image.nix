@@ -106,12 +106,15 @@ pkgs.dockerTools.buildLayeredImage {
     ln -sf ${pkgs.glibc}/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2
     
     # 2. 核心库 (libstdc++, libgcc_s)
-    # 链接到多个常见位置以确保兼容性
+    # 使用 cp -L 复制实际文件，避免软链接权限或解析问题 (解决 "cannot open shared object file" 错误)
     for lib in libstdc++.so.6 libgcc_s.so.1; do
-      ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/$lib lib64/$lib
-      ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib/$lib
-      ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib64/$lib
-      ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib/x86_64-linux-gnu/$lib
+      # 复制到主要路径
+      cp -L ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib/$lib
+      cp -L ${pkgs.stdenv.cc.cc.lib}/lib/$lib usr/lib64/$lib
+      
+      # 其他路径使用软链接指向已复制的文件
+      ln -sf /usr/lib/$lib lib64/$lib
+      ln -sf /usr/lib/$lib usr/lib/x86_64-linux-gnu/$lib
     done
     
     # bin/bash 软链接

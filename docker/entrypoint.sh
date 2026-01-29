@@ -42,6 +42,7 @@ fi
 
 # 4. Export Environment for SSH Sessions
 env | grep -E "^(PATH|NIX_|CARGO_|RUST_|PKG_CONFIG|LD_)" > /root/.ssh/environment || true
+chmod 600 /root/.ssh/environment
 
 # 5. Execute Command or Start SSHD
 if [ $# -gt 0 ]; then
