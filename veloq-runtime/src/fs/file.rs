@@ -12,6 +12,7 @@ use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 #[cfg(not(unix))]
 macro_rules! ignore {
@@ -95,6 +96,52 @@ pub struct GenericFile<S: OpSubmitter, P: FilePos> {
 pub type LocalFile = GenericFile<LocalSubmitter, Cell<u64>>;
 pub type File = GenericFile<DetachedSubmitter, AtomicU64>;
 
+// ============================================================================
+// SyncRange Types (Zero-allocation)
+// ============================================================================
+
+enum SyncRangeState<S: OpSubmitter> {
+    Idle(Option<(S, SyncFileRange)>),
+    Submitted(S::Future<SyncFileRange>),
+}
+
+pub struct SyncRangeFuture<S: OpSubmitter> {
+    state: SyncRangeState<S>,
+}
+
+impl<S: OpSubmitter> Future for SyncRangeFuture<S> {
+    type Output = io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Safety: We use manual pin projection to access `state`.
+        // `SyncRangeState` fields:
+        // - `Idle` variant holds `S` (Clone) and `SyncFileRange` (Copy-like). Safe to move out?
+        //   We use `Option` to take ownership.
+        // - `Submitted` variant holds `S::Future`. This MUST be pinned.
+        //   We ensure it is pinned when polling.
+        let this = unsafe { self.get_unchecked_mut() };
+
+        loop {
+            match &mut this.state {
+                SyncRangeState::Idle(data) => {
+                    let (submitter, op) =
+                        data.take().expect("Polled after completion or invalid state");
+                    let fut = submitter.submit(Op::new(op));
+                    this.state = SyncRangeState::Submitted(fut);
+                }
+                SyncRangeState::Submitted(fut) => {
+                    // Safety: `fut` is structurally pinned because `self` is pinned.
+                    let fut = unsafe { Pin::new_unchecked(fut) };
+                    match fut.poll(cx) {
+                        Poll::Ready((res, _)) => return Poll::Ready(res.map(|_| ())),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub struct SyncRangeBuilder<'a, S: OpSubmitter, P: FilePos> {
     file: &'a GenericFile<S, P>,
     offset: u64,
@@ -158,8 +205,7 @@ impl<'a, S: OpSubmitter, P: FilePos> SyncRangeBuilder<'a, S, P> {
 
 impl<'a, S: OpSubmitter, P: FilePos> IntoFuture for SyncRangeBuilder<'a, S, P> {
     type Output = io::Result<()>;
-    // Note: We don't enforce Send here because LocalFile (using Cell) isn't Sync, so &LocalFile isn't Send.
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = SyncRangeFuture<S>;
 
     fn into_future(self) -> Self::IntoFuture {
         let op = SyncFileRange {
@@ -170,10 +216,10 @@ impl<'a, S: OpSubmitter, P: FilePos> IntoFuture for SyncRangeBuilder<'a, S, P> {
         };
 
         let submitter = self.file.submitter.clone();
-        Box::pin(async move {
-            let (res, _) = submitter.submit(Op::new(op)).await;
-            res.map(|_| ())
-        })
+
+        SyncRangeFuture {
+            state: SyncRangeState::Idle(Some((submitter, op))),
+        }
     }
 }
 
