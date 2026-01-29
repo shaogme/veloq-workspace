@@ -1,7 +1,8 @@
 use crate::io::buffer::FixedBuf;
+use crate::io::driver::iocp::IocpOp;
 use crate::io::driver::iocp::ext::Extensions;
 use crate::io::driver::iocp::submit::SubmissionResult;
-use crate::io::driver::iocp::{IocpOp, PlatformData};
+use crate::io::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::io::driver::op_registry::OpRegistry;
 use crate::io::op::IoFd;
 use crate::io::socket::SockAddrStorage;
@@ -117,7 +118,7 @@ impl RioState {
 
     pub fn process_completions(
         &mut self,
-        ops: &mut OpRegistry<IocpOp, PlatformData>,
+        ops: &mut OpRegistry<IocpOp, IocpOpState>,
         ext: &Extensions,
     ) -> io::Result<()> {
         let dequeue_fn = ext
@@ -150,18 +151,21 @@ impl RioState {
 
                 if ops.contains(user_data) {
                     let op = &mut ops[user_data];
-                    if !op.cancelled {
+
+                    if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
                         let result = if res.Status == 0 {
                             Ok(res.BytesTransferred as usize)
                         } else {
                             Err(io::Error::from_raw_os_error(res.Status as i32))
                         };
 
-                        op.result = Some(result);
-                        op.platform_data = PlatformData::None;
+                        op.platform_data.lifecycle = OpLifecycle::Completed(result);
                         if let Some(waker) = op.waker.take() {
                             waker.wake();
                         }
+                    } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
+                        // If cancelled, we can now remove it
+                        ops.remove(user_data);
                     }
                 }
             }
@@ -183,7 +187,7 @@ impl RioState {
     pub fn ensure_slab_page_registration(
         &mut self,
         page_idx: usize,
-        ops: &OpRegistry<IocpOp, PlatformData>,
+        ops: &OpRegistry<IocpOp, IocpOpState>,
         ext: &Extensions,
     ) {
         if page_idx >= self.slab_rio_pages.len() {
@@ -361,7 +365,7 @@ impl RioState {
         };
 
         // Use the constant from OpRegistry to ensure we match the slab implementation
-        const PAGE_SHIFT: usize = OpRegistry::<IocpOp, PlatformData>::PAGE_SHIFT;
+        const PAGE_SHIFT: usize = OpRegistry::<IocpOp, IocpOpState>::PAGE_SHIFT;
         let page_idx = user_data >> PAGE_SHIFT;
 
         // Copy values out to avoid holding borrow on self.slab_rio_pages while calling ensure_rq
@@ -436,7 +440,7 @@ impl RioState {
             }
         };
 
-        const PAGE_SHIFT: usize = OpRegistry::<IocpOp, PlatformData>::PAGE_SHIFT;
+        const PAGE_SHIFT: usize = OpRegistry::<IocpOp, IocpOpState>::PAGE_SHIFT;
         let page_idx = user_data >> PAGE_SHIFT;
 
         // Copy values out to avoid holding borrow on self

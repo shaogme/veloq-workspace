@@ -1,16 +1,11 @@
 use super::stable_slab::StableSlab;
 use crate::io::driver::PlatformOp;
-use std::io;
 use std::ops::{Index, IndexMut};
-use std::task::{Context, Poll, Waker};
-use tracing::trace;
+use std::task::Waker;
 
 pub struct OpEntry<Op: PlatformOp, P> {
     pub waker: Option<Waker>,
-    pub result: Option<io::Result<usize>>,
     pub resources: Option<Op>,
-    pub cancelled: bool,
-    #[allow(dead_code)]
     pub platform_data: P,
 }
 
@@ -18,9 +13,7 @@ impl<Op: PlatformOp, P> OpEntry<Op, P> {
     pub fn new(resources: Option<Op>, platform_data: P) -> Self {
         Self {
             waker: None,
-            result: None,
             resources,
-            cancelled: false,
             platform_data,
         }
     }
@@ -85,35 +78,6 @@ impl<Op: PlatformOp, P> OpRegistry<Op, P> {
     pub const INDEX_MASK: usize = StableSlab::<OpEntry<Op, P>>::index_mask();
     #[cfg(target_os = "windows")]
     pub const PAGE_SHIFT: usize = StableSlab::<OpEntry<Op, P>>::PAGE_SHIFT;
-
-    pub fn poll_op(
-        &mut self,
-        user_data: usize,
-        cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<usize>, Op)> {
-        trace!(user_data, "OpRegistry::poll_op");
-        if let Some(op) = self.slab.get_mut(user_data) {
-            if let Some(res) = op.result.take() {
-                let mut entry = self.slab.remove(user_data);
-                // Resources should be present if we have a result (implying submission happened)
-                // If None, it means logic error.
-                let resources = entry
-                    .resources
-                    .take()
-                    .expect("Op completed but resources missing");
-                Poll::Ready((res, resources))
-            } else {
-                op.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        } else {
-            // Op not found. Can't return DriverOp.
-            // This poll signature assumes we always return Op back.
-            // If we can't find it, we can't return Op.
-            // In previous code `IoResources::None` was returned.
-            panic!("Op not found in registry and no None variant available");
-        }
-    }
 }
 
 impl<Op: PlatformOp, P> Index<usize> for OpRegistry<Op, P> {

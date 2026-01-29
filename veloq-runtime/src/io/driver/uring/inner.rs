@@ -12,12 +12,36 @@ use tracing::{debug, trace};
 use crate::io::driver::uring::op::UringOp;
 use crate::io::op::IntoPlatformOp;
 
-#[derive(Default)]
+#[derive(Debug)]
+pub enum OpLifecycle {
+    /// Created, resources attached, waiting to be submitted (was !submitted && !cancelled)
+    Pending,
+    /// Submitted to ring or timer wheel (was submitted && !cancelled)
+    InFlight,
+    /// CQE arrived or Timer fired (was result.is_some())
+    Completed(io::Result<usize>), // Stores the result here!
+    /// Aborted by user (was cancelled)
+    Cancelled,
+    /// Detached completer running or done (was detached)
+    Detached,
+}
+
 pub struct UringOpState {
-    pub submitted: bool,
+    pub lifecycle: OpLifecycle,
     pub next: Option<usize>,
     pub detached_completer: Option<Box<dyn DetachedCompleter<UringOp>>>,
     pub timer_id: Option<veloq_wheel::TaskId>,
+}
+
+impl Default for UringOpState {
+    fn default() -> Self {
+        Self {
+            lifecycle: OpLifecycle::Pending,
+            next: None,
+            detached_completer: None,
+            timer_id: None,
+        }
+    }
 }
 
 impl UringOpState {
@@ -174,7 +198,7 @@ impl UringDriver {
         if let Some(sqe) = sqe {
             if self.push_entry(sqe) {
                 if let Some(entry) = self.ops.get_mut(user_data) {
-                    entry.platform_data.submitted = true;
+                    entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
             } else {
                 // Waker failed to submit. This is bad but handled by backlog logic.
@@ -241,8 +265,8 @@ impl UringDriver {
             for &user_data in &self.timer_buffer {
                 if let Some(entry) = self.ops.get_mut(user_data) {
                     // Mark timer task as completed
-                    if !entry.cancelled && entry.result.is_none() {
-                        entry.result = Some(Ok(0));
+                    if matches!(entry.platform_data.lifecycle, OpLifecycle::InFlight) {
+                        entry.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
                         if let Some(waker) = entry.waker.take() {
                             waker.wake();
                         }
@@ -298,19 +322,20 @@ impl UringDriver {
                         Err(io::Error::from_raw_os_error(-cqe.result()))
                     };
 
-                    if op.cancelled {
+                    if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
                         self.ops.remove(user_data);
                     } else {
                         // Check if it has a detached completer
                         if let Some(completer) = op.platform_data.detached_completer.take() {
                             // Must take resources
+                            op.platform_data.lifecycle = OpLifecycle::Detached;
                             if let Some(res_op) = op.resources.take() {
                                 completer.complete(res, res_op);
                             }
                             // Remove op
                             self.ops.remove(user_data);
                         } else {
-                            op.result = Some(res);
+                            op.platform_data.lifecycle = OpLifecycle::Completed(res);
                             if let Some(waker) = op.waker.take() {
                                 waker.wake();
                             }
@@ -387,25 +412,28 @@ impl UringDriver {
     pub(crate) fn flush_backlog(&mut self) {
         while let Some(user_data) = self.backlog_head {
             // 1. Check state
-            let (is_cancelled, is_submitted, has_resources) =
-                if let Some(entry) = self.ops.get_mut(user_data) {
-                    (
-                        entry.cancelled,
-                        entry.platform_data.submitted,
-                        entry.resources.is_some(),
-                    )
-                } else {
-                    // Op missing? Pop and continue
-                    self.pop_backlog();
-                    continue;
-                };
+            let (is_cancelled, is_processed, is_pending) = if let Some(entry) =
+                self.ops.get_mut(user_data)
+            {
+                let l = &entry.platform_data.lifecycle;
+                (
+                    matches!(l, OpLifecycle::Cancelled),
+                    matches!(
+                        l,
+                        OpLifecycle::InFlight | OpLifecycle::Completed(_) | OpLifecycle::Detached
+                    ),
+                    matches!(l, OpLifecycle::Pending),
+                )
+            } else {
+                self.pop_backlog();
+                continue;
+            };
 
-            // Optimize: If cancelled, do NOT submit.
             if is_cancelled {
                 self.pop_backlog();
-                // Complete with ECANCELED
                 if let Some(entry) = self.ops.get_mut(user_data) {
-                    entry.result = Some(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+                    entry.platform_data.lifecycle =
+                        OpLifecycle::Completed(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
                     if let Some(waker) = entry.waker.take() {
                         waker.wake();
                     }
@@ -413,23 +441,29 @@ impl UringDriver {
                 continue;
             }
 
-            if is_submitted {
+            if is_processed {
                 self.pop_backlog();
                 continue;
             }
 
-            if !has_resources {
+            if !is_pending {
+                // Should be unreachable if logic is correct
+                self.pop_backlog();
+                continue;
+            }
+
+            // Check resources
+            if let Some(entry) = self.ops.get_mut(user_data) {
+                if entry.resources.is_none() {
+                    self.pop_backlog();
+                    continue;
+                }
+            } else {
                 self.pop_backlog();
                 continue;
             }
 
             // 2. Check Strategy & Generate SQE
-            // We use a scope here to borrow entry, check things, and potentially generate SQE.
-            // If we can't get what we need, we set a flag to skip.
-
-            // We need to be careful with borrowing. We can't hold `entry` while calling `push_entry` (which takes &mut self).
-            // So we must extract necessary info or generate SQE first.
-
             let waker_fd = self.waker_fd;
             let (sqe_opt, strategy_opt, duration_opt) = self
                 .ops
@@ -467,7 +501,7 @@ impl UringDriver {
                         if self.push_entry(sqe) {
                             self.pop_backlog();
                             if let Some(entry) = self.ops.get_mut(user_data) {
-                                entry.platform_data.submitted = true;
+                                entry.platform_data.lifecycle = OpLifecycle::InFlight;
                                 if let Some(waker) = entry.waker.take() {
                                     waker.wake();
                                 }
@@ -487,7 +521,7 @@ impl UringDriver {
                         let task_id = self.wheel.insert(user_data, duration);
                         self.pop_backlog();
                         if let Some(entry) = self.ops.get_mut(user_data) {
-                            entry.platform_data.submitted = true;
+                            entry.platform_data.lifecycle = OpLifecycle::InFlight;
                             entry.platform_data.timer_id = Some(task_id);
                         }
                     } else {
@@ -580,39 +614,59 @@ impl UringDriver {
     }
 
     pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
-        if let Some(op) = self.ops.get_mut(user_data) {
-            op.cancelled = true;
-            op.waker = None;
-
-            if let Some(tid) = op.platform_data.timer_id.take() {
-                self.wheel.cancel(tid);
-                // If it was a pure timer (no SQE), we are done.
-                // We should probably check if we need to remove it from ops immediately?
-                // IOCP behavior: yes, but here we can just leave it cancelled.
-                // flush_backlog handles cancelled ops by completing them with ECANCELED.
-                // But this op is marked "submitted" (fake submission).
-                // So it won't be in backlog.
-                // We must ensure subsequent poll returns error or we remove it now.
-                // If we remove it now, subsequent poll helper panics if not found?
-                // OpRegistry::poll_op panics if not found.
-                // So we should leave it, but set result to ECANCELED?
-                if op.result.is_none() {
-                    op.result = Some(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+        let (action, timer_id) = if let Some(op) = self.ops.get_mut(user_data) {
+            match &op.platform_data.lifecycle {
+                OpLifecycle::Completed(_) | OpLifecycle::Cancelled | OpLifecycle::Detached => {
+                    (None, None)
                 }
-                return;
+                OpLifecycle::Pending => (Some(OpLifecycle::Pending), None),
+                OpLifecycle::InFlight => (Some(OpLifecycle::InFlight), op.platform_data.timer_id),
             }
+        } else {
+            (None, None)
+        };
 
-            let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
-                .build()
-                .user_data(CANCEL_USER_DATA);
-
-            if !self.push_entry(cancel_sqe) {
-                // Store for later retry
-                self.pending_cancellations.push_back(user_data);
+        match action {
+            None => {}
+            Some(OpLifecycle::Pending) => {
+                if let Some(op) = self.ops.get_mut(user_data) {
+                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
+                    op.waker.take().map(|w| w.wake());
+                    op.waker = None;
+                }
             }
+            Some(OpLifecycle::InFlight) => {
+                // Update state first
+                if let Some(op) = self.ops.get_mut(user_data) {
+                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
+                }
+
+                if let Some(tid) = timer_id {
+                    self.wheel.cancel(tid);
+                    if let Some(op) = self.ops.get_mut(user_data) {
+                        op.platform_data.lifecycle = OpLifecycle::Completed(Err(
+                            io::Error::from_raw_os_error(libc::ECANCELED),
+                        ));
+                        op.waker.take().map(|w| w.wake());
+                        op.waker = None;
+                    }
+                    return;
+                }
+
+                let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
+                    .build()
+                    .user_data(CANCEL_USER_DATA);
+
+                if !self.push_entry(cancel_sqe) {
+                    self.pending_cancellations.push_back(user_data);
+                }
+
+                if let Some(op) = self.ops.get_mut(user_data) {
+                    op.waker = None;
+                }
+            }
+            _ => unreachable!(),
         }
-        // Remove from backlog if present? O(N).
-        // We let flush_backlog handle it (it checks cancelled).
     }
 }
 

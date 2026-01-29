@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use tracing::{debug, trace};
 use windows_sys::Win32::System::IO::{OVERLAPPED, PostQueuedCompletionStatus};
 
-pub use inner::{IocpDriver, PlatformData};
+pub use inner::{IocpDriver, IocpOpState, OpLifecycle};
 use op::IocpOp;
 use submit::SubmissionResult;
 
@@ -23,7 +23,7 @@ impl Driver for IocpDriver {
 
     fn reserve_op(&mut self) -> usize {
         let old_pages = self.ops.page_count();
-        let user_data = self.ops.insert(OpEntry::new(None, PlatformData::None));
+        let user_data = self.ops.insert(OpEntry::new(None, IocpOpState::new()));
         trace!(user_data, "Reserved op slot");
 
         if self.ops.page_count() > old_pages {
@@ -42,7 +42,7 @@ impl Driver for IocpDriver {
         completer: Box<dyn DetachedCompleter<Self::Op>>,
     ) {
         if let Some(op) = self.ops.get_mut(user_data) {
-            op.platform_data = PlatformData::Detached(completer);
+            op.platform_data.detached_completer = Some(completer);
         }
     }
 
@@ -77,18 +77,22 @@ impl Driver for IocpDriver {
 
             match result {
                 Ok(SubmissionResult::Pending) => {
-                    // Op submitted successfully
+                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
                 Ok(SubmissionResult::PostToQueue) => {
                     // E.g. Wakeup. Post immediately.
                     let _ = unsafe {
                         PostQueuedCompletionStatus(self.port, 0, user_data, std::ptr::null_mut())
                     };
+                    // Treat as in-flight; completion comes immediately via CQ
+                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
                 Ok(SubmissionResult::Offload(task)) => {
                     use crate::runtime::blocking::get_blocking_pool;
+                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                     if get_blocking_pool().execute(task).is_err() {
-                        op_entry.result = Some(Err(io::Error::other("Thread pool overloaded")));
+                        op_entry.platform_data.lifecycle =
+                            OpLifecycle::Completed(Err(io::Error::other("Thread pool overloaded")));
                         if let Some(waker) = op_entry.waker.take() {
                             waker.wake();
                         }
@@ -96,10 +100,11 @@ impl Driver for IocpDriver {
                 }
                 Ok(SubmissionResult::Timer(duration)) => {
                     let timeout = self.wheel.insert(user_data, duration);
-                    op_entry.platform_data = PlatformData::Timer(timeout);
+                    op_entry.platform_data.timer_id = Some(timeout);
+                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
                 Err(e) => {
-                    op_entry.result = Some(Err(e));
+                    op_entry.platform_data.lifecycle = OpLifecycle::Completed(Err(e));
                     if let Some(waker) = op_entry.waker.take() {
                         waker.wake();
                     }
@@ -107,23 +112,20 @@ impl Driver for IocpDriver {
             }
         }
 
-        // Check if we need to complete a Detached op synchronously (e.g. if submit failed)
         let should_complete_detached = if let Some(op) = self.ops.get_mut(user_data) {
-            op.result.is_some() && matches!(op.platform_data, PlatformData::Detached(_))
+            matches!(op.platform_data.lifecycle, OpLifecycle::Completed(_))
+                && op.platform_data.detached_completer.is_some()
         } else {
             false
         };
 
         if should_complete_detached {
-            let mut entry = self.ops.remove(user_data);
-            // Extract result
-            let result = entry.result.take().unwrap_or(Ok(0));
-
-            // Extract completer
-            if let PlatformData::Detached(completer) = entry.platform_data {
-                // Extract resources
-                if let Some(iocp_op) = entry.resources {
-                    completer.complete(result, iocp_op);
+            let entry = self.ops.remove(user_data);
+            if let OpLifecycle::Completed(result) = entry.platform_data.lifecycle {
+                if let Some(completer) = entry.platform_data.detached_completer {
+                    if let Some(iocp_op) = entry.resources {
+                        completer.complete(result, iocp_op);
+                    }
                 }
             }
         }
@@ -134,11 +136,8 @@ impl Driver for IocpDriver {
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
         let user_data = self.reserve_op();
 
-        // Same RIO registration logic for background ops (though usually used for file ops, safety check doesn't hurt)
-        // Eager registration handles this now.
-
         if let Some(op_entry) = self.ops.get_mut(user_data) {
-            op_entry.platform_data = PlatformData::Background;
+            op_entry.platform_data.is_background = true;
             op_entry.resources = Some(op);
             let op_ref = op_entry.resources.as_mut().unwrap();
             op_ref.header.user_data = user_data;
@@ -149,23 +148,21 @@ impl Driver for IocpDriver {
                 ext: &self.extensions,
                 registered_files: &self.registered_files,
                 rio: self.rio_state.as_mut(),
-                // ops removed
             };
 
             let result = unsafe { (op_ref.vtable.submit)(op_ref, &mut ctx) };
 
             match result {
                 Ok(SubmissionResult::Offload(task)) => {
+                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                     use crate::runtime::blocking::get_blocking_pool;
                     if get_blocking_pool().execute(task).is_err() {
-                        // Failed to submit background task
                         self.ops.remove(user_data);
                         return Err(io::Error::other("Thread pool overloaded"));
                     }
                 }
                 Ok(_) => {
-                    // Expected Offload for Close, but if other types are used, this is fine too.
-                    // If it is Pending, it will complete properly and be cleaned up.
+                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
                 Err(e) => {
                     debug!(error = ?e, user_data, "Background submit failed");
@@ -182,7 +179,49 @@ impl Driver for IocpDriver {
         user_data: usize,
         cx: &mut Context<'_>,
     ) -> Poll<(io::Result<usize>, Self::Op)> {
-        self.ops.poll_op(user_data, cx)
+        trace!(user_data, "IocpDriver::poll_op");
+        if let Some(op) = self.ops.get_mut(user_data) {
+            match op.platform_data.lifecycle {
+                OpLifecycle::Completed(_) => {
+                    // We can't move out of match arm if we match on &mut op.platform_data.lifecycle
+                    // So we check, then take.
+                }
+                OpLifecycle::Cancelled => {
+                    // If cancelled, usually it implies we are waiting for cancellation to finish or it already finished
+                    // with error. If we see Cancelled here, maybe we should return Error?
+                    // Similar to Completed(Err(Cancelled))
+                    let mut entry = self.ops.remove(user_data);
+                    if let Some(res) = entry.resources.take() {
+                        return Poll::Ready((
+                            Err(io::Error::from_raw_os_error(
+                                windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+                            )),
+                            res,
+                        ));
+                    }
+                    panic!("Op cancelled but resources missing");
+                }
+                _ => {
+                    op.waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+        } else {
+            panic!("Op not found in registry");
+        }
+
+        // If we refer to op above, we can't remove it. separate scope.
+        let mut entry = self.ops.remove(user_data);
+        if let OpLifecycle::Completed(res) = entry.platform_data.lifecycle {
+            let resources = entry
+                .resources
+                .take()
+                .expect("Op completed but resources missing");
+            Poll::Ready((res, resources))
+        } else {
+            // Should be unreachable due to check above
+            panic!("Inconsistent state in poll_op");
+        }
     }
 
     fn submit_queue(&mut self) -> io::Result<()> {

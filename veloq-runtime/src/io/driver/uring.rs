@@ -76,13 +76,13 @@ impl Driver for UringDriver {
                     if self.push_entry(sqe) {
                         trace!(user_data, "Submitted to SQ");
                         if let Some(entry) = self.ops.get_mut(user_data) {
-                            entry.platform_data.submitted = true;
+                            entry.platform_data.lifecycle = inner::OpLifecycle::InFlight;
                         }
                         Ok(Poll::Ready(()))
                     } else {
                         debug!(user_data, "SQ full, pushing to backlog");
                         if let Some(entry) = self.ops.get_mut(user_data) {
-                            entry.platform_data.submitted = false;
+                            entry.platform_data.lifecycle = inner::OpLifecycle::Pending;
                         }
                         self.push_backlog(user_data);
                         Ok(Poll::Pending)
@@ -121,7 +121,7 @@ impl Driver for UringDriver {
                 if let Some(duration) = duration_opt {
                     let task_id = self.wheel.insert(user_data, duration);
                     if let Some(entry) = self.ops.get_mut(user_data) {
-                        entry.platform_data.submitted = true;
+                        entry.platform_data.lifecycle = inner::OpLifecycle::InFlight;
                         entry.platform_data.timer_id = Some(task_id);
                     }
                     trace!(user_data, ?duration, "Registered software timer");
@@ -167,18 +167,25 @@ impl Driver for UringDriver {
         user_data: usize,
         cx: &mut Context<'_>,
     ) -> Poll<(io::Result<usize>, Self::Op)> {
-        // First check if stored in backlog (not submitted)
-        if let Some(entry) = self.ops.get_mut(user_data)
-            && !entry.platform_data.submitted
-        {
-            // Not in ring yet. Try to flush backlog.
+        // 1. Check if we need to flush pending op
+        let is_pending = if let Some(entry) = self.ops.get_mut(user_data) {
+            matches!(entry.platform_data.lifecycle, inner::OpLifecycle::Pending)
+        } else {
+            // Op missing logic handled below or panic
+            panic!("Op not found in registry");
+        };
+
+        if is_pending {
             self.flush_backlog();
             self.flush_cancellations();
+        }
 
-            // Check again
-            let entry = self.ops.get_mut(user_data).unwrap();
-            if !entry.platform_data.submitted {
-                // Still not in ring. Register waker.
+        // 2. Check for completion
+        if let Some(entry) = self.ops.get_mut(user_data) {
+            if let inner::OpLifecycle::Completed(_) = entry.platform_data.lifecycle {
+                // Completed, proceed to remove
+            } else {
+                // Not completed (InFlight, Pending, Cancelled, Detached)
                 if entry
                     .waker
                     .as_ref()
@@ -188,10 +195,18 @@ impl Driver for UringDriver {
                 }
                 return Poll::Pending;
             }
+        } else {
+            panic!("Op not found in registry");
         }
 
-        // Delegate to ops registry for result check
-        self.ops.poll_op(user_data, cx)
+        // 3. Remove and return result
+        let mut entry = self.ops.remove(user_data);
+        if let inner::OpLifecycle::Completed(res) = entry.platform_data.lifecycle {
+            let resources = entry.resources.take().expect("resources missing");
+            Poll::Ready((res, resources))
+        } else {
+            unreachable!("Checked completed above");
+        }
     }
 
     fn submit_queue(&mut self) -> io::Result<()> {

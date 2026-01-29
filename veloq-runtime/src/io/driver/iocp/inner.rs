@@ -23,18 +23,49 @@ use veloq_wheel::{TaskId, Wheel, WheelConfig};
 pub(crate) const WAKEUP_USER_DATA: usize = usize::MAX;
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
-pub enum PlatformData {
-    Timer(TaskId),
-    Background,
-    Detached(Box<dyn DetachedCompleter<IocpOp>>),
-    None,
+#[derive(Debug)]
+pub enum OpLifecycle {
+    /// Created, resources attached, waiting to be submitted
+    Pending,
+    /// Submitted to true OS operations (IOCP/RIO)
+    InFlight,
+    /// Completion received or Timer fired
+    Completed(io::Result<usize>), // Stores the result here!
+    /// Cancelled by user
+    Cancelled,
+    /// Detached completer running or done
+    Detached,
+}
+
+pub struct IocpOpState {
+    pub lifecycle: OpLifecycle,
+    pub detached_completer: Option<Box<dyn DetachedCompleter<IocpOp>>>,
+    pub timer_id: Option<TaskId>,
+    pub is_background: bool,
+}
+
+impl Default for IocpOpState {
+    fn default() -> Self {
+        Self {
+            lifecycle: OpLifecycle::Pending,
+            detached_completer: None,
+            timer_id: None,
+            is_background: false,
+        }
+    }
+}
+
+impl IocpOpState {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 pub type PreInit = usize;
 
 pub struct IocpDriver {
     pub(crate) port: HANDLE,
-    pub(crate) ops: OpRegistry<IocpOp, PlatformData>,
+    pub(crate) ops: OpRegistry<IocpOp, IocpOpState>,
     pub(crate) extensions: Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
@@ -157,14 +188,14 @@ impl IocpDriver {
         self.wheel.advance(elapsed, &mut self.timer_buffer);
         for &user_data in &self.timer_buffer {
             if let Some(op) = self.ops.get_mut(user_data) {
-                if !op.cancelled && op.result.is_none() {
-                    op.result = Some(Ok(0));
+                // Mark timer as completed if it was in flight
+                if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                    op.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
                     if let Some(waker) = op.waker.take() {
                         waker.wake();
                     }
                 }
-                // Clean up platform data
-                op.platform_data = PlatformData::None;
+                op.platform_data.timer_id = None;
             }
         }
         self.timer_buffer.clear();
@@ -175,7 +206,6 @@ impl IocpDriver {
             if let Some(rio) = &mut self.rio_state {
                 return rio.process_completions(&mut self.ops, &self.extensions);
             } else {
-                // Should not happen if RIO_EVENT_KEY triggered but state disappeared?
                 return Ok(());
             }
         } else if !overlapped.is_null() {
@@ -187,110 +217,68 @@ impl IocpDriver {
                 if err == WAIT_TIMEOUT {
                     return Ok(());
                 }
-                debug!(err, "GetQueuedCompletionStatus returned error");
-                return Err(io::Error::from_raw_os_error(err as i32));
+                if completion_key == 0 && overlapped.is_null() {
+                    // Spurious wake or error without op context
+                    return Err(io::Error::from_raw_os_error(err as i32));
+                }
             }
             completion_key
         };
 
-        trace!(user_data, bytes_transferred, "CQE received");
-
-        enum CompletionAction {
-            Cancelled,
-            Background,
-            Detached,
-            Normal,
-            NotFound,
+        if user_data == WAKEUP_USER_DATA {
+            trace!("Wakeup received");
+            return Ok(());
         }
 
-        let action = self
-            .ops
-            .get(user_data)
-            .map(|op| {
-                if op.cancelled {
-                    CompletionAction::Cancelled
-                } else {
-                    match op.platform_data {
-                        PlatformData::Background => CompletionAction::Background,
-                        PlatformData::Detached(_) => CompletionAction::Detached,
-                        _ => CompletionAction::Normal,
-                    }
-                }
-            })
-            .unwrap_or(CompletionAction::NotFound);
+        trace!(user_data, bytes_transferred, "CQE received");
 
-        match action {
-            CompletionAction::Cancelled => {
-                let mut entry = self.ops.remove(user_data);
-                if let PlatformData::Detached(completer) = entry.platform_data {
-                    if let Some(op) = entry.resources.take() {
-                        completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
+        if self.ops.contains(user_data) {
+            let op = self.ops.get_mut(user_data).unwrap();
+
+            // Determine IO result
+            let mut io_result = if res == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(bytes_transferred as usize)
+            };
+
+            // Post-processing hooks (e.g. for buffer updates)
+            if let Some(iocp_op) = op.resources.as_mut() {
+                if let Some(blocking_res) = iocp_op.header.blocking_result.take() {
+                    io_result = blocking_res;
+                } else if io_result.is_ok() {
+                    if let Some(on_comp) = iocp_op.vtable.on_complete {
+                        let val = io_result.unwrap();
+                        io_result = unsafe { (on_comp)(iocp_op, val, &self.extensions) };
                     }
                 }
             }
-            CompletionAction::Background => {
-                trace!(user_data, "Background op completion ignored");
-                self.ops.remove(user_data);
-            }
-            CompletionAction::Detached => {
-                let mut entry = self.ops.remove(user_data);
-                if let PlatformData::Detached(completer) = entry.platform_data {
-                    if let Some(mut iocp_op) = entry.resources.take() {
-                        let mut result = if res == 0 {
-                            Err(io::Error::last_os_error())
-                        } else {
-                            Ok(bytes_transferred as usize)
-                        };
 
-                        if let Some(blocking_res) = iocp_op.header.blocking_result.take() {
-                            result = blocking_res;
+            match op.platform_data.lifecycle {
+                OpLifecycle::Cancelled | OpLifecycle::InFlight => {
+                    if op.platform_data.is_background {
+                        // Background op completed, just remove.
+                        self.ops.remove(user_data);
+                    } else if let Some(completer) = op.platform_data.detached_completer.take() {
+                        // Detached op completed
+                        op.platform_data.lifecycle = OpLifecycle::Detached;
+                        let mut entry = self.ops.remove(user_data);
+                        if let Some(iocp_op) = entry.resources.take() {
+                            completer.complete(io_result, iocp_op);
                         }
-                        completer.complete(result, iocp_op);
                     } else {
-                        tracing::error!(
-                            user_data,
-                            "RemoteOp completion missing resources - Task will likely panic"
-                        );
-                    }
-                }
-            }
-            CompletionAction::Normal => {
-                // Unwrapping is fine because we already checked existence in decision phase
-                let op = self.ops.get_mut(user_data).unwrap();
-                let mut result_is_ready = false;
-
-                if op.result.is_none() {
-                    if let Some(iocp_op) = op.resources.as_mut() {
-                        if let Some(entry) = iocp_op.header.blocking_result.take() {
-                            op.result = Some(entry);
-                        } else {
-                            let mut result = if res == 0 {
-                                Err(io::Error::last_os_error())
-                            } else {
-                                Ok(bytes_transferred as usize)
-                            };
-
-                            if result.is_ok() {
-                                if let Some(on_comp) = iocp_op.vtable.on_complete {
-                                    let val = result.unwrap();
-                                    result = unsafe { (on_comp)(iocp_op, val, &self.extensions) };
-                                }
-                            }
-                            op.result = Some(result);
+                        // Normal completion
+                        op.platform_data.lifecycle = OpLifecycle::Completed(io_result);
+                        if let Some(waker) = op.waker.take() {
+                            waker.wake();
                         }
-                        result_is_ready = true;
                     }
                 }
-
-                if result_is_ready {
-                    op.platform_data = PlatformData::None;
-                    if let Some(waker) = op.waker.take() {
-                        waker.wake();
-                    }
+                _ => {
+                    // Pending or already Completed/Detached - unexpected new completion?
+                    // Could be valid for partial completions if supported (not for now), or bug.
+                    debug!(user_data, "Received completion for non-InFlight op");
                 }
-            }
-            CompletionAction::NotFound => {
-                // Op not found, do nothing.
             }
         }
 
@@ -315,17 +303,39 @@ impl IocpDriver {
     pub fn cancel_op_internal(&mut self, user_data: usize) {
         if let Some(op) = self.ops.get_mut(user_data) {
             trace!(user_data, "Cancelling op");
-            op.cancelled = true;
+            // Transition to Cancelled state
 
-            match &mut op.platform_data {
-                PlatformData::Timer(id) => {
-                    self.wheel.cancel(*id);
+            // If it's a timer
+            if let Some(tid) = op.platform_data.timer_id {
+                self.wheel.cancel(tid);
+                op.platform_data.timer_id = None;
+                // For a timer, cancellation is immediate completion with error
+                op.platform_data.lifecycle =
+                    OpLifecycle::Completed(Err(io::Error::from_raw_os_error(
+                        windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+                    )));
+                if let Some(waker) = op.waker.take() {
+                    waker.wake();
                 }
-                PlatformData::Background => {
-                    // Should not happen for cancel_op usually, but same logic
+                return;
+            }
+
+            match op.platform_data.lifecycle {
+                OpLifecycle::Pending => {
+                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
+                    // Pending ops haven't been submitted, so we can just wake and let poll see Cancelled
+                    // or just remove?
+                    // Usually if it's Pending, it means it's in the registry but not submitted?
+                    // But our reserve_op puts it there.
+                    // If we just wake, poll_op needs to handle Cancelled.
+                    if let Some(waker) = op.waker.take() {
+                        waker.wake();
+                    }
                 }
-                PlatformData::None | PlatformData::Detached(_) => {
-                    // Try to CancelIoEx if resources exist
+                OpLifecycle::InFlight => {
+                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
+
+                    // Try to CancelIoEx
                     if let Some(res) = &mut op.resources
                         && let Some(fd) = res.get_fd()
                         && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files)
@@ -337,24 +347,11 @@ impl IocpDriver {
                             let _ = CancelIoEx(handle, &entry.inner as *const _ as *mut _);
                         }
                     }
+                    // We do NOT remove the op here. usage of CancelIoEx implies we expect a completion packet
+                    // with ERROR_OPERATION_ABORTED. We handle cleanup in `get_completion`.
                 }
+                _ => {}
             }
-        }
-
-        let should_remove = if let Some(op) = self.ops.get_mut(user_data) {
-            match op.platform_data {
-                PlatformData::Timer(_) => true,
-                _ => {
-                    // For IO ops, we can remove if the result is already available
-                    op.result.is_some()
-                }
-            }
-        } else {
-            false
-        };
-
-        if should_remove {
-            self.ops.remove(user_data);
         }
     }
 
@@ -435,9 +432,8 @@ impl Drop for IocpDriver {
         debug!("Dropping IocpDriver");
         let mut pending_count = 0;
         for (_user_data, op) in self.ops.iter_mut() {
-            if op.resources.is_some() && op.result.is_none() {
-                if !op.cancelled
-                    && let Some(res) = op.resources.as_mut()
+            if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                if let Some(res) = op.resources.as_mut()
                     && let Some(fd) = res.get_fd()
                     && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files)
                 {
@@ -476,12 +472,9 @@ impl Drop for IocpDriver {
         // Complete any remaining remote ops to avoid panics in their waiters.
         // During shutdown, we must ensure all RemoteOps return their resources.
         for (_user_data, op_entry) in self.ops.iter_mut() {
-            if let PlatformData::Detached(_) = op_entry.platform_data {
-                let data = std::mem::replace(&mut op_entry.platform_data, PlatformData::None);
-                if let PlatformData::Detached(completer) = data {
-                    if let Some(op) = op_entry.resources.take() {
-                        completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
-                    }
+            if let Some(completer) = op_entry.platform_data.detached_completer.take() {
+                if let Some(op) = op_entry.resources.take() {
+                    completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
                 }
             }
         }
