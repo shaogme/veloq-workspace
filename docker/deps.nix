@@ -16,6 +16,7 @@ let
   # 2. Development Tools
   devTools = with pkgs; [
     # Core
+    gcc
     glibc
     glibc.bin # Contains ldd, required for version checks
     coreutils
