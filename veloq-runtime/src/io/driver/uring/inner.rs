@@ -182,18 +182,14 @@ impl UringDriver {
         self.waker_token = Some(user_data);
 
         // Generate SQE
-        let sqe = if let Some(entry) = self.ops.get_mut(user_data) {
-            if let Some(ref mut resources) = entry.resources {
-                Some(unsafe {
-                    (resources.vtable.make_sqe)(resources, self.waker_fd as usize)
-                        .user_data(user_data as u64)
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let sqe = self
+            .ops
+            .get_mut(user_data)
+            .and_then(|entry| entry.resources.as_mut())
+            .map(|resources| unsafe {
+                (resources.vtable.make_sqe)(resources, self.waker_fd as usize)
+                    .user_data(user_data as u64)
+            });
 
         if let Some(sqe) = sqe {
             if self.push_entry(sqe) {
@@ -311,16 +307,20 @@ impl UringDriver {
                     continue;
                 }
 
-                if self.ops.contains(user_data) {
-                    let op = &mut self.ops[user_data];
-
-                    let res = if let Some(ref mut resources) = op.resources {
-                        unsafe { (resources.vtable.on_complete)(resources, cqe.result()) }
-                    } else if cqe.result() >= 0 {
-                        Ok(cqe.result() as usize)
-                    } else {
-                        Err(io::Error::from_raw_os_error(-cqe.result()))
-                    };
+                if let Some(op) = self.ops.get_mut(user_data) {
+                    let res = op
+                        .resources
+                        .as_mut()
+                        .map(|resources| unsafe {
+                            (resources.vtable.on_complete)(resources, cqe.result())
+                        })
+                        .unwrap_or_else(|| {
+                            if cqe.result() >= 0 {
+                                Ok(cqe.result() as usize)
+                            } else {
+                                Err(io::Error::from_raw_os_error(-cqe.result()))
+                            }
+                        });
 
                     if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
                         self.ops.remove(user_data);
@@ -410,129 +410,119 @@ impl UringDriver {
 
     /// Attempt to submit operations from the backlog.
     pub(crate) fn flush_backlog(&mut self) {
+        enum BacklogAction {
+            Submit,
+            Cancel,
+            Drop,
+        }
+
         while let Some(user_data) = self.backlog_head {
-            // 1. Check state
-            let (is_cancelled, is_processed, is_pending) = if let Some(entry) =
-                self.ops.get_mut(user_data)
-            {
-                let l = &entry.platform_data.lifecycle;
-                (
-                    matches!(l, OpLifecycle::Cancelled),
-                    matches!(
-                        l,
-                        OpLifecycle::InFlight | OpLifecycle::Completed(_) | OpLifecycle::Detached
-                    ),
-                    matches!(l, OpLifecycle::Pending),
-                )
-            } else {
-                self.pop_backlog();
-                continue;
-            };
-
-            if is_cancelled {
-                self.pop_backlog();
-                if let Some(entry) = self.ops.get_mut(user_data) {
-                    entry.platform_data.lifecycle =
-                        OpLifecycle::Completed(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-                    if let Some(waker) = entry.waker.take() {
-                        waker.wake();
-                    }
-                }
-                continue;
-            }
-
-            if is_processed {
-                self.pop_backlog();
-                continue;
-            }
-
-            if !is_pending {
-                // Should be unreachable if logic is correct
-                self.pop_backlog();
-                continue;
-            }
-
-            // Check resources
-            if let Some(entry) = self.ops.get_mut(user_data) {
-                if entry.resources.is_none() {
-                    self.pop_backlog();
-                    continue;
-                }
-            } else {
-                self.pop_backlog();
-                continue;
-            }
-
-            // 2. Check Strategy & Generate SQE
-            let waker_fd = self.waker_fd;
-            let (sqe_opt, strategy_opt, duration_opt) = self
+            // 1. Determine Action based on state (without holding borrow on self.ops)
+            let action = self
                 .ops
                 .get_mut(user_data)
-                .and_then(|entry| entry.resources.as_mut())
-                .map(|res| {
-                    let strategy = res.vtable.strategy;
-                    match strategy {
+                .map(|e| match e.platform_data.lifecycle {
+                    OpLifecycle::Cancelled => BacklogAction::Cancel,
+                    OpLifecycle::Pending => {
+                        if e.resources.is_some() {
+                            BacklogAction::Submit
+                        } else {
+                            BacklogAction::Drop
+                        }
+                    }
+                    _ => BacklogAction::Drop,
+                })
+                .unwrap_or(BacklogAction::Drop);
+
+            // 2. Execute Action
+            match action {
+                BacklogAction::Cancel => {
+                    self.pop_backlog();
+                    if let Some(entry) = self.ops.get_mut(user_data) {
+                        entry.platform_data.lifecycle = OpLifecycle::Completed(Err(
+                            io::Error::from_raw_os_error(libc::ECANCELED),
+                        ));
+                        if let Some(waker) = entry.waker.take() {
+                            waker.wake();
+                        }
+                    }
+                }
+                BacklogAction::Drop => {
+                    self.pop_backlog();
+                }
+                BacklogAction::Submit => {
+                    // Check Strategy & Generate SQE
+                    let waker_fd = self.waker_fd;
+                    // We need to access resources, which requires &mut self.ops.
+                    // This is safe because `action` doesn't borrow self.
+                    let (sqe_opt, strategy_opt, duration_opt) = self
+                        .ops
+                        .get_mut(user_data)
+                        .and_then(|entry| entry.resources.as_mut())
+                        .map(|res| {
+                            let strategy = res.vtable.strategy;
+                            match strategy {
+                                crate::io::driver::uring::op::SubmissionStrategy::SubmitSqe => {
+                                    let s = unsafe {
+                                        (res.vtable.make_sqe)(res, waker_fd as usize)
+                                            .user_data(user_data as u64)
+                                    };
+                                    (Some(s), Some(strategy), None)
+                                }
+                                crate::io::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
+                                    let d = unsafe { (res.vtable.get_timeout)(res) };
+                                    (None, Some(strategy), d)
+                                }
+                                _ => (None, Some(strategy), None),
+                            }
+                        })
+                        .unwrap_or((None, None, None));
+
+                    // Handle missing entry/resources (Should be handled by Action::Drop check, but safe guard)
+                    if strategy_opt.is_none() {
+                        self.pop_backlog();
+                        continue;
+                    }
+
+                    match strategy_opt.unwrap() {
                         crate::io::driver::uring::op::SubmissionStrategy::SubmitSqe => {
-                            let s = unsafe {
-                                (res.vtable.make_sqe)(res, waker_fd as usize)
-                                    .user_data(user_data as u64)
-                            };
-                            (Some(s), Some(strategy), None)
+                            if let Some(sqe) = sqe_opt {
+                                // 3. Push
+                                if self.push_entry(sqe) {
+                                    self.pop_backlog();
+                                    if let Some(entry) = self.ops.get_mut(user_data) {
+                                        entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                                        if let Some(waker) = entry.waker.take() {
+                                            waker.wake();
+                                        }
+                                    }
+                                } else {
+                                    // Full
+                                    break;
+                                }
+                            } else {
+                                self.pop_backlog();
+                                continue;
+                            }
                         }
                         crate::io::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
-                            let d = unsafe { (res.vtable.get_timeout)(res) };
-                            (None, Some(strategy), d)
-                        }
-                        _ => (None, Some(strategy), None),
-                    }
-                })
-                .unwrap_or((None, None, None));
-
-            // Handle missing entry/resources
-            if strategy_opt.is_none() {
-                self.pop_backlog();
-                continue;
-            }
-
-            match strategy_opt.unwrap() {
-                crate::io::driver::uring::op::SubmissionStrategy::SubmitSqe => {
-                    if let Some(sqe) = sqe_opt {
-                        // 3. Push
-                        if self.push_entry(sqe) {
-                            self.pop_backlog();
-                            if let Some(entry) = self.ops.get_mut(user_data) {
-                                entry.platform_data.lifecycle = OpLifecycle::InFlight;
-                                if let Some(waker) = entry.waker.take() {
-                                    waker.wake();
+                            if let Some(duration) = duration_opt {
+                                let task_id = self.wheel.insert(user_data, duration);
+                                self.pop_backlog();
+                                if let Some(entry) = self.ops.get_mut(user_data) {
+                                    entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                                    entry.platform_data.timer_id = Some(task_id);
                                 }
+                            } else {
+                                self.pop_backlog();
+                                continue;
                             }
-                        } else {
-                            // Full
-                            break;
                         }
-                    } else {
-                        // Should be unreachable given prior check
-                        self.pop_backlog();
-                        continue;
-                    }
-                }
-                crate::io::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
-                    if let Some(duration) = duration_opt {
-                        let task_id = self.wheel.insert(user_data, duration);
-                        self.pop_backlog();
-                        if let Some(entry) = self.ops.get_mut(user_data) {
-                            entry.platform_data.lifecycle = OpLifecycle::InFlight;
-                            entry.platform_data.timer_id = Some(task_id);
+                        _ => {
+                            self.pop_backlog();
+                            continue;
                         }
-                    } else {
-                        self.pop_backlog();
-                        continue;
                     }
-                }
-                _ => {
-                    // unexpected strategy in backlog
-                    self.pop_backlog();
-                    continue;
                 }
             }
         }

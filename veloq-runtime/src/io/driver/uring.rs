@@ -48,28 +48,20 @@ impl Driver for UringDriver {
             )),
             op::SubmissionStrategy::SubmitSqe => {
                 // 1. Store resources FIRST to ensure stable address
-                if let Some(entry) = self.ops.get_mut(user_data) {
-                    entry.resources = Some(op);
-                } else {
+                let Some(entry) = self.ops.get_mut(user_data) else {
                     return Err((io::Error::other("op slot not found"), op));
-                }
+                };
+                entry.resources = Some(op);
 
                 // 2. Generate SQE from STABLE location
-                let sqe_res = if let Some(entry) = self.ops.get_mut(user_data) {
-                    if let Some(res) = entry.resources.as_mut() {
-                        unsafe {
-                            // We construct the SQE referencing the stable 'res'
-                            Some(
-                                (res.vtable.make_sqe)(res, self.waker_fd as usize)
-                                    .user_data(user_data as u64),
-                            )
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let sqe_res = self
+                    .ops
+                    .get_mut(user_data)
+                    .and_then(|entry| entry.resources.as_mut())
+                    .map(|res| unsafe {
+                        (res.vtable.make_sqe)(res, self.waker_fd as usize)
+                            .user_data(user_data as u64)
+                    });
 
                 // 3. Push
                 if let Some(sqe) = sqe_res {
@@ -108,15 +100,11 @@ impl Driver for UringDriver {
                 }
 
                 // 2. Extract duration from STABLE location (via helper or direct access)
-                let duration_opt = if let Some(entry) = self.ops.get_mut(user_data) {
-                    if let Some(res) = entry.resources.as_ref() {
-                        unsafe { (res.vtable.get_timeout)(res) }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let duration_opt = self
+                    .ops
+                    .get_mut(user_data)
+                    .and_then(|entry| entry.resources.as_ref())
+                    .and_then(|res| unsafe { (res.vtable.get_timeout)(res) });
 
                 if let Some(duration) = duration_opt {
                     let task_id = self.wheel.insert(user_data, duration);
