@@ -7,7 +7,7 @@ use crate::driver::op_registry::OpRegistry;
 use crate::op::IoFd;
 use rustc_hash::FxHashMap;
 use std::io;
-use veloq_buf::buffer::FixedBuf;
+use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT,
@@ -165,10 +165,7 @@ impl RioState {
         }
     }
 
-    pub fn register_buffers(
-        &mut self,
-        regions: &[veloq_buf::buffer::BufferRegion],
-    ) -> io::Result<()> {
+    pub fn register_buffers(&mut self, regions: &[veloq_buf::BufferRegion]) -> io::Result<()> {
         let reg_fn = self.dispatch.register_buffer;
 
         self.registered_bufs.clear();

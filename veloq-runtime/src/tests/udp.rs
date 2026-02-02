@@ -6,8 +6,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use veloq_buf::buffer::BufferConfig;
-use veloq_buf::buffer::hybrid::HybridSpec;
+use veloq_buf::BufferConfig;
+use veloq_buf::hybrid::HybridSpec;
 
 // ============ Helper Functions ============
 

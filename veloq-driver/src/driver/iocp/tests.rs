@@ -1,6 +1,6 @@
 use super::ext::Extensions;
 use super::*;
-use veloq_buf::buffer::HybridPool;
+use veloq_buf::HybridPool;
 
 use crate::Socket;
 use crate::config::IocpConfig;
@@ -189,7 +189,7 @@ fn test_iocp_timeout() {
 fn test_iocp_recv_with_buffer_pool() {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use veloq_buf::buffer::BufPool;
+    use veloq_buf::BufPool;
 
     let driver = Rc::new(RefCell::new(
         IocpDriver::new(IocpConfig::default()).unwrap(),
@@ -198,10 +198,10 @@ fn test_iocp_recv_with_buffer_pool() {
     // Setup GlobalAlloc
     let multiplier =
         veloq_buf::ThreadMemoryMultiplier(unsafe { std::num::NonZeroUsize::new_unchecked(10) });
-    let config = veloq_buf::GlobalAllocatorConfig {
+    let config = veloq_buf::global::GlobalAllocatorConfig {
         multipliers: vec![multiplier],
     };
-    let (mut memories, global_info) = veloq_buf::GlobalAllocator::new(config).unwrap();
+    let (mut memories, global_info) = veloq_buf::global::GlobalAllocator::new(config).unwrap();
     let memory = memories.pop().unwrap();
 
     let pool = HybridPool::new(memory).unwrap();
@@ -211,11 +211,8 @@ fn test_iocp_recv_with_buffer_pool() {
         driver: Rc<RefCell<IocpDriver>>,
     }
 
-    impl veloq_buf::buffer::BufferRegistrar for LegacyDriverRegistrar {
-        fn register(
-            &self,
-            regions: &[veloq_buf::buffer::BufferRegion],
-        ) -> std::io::Result<Vec<usize>> {
+    impl veloq_buf::BufferRegistrar for LegacyDriverRegistrar {
+        fn register(&self, regions: &[veloq_buf::BufferRegion]) -> std::io::Result<Vec<usize>> {
             self.driver.borrow_mut().register_buffer_regions(regions)
         }
     }
@@ -223,7 +220,7 @@ fn test_iocp_recv_with_buffer_pool() {
     let registrar = Box::new(LegacyDriverRegistrar {
         driver: driver.clone(),
     });
-    let reg_pool = veloq_buf::buffer::RegisteredPool::new(pool, registrar, global_info)
+    let reg_pool = veloq_buf::RegisteredPool::new(pool, registrar, global_info)
         .expect("Failed to register pool");
 
     // Setup connection

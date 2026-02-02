@@ -3,7 +3,8 @@ use std::future::IntoFuture;
 use std::hint::black_box;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
+
+use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig};
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::config::BlockingPoolConfig;
 use veloq_runtime::fs::{BufferingMode, File};

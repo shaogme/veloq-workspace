@@ -8,8 +8,8 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use veloq_buf::buffer::{AnyBufPool, HybridPool, RegisteredPool};
-use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
+use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig};
+use veloq_buf::{AnyBufPool, HybridPool, RegisteredPool};
 
 fn create_local_executor() -> LocalExecutor {
     let multiplier = veloq_buf::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(8) });

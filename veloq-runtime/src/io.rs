@@ -1,10 +1,9 @@
 use std::future::Future;
 use std::io;
-use veloq_buf::buffer::FixedBuf;
+use veloq_buf::FixedBuf;
 
 pub mod buffer {
-    pub use veloq_buf::buffer::*;
-    pub use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig, GlobalMemoryInfo};
+    pub use veloq_buf::*;
 }
 
 /// Async buffered reading trait.

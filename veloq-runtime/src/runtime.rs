@@ -23,9 +23,9 @@ pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
-use veloq_buf::buffer::BufferConfig;
-use veloq_buf::buffer::buddy::BuddySpec;
-use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig, GlobalMemoryInfo, ThreadMemory};
+use veloq_buf::buddy::BuddySpec;
+use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig, GlobalMemoryInfo};
+use veloq_buf::{BufferConfig, ThreadMemory};
 use veloq_driver::driver::RemoteWaker;
 
 use veloq_blocking::init_blocking_pool;

@@ -304,7 +304,7 @@ impl PoolSpec for HybridSpec {
         self: Box<Self>,
         memory: ThreadMemory,
         registrar: Box<dyn crate::buffer::BufferRegistrar>,
-        global_info: crate::GlobalMemoryInfo,
+        global_info: crate::global::GlobalMemoryInfo,
     ) -> AnyBufPool {
         let pool = HybridPool::new(memory).expect("Failed to create HybridPool");
         let reg_pool =
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_allocator_basic() {
-        use crate::{GlobalAllocator, GlobalAllocatorConfig};
+        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
         let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
         let multiplier =
             crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_allocator_small() {
-        use crate::{GlobalAllocator, GlobalAllocatorConfig};
+        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
         let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
         let multiplier =
             crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_allocator_large() {
-        use crate::{GlobalAllocator, GlobalAllocatorConfig};
+        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
         let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
         let multiplier =
             crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
@@ -526,7 +526,7 @@ mod tests {
     // But since HybridPool is BackingPool, we can test alloc_mem.
     #[test]
     fn test_hybrid_pool_alloc_mem() {
-        use crate::{GlobalAllocator, GlobalAllocatorConfig};
+        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
         let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
         let multiplier =
             crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });

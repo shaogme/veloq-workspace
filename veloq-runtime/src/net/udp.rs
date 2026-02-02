@@ -3,7 +3,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::net::common::InnerSocket;
 use crate::runtime::context::submit;
-use veloq_buf::buffer::FixedBuf;
+use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
     Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, RecvFrom, SendTo,

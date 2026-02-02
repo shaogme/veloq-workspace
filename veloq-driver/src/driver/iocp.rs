@@ -241,7 +241,7 @@ impl Driver for IocpDriver {
 
     fn register_buffer_regions(
         &mut self,
-        regions: &[veloq_buf::buffer::BufferRegion],
+        regions: &[veloq_buf::BufferRegion],
     ) -> io::Result<Vec<usize>> {
         IocpDriver::register_buffer_regions(self, regions)
     }

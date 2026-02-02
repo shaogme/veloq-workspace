@@ -20,7 +20,7 @@ use std::{
 use veloq_atomic_waker::AtomicWaker;
 
 use tracing::trace;
-use veloq_buf::buffer::FixedBuf;
+use veloq_buf::FixedBuf;
 
 use crate::RawHandle;
 use crate::SockAddrStorage;

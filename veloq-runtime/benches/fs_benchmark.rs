@@ -4,11 +4,12 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
-use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig, nz};
+
+use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig};
+use veloq_buf::{BufPool, BufferConfig, RegisteredPool, buddy::BuddySpec, nz};
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::config::BlockingPoolConfig;
 use veloq_runtime::fs::{BufferingMode, File};
-use veloq_runtime::io::buffer::{BufPool, BufferConfig, RegisteredPool, buddy::BuddySpec};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::runtime::blocking::init_blocking_pool;
 use veloq_runtime::spawn_local;

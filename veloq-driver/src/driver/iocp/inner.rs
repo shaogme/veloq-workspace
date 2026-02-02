@@ -307,7 +307,7 @@ impl IocpDriver {
 
     pub fn register_buffer_regions(
         &mut self,
-        regions: &[veloq_buf::buffer::BufferRegion],
+        regions: &[veloq_buf::BufferRegion],
     ) -> io::Result<Vec<usize>> {
         if let Some(rio) = &mut self.rio_state {
             rio.register_buffers(regions)?;

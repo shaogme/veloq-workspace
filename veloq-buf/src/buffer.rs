@@ -221,7 +221,7 @@ pub trait PoolSpec: Send + Sync + 'static {
         self: Box<Self>,
         memory: crate::ThreadMemory,
         registrar: Box<dyn BufferRegistrar>,
-        global_info: crate::GlobalMemoryInfo,
+        global_info: crate::global::GlobalMemoryInfo,
     ) -> AnyBufPool;
 
     fn clone_box(&self) -> Box<dyn PoolSpec>;
@@ -265,7 +265,7 @@ impl BufferConfig {
         self,
         memory: crate::ThreadMemory,
         registrar: Box<dyn BufferRegistrar>,
-        global_info: crate::GlobalMemoryInfo,
+        global_info: crate::global::GlobalMemoryInfo,
     ) -> AnyBufPool {
         self.spec.build(memory, registrar, global_info)
     }
@@ -288,7 +288,7 @@ impl<P: BackingPool> RegisteredPool<P> {
     pub fn new(
         pool: P,
         registrar: Box<dyn BufferRegistrar>,
-        global_info: crate::GlobalMemoryInfo,
+        global_info: crate::global::GlobalMemoryInfo,
     ) -> std::io::Result<Self> {
         // God View Registration: Register the SINGLE global block as Index 0.
         let regions = [BufferRegion {

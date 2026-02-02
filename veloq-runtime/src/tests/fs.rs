@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use veloq_blocking::{BlockingPoolConfig, init_blocking_pool};
-use veloq_buf::buffer::hybrid::HybridSpec;
-use veloq_buf::buffer::{AnyBufPool, BufferConfig, HybridPool, RegisteredPool};
-use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
+use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig};
+use veloq_buf::hybrid::HybridSpec;
+use veloq_buf::{AnyBufPool, BufferConfig, HybridPool, RegisteredPool};
 
 fn create_local_executor() -> LocalExecutor {
     let multiplier = veloq_buf::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(8) });

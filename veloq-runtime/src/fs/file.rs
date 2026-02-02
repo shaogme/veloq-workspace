@@ -2,7 +2,7 @@ use crate::runtime::context::submit;
 
 use super::open_options::OpenOptions;
 
-use veloq_buf::buffer::FixedBuf;
+use veloq_buf::FixedBuf;
 use veloq_driver::RawHandle;
 use veloq_driver::op::{
     DetachedSubmitter, Fallocate, Fsync, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed,

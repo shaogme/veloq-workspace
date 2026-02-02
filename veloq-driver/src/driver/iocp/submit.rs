@@ -21,7 +21,7 @@ use windows_sys::Win32::System::IO::CreateIoCompletionPort;
 
 use veloq_blocking::BlockingTask;
 use veloq_blocking::blocking_ops::windows::{BlockingOps, CompletionInfo};
-use veloq_buf::buffer::FixedBuf;
+use veloq_buf::FixedBuf;
 
 // ============================================================================
 // Macros

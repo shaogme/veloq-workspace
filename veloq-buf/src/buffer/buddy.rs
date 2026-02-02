@@ -553,7 +553,7 @@ impl PoolSpec for BuddySpec {
         self: Box<Self>,
         memory: crate::ThreadMemory,
         registrar: Box<dyn crate::buffer::BufferRegistrar>,
-        global_info: crate::GlobalMemoryInfo,
+        global_info: crate::global::GlobalMemoryInfo,
     ) -> AnyBufPool {
         let pool = BuddyPool::new(memory).expect("Failed to create BuddyPool");
         let reg_pool =
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn test_alloc_basic() {
-        use crate::{GlobalAllocator, GlobalAllocatorConfig};
+        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
 
         // Create a real ThreadMemory for testing
         let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();

@@ -222,7 +222,7 @@ impl Driver for UringDriver {
 
     fn register_buffer_regions(
         &mut self,
-        regions: &[veloq_buf::buffer::BufferRegion],
+        regions: &[veloq_buf::BufferRegion],
     ) -> io::Result<Vec<usize>> {
         UringDriver::register_buffer_regions(self, regions)
     }

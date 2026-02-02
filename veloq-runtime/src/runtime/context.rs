@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 
 use crossbeam_deque::Worker;
-use veloq_buf::buffer::{AnyBufPool, BufPool, FixedBuf};
+use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver::driver::PlatformDriver;
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
