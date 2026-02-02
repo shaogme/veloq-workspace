@@ -1,3 +1,5 @@
+pub mod blocking_ops;
+
 use crossbeam_queue::SegQueue;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5,8 +7,26 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::config::BlockingPoolConfig;
-use crate::io::op::SysBlockingOps;
+use crate::blocking_ops::SysBlockingOps;
+
+#[derive(Debug, Clone)]
+pub struct BlockingPoolConfig {
+    pub core_threads: usize,
+    pub max_threads: usize,
+    pub queue_capacity: usize,
+    pub keep_alive: Duration,
+}
+
+impl Default for BlockingPoolConfig {
+    fn default() -> Self {
+        Self {
+            core_threads: 16,
+            max_threads: 512,
+            queue_capacity: 10000,
+            keep_alive: Duration::from_secs(30),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ThreadPoolError {

@@ -1,8 +1,5 @@
-use crate::config::BlockingPoolConfig;
 use crate::fs::{File, LocalFile};
-use crate::io::buffer::{BufferConfig, HybridSpec, RegisteredPool};
 use crate::runtime::Runtime;
-use crate::runtime::blocking::init_blocking_pool;
 use crate::runtime::context::alloc;
 use crate::runtime::executor::LocalExecutor;
 use std::fs;
@@ -10,6 +7,10 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use veloq_blocking::{BlockingPoolConfig, init_blocking_pool};
+use veloq_buf::buffer::hybrid::HybridSpec;
+use veloq_buf::buffer::{AnyBufPool, BufferConfig, HybridPool, RegisteredPool};
 use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
 
 fn create_local_executor() -> LocalExecutor {
@@ -20,8 +21,8 @@ fn create_local_executor() -> LocalExecutor {
     let memory = memories.pop().unwrap();
 
     LocalExecutor::builder().build(move |registrar| {
-        let pool = crate::io::buffer::HybridPool::new(memory).unwrap();
-        crate::io::buffer::AnyBufPool::new(
+        let pool = HybridPool::new(memory).unwrap();
+        AnyBufPool::new(
             RegisteredPool::new(pool, registrar, global_info)
                 .expect("Failed to register buffer pool"),
         )

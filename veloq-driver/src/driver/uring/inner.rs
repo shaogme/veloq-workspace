@@ -1,5 +1,3 @@
-use crate::io::driver::op_registry::{OpEntry, OpRegistry};
-use crate::io::driver::{DetachedCompleter, RemoteWaker};
 use io_uring::{IoUring, opcode, squeue};
 use std::collections::VecDeque;
 use std::io;
@@ -9,8 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, trace};
 
-use crate::io::driver::uring::op::UringOp;
-use crate::io::op::IntoPlatformOp;
+use crate::config::{IoMode, UringConfig};
+use crate::driver::op_registry::{OpEntry, OpRegistry};
+use crate::driver::uring::op::UringOp;
+use crate::driver::{DetachedCompleter, RemoteWaker};
+use crate::op::IntoPlatformOp;
 
 #[derive(Debug)]
 pub enum OpLifecycle {
@@ -110,8 +111,8 @@ pub struct UringDriver {
 }
 
 impl UringDriver {
-    pub fn new(config: &crate::config::Config) -> io::Result<Self> {
-        let entries = config.uring.entries;
+    pub fn new(config: impl AsRef<UringConfig>) -> io::Result<Self> {
+        let config = config.as_ref();
         let mut builder = IoUring::builder();
 
         builder
@@ -119,10 +120,11 @@ impl UringDriver {
             .setup_single_issuer() // Optimized for single-threaded submission (Kernel 6.0+)
             .setup_defer_taskrun(); // Defer work until enter (Kernel 6.1+)
 
-        if config.uring.mode == crate::config::IoMode::Polling {
-            builder.setup_sqpoll(config.uring.sqpoll_idle_ms); // Kernel 5.1+
+        if let IoMode::Polling(idle_ms) = config.mode {
+            builder.setup_sqpoll(idle_ms.get()); // Kernel 5.1+
         }
 
+        let entries = config.entries.get();
         let ring = builder.build(entries).or_else(|e| {
             // Fallback for older kernels if flags are unsupported (EINVAL)
             if e.raw_os_error() == Some(libc::EINVAL) {
@@ -170,11 +172,11 @@ impl UringDriver {
         }
 
         let fd = self.waker_fd;
-        let op = crate::io::op::Wakeup {
-            fd: crate::io::op::IoFd::Raw(crate::io::RawHandle { fd }),
+        let op = crate::op::Wakeup {
+            fd: crate::op::IoFd::Raw(crate::RawHandle { fd }),
         };
         // Use into_platform_op to convert to UringOp
-        let uring_op = <crate::io::op::Wakeup as IntoPlatformOp<UringDriver>>::into_platform_op(op);
+        let uring_op = <crate::op::Wakeup as IntoPlatformOp<UringDriver>>::into_platform_op(op);
 
         let user_data = self
             .ops
@@ -486,14 +488,14 @@ impl UringDriver {
                         .map(|res| {
                             let strategy = res.vtable.strategy;
                             match strategy {
-                                crate::io::driver::uring::op::SubmissionStrategy::SubmitSqe => {
+                                crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
                                     let s = unsafe {
                                         (res.vtable.make_sqe)(res, waker_fd as usize)
                                             .user_data(user_data as u64)
                                     };
                                     (Some(s), Some(strategy), None)
                                 }
-                                crate::io::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
+                                crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
                                     let d = unsafe { (res.vtable.get_timeout)(res) };
                                     (None, Some(strategy), d)
                                 }
@@ -509,7 +511,7 @@ impl UringDriver {
                     }
 
                     match strategy_opt.unwrap() {
-                        crate::io::driver::uring::op::SubmissionStrategy::SubmitSqe => {
+                        crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
                             if let Some(sqe) = sqe_opt {
                                 // 3. Push
                                 if self.push_entry(sqe) {
@@ -529,7 +531,7 @@ impl UringDriver {
                                 continue;
                             }
                         }
-                        crate::io::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
+                        crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
                             if let Some(duration) = duration_opt {
                                 let task_id = self.wheel.insert(user_data, duration);
                                 self.pop_backlog();
@@ -593,7 +595,7 @@ impl UringDriver {
 
     pub(crate) fn register_buffer_regions(
         &mut self,
-        regions: &[crate::io::buffer::BufferRegion],
+        regions: &[veloq_buf::buffer::BufferRegion],
     ) -> io::Result<Vec<usize>> {
         if self.buffers_registered {
             // Assume existing registration matches?

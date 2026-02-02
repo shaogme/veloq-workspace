@@ -1,4 +1,3 @@
-use crate::io::driver::iocp::op::OverlappedEntry;
 use std::io;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -13,6 +12,13 @@ pub struct CompletionInfo {
     pub port: usize,
     pub user_data: usize,
     pub overlapped: usize,
+}
+
+#[repr(C)]
+pub struct OverlappedEntry {
+    pub inner: OVERLAPPED,
+    pub user_data: usize,
+    pub blocking_result: Option<io::Result<usize>>,
 }
 
 impl CompletionInfo {

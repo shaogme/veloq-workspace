@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use veloq_runtime::fs::{BufferingMode, File, OpenOptions};
-use veloq_runtime::io::buffer::{BuddySpec, BufPool, BufferConfig, FixedBuf};
+use veloq_runtime::io::buffer::{BufPool, BufferConfig, FixedBuf, buddy::BuddySpec};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
 use veloq_runtime::sync::mpsc;

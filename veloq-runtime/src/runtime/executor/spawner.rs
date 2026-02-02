@@ -6,8 +6,8 @@ use tracing::{trace, warn};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 
-use crate::io::driver::RemoteWaker;
 use crate::runtime::task::{SpawnedTask, Task};
+use veloq_driver::driver::RemoteWaker;
 
 // --- Job Definition ---
 

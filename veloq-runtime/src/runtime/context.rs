@@ -10,9 +10,10 @@ use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 
 use crossbeam_deque::Worker;
+use veloq_buf::buffer::{AnyBufPool, BufPool, FixedBuf};
+use veloq_driver::driver::PlatformDriver;
+use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
-use crate::io::buffer::{AnyBufPool, BufPool, FixedBuf};
-use crate::io::driver::PlatformDriver;
 use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
 use crate::runtime::executor::spawner::pack_job;
@@ -67,6 +68,18 @@ pub fn current() -> RuntimeContext {
 /// Try to retrieve the current runtime context.
 pub fn try_current() -> Option<RuntimeContext> {
     CONTEXT.with(|ctx| ctx.borrow().clone())
+}
+
+pub fn submit<T, S>(submitter: &S, op: Op<T>) -> S::Future<T>
+where
+    S: OpSubmitter,
+    T: IntoPlatformOp<PlatformDriver> + 'static,
+{
+    let driver = current()
+        .driver()
+        .upgrade()
+        .expect("Runtime driver missing");
+    submitter.submit(op, driver)
 }
 
 /// Try to allocate a buffer from the current runtime context.

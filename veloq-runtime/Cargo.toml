@@ -18,6 +18,8 @@ veloq-local = { workspace = true }
 veloq-buf = { workspace = true }
 veloq-atomic-waker = { workspace = true }
 veloq-wheel = { workspace = true }
+veloq-driver = { workspace = true }
+veloq-blocking = { workspace = true }
 
 num_cpus = "1.17.0"
 crossbeam-utils = { workspace = true }

@@ -1,12 +1,14 @@
-use crate::io::buffer::FixedBuf;
-use crate::io::op::{
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
+
+use crate::net::common::InnerSocket;
+use crate::runtime::context::submit;
+use veloq_buf::buffer::FixedBuf;
+use veloq_driver::Socket;
+use veloq_driver::op::{
     Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, RecvFrom, SendTo,
     WriteFixed,
 };
-use crate::io::socket::Socket;
-use crate::net::common::InnerSocket;
-use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
 
 // ============================================================================
 // Generic UDP Socket
@@ -78,7 +80,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             buf,
             addr: target,
         };
-        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
         (res, op_back.buf)
     }
 
@@ -88,7 +90,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             buf,
             addr: None,
         };
-        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
 
         match res {
             Ok(n) => {
@@ -100,14 +102,14 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = Connect {
             fd: IoFd::Raw(self.inner.raw()),
             addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
-        let (res, _) = self.submitter.submit(Op::new(op)).await;
+        let (res, _) = submit(&self.submitter, Op::new(op)).await;
         res.map(|_| ())
     }
 
@@ -117,7 +119,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             buf,
             offset: 0,
         };
-        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
         (res, op_back.buf)
     }
 
@@ -127,7 +129,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             buf,
             offset: 0,
         };
-        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
         (res, op_back.buf)
     }
 }

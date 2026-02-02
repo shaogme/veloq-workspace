@@ -1,9 +1,10 @@
-use crate::io::op::{DetachedOpFuture, LocalOp, Op, Timeout as OpTimeout};
 use crate::runtime::context;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use veloq_driver::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
 
 // ============================================================================
 // Sync/Send Sleep (uses DetachedOp)
@@ -28,7 +29,7 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 
 pub struct Sleep {
     deadline: Instant,
-    inner: Option<DetachedOpFuture<OpTimeout>>,
+    inner: Option<DetachedOp<OpTimeout>>,
 }
 
 impl Sleep {
@@ -53,7 +54,7 @@ impl Future for Sleep {
         loop {
             if let Some(ref mut op) = self.inner {
                 // Poll existing detached op
-                // DetachedOpFuture is Unpin
+                // DetachedOp is Unpin
                 match Pin::new(op).poll(cx) {
                     Poll::Ready(_) => {
                         if Instant::now() >= self.deadline {

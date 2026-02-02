@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use crate::io::driver::RemoteWaker;
 use crate::runtime::executor::ExecutorShared;
 use tracing::trace;
+use veloq_driver::driver::RemoteWaker;
 
 pub mod harness;
 pub mod raw;

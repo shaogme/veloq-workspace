@@ -1015,6 +1015,14 @@ name = "veloq-bitset"
 version = "0.1.0"
 
 [[package]]
+name = "veloq-blocking"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "veloq-buf"
 version = "0.1.0"
 dependencies = [
@@ -1022,6 +1030,21 @@ dependencies = [
  "libc",
  "tempfile",
  "veloq-bitset",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "veloq-driver"
+version = "0.1.0"
+dependencies = [
+ "io-uring",
+ "libc",
+ "rustc-hash",
+ "tracing",
+ "veloq-atomic-waker",
+ "veloq-blocking",
+ "veloq-buf",
+ "veloq-wheel",
  "windows-sys 0.61.2",
 ]
 
@@ -1057,7 +1080,9 @@ dependencies = [
  "tracing-subscriber",
  "veloq-atomic-waker",
  "veloq-bitset",
+ "veloq-blocking",
  "veloq-buf",
+ "veloq-driver",
  "veloq-local",
  "veloq-sync",
  "veloq-wheel",

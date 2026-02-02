@@ -1,4 +1,3 @@
-pub mod blocking;
 pub mod context;
 pub mod executor;
 pub mod join;
@@ -15,8 +14,6 @@ use crossbeam_utils::CachePadded;
 use tracing::debug;
 
 use crate::config::Config;
-use crate::io::driver::RemoteWaker;
-use crate::runtime::blocking::init_blocking_pool;
 use crate::runtime::executor::spawner::LateBoundWaker;
 use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
 use crate::runtime::task::harness::Runnable;
@@ -26,8 +23,16 @@ pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
-use crate::io::buffer::{BuddySpec, BufferConfig};
+use veloq_buf::buffer::BufferConfig;
+use veloq_buf::buffer::buddy::BuddySpec;
 use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig, GlobalMemoryInfo, ThreadMemory};
+use veloq_driver::driver::RemoteWaker;
+
+use veloq_blocking::init_blocking_pool;
+
+pub mod blocking {
+    pub use veloq_blocking::*;
+}
 
 struct WorkerPrep {
     shared: Arc<ExecutorShared>,

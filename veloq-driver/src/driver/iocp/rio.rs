@@ -1,13 +1,13 @@
-use crate::io::buffer::FixedBuf;
-use crate::io::driver::iocp::IocpOp;
-use crate::io::driver::iocp::ext::Extensions;
-use crate::io::driver::iocp::submit::SubmissionResult;
-use crate::io::driver::iocp::{IocpOpState, OpLifecycle};
-use crate::io::driver::op_registry::OpRegistry;
-use crate::io::op::IoFd;
-use crate::io::socket::SockAddrStorage;
+use crate::SockAddrStorage;
+use crate::driver::iocp::IocpOp;
+use crate::driver::iocp::ext::Extensions;
+use crate::driver::iocp::submit::SubmissionResult;
+use crate::driver::iocp::{IocpOpState, OpLifecycle};
+use crate::driver::op_registry::OpRegistry;
+use crate::op::IoFd;
 use rustc_hash::FxHashMap;
 use std::io;
+use veloq_buf::buffer::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT,
@@ -167,7 +167,7 @@ impl RioState {
 
     pub fn register_buffers(
         &mut self,
-        regions: &[crate::io::buffer::BufferRegion],
+        regions: &[veloq_buf::buffer::BufferRegion],
     ) -> io::Result<()> {
         let reg_fn = self.dispatch.register_buffer;
 

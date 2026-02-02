@@ -1,12 +1,14 @@
-use crate::io::buffer::FixedBuf;
-use crate::io::op::{
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
+
+use crate::net::common::InnerSocket;
+use crate::runtime::context::submit;
+use veloq_buf::buffer::FixedBuf;
+use veloq_driver::Socket;
+use veloq_driver::op::{
     Accept, Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter,
     ReadFixed, WriteFixed,
 };
-use crate::io::socket::Socket;
-use crate::net::common::InnerSocket;
-use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
 
 // ============================================================================
 // Generic TCP Socket
@@ -75,7 +77,7 @@ impl<S: OpSubmitter> GenericTcpListener<S> {
         let op = Accept::prepare_op(self.inner.raw())?;
 
         // Wait for connection
-        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
         // Check result and get fd, addr
         let (fd, addr) = op_back.into_output(res)?;
 
@@ -101,7 +103,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         let inner = new_stream_inner(&addr)?;
         let submitter = S::from_current_context()?;
 
-        let (raw_addr, raw_addr_len) = crate::io::socket::socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = Connect {
             fd: IoFd::Raw(inner.raw()),
@@ -109,7 +111,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
             addr_len: raw_addr_len as u32,
         };
 
-        let (res, _) = submitter.submit(Op::new(op)).await;
+        let (res, _) = submit(&submitter, Op::new(op)).await;
         res?;
 
         Ok(Self { inner, submitter })
@@ -121,7 +123,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
             buf,
             offset: 0,
         };
-        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
         (res, op_back.buf)
     }
 
@@ -131,7 +133,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
             buf,
             offset: 0,
         };
-        let (res, op_back) = self.submitter.submit(Op::new(op)).await;
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
         (res, op_back.buf)
     }
 }

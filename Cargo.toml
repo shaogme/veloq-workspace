@@ -8,7 +8,9 @@ members = [
     "utils/veloq-atomic-waker", 
     "utils/veloq-intrusive-linklist", 
     "utils/veloq-bitset",
-    "utils/veloq-wheel",
+    "utils/veloq-wheel", 
+    "utils/veloq-blocking",
+    "veloq-driver", 
 ]
 resolver = "3"
 
@@ -32,13 +34,14 @@ veloq-runtime = { path = "veloq-runtime", version = "0.1.0" }
 veloq-sync = { path = "veloq-sync", version = "0.1.0" }
 veloq-local = { path = "veloq-local", version = "0.1.0" }
 veloq-buf = { path = "veloq-buf", version = "0.1.0" }
+veloq-driver = { path = "veloq-driver", version = "0.1.0" }
 
 veloq-shim = { path = "utils/veloq-shim", version = "0.1.0" }
 veloq-atomic-waker = { path = "utils/veloq-atomic-waker", version = "0.1.0" }
 veloq-intrusive-linklist = { path = "utils/veloq-intrusive-linklist", version = "0.1.0" }
 veloq-bitset = { path = "utils/veloq-bitset", version = "0.1.0" }
 veloq-wheel = { path = "utils/veloq-wheel", version = "0.1.0" }
-
+veloq-blocking = { path = "utils/veloq-blocking", version = "0.1.0" }
 
 # External Crates
 crossbeam-utils = { version = "0.8", default-features = false }
@@ -55,3 +58,4 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_Memory",
 ] }
+tracing = "0.1.44"

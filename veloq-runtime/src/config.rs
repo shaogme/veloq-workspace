@@ -1,66 +1,9 @@
-use std::{num::NonZeroUsize, time::Duration};
+use std::num::NonZeroUsize;
 
 use veloq_buf::nz;
 
-/// I/O Driver Operation Mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoMode {
-    /// Interrupt driven mode (syscalls + waiting)
-    Interrupt,
-    /// Polling mode (SQPOLL on Linux, busy-wait on Windows)
-    Polling,
-}
-
-#[derive(Debug, Clone)]
-pub struct UringConfig {
-    pub mode: IoMode,
-    pub entries: u32,
-    pub sqpoll_idle_ms: u32,
-}
-
-impl Default for UringConfig {
-    fn default() -> Self {
-        Self {
-            mode: IoMode::Interrupt,
-            entries: 1024,
-            sqpoll_idle_ms: 2000,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct IocpConfig {
-    pub mode: IoMode,
-    pub entries: u32,
-}
-
-impl Default for IocpConfig {
-    fn default() -> Self {
-        Self {
-            mode: IoMode::Interrupt,
-            entries: 1024,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BlockingPoolConfig {
-    pub core_threads: usize,
-    pub max_threads: usize,
-    pub queue_capacity: usize,
-    pub keep_alive: Duration,
-}
-
-impl Default for BlockingPoolConfig {
-    fn default() -> Self {
-        Self {
-            core_threads: 16,
-            max_threads: 512,
-            queue_capacity: 10000,
-            keep_alive: Duration::from_secs(30),
-        }
-    }
-}
+pub use veloq_blocking::BlockingPoolConfig;
+pub use veloq_driver::config::{IocpConfig, UringConfig};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -70,6 +13,18 @@ pub struct Config {
     pub direct_io: bool,
     pub blocking_pool: BlockingPoolConfig,
     pub internal_queue_capacity: usize,
+}
+
+impl AsRef<UringConfig> for Config {
+    fn as_ref(&self) -> &UringConfig {
+        &self.uring
+    }
+}
+
+impl AsRef<IocpConfig> for Config {
+    fn as_ref(&self) -> &IocpConfig {
+        &self.iocp
+    }
 }
 
 impl Default for Config {

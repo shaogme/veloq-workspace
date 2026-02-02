@@ -1,11 +1,13 @@
 //! UDP network tests - single-threaded and multi-threaded.
 
-use crate::io::buffer::{BufferConfig, HybridSpec};
 use crate::net::udp::UdpSocket;
 use crate::runtime::Runtime;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use veloq_buf::buffer::BufferConfig;
+use veloq_buf::buffer::hybrid::HybridSpec;
 
 // ============ Helper Functions ============
 

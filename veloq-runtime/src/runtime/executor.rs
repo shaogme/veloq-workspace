@@ -10,9 +10,9 @@ use crossbeam_deque::Worker;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 use tracing::{debug, trace};
+use veloq_buf::buffer::{BufferRegion, BufferRegistrar};
+use veloq_driver::driver::{Driver, PlatformDriver, RemoteWaker};
 
-use crate::io::buffer::{BufferRegion, BufferRegistrar};
-use crate::io::driver::{Driver, PlatformDriver, RemoteWaker};
 use crate::runtime::context::RuntimeContext;
 pub(crate) use crate::runtime::executor::spawner::ExecutorShared;
 use crate::runtime::join::LocalJoinHandle;
@@ -86,7 +86,7 @@ impl LocalExecutorBuilder {
     /// Requires a `pool_constructor` closure that creates an `AnyBufPool` using the provided `BufferRegistrar`.
     pub fn build<F>(self, pool_constructor: F) -> LocalExecutor
     where
-        F: FnOnce(Box<dyn BufferRegistrar>) -> crate::io::buffer::AnyBufPool,
+        F: FnOnce(Box<dyn BufferRegistrar>) -> veloq_buf::buffer::AnyBufPool,
     {
         let driver_val = PlatformDriver::new(&self.config).expect("Failed to create driver");
         // Wrap driver early to create registrar
@@ -178,7 +178,7 @@ pub struct LocalExecutor {
     // Cached ID (usize::MAX if not in mesh)
     id: usize,
     // Buffer Pool
-    buf_pool: crate::io::buffer::AnyBufPool,
+    buf_pool: veloq_buf::buffer::AnyBufPool,
 }
 
 impl LocalExecutor {
@@ -223,7 +223,7 @@ impl LocalExecutor {
         })
     }
 
-    pub fn pool(&self) -> crate::io::buffer::AnyBufPool {
+    pub fn pool(&self) -> veloq_buf::buffer::AnyBufPool {
         self.buf_pool.clone()
     }
 

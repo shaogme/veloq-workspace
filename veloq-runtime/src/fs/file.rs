@@ -1,7 +1,10 @@
+use crate::runtime::context::submit;
+
 use super::open_options::OpenOptions;
-use crate::io::RawHandle;
-use crate::io::buffer::FixedBuf;
-use crate::io::op::{
+
+use veloq_buf::buffer::FixedBuf;
+use veloq_driver::RawHandle;
+use veloq_driver::op::{
     DetachedSubmitter, Fallocate, Fsync, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed,
     SyncFileRange, WriteFixed,
 };
@@ -124,9 +127,10 @@ impl<S: OpSubmitter> Future for SyncRangeFuture<S> {
         loop {
             match &mut this.state {
                 SyncRangeState::Idle(data) => {
-                    let (submitter, op) =
-                        data.take().expect("Polled after completion or invalid state");
-                    let fut = submitter.submit(Op::new(op));
+                    let (submitter, op) = data
+                        .take()
+                        .expect("Polled after completion or invalid state");
+                    let fut = submit(&submitter, Op::new(op));
                     this.state = SyncRangeState::Submitted(fut);
                 }
                 SyncRangeState::Submitted(fut) => {
@@ -243,7 +247,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             offset,
         };
 
-        let (res, op) = self.submitter.submit(Op::new(op)).await;
+        let (res, op) = submit(&self.submitter, Op::new(op)).await;
         (res, op.buf)
     }
 
@@ -254,7 +258,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             offset,
         };
 
-        let (res, op) = self.submitter.submit(Op::new(op)).await;
+        let (res, op) = submit(&self.submitter, Op::new(op)).await;
         (res, op.buf)
     }
 
@@ -264,7 +268,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             datasync: false,
         };
 
-        let (res, _) = self.submitter.submit(Op::new(op)).await;
+        let (res, _) = submit(&self.submitter, Op::new(op)).await;
         res.map(|_| ())
     }
 
@@ -274,7 +278,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             datasync: true,
         };
 
-        let (res, _) = self.submitter.submit(Op::new(op)).await;
+        let (res, _) = submit(&self.submitter, Op::new(op)).await;
         res.map(|_| ())
     }
 
@@ -296,7 +300,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             len,
         };
 
-        let (res, _) = self.submitter.submit(Op::new(op)).await;
+        let (res, _) = submit(&self.submitter, Op::new(op)).await;
         res.map(|_| ())
     }
 }

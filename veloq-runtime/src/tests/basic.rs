@@ -1,6 +1,5 @@
 //! Basic runtime tests for spawn and spawn_local functionality.
 
-use crate::io::buffer::RegisteredPool;
 use crate::runtime::{LocalExecutor, Runtime};
 use crate::spawn_local;
 use crate::sync::mpsc;
@@ -8,6 +7,8 @@ use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use veloq_buf::buffer::{AnyBufPool, HybridPool, RegisteredPool};
 use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
 
 fn create_local_executor() -> LocalExecutor {
@@ -18,8 +19,8 @@ fn create_local_executor() -> LocalExecutor {
     let memory = memories.pop().unwrap();
 
     LocalExecutor::builder().build(move |registrar| {
-        let pool = crate::io::buffer::HybridPool::new(memory).unwrap();
-        crate::io::buffer::AnyBufPool::new(
+        let pool = HybridPool::new(memory).unwrap();
+        AnyBufPool::new(
             RegisteredPool::new(pool, registrar, global_info)
                 .expect("Failed to register buffer pool"),
         )

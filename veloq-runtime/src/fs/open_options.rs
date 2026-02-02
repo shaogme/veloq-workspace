@@ -1,6 +1,6 @@
-use crate::io::op::{OpSubmitter, Open};
 use std::num::NonZeroUsize;
 use std::path::Path;
+use veloq_driver::op::Open;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferingMode {
@@ -102,12 +102,14 @@ impl OpenOptions {
         let op = self.build_op(path.as_ref())?;
 
         // 2. 提交给 runtime (local)
-        use crate::io::op::{LocalSubmitter, Op, OpSubmitter};
+        use crate::runtime::context::submit;
+        use veloq_driver::op::{LocalSubmitter, Op};
+
         let submitter = LocalSubmitter;
-        let (res, _) = submitter.submit(Op::new(op)).await;
+        let (res, _) = submit(&submitter, Op::new(op)).await;
 
         // 3. 转换结果
-        let fd = crate::io::RawHandle::from(res?);
+        let fd = veloq_driver::RawHandle::from(res?);
         use super::file::InnerFile;
         use std::cell::Cell;
 
@@ -124,15 +126,16 @@ impl OpenOptions {
         let op = self.build_op(path.as_ref())?;
 
         // 使用 DetachedSubmitter 提交
-        use crate::io::op::{DetachedSubmitter, Op};
+        use crate::runtime::context::submit;
+        use veloq_driver::op::{DetachedSubmitter, Op};
 
         // 捕获 SubmitContext (Injector)
         let submitter = DetachedSubmitter::new()?;
 
         // 提交执行 (Result, Op) — Op 的所有权被返还
-        let (res, _) = submitter.submit(Op::new(op)).await;
+        let (res, _) = submit(&submitter, Op::new(op)).await;
 
-        let fd = crate::io::RawHandle::from(res?);
+        let fd = veloq_driver::RawHandle::from(res?);
 
         use super::file::InnerFile;
         use std::sync::atomic::AtomicU64;

@@ -2,3 +2,4 @@
 /docs/book
 /**/*.html
 *.html
+/**/*tmp*   

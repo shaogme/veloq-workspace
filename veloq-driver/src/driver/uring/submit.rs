@@ -3,8 +3,8 @@
 //! This module implements the logic for submitting operations and handling completions,
 //! exposed as static functions for VTable construction.
 
-use crate::io::driver::uring::op::UringOp;
-use crate::io::op::IoFd;
+use crate::driver::uring::op::UringOp;
+use crate::op::IoFd;
 use io_uring::{opcode, squeue, types};
 use std::io;
 use std::mem::ManuallyDrop;
@@ -247,7 +247,7 @@ pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Re
                 accept_op.addr_len as usize,
             )
         };
-        if let Ok(addr) = crate::io::socket::to_socket_addr(addr_bytes) {
+        if let Ok(addr) = crate::to_socket_addr(addr_bytes) {
             accept_op.remote_addr = Some(addr);
         }
         Ok(result as usize)
@@ -320,7 +320,7 @@ pub(crate) unsafe fn on_complete_recv_from(op: &mut UringOp, result: i32) -> io:
         let len = payload.msghdr.msg_namelen as usize;
         let addr_bytes =
             unsafe { std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len) };
-        if let Ok(addr) = crate::io::socket::to_socket_addr(addr_bytes) {
+        if let Ok(addr) = crate::to_socket_addr(addr_bytes) {
             payload.op.addr = Some(addr);
         }
         Ok(result as usize)

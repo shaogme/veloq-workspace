@@ -1,10 +1,11 @@
-use crate::io::buffer::RegisteredPool;
 use crate::runtime::executor::LocalExecutor;
 use crate::select;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+use veloq_buf::buffer::{AnyBufPool, HybridPool, RegisteredPool};
 use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
 
 fn create_local_executor() -> LocalExecutor {
@@ -15,8 +16,8 @@ fn create_local_executor() -> LocalExecutor {
     let memory = memories.pop().unwrap();
 
     LocalExecutor::builder().build(move |registrar| {
-        let pool = crate::io::buffer::HybridPool::new(memory).unwrap();
-        crate::io::buffer::AnyBufPool::new(
+        let pool = HybridPool::new(memory).unwrap();
+        AnyBufPool::new(
             RegisteredPool::new(pool, registrar, global_info)
                 .expect("Failed to register buffer pool"),
         )

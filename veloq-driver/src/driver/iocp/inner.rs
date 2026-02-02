@@ -2,8 +2,9 @@ use super::ext::Extensions;
 use super::op::{IocpOp, OverlappedEntry};
 use super::rio::RioState;
 use super::submit;
-use crate::io::driver::op_registry::OpRegistry;
-use crate::io::driver::{DetachedCompleter, RemoteWaker};
+use crate::config::IocpConfig;
+use crate::driver::op_registry::OpRegistry;
+use crate::driver::{DetachedCompleter, RemoteWaker};
 
 use std::io;
 use std::time::Instant;
@@ -102,7 +103,7 @@ impl Drop for IocpWaker {
 }
 
 impl IocpDriver {
-    pub fn create_pre_init(_config: &crate::config::Config) -> io::Result<PreInit> {
+    pub fn create_pre_init() -> io::Result<PreInit> {
         // Create a new completion port.
         let port =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
@@ -114,24 +115,20 @@ impl IocpDriver {
         }
     }
 
-    pub fn pre_init_handle(pre: &PreInit) -> crate::io::RawHandle {
-        crate::io::RawHandle { handle: *pre as _ }
+    pub fn pre_init_handle(pre: &PreInit) -> crate::RawHandle {
+        crate::RawHandle { handle: *pre as _ }
     }
 
-    pub fn new(config: &crate::config::Config) -> io::Result<Self> {
-        let pre = Self::create_pre_init(config)?;
-        Self::new_from_pre_init(config, pre)
+    pub fn new(config: impl AsRef<IocpConfig>) -> io::Result<Self> {
+        let pre = Self::create_pre_init()?;
+        Self::new_from_pre_init(config.as_ref().entries.get(), pre)
     }
 
-    pub fn new_from_pre_init(
-        config: &crate::config::Config,
-        port_val: PreInit,
-    ) -> io::Result<Self> {
+    pub fn new_from_pre_init(entries: u32, port_val: PreInit) -> io::Result<Self> {
         let port = port_val as HANDLE;
         debug!(port = ?port, "Initializing IocpDriver");
         // Load extensions
         let extensions = Extensions::new()?;
-        let entries = config.iocp.entries;
 
         // Initialize RIO State
         let mut rio_state = RioState::new(port, entries, &extensions)?;
@@ -310,7 +307,7 @@ impl IocpDriver {
 
     pub fn register_buffer_regions(
         &mut self,
-        regions: &[crate::io::buffer::BufferRegion],
+        regions: &[veloq_buf::buffer::BufferRegion],
     ) -> io::Result<Vec<usize>> {
         if let Some(rio) = &mut self.rio_state {
             rio.register_buffers(regions)?;
@@ -380,8 +377,8 @@ impl IocpDriver {
 
     pub fn register_files(
         &mut self,
-        files: &[crate::io::RawHandle],
-    ) -> io::Result<Vec<crate::io::op::IoFd>> {
+        files: &[crate::RawHandle],
+    ) -> io::Result<Vec<crate::op::IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for &handle in files {
             let idx = if let Some(idx) = self.free_slots.pop() {
@@ -397,14 +394,14 @@ impl IocpDriver {
                 }
                 self.registered_files.len() - 1
             };
-            registered.push(crate::io::op::IoFd::Fixed(idx as u32));
+            registered.push(crate::op::IoFd::Fixed(idx as u32));
         }
         Ok(registered)
     }
 
-    pub fn unregister_files(&mut self, files: Vec<crate::io::op::IoFd>) -> io::Result<()> {
+    pub fn unregister_files(&mut self, files: Vec<crate::op::IoFd>) -> io::Result<()> {
         for fd in files {
-            if let crate::io::op::IoFd::Fixed(idx) = fd {
+            if let crate::op::IoFd::Fixed(idx) = fd {
                 let idx = idx as usize;
                 if idx < self.registered_files.len() && self.registered_files[idx].is_some() {
                     self.registered_files[idx] = None;
