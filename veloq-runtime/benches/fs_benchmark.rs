@@ -15,8 +15,9 @@ use veloq_runtime::spawn_local;
 
 fn create_local_executor() -> LocalExecutor {
     // 256MB for benchmark
+    let multiplier = veloq_buf::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(128) });
     let config = GlobalAllocatorConfig {
-        thread_sizes: vec![NonZeroUsize::new(256 * 1024 * 1024).unwrap()],
+        multipliers: vec![multiplier],
     };
     let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
     let memory = memories.pop().unwrap();

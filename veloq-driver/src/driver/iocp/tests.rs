@@ -196,8 +196,10 @@ fn test_iocp_recv_with_buffer_pool() {
     ));
 
     // Setup GlobalAlloc
+    let multiplier =
+        veloq_buf::ThreadMemoryMultiplier(unsafe { std::num::NonZeroUsize::new_unchecked(10) });
     let config = veloq_buf::GlobalAllocatorConfig {
-        thread_sizes: vec![std::num::NonZeroUsize::new(20 * 1024 * 1024).unwrap()],
+        multipliers: vec![multiplier],
     };
     let (mut memories, global_info) = veloq_buf::GlobalAllocator::new(config).unwrap();
     let memory = memories.pop().unwrap();

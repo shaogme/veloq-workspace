@@ -454,8 +454,11 @@ mod tests {
     #[test]
     fn test_allocator_basic() {
         use crate::{GlobalAllocator, GlobalAllocatorConfig};
+        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
+        let multiplier =
+            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
         let config = GlobalAllocatorConfig {
-            thread_sizes: vec![ARENA_SIZE],
+            multipliers: vec![multiplier],
         }; // 20MB
         let mut memories = GlobalAllocator::new(config).unwrap().0;
         let memory = memories.pop().unwrap();
@@ -480,8 +483,11 @@ mod tests {
     #[test]
     fn test_allocator_small() {
         use crate::{GlobalAllocator, GlobalAllocatorConfig};
+        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
+        let multiplier =
+            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
         let config = GlobalAllocatorConfig {
-            thread_sizes: vec![ARENA_SIZE],
+            multipliers: vec![multiplier],
         };
         let mut memories = GlobalAllocator::new(config).unwrap().0;
         let memory = memories.pop().unwrap();
@@ -498,8 +504,11 @@ mod tests {
     #[test]
     fn test_allocator_large() {
         use crate::{GlobalAllocator, GlobalAllocatorConfig};
+        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
+        let multiplier =
+            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
         let config = GlobalAllocatorConfig {
-            thread_sizes: vec![ARENA_SIZE],
+            multipliers: vec![multiplier],
         };
         let mut memories = GlobalAllocator::new(config).unwrap().0;
         let memory = memories.pop().unwrap();
@@ -518,8 +527,11 @@ mod tests {
     #[test]
     fn test_hybrid_pool_alloc_mem() {
         use crate::{GlobalAllocator, GlobalAllocatorConfig};
+        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
+        let multiplier =
+            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
         let config = GlobalAllocatorConfig {
-            thread_sizes: vec![ARENA_SIZE],
+            multipliers: vec![multiplier],
         };
         let mut memories = GlobalAllocator::new(config).unwrap().0;
         let memory = memories.pop().unwrap();

@@ -6,12 +6,17 @@ use std::{io, num::NonZeroUsize, ptr::NonNull, sync::Arc};
 /// 2MB minimum memory per thread (Huge Page aligned)
 pub const MIN_THREAD_MEMORY: NonZeroUsize = nz!(2 * 1024 * 1024);
 
+/// Multiplier for thread memory scaling.
+/// Each unit represents `MIN_THREAD_MEMORY` (2MB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadMemoryMultiplier(pub NonZeroUsize);
+
 /// Configuration for GlobalAllocator
 #[derive(Debug, Clone)]
 pub struct GlobalAllocatorConfig {
-    /// Defines the memory size (in bytes) for each thread.
+    /// Defines the memory multiplier for each thread.
     /// The index corresponds to the thread/worker ID.
-    pub thread_sizes: Vec<NonZeroUsize>,
+    pub multipliers: Vec<ThreadMemoryMultiplier>,
 }
 
 /// Underlying physical memory block (RAII Wrapper).
@@ -122,14 +127,18 @@ impl GlobalAllocator {
     /// 1. A vector of `ThreadMemory` objects, each having independent ownership.
     /// 2. `GlobalMemoryInfo` for registering the entire block with io_uring/RIO.
     pub fn new(config: GlobalAllocatorConfig) -> io::Result<(Vec<ThreadMemory>, GlobalMemoryInfo)> {
-        if config.thread_sizes.is_empty() {
+        if config.multipliers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Thread sizes cannot be empty",
+                "Thread multipliers cannot be empty",
             ));
         }
 
-        let total_size: usize = config.thread_sizes.iter().map(|s| s.get()).sum();
+        let total_size: usize = config
+            .multipliers
+            .iter()
+            .map(|m| MIN_THREAD_MEMORY.get() * m.0.get())
+            .sum();
 
         // 1. Allocate a single large chunk (Maximizes utilization, huge page friendly)
         // SAFETY: total_size is guaranteed to be non-zero because config.thread_sizes is not empty.
@@ -142,11 +151,14 @@ impl GlobalAllocator {
             len: slab.size,
         };
 
-        let mut result = Vec::with_capacity(config.thread_sizes.len());
+        let mut result = Vec::with_capacity(config.multipliers.len());
         let mut current_ptr = slab.ptr.as_ptr();
 
         // 2. Slice it for each thread
-        for &size in &config.thread_sizes {
+        for &multiplier in &config.multipliers {
+            let size = unsafe {
+                NonZeroUsize::new_unchecked(MIN_THREAD_MEMORY.get() * multiplier.0.get())
+            };
             let thread_ptr = unsafe { NonNull::new_unchecked(current_ptr) };
 
             result.push(ThreadMemory {
@@ -189,8 +201,9 @@ mod tests {
     fn test_global_allocator_lifecycle() {
         let per_thread_size = MIN_THREAD_MEMORY;
         let thread_count = 4;
+        let multiplier = ThreadMemoryMultiplier(nz!(1));
         let config = GlobalAllocatorConfig {
-            thread_sizes: vec![per_thread_size; thread_count],
+            multipliers: vec![multiplier; thread_count],
         };
 
         match GlobalAllocator::new(config) {

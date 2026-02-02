@@ -87,8 +87,13 @@ impl RuntimeBuilder {
             .unwrap_or_else(|| BufferConfig::new(BuddySpec::default()));
 
         let memory_req = buffer_config.memory_requirement();
+        let multiplier_val = memory_req.get() / veloq_buf::MIN_THREAD_MEMORY.get();
+        // Ensure at least 1 multiplier if memory_req is small (though it shouldn't be with BuddySpec default)
+        let multiplier =
+            unsafe { std::num::NonZeroUsize::new_unchecked(std::cmp::max(1, multiplier_val)) };
+
         let alloc_config = GlobalAllocatorConfig {
-            thread_sizes: vec![memory_req; worker_count],
+            multipliers: vec![veloq_buf::ThreadMemoryMultiplier(multiplier); worker_count],
         };
 
         let (memories, global_info) = GlobalAllocator::new(alloc_config)?;

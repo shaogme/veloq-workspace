@@ -12,8 +12,9 @@ use veloq_buf::buffer::{AnyBufPool, HybridPool, RegisteredPool};
 use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
 
 fn create_local_executor() -> LocalExecutor {
+    let multiplier = veloq_buf::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(8) });
     let config = GlobalAllocatorConfig {
-        thread_sizes: vec![NonZeroUsize::new(16 * 1024 * 1024).unwrap()],
+        multipliers: vec![multiplier],
     };
     let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
     let memory = memories.pop().unwrap();

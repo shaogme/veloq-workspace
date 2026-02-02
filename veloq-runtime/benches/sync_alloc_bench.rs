@@ -1,19 +1,20 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::future::IntoFuture;
-use std::path::Path;
 use std::hint::black_box;
-use veloq_runtime::fs::{BufferingMode, File};
+use std::num::NonZeroUsize;
+use std::path::Path;
+use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::config::BlockingPoolConfig;
-use veloq_runtime::runtime::blocking::init_blocking_pool;
-use veloq_buf::{GlobalAllocator, GlobalAllocatorConfig};
+use veloq_runtime::fs::{BufferingMode, File};
 use veloq_runtime::io::buffer::RegisteredPool;
-use std::num::NonZeroUsize;
+use veloq_runtime::runtime::blocking::init_blocking_pool;
 
 fn create_local_executor() -> LocalExecutor {
     // Increase memory to 32MB to avoid OOM in BuddyPool
+    let multiplier = veloq_buf::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(16) });
     let config = GlobalAllocatorConfig {
-        thread_sizes: vec![NonZeroUsize::new(32 * 1024 * 1024).unwrap()],
+        multipliers: vec![multiplier],
     };
     let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
     let memory = memories.pop().unwrap();

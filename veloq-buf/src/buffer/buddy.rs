@@ -25,7 +25,9 @@ impl Drop for CreditCache {
                 // If we are the last ones (ref_count == credit), we must drop the pool.
                 if state.ref_count.fetch_sub(credit, Ordering::Release) == credit {
                     std::sync::atomic::fence(Ordering::Acquire);
-                    unsafe { let _ = Box::from_raw(ptr); }
+                    unsafe {
+                        let _ = Box::from_raw(ptr);
+                    }
                 }
             }
         }
@@ -498,7 +500,10 @@ pub struct BuddyPool {
 impl Clone for BuddyPool {
     fn clone(&self) -> Self {
         unsafe {
-            self.inner.as_ref().ref_count.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .as_ref()
+                .ref_count
+                .fetch_add(1, Ordering::Relaxed);
         }
         Self { inner: self.inner }
     }
@@ -508,7 +513,13 @@ impl Clone for BuddyPool {
 impl Drop for BuddyPool {
     fn drop(&mut self) {
         unsafe {
-            if self.inner.as_ref().ref_count.fetch_sub(1, Ordering::Release) == 1 {
+            if self
+                .inner
+                .as_ref()
+                .ref_count
+                .fetch_sub(1, Ordering::Release)
+                == 1
+            {
                 std::sync::atomic::fence(Ordering::Acquire);
                 let _ = Box::from_raw(self.inner.as_ptr());
             }
@@ -618,12 +629,14 @@ unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
             }
 
             if !found {
-                 // Not in cache, just atomic decrement
-                 if state.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+                // Not in cache, just atomic decrement
+                if state.ref_count.fetch_sub(1, Ordering::Release) == 1 {
                     std::sync::atomic::fence(Ordering::Acquire);
                     // SAFETY: RefCount is 0, we are the last owner.
-                    unsafe { let _ = Box::from_raw(ptr); }
-                 }
+                    unsafe {
+                        let _ = Box::from_raw(ptr);
+                    }
+                }
             }
         });
     } else {
@@ -631,7 +644,9 @@ unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
         if state.ref_count.fetch_sub(1, Ordering::Release) == 1 {
             std::sync::atomic::fence(Ordering::Acquire);
             // SAFETY: RefCount is 0, we are the last owner.
-            unsafe { let _ = Box::from_raw(ptr); }
+            unsafe {
+                let _ = Box::from_raw(ptr);
+            }
         }
     }
 }
@@ -731,10 +746,10 @@ impl BackingPool for BuddyPool {
                     *credit -= 1;
                     return true; // Consumed local credit
                 } else {
-                     // Empty credit, need refill
-                     inner.ref_count.fetch_add(BATCH_SIZE, Ordering::Relaxed);
-                     *credit = BATCH_SIZE - 1; // Keep 1 for this alloc
-                     return true; // Used new batch
+                    // Empty credit, need refill
+                    inner.ref_count.fetch_add(BATCH_SIZE, Ordering::Relaxed);
+                    *credit = BATCH_SIZE - 1; // Keep 1 for this alloc
+                    return true; // Used new batch
                 }
             } else {
                 // Not in cache. Can we insert?
@@ -767,8 +782,11 @@ mod tests {
         use crate::{GlobalAllocator, GlobalAllocatorConfig};
 
         // Create a real ThreadMemory for testing
+        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
+        let multiplier =
+            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
         let config = GlobalAllocatorConfig {
-            thread_sizes: vec![ARENA_SIZE],
+            multipliers: vec![multiplier],
         };
         let mut memories = GlobalAllocator::new(config).unwrap().0;
         let memory = memories.pop().unwrap();
