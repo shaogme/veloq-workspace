@@ -316,15 +316,19 @@ impl Default for HybridSpec {
     }
 }
 
-impl PoolSpec for HybridSpec {
-    fn memory_requirement(&self) -> std::num::NonZeroUsize {
-        let mut total_arena_size = 0;
-        for config in SLABS.iter() {
-            total_arena_size += config.block_size * config.count;
-        }
-        // SAFETY: calculated size is known to be non-zero
-        unsafe { std::num::NonZeroUsize::new_unchecked(total_arena_size) }
+const fn memory_requirement() -> std::num::NonZeroUsize {
+    let mut total_arena_size = 0;
+    let mut i = 0;
+    while i < SLABS.len() {
+        total_arena_size += SLABS[i].block_size * SLABS[i].count;
+        i += 1;
     }
+    // SAFETY: calculated size is known to be non-zero
+    std::num::NonZeroUsize::new(total_arena_size).unwrap()
+}
+
+impl PoolSpec for HybridSpec {
+    const MEMORY_REQUIREMENT: NonZeroUsize = memory_requirement();
 
     fn build(
         self,

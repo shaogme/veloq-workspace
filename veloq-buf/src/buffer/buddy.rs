@@ -504,9 +504,8 @@ impl<const SIZE: usize> Default for BuddySpec<SIZE> {
 }
 
 impl<const SIZE: usize> PoolSpec for BuddySpec<SIZE> {
-    fn memory_requirement(&self) -> NonZeroUsize {
-        NonZeroUsize::new(SIZE).expect("Memory size must be > 0")
-    }
+    const MEMORY_REQUIREMENT: NonZeroUsize =
+        NonZeroUsize::new(SIZE).expect("Memory size must be > 0");
 
     fn build(
         self,

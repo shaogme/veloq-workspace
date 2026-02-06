@@ -212,10 +212,9 @@ pub trait BufPool: std::fmt::Debug + 'static {
 /// 1. 声明所需的内存大小 (Binding Size)
 /// 2. 通过分配好的内存构建 Pool (Building)
 pub trait PoolSpec: Clone + Send + Sync + 'static {
-    /// 返回此配置所需的内存大小。
-    /// GlobalAllocator 将依据此返回值进行物理内存分配。
-    fn memory_requirement(&self) -> std::num::NonZeroUsize;
-
+    /// 此配置所需的内存大小。
+    const MEMORY_REQUIREMENT: NonZeroUsize;
+    
     /// 消耗自身配置，将分配好的 ThreadMemory 和 Registrar 组装成 AnyBufPool。
     fn build(
         self,

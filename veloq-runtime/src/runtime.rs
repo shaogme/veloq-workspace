@@ -85,7 +85,7 @@ impl<P: PoolSpec> RuntimeBuilder<P> {
         // Initialize the blocking pool
         init_blocking_pool(self.config.blocking_pool.clone());
 
-        let memory_req = self.pool_spec.memory_requirement();
+        let memory_req = P::MEMORY_REQUIREMENT;
         let multiplier_val = memory_req.get() / veloq_buf::MIN_THREAD_MEMORY.get();
         // Ensure at least 1 multiplier if memory_req is small
         let multiplier =
