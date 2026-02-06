@@ -33,6 +33,20 @@
 - 注册一个 `Poll` 或 `Read` 操作 (`Wakeup`) 到 `io_uring` 监听该 fd。
 - `RemoteWaker` 的实现只是简单地向该 `eventfd` 写入 8 字节，从而触发 `io_uring` 完成事件，唤醒驱动主循环。
 
+### 2.5 内核兼容性与降级策略 (Kernel Compatibility)
+`veloq-runtime` 优先使用较新内核的特性以获得最佳性能，但也提供了针对较旧内核的回退支持。
+
+#### 功能降级矩阵 (Degradation Matrix)
+驱动初始化时会尝试启用所有高级特性 (`SingleIssuer`, `DeferTaskRun`, `CoopTaskRun`)。如果内核不支持（返回 `EINVAL`），将自动回退到基础模式。
+
+| 内核版本 (Kernel) | 模式 (Mode) | 特性支持 (Features) | 性能影响 (Performance) |
+| :--- | :--- | :--- | :--- |
+| **≥ 6.1** | **高性能 (High Perf)** | `SingleIssuer` + `DeferTaskRun` + `CoopTaskRun` | 最佳。最小化系统调用开销和 IPI。 |
+| **5.6 - 6.0** | **基础 (Basic)** | 标准 `io_uring` | 良好。无 `DeferTaskRun` 批处理优化，可能有少量多余 IPI。 |
+| **< 5.6** | **不支持 (Unsupported)** | - | 无法运行。缺少 `IORING_OP_RECV` / `IORING_OP_SEND` 等核心指令支持。 |
+
+*注：虽然 5.10+ (LTS) 是推荐的生产环境最低版本，但在 5.6+ 上理论上可运行基础功能。*
+
 ## 3. 模块内结构 (Internal Structure)
 
 ```
@@ -90,7 +104,7 @@ pub struct UringOp {
 
 1.  **内核版本依赖**:
     - 当前使用了许多较新的 io_uring 特性（如 `Single Issuer`, `Defer Taskrun`）。在旧内核（< 5.10）上虽然有回退逻辑，但性能和功能可能受限。
-    - **TODO**: 完善降级策略文档，明确支持的最低内核版本矩阵。
+    - 降级策略与兼容性矩阵详见 [2.5 内核兼容性与降级策略](#25-内核兼容性与降级策略-kernel-compatibility)。
 
 2.  **Backlog 性能**:
     - 目前 Backlog 是一个单向链表。如果 Ring 长期处于满载状态，大量的 Backlog 插入/弹出可能导致 CPU 开销增加。
