@@ -1,3 +1,4 @@
+#![cfg(feature = "compat")]
 use std::future::Future;
 use std::io;
 use std::mem;

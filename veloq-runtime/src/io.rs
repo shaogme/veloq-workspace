@@ -6,7 +6,9 @@ pub mod buffer {
     pub use veloq_buf::*;
 }
 
+#[cfg(feature = "compat")]
 pub mod compat;
+#[cfg(feature = "compat")]
 pub use compat::Compat;
 
 /// Async buffered reading trait.

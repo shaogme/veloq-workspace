@@ -1,3 +1,4 @@
+#![cfg(feature = "compat")]
 use futures::{AsyncReadExt, AsyncWriteExt};
 use std::alloc::{Layout, alloc, dealloc};
 use std::future::Future;
