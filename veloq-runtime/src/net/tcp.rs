@@ -15,13 +15,13 @@ use veloq_driver::op::{
 // ============================================================================
 
 pub struct GenericTcpListener<S: OpSubmitter> {
-    inner: InnerSocket,
-    submitter: S,
+    pub(crate) inner: InnerSocket,
+    pub(crate) submitter: S,
 }
 
 pub struct GenericTcpStream<S: OpSubmitter> {
-    inner: InnerSocket,
-    submitter: S,
+    pub(crate) inner: InnerSocket,
+    pub(crate) submitter: S,
 }
 
 pub type LocalTcpListener = GenericTcpListener<LocalSubmitter>;
@@ -101,6 +101,13 @@ impl<S: OpSubmitter> GenericTcpListener<S> {
 impl<S: OpSubmitter> GenericTcpStream<S> {
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
         let inner = new_stream_inner(&addr)?;
+        Self::connect_from_inner(inner, addr).await
+    }
+
+    pub(crate) async fn connect_from_inner(
+        inner: InnerSocket,
+        addr: SocketAddr,
+    ) -> io::Result<Self> {
         let submitter = S::from_current_context()?;
 
         let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);

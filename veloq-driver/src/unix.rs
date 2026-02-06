@@ -84,6 +84,50 @@ impl Socket {
             std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
         })
     }
+
+    fn setsockopt<T>(&self, level: c_int, optname: c_int, optval: T) -> std::io::Result<()> {
+        let ret = unsafe {
+            libc::setsockopt(
+                self.fd,
+                level,
+                optname,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<T>() as socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
+        self.setsockopt(libc::IPPROTO_TCP, libc::TCP_NODELAY, nodelay as c_int)
+    }
+
+    pub fn set_recv_buffer_size(&self, size: usize) -> std::io::Result<()> {
+        self.setsockopt(libc::SOL_SOCKET, libc::SO_RCVBUF, size as c_int)
+    }
+
+    pub fn set_send_buffer_size(&self, size: usize) -> std::io::Result<()> {
+        self.setsockopt(libc::SOL_SOCKET, libc::SO_SNDBUF, size as c_int)
+    }
+
+    pub fn set_reuse_address(&self, reuse: bool) -> std::io::Result<()> {
+        self.setsockopt(libc::SOL_SOCKET, libc::SO_REUSEADDR, reuse as c_int)
+    }
+
+    pub fn set_keepalive(&self, keepalive: bool) -> std::io::Result<()> {
+        self.setsockopt(libc::SOL_SOCKET, libc::SO_KEEPALIVE, keepalive as c_int)
+    }
+
+    pub fn set_ttl(&self, ttl: u32) -> std::io::Result<()> {
+        self.setsockopt(libc::IPPROTO_IP, libc::IP_TTL, ttl as c_int)
+    }
+
+    pub fn set_broadcast(&self, broadcast: bool) -> std::io::Result<()> {
+        self.setsockopt(libc::SOL_SOCKET, libc::SO_BROADCAST, broadcast as c_int)
+    }
 }
 
 impl Drop for Socket {
