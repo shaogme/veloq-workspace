@@ -214,7 +214,7 @@ pub trait BufPool: std::fmt::Debug + 'static {
 pub trait PoolSpec: Clone + Send + Sync + 'static {
     /// 此配置所需的内存大小。
     const MEMORY_REQUIREMENT: NonZeroUsize;
-    
+
     /// 消耗自身配置，将分配好的 ThreadMemory 和 Registrar 组装成 AnyBufPool。
     fn build(
         self,
@@ -222,6 +222,45 @@ pub trait PoolSpec: Clone + Send + Sync + 'static {
         registrar: Box<dyn BufferRegistrar>,
         global_info: crate::global::GlobalMemoryInfo,
     ) -> AnyBufPool;
+}
+
+/// 定义 Runtime 所有工作线程的缓冲池拓扑结构
+pub trait PoolTopology: Clone + Send + Sync + 'static {
+    /// 步骤 1: 计算布局
+    /// 返回一个向量，描述每个 Worker (0..N) 所需的内存大小。
+    /// Runtime 将根据此列表向操作系统申请对齐的内存。
+    fn memory_requirements(&self, worker_count: usize) -> Vec<NonZeroUsize>;
+
+    /// 步骤 2: 构建实例
+    /// 为指定的 worker_index 构建具体的 Pool。
+    /// 传入的 `memory` 大小保证与 `memory_requirements` 中返回的一致。
+    fn build(
+        &self,
+        worker_index: usize,
+        memory: crate::ThreadMemory,
+        registrar: Box<dyn BufferRegistrar>,
+        global_info: crate::global::GlobalMemoryInfo,
+    ) -> AnyBufPool;
+}
+
+/// 标准拓扑：所有线程使用相同的 PoolSpec
+#[derive(Clone, Debug)]
+pub struct Uniform<P>(pub P);
+
+impl<P: PoolSpec> PoolTopology for Uniform<P> {
+    fn memory_requirements(&self, worker_count: usize) -> Vec<NonZeroUsize> {
+        vec![P::MEMORY_REQUIREMENT; worker_count]
+    }
+
+    fn build(
+        &self,
+        _index: usize,
+        memory: crate::ThreadMemory,
+        registrar: Box<dyn BufferRegistrar>,
+        global_info: crate::global::GlobalMemoryInfo,
+    ) -> AnyBufPool {
+        self.0.clone().build(memory, registrar, global_info)
+    }
 }
 
 // 组合注册池

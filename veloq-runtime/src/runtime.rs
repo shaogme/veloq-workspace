@@ -25,7 +25,7 @@ pub use join::{JoinHandle, LocalJoinHandle};
 
 use veloq_buf::buddy::BuddySpec;
 use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig, GlobalMemoryInfo};
-use veloq_buf::{PoolSpec, ThreadMemory};
+use veloq_buf::{PoolSpec, PoolTopology, ThreadMemory, Uniform};
 use veloq_driver::driver::RemoteWaker;
 
 use veloq_blocking::init_blocking_pool;
@@ -34,7 +34,7 @@ pub mod blocking {
     pub use veloq_blocking::*;
 }
 
-struct WorkerPrep<P: PoolSpec> {
+struct WorkerPrep<T: PoolTopology> {
     shared: Arc<ExecutorShared>,
     remote_receiver: mpsc::Receiver<Task>,
     pinned_receiver: mpsc::Receiver<SpawnedTask>,
@@ -42,39 +42,46 @@ struct WorkerPrep<P: PoolSpec> {
     stealable_worker: Worker<Runnable>,
     thread_memory: ThreadMemory,
     global_info: GlobalMemoryInfo,
-    pool_spec: P,
+    topology: T,
     config: Config,
     barrier: Arc<Barrier>,
 }
 
-pub struct RuntimeBuilder<P: PoolSpec = BuddySpec> {
+pub struct RuntimeBuilder<T: PoolTopology = Uniform<BuddySpec>> {
     config: Config,
-    pool_spec: P,
+    topology: T,
 }
 
-impl RuntimeBuilder<BuddySpec> {
+impl RuntimeBuilder<Uniform<BuddySpec>> {
     pub fn new() -> Self {
         Self {
             config: Config::default(),
-            pool_spec: BuddySpec::default(),
+            topology: Uniform(BuddySpec::default()),
         }
     }
 }
 
-impl<P: PoolSpec> RuntimeBuilder<P> {
+impl<T: PoolTopology> RuntimeBuilder<T> {
     pub fn config(mut self, config: Config) -> Self {
         self.config = config;
         self
     }
 
-    pub fn with_buffer_spec<NewP: PoolSpec>(self, spec: NewP) -> RuntimeBuilder<NewP> {
+    pub fn with_buffer_spec<NewP: PoolSpec>(self, spec: NewP) -> RuntimeBuilder<Uniform<NewP>> {
         RuntimeBuilder {
             config: self.config,
-            pool_spec: spec,
+            topology: Uniform(spec),
         }
     }
 
-    pub fn build(self) -> std::io::Result<Runtime<P>> {
+    pub fn with_topology<NewT: PoolTopology>(self, topology: NewT) -> RuntimeBuilder<NewT> {
+        RuntimeBuilder {
+            config: self.config,
+            topology,
+        }
+    }
+
+    pub fn build(self) -> std::io::Result<Runtime<T>> {
         let worker_count = self
             .config
             .worker_threads
@@ -85,15 +92,27 @@ impl<P: PoolSpec> RuntimeBuilder<P> {
         // Initialize the blocking pool
         init_blocking_pool(self.config.blocking_pool.clone());
 
-        let memory_req = P::MEMORY_REQUIREMENT;
-        let multiplier_val = memory_req.get() / veloq_buf::MIN_THREAD_MEMORY.get();
-        // Ensure at least 1 multiplier if memory_req is small
-        let multiplier =
-            unsafe { std::num::NonZeroUsize::new_unchecked(std::cmp::max(1, multiplier_val)) };
+        // Step 1: Calculate memory requirements per worker from Topology
+        let mem_requirements = self.topology.memory_requirements(worker_count);
+        assert_eq!(
+            mem_requirements.len(),
+            worker_count,
+            "Topology returned incorrect number of memory requirements"
+        );
 
-        let alloc_config = GlobalAllocatorConfig {
-            multipliers: vec![veloq_buf::ThreadMemoryMultiplier(multiplier); worker_count],
-        };
+        let multipliers: Vec<_> = mem_requirements
+            .iter()
+            .map(|req| {
+                let multiplier_val = req.get() / veloq_buf::MIN_THREAD_MEMORY.get();
+                // Ensure at least 1 multiplier if memory_req is small
+                let m = std::cmp::max(1, multiplier_val);
+                veloq_buf::ThreadMemoryMultiplier(unsafe {
+                    std::num::NonZeroUsize::new_unchecked(m)
+                })
+            })
+            .collect();
+
+        let alloc_config = GlobalAllocatorConfig { multipliers };
 
         let (memories, global_info) = GlobalAllocator::new(alloc_config)?;
 
@@ -179,7 +198,7 @@ impl<P: PoolSpec> RuntimeBuilder<P> {
             let config = self.config.clone();
             // Assuming global_info is Copy or cheap to Clone (it's usually (ptr, len))
             let global_info = global_info;
-            let pool_spec = self.pool_spec.clone();
+            let topology = self.topology.clone();
 
             let builder = thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
 
@@ -191,7 +210,7 @@ impl<P: PoolSpec> RuntimeBuilder<P> {
                     .with_remote_receiver(res.remote_rx)
                     .with_pinned_receiver(res.pinned_rx)
                     .with_worker(res.worker)
-                    .build(|registrar| pool_spec.build(memory, registrar, global_info));
+                    .build(|registrar| topology.build(worker_id, memory, registrar, global_info));
 
                 executor = executor.with_registry(registry);
                 executor = executor.with_id(worker_id);
@@ -217,7 +236,7 @@ impl<P: PoolSpec> RuntimeBuilder<P> {
             stealable_worker: worker_0_res.worker,
             thread_memory: worker_0_memory,
             global_info,
-            pool_spec: self.pool_spec,
+            topology: self.topology,
             config: self.config,
             barrier,
         };
@@ -232,16 +251,16 @@ impl<P: PoolSpec> RuntimeBuilder<P> {
     }
 }
 
-pub struct Runtime<P: PoolSpec = BuddySpec> {
+pub struct Runtime<T: PoolTopology = Uniform<BuddySpec>> {
     handles: Vec<thread::JoinHandle<()>>,
     registry: Arc<ExecutorRegistry>,
     peer_handles: Arc<Vec<AtomicUsize>>,
     #[allow(dead_code)]
     worker_count: usize,
-    worker_0_prep: Option<WorkerPrep<P>>,
+    worker_0_prep: Option<WorkerPrep<T>>,
 }
 
-impl<P: PoolSpec> Drop for Runtime<P> {
+impl<T: PoolTopology> Drop for Runtime<T> {
     fn drop(&mut self) {
         debug!("Runtime shutting down");
         // 1. Notify all workers to stop
@@ -258,8 +277,8 @@ impl<P: PoolSpec> Drop for Runtime<P> {
     }
 }
 
-impl Runtime<BuddySpec> {
-    pub fn builder() -> RuntimeBuilder<BuddySpec> {
+impl Runtime<Uniform<BuddySpec>> {
+    pub fn builder() -> RuntimeBuilder<Uniform<BuddySpec>> {
         RuntimeBuilder::new()
     }
 
@@ -272,7 +291,7 @@ impl Runtime<BuddySpec> {
     }
 }
 
-impl<P: PoolSpec> Runtime<P> {
+impl<T: PoolTopology> Runtime<T> {
     pub fn spawner(&self) -> Spawner {
         Spawner::new(self.registry.clone())
     }
@@ -308,8 +327,8 @@ impl<P: PoolSpec> Runtime<P> {
             .with_worker(prep.stealable_worker) // Inject stealable worker
             .build(|registrar| {
                 // Bind Buffer Pool using stored prep data
-                prep.pool_spec
-                    .build(prep.thread_memory, registrar, prep.global_info)
+                prep.topology
+                    .build(0, prep.thread_memory, registrar, prep.global_info)
             });
 
         executor = executor.with_registry(self.registry.clone());
