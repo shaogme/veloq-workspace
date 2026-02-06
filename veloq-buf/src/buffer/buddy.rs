@@ -4,42 +4,10 @@ use super::{
 };
 use crate::{ThreadMemory, nz};
 use crossbeam_queue::SegQueue;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-
-// TLS Credit Cache
-// Stores (pointer_addr, credit)
-struct CreditCache(Vec<(usize, usize)>);
-
-impl Drop for CreditCache {
-    fn drop(&mut self) {
-        for &(addr, credit) in &self.0 {
-            if credit > 0 {
-                let ptr = addr as *mut SharedBuddyState;
-                // SAFETY: We hold credits, so the pointer is valid.
-                // We must return the credits to the global counter.
-                let state = unsafe { &*ptr };
-                // If we are the last ones (ref_count == credit), we must drop the pool.
-                if state.ref_count.fetch_sub(credit, Ordering::Release) == credit {
-                    std::sync::atomic::fence(Ordering::Acquire);
-                    unsafe {
-                        let _ = Box::from_raw(ptr);
-                    }
-                }
-            }
-        }
-    }
-}
-
-thread_local! {
-    static BUDDY_REF_CREDITS: RefCell<CreditCache> = RefCell::new(CreditCache(Vec::with_capacity(4)));
-}
-
-const BATCH_SIZE: usize = 64;
-const MAX_CREDIT: usize = 128;
 
 // Buddy System Constants
 const ARENA_SIZE: NonZeroUsize = nz!(32 * 1024 * 1024); // 32MB Total to support higher concurrency with overhead
@@ -482,14 +450,12 @@ impl BuddyAllocator {
 /// Shared state for thread-safe access and deferred deallocation
 struct SharedBuddyState {
     allocator: UnsafeCell<BuddyAllocator>,
-    return_queue: SegQueue<DeallocParams>,
+    event_queue: SegQueue<DeallocParams>,
     owner_id: thread::ThreadId,
-    ref_count: AtomicUsize,
+    // Using UnsafeCell for ref_count since it's only modified by the owner thread.
+    // Cross-thread ops are queued.
+    ref_count: UnsafeCell<usize>,
 }
-
-// SAFETY: Synchronization is handled via owner_id checks and SegQueue
-unsafe impl Send for SharedBuddyState {}
-unsafe impl Sync for SharedBuddyState {}
 
 /// 各种 BufferPool 实现的包装器
 pub struct BuddyPool {
@@ -499,11 +465,11 @@ pub struct BuddyPool {
 // Manual Clone for ref-counting
 impl Clone for BuddyPool {
     fn clone(&self) -> Self {
+        // Since BuddyPool is !Send, we are guaranteed to be on the owner thread.
         unsafe {
-            self.inner
-                .as_ref()
-                .ref_count
-                .fetch_add(1, Ordering::Relaxed);
+            let inner = self.inner.as_ref();
+            // We are on owner thread, safe to mutate ref_count
+            *inner.ref_count.get() += 1;
         }
         Self { inner: self.inner }
     }
@@ -513,23 +479,20 @@ impl Clone for BuddyPool {
 impl Drop for BuddyPool {
     fn drop(&mut self) {
         unsafe {
-            if self
-                .inner
-                .as_ref()
-                .ref_count
-                .fetch_sub(1, Ordering::Release)
-                == 1
-            {
-                std::sync::atomic::fence(Ordering::Acquire);
+            let inner = self.inner.as_ref();
+            // Since BuddyPool is !Send, we are guaranteed to be on the owner thread.
+            let count = inner.ref_count.get();
+            *count -= 1;
+            if *count == 0 {
+                // Last reference, cleanup
                 let _ = Box::from_raw(self.inner.as_ptr());
             }
         }
     }
 }
 
-// Must implement Send/Sync because SharedBuddyState is Sync
-unsafe impl Send for BuddyPool {}
-unsafe impl Sync for BuddyPool {}
+// BuddyPool is !Send and !Sync implies it cannot be moved to other threads.
+// This allows us to remove runtime thread-ID checks for handle usage.
 
 pub struct BuddySpec {
     pub arena_size: NonZeroUsize,
@@ -586,68 +549,27 @@ unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
     // SAFETY: We hold a refcount (logically), so ptr is valid.
     let state = unsafe { &*ptr };
 
-    // 2. Adjust params to find original block start
-    let block_start_ptr = params.ptr;
-    let order = params.context;
-
     let is_owner = thread::current().id() == state.owner_id;
 
-    // 3. Dealloc logic
+    // 2. Dealloc logic
     if is_owner {
         // Local dealloc
         // SAFETY: We checked ownership.
         let allocator = unsafe { &mut *state.allocator.get() };
         // SAFETY: ptr is valid and allocated from this pool.
-        unsafe { allocator.dealloc(block_start_ptr, order) };
-    } else {
-        // Remote dealloc: push to queue
-        state.return_queue.push(params);
-    }
+        unsafe { allocator.dealloc(params.ptr, params.context) };
 
-    // 4. Ref Count Logic
-    if is_owner {
-        BUDDY_REF_CREDITS.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let credits = &mut cache.0;
-            let addr = ptr as usize;
-
-            // Linear scan (faster than hash for small N)
-            let mut found = false;
-            for (p_addr, credit) in credits.iter_mut() {
-                if *p_addr == addr {
-                    *credit += 1;
-                    if *credit > MAX_CREDIT {
-                        // Return batch to global
-                        state.ref_count.fetch_sub(*credit, Ordering::Release);
-                        *credit = 0;
-                        // Note: We don't drop here because we just returned excess credit.
-                        // The strong count should still be > 0 if we are here.
-                    }
-                    found = true;
-                    break;
-                }
-            }
-
-            if !found {
-                // Not in cache, just atomic decrement
-                if state.ref_count.fetch_sub(1, Ordering::Release) == 1 {
-                    std::sync::atomic::fence(Ordering::Acquire);
-                    // SAFETY: RefCount is 0, we are the last owner.
-                    unsafe {
-                        let _ = Box::from_raw(ptr);
-                    }
-                }
-            }
-        });
-    } else {
-        // Remote dealloc: always atomic decrement
-        if state.ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            std::sync::atomic::fence(Ordering::Acquire);
-            // SAFETY: RefCount is 0, we are the last owner.
-            unsafe {
+        // Decrement RefCount for the returned buffer
+        unsafe {
+            let ref_count = &mut *state.ref_count.get();
+            *ref_count -= 1;
+            if *ref_count == 0 {
                 let _ = Box::from_raw(ptr);
             }
         }
+    } else {
+        // Remote dealloc: push to queue
+        state.event_queue.push(params);
     }
 }
 
@@ -657,10 +579,9 @@ unsafe fn buddy_resolve_region_info_shim(pool_data: NonNull<()>, buf: &FixedBuf)
     // SAFETY: pool_data implies a valid ref.
     let inner = unsafe { &*raw };
     // SAFETY: We are only reading global region, which is constant/safe.
-    // However, UnsafeCell::get() usage here assumes no concurrent mutable access to global_region?
     // RawBuddyAllocator::global_region returns values from ThreadMemory, which is Sync.
+    // It's safe to read allocator specific fields that are constant (global region).
     let allocator = unsafe { &*inner.allocator.get() };
-    // Use global region to calculate offset
     let (global_base, _) = allocator.global_region();
     (
         0,
@@ -672,9 +593,9 @@ impl BuddyPool {
     pub fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
         let state = SharedBuddyState {
             allocator: UnsafeCell::new(BuddyAllocator::new(memory)?),
-            return_queue: SegQueue::new(),
+            event_queue: SegQueue::new(),
             owner_id: thread::current().id(),
-            ref_count: AtomicUsize::new(1),
+            ref_count: UnsafeCell::new(1),
         };
 
         let ptr = Box::into_raw(Box::new(state));
@@ -688,22 +609,25 @@ impl BackingPool for BuddyPool {
     fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
         // Enforce thread locality for allocation
         let inner = unsafe { self.inner.as_ref() };
-
-        if thread::current().id() != inner.owner_id {
-            panic!("BuddyPool::alloc_mem called from non-owner thread");
-        }
+        // No need to check thread ID, !Send guarantees we are on owner thread.
 
         let allocator = unsafe { &mut *inner.allocator.get() };
+        let ref_count = unsafe { &mut *inner.ref_count.get() };
 
         // Drain return queue
-        while let Some(params) = inner.return_queue.pop() {
+        while let Some(params) = inner.event_queue.pop() {
             unsafe { allocator.dealloc(params.ptr, params.context) };
+            *ref_count -= 1;
         }
+
+        // Check if potentially refs are 0 after processing queue?
+        // Impossible because `self` is a live reference (ref_count >= 1).
 
         match allocator.alloc(size.get()) {
             Some((block_ptr, order)) => {
                 let capacity = MIN_BLOCK_SIZE << order;
-                // No header writing needed
+                // Increment ref_count for the new FixedBuf
+                *ref_count += 1;
 
                 AllocResult::Allocated {
                     ptr: block_ptr,
@@ -723,51 +647,6 @@ impl BackingPool for BuddyPool {
 
     fn pool_data(&self) -> NonNull<()> {
         let ptr = self.inner.as_ptr();
-        let addr = ptr as usize;
-        let inner = unsafe { self.inner.as_ref() };
-
-        // Try to consume credit or refill
-        let consumed = BUDDY_REF_CREDITS.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let credits = &mut cache.0;
-
-            // Try find
-            let mut found_idx = None;
-            for (i, (p, _)) in credits.iter().enumerate() {
-                if *p == addr {
-                    found_idx = Some(i);
-                    break;
-                }
-            }
-
-            if let Some(idx) = found_idx {
-                let credit = &mut credits[idx].1;
-                if *credit > 0 {
-                    *credit -= 1;
-                    return true; // Consumed local credit
-                } else {
-                    // Empty credit, need refill
-                    inner.ref_count.fetch_add(BATCH_SIZE, Ordering::Relaxed);
-                    *credit = BATCH_SIZE - 1; // Keep 1 for this alloc
-                    return true; // Used new batch
-                }
-            } else {
-                // Not in cache. Can we insert?
-                if credits.len() < 4 {
-                    // Refill and insert
-                    inner.ref_count.fetch_add(BATCH_SIZE, Ordering::Relaxed);
-                    credits.push((addr, BATCH_SIZE - 1));
-                    return true;
-                }
-            }
-            false
-        });
-
-        if !consumed {
-            // Cache full and not found. Fallback to atomic +1
-            inner.ref_count.fetch_add(1, Ordering::Relaxed);
-        }
-
         unsafe { NonNull::new_unchecked(ptr as *mut ()) }
     }
 }
