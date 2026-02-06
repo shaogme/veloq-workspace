@@ -12,6 +12,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
+futures = "0.3"
 veloq-bitset = { workspace = true }
 veloq-sync = { workspace = true }
 veloq-local = { workspace = true }

@@ -6,6 +6,9 @@ pub mod buffer {
     pub use veloq_buf::*;
 }
 
+pub mod compat;
+pub use compat::Compat;
+
 /// Async buffered reading trait.
 /// Suitable for underlying asynchronous read operations that require passing FixedBuf ownership.
 pub trait AsyncBufRead {
