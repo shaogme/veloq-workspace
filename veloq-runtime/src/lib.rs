@@ -23,6 +23,7 @@ mod tests {
     mod fs;
     mod select_test;
     mod spawn_to_test;
+    mod socket_opts;
     mod tcp;
     mod time;
     mod udp;

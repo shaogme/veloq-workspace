@@ -92,6 +92,80 @@ impl Socket {
         }
         to_socket_addr(&buf[..len as usize])
     }
+
+    fn setsockopt<T>(&self, level: i32, optname: i32, optval: T) -> std::io::Result<()> {
+        let ret = unsafe {
+            windows_sys::Win32::Networking::WinSock::setsockopt(
+                self.handle.into(),
+                level,
+                optname,
+                &optval as *const _ as *const u8,
+                std::mem::size_of::<T>() as i32,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
+        let val = if nodelay { 1i32 } else { 0i32 };
+        self.setsockopt(IPPROTO_TCP, windows_sys::Win32::Networking::WinSock::TCP_NODELAY, val)
+    }
+
+    pub fn set_recv_buffer_size(&self, size: usize) -> std::io::Result<()> {
+        self.setsockopt(
+            windows_sys::Win32::Networking::WinSock::SOL_SOCKET,
+            windows_sys::Win32::Networking::WinSock::SO_RCVBUF,
+            size as i32,
+        )
+    }
+
+    pub fn set_send_buffer_size(&self, size: usize) -> std::io::Result<()> {
+        self.setsockopt(
+            windows_sys::Win32::Networking::WinSock::SOL_SOCKET,
+            windows_sys::Win32::Networking::WinSock::SO_SNDBUF,
+            size as i32,
+        )
+    }
+
+    pub fn set_reuse_address(&self, reuse: bool) -> std::io::Result<()> {
+        let val = if reuse { 1i32 } else { 0i32 };
+        self.setsockopt(
+            windows_sys::Win32::Networking::WinSock::SOL_SOCKET,
+            windows_sys::Win32::Networking::WinSock::SO_REUSEADDR,
+            val,
+        )
+    }
+
+    pub fn set_keepalive(&self, keepalive: bool) -> std::io::Result<()> {
+        let val = if keepalive { 1i32 } else { 0i32 };
+        self.setsockopt(
+            windows_sys::Win32::Networking::WinSock::SOL_SOCKET,
+            windows_sys::Win32::Networking::WinSock::SO_KEEPALIVE,
+            val,
+        )
+    }
+
+    pub fn set_ttl(&self, ttl: u32) -> std::io::Result<()> {
+        // IP_TTL is not always standard across windows versions in header, but usually available.
+        // windows-sys defines IP_TTL in WinSock.
+        self.setsockopt(
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IP,
+            windows_sys::Win32::Networking::WinSock::IP_TTL,
+            ttl as i32,
+        )
+    }
+
+    pub fn set_broadcast(&self, broadcast: bool) -> std::io::Result<()> {
+        let val = if broadcast { 1i32 } else { 0i32 };
+        self.setsockopt(
+            windows_sys::Win32::Networking::WinSock::SOL_SOCKET,
+            windows_sys::Win32::Networking::WinSock::SO_BROADCAST,
+            val,
+        )
+    }
 }
 
 impl Drop for Socket {

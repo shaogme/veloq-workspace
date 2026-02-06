@@ -15,8 +15,8 @@ use veloq_driver::op::{
 // ============================================================================
 
 pub struct GenericUdpSocket<S: OpSubmitter> {
-    inner: InnerSocket,
-    submitter: S,
+    pub(crate) inner: InnerSocket,
+    pub(crate) submitter: S,
 }
 
 pub type LocalUdpSocket = GenericUdpSocket<LocalSubmitter>;
