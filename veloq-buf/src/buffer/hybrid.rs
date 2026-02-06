@@ -307,6 +307,7 @@ impl Drop for HybridPool {
 // HybridPool is !Send and !Sync implies it cannot be moved to other threads.
 // This allows us to remove runtime thread-ID checks for handle usage.
 
+#[derive(Clone, Copy, Debug)]
 pub struct HybridSpec;
 
 impl Default for HybridSpec {
@@ -326,7 +327,7 @@ impl PoolSpec for HybridSpec {
     }
 
     fn build(
-        self: Box<Self>,
+        self,
         memory: ThreadMemory,
         registrar: Box<dyn crate::buffer::BufferRegistrar>,
         global_info: crate::global::GlobalMemoryInfo,
@@ -335,10 +336,6 @@ impl PoolSpec for HybridSpec {
         let reg_pool =
             RegisteredPool::new(pool, registrar, global_info).expect("Failed to register pool");
         AnyBufPool::new(reg_pool)
-    }
-
-    fn clone_box(&self) -> Box<dyn PoolSpec> {
-        Box::new(Self)
     }
 }
 

@@ -1,14 +1,14 @@
 use crate::net::socket::{TcpSocket, UdpSocketBuilder};
 use crate::runtime::Runtime;
-use veloq_buf::BufferConfig;
-use veloq_buf::hybrid::HybridSpec;
+
 use std::sync::Arc;
+use veloq_buf::hybrid::HybridSpec;
 
 #[test]
 fn test_tcp_socket_options() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .buffer_config(BufferConfig::new(HybridSpec))
+        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -16,8 +16,12 @@ fn test_tcp_socket_options() {
         // Create listener using builder
         let socket = TcpSocket::new_v4().expect("Failed to create socket");
         socket.set_nodelay(true).expect("Failed to set nodelay");
-        socket.set_reuse_address(true).expect("Failed to set reuseaddr");
-        socket.set_recv_buffer_size(8192).expect("Failed to set rcvbuf");
+        socket
+            .set_reuse_address(true)
+            .expect("Failed to set reuseaddr");
+        socket
+            .set_recv_buffer_size(8192)
+            .expect("Failed to set rcvbuf");
 
         socket.bind("127.0.0.1:0").expect("Failed to bind");
         let listener = socket.listen(1024).expect("Failed to listen");
@@ -39,10 +43,17 @@ fn test_tcp_socket_options() {
 
         // Client using builder
         let client_socket = TcpSocket::new_v4().expect("Failed to create client socket");
-        client_socket.set_nodelay(true).expect("Failed to set nodelay");
-        client_socket.set_send_buffer_size(8192).expect("Failed to set sndbuf");
+        client_socket
+            .set_nodelay(true)
+            .expect("Failed to set nodelay");
+        client_socket
+            .set_send_buffer_size(8192)
+            .expect("Failed to set sndbuf");
 
-        let stream = client_socket.connect(listen_addr).await.expect("Failed to connect");
+        let stream = client_socket
+            .connect(listen_addr)
+            .await
+            .expect("Failed to connect");
         println!("Connected successfully");
         drop(stream);
 
@@ -54,15 +65,21 @@ fn test_tcp_socket_options() {
 fn test_udp_socket_options() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .buffer_config(BufferConfig::new(HybridSpec))
+        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
     runtime.block_on(async move {
         let builder = UdpSocketBuilder::new_v4().expect("Failed to create UDP builder");
-        builder.set_broadcast(true).expect("Failed to set broadcast");
-        builder.set_recv_buffer_size(4096).expect("Failed to set rcvbuf");
-        builder.set_reuse_address(true).expect("Failed to set reuseaddr");
+        builder
+            .set_broadcast(true)
+            .expect("Failed to set broadcast");
+        builder
+            .set_recv_buffer_size(4096)
+            .expect("Failed to set rcvbuf");
+        builder
+            .set_reuse_address(true)
+            .expect("Failed to set reuseaddr");
 
         let socket = builder.bind("127.0.0.1:0").expect("Failed to bind UDP");
         let addr = socket.local_addr().expect("Failed to get local addr");
@@ -70,7 +87,9 @@ fn test_udp_socket_options() {
 
         // Basic verify it works
         let builder2 = UdpSocketBuilder::new_v4().expect("Failed to create UDP builder 2");
-        let client = builder2.bind("127.0.0.1:0").expect("Failed to bind UDP client");
+        let client = builder2
+            .bind("127.0.0.1:0")
+            .expect("Failed to bind UDP client");
 
         let buf = crate::runtime::context::alloc(1024);
         let (res, _) = client.send_to(buf, addr).await;

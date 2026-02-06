@@ -211,64 +211,18 @@ pub trait BufPool: std::fmt::Debug + 'static {
 /// 职责：
 /// 1. 声明所需的内存大小 (Binding Size)
 /// 2. 通过分配好的内存构建 Pool (Building)
-pub trait PoolSpec: Send + Sync + 'static {
+pub trait PoolSpec: Clone + Send + Sync + 'static {
     /// 返回此配置所需的内存大小。
     /// GlobalAllocator 将依据此返回值进行物理内存分配。
     fn memory_requirement(&self) -> std::num::NonZeroUsize;
 
     /// 消耗自身配置，将分配好的 ThreadMemory 和 Registrar 组装成 AnyBufPool。
     fn build(
-        self: Box<Self>,
-        memory: crate::ThreadMemory,
-        registrar: Box<dyn BufferRegistrar>,
-        global_info: crate::global::GlobalMemoryInfo,
-    ) -> AnyBufPool;
-
-    fn clone_box(&self) -> Box<dyn PoolSpec>;
-}
-
-impl Clone for Box<dyn PoolSpec> {
-    fn clone(&self) -> Box<dyn PoolSpec> {
-        self.clone_box()
-    }
-}
-
-impl Clone for BufferConfig {
-    fn clone(&self) -> Self {
-        Self {
-            spec: self.spec.clone(),
-        }
-    }
-}
-
-/// 用户面向的通用配置结构体
-/// 允许容纳任何实现了 PoolSpec 的具体配置
-pub struct BufferConfig {
-    spec: Box<dyn PoolSpec>,
-}
-
-impl BufferConfig {
-    /// 使用具体的 Spec 创建配置 (例如 BuddySpec 或 HybridSpec)
-    pub fn new<S: PoolSpec>(spec: S) -> Self {
-        Self {
-            spec: Box::new(spec),
-        }
-    }
-
-    /// 获取该配置所需的内存大小 (用于 GlobalAllocator)
-    pub fn memory_requirement(&self) -> std::num::NonZeroUsize {
-        self.spec.memory_requirement()
-    }
-
-    /// 消耗配置并构建 Pool (用于 Runtime 初始化)
-    pub fn build(
         self,
         memory: crate::ThreadMemory,
         registrar: Box<dyn BufferRegistrar>,
         global_info: crate::global::GlobalMemoryInfo,
-    ) -> AnyBufPool {
-        self.spec.build(memory, registrar, global_info)
-    }
+    ) -> AnyBufPool;
 }
 
 // 组合注册池

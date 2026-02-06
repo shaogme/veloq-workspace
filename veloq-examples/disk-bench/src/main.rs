@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use veloq_runtime::fs::{BufferingMode, File, OpenOptions};
-use veloq_runtime::io::buffer::{BufPool, BufferConfig, FixedBuf, buddy::BuddySpec};
+use veloq_runtime::io::buffer::{BufPool, FixedBuf, buddy::BuddySpec};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
 use veloq_runtime::sync::mpsc;
@@ -405,7 +405,7 @@ fn main() {
     // Initialize Runtime
     let runtime = Runtime::builder()
         .config(veloq_runtime::config::Config::default().worker_threads(args.threads))
-        .buffer_config(BufferConfig::new(BuddySpec::default()))
+        .with_buffer_spec(BuddySpec::<{ 32 * 1024 * 1024 }>)
         .build()
         .expect("Failed to build Runtime");
 

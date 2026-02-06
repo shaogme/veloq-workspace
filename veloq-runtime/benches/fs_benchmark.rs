@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig};
-use veloq_buf::{BufPool, BufferConfig, RegisteredPool, buddy::BuddySpec, nz};
+use veloq_buf::{BufPool, RegisteredPool, buddy::BuddySpec, nz};
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::config::BlockingPoolConfig;
 use veloq_runtime::fs::{BufferingMode, File};
@@ -163,7 +163,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                 // Re-initialized per iteration because block_on consumes the runtime.
                 let runtime = Runtime::builder()
                     .config(veloq_runtime::config::Config::default().worker_threads(WORKER_COUNT))
-                    .buffer_config(BufferConfig::new(BuddySpec::default()))
+                    .with_buffer_spec(BuddySpec::<{ 32 * 1024 * 1024 }>)
                     .build()
                     .unwrap();
 

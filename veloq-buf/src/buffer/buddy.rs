@@ -494,26 +494,22 @@ impl Drop for BuddyPool {
 // BuddyPool is !Send and !Sync implies it cannot be moved to other threads.
 // This allows us to remove runtime thread-ID checks for handle usage.
 
-pub struct BuddySpec {
-    pub arena_size: NonZeroUsize,
-}
+#[derive(Clone, Copy, Debug)]
+pub struct BuddySpec<const SIZE: usize = 33554432>; // 32MB default
 
-impl Default for BuddySpec {
+impl<const SIZE: usize> Default for BuddySpec<SIZE> {
     fn default() -> Self {
-        Self {
-            // SAFETY: ARENA_SIZE is non-zero (32MB)
-            arena_size: ARENA_SIZE,
-        }
+        Self
     }
 }
 
-impl PoolSpec for BuddySpec {
+impl<const SIZE: usize> PoolSpec for BuddySpec<SIZE> {
     fn memory_requirement(&self) -> NonZeroUsize {
-        self.arena_size
+        NonZeroUsize::new(SIZE).expect("Memory size must be > 0")
     }
 
     fn build(
-        self: Box<Self>,
+        self,
         memory: crate::ThreadMemory,
         registrar: Box<dyn crate::buffer::BufferRegistrar>,
         global_info: crate::global::GlobalMemoryInfo,
@@ -522,12 +518,6 @@ impl PoolSpec for BuddySpec {
         let reg_pool =
             RegisteredPool::new(pool, registrar, global_info).expect("Failed to register pool");
         AnyBufPool::new(reg_pool)
-    }
-
-    fn clone_box(&self) -> Box<dyn PoolSpec> {
-        Box::new(Self {
-            arena_size: self.arena_size,
-        })
     }
 }
 

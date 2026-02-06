@@ -6,7 +6,6 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use veloq_buf::BufferConfig;
 use veloq_buf::hybrid::HybridSpec;
 
 // ============ Helper Functions ============
@@ -18,7 +17,7 @@ use veloq_buf::hybrid::HybridSpec;
 fn test_tcp_connect_with_global_api() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .buffer_config(BufferConfig::new(HybridSpec))
+        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -58,7 +57,7 @@ fn test_tcp_send_recv() {
 
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
-                .buffer_config(BufferConfig::new(HybridSpec))
+                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 
@@ -148,7 +147,7 @@ fn test_tcp_send_recv() {
 fn test_tcp_multiple_connections() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .buffer_config(BufferConfig::new(HybridSpec))
+        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -192,7 +191,7 @@ fn test_tcp_large_data_transfer() {
         std::thread::spawn(move || {
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
-                .buffer_config(BufferConfig::new(HybridSpec))
+                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
             runtime.block_on(async move {
@@ -266,7 +265,7 @@ fn test_tcp_large_data_transfer() {
 fn test_listener_local_addr() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .buffer_config(BufferConfig::new(HybridSpec))
+        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -287,7 +286,7 @@ fn test_listener_local_addr() {
 fn test_tcp_connect_refused() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .buffer_config(BufferConfig::new(HybridSpec))
+        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -308,7 +307,7 @@ fn test_tcp_recv_zero_bytes() {
         std::thread::spawn(move || {
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
-                .buffer_config(BufferConfig::new(HybridSpec))
+                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 
@@ -353,7 +352,7 @@ fn test_tcp_recv_zero_bytes() {
 fn test_tcp_ipv6() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .buffer_config(BufferConfig::new(HybridSpec))
+        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -401,7 +400,7 @@ fn test_multithread_tcp_connections() {
 
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(NUM_WORKERS))
-        .buffer_config(BufferConfig::new(HybridSpec))
+        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -463,7 +462,7 @@ fn test_multithread_tcp_echo() {
             // 2 Workers
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(2))
-                .buffer_config(BufferConfig::new(HybridSpec))
+                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 
@@ -553,7 +552,7 @@ fn test_multithread_concurrent_clients() {
 
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(NUM_WORKERS))
-        .buffer_config(BufferConfig::new(HybridSpec))
+        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
