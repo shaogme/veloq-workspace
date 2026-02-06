@@ -7,10 +7,10 @@ use super::{
 use crate::ThreadMemory;
 use crossbeam_queue::SegQueue;
 use std::alloc::{Layout, alloc, dealloc};
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 // Alignment requirement for Direct I/O.
@@ -59,6 +59,36 @@ const SLABS: [SlabConfig; 5] = [
         count: 32,
     },
 ];
+
+// TLS Credit Cache for HybridPool
+// Stores (pointer_addr, credit)
+struct CreditCache(Vec<(usize, usize)>);
+
+impl Drop for CreditCache {
+    fn drop(&mut self) {
+        for &(addr, credit) in &self.0 {
+            if credit > 0 {
+                let ptr = addr as *mut SharedHybridState;
+                // SAFETY: We hold credits, so the pointer is valid.
+                let state = unsafe { &*ptr };
+                // If we are the last ones (ref_count == credit), we must drop the pool.
+                if state.ref_count.fetch_sub(credit, Ordering::Release) == credit {
+                    std::sync::atomic::fence(Ordering::Acquire);
+                    unsafe {
+                        let _ = Box::from_raw(ptr);
+                    }
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    static HYBRID_REF_CREDITS: RefCell<CreditCache> = RefCell::new(CreditCache(Vec::with_capacity(4)));
+}
+
+const BATCH_SIZE: usize = 64;
+const MAX_CREDIT: usize = 128;
 
 const GLOBAL_ALLOC_CONTEXT: usize = usize::MAX;
 const NEXT_NONE: usize = usize::MAX;
@@ -271,16 +301,48 @@ struct SharedHybridState {
     allocator: UnsafeCell<HybridAllocator>,
     return_queue: SegQueue<DeallocParams>,
     owner_id: thread::ThreadId,
+    ref_count: AtomicUsize,
 }
 
 // SAFETY: Synchronization via owner_id and SegQueue
 unsafe impl Send for SharedHybridState {}
 unsafe impl Sync for SharedHybridState {}
 
-#[derive(Clone)]
 pub struct HybridPool {
-    inner: Arc<SharedHybridState>,
+    inner: NonNull<SharedHybridState>,
 }
+
+impl Clone for HybridPool {
+    fn clone(&self) -> Self {
+        unsafe {
+            self.inner
+                .as_ref()
+                .ref_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Self { inner: self.inner }
+    }
+}
+
+impl Drop for HybridPool {
+    fn drop(&mut self) {
+        unsafe {
+            if self
+                .inner
+                .as_ref()
+                .ref_count
+                .fetch_sub(1, Ordering::Release)
+                == 1
+            {
+                std::sync::atomic::fence(Ordering::Acquire);
+                let _ = Box::from_raw(self.inner.as_ptr());
+            }
+        }
+    }
+}
+
+unsafe impl Send for HybridPool {}
+unsafe impl Sync for HybridPool {}
 
 pub struct HybridSpec;
 
@@ -330,18 +392,55 @@ static HYBRID_POOL_VTABLE: PoolVTable = PoolVTable {
 };
 
 unsafe fn hybrid_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    let pool_arc = unsafe { Arc::from_raw(pool_data.as_ptr() as *const SharedHybridState) };
+    let ptr = pool_data.as_ptr() as *mut SharedHybridState;
+    // SAFETY: We hold a refcount (logically), so ptr is valid.
+    let state = unsafe { &*ptr };
 
-    if thread::current().id() == pool_arc.owner_id {
-        let inner = unsafe { &mut *pool_arc.allocator.get() };
+    let is_owner = thread::current().id() == state.owner_id;
+
+    if is_owner {
+        let allocator = unsafe { &mut *state.allocator.get() };
         unsafe {
-            if let Err(_e) = inner.dealloc(params.ptr, params.cap.get(), params.context) {
+            if let Err(_e) = allocator.dealloc(params.ptr, params.cap.get(), params.context) {
                 #[cfg(debug_assertions)]
                 eprintln!("HybridPool dealloc error: {}", _e);
             }
         }
     } else {
-        pool_arc.return_queue.push(params);
+        state.return_queue.push(params);
+    }
+
+    if is_owner {
+        HYBRID_REF_CREDITS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let credits = &mut cache.0;
+            let addr = ptr as usize;
+
+            let mut found = false;
+            for (p_addr, credit) in credits.iter_mut() {
+                if *p_addr == addr {
+                    *credit += 1;
+                    if *credit > MAX_CREDIT {
+                        state.ref_count.fetch_sub(*credit, Ordering::Release);
+                        *credit = 0;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found && state.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+                std::sync::atomic::fence(Ordering::Acquire);
+                unsafe {
+                    let _ = Box::from_raw(ptr);
+                }
+            }
+        });
+    } else if state.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        unsafe {
+            let _ = Box::from_raw(ptr);
+        }
     }
 }
 
@@ -350,9 +449,9 @@ unsafe fn hybrid_resolve_region_info_shim(
     buf: &FixedBuf,
 ) -> (usize, usize) {
     let raw = pool_data.as_ptr() as *const SharedHybridState;
-    let arc = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(raw) });
-
-    let inner = unsafe { &*arc.allocator.get() };
+    // SAFETY: pool_data implies a valid ref.
+    let state = unsafe { &*raw };
+    let inner = unsafe { &*state.allocator.get() };
 
     // Use global region to calculate offset
     let (global_base, global_len) = inner.memory.global_region();
@@ -370,12 +469,15 @@ unsafe fn hybrid_resolve_region_info_shim(
 
 impl HybridPool {
     pub fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
+        let state = SharedHybridState {
+            allocator: UnsafeCell::new(HybridAllocator::new(memory)?),
+            return_queue: SegQueue::new(),
+            owner_id: thread::current().id(),
+            ref_count: AtomicUsize::new(1),
+        };
+        let ptr = Box::into_raw(Box::new(state));
         Ok(Self {
-            inner: Arc::new(SharedHybridState {
-                allocator: UnsafeCell::new(HybridAllocator::new(memory)?),
-                return_queue: SegQueue::new(),
-                owner_id: thread::current().id(),
-            }),
+            inner: unsafe { NonNull::new_unchecked(ptr) },
         })
     }
 
@@ -384,13 +486,14 @@ impl HybridPool {
         &self,
         size: usize,
     ) -> Option<(NonNull<u8>, usize, Option<GlobalIndex>, usize)> {
-        if thread::current().id() != self.inner.owner_id {
+        let inner = unsafe { self.inner.as_ref() };
+        if thread::current().id() != inner.owner_id {
             panic!("HybridPool::alloc_mem called from non-owner thread");
         }
-        let allocator = unsafe { &mut *self.inner.allocator.get() };
+        let allocator = unsafe { &mut *inner.allocator.get() };
 
         // Drain return queue
-        while let Some(params) = self.inner.return_queue.pop() {
+        while let Some(params) = inner.return_queue.pop() {
             unsafe {
                 if let Err(_e) = allocator.dealloc(params.ptr, params.cap.get(), params.context) {
                     #[cfg(debug_assertions)]
@@ -436,10 +539,45 @@ impl BackingPool for HybridPool {
     }
 
     fn pool_data(&self) -> NonNull<()> {
-        unsafe {
-            let raw = Arc::into_raw(self.inner.clone());
-            NonNull::new_unchecked(raw as *mut ())
+        let ptr = self.inner.as_ptr();
+        let addr = ptr as usize;
+        let inner = unsafe { self.inner.as_ref() };
+
+        let consumed = HYBRID_REF_CREDITS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let credits = &mut cache.0;
+
+            let mut found_idx = None;
+            for (i, (p, _)) in credits.iter().enumerate() {
+                if *p == addr {
+                    found_idx = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(idx) = found_idx {
+                let credit = &mut credits[idx].1;
+                if *credit > 0 {
+                    *credit -= 1;
+                    return true;
+                } else {
+                    inner.ref_count.fetch_add(BATCH_SIZE, Ordering::Relaxed);
+                    *credit = BATCH_SIZE - 1;
+                    return true;
+                }
+            } else if credits.len() < 4 {
+                inner.ref_count.fetch_add(BATCH_SIZE, Ordering::Relaxed);
+                credits.push((addr, BATCH_SIZE - 1));
+                return true;
+            }
+            false
+        });
+
+        if !consumed {
+            inner.ref_count.fetch_add(1, Ordering::Relaxed);
         }
+
+        unsafe { NonNull::new_unchecked(ptr as *mut ()) }
     }
 }
 
