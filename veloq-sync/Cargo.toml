@@ -12,13 +12,13 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-veloq-intrusive-linklist = { workspace = true }
-veloq-atomic-waker = { workspace = true }
-veloq-shim = { workspace = true }
+veloq-intrusive-linklist.workspace = true
+veloq-atomic-waker.workspace = true
+veloq-shim.workspace = true
 
-crossbeam-utils = { workspace = true }
-futures-core = { workspace = true }
-crossbeam-queue = { workspace = true }
+crossbeam-utils.workspace = true
+futures-core.workspace = true
+crossbeam-queue.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

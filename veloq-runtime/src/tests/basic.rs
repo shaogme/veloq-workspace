@@ -4,27 +4,29 @@ use crate::runtime::{LocalExecutor, Runtime};
 use crate::spawn_local;
 use crate::sync::mpsc;
 use std::cell::RefCell;
-use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig};
-use veloq_buf::{AnyBufPool, HybridPool, RegisteredPool};
+use veloq_buf::{BlockTopology, BufferRegion, ThreadMemoryMultiplier, UniformBlock, nz};
 
 fn create_local_executor() -> LocalExecutor {
-    let multiplier = veloq_buf::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(8) });
-    let config = GlobalAllocatorConfig {
-        multipliers: vec![multiplier],
-    };
-    let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
-    let memory = memories.pop().unwrap();
+    let topology = UniformBlock::hybrid(ThreadMemoryMultiplier(nz!(8)));
+    // We are creating a single-threaded executor for test, so worker_count = 1
+    let global_pool = topology
+        .create_pool(1)
+        .expect("Failed to create global pool");
+
+    // We are worker 0
+    let worker_idx = 0;
 
     LocalExecutor::builder().build(move |registrar| {
-        let pool = HybridPool::new(memory).unwrap();
-        AnyBufPool::new(
-            RegisteredPool::new(pool, registrar, global_info)
-                .expect("Failed to register buffer pool"),
-        )
+        // Register global memory
+        let info = global_pool.global_info();
+        let regions = [BufferRegion::new(info.ptr, info.len)];
+        registrar.register(&regions).expect("Failed to register");
+
+        // Use topology to build pool
+        topology.build_for_worker(global_pool, worker_idx, registrar)
     })
 }
 

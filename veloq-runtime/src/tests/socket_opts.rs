@@ -2,13 +2,11 @@ use crate::net::socket::{TcpSocket, UdpSocketBuilder};
 use crate::runtime::Runtime;
 
 use std::sync::Arc;
-use veloq_buf::hybrid::HybridSpec;
 
 #[test]
 fn test_tcp_socket_options() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -65,7 +63,6 @@ fn test_tcp_socket_options() {
 fn test_udp_socket_options() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 

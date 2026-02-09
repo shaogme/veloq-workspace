@@ -13,8 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-futures-core = { workspace = true }
-veloq-intrusive-linklist = { workspace = true }
+futures-core.workspace = true
+veloq-intrusive-linklist.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

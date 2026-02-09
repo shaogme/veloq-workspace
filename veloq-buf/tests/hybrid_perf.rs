@@ -1,9 +1,10 @@
 use std::num::NonZeroUsize;
 use std::sync::mpsc::channel;
 use std::time::Instant;
-use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig};
-use veloq_buf::{BufPool, BufferRegion, BufferRegistrar, FixedBuf, ThreadMemoryMultiplier};
-use veloq_buf::{HybridPool, RegisteredPool};
+use veloq_buf::{
+    BlockTopology, BufPool, BufferRegion, BufferRegistrar, FixedBuf, ThreadMemoryMultiplier,
+    UniformBlock,
+};
 
 struct DummyRegistrar;
 impl BufferRegistrar for DummyRegistrar {
@@ -14,26 +15,19 @@ impl BufferRegistrar for DummyRegistrar {
 
 #[test]
 fn bench_hybrid_contended() {
-    let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(8).unwrap());
-    let config = GlobalAllocatorConfig {
-        multipliers: vec![multiplier],
-    };
+    // 8x multiplier for ~16MB total (Hybrid needs min 14MB per instance)
+    // Here we use 1 thread, so 1 instance.
+    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(8).unwrap());
+    let topology = UniformBlock::hybrid(multiplier);
 
-    let (mut memories, global_info) = match GlobalAllocator::new(config) {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!(
-                "Skipping benchmark: Failed to allocate global memory: {}",
-                e
-            );
-            return;
-        }
-    };
+    // Create global pool for 1 worker
+    // This creates 2 blocks (Primary + Backup) for Thread 0
+    let global_pool = topology
+        .create_pool(1)
+        .expect("Failed to create global pool");
 
-    let memory = memories.pop().unwrap();
-    let raw_pool = HybridPool::new(memory).expect("Failed to create HybridPool");
-    let pool = RegisteredPool::new(raw_pool, Box::new(DummyRegistrar), global_info)
-        .expect("Failed to register pool");
+    // Build pool for worker 0
+    let pool = topology.build_for_worker(global_pool, 0, Box::new(DummyRegistrar));
 
     let iterations = 500_000;
 
@@ -52,9 +46,6 @@ fn bench_hybrid_contended() {
         }
     });
 
-    // Producer (must be owner thread of the pool, which is the main thread here if we created it here? No, owner is thread::current().id() when new() called)
-    // HybridPool::new was called in main thread. So main thread is owner.
-
     for _ in 0..iterations {
         let mut buf = pool.alloc(NonZeroUsize::new(4096).unwrap());
         while buf.is_none() {
@@ -68,7 +59,7 @@ fn bench_hybrid_contended() {
 
     let duration = start.elapsed();
 
-    println!("HybridPool Contended Performance:");
+    println!("HybridPool (BlockBased) Contended Performance:");
     println!("  Iterations: {}", iterations);
     println!("  Total Time: {:?}", duration);
     println!("  Avg Time: {:?} / op", duration / iterations as u32);

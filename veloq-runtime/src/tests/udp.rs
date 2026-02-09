@@ -6,8 +6,6 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use veloq_buf::hybrid::HybridSpec;
-
 // ============ Helper Functions ============
 
 // ============ Single-Thread UDP Tests (using Runtime/spawn) ============
@@ -17,7 +15,6 @@ use veloq_buf::hybrid::HybridSpec;
 fn test_udp_bind() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -42,7 +39,6 @@ fn test_udp_send_receive() {
 
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
-                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 
@@ -94,7 +90,6 @@ fn test_udp_echo() {
             println!("Testing with BufferSize: {:?}", size);
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
-                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 
@@ -169,7 +164,6 @@ fn test_udp_multiple_messages() {
         std::thread::spawn(move || {
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
-                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 
@@ -224,7 +218,6 @@ fn test_udp_large_data() {
         std::thread::spawn(move || {
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
-                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 
@@ -278,7 +271,6 @@ fn test_udp_large_data() {
 fn test_udp_ipv6() {
     let runtime = Runtime::builder()
         .config(crate::config::Config::default().worker_threads(1))
-        .with_buffer_spec(HybridSpec)
         .build()
         .unwrap();
 
@@ -312,7 +304,6 @@ fn test_multithread_udp_no_echo() {
 
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(NUM_WORKERS))
-                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 
@@ -405,7 +396,6 @@ fn test_multithread_udp_echo() {
             let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(2)) // 2 workers (0 and 1)
-                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 
@@ -506,7 +496,6 @@ fn test_multithread_concurrent_udp_clients() {
 
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(NUM_WORKERS))
-                .with_buffer_spec(HybridSpec)
                 .build()
                 .unwrap();
 

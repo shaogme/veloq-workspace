@@ -1,6 +1,5 @@
 use super::ext::Extensions;
 use super::*;
-use veloq_buf::HybridPool;
 
 use crate::Socket;
 use crate::config::IocpConfig;
@@ -195,16 +194,14 @@ fn test_iocp_recv_with_buffer_pool() {
         IocpDriver::new(IocpConfig::default()).unwrap(),
     ));
 
-    // Setup GlobalAlloc
-    let multiplier =
-        veloq_buf::ThreadMemoryMultiplier(unsafe { std::num::NonZeroUsize::new_unchecked(10) });
-    let config = veloq_buf::global::GlobalAllocatorConfig {
-        multipliers: vec![multiplier],
-    };
-    let (mut memories, global_info) = veloq_buf::global::GlobalAllocator::new(config).unwrap();
-    let memory = memories.pop().unwrap();
+    use veloq_buf::{BlockTopology, ThreadMemoryMultiplier, UniformBlock};
 
-    let pool = HybridPool::new(memory).unwrap();
+    // Setup GlobalAlloc
+    // 10x multiplier -> 20MB
+    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let topology = UniformBlock::hybrid(multiplier);
+
+    let global_pool = topology.create_pool(1).expect("Create pool failed");
 
     // Wrapper to use driver as registrar
     struct LegacyDriverRegistrar {
@@ -220,8 +217,8 @@ fn test_iocp_recv_with_buffer_pool() {
     let registrar = Box::new(LegacyDriverRegistrar {
         driver: driver.clone(),
     });
-    let reg_pool = veloq_buf::RegisteredPool::new(pool, registrar, global_info)
-        .expect("Failed to register pool");
+
+    let reg_pool = topology.build_for_worker(global_pool, 0, registrar);
 
     // Setup connection
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

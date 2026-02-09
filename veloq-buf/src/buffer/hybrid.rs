@@ -1,16 +1,9 @@
-use veloq_bitset::BitSet;
-
-use super::{
-    AllocError, AllocResult, AnyBufPool, BackingPool, DeallocParams, FixedBuf, GlobalIndex,
-    PoolSpec, PoolVTable, RegisteredPool,
-};
+use super::AllocError;
 use crate::ThreadMemory;
-use crossbeam_queue::SegQueue;
 use std::alloc::{Layout, alloc, dealloc};
-use std::cell::UnsafeCell;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
-use std::thread;
+use veloq_bitset::BitSet;
 
 // Alignment requirement for Direct I/O.
 // We use 4096 (Page Size) to ensure compatibility with strict Direct I/O requirements.
@@ -59,7 +52,7 @@ const SLABS: [SlabConfig; 5] = [
     },
 ];
 
-const GLOBAL_ALLOC_CONTEXT: usize = usize::MAX;
+const GLOBAL_ALLOC_CONTEXT: usize = 0xFFFFFFFF;
 const NEXT_NONE: usize = usize::MAX;
 
 struct Slab {
@@ -84,8 +77,12 @@ pub struct HybridAllocator {
     slabs: Vec<Slab>,
 }
 
+// SAFETY: HybridAllocator 管理自己的内存，指针指向的是它拥有的内存区域。
+// 整个结构体可以安全地跨线程传递（虽然不应该同时从多个线程访问）。
+unsafe impl Send for HybridAllocator {}
+
 impl HybridAllocator {
-    pub fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
+    pub fn new(mut memory: ThreadMemory) -> Result<Self, AllocError> {
         let mut total_arena_size = 0;
         for config in SLABS.iter() {
             total_arena_size += config.block_size * config.count;
@@ -95,7 +92,7 @@ impl HybridAllocator {
             return Err(AllocError::Oom);
         }
 
-        let arena_base_ptr = memory.as_ptr() as *mut u8;
+        let arena_base_ptr = memory.as_mut_ptr();
         let mut slabs = Vec::with_capacity(SLABS.len());
         let mut current_offset = 0;
 
@@ -157,7 +154,8 @@ impl HybridAllocator {
                 if slab.free_head != NEXT_NONE {
                     let index = slab.free_head;
                     let block_offset = slab.base_offset + index * slab.config.block_size;
-                    let block_ptr = unsafe { self.memory.as_ptr().add(block_offset) as *mut u8 };
+                    // Bug Fix: Use as_mut_ptr to ensure correct provenance
+                    let block_ptr = unsafe { self.memory.as_mut_ptr().add(block_offset) };
 
                     // Read next free index embedded in the block
                     let next_free = unsafe { *(block_ptr as *const usize) };
@@ -247,7 +245,8 @@ impl HybridAllocator {
 
             // Return to free list (push to head)
             let offset = slab.base_offset + index * slab.config.block_size;
-            let block_ptr = unsafe { self.memory.as_ptr().add(offset) };
+            // Bug Fix: Use as_mut_ptr to ensure correct provenance for mutable access
+            let block_ptr = unsafe { self.memory.as_mut_ptr().add(offset) };
             unsafe {
                 *(block_ptr as *mut usize) = slab.free_head;
             }
@@ -266,227 +265,25 @@ impl HybridAllocator {
     }
 }
 
-struct SharedHybridState {
-    allocator: UnsafeCell<HybridAllocator>,
-    event_queue: SegQueue<DeallocParams>,
-    owner_id: thread::ThreadId,
-    // Using UnsafeCell for ref_count since it's only modified by the owner thread.
-    ref_count: UnsafeCell<usize>,
-}
-
-pub struct HybridPool {
-    inner: NonNull<SharedHybridState>,
-}
-
-// Manual Clone for ref-counting
-impl Clone for HybridPool {
-    fn clone(&self) -> Self {
-        unsafe {
-            let inner = self.inner.as_ref();
-            // Since HybridPool is !Send, we are guaranteed to be on the owner thread.
-            *inner.ref_count.get() += 1;
-        }
-        Self { inner: self.inner }
-    }
-}
-
-impl Drop for HybridPool {
-    fn drop(&mut self) {
-        unsafe {
-            let inner = self.inner.as_ref();
-            // Since HybridPool is !Send, we are guaranteed to be on the owner thread.
-            let count = inner.ref_count.get();
-            *count -= 1;
-            if *count == 0 {
-                let _ = Box::from_raw(self.inner.as_ptr());
-            }
-        }
-    }
-}
-
-// HybridPool is !Send and !Sync implies it cannot be moved to other threads.
-// This allows us to remove runtime thread-ID checks for handle usage.
-
-#[derive(Clone, Copy, Debug)]
-pub struct HybridSpec;
-
-impl Default for HybridSpec {
-    fn default() -> Self {
-        Self
-    }
-}
-
-const fn memory_requirement() -> std::num::NonZeroUsize {
-    let mut total_arena_size = 0;
-    let mut i = 0;
-    while i < SLABS.len() {
-        total_arena_size += SLABS[i].block_size * SLABS[i].count;
-        i += 1;
-    }
-    // SAFETY: calculated size is known to be non-zero
-    std::num::NonZeroUsize::new(total_arena_size).unwrap()
-}
-
-impl PoolSpec for HybridSpec {
-    const MEMORY_REQUIREMENT: NonZeroUsize = memory_requirement();
-
-    fn build(
-        self,
-        memory: ThreadMemory,
-        registrar: Box<dyn crate::buffer::BufferRegistrar>,
-        global_info: crate::global::GlobalMemoryInfo,
-    ) -> AnyBufPool {
-        let pool = HybridPool::new(memory).expect("Failed to create HybridPool");
-        let reg_pool =
-            RegisteredPool::new(pool, registrar, global_info).expect("Failed to register pool");
-        AnyBufPool::new(reg_pool)
-    }
-}
-
-impl std::fmt::Debug for HybridPool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HybridPool").finish_non_exhaustive()
-    }
-}
-
-// VTable Shim
-static HYBRID_POOL_VTABLE: PoolVTable = PoolVTable {
-    dealloc: hybrid_dealloc_shim,
-    resolve_region_info: hybrid_resolve_region_info_shim,
-};
-
-unsafe fn hybrid_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    let ptr = pool_data.as_ptr() as *mut SharedHybridState;
-    // SAFETY: We hold a refcount (logically), so ptr is valid.
-    let state = unsafe { &*ptr };
-
-    let is_owner = thread::current().id() == state.owner_id;
-
-    if is_owner {
-        let allocator = unsafe { &mut *state.allocator.get() };
-        unsafe {
-            if let Err(_e) = allocator.dealloc(params.ptr, params.cap.get(), params.context) {
-                #[cfg(debug_assertions)]
-                eprintln!("HybridPool dealloc error: {}", _e);
-            }
-        }
-
-        // Decrement RefCount for the returned buffer
-        unsafe {
-            let ref_count = &mut *state.ref_count.get();
-            *ref_count -= 1;
-            if *ref_count == 0 {
-                let _ = Box::from_raw(ptr);
-            }
-        }
-    } else {
-        // Remote dealloc
-        state.event_queue.push(params);
-    }
-}
-
-unsafe fn hybrid_resolve_region_info_shim(
-    pool_data: NonNull<()>,
-    buf: &FixedBuf,
-) -> (usize, usize) {
-    let raw = pool_data.as_ptr() as *const SharedHybridState;
-    // SAFETY: pool_data implies a valid ref.
-    let state = unsafe { &*raw };
-    // SAFETY: allocator access assumed safe for read-only global structure.
-    let inner = unsafe { &*state.allocator.get() };
-
-    // Use global region to calculate offset
-    let (global_base, global_len) = inner.memory.global_region();
-    let base = global_base.as_ptr() as usize;
-    let ptr = buf.as_ptr() as usize;
-
-    // Check bounds against GLOBAL region
-    if ptr < base || ptr >= base + global_len {
-        // Fallback or out of bounds
-        panic!("Buffer not found in HybridPool regions (Global Fallback?)");
-    }
-
-    (0, ptr - base)
-}
-
-impl HybridPool {
-    pub fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
-        let state = SharedHybridState {
-            allocator: UnsafeCell::new(HybridAllocator::new(memory)?),
-            event_queue: SegQueue::new(),
-            owner_id: thread::current().id(),
-            ref_count: UnsafeCell::new(1),
-        };
-        let ptr = Box::into_raw(Box::new(state));
-        Ok(Self {
-            inner: unsafe { NonNull::new_unchecked(ptr) },
+// 实现 RawAllocator trait for HybridAllocator
+impl crate::block::RawAllocator for HybridAllocator {
+    fn alloc(&mut self, size: usize) -> Option<crate::block::RawAllocResult> {
+        let raw = self.alloc(size)?;
+        Some(crate::block::RawAllocResult {
+            ptr: raw.ptr,
+            cap: unsafe { NonZeroUsize::new_unchecked(raw.cap) },
+            context: raw.context,
         })
     }
 
-    // Helper to return proper types for FixedBuf or AllocResult
-    fn alloc_mem_inner(
-        &self,
-        size: usize,
-    ) -> Option<(NonNull<u8>, usize, Option<GlobalIndex>, usize)> {
-        let inner = unsafe { self.inner.as_ref() };
-        // No need to check thread ID, !Send guarantees we are on owner thread.
-        let allocator = unsafe { &mut *inner.allocator.get() };
-        let ref_count = unsafe { &mut *inner.ref_count.get() };
-
-        // Drain return queue
-        while let Some(params) = inner.event_queue.pop() {
-            unsafe {
-                if let Err(_e) = allocator.dealloc(params.ptr, params.cap.get(), params.context) {
-                    #[cfg(debug_assertions)]
-                    eprintln!("HybridPool deferred dealloc error: {}", _e);
-                }
-            };
-            *ref_count -= 1;
-        }
-
-        let needed_total = size;
-
-        if let Some(raw) = allocator.alloc(needed_total) {
-            let block_ptr = raw.ptr.as_ptr();
-
-            // Success alloc, increment ref count
-            *ref_count += 1;
-
-            unsafe {
-                Some((
-                    NonNull::new_unchecked(block_ptr),
-                    raw.cap,
-                    None, // BackingPool: global_index is None
-                    raw.context,
-                ))
-            }
-        } else {
-            None
-        }
-    }
-}
-
-impl BackingPool for HybridPool {
-    fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
-        if let Some((ptr, cap, global_index, context)) = self.alloc_mem_inner(size.get()) {
-            AllocResult::Allocated {
-                ptr,
-                cap: unsafe { NonZeroUsize::new_unchecked(cap) },
-                global_index,
-                context,
-            }
-        } else {
-            AllocResult::Failed
+    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, cap: usize, context: usize) {
+        unsafe {
+            let _ = self.dealloc(ptr, cap, context);
         }
     }
 
-    fn vtable(&self) -> &'static PoolVTable {
-        &HYBRID_POOL_VTABLE
-    }
-
-    fn pool_data(&self) -> NonNull<()> {
-        let ptr = self.inner.as_ptr();
-        unsafe { NonNull::new_unchecked(ptr as *mut ()) }
+    fn global_region(&self) -> (NonNull<u8>, usize) {
+        self.memory.global_region()
     }
 }
 
@@ -500,15 +297,9 @@ mod tests {
 
     #[test]
     fn test_allocator_basic() {
-        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
-        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
-        let multiplier =
-            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
-        let config = GlobalAllocatorConfig {
-            multipliers: vec![multiplier],
-        }; // 20MB
-        let mut memories = GlobalAllocator::new(config).unwrap().0;
-        let memory = memories.pop().unwrap();
+        // Use standalone memory
+        let size = ARENA_SIZE;
+        let memory = crate::ThreadMemory::new_standalone(size).unwrap();
 
         let mut allocator = HybridAllocator::new(memory).unwrap();
         // Check initial free counts
@@ -529,15 +320,9 @@ mod tests {
 
     #[test]
     fn test_allocator_small() {
-        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
-        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
-        let multiplier =
-            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
-        let config = GlobalAllocatorConfig {
-            multipliers: vec![multiplier],
-        };
-        let mut memories = GlobalAllocator::new(config).unwrap().0;
-        let memory = memories.pop().unwrap();
+        // Use standalone memory
+        let size = ARENA_SIZE;
+        let memory = crate::ThreadMemory::new_standalone(size).unwrap();
 
         let mut allocator = HybridAllocator::new(memory).unwrap();
         // Request very small size. 100 bytes
@@ -550,15 +335,9 @@ mod tests {
 
     #[test]
     fn test_allocator_large() {
-        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
-        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
-        let multiplier =
-            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
-        let config = GlobalAllocatorConfig {
-            multipliers: vec![multiplier],
-        };
-        let mut memories = GlobalAllocator::new(config).unwrap().0;
-        let memory = memories.pop().unwrap();
+        // Use standalone memory
+        let size = ARENA_SIZE;
+        let memory = crate::ThreadMemory::new_standalone(size).unwrap();
 
         let mut allocator = HybridAllocator::new(memory).unwrap();
         // Request 1MB
@@ -567,32 +346,5 @@ mod tests {
         assert_eq!(raw.context, GLOBAL_ALLOC_CONTEXT);
 
         unsafe { allocator.dealloc(raw.ptr, raw.cap, raw.context).unwrap() };
-    }
-
-    // Test for HybridPool integration removed/adjusted because direct alloc returns FixedBuf which requires Registration
-    // But since HybridPool is BackingPool, we can test alloc_mem.
-    #[test]
-    fn test_hybrid_pool_alloc_mem() {
-        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
-        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
-        let multiplier =
-            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
-        let config = GlobalAllocatorConfig {
-            multipliers: vec![multiplier],
-        };
-        let mut memories = GlobalAllocator::new(config).unwrap().0;
-        let memory = memories.pop().unwrap();
-
-        let pool = HybridPool::new(memory).unwrap();
-        let res = pool.alloc_mem(NonZeroUsize::new(4096).unwrap());
-        match res {
-            AllocResult::Allocated {
-                cap, global_index, ..
-            } => {
-                assert_eq!(cap.get(), 4096);
-                assert!(global_index.is_none());
-            }
-            _ => panic!("Alloc failed"),
-        }
     }
 }

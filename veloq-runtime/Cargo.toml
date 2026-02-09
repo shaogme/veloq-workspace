@@ -17,27 +17,27 @@ compat = ["dep:futures"]
 
 [dependencies]
 futures = { version = "0.3", optional = true }
-veloq-bitset = { workspace = true }
-veloq-sync = { workspace = true }
-veloq-local = { workspace = true }
-veloq-buf = { workspace = true }
-veloq-atomic-waker = { workspace = true }
-veloq-wheel = { workspace = true }
-veloq-driver = { workspace = true }
-veloq-blocking = { workspace = true }
+veloq-bitset.workspace = true
+veloq-sync.workspace = true
+veloq-local.workspace = true
+veloq-buf.workspace = true
+veloq-atomic-waker.workspace = true
+veloq-wheel.workspace = true
+veloq-driver.workspace = true
+veloq-blocking.workspace = true
 
 num_cpus = "1.17.0"
-crossbeam-utils = { workspace = true }
-crossbeam-queue = { workspace = true }
+crossbeam-utils.workspace = true
+crossbeam-queue.workspace = true
 crossbeam-deque = "0.8"
 tracing = "0.1.44"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"
-libc = { workspace = true }
+libc.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true }
+windows-sys.workspace = true
 rustc-hash = "2.1.1"
 
 [dev-dependencies]

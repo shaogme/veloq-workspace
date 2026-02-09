@@ -14,4 +14,4 @@ readme.workspace = true
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
 rand = "0.8"
-veloq-runtime = { workspace = true }
+veloq-runtime.workspace = true

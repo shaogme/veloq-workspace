@@ -12,14 +12,15 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-veloq-bitset = { workspace = true }
-crossbeam-queue = { workspace = true }
+veloq-bitset.workspace = true
+parking_lot = "0.12"
+crossbeam-utils.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
+libc.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true }
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig};
-use veloq_buf::{BufPool, RegisteredPool, buddy::BuddySpec, nz};
+use veloq_buf::{BufPool, nz};
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::config::BlockingPoolConfig;
 use veloq_runtime::fs::{BufferingMode, File};
@@ -15,20 +14,17 @@ use veloq_runtime::runtime::blocking::init_blocking_pool;
 use veloq_runtime::spawn_local;
 
 fn create_local_executor() -> LocalExecutor {
-    // 256MB for benchmark
-    let multiplier = veloq_buf::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(128) });
-    let config = GlobalAllocatorConfig {
-        multipliers: vec![multiplier],
-    };
-    let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
-    let memory = memories.pop().unwrap();
-
     LocalExecutor::builder().build(move |registrar| {
-        let pool = veloq_runtime::io::buffer::BuddyPool::new(memory).unwrap();
-        veloq_runtime::io::buffer::AnyBufPool::new(
-            RegisteredPool::new(pool, registrar, global_info)
-                .expect("Failed to register buffer pool"),
-        )
+        use veloq_buf::{BlockTopology, ThreadMemoryMultiplier, UniformBlock};
+
+        // 128x multiplier -> ~256MB
+        let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(128) });
+        let topology = UniformBlock::buddy(multiplier);
+
+        let global_pool = topology
+            .create_pool(1)
+            .expect("Failed to create global pool");
+        topology.build_for_worker(global_pool, 0, registrar)
     })
 }
 
@@ -163,7 +159,6 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                 // Re-initialized per iteration because block_on consumes the runtime.
                 let runtime = Runtime::builder()
                     .config(veloq_runtime::config::Config::default().worker_threads(WORKER_COUNT))
-                    .with_buffer_spec(BuddySpec::<{ 32 * 1024 * 1024 }>)
                     .build()
                     .unwrap();
 

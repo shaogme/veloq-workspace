@@ -4,28 +4,24 @@ use std::hint::black_box;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use veloq_buf::global::{GlobalAllocator, GlobalAllocatorConfig};
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::config::BlockingPoolConfig;
 use veloq_runtime::fs::{BufferingMode, File};
-use veloq_runtime::io::buffer::RegisteredPool;
 use veloq_runtime::runtime::blocking::init_blocking_pool;
 
 fn create_local_executor() -> LocalExecutor {
     // Increase memory to 32MB to avoid OOM in BuddyPool
-    let multiplier = veloq_buf::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(16) });
-    let config = GlobalAllocatorConfig {
-        multipliers: vec![multiplier],
-    };
-    let (mut memories, global_info) = GlobalAllocator::new(config).unwrap();
-    let memory = memories.pop().unwrap();
-
     LocalExecutor::builder().build(move |registrar| {
-        let pool = veloq_runtime::io::buffer::BuddyPool::new(memory).unwrap();
-        veloq_runtime::io::buffer::AnyBufPool::new(
-            RegisteredPool::new(pool, registrar, global_info)
-                .expect("Failed to register buffer pool"),
-        )
+        use veloq_buf::{BlockTopology, ThreadMemoryMultiplier, UniformBlock};
+
+        // 16x multiplier -> 32MB (BuddyPool default block size is 2MB * 16 = 32MB)
+        let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(16) });
+        let topology = UniformBlock::buddy(multiplier);
+
+        let global_pool = topology
+            .create_pool(1)
+            .expect("Failed to create global pool");
+        topology.build_for_worker(global_pool, 0, registrar)
     })
 }
 

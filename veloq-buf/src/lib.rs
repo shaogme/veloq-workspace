@@ -1,6 +1,7 @@
 mod buffer;
 mod os;
 
+pub mod block;
 pub mod global;
 
 use std::{num::NonZeroUsize, ptr::NonNull, sync::Arc};
@@ -19,7 +20,7 @@ macro_rules! nz {
 
         // 2. 如果上面通过了，说明 $value 肯定不为 0
         // 使用 unsafe 块调用 new_unchecked
-        unsafe { NonZeroUsize::new_unchecked($value) }
+        unsafe { std::num::NonZeroUsize::new_unchecked($value) }
     }};
 }
 
@@ -106,6 +107,17 @@ impl ThreadMemory {
     /// Used for registering the entire memory block with the kernel (e.g., io_uring).
     pub fn global_region(&self) -> (NonNull<u8>, usize) {
         (self._owner.ptr, self._owner.size.get())
+    }
+
+    /// Create a standalone ThreadMemory instance (e.g., for testing or single-threaded use).
+    /// This allocates a dedicated RawSlab.
+    pub fn new_standalone(size: NonZeroUsize) -> std::io::Result<Self> {
+        let slab = Arc::new(RawSlab::new(size)?);
+        Ok(Self {
+            _owner: slab.clone(),
+            ptr: slab.ptr,
+            len: slab.size,
+        })
     }
 }
 

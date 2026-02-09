@@ -1115,8 +1115,9 @@ dependencies = [
 name = "veloq-buf"
 version = "0.1.0"
 dependencies = [
- "crossbeam-queue",
+ "crossbeam-utils",
  "libc",
+ "parking_lot",
  "tempfile",
  "veloq-bitset",
  "windows-sys 0.61.2",

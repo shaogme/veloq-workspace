@@ -1,13 +1,7 @@
-use super::{
-    AllocError, AllocResult, AnyBufPool, BackingPool, DeallocParams, FixedBuf, PoolSpec,
-    PoolVTable, RegisteredPool,
-};
+use super::AllocError;
 use crate::{ThreadMemory, nz};
-use crossbeam_queue::SegQueue;
-use std::cell::UnsafeCell;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
-use std::thread;
 
 // Buddy System Constants
 const ARENA_SIZE: NonZeroUsize = nz!(32 * 1024 * 1024); // 32MB Total to support higher concurrency with overhead
@@ -173,7 +167,7 @@ struct RawBuddyAllocator {
 }
 
 impl RawBuddyAllocator {
-    fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
+    fn new(mut memory: ThreadMemory) -> Result<Self, AllocError> {
         // Check memory size
         if memory.len() < ARENA_SIZE.get() {
             // For now fail if provided memory is less than ARENA_SIZE
@@ -181,12 +175,13 @@ impl RawBuddyAllocator {
             return Err(AllocError::Oom);
         }
 
-        let base_ptr = memory.as_ptr() as *mut u8;
+        // Bug Fix: Use as_mut_ptr to ensure correct provenance for mutable access
+        let base_ptr = memory.as_mut_ptr();
         let calculator = BlockCalculator::new(base_ptr);
 
         let mut free_lists = [FreeList::new(); NUM_ORDERS];
 
-        // 初始化最大的块（Order 12, 16MB） -> Wait, order 13 is 32MB. 2^12 * 4096 = 16M?
+        // 初始化最大的块 (Order 12, 16MB) -> Wait, order 13 is 32MB. 2^12 * 4096 = 16M?
         // MIN_BLOCK = 4096 (2^12.
         // MAX Order = 13 (NUM_ORDERS - 1). Size = 4096 << 13 = 32MB.
         let max_order = NUM_ORDERS - 1;
@@ -358,18 +353,25 @@ impl RawBuddyAllocator {
 }
 
 /// 包含缓存层 (Slab) 的分配器封装
-struct BuddyAllocator {
+pub struct BuddyAllocator {
     raw: RawBuddyAllocator,
 
     // Slab 缓存：存储常用 Order 的空闲块 (Order 0..=MAX_SLAB_ORDER)
     slabs: [Vec<NonNull<u8>>; MAX_SLAB_ORDER + 1],
 }
 
+// SAFETY: BuddyAllocator 管理自己的内存，指针指向的是它拥有的内存区域。
+// 整个结构体可以安全地跨线程传递（虽然不应该同时从多个线程访问）。
+unsafe impl Send for BuddyAllocator {}
+
 impl BuddyAllocator {
-    fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
+    pub fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
+        // Pre-allocate slab vectors to avoid reallocation jitter
+        let slabs = std::array::from_fn(|i| Vec::with_capacity(SLAB_CAPACITIES[i]));
+
         Ok(Self {
             raw: RawBuddyAllocator::new(memory)?,
-            slabs: Default::default(),
+            slabs,
         })
     }
 
@@ -441,202 +443,29 @@ impl BuddyAllocator {
             0
         }
     }
+}
+
+// 实现 RawAllocator trait for BuddyAllocator
+impl crate::block::RawAllocator for BuddyAllocator {
+    fn alloc(&mut self, size: usize) -> Option<crate::block::RawAllocResult> {
+        let (ptr, order) = self.alloc(size)?;
+        let capacity = MIN_BLOCK_SIZE << order;
+        Some(crate::block::RawAllocResult {
+            ptr,
+            cap: unsafe { NonZeroUsize::new_unchecked(capacity) },
+            context: order,
+        })
+    }
+
+    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, _cap: usize, context: usize) {
+        // context is the order
+        unsafe {
+            self.dealloc(ptr, context);
+        }
+    }
 
     fn global_region(&self) -> (NonNull<u8>, usize) {
         self.raw.global_region()
-    }
-}
-
-/// Shared state for thread-safe access and deferred deallocation
-struct SharedBuddyState {
-    allocator: UnsafeCell<BuddyAllocator>,
-    event_queue: SegQueue<DeallocParams>,
-    owner_id: thread::ThreadId,
-    // Using UnsafeCell for ref_count since it's only modified by the owner thread.
-    // Cross-thread ops are queued.
-    ref_count: UnsafeCell<usize>,
-}
-
-/// 各种 BufferPool 实现的包装器
-pub struct BuddyPool {
-    inner: NonNull<SharedBuddyState>,
-}
-
-// Manual Clone for ref-counting
-impl Clone for BuddyPool {
-    fn clone(&self) -> Self {
-        // Since BuddyPool is !Send, we are guaranteed to be on the owner thread.
-        unsafe {
-            let inner = self.inner.as_ref();
-            // We are on owner thread, safe to mutate ref_count
-            *inner.ref_count.get() += 1;
-        }
-        Self { inner: self.inner }
-    }
-}
-
-// Manual Drop for ref-counting
-impl Drop for BuddyPool {
-    fn drop(&mut self) {
-        unsafe {
-            let inner = self.inner.as_ref();
-            // Since BuddyPool is !Send, we are guaranteed to be on the owner thread.
-            let count = inner.ref_count.get();
-            *count -= 1;
-            if *count == 0 {
-                // Last reference, cleanup
-                let _ = Box::from_raw(self.inner.as_ptr());
-            }
-        }
-    }
-}
-
-// BuddyPool is !Send and !Sync implies it cannot be moved to other threads.
-// This allows us to remove runtime thread-ID checks for handle usage.
-
-#[derive(Clone, Copy, Debug)]
-pub struct BuddySpec<const SIZE: usize = 33554432>; // 32MB default
-
-impl<const SIZE: usize> Default for BuddySpec<SIZE> {
-    fn default() -> Self {
-        Self
-    }
-}
-
-impl<const SIZE: usize> PoolSpec for BuddySpec<SIZE> {
-    const MEMORY_REQUIREMENT: NonZeroUsize =
-        NonZeroUsize::new(SIZE).expect("Memory size must be > 0");
-
-    fn build(
-        self,
-        memory: crate::ThreadMemory,
-        registrar: Box<dyn crate::buffer::BufferRegistrar>,
-        global_info: crate::global::GlobalMemoryInfo,
-    ) -> AnyBufPool {
-        let pool = BuddyPool::new(memory).expect("Failed to create BuddyPool");
-        let reg_pool =
-            RegisteredPool::new(pool, registrar, global_info).expect("Failed to register pool");
-        AnyBufPool::new(reg_pool)
-    }
-}
-
-impl std::fmt::Debug for BuddyPool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BuddyPool").finish_non_exhaustive()
-    }
-}
-
-// Static VTable for Type Erasure
-static BUDDY_POOL_VTABLE: PoolVTable = PoolVTable {
-    dealloc: buddy_dealloc_shim,
-    resolve_region_info: buddy_resolve_region_info_shim,
-};
-
-unsafe fn buddy_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    // 1. Recover the Pool Pointer
-    let ptr = pool_data.as_ptr() as *mut SharedBuddyState;
-    // SAFETY: We hold a refcount (logically), so ptr is valid.
-    let state = unsafe { &*ptr };
-
-    let is_owner = thread::current().id() == state.owner_id;
-
-    // 2. Dealloc logic
-    if is_owner {
-        // Local dealloc
-        // SAFETY: We checked ownership.
-        let allocator = unsafe { &mut *state.allocator.get() };
-        // SAFETY: ptr is valid and allocated from this pool.
-        unsafe { allocator.dealloc(params.ptr, params.context) };
-
-        // Decrement RefCount for the returned buffer
-        unsafe {
-            let ref_count = &mut *state.ref_count.get();
-            *ref_count -= 1;
-            if *ref_count == 0 {
-                let _ = Box::from_raw(ptr);
-            }
-        }
-    } else {
-        // Remote dealloc: push to queue
-        state.event_queue.push(params);
-    }
-}
-
-unsafe fn buddy_resolve_region_info_shim(pool_data: NonNull<()>, buf: &FixedBuf) -> (usize, usize) {
-    let raw = pool_data.as_ptr() as *const SharedBuddyState;
-    // We don't touch refcount here, just access data
-    // SAFETY: pool_data implies a valid ref.
-    let inner = unsafe { &*raw };
-    // SAFETY: We are only reading global region, which is constant/safe.
-    // RawBuddyAllocator::global_region returns values from ThreadMemory, which is Sync.
-    // It's safe to read allocator specific fields that are constant (global region).
-    let allocator = unsafe { &*inner.allocator.get() };
-    let (global_base, _) = allocator.global_region();
-    (
-        0,
-        (buf.as_ptr() as usize).saturating_sub(global_base.as_ptr() as usize),
-    )
-}
-
-impl BuddyPool {
-    pub fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
-        let state = SharedBuddyState {
-            allocator: UnsafeCell::new(BuddyAllocator::new(memory)?),
-            event_queue: SegQueue::new(),
-            owner_id: thread::current().id(),
-            ref_count: UnsafeCell::new(1),
-        };
-
-        let ptr = Box::into_raw(Box::new(state));
-        Ok(Self {
-            inner: unsafe { NonNull::new_unchecked(ptr) },
-        })
-    }
-}
-
-impl BackingPool for BuddyPool {
-    fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
-        // Enforce thread locality for allocation
-        let inner = unsafe { self.inner.as_ref() };
-        // No need to check thread ID, !Send guarantees we are on owner thread.
-
-        let allocator = unsafe { &mut *inner.allocator.get() };
-        let ref_count = unsafe { &mut *inner.ref_count.get() };
-
-        // Drain return queue
-        while let Some(params) = inner.event_queue.pop() {
-            unsafe { allocator.dealloc(params.ptr, params.context) };
-            *ref_count -= 1;
-        }
-
-        // Check if potentially refs are 0 after processing queue?
-        // Impossible because `self` is a live reference (ref_count >= 1).
-
-        match allocator.alloc(size.get()) {
-            Some((block_ptr, order)) => {
-                let capacity = MIN_BLOCK_SIZE << order;
-                // Increment ref_count for the new FixedBuf
-                *ref_count += 1;
-
-                AllocResult::Allocated {
-                    ptr: block_ptr,
-                    cap: unsafe { NonZeroUsize::new_unchecked(capacity) },
-                    // BackingPool doesn't know about registration
-                    global_index: None,
-                    context: order,
-                }
-            }
-            None => AllocResult::Failed,
-        }
-    }
-
-    fn vtable(&self) -> &'static PoolVTable {
-        &BUDDY_POOL_VTABLE
-    }
-
-    fn pool_data(&self) -> NonNull<()> {
-        let ptr = self.inner.as_ptr();
-        unsafe { NonNull::new_unchecked(ptr as *mut ()) }
     }
 }
 
@@ -647,17 +476,9 @@ mod tests {
 
     #[test]
     fn test_alloc_basic() {
-        use crate::global::{GlobalAllocator, GlobalAllocatorConfig};
-
         // Create a real ThreadMemory for testing
-        let multiplier_val = ARENA_SIZE.get() / crate::MIN_THREAD_MEMORY.get();
-        let multiplier =
-            crate::ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(multiplier_val) });
-        let config = GlobalAllocatorConfig {
-            multipliers: vec![multiplier],
-        };
-        let mut memories = GlobalAllocator::new(config).unwrap().0;
-        let memory = memories.pop().unwrap();
+        let size = ARENA_SIZE;
+        let memory = crate::ThreadMemory::new_standalone(size).unwrap();
 
         let mut allocator = BuddyAllocator::new(memory).unwrap();
         // 初始状态：1个 MaxOrder 块 (Order 13)
