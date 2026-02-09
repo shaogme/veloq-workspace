@@ -12,7 +12,7 @@ use veloq_runtime::runtime::blocking::init_blocking_pool;
 fn create_local_executor() -> LocalExecutor {
     // Increase memory to 32MB to avoid OOM in BuddyPool
     LocalExecutor::builder().build(move |registrar| {
-        use veloq_buf::{BlockTopology, ThreadMemoryMultiplier, UniformBlock};
+        use veloq_buf::{ThreadMemoryMultiplier, UniformBlock};
 
         // 16x multiplier -> 32MB (BuddyPool default block size is 2MB * 16 = 32MB)
         let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(16) });

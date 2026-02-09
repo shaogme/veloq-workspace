@@ -194,7 +194,7 @@ fn test_iocp_recv_with_buffer_pool() {
         IocpDriver::new(IocpConfig::default()).unwrap(),
     ));
 
-    use veloq_buf::{BlockTopology, ThreadMemoryMultiplier, UniformBlock};
+    use veloq_buf::{ThreadMemoryMultiplier, UniformBlock};
 
     // Setup GlobalAlloc
     // 10x multiplier -> 20MB

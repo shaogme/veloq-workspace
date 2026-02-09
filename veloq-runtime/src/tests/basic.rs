@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use veloq_buf::{BlockTopology, BufferRegion, ThreadMemoryMultiplier, UniformBlock, nz};
+use veloq_buf::{BufferRegion, ThreadMemoryMultiplier, UniformBlock, nz};
 
 fn create_local_executor() -> LocalExecutor {
     let topology = UniformBlock::hybrid(ThreadMemoryMultiplier(nz!(8)));

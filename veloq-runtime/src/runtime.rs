@@ -23,8 +23,7 @@ pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
-use veloq_buf::global::GlobalBlockPool;
-use veloq_buf::{BlockTopology, BufferRegion, ThreadMemoryMultiplier, UniformBlock, nz};
+use veloq_buf::{PoolTopology, ThreadMemoryMultiplier, UniformBlock, nz};
 use veloq_driver::driver::RemoteWaker;
 
 use veloq_blocking::init_blocking_pool;
@@ -33,19 +32,19 @@ pub mod blocking {
     pub use veloq_blocking::*;
 }
 
-struct WorkerPrep<T: BlockTopology> {
+struct WorkerPrep<T: PoolTopology> {
     shared: Arc<ExecutorShared>,
     remote_receiver: mpsc::Receiver<Task>,
     pinned_receiver: mpsc::Receiver<SpawnedTask>,
     // Worker local queue for stealable tasks
     stealable_worker: Worker<Runnable>,
-    pool: &'static GlobalBlockPool,
+    state: T::State,
     topology: T,
     config: Config,
     barrier: Arc<Barrier>,
 }
 
-pub struct RuntimeBuilder<T: BlockTopology = UniformBlock> {
+pub struct RuntimeBuilder<T: PoolTopology = UniformBlock> {
     config: Config,
     topology: T,
 }
@@ -59,13 +58,13 @@ impl RuntimeBuilder<UniformBlock> {
     }
 }
 
-impl<T: BlockTopology> RuntimeBuilder<T> {
+impl<T: PoolTopology> RuntimeBuilder<T> {
     pub fn config(mut self, config: Config) -> Self {
         self.config = config;
         self
     }
 
-    pub fn with_topology<NewT: BlockTopology>(self, topology: NewT) -> RuntimeBuilder<NewT> {
+    pub fn with_topology<NewT: PoolTopology>(self, topology: NewT) -> RuntimeBuilder<NewT> {
         RuntimeBuilder {
             config: self.config,
             topology,
@@ -83,8 +82,8 @@ impl<T: BlockTopology> RuntimeBuilder<T> {
         // Initialize the blocking pool
         init_blocking_pool(self.config.blocking_pool.clone());
 
-        // Step 1: Create Shared Global Block Pool
-        let global_pool = self.topology.create_pool(worker_count)?;
+        // Step 1: Initialize Pool Strategy State
+        let state = self.topology.init(worker_count)?;
 
         // Struct to hold per-worker resources temporarily
         struct WorkerInit {
@@ -163,7 +162,7 @@ impl<T: BlockTopology> RuntimeBuilder<T> {
             let barrier = barrier.clone();
             let config = self.config.clone();
             let topology = self.topology.clone();
-            let pool = global_pool;
+            let state = state.clone();
 
             let builder = thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
 
@@ -176,16 +175,8 @@ impl<T: BlockTopology> RuntimeBuilder<T> {
                     .with_pinned_receiver(res.pinned_rx)
                     .with_worker(res.worker)
                     .build(|registrar| {
-                        // Register global memory
-                        let info = pool.global_info();
-                        let regions = [BufferRegion::new(info.ptr, info.len)];
-                        // We register it to ensure the driver knows about it,
-                        // even if BlockBasedPool assumes it's registered at index 0.
-                        let _ = registrar
-                            .register(&regions)
-                            .expect("Failed to register global memory");
-
-                        topology.build_for_worker(pool, worker_id, registrar)
+                        // Topology determines how to build the pool and register memory
+                        topology.build(&state, worker_id, registrar)
                     });
 
                 let mut executor = executor.with_registry(registry);
@@ -211,7 +202,7 @@ impl<T: BlockTopology> RuntimeBuilder<T> {
             remote_receiver: worker_0_res.remote_rx,
             pinned_receiver: worker_0_res.pinned_rx,
             stealable_worker: worker_0_res.worker,
-            pool: global_pool,
+            state: state.clone(),
             topology: self.topology,
             config: self.config,
             barrier,
@@ -227,7 +218,7 @@ impl<T: BlockTopology> RuntimeBuilder<T> {
     }
 }
 
-pub struct Runtime<T: BlockTopology = UniformBlock> {
+pub struct Runtime<T: PoolTopology = UniformBlock> {
     handles: Vec<thread::JoinHandle<()>>,
     registry: Arc<ExecutorRegistry>,
     peer_handles: Arc<Vec<AtomicUsize>>,
@@ -236,7 +227,7 @@ pub struct Runtime<T: BlockTopology = UniformBlock> {
     worker_0_prep: Option<WorkerPrep<T>>,
 }
 
-impl<T: BlockTopology> Drop for Runtime<T> {
+impl<T: PoolTopology> Drop for Runtime<T> {
     fn drop(&mut self) {
         debug!("Runtime shutting down");
         // 1. Notify all workers to stop
@@ -267,7 +258,7 @@ impl Runtime<UniformBlock> {
     }
 }
 
-impl<T: BlockTopology> Runtime<T> {
+impl<T: PoolTopology> Runtime<T> {
     pub fn spawner(&self) -> Spawner {
         Spawner::new(self.registry.clone())
     }
@@ -295,7 +286,7 @@ impl<T: BlockTopology> Runtime<T> {
             .take()
             .expect("Runtime already started or invalid state");
 
-        let pool = prep.pool;
+        let state = prep.state;
         let topology = prep.topology.clone();
 
         let executor = LocalExecutor::builder()
@@ -305,15 +296,8 @@ impl<T: BlockTopology> Runtime<T> {
             .with_pinned_receiver(prep.pinned_receiver) // Inject pinned receiver
             .with_worker(prep.stealable_worker) // Inject stealable worker
             .build(|registrar| {
-                // Register global memory (Worker 0)
-                let info = pool.global_info();
-                let regions = [BufferRegion::new(info.ptr, info.len)];
-                let _ = registrar
-                    .register(&regions)
-                    .expect("Failed to register global memory");
-
                 // Bind Buffer Pool using stored prep data
-                topology.build_for_worker(pool, 0, registrar)
+                topology.build(&state, 0, registrar)
             });
 
         let mut executor = executor.with_registry(self.registry.clone());

@@ -2,8 +2,7 @@ use std::num::NonZeroUsize;
 use std::sync::mpsc::channel;
 use std::time::Instant;
 use veloq_buf::{
-    BlockTopology, BufPool, BufferRegion, BufferRegistrar, FixedBuf, ThreadMemoryMultiplier,
-    UniformBlock,
+    BufPool, BufferRegion, BufferRegistrar, FixedBuf, ThreadMemoryMultiplier, UniformBlock,
 };
 
 struct DummyRegistrar;

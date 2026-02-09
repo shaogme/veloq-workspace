@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use veloq_blocking::{BlockingPoolConfig, init_blocking_pool};
-use veloq_buf::{BlockTopology, BufferRegion, ThreadMemoryMultiplier, UniformBlock, nz};
+use veloq_buf::{BufferRegion, ThreadMemoryMultiplier, UniformBlock, nz};
 
 fn create_local_executor() -> LocalExecutor {
     let topology = UniformBlock::hybrid(ThreadMemoryMultiplier(nz!(8)));

@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use veloq_buf::{BlockTopology, BufferRegion, ThreadMemoryMultiplier, UniformBlock, nz};
+use veloq_buf::{BufferRegion, ThreadMemoryMultiplier, UniformBlock, nz};
 
 fn create_local_executor() -> LocalExecutor {
     let topology = UniformBlock::hybrid(ThreadMemoryMultiplier(nz!(8)));

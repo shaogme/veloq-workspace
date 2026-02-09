@@ -15,7 +15,7 @@ use veloq_runtime::spawn_local;
 
 fn create_local_executor() -> LocalExecutor {
     LocalExecutor::builder().build(move |registrar| {
-        use veloq_buf::{BlockTopology, ThreadMemoryMultiplier, UniformBlock};
+        use veloq_buf::{ThreadMemoryMultiplier, UniformBlock};
 
         // 128x multiplier -> ~256MB
         let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(128) });

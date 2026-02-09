@@ -124,7 +124,6 @@ pub enum AllocResult {
 }
 
 impl AllocResult {
-    #[inline]
     pub fn into_buf(self, pool: &dyn BackingPool) -> Option<FixedBuf> {
         match self {
             AllocResult::Allocated {
@@ -208,76 +207,34 @@ pub trait BufPool: std::fmt::Debug + 'static {
     fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf>;
 }
 
-/// 核心 Trait：定义 Buffer Pool 的规格
-/// 职责：
-/// 1. 声明所需的内存大小 (Binding Size)
-/// 2. 通过分配好的内存构建 Pool (Building)
-pub trait PoolSpec: Clone + Send + Sync + 'static {
-    /// 此配置所需的内存大小。
-    const MEMORY_REQUIREMENT: NonZeroUsize;
-
-    /// 消耗自身配置，将分配好的 ThreadMemory 和 Registrar 组装成 AnyBufPool。
-    fn build(
-        self,
-        memory: crate::ThreadMemory,
-        registrar: Box<dyn BufferRegistrar>,
-        global_info: crate::global::GlobalMemoryInfo,
-    ) -> AnyBufPool;
-}
-
 /// 定义 Runtime 所有工作线程的缓冲池拓扑结构
+/// Defines the buffer pool topology for the runtime.
+///
+/// This trait manages the creation and distribution of buffer pools across worker threads.
+/// It allows for diverse configurations:
+/// - Shared Global Pools (e.g., `UniformBlock`)
+/// - Independent Per-Thread Pools
+/// - Hybrid approaches
 pub trait PoolTopology: Clone + Send + Sync + 'static {
-    /// 步骤 1: 计算布局
-    /// 返回一个向量，描述每个 Worker (0..N) 所需的内存大小。
-    /// Runtime 将根据此列表向操作系统申请对齐的内存。
-    fn memory_requirements(&self, worker_count: usize) -> Vec<NonZeroUsize>;
+    /// Shared state initialized once at startup.
+    /// This is passed to every worker during pool construction.
+    /// Must be `Clone` (shared via `Arc` or `&'static`) and thread-safe.
+    type State: Clone + Send + Sync + 'static;
 
-    /// 步骤 2: 构建实例
-    /// 为指定的 worker_index 构建具体的 Pool。
-    /// 传入的 `memory` 大小保证与 `memory_requirements` 中返回的一致。
+    /// Initialize the global/shared state.
+    /// Called once by the Runtime Builder.
+    fn init(&self, worker_count: usize) -> std::io::Result<Self::State>;
+
+    /// Build the `AnyBufPool` for a specific worker.
+    /// Called within each worker thread.
+    ///
+    /// Responsibilities:
+    /// 1. Register necessary memory regions via `registrar`.
+    /// 2. Construct and return the `AnyBufPool`.
     fn build(
         &self,
-        worker_index: usize,
-        memory: crate::ThreadMemory,
-        registrar: Box<dyn BufferRegistrar>,
-        global_info: crate::global::GlobalMemoryInfo,
-    ) -> AnyBufPool;
-}
-
-// ============================================================================
-// Block-Based Topology (New Architecture)
-// ============================================================================
-
-/// Block 拓扑结构 trait
-///
-/// 与 PoolTopology 不同，BlockTopology 使用 GlobalBlockPool，
-/// 所有线程共享同一个 Block Pool。
-pub trait BlockTopology: Clone + Send + Sync + 'static {
-    /// 为所有工作线程创建 GlobalBlockPool
-    ///
-    /// # 参数
-    /// - `worker_count`: 工作线程数量
-    ///
-    /// # 返回
-    /// `GlobalBlockPool`，包含所有线程的 N*2 个 Block
-    fn create_pool(
-        &self,
-        worker_count: usize,
-    ) -> std::io::Result<&'static crate::global::GlobalBlockPool>;
-
-    /// 为指定的 worker 构建 BufPool
-    ///
-    /// # 参数
-    /// - `pool`: 全局 Block Pool 的引用
-    /// - `worker_index`: 工作线程索引
-    /// - `registrar`: 驱动注册器
-    ///
-    /// # 返回
-    /// 该 worker 的 BufPool 实例
-    fn build_for_worker(
-        &self,
-        pool: &'static crate::global::GlobalBlockPool,
-        worker_index: usize,
+        state: &Self::State,
+        worker_idx: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool;
 }
@@ -331,13 +288,29 @@ impl UniformBlock {
             )
         })
     }
-}
 
-impl BlockTopology for UniformBlock {
-    fn create_pool(
+    // Backward compatibility shim for tests
+    pub fn create_pool(
         &self,
         worker_count: usize,
     ) -> std::io::Result<&'static crate::global::GlobalBlockPool> {
+        self.init(worker_count)
+    }
+
+    pub fn build_for_worker(
+        &self,
+        pool: &'static crate::global::GlobalBlockPool,
+        worker_index: usize,
+        registrar: Box<dyn BufferRegistrar>,
+    ) -> AnyBufPool {
+        self.build(&pool, worker_index, registrar)
+    }
+}
+
+impl PoolTopology for UniformBlock {
+    type State = &'static crate::global::GlobalBlockPool;
+
+    fn init(&self, worker_count: usize) -> std::io::Result<Self::State> {
         let config = crate::global::GlobalAllocatorConfig {
             multipliers: vec![self.multiplier; worker_count],
         };
@@ -348,13 +321,14 @@ impl BlockTopology for UniformBlock {
             Box::new(move |thread_idx, memory| (factory)(thread_idx, memory)),
         )?;
 
+        // Leak to get &'static life
         Ok(Box::leak(Box::new(pool)))
     }
 
-    fn build_for_worker(
+    fn build(
         &self,
-        pool: &'static crate::global::GlobalBlockPool,
-        worker_index: usize,
+        pool: &Self::State,
+        worker_idx: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool {
         // 在 Block 架构中，我们需要为每个 Worker 注册全局内存块
@@ -373,92 +347,8 @@ impl BlockTopology for UniformBlock {
             }
         };
 
-        let block_pool = BlockBasedPool::new(pool, worker_index, global_index);
+        let block_pool = BlockBasedPool::new(pool, worker_idx, global_index);
         AnyBufPool::new(block_pool)
-    }
-}
-
-impl std::fmt::Debug for UniformBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UniformBlock")
-            .field("multiplier", &self.multiplier)
-            .field("factory", &"<function>")
-            .finish()
-    }
-}
-
-// 组合注册池
-
-/// A wrapper that binds a backing pool with a registrar.
-/// This is the bridge between raw memory and driver-aware buffers.
-#[derive(Clone)]
-pub struct RegisteredPool<P> {
-    pool: P,
-    // Rc is required to satisfy Clone for AnyBufPool
-    #[allow(dead_code)]
-    registrar: std::rc::Rc<dyn BufferRegistrar>,
-    registration_ids: std::rc::Rc<Vec<usize>>,
-}
-
-impl<P: BackingPool> RegisteredPool<P> {
-    pub fn new(
-        pool: P,
-        registrar: Box<dyn BufferRegistrar>,
-        global_info: crate::global::GlobalMemoryInfo,
-    ) -> std::io::Result<Self> {
-        // God View Registration: Register the SINGLE global block as Index 0.
-        let regions = [BufferRegion {
-            ptr: global_info.ptr,
-            len: global_info.len,
-        }];
-        let ids = registrar.register(&regions)?;
-        Ok(Self {
-            pool,
-            registrar: std::rc::Rc::from(registrar),
-            registration_ids: std::rc::Rc::new(ids),
-        })
-    }
-}
-
-impl<P: BackingPool> std::fmt::Debug for RegisteredPool<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegisteredPool")
-            .field("pool", &self.pool)
-            .field("registration_ids", &self.registration_ids)
-            .finish()
-    }
-}
-
-impl<P: BackingPool> BufPool for RegisteredPool<P> {
-    fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf> {
-        match self.pool.alloc_mem(len) {
-            AllocResult::Allocated {
-                ptr, cap, context, ..
-            } => {
-                // Use the first registration ID as the global index.
-                // For complex multi-region pools, we might need mapping logic,
-                // but currently Buddy/Hybrid are single-region arenas.
-                let global_index = self
-                    .registration_ids
-                    .first()
-                    .copied()
-                    .and_then(|idx| GlobalIndex::new(idx as u16));
-
-                unsafe {
-                    let mut buf = FixedBuf::new(
-                        ptr,
-                        cap,
-                        global_index,
-                        self.pool.pool_data(),
-                        self.pool.vtable(),
-                        context,
-                    );
-                    buf.set_len(len);
-                    Some(buf)
-                }
-            }
-            AllocResult::Failed => None,
-        }
     }
 }
 
