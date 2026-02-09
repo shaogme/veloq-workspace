@@ -75,13 +75,13 @@ veloq-buf/src/
 ### 4.2 核心抽象 (`buffer.rs`)
 
 **`FixedBuf`**:
-用户持有的最终句柄。
+用户持有的最终句柄，类似于标准库的 `Box<[u8]>` 但带有自定义释放逻辑。
 ```rust
 pub struct FixedBuf {
     ptr: NonNull<u8>,
     cap: NonZeroUsize,
     global_index: Option<GlobalIndex>, // 注册后的 Buffer Index (io_uring use)
-    pool_data: NonNull<()>,            // 指向 LocalPoolState 的指针
+    pool_data: NonNull<()>,            // 指向 GlobalBlockPool 的静态引用 ('static)
     vtable: &'static PoolVTable,       // 虚函数表
     context: usize,                    // 分配上下文 (High 32: Block Index, Low 32: Alloc Context)
     ...
@@ -91,7 +91,7 @@ pub struct FixedBuf {
 
 **`BlockBasedPool`**:
 这是通常用户使用的具体类型，对应单个线程。
-1.  持有 `Arc<LocalPoolState>`，其中包含对 `GlobalBlockPool` 的引用。
+1.  **Global Static 架构**: 直接持有 `&'static GlobalBlockPool`。为了减少原子操作竞争（Atomic Contention），全局 Pool 被设计为进程级静态生命周期（通过 `Box::leak`），从而避免了在每个 Buffer 创建/销毁时修改 `Arc` 引用计数。
 2.  `alloc()`: 调用 `GlobalBlockPool::alloc`，按照 4 级优先级策略尝试获取内存。
 3.  生成 `FixedBuf` 时，将 `Block Index` 编码进 `context` 的高 32 位，确保释放时能路由回正确的 `Block`。
 

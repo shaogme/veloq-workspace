@@ -210,6 +210,10 @@ impl LocalExecutor {
         self
     }
 
+    pub fn set_id(&mut self, id: usize) {
+        self.id = id;
+    }
+
     pub fn handle(&self) -> ExecutorHandle {
         ExecutorHandle {
             id: self.id,

@@ -39,7 +39,7 @@ struct WorkerPrep<T: BlockTopology> {
     pinned_receiver: mpsc::Receiver<SpawnedTask>,
     // Worker local queue for stealable tasks
     stealable_worker: Worker<Runnable>,
-    pool: Arc<GlobalBlockPool>,
+    pool: &'static GlobalBlockPool,
     topology: T,
     config: Config,
     barrier: Arc<Barrier>,
@@ -163,13 +163,13 @@ impl<T: BlockTopology> RuntimeBuilder<T> {
             let barrier = barrier.clone();
             let config = self.config.clone();
             let topology = self.topology.clone();
-            let pool = global_pool.clone();
+            let pool = global_pool;
 
             let builder = thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
 
             let handle = builder.spawn(move || {
                 debug!("Worker {} thread started", worker_id);
-                let mut executor = LocalExecutor::builder()
+                let executor = LocalExecutor::builder()
                     .config(config)
                     .with_shared(res.shared)
                     .with_remote_receiver(res.remote_rx)
@@ -188,10 +188,11 @@ impl<T: BlockTopology> RuntimeBuilder<T> {
                         topology.build_for_worker(pool, worker_id, registrar)
                     });
 
-                executor = executor.with_registry(registry);
-                executor = executor.with_id(worker_id);
+                let mut executor = executor.with_registry(registry);
+                executor.set_id(worker_id);
 
                 // Publish Handle
+                // Accessing handles inside Arc<Vec<...>>
                 peer_handles[worker_id].store(executor.raw_driver_handle(), Ordering::Release);
 
                 // Wait for all workers to be ready
@@ -294,10 +295,10 @@ impl<T: BlockTopology> Runtime<T> {
             .take()
             .expect("Runtime already started or invalid state");
 
-        let pool = prep.pool.clone();
+        let pool = prep.pool;
         let topology = prep.topology.clone();
 
-        let mut executor = LocalExecutor::builder()
+        let executor = LocalExecutor::builder()
             .config(prep.config)
             .with_shared(prep.shared) // Inject shared state
             .with_remote_receiver(prep.remote_receiver) // Inject remote receiver
@@ -315,8 +316,8 @@ impl<T: BlockTopology> Runtime<T> {
                 topology.build_for_worker(pool, 0, registrar)
             });
 
-        executor = executor.with_registry(self.registry.clone());
-        executor = executor.with_id(0); // Set Worker ID (Worker 0)
+        let mut executor = executor.with_registry(self.registry.clone());
+        executor.set_id(0); // Set Worker ID (Worker 0)
 
         // Publish Handle
         let fd = executor.raw_driver_handle();

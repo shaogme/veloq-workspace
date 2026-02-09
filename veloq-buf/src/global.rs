@@ -327,7 +327,6 @@ mod tests {
     #[test]
     fn test_block_based_pool_integration() {
         use crate::buffer::{BlockBasedPool, BufPool};
-        use std::sync::Arc;
 
         let config = GlobalAllocatorConfig {
             multipliers: vec![
@@ -341,10 +340,10 @@ mod tests {
             Box::new(HybridAllocator::new(memory).expect("Failed to create allocator"))
         });
 
-        let global_pool = Arc::new(GlobalAllocator::new(config, factory).unwrap());
+        let global_pool = Box::leak(Box::new(GlobalAllocator::new(config, factory).unwrap()));
 
         // 为线程 0 创建 BlockBasedPool
-        let pool = BlockBasedPool::new(global_pool.clone(), 0, None);
+        let pool = BlockBasedPool::new(global_pool, 0, None);
 
         // 测试分配
         let buf = pool.alloc(crate::nz!(4096)).expect("Allocation failed");

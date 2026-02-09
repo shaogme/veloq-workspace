@@ -52,8 +52,6 @@ use std::{
     sync::Arc,
 };
 
-use crossbeam_utils::CachePadded;
-
 pub mod buddy;
 pub mod hybrid;
 
@@ -265,7 +263,7 @@ pub trait BlockTopology: Clone + Send + Sync + 'static {
     fn create_pool(
         &self,
         worker_count: usize,
-    ) -> std::io::Result<Arc<crate::global::GlobalBlockPool>>;
+    ) -> std::io::Result<&'static crate::global::GlobalBlockPool>;
 
     /// 为指定的 worker 构建 BufPool
     ///
@@ -278,7 +276,7 @@ pub trait BlockTopology: Clone + Send + Sync + 'static {
     /// 该 worker 的 BufPool 实例
     fn build_for_worker(
         &self,
-        pool: Arc<crate::global::GlobalBlockPool>,
+        pool: &'static crate::global::GlobalBlockPool,
         worker_index: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool;
@@ -339,7 +337,7 @@ impl BlockTopology for UniformBlock {
     fn create_pool(
         &self,
         worker_count: usize,
-    ) -> std::io::Result<Arc<crate::global::GlobalBlockPool>> {
+    ) -> std::io::Result<&'static crate::global::GlobalBlockPool> {
         let config = crate::global::GlobalAllocatorConfig {
             multipliers: vec![self.multiplier; worker_count],
         };
@@ -350,12 +348,12 @@ impl BlockTopology for UniformBlock {
             Box::new(move |thread_idx, memory| (factory)(thread_idx, memory)),
         )?;
 
-        Ok(Arc::new(pool))
+        Ok(Box::leak(Box::new(pool)))
     }
 
     fn build_for_worker(
         &self,
-        pool: Arc<crate::global::GlobalBlockPool>,
+        pool: &'static crate::global::GlobalBlockPool,
         worker_index: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool {
@@ -701,35 +699,14 @@ impl std::fmt::Debug for AnyBufPool {
     }
 }
 
-// ============================================================================
-// Block-Based Pool (New Architecture)
-// ============================================================================
-
-// ============================================================================
-// Block-Based Pool (New Architecture with Local & Global State)
-// ============================================================================
-
-/// Thread-Local Pool State wrapper.
-///
-/// This structure acts as a thread-local anchor for the GlobalBlockPool.
-/// Each worker thread (and its associated BlockBasedPool) holds its own instance of `LocalPoolState`
-/// wrapped in an `Arc`.
-///
-/// When `FixedBuf` takes a reference to the pool, it increments the ref-count of this LOCAL
-/// `Arc<LocalPoolState>`, effectively sharding the reference counting traffic.
-/// The underlying `GlobalBlockPool` is kept alive by `LocalPoolState` holding a strong reference to it.
-struct LocalPoolState {
-    global: CachePadded<Arc<crate::global::GlobalBlockPool>>,
-}
-
 /// 基于 GlobalBlockPool 的 Pool 实现
 ///
 /// 这个 Pool 对应单个线程，通过 GlobalBlockPool 进行分配和释放。
 /// context 字段编码了 block_idx，以便在释放时找到正确的 Block。
 #[derive(Clone)]
 pub struct BlockBasedPool {
-    /// 本地状态 (Sharded Ref-Counting Anchor)
-    state: Arc<LocalPoolState>,
+    /// 全局 Block Pool 的静态引用
+    pool: &'static crate::global::GlobalBlockPool,
     /// 当前线程的索引
     thread_idx: usize,
     /// 全局索引（用于驱动注册）
@@ -739,14 +716,12 @@ pub struct BlockBasedPool {
 impl BlockBasedPool {
     /// 创建新的 BlockBasedPool
     pub fn new(
-        pool: Arc<crate::global::GlobalBlockPool>,
+        pool: &'static crate::global::GlobalBlockPool,
         thread_idx: usize,
         global_index: Option<GlobalIndex>,
     ) -> Self {
         Self {
-            state: Arc::new(LocalPoolState {
-                global: CachePadded::new(pool),
-            }),
+            pool,
             thread_idx,
             global_index,
         }
@@ -765,7 +740,7 @@ impl std::fmt::Debug for BlockBasedPool {
 impl BackingPool for BlockBasedPool {
     fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
         // 通过 GlobalBlockPool 的 4 级优先级分配
-        if let Some((block_idx, result)) = self.state.global.alloc(self.thread_idx, size.get()) {
+        if let Some((block_idx, result)) = self.pool.alloc(self.thread_idx, size.get()) {
             // 将 block_idx 编码到 context 的高 32 位
             let combined_context = ((block_idx as usize) << 32) | (result.context & 0xFFFFFFFF);
 
@@ -785,10 +760,9 @@ impl BackingPool for BlockBasedPool {
     }
 
     fn pool_data(&self) -> NonNull<()> {
-        // Critical Fix: FixedBuf holds a strong reference to LocalPoolState (wrapper).
-        // This increments the LOCAL Arc counter, avoiding global contention.
-        let arc = self.state.clone();
-        let ptr = Arc::into_raw(arc) as *mut ();
+        // Since we are using &'static GlobalBlockPool, we can just cast it to NonNull<()>.
+        // This is safe because the reference lives forever.
+        let ptr = self.pool as *const crate::global::GlobalBlockPool as *mut ();
         unsafe { NonNull::new_unchecked(ptr) }
     }
 }
@@ -806,36 +780,29 @@ static BLOCK_BASED_POOL_VTABLE: PoolVTable = PoolVTable {
 };
 
 unsafe fn block_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    // 1. Recover ownership of the Arc<LocalPoolState>
-    // This pointer was created via Arc::into_raw in pool_data()
-    let raw_ptr = pool_data.as_ptr() as *const LocalPoolState;
-    let state = unsafe { Arc::from_raw(raw_ptr) };
+    // 1. Cast back to &'static GlobalBlockPool
+    // We do NOT drop anything here because it's a static reference.
+    let pool = unsafe { &*(pool_data.as_ptr() as *const crate::global::GlobalBlockPool) };
 
     // 2. Extract block_idx from context (high 32 bits)
     let block_idx = (params.context >> 32) as usize;
     let allocator_context = params.context & 0xFFFFFFFF;
 
-    // 3. Delegate to GlobalBlockPool via LocalPoolState
+    // 3. Delegate to GlobalBlockPool
     unsafe {
-        state
-            .global
-            .dealloc(block_idx, params.ptr, params.cap.get(), allocator_context);
+        pool.dealloc(block_idx, params.ptr, params.cap.get(), allocator_context);
     }
-
-    // 4. state (Arc) goes out of scope here and is dropped, decrementing the LOCAL ref count.
 }
 
 unsafe fn block_based_resolve_region_info_shim(
     pool_data: NonNull<()>,
     buf: &FixedBuf,
 ) -> (usize, usize) {
-    // 1. Access LocalPoolState temporarily
-    // We do NOT take ownership (do not drop the Arc), just use the pointer.
-    let raw_ptr = pool_data.as_ptr() as *const LocalPoolState;
-    let state = unsafe { &*raw_ptr };
+    // 1. Cast back to &'static GlobalBlockPool
+    let pool = unsafe { &*(pool_data.as_ptr() as *const crate::global::GlobalBlockPool) };
 
     // 2. Get base address from global info
-    let global_info = state.global.global_info();
+    let global_info = pool.global_info();
     let base = global_info.ptr.as_ptr() as usize;
     let ptr = buf.as_ptr() as usize;
 
