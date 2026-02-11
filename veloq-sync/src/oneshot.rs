@@ -7,9 +7,32 @@ use veloq_atomic_waker::AtomicWaker;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering::{self, Acquire};
+use std::sync::atomic::Ordering;
 use std::task::Poll::{Pending, Ready};
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
+
+/// Creates a new one-shot channel for sending a single value.
+///
+/// The function returns separate `Sender` and `Receiver` handles. The `Sender`
+/// handle is used by the producer to send the value. The `Receiver` handle is
+/// used by the consumer to receive the value.
+///
+/// Each handle can only be used once.
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    let inner = Arc::new(Inner {
+        state: AtomicUsize::new(State::new().as_usize()),
+        value: UnsafeCell::new(None),
+        tx_task: AtomicWaker::new(),
+        rx_task: AtomicWaker::new(),
+    });
+
+    let tx = Sender {
+        inner: Some(inner.clone()),
+    };
+    let rx = Receiver { inner: Some(inner) };
+
+    (tx, rx)
+}
 
 #[derive(Debug)]
 pub struct Sender<T> {
@@ -22,13 +45,9 @@ pub struct Receiver<T> {
 }
 
 pub mod error {
-    //! `Oneshot` error types.
-
     use std::fmt;
 
     /// Error returned by the `Future` implementation for `Receiver`.
-    ///
-    /// This error is returned by the receiver when the sender is dropped without sending.
     #[derive(Debug, Eq, PartialEq, Clone)]
     pub struct RecvError(pub ());
 
@@ -37,12 +56,9 @@ pub mod error {
     pub enum TryRecvError {
         /// The send half of the channel has not yet sent a value.
         Empty,
-
         /// The send half of the channel was dropped without sending a value.
         Closed,
     }
-
-    // ===== impl RecvError =====
 
     impl fmt::Display for RecvError {
         fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -51,8 +67,6 @@ pub mod error {
     }
 
     impl std::error::Error for RecvError {}
-
-    // ===== impl TryRecvError =====
 
     impl fmt::Display for TryRecvError {
         fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -72,8 +86,8 @@ struct Inner<T> {
     /// Manages the state of the inner cell.
     state: AtomicUsize,
 
-    /// The value. This is set by `Sender` and read by `Receiver`. The state of
-    /// the cell is tracked by `state`.
+    /// The value. This is set by `Sender` and read by `Receiver`.
+    /// The state of the cell is tracked by `state`.
     value: UnsafeCell<Option<T>>,
 
     /// The task to notify when the receiver drops without consuming the value.
@@ -86,36 +100,36 @@ struct Inner<T> {
 #[derive(Clone, Copy)]
 struct State(usize);
 
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let inner = Arc::new(Inner {
-        state: AtomicUsize::new(State::new().as_usize()),
-        value: UnsafeCell::new(None),
-        tx_task: AtomicWaker::new(),
-        rx_task: AtomicWaker::new(),
-    });
-
-    let tx = Sender {
-        inner: Some(inner.clone()),
-    };
-    let rx = Receiver { inner: Some(inner) };
-
-    (tx, rx)
-}
+// ===== impl Sender =====
 
 impl<T> Sender<T> {
+    /// Sends a value.
+    ///
+    /// This method consumes the sender, ensuring that it is only called once.
+    ///
+    /// If the receiver has already hung up, this method returns the error `Err(T)`.
     pub fn send(mut self, t: T) -> Result<(), T> {
-        let inner = self.inner.take().unwrap();
+        let inner = self
+            .inner
+            .take()
+            .expect("Sender::inner cannot be None unless consumed");
 
+        // Write the value to the unsafe cell.
+        // SAFETY: We have not yet set the `VALUE_SENT` bit (via `complete`),
+        // so we are the only one accessing the cell.
         unsafe { inner.value.with_mut(|ptr| *ptr = Some(t)) };
 
+        // Attempt to transition the state to complete.
         if !inner.complete() {
+            // If `complete()` returns false, the channel was closed by the receiver.
+            // We must retrieve the value to return it to the caller.
+            //
+            // SAFETY: `complete()` failing implies the `CLOSED` bit is set.
+            // When `CLOSED` is set, the receiver will strictly NOT access the value
+            // (see `Receiver::try_recv` logic regarding priority).
+            // Since we failed to set `VALUE_SENT`, the receiver considers the channel empty/closed.
+            // Therefore, we have exclusive access to take the value back.
             unsafe {
-                // SAFETY: The receiver will not access the `UnsafeCell` unless
-                // the channel has been marked as "complete". Calling
-                // `complete()` will return true if this bit is set, and false
-                // if it is not set. Thus, if `complete()` returned false, it is
-                // safe for us to access the value, because we know that the
-                // receiver will not.
                 return Err(inner.consume_value().unwrap());
             }
         }
@@ -123,34 +137,32 @@ impl<T> Sender<T> {
         Ok(())
     }
 
+    /// Waits for the channel to be closed.
     pub async fn closed(&mut self) {
         use std::future::poll_fn;
-
-        let closed = poll_fn(|cx| self.poll_closed(cx));
-
-        closed.await;
+        poll_fn(|cx| self.poll_closed(cx)).await;
     }
 
+    /// Returns `true` if the receiver has closed the channel.
     pub fn is_closed(&self) -> bool {
         let inner = self.inner.as_ref().unwrap();
-
-        let state = State::load(&inner.state, Acquire);
+        let state = State::load(&inner.state, Ordering::Acquire);
         state.is_closed()
     }
 
+    /// Polls to check if the receiver has closed the channel.
     pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         let inner = self.inner.as_ref().unwrap();
 
-        let state = State::load(&inner.state, Acquire);
-
-        if state.is_closed() {
+        // Fast path check
+        if State::load(&inner.state, Ordering::Acquire).is_closed() {
             return Ready(());
         }
 
         inner.tx_task.register(cx.waker());
 
-        let state = State::load(&inner.state, Acquire);
-        if state.is_closed() {
+        // Double check after registration to avoid races
+        if State::load(&inner.state, Ordering::Acquire).is_closed() {
             return Ready(());
         }
 
@@ -160,83 +172,90 @@ impl<T> Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
+        // If `self.inner` is Some, it means `send` was not called.
+        // We trigger completion (effectively sending `None`) to notify the receiver.
         if let Some(inner) = self.inner.as_ref() {
             inner.complete();
         }
     }
 }
 
+// ===== impl Receiver =====
+
 impl<T> Receiver<T> {
+    /// Prevents the channel from ever delivering a message.
     pub fn close(&mut self) {
         if let Some(inner) = self.inner.as_ref() {
             inner.close();
         }
     }
 
+    /// Returns true if the channel has terminated (inner is gone).
     pub fn is_terminated(&self) -> bool {
         self.inner.is_none()
     }
 
+    /// Checks if the channel is empty.
+    ///
+    /// Returns true if the value has not been sent yet or if the value has already been consumed.
     pub fn is_empty(&self) -> bool {
         let Some(inner) = self.inner.as_ref() else {
-            // The channel has already terminated.
             return true;
         };
 
-        let state = State::load(&inner.state, Acquire);
+        let state = State::load(&inner.state, Ordering::Acquire);
         if state.is_complete() {
-            // SAFETY: If `state.is_complete()` returns true, then the
-            // `VALUE_SENT` bit has been set and the sender side of the
-            // channel will no longer attempt to access the inner
-            // `UnsafeCell`. Therefore, it is now safe for us to access the
-            // cell.
-            //
-            // The channel is empty if it does not have a value.
+            // SAFETY: `is_complete` implies `VALUE_SENT` is set.
+            // This synchronizes with the sender's writes.
+            // Only the receiver can access now.
             unsafe { !inner.has_value() }
         } else {
-            // The receiver closed the channel or no value has been sent yet.
             true
         }
     }
 
+    /// Attempts to receive a value.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        let result = if let Some(inner) = self.inner.as_ref() {
-            let state = State::load(&inner.state, Acquire);
-
-            if state.is_complete() {
-                // SAFETY: If `state.is_complete()` returns true, then the
-                // `VALUE_SENT` bit has been set and the sender side of the
-                // channel will no longer attempt to access the inner
-                // `UnsafeCell`. Therefore, it is now safe for us to access the
-                // cell.
-                match unsafe { inner.consume_value() } {
-                    Some(value) => Ok(value),
-                    None => Err(TryRecvError::Closed),
-                }
-            } else if state.is_closed() {
-                Err(TryRecvError::Closed)
-            } else {
-                // Not ready, this does not clear `inner`
-                return Err(TryRecvError::Empty);
-            }
-        } else {
-            Err(TryRecvError::Closed)
+        let inner = match self.inner.as_ref() {
+            Some(inner) => inner,
+            None => return Err(TryRecvError::Closed),
         };
 
-        self.inner = None;
-        result
+        let state = State::load(&inner.state, Ordering::Acquire);
+
+        if state.is_complete() {
+            // SAFETY: `VALUE_SENT` is set, exclusive access granted to Receiver.
+            match unsafe { inner.consume_value() } {
+                Some(value) => {
+                    // We successfully consumed the value, so we can drop the reference to inner.
+                    self.inner = None;
+                    Ok(value)
+                }
+                // Sender dropped without sending a value.
+                None => {
+                    self.inner = None;
+                    Err(TryRecvError::Closed)
+                }
+            }
+        } else if state.is_closed() {
+            self.inner = None;
+            Err(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
+        }
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.as_ref() {
+            // Mark as closed to notify Sender.
             let state = inner.close();
 
+            // If the sender had already completed sending, we are responsible for cleaning up the value.
             if state.is_complete() {
-                // SAFETY: we have ensured that the `VALUE_SENT` bit has been set,
-                // so only the receiver can access the value.
-                drop(unsafe { inner.consume_value() });
+                // SAFETY: `VALUE_SENT` set, we own the data.
+                unsafe { drop(inner.consume_value()) };
             }
         }
     }
@@ -246,20 +265,62 @@ impl<T> Future for Receiver<T> {
     type Output = Result<T, RecvError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let ret = if let Some(inner) = self.as_ref().get_ref().inner.as_ref() {
-            let res = ready!(inner.poll_recv(cx)).map_err(Into::into);
+        // If inner is None, we've already consumed the result or been polled to completion.
+        let inner = self
+            .inner
+            .as_ref()
+            .expect("Receiver polled after completion");
 
-            res
+        // Fast path: check if ready without registering waker.
+        let state = State::load(&inner.state, Ordering::Acquire);
+        if state.is_complete() {
+            // SAFETY: standard consume logic
+            return match unsafe { inner.consume_value() } {
+                Some(v) => {
+                    self.inner = None;
+                    Ready(Ok(v))
+                }
+                None => {
+                    self.inner = None;
+                    Ready(Err(RecvError(())))
+                }
+            };
+        }
+
+        if state.is_closed() {
+            self.inner = None;
+            return Ready(Err(RecvError(())));
+        }
+
+        // Register waker
+        inner.rx_task.register(cx.waker());
+
+        // Double check state
+        let state = State::load(&inner.state, Ordering::Acquire);
+        if state.is_complete() {
+            match unsafe { inner.consume_value() } {
+                Some(v) => {
+                    self.inner = None;
+                    Ready(Ok(v))
+                }
+                None => {
+                    self.inner = None;
+                    Ready(Err(RecvError(())))
+                }
+            }
+        } else if state.is_closed() {
+            self.inner = None;
+            Ready(Err(RecvError(())))
         } else {
-            panic!("called after complete");
-        };
-
-        self.inner = None;
-        Ready(ret)
+            Pending
+        }
     }
 }
 
+// ===== impl Inner =====
+
 impl<T> Inner<T> {
+    /// Try to set the state to complete. Returns `true` if successful, `false` if closed.
     fn complete(&self) -> bool {
         let prev = State::set_complete(&self.state);
 
@@ -267,83 +328,32 @@ impl<T> Inner<T> {
             return false;
         }
 
-        // Try to consume the waker to avoid cloning it.
-        // AtomicWaker::take() handles the synchronization.
-        if let Some(waker) = self.rx_task.take() {
-            waker.wake();
-        }
-
+        // Notify the receiver task.
+        self.rx_task.wake();
         true
     }
 
-    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
-        // Load the state
-        let mut state = State::load(&self.state, Acquire);
-
-        if state.is_complete() {
-            match unsafe { self.consume_value() } {
-                Some(value) => Ready(Ok(value)),
-                None => Ready(Err(RecvError(()))),
-            }
-        } else if state.is_closed() {
-            Ready(Err(RecvError(())))
-        } else {
-            self.rx_task.register(cx.waker());
-
-            // Check the state again to avoid race conditions.
-            // If the state became complete while we were registering,
-            // the wake might have been missed or we might have overwritten
-            // the waker that was about to be woken.
-            // However, AtomicWaker handles the lost wake case: if wake() was called
-            // concurrently with register(), AtomicWaker ensures the task is woken.
-            // We just need to check if the value is ready now.
-            state = State::load(&self.state, Acquire);
-
-            if state.is_complete() {
-                match unsafe { self.consume_value() } {
-                    Some(value) => Ready(Ok(value)),
-                    None => Ready(Err(RecvError(()))),
-                }
-            } else if state.is_closed() {
-                Ready(Err(RecvError(())))
-            } else {
-                Pending
-            }
-        }
-    }
-
-    /// Called by `Receiver` to indicate that the value will never be received.
+    /// Set the state to closed and notify the sender logic.
     fn close(&self) -> State {
         let prev = State::set_closed(&self.state);
-
-        // We can just wake by ref or take here. AtomicWaker::wake() is safe.
+        // Notify the sender task (waiting in `closed()`).
         self.tx_task.wake();
-
         prev
     }
 
-    /// Consumes the value. This function does not check `state`.
+    /// Consumes the value.
     ///
     /// # Safety
-    ///
-    /// Calling this method concurrently on multiple threads will result in a
-    /// data race. The `VALUE_SENT` state bit is used to ensure that only the
-    /// sender *or* the receiver will call this method at a given point in time.
-    /// If `VALUE_SENT` is not set, then only the sender may call this method;
-    /// if it is set, then only the receiver may call this method.
+    /// Must only be called if `VALUE_SENT` is set, or if we have guaranteed exclusive access
+    /// (e.g., inside `Sender::send` failure path).
     unsafe fn consume_value(&self) -> Option<T> {
         unsafe { self.value.with_mut(|ptr| (*ptr).take()) }
     }
 
-    /// Returns true if there is a value. This function does not check `state`.
+    /// Returns true if there is a value.
     ///
     /// # Safety
-    ///
-    /// Calling this method concurrently on multiple threads will result in a
-    /// data race. The `VALUE_SENT` state bit is used to ensure that only the
-    /// sender *or* the receiver will call this method at a given point in time.
-    /// If `VALUE_SENT` is not set, then only the sender may call this method;
-    /// if it is set, then only the receiver may call this method.
+    /// Must only be called if `VALUE_SENT` is set.
     unsafe fn has_value(&self) -> bool {
         unsafe { self.value.with(|ptr| (*ptr).is_some()) }
     }
@@ -354,35 +364,27 @@ unsafe impl<T: Send> Sync for Inner<T> {}
 
 impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
-        // SAFETY: we have `&mut self`, and therefore we have
-        // exclusive access to the value.
+        // SAFETY: `Inner` is dropping, meaning the refcount is 0.
+        // We have exclusive access to the `UnsafeCell`.
+        // We must ensure the contained value is dropped to avoid memory leaks.
         unsafe {
-            // Note: the assertion holds because if the value has been sent by sender,
-            // we must ensure that the value must have been consumed by the receiver before
-            // dropping the `Inner`.
-            debug_assert!(self.consume_value().is_none());
+            self.value.with_mut(|ptr| {
+                let _ = (*ptr).take();
+            });
         }
     }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Inner<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use std::sync::atomic::Ordering::Relaxed;
-
         fmt.debug_struct("Inner")
-            .field("state", &State::load(&self.state, Relaxed))
+            .field("state", &State::load(&self.state, Ordering::Relaxed))
             .finish()
     }
 }
 
-/// Indicates that a value has been stored in the channel's inner `UnsafeCell`.
-///
-/// # Safety
-///
-/// This bit controls which side of the channel is permitted to access the
-/// `UnsafeCell`. If it is set, the `UnsafeCell` may ONLY be accessed by the
-/// receiver. If this bit is NOT set, the `UnsafeCell` may ONLY be accessed by
-/// the sender.
+// ===== State Management =====
+
 const VALUE_SENT: usize = 0b00010;
 const CLOSED: usize = 0b00100;
 
@@ -395,20 +397,11 @@ impl State {
         self.0 & VALUE_SENT == VALUE_SENT
     }
 
+    fn is_closed(self) -> bool {
+        self.0 & CLOSED == CLOSED
+    }
+
     fn set_complete(cell: &AtomicUsize) -> State {
-        // This method is a compare-and-swap loop rather than a fetch-or like
-        // other `set_$WHATEVER` methods on `State`. This is because we must
-        // check if the state has been closed before setting the `VALUE_SENT`
-        // bit.
-        //
-        // We don't want to set both the `VALUE_SENT` bit if the `CLOSED`
-        // bit is already set, because `VALUE_SENT` will tell the receiver that
-        // it's okay to access the inner `UnsafeCell`. Immediately after calling
-        // `set_complete`, if the channel was closed, the sender will _also_
-        // access the `UnsafeCell` to take the value back out, so if a
-        // `poll_recv` or `try_recv` call is occurring concurrently, both
-        // threads may try to access the `UnsafeCell` if we were to set the
-        // `VALUE_SENT` bit on a closed channel.
         let mut state = cell.load(Ordering::Relaxed);
         loop {
             if State(state).is_closed() {
@@ -421,23 +414,18 @@ impl State {
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => {
-                    break;
-                }
+                Ok(_) => break,
                 Err(actual) => state = actual,
             }
         }
         State(state)
     }
 
-    fn is_closed(self) -> bool {
-        self.0 & CLOSED == CLOSED
-    }
-
     fn set_closed(cell: &AtomicUsize) -> State {
-        // Acquire because we want all later writes (attempting to poll) to be
-        // ordered after this.
-        let val = cell.fetch_or(CLOSED, Acquire);
+        // Using AcqRel ensures that:
+        // 1. Release: The closed state is published to other threads.
+        // 2. Acquire: We see any state changes that happened before this (though less critical for close).
+        let val = cell.fetch_or(CLOSED, Ordering::AcqRel);
         State(val)
     }
 
@@ -446,8 +434,7 @@ impl State {
     }
 
     fn load(cell: &AtomicUsize, order: Ordering) -> State {
-        let val = cell.load(order);
-        State(val)
+        State(cell.load(order))
     }
 }
 
