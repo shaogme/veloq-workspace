@@ -24,7 +24,7 @@ fn create_local_executor() -> LocalExecutor {
         let global_pool = topology
             .create_pool(1)
             .expect("Failed to create global pool");
-        topology.build_for_worker(global_pool, 0, registrar)
+        topology.build_for_worker(&global_pool, 0, registrar)
     })
 }
 
@@ -159,6 +159,9 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                 // Re-initialized per iteration because block_on consumes the runtime.
                 let runtime = Runtime::builder()
                     .config(veloq_runtime::config::Config::default().worker_threads(WORKER_COUNT))
+                    .with_topology(veloq_buf::UniformBlock::buddy(
+                        veloq_buf::ThreadMemoryMultiplier(nz!(32)),
+                    ))
                     .build()
                     .unwrap();
 

@@ -1,10 +1,10 @@
 use super::ext::Extensions;
 use super::*;
 
-use crate::Socket;
 use crate::config::IocpConfig;
 use crate::driver::Driver;
 use crate::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, Recv, Timeout};
+use crate::Socket;
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -218,7 +218,7 @@ fn test_iocp_recv_with_buffer_pool() {
         driver: driver.clone(),
     });
 
-    let reg_pool = topology.build_for_worker(global_pool, 0, registrar);
+    let reg_pool = topology.build_for_worker(&global_pool, 0, registrar);
 
     // Setup connection
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

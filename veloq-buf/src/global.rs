@@ -340,7 +340,7 @@ mod tests {
             Box::new(HybridAllocator::new(memory).expect("Failed to create allocator"))
         });
 
-        let global_pool = Box::leak(Box::new(GlobalAllocator::new(config, factory).unwrap()));
+        let global_pool = std::sync::Arc::new(GlobalAllocator::new(config, factory).unwrap());
 
         // 为线程 0 创建 BlockBasedPool
         let pool = BlockBasedPool::new(global_pool, 0, None);

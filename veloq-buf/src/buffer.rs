@@ -293,13 +293,13 @@ impl UniformBlock {
     pub fn create_pool(
         &self,
         worker_count: usize,
-    ) -> std::io::Result<&'static crate::global::GlobalBlockPool> {
+    ) -> std::io::Result<Arc<crate::global::GlobalBlockPool>> {
         self.init(worker_count)
     }
 
     pub fn build_for_worker(
         &self,
-        pool: &'static crate::global::GlobalBlockPool,
+        pool: &Arc<crate::global::GlobalBlockPool>,
         worker_index: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool {
@@ -308,7 +308,7 @@ impl UniformBlock {
 }
 
 impl PoolTopology for UniformBlock {
-    type State = &'static crate::global::GlobalBlockPool;
+    type State = Arc<crate::global::GlobalBlockPool>;
 
     fn init(&self, worker_count: usize) -> std::io::Result<Self::State> {
         let config = crate::global::GlobalAllocatorConfig {
@@ -321,8 +321,8 @@ impl PoolTopology for UniformBlock {
             Box::new(move |thread_idx, memory| (factory)(thread_idx, memory)),
         )?;
 
-        // Leak to get &'static life
-        Ok(Box::leak(Box::new(pool)))
+        // Return Arc instead of leaking
+        Ok(Arc::new(pool))
     }
 
     fn build(
@@ -336,18 +336,16 @@ impl PoolTopology for UniformBlock {
         let region = crate::buffer::BufferRegion::new(global_info.ptr, global_info.len);
 
         // 注册内存区域
-        let global_index = match registrar.register(&[region]) {
-            Ok(ids) => ids.first().and_then(|&id| GlobalIndex::new(id as u16)),
-            Err(e) => {
-                // 如果注册失败，这里是否应该 panic?
-                // 通常这意味着驱动出现了严重问题或不支持，降级为无注册 Buffer
-                #[cfg(debug_assertions)]
-                eprintln!("Failed to register global buffer region: {}", e);
-                None
-            }
-        };
+        //
+        // 必须确保全局内存成功注册，否则无法保证 WriteFixed 等操作的正确性。
+        // 如果这里 panic，通常是因为 Linux 的 RLIMIT_MEMLOCK 限制（ulimit -l）。
+        let ids = registrar
+            .register(&[region])
+            .expect("Failed to register global buffer region (check 'ulimit -l' / RLIMIT_MEMLOCK)");
 
-        let block_pool = BlockBasedPool::new(pool, worker_idx, global_index);
+        let global_index = ids.first().and_then(|&id| GlobalIndex::new(id as u16));
+
+        let block_pool = BlockBasedPool::new(pool.clone(), worker_idx, global_index);
         AnyBufPool::new(block_pool)
     }
 }
@@ -595,8 +593,8 @@ impl std::fmt::Debug for AnyBufPool {
 /// context 字段编码了 block_idx，以便在释放时找到正确的 Block。
 #[derive(Clone)]
 pub struct BlockBasedPool {
-    /// 全局 Block Pool 的静态引用
-    pool: &'static crate::global::GlobalBlockPool,
+    /// 全局 Block Pool 的引用 (Arc)
+    pool: Arc<crate::global::GlobalBlockPool>,
     /// 当前线程的索引
     thread_idx: usize,
     /// 全局索引（用于驱动注册）
@@ -606,7 +604,7 @@ pub struct BlockBasedPool {
 impl BlockBasedPool {
     /// 创建新的 BlockBasedPool
     pub fn new(
-        pool: &'static crate::global::GlobalBlockPool,
+        pool: Arc<crate::global::GlobalBlockPool>,
         thread_idx: usize,
         global_index: Option<GlobalIndex>,
     ) -> Self {
@@ -631,13 +629,19 @@ impl BackingPool for BlockBasedPool {
     fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
         // 通过 GlobalBlockPool 的 4 级优先级分配
         if let Some((block_idx, result)) = self.pool.alloc(self.thread_idx, size.get()) {
+            let effective_global_index = if result.is_registered {
+                self.global_index
+            } else {
+                None
+            };
+
             // 将 block_idx 编码到 context 的高 32 位
             let combined_context = ((block_idx as usize) << 32) | (result.context & 0xFFFFFFFF);
 
             AllocResult::Allocated {
                 ptr: result.ptr,
                 cap: result.cap,
-                global_index: self.global_index,
+                global_index: effective_global_index,
                 context: combined_context,
             }
         } else {
@@ -650,10 +654,23 @@ impl BackingPool for BlockBasedPool {
     }
 
     fn pool_data(&self) -> NonNull<()> {
-        // Since we are using &'static GlobalBlockPool, we can just cast it to NonNull<()>.
-        // This is safe because the reference lives forever.
-        let ptr = self.pool as *const crate::global::GlobalBlockPool as *mut ();
-        unsafe { NonNull::new_unchecked(ptr) }
+        let ptr = {
+            #[cfg(debug_assertions)]
+            {
+                // Debug Mode: Increment strong count to track lifetime safely.
+                // This allows detecting use-after-free if the pool is dropped prematurely.
+                Arc::into_raw(self.pool.clone())
+            }
+
+            #[cfg(not(debug_assertions))]
+            {
+                // Release Mode: Use raw pointer without touching reference count.
+                // SAFETY: The runtime MUST guarantee that the pool outlives all buffers.
+                Arc::as_ptr(&self.pool)
+            }
+        };
+
+        unsafe { NonNull::new_unchecked(ptr as *mut ()) }
     }
 }
 
@@ -670,17 +687,28 @@ static BLOCK_BASED_POOL_VTABLE: PoolVTable = PoolVTable {
 };
 
 unsafe fn block_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    // 1. Cast back to &'static GlobalBlockPool
-    // We do NOT drop anything here because it's a static reference.
-    let pool = unsafe { &*(pool_data.as_ptr() as *const crate::global::GlobalBlockPool) };
+    let raw_ptr = pool_data.as_ptr() as *const crate::global::GlobalBlockPool;
 
-    // 2. Extract block_idx from context (high 32 bits)
-    let block_idx = (params.context >> 32) as usize;
-    let allocator_context = params.context & 0xFFFFFFFF;
+    #[cfg(debug_assertions)]
+    {
+        // Debug Mode: Restore Arc to decrement reference count (and possibly Drop).
+        let pool = unsafe { Arc::from_raw(raw_ptr) };
+        let block_idx = (params.context >> 32) as usize;
+        let allocator_context = params.context & 0xFFFFFFFF;
+        unsafe {
+            pool.dealloc(block_idx, params.ptr, params.cap.get(), allocator_context);
+        }
+    }
 
-    // 3. Delegate to GlobalBlockPool
-    unsafe {
-        pool.dealloc(block_idx, params.ptr, params.cap.get(), allocator_context);
+    #[cfg(not(debug_assertions))]
+    {
+        // Release Mode: Simply cast the pointer. No ref-count modification.
+        let pool = unsafe { &*raw_ptr };
+        let block_idx = (params.context >> 32) as usize;
+        let allocator_context = params.context & 0xFFFFFFFF;
+        unsafe {
+            pool.dealloc(block_idx, params.ptr, params.cap.get(), allocator_context);
+        }
     }
 }
 
@@ -688,7 +716,8 @@ unsafe fn block_based_resolve_region_info_shim(
     pool_data: NonNull<()>,
     buf: &FixedBuf,
 ) -> (usize, usize) {
-    // 1. Cast back to &'static GlobalBlockPool
+    // 1. Cast back to GlobalBlockPool (Borrowed pointer in both cases)
+    // Even in Debug mode where it is an "Owned Arc", we access it via pointer ref here.
     let pool = unsafe { &*(pool_data.as_ptr() as *const crate::global::GlobalBlockPool) };
 
     // 2. Get base address from global info

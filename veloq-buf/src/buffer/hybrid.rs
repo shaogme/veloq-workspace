@@ -1,6 +1,6 @@
 use super::AllocError;
 use crate::ThreadMemory;
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::{alloc, dealloc, Layout};
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use veloq_bitset::BitSet;
@@ -68,6 +68,7 @@ pub struct RawAlloc {
     pub ptr: NonNull<u8>,
     pub cap: usize,
     pub context: usize,
+    pub is_registered: bool,
 }
 
 /// Core allocator logic, managing slabs and global fallback
@@ -173,6 +174,7 @@ impl HybridAllocator {
                         ptr: unsafe { NonNull::new_unchecked(block_ptr) },
                         cap: slab.config.block_size,
                         context,
+                        is_registered: true,
                     });
                 }
             }
@@ -195,6 +197,7 @@ impl HybridAllocator {
                 ptr: unsafe { NonNull::new_unchecked(block_ptr) },
                 cap,
                 context: GLOBAL_ALLOC_CONTEXT,
+                is_registered: false,
             });
         }
 
@@ -273,6 +276,7 @@ impl crate::block::RawAllocator for HybridAllocator {
             ptr: raw.ptr,
             cap: unsafe { NonZeroUsize::new_unchecked(raw.cap) },
             context: raw.context,
+            is_registered: raw.is_registered,
         })
     }
 

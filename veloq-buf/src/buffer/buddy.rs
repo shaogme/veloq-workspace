@@ -1,5 +1,5 @@
 use super::AllocError;
-use crate::{ThreadMemory, nz};
+use crate::{nz, ThreadMemory};
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 
@@ -454,6 +454,7 @@ impl crate::block::RawAllocator for BuddyAllocator {
             ptr,
             cap: unsafe { NonZeroUsize::new_unchecked(capacity) },
             context: order,
+            is_registered: true,
         })
     }
 

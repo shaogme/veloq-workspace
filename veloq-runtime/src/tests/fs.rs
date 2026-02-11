@@ -28,7 +28,7 @@ fn create_local_executor() -> LocalExecutor {
         registrar.register(&regions).expect("Failed to register");
 
         // Use topology to build pool
-        topology.build_for_worker(global_pool, worker_idx, registrar)
+        topology.build_for_worker(&global_pool, worker_idx, registrar)
     })
 }
 

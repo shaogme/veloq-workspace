@@ -26,7 +26,7 @@ fn bench_hybrid_contended() {
         .expect("Failed to create global pool");
 
     // Build pool for worker 0
-    let pool = topology.build_for_worker(global_pool, 0, Box::new(DummyRegistrar));
+    let pool = topology.build_for_worker(&global_pool, 0, Box::new(DummyRegistrar));
 
     let iterations = 500_000;
 

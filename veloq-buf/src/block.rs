@@ -18,6 +18,8 @@ pub struct RawAllocResult {
     pub cap: NonZeroUsize,
     /// 分配器特定的上下文信息（用于释放时识别）
     pub context: usize,
+    /// 这里的内存是否属于注册的内存区域（如果是，可以使用 WriteFixed 等优化）
+    pub is_registered: bool,
 }
 
 /// 原始分配器接口
@@ -251,6 +253,7 @@ mod tests {
                 ptr: unsafe { NonNull::new_unchecked(self.memory.as_ptr() as *mut u8) },
                 cap: unsafe { NonZeroUsize::new_unchecked(size) },
                 context: 0,
+                is_registered: true,
             })
         }
 

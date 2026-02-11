@@ -21,7 +21,7 @@ fn create_local_executor() -> LocalExecutor {
         let global_pool = topology
             .create_pool(1)
             .expect("Failed to create global pool");
-        topology.build_for_worker(global_pool, 0, registrar)
+        topology.build_for_worker(&global_pool, 0, registrar)
     })
 }
 
