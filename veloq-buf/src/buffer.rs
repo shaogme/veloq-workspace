@@ -41,7 +41,7 @@
 //! - The `dealloc` function in the VTable can correctly free the memory using only:
 //!   - The payload pointer (`ptr`)
 //!   - The capacity (`cap`)
-//!   - An opaque `context` value (usize) provided during allocation
+//!   - An opaque `context` value (u64) provided during allocation
 //!
 //! See [`SlotBasedPool`] for the implementation relying on [`crate::global::GlobalSlotPool`].
 
@@ -109,7 +109,7 @@ pub struct PoolVTable {
 pub struct DeallocParams {
     pub ptr: NonNull<u8>,  // Points to the Payload (data), not the header
     pub cap: NonZeroUsize, // Capacity of the Payload
-    pub context: usize,    // Context restored from header
+    pub context: u64,      // Context restored from header
 }
 
 #[derive(Debug)]
@@ -117,7 +117,7 @@ pub enum AllocResult {
     Allocated {
         ptr: NonNull<u8>,
         cap: NonZeroUsize,
-        context: usize,
+        context: u64,
     },
     Failed,
 }
@@ -300,7 +300,7 @@ pub struct FixedBuf {
     // Metadata moved from Heap Header to Handle
     pool_data: NonNull<()>,
     vtable: &'static PoolVTable,
-    context: usize,
+    context: u64,
 }
 
 // Safety: FixedBuf 拥有其底层内存的所有权。
@@ -315,7 +315,7 @@ impl FixedBuf {
         cap: NonZeroUsize,
         pool_data: NonNull<()>,
         vtable: &'static PoolVTable,
-        context: usize,
+        context: u64,
     ) -> Self {
         Self {
             ptr,
@@ -572,13 +572,14 @@ impl BackingPool for SlotBasedPool {
             // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
             let global_idx_val = self
                 .global_index
-                .map(|g| g.get() as usize)
-                .unwrap_or(NO_REGISTRATION_INDEX as usize);
+                .map(|g| g.get() as u64)
+                .unwrap_or(NO_REGISTRATION_INDEX as u64);
 
-            let s_idx = slot_idx.0;
+            let s_idx = slot_idx.0 as u64;
             debug_assert!(s_idx < (1 << 40), "SlotIndex exceeded 40 bits");
 
-            let context = (global_idx_val << 48) | ((order & 0xFF) << 40) | (s_idx & 0xFFFFFFFFFF);
+            let context =
+                (global_idx_val << 48) | ((order as u64 & 0xFF) << 40) | (s_idx & 0xFFFFFFFFFF);
 
             let cap = unsafe { NonZeroUsize::new_unchecked(capacity) };
 
@@ -594,17 +595,8 @@ impl BackingPool for SlotBasedPool {
 
     fn pool_data(&self) -> NonNull<()> {
         let ptr = {
-            #[cfg(debug_assertions)]
-            {
-                // Debug Mode: Increment strong count
-                Arc::into_raw(self.pool.clone())
-            }
-
-            #[cfg(not(debug_assertions))]
-            {
-                // Release Mode: Use raw pointer
-                Arc::as_ptr(&self.pool)
-            }
+            // Always acquire strong reference to ensure safety for FixedBuf lifetime
+            Arc::into_raw(self.pool.clone())
         };
 
         unsafe { NonNull::new_unchecked(ptr as *mut ()) }
@@ -626,28 +618,16 @@ static SLOT_BASED_POOL_VTABLE: PoolVTable = PoolVTable {
 unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
     let raw_ptr = pool_data.as_ptr() as *const crate::global::GlobalSlotPool;
 
-    // Unpack context
+    // Unpack context (u64)
     // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
-    let order = (params.context >> 40) & 0xFF;
-    let slot_idx_val = params.context & 0xFFFFFFFFFF;
+    let order = ((params.context >> 40) & 0xFF) as usize;
+    let slot_idx_val = (params.context & 0xFFFFFFFFFF) as usize;
     let slot_idx = crate::slot::SlotIndex(slot_idx_val);
 
-    #[cfg(debug_assertions)]
-    {
-        // Debug Mode: Restore Arc
-        let pool = unsafe { Arc::from_raw(raw_ptr) };
-        unsafe {
-            pool.dealloc_slots(slot_idx, order);
-        }
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        // Release Mode
-        let pool = unsafe { &*raw_ptr };
-        unsafe {
-            pool.dealloc_slots(slot_idx, order);
-        }
+    // Restore ownership of Arc to drop it (decrement ref count)
+    let pool = unsafe { Arc::from_raw(raw_ptr) };
+    unsafe {
+        pool.dealloc_slots(slot_idx, order);
     }
 }
 
@@ -666,10 +646,10 @@ unsafe fn slot_based_resolve_region_info_shim(
     // 3. Unpack GlobalIndex from context
     // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
     let global_idx_val = (buf.context >> 48) & 0xFFFF;
-    let region_index = if global_idx_val == NO_REGISTRATION_INDEX as usize {
+    let region_index = if global_idx_val == NO_REGISTRATION_INDEX as u64 {
         usize::MAX
     } else {
-        global_idx_val
+        global_idx_val as usize
     };
 
     (region_index, ptr.saturating_sub(base))
