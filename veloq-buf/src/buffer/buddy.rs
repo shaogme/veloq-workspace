@@ -27,7 +27,8 @@ const SLAB_CAPACITIES: [usize; MAX_SLAB_ORDER + 1] = [
 ];
 
 const TAG_ALLOCATED: u8 = 0x80;
-const TAG_ORDER_MASK: u8 = 0x7F;
+const TAG_SLAB: u8 = 0x40;
+const TAG_ORDER_MASK: u8 = 0x3F;
 
 /// 侵入式双向链表节点，存储在空闲块的头部
 #[repr(C)]
@@ -143,6 +144,97 @@ impl RawBuddyAllocator {
         self._memory_owner.global_region()
     }
 
+    // --- Helper Methods to Encapsulate Tag Logic ---
+
+    #[inline]
+    unsafe fn mark_allocated(&mut self, offset: usize, order: usize) {
+        let idx = self.calculator.tag_index(offset);
+        // SAFETY: idx checked
+        unsafe {
+            *self.tags.get_unchecked_mut(idx) = (order as u8) | TAG_ALLOCATED;
+        }
+    }
+
+    #[inline]
+    unsafe fn mark_unallocated(&mut self, offset: usize, order: usize) {
+        let idx = self.calculator.tag_index(offset);
+        // SAFETY: idx checked
+        unsafe {
+            *self.tags.get_unchecked_mut(idx) = order as u8;
+        }
+    }
+
+    /// Mark block as currently in Slab cache
+    /// SAFETY: Caller ensures ptr is valid
+    unsafe fn mark_slab(&mut self, ptr: NonNull<u8>) {
+        let offset = unsafe { self.calculator.offset_of(ptr) };
+        let idx = self.calculator.tag_index(offset);
+        unsafe {
+            let tag = self.tags.get_unchecked_mut(idx);
+            // Must be allocated to be in slab
+            if (*tag & TAG_ALLOCATED) == 0 {
+                panic!(
+                    "Logic Error: Attempt to put free block into Slab: ptr={:?}",
+                    ptr
+                );
+            }
+            if (*tag & TAG_SLAB) != 0 {
+                panic!("Double free detected (Slab Re-entry): ptr={:?}", ptr);
+            }
+            *tag |= TAG_SLAB;
+        }
+    }
+
+    /// Unmark block from Slab cache (retrieve for use)
+    /// SAFETY: Caller ensures ptr is valid
+    unsafe fn unmark_slab(&mut self, ptr: NonNull<u8>) {
+        let offset = unsafe { self.calculator.offset_of(ptr) };
+        let idx = self.calculator.tag_index(offset);
+        unsafe {
+            let tag = self.tags.get_unchecked_mut(idx);
+            // Must be allocated
+            debug_assert!(
+                (*tag & TAG_ALLOCATED) != 0,
+                "Slab block must be marked allocated"
+            );
+            debug_assert!((*tag & TAG_SLAB) != 0, "Slab block must be marked as Slab");
+
+            *tag &= !TAG_SLAB;
+        }
+    }
+
+    /// Check for double free before Raw Dealloc
+    unsafe fn check_double_free(&self, offset: usize, order: usize) {
+        let idx = self.calculator.tag_index(offset);
+        let tag = unsafe { *self.tags.get_unchecked(idx) };
+
+        if (tag & TAG_ALLOCATED) == 0 {
+            panic!(
+                "Double free detected (Raw): offset={}, order={}",
+                offset, order
+            );
+        }
+        // If it's in slab, it shouldn't be deallocated via raw unless removed from slab first
+        // But dealloc usually implies it's NOT in slab anymore or never was (if we skipped slab).
+        // Actually, if it has TAG_SLAB, it means it IS in the slab list. If we try to raw-dealloc it, that's wrong.
+        if (tag & TAG_SLAB) != 0 {
+            panic!(
+                "Double free detected (In Slab): offset={}, order={}",
+                offset, order
+            );
+        }
+        if (tag & TAG_ORDER_MASK) != order as u8 {
+            panic!(
+                "Dealloc order mismatch: offset={}, expected={}, actual={}",
+                offset,
+                tag & TAG_ORDER_MASK,
+                order
+            );
+        }
+    }
+
+    // --- End Helper Methods ---
+
     /// 分配指定 Order 的内存块
     fn alloc(&mut self, order: usize) -> Option<NonNull<u8>> {
         // 寻找合适的空闲块 - Bitmap 加速查找 (O(1))
@@ -193,20 +285,15 @@ impl RawBuddyAllocator {
                 self.free_bitmap |= 1 << curr_order;
             };
 
-            // 更新 Buddy 的 Tag
-            let buddy_idx = self.calculator.tag_index(buddy_offset);
-            // SAFETY: buddy_idx is calculated from a valid offset within the arena,
-            // so it's guaranteed to be in bounds.
+            // 更新 Buddy 的 Tag (Clean State, implies unallocated)
             unsafe {
-                *self.tags.get_unchecked_mut(buddy_idx) = curr_order as u8;
+                self.mark_unallocated(buddy_offset, curr_order);
             }
         }
 
         // 标记分配出的块
-        let idx = self.calculator.tag_index(curr_offset);
-        // SAFETY: idx is calculated from the current offset, which is always valid.
         unsafe {
-            *self.tags.get_unchecked_mut(idx) = (order as u8) | TAG_ALLOCATED;
+            self.mark_allocated(curr_offset, order);
         }
 
         // SAFETY: curr_offset 始终有效
@@ -221,13 +308,11 @@ impl RawBuddyAllocator {
         let mut curr_offset = offset;
         let mut curr_order = order;
 
+        // Double-Free Check
+        unsafe { self.check_double_free(curr_offset, curr_order) };
+
         // 立即标记为空闲
-        let idx = self.calculator.tag_index(curr_offset);
-        // SAFETY: The offset is from a pointer previously allocated by this allocator,
-        // so the index is guaranteed to be in bounds.
-        unsafe {
-            *self.tags.get_unchecked_mut(idx) = curr_order as u8;
-        }
+        unsafe { self.mark_unallocated(curr_offset, curr_order) };
 
         // 尝试向上合并
         while curr_order < NUM_ORDERS - 1 {
@@ -243,6 +328,8 @@ impl RawBuddyAllocator {
             let buddy_tag = unsafe { *self.tags.get_unchecked(buddy_idx) };
 
             // 检查 Buddy 是否空闲且 Order 一致
+            // 注意: 被合并的 Buddy 必须不是 Allocated 也不是 internal Slab 状态(虽然 unallocated 肯定不是 slab)
+            // 只要 (buddy_tag & TAG_ALLOCATED) == 0，它就是真正的 Raw Free
             if (buddy_tag & TAG_ALLOCATED) == 0 && (buddy_tag & TAG_ORDER_MASK) == curr_order as u8
             {
                 // 合并 Buddy
@@ -266,13 +353,8 @@ impl RawBuddyAllocator {
                 curr_offset = std::cmp::min(curr_offset, buddy_offset);
                 curr_order += 1;
 
-                // 更新新块的 Tag
-                let new_idx = self.calculator.tag_index(curr_offset);
-                // SAFETY: curr_offset is the minimum of two valid offsets,
-                // so it's also a valid offset.
-                unsafe {
-                    *self.tags.get_unchecked_mut(new_idx) = curr_order as u8;
-                }
+                // 更新新块的 Tag (Upper level calls might reset this later, but keep consistent)
+                unsafe { self.mark_unallocated(curr_offset, curr_order) };
             } else {
                 break;
             }
@@ -350,6 +432,8 @@ impl BuddyAllocator {
         // 1. 尝试从 Slab 分配
         if needed_order <= MAX_SLAB_ORDER {
             if let Some(ptr) = self.slabs[needed_order].pop() {
+                // Update Tag: Clear SLAB bit
+                unsafe { self.raw.unmark_slab(ptr) };
                 return Some((ptr, needed_order));
             }
         }
@@ -364,6 +448,9 @@ impl BuddyAllocator {
         // 1. 尝试放入 Slab 缓存
         if order <= MAX_SLAB_ORDER {
             if self.slabs[order].len() < SLAB_CAPACITIES[order] {
+                // Mark as in SLAB & Check Double Free
+                unsafe { self.raw.mark_slab(ptr) };
+
                 self.slabs[order].push(ptr);
                 return;
             }
