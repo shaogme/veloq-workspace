@@ -43,7 +43,7 @@
 //!   - The capacity (`cap`)
 //!   - An opaque `context` value (usize) provided during allocation
 //!
-//! See [`BlockBasedPool`] for the primary implementation relying on [`crate::global::GlobalBlockPool`].
+//! See [`SlotBasedPool`] for the implementation relying on [`crate::global::GlobalSlotPool`].
 
 use std::{
     alloc::LayoutError,
@@ -53,7 +53,6 @@ use std::{
 };
 
 pub mod buddy;
-pub mod hybrid;
 
 const NO_REGISTRATION_INDEX: u16 = u16::MAX;
 
@@ -212,7 +211,7 @@ pub trait BufPool: std::fmt::Debug + 'static {
 ///
 /// This trait manages the creation and distribution of buffer pools across worker threads.
 /// It allows for diverse configurations:
-/// - Shared Global Pools (e.g., `UniformBlock`)
+/// - Shared Global Pools (e.g., `UniformSlot`)
 /// - Independent Per-Thread Pools
 /// - Hybrid approaches
 pub trait PoolTopology: Clone + Send + Sync + 'static {
@@ -239,87 +238,42 @@ pub trait PoolTopology: Clone + Send + Sync + 'static {
     ) -> AnyBufPool;
 }
 
-/// 标准 Block 拓扑：所有线程使用相同的分配器类型和大小
+/// 标准 Slot 拓扑：使用 GlobalSlotPool
 #[derive(Clone)]
-pub struct UniformBlock {
-    /// 每个 Block 的内存倍数
+pub struct UniformSlot {
+    /// 内存倍数 (用于计算总内存大小)
     pub multiplier: crate::ThreadMemoryMultiplier,
-    /// 分配器工厂函数
-    factory: Arc<
-        dyn Fn(usize, crate::ThreadMemory) -> Box<dyn crate::block::RawAllocator> + Send + Sync,
-    >,
 }
 
-impl UniformBlock {
-    /// 创建新的 UniformBlock topology
-    ///
-    /// # 参数
-    /// - `multiplier`: 每个 Block 的内存大小倍数
-    /// - `factory`: 用于创建分配器的工厂函数
-    pub fn new<F>(multiplier: crate::ThreadMemoryMultiplier, factory: F) -> Self
-    where
-        F: Fn(usize, crate::ThreadMemory) -> Box<dyn crate::block::RawAllocator>
-            + Send
-            + Sync
-            + 'static,
-    {
-        Self {
-            multiplier,
-            factory: Arc::new(factory),
-        }
+impl UniformSlot {
+    /// 创建新的 UniformSlot topology
+    pub fn new(multiplier: crate::ThreadMemoryMultiplier) -> Self {
+        Self { multiplier }
     }
 
-    /// 使用 HybridAllocator 的便捷构造函数
-    pub fn hybrid(multiplier: crate::ThreadMemoryMultiplier) -> Self {
-        Self::new(multiplier, |_thread_idx, memory| {
-            Box::new(
-                crate::buffer::hybrid::HybridAllocator::new(memory)
-                    .expect("Failed to create HybridAllocator"),
-            )
-        })
-    }
-
-    /// 使用 BuddyAllocator 的便捷构造函数
+    /// Convenience constructor (previously buddy)
     pub fn buddy(multiplier: crate::ThreadMemoryMultiplier) -> Self {
-        Self::new(multiplier, |_thread_idx, memory| {
-            Box::new(
-                crate::buffer::buddy::BuddyAllocator::new(memory)
-                    .expect("Failed to create BuddyAllocator"),
-            )
-        })
+        Self::new(multiplier)
     }
 
-    // Backward compatibility shim for tests
+    // Backward compatibility shim for tests if needed
     pub fn create_pool(
         &self,
         worker_count: usize,
-    ) -> std::io::Result<Arc<crate::global::GlobalBlockPool>> {
+    ) -> std::io::Result<Arc<crate::global::GlobalSlotPool>> {
         self.init(worker_count)
-    }
-
-    pub fn build_for_worker(
-        &self,
-        pool: &Arc<crate::global::GlobalBlockPool>,
-        worker_index: usize,
-        registrar: Box<dyn BufferRegistrar>,
-    ) -> AnyBufPool {
-        self.build(&pool, worker_index, registrar)
     }
 }
 
-impl PoolTopology for UniformBlock {
-    type State = Arc<crate::global::GlobalBlockPool>;
+impl PoolTopology for UniformSlot {
+    type State = Arc<crate::global::GlobalSlotPool>;
 
     fn init(&self, worker_count: usize) -> std::io::Result<Self::State> {
         let config = crate::global::GlobalAllocatorConfig {
             multipliers: vec![self.multiplier; worker_count],
         };
 
-        let factory = self.factory.clone();
-        let pool = crate::global::GlobalAllocator::new(
-            config,
-            Box::new(move |thread_idx, memory| (factory)(thread_idx, memory)),
-        )?;
+        let pool = crate::global::GlobalSlotPool::new(config)?;
 
         // Return Arc instead of leaking
         Ok(Arc::new(pool))
@@ -328,25 +282,22 @@ impl PoolTopology for UniformBlock {
     fn build(
         &self,
         pool: &Self::State,
-        worker_idx: usize,
+        _worker_idx: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool {
-        // 在 Block 架构中，我们需要为每个 Worker 注册全局内存块
+        // 在 Slot 架构中，所有线程共享一个大的连续区域
         let global_info = pool.global_info();
         let region = crate::buffer::BufferRegion::new(global_info.ptr, global_info.len);
 
         // 注册内存区域
-        //
-        // 必须确保全局内存成功注册，否则无法保证 WriteFixed 等操作的正确性。
-        // 如果这里 panic，通常是因为 Linux 的 RLIMIT_MEMLOCK 限制（ulimit -l）。
         let ids = registrar
             .register(&[region])
             .expect("Failed to register global buffer region (check 'ulimit -l' / RLIMIT_MEMLOCK)");
 
         let global_index = ids.first().and_then(|&id| GlobalIndex::new(id as u16));
 
-        let block_pool = BlockBasedPool::new(pool.clone(), worker_idx, global_index);
-        AnyBufPool::new(block_pool)
+        let slot_pool = SlotBasedPool::new(pool.clone(), global_index);
+        AnyBufPool::new(slot_pool)
     }
 }
 
@@ -363,12 +314,7 @@ pub struct FixedBuf {
 }
 
 // Safety: FixedBuf 拥有其底层内存的所有权。
-// 使用者需要确保底层的 BufPool 是线程安全的（支持跨线程 Dealloc），
-// 或者只在单线程 Runtime 环境下使用。
 unsafe impl Send for FixedBuf {}
-
-// Safety: This buffer is generally not Send because it refers to thread-local pool logic
-// but in Thread-per-Core it stays on thread.
 
 impl FixedBuf {
     /// # Safety
@@ -587,62 +533,64 @@ impl std::fmt::Debug for AnyBufPool {
     }
 }
 
-/// 基于 GlobalBlockPool 的 Pool 实现
+/// 基于 GlobalSlotPool 的 Pool 实现
 ///
-/// 这个 Pool 对应单个线程，通过 GlobalBlockPool 进行分配和释放。
-/// context 字段编码了 block_idx，以便在释放时找到正确的 Block。
+/// 这个 Pool 使用 GlobalSlotPool 来分配内存。
 #[derive(Clone)]
-pub struct BlockBasedPool {
-    /// 全局 Block Pool 的引用 (Arc)
-    pool: Arc<crate::global::GlobalBlockPool>,
-    /// 当前线程的索引
-    thread_idx: usize,
+pub struct SlotBasedPool {
+    /// 全局 Slot Pool 的引用 (Arc)
+    pool: Arc<crate::global::GlobalSlotPool>,
     /// 全局索引（用于驱动注册）
     global_index: Option<GlobalIndex>,
 }
 
-impl BlockBasedPool {
-    /// 创建新的 BlockBasedPool
+impl SlotBasedPool {
+    /// 创建新的 SlotBasedPool
     pub fn new(
-        pool: Arc<crate::global::GlobalBlockPool>,
-        thread_idx: usize,
+        pool: Arc<crate::global::GlobalSlotPool>,
         global_index: Option<GlobalIndex>,
     ) -> Self {
-        Self {
-            pool,
-            thread_idx,
-            global_index,
+        Self { pool, global_index }
+    }
+
+    /// Calculate order for a given size
+    fn calculate_order(size: usize) -> usize {
+        if size <= 4096 {
+            0
+        } else {
+            // (size + 4095) / 4096 next power of two
+            // But buddy allocator works better if we just use ilog2 of (rounded up to power of two)
+            // if size = 4097 -> 8192 -> order 1
+            let needed = size.next_power_of_two();
+            needed.ilog2() as usize - 12
         }
     }
 }
 
-impl std::fmt::Debug for BlockBasedPool {
+impl std::fmt::Debug for SlotBasedPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlockBasedPool")
-            .field("thread_idx", &self.thread_idx)
+        f.debug_struct("SlotBasedPool")
             .field("global_index", &self.global_index)
             .finish()
     }
 }
 
-impl BackingPool for BlockBasedPool {
+impl BackingPool for SlotBasedPool {
     fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
-        // 通过 GlobalBlockPool 的 4 级优先级分配
-        if let Some((block_idx, result)) = self.pool.alloc(self.thread_idx, size.get()) {
-            let effective_global_index = if result.is_registered {
-                self.global_index
-            } else {
-                None
-            };
+        let size_val = size.get();
+        let order = Self::calculate_order(size_val);
 
-            // 将 block_idx 编码到 context 的高 32 位
-            let combined_context = ((block_idx as usize) << 32) | (result.context & 0xFFFFFFFF);
+        if let Some((slot_idx, ptr)) = self.pool.alloc_slots(order) {
+            let capacity = crate::buffer::buddy::BuddyAllocator::capacity_of(order);
+
+            let context = (slot_idx.0 << 8) | order;
+            let cap = unsafe { NonZeroUsize::new_unchecked(capacity) };
 
             AllocResult::Allocated {
-                ptr: result.ptr,
-                cap: result.cap,
-                global_index: effective_global_index,
-                context: combined_context,
+                ptr,
+                cap,
+                global_index: self.global_index,
+                context,
             }
         } else {
             AllocResult::Failed
@@ -650,22 +598,20 @@ impl BackingPool for BlockBasedPool {
     }
 
     fn vtable(&self) -> &'static PoolVTable {
-        &BLOCK_BASED_POOL_VTABLE
+        &SLOT_BASED_POOL_VTABLE
     }
 
     fn pool_data(&self) -> NonNull<()> {
         let ptr = {
             #[cfg(debug_assertions)]
             {
-                // Debug Mode: Increment strong count to track lifetime safely.
-                // This allows detecting use-after-free if the pool is dropped prematurely.
+                // Debug Mode: Increment strong count
                 Arc::into_raw(self.pool.clone())
             }
 
             #[cfg(not(debug_assertions))]
             {
-                // Release Mode: Use raw pointer without touching reference count.
-                // SAFETY: The runtime MUST guarantee that the pool outlives all buffers.
+                // Release Mode: Use raw pointer
                 Arc::as_ptr(&self.pool)
             }
         };
@@ -674,51 +620,56 @@ impl BackingPool for BlockBasedPool {
     }
 }
 
-impl BufPool for BlockBasedPool {
+impl BufPool for SlotBasedPool {
     fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf> {
         self.alloc_mem(len).into_buf(self)
     }
 }
 
-// VTable for BlockBasedPool
-static BLOCK_BASED_POOL_VTABLE: PoolVTable = PoolVTable {
-    dealloc: block_based_dealloc_shim,
-    resolve_region_info: block_based_resolve_region_info_shim,
+// VTable for SlotBasedPool
+static SLOT_BASED_POOL_VTABLE: PoolVTable = PoolVTable {
+    dealloc: slot_based_dealloc_shim,
+    resolve_region_info: slot_based_resolve_region_info_shim,
 };
 
-unsafe fn block_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    let raw_ptr = pool_data.as_ptr() as *const crate::global::GlobalBlockPool;
+unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
+    let raw_ptr = pool_data.as_ptr() as *const crate::global::GlobalSlotPool;
 
     #[cfg(debug_assertions)]
     {
-        // Debug Mode: Restore Arc to decrement reference count (and possibly Drop).
+        // Debug Mode: Restore Arc
         let pool = unsafe { Arc::from_raw(raw_ptr) };
-        let block_idx = (params.context >> 32) as usize;
-        let allocator_context = params.context & 0xFFFFFFFF;
+
+        let order = params.context & 0xFF;
+        let slot_idx_val = params.context >> 8;
+        let slot_idx = crate::slot::SlotIndex(slot_idx_val);
+
         unsafe {
-            pool.dealloc(block_idx, params.ptr, params.cap.get(), allocator_context);
+            pool.dealloc_slots(slot_idx, order);
         }
     }
 
     #[cfg(not(debug_assertions))]
     {
-        // Release Mode: Simply cast the pointer. No ref-count modification.
+        // Release Mode
         let pool = unsafe { &*raw_ptr };
-        let block_idx = (params.context >> 32) as usize;
-        let allocator_context = params.context & 0xFFFFFFFF;
+
+        let order = params.context & 0xFF;
+        let slot_idx_val = params.context >> 8;
+        let slot_idx = crate::slot::SlotIndex(slot_idx_val);
+
         unsafe {
-            pool.dealloc(block_idx, params.ptr, params.cap.get(), allocator_context);
+            pool.dealloc_slots(slot_idx, order);
         }
     }
 }
 
-unsafe fn block_based_resolve_region_info_shim(
+unsafe fn slot_based_resolve_region_info_shim(
     pool_data: NonNull<()>,
     buf: &FixedBuf,
 ) -> (usize, usize) {
-    // 1. Cast back to GlobalBlockPool (Borrowed pointer in both cases)
-    // Even in Debug mode where it is an "Owned Arc", we access it via pointer ref here.
-    let pool = unsafe { &*(pool_data.as_ptr() as *const crate::global::GlobalBlockPool) };
+    // 1. Cast back to GlobalSlotPool
+    let pool = unsafe { &*(pool_data.as_ptr() as *const crate::global::GlobalSlotPool) };
 
     // 2. Get base address from global info
     let global_info = pool.global_info();
@@ -726,7 +677,6 @@ unsafe fn block_based_resolve_region_info_shim(
     let ptr = buf.as_ptr() as usize;
 
     // 3. return (region_index, offset)
-    // We use the global_index stored in the FixedBuf itself
     let region_index = buf.buf_index().map(|idx| idx.get() as usize).unwrap_or(0);
     (region_index, ptr.saturating_sub(base))
 }

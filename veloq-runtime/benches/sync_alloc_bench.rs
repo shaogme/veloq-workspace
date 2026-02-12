@@ -3,6 +3,7 @@ use std::future::IntoFuture;
 use std::hint::black_box;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use veloq_buf::PoolTopology;
 
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::config::BlockingPoolConfig;
@@ -12,16 +13,16 @@ use veloq_runtime::runtime::blocking::init_blocking_pool;
 fn create_local_executor() -> LocalExecutor {
     // Increase memory to 32MB to avoid OOM in BuddyPool
     LocalExecutor::builder().build(move |registrar| {
-        use veloq_buf::{ThreadMemoryMultiplier, UniformBlock};
+        use veloq_buf::{ThreadMemoryMultiplier, UniformSlot};
 
         // 16x multiplier -> 32MB (BuddyPool default block size is 2MB * 16 = 32MB)
         let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(16) });
-        let topology = UniformBlock::buddy(multiplier);
+        let topology = UniformSlot::new(multiplier);
 
         let global_pool = topology
             .create_pool(1)
             .expect("Failed to create global pool");
-        topology.build_for_worker(&global_pool, 0, registrar)
+        topology.build(&global_pool, 0, registrar)
     })
 }
 

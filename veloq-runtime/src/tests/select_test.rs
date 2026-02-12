@@ -4,10 +4,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use veloq_buf::{BufferRegion, ThreadMemoryMultiplier, UniformBlock, nz};
+use veloq_buf::{BufferRegion, PoolTopology, ThreadMemoryMultiplier, UniformSlot, nz};
 
 fn create_local_executor() -> LocalExecutor {
-    let topology = UniformBlock::hybrid(ThreadMemoryMultiplier(nz!(8)));
+    let topology = UniformSlot::new(ThreadMemoryMultiplier(nz!(8)));
     // We are creating a single-threaded executor for test, so worker_count = 1
     let global_pool = topology
         .create_pool(1)
@@ -23,7 +23,7 @@ fn create_local_executor() -> LocalExecutor {
         registrar.register(&regions).expect("Failed to register");
 
         // Use topology to build pool
-        topology.build_for_worker(&global_pool, worker_idx, registrar)
+        topology.build(&global_pool, worker_idx, registrar)
     })
 }
 struct ReadyFuture<T>(Option<T>);

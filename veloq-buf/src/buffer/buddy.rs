@@ -1,544 +1,438 @@
-use super::AllocError;
-use crate::{ThreadMemory, nz};
+use crate::slot::{SLOT_SIZE, SlotIndex};
+use std::fmt;
 use std::mem::ManuallyDrop;
-use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_intrusive_linklist::{Link, LinkedList};
 
-// Buddy System Constants
-const ARENA_SIZE: NonZeroUsize = nz!(32 * 1024 * 1024); // 32MB Total to support higher concurrency with overhead
-const MIN_BLOCK_SIZE: usize = 4096; // 4KB to support 4KB payload with 4KB alignment
+/// Buddy System Constants
+pub const MIN_ORDER: usize = 0; // 4KB
+pub const MAX_ORDER: usize = 18; // 2^18 * 4KB = 1GB (Maximum single allocation supported)
 
-// Number of orders: 4KB, 8KB, 16KB, 32KB, 64KB, 128KB, 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB, 32MB
-const NUM_ORDERS: usize = 14;
-
-// Max order to cache in slabs (Order 5 = 128KB)
-const MAX_SLAB_ORDER: usize = 5;
-
-// Capacities for each slab order (aiming for ~4MB cache per order to avoid excessive overhead)
-const SLAB_CAPACITIES: [usize; MAX_SLAB_ORDER + 1] = [
-    1024, // Order 0 (4KB)   -> 4MB
-    512,  // Order 1 (8KB)   -> 4MB
-    256,  // Order 2 (16KB)  -> 4MB
-    128,  // Order 3 (32KB)  -> 4MB
-    64,   // Order 4 (64KB)  -> 4MB
-    32,   // Order 5 (128KB) -> 4MB
-];
-
+// Allocator Tag Constants
 const TAG_ALLOCATED: u8 = 0x80;
-const TAG_SLAB: u8 = 0x40;
 const TAG_ORDER_MASK: u8 = 0x3F;
 
-/// 侵入式双向链表节点，存储在空闲块的头部
+/// Intrusive Doubly Linked List Node
+/// Stored in the head of a free Slot.
 #[repr(C)]
 struct FreeNode {
-    link: Link,
+    link: ManuallyDrop<Link>,
 }
 
-intrusive_adapter!(FreeNodeAdapter = FreeNode { link: Link });
+struct FreeNodeAdapter;
 
-/// 地址计算辅助器
-struct BlockCalculator {
+unsafe impl veloq_intrusive_linklist::Adapter for FreeNodeAdapter {
+    type Value = FreeNode;
+
+    unsafe fn get_link(&self, value: NonNull<Self::Value>) -> NonNull<Link> {
+        // FreeNode is #[repr(C)] (implied for safe transmutability in this context) and link is the first field.
+        // ManuallyDrop<T> has the same layout as T.
+        value.cast()
+    }
+
+    unsafe fn get_value(&self, link: NonNull<Link>) -> NonNull<Self::Value> {
+        link.cast()
+    }
+}
+
+/// Error type for Buddy Allocator
+#[derive(Debug)]
+pub enum BuddyError {
+    Oom,
+    InvalidFree,
+    DoubleFree,
+}
+
+/// Address calculation helper
+struct AddressCalculator {
     base_ptr: *mut u8,
+    #[allow(dead_code)] // Keep for range checks if needed
+    total_len: usize,
 }
 
-impl BlockCalculator {
-    fn new(base_ptr: *mut u8) -> Self {
-        Self { base_ptr }
+impl AddressCalculator {
+    unsafe fn new(base_ptr: *mut u8, total_len: usize) -> Self {
+        Self {
+            base_ptr,
+            total_len,
+        }
     }
 
-    /// 获取相对于基地址的偏移量
-    /// SAFETY: ptr 必须在 Arena 范围内
-    unsafe fn offset_of(&self, ptr: NonNull<u8>) -> usize {
-        // SAFETY: Caller guarantees ptr is valid relative to base_ptr
-        unsafe { ptr.as_ptr().offset_from(self.base_ptr) as usize }
+    #[inline(always)]
+    unsafe fn ptr_from_index(&self, index: SlotIndex) -> NonNull<u8> {
+        // SAFETY: Caller must ensure index is valid
+        unsafe { NonNull::new_unchecked(self.base_ptr.add(index.offset())) }
     }
 
-    /// 根据偏移量获取指针
-    /// SAFETY: offset 必须在 valid range
-    unsafe fn ptr_at(&self, offset: usize) -> NonNull<u8> {
-        // SAFETY: Caller guarantees offset is valid; NonNull::new_unchecked is safe for valid arena ptrs
-        unsafe { NonNull::new_unchecked(self.base_ptr.add(offset)) }
+    #[inline(always)]
+    unsafe fn index_from_ptr(&self, ptr: NonNull<u8>) -> SlotIndex {
+        let offset = unsafe { ptr.as_ptr().offset_from(self.base_ptr) as usize };
+        SlotIndex::from_offset(offset)
     }
 
-    /// 根据偏移量获取对应的 Tag 索引 (block_idx)
-    fn tag_index(&self, offset: usize) -> usize {
-        offset / MIN_BLOCK_SIZE
-    }
-
-    /// 计算给定 Order 的块大小
-    fn block_size(&self, order: usize) -> usize {
-        MIN_BLOCK_SIZE << order
-    }
-
-    /// 计算 Buddy 的偏移量
-    fn buddy_offset(&self, offset: usize, order: usize) -> usize {
-        offset ^ self.block_size(order)
+    #[inline(always)]
+    fn buddy_index(&self, index: SlotIndex, order: usize) -> SlotIndex {
+        // Buddy index is XORed by the size of the block (in slots)
+        // Order 0: 1 slot (1 << 0). XOR 1.
+        // Order k: 2^k slots. XOR (1 << k).
+        SlotIndex(index.0 ^ (1 << order))
     }
 }
 
-/// 核心分配器逻辑，管理内存块和空闲列表 (无缓存层)
-struct RawBuddyAllocator {
-    // 保持对内存的所有权
-    _memory_owner: ThreadMemory,
+/// Core Buddy Allocator
+///
+/// Designed to manage a large continuous memory implementation `GlobalSlotPool`.
+/// It does NOT own the memory, but manages the state of the memory provided to it.
+pub struct BuddyAllocator {
+    calculator: AddressCalculator,
 
-    // 地址计算辅助器 (替代原本的 base_ptr)
-    calculator: BlockCalculator,
+    // Free lists for each order
+    // Order 0: 4KB, Order 1: 8KB, ..., Order 18: 1GB
+    free_lists: ManuallyDrop<[LinkedList<FreeNodeAdapter>; MAX_ORDER + 1]>,
 
-    // 每个阶数（Order）对应的空闲链表
-    free_lists: ManuallyDrop<[LinkedList<FreeNodeAdapter>; NUM_ORDERS]>,
+    // Bitmap to quickly find non-empty orders
+    // bit k is 1 if free_lists[k] is not empty
+    free_bitmap: u32,
 
-    // 位图索引，加速空闲块查找
-    free_bitmap: u16,
-
-    // 块标签数组，索引为 block_offset / 4096
-    // 记录块的 Order 和是否已分配状态
+    // Tags array to track the state of each block (allocated/order)
+    // One u8 per Slot.
+    // Optimization: This could be 2 bits per slot (4 values: Free, Used, Split, etc), but u8 is simpler for now.
     tags: Vec<u8>,
+
+    // Total slots managed
+    total_slots: usize,
 }
 
-impl RawBuddyAllocator {
-    fn new(mut memory: ThreadMemory) -> Result<Self, AllocError> {
-        // Check memory size
-        if memory.len() < ARENA_SIZE.get() {
-            // For now fail if provided memory is less than ARENA_SIZE
-            // In future we could adjust ARENA_SIZE dynamically
-            return Err(AllocError::Oom);
-        }
+// SAFETY: BuddyAllocator is Send/Sync as long as we synchronize access (which Mutex in GlobalSlotPool will do)
+unsafe impl Send for BuddyAllocator {}
+unsafe impl Sync for BuddyAllocator {}
 
-        // Bug Fix: Use as_mut_ptr to ensure correct provenance for mutable access
-        let base_ptr = memory.as_mut_ptr();
-        let calculator = BlockCalculator::new(base_ptr);
+impl BuddyAllocator {
+    /// Initialize the Buddy Allocator from a raw memory region
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid memory region of at least `len` bytes.
+    /// The memory region must be alive as long as this allocator is used.
+    pub unsafe fn new(ptr: NonNull<u8>, len: usize) -> Self {
+        assert!(len >= SLOT_SIZE, "Memory too small");
+        // Ensure alignment? Assuming ptr is 4K aligned from HugePage/Page alloc.
 
-        let mut free_lists = std::array::from_fn(|_| LinkedList::new(FreeNodeAdapter));
+        let total_slots = len / SLOT_SIZE;
+        let calculator = unsafe { AddressCalculator::new(ptr.as_ptr(), len) };
+        let free_lists = std::array::from_fn(|_| LinkedList::new(FreeNodeAdapter));
 
-        // 初始化最大的块 (Order 12, 16MB) -> Wait, order 13 is 32MB. 2^12 * 4096 = 16M?
-        // MIN_BLOCK = 4096 (2^12.
-        // MAX Order = 13 (NUM_ORDERS - 1). Size = 4096 << 13 = 32MB.
-        let max_order = NUM_ORDERS - 1;
-
-        // SAFETY: 刚刚分配的内存，指针有效且大小足够
-        unsafe {
-            let root_node = &mut *(base_ptr as *mut FreeNode);
-            root_node.link = Link::new();
-
-            free_lists[max_order].push_front(Pin::new_unchecked(root_node));
-        }
-        let free_bitmap = 1 << max_order;
-
-        let leaf_count = ARENA_SIZE.get() / MIN_BLOCK_SIZE;
-        let mut tags = vec![0u8; leaf_count];
-        // 标记第一个最大块为空闲
-        tags[0] = max_order as u8;
-
-        Ok(Self {
-            _memory_owner: memory,
+        let mut allocator = Self {
             calculator,
             free_lists: ManuallyDrop::new(free_lists),
-            free_bitmap,
-            tags,
-        })
+            free_bitmap: 0,
+            tags: vec![0; total_slots], // Initially all 0 (Implicitly means order 0?? No, need init)
+            total_slots,
+        };
+
+        // Initialize the memory as a set of maximal free blocks
+        allocator.init_free_blocks(total_slots);
+
+        allocator
     }
 
-    fn global_region(&self) -> (NonNull<u8>, usize) {
-        self._memory_owner.global_region()
-    }
+    /// Initialize the free lists by breaking down the total slots into maximal power-of-two blocks
+    fn init_free_blocks(&mut self, total_slots: usize) {
+        let mut start_idx: usize = 0;
+        let mut remaining = total_slots;
 
-    // --- Helper Methods to Encapsulate Tag Logic ---
+        while remaining > 0 {
+            // Find the largest order that fits in `remaining` AND satisfies alignment of `start_idx`
+            // A block of order K must start at index multiple of 2^K
+            // size = 1 << k
 
-    #[inline]
-    unsafe fn mark_allocated(&mut self, offset: usize, order: usize) {
-        let idx = self.calculator.tag_index(offset);
-        // SAFETY: idx checked
-        unsafe {
-            *self.tags.get_unchecked_mut(idx) = (order as u8) | TAG_ALLOCATED;
-        }
-    }
+            // 1. Largest power of two <= remaining
+            let order_by_size = (usize::BITS - remaining.leading_zeros() - 1) as usize;
 
-    #[inline]
-    unsafe fn mark_unallocated(&mut self, offset: usize, order: usize) {
-        let idx = self.calculator.tag_index(offset);
-        // SAFETY: idx checked
-        unsafe {
-            *self.tags.get_unchecked_mut(idx) = order as u8;
-        }
-    }
+            // 2. Largest alignment of start_idx
+            let order_by_align = if start_idx == 0 {
+                MAX_ORDER // Aligned to anything
+            } else {
+                start_idx.trailing_zeros() as usize
+            };
 
-    /// Mark block as currently in Slab cache
-    /// SAFETY: Caller ensures ptr is valid
-    unsafe fn mark_slab(&mut self, ptr: NonNull<u8>) {
-        let offset = unsafe { self.calculator.offset_of(ptr) };
-        let idx = self.calculator.tag_index(offset);
-        unsafe {
-            let tag = self.tags.get_unchecked_mut(idx);
-            // Must be allocated to be in slab
-            if (*tag & TAG_ALLOCATED) == 0 {
-                panic!(
-                    "Logic Error: Attempt to put free block into Slab: ptr={:?}",
-                    ptr
-                );
+            // Constraint: Must fit in MAX_ORDER
+            let order = order_by_size.min(order_by_align).min(MAX_ORDER);
+
+            // Add this block to the free list
+            unsafe {
+                self.add_to_free_list(SlotIndex(start_idx), order);
             }
-            if (*tag & TAG_SLAB) != 0 {
-                panic!("Double free detected (Slab Re-entry): ptr={:?}", ptr);
-            }
-            *tag |= TAG_SLAB;
+
+            let block_size = 1 << order;
+            start_idx += block_size;
+            remaining -= block_size;
         }
     }
 
-    /// Unmark block from Slab cache (retrieve for use)
-    /// SAFETY: Caller ensures ptr is valid
-    unsafe fn unmark_slab(&mut self, ptr: NonNull<u8>) {
-        let offset = unsafe { self.calculator.offset_of(ptr) };
-        let idx = self.calculator.tag_index(offset);
+    /// Helper: Add a block to the free list
+    unsafe fn add_to_free_list(&mut self, index: SlotIndex, order: usize) {
+        let ptr = unsafe { self.calculator.ptr_from_index(index) };
+        let node = unsafe { &mut *(ptr.as_ptr() as *mut FreeNode) };
+        // We use ManuallyDrop to wrap the Link. Assigning to it does NOT drop the old value
+        // (which is implicitly ManuallyDrop::drop, doing nothing).
+        // This safely overwrites garbage data without panicking.
+        node.link = ManuallyDrop::new(Link::new());
+
         unsafe {
-            let tag = self.tags.get_unchecked_mut(idx);
-            // Must be allocated
-            debug_assert!(
-                (*tag & TAG_ALLOCATED) != 0,
-                "Slab block must be marked allocated"
-            );
-            debug_assert!((*tag & TAG_SLAB) != 0, "Slab block must be marked as Slab");
+            (*self.free_lists)[order].push_front(Pin::new_unchecked(node));
+        }
+        self.free_bitmap |= 1 << order;
 
-            *tag &= !TAG_SLAB;
+        // Mark tag as clean (Order K, Not Allocated)
+        self.set_tag(index, order, false);
+    }
+
+    /// Helper: Remove a block from the free list
+    unsafe fn remove_from_free_list(&mut self, index: SlotIndex, order: usize) {
+        let ptr = unsafe { self.calculator.ptr_from_index(index) };
+        let node_ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr() as *mut FreeNode) };
+
+        // We need a cursor to remove specific node, or just pop if we don't care which one (for alloc).
+        // But for merging (dealloc), we have a specific node address (buddy).
+        // `veloq_intrusive_linklist` supports cursor removal.
+
+        unsafe {
+            let mut cursor = (*self.free_lists)[order].cursor_mut_from_ptr(node_ptr);
+            cursor.remove();
+        }
+
+        if (*self.free_lists)[order].is_empty() {
+            self.free_bitmap &= !(1 << order);
         }
     }
 
-    /// Check for double free before Raw Dealloc
-    unsafe fn check_double_free(&self, offset: usize, order: usize) {
-        let idx = self.calculator.tag_index(offset);
-        let tag = unsafe { *self.tags.get_unchecked(idx) };
-
-        if (tag & TAG_ALLOCATED) == 0 {
-            panic!(
-                "Double free detected (Raw): offset={}, order={}",
-                offset, order
-            );
+    /// Set tag for a block
+    /// We only set the tag for the *head* slot of the block.
+    fn set_tag(&mut self, index: SlotIndex, order: usize, allocated: bool) {
+        if index.0 >= self.tags.len() {
+            return;
         }
-        // If it's in slab, it shouldn't be deallocated via raw unless removed from slab first
-        // But dealloc usually implies it's NOT in slab anymore or never was (if we skipped slab).
-        // Actually, if it has TAG_SLAB, it means it IS in the slab list. If we try to raw-dealloc it, that's wrong.
-        if (tag & TAG_SLAB) != 0 {
-            panic!(
-                "Double free detected (In Slab): offset={}, order={}",
-                offset, order
-            );
-        }
-        if (tag & TAG_ORDER_MASK) != order as u8 {
-            panic!(
-                "Dealloc order mismatch: offset={}, expected={}, actual={}",
-                offset,
-                tag & TAG_ORDER_MASK,
-                order
-            );
-        }
+        let val = (order as u8) & TAG_ORDER_MASK;
+        self.tags[index.0] = if allocated { val | TAG_ALLOCATED } else { val };
     }
 
-    // --- End Helper Methods ---
+    fn get_tag(&self, index: SlotIndex) -> u8 {
+        self.tags[index.0]
+    }
 
-    /// 分配指定 Order 的内存块
-    fn alloc(&mut self, order: usize) -> Option<NonNull<u8>> {
-        // 寻找合适的空闲块 - Bitmap 加速查找 (O(1))
-        let search_mask = 0xFFFFu16 << order;
+    /// Allocation: Request 2^order slots
+    pub fn alloc(&mut self, order: usize) -> Option<SlotIndex> {
+        if order > MAX_ORDER {
+            return None;
+        }
+
+        // 1. Search for best fit
+        let search_mask = !((1u32 << order) - 1); // Bitmask >= order
         let candidates = self.free_bitmap & search_mask;
 
         if candidates == 0 {
             return None;
         }
 
-        // 找到最小的满足条件的 Order
         let found_order = candidates.trailing_zeros() as usize;
 
-        // SAFETY: bitmap 对应的位为 1，意味着 free_lists[found_order] 必定非空
-        let node_ref = unsafe {
-            (*self.free_lists)[found_order]
+        // 2. Pop from the found list
+        // FIX: Extract raw pointer immediately to drop borrow of free_lists
+        let ptr = unsafe {
+            let node = (*self.free_lists)[found_order]
                 .pop_front()
-                .unwrap_unchecked()
+                .unwrap_unchecked();
+            // Assuming node is Pin<&mut FreeNode> or similar that allows get_unchecked_mut
+            // intrusive_linklist usually returns a cursor or reference.
+            // If it returns a reference, we need to convert to raw pointer.
+            NonNull::new_unchecked(node.get_unchecked_mut() as *mut FreeNode as *mut u8)
         };
-        // Get raw pointer before we potentially invalidate the reference by splitting etc (though we own it now)
-        let node_ptr = unsafe { NonNull::from(node_ref.get_unchecked_mut()) };
 
         if (*self.free_lists)[found_order].is_empty() {
             self.free_bitmap &= !(1 << found_order);
         }
 
-        let mut curr_order = found_order;
-        // 此时我们其实需要 offset，但 node_ptr 刚拿出来，先计算一次 offset
-        // SAFETY: node_ptr 必定在 Arena 内
-        let curr_offset = unsafe { self.calculator.offset_of(node_ptr.cast::<u8>()) };
+        let found_idx = unsafe { self.calculator.index_from_ptr(ptr) };
 
-        // 迭代分裂直到达到所需大小
+        // 3. Split until needed order
+        let mut curr_order = found_order;
+        // Fix unused mut warning
+        let curr_idx = found_idx;
+
         while curr_order > order {
             curr_order -= 1;
-            let block_size = self.calculator.block_size(curr_order);
+            let buddy_idx = SlotIndex(curr_idx.0 + (1 << curr_order));
 
-            // Buddy 是高地址的那一半
-            // SAFETY: 向下分裂时，block_size 必定在当前块范围内
-            let buddy_offset = curr_offset + block_size;
-            let buddy_ptr = unsafe { self.calculator.ptr_at(buddy_offset) };
-
-            // 将 Buddy 初始化为 FreeNode 并加入对应的空闲链表
-            // SAFETY: buddy_ptr 指向有效的未使用内存
+            // Add buddy to free list
             unsafe {
-                let buddy_node = &mut *(buddy_ptr.as_ptr() as *mut FreeNode);
-                buddy_node.link = Link::new();
-                (*self.free_lists)[curr_order].push_front(Pin::new_unchecked(buddy_node));
-                self.free_bitmap |= 1 << curr_order;
-            };
-
-            // 更新 Buddy 的 Tag (Clean State, implies unallocated)
-            unsafe {
-                self.mark_unallocated(buddy_offset, curr_order);
+                self.add_to_free_list(buddy_idx, curr_order);
             }
         }
 
-        // 标记分配出的块
-        unsafe {
-            self.mark_allocated(curr_offset, order);
-        }
+        // 4. Mark allocated
+        self.set_tag(curr_idx, order, true);
 
-        // SAFETY: curr_offset 始终有效
-        Some(unsafe { self.calculator.ptr_at(curr_offset) })
+        Some(curr_idx)
     }
 
-    /// 释放内存块
-    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, order: usize) {
-        // SAFETY: 假定 ptr 是由 alloc 返回的，在 Arena 范围内
-        let offset = unsafe { self.calculator.offset_of(ptr) };
-
-        let mut curr_offset = offset;
+    /// Deallocation
+    ///
+    /// # Safety
+    /// index must be a valid allocated block start.
+    /// order must match allocation order (though we can verify with tags).
+    pub unsafe fn dealloc(&mut self, index: SlotIndex, order: usize) -> Result<(), BuddyError> {
+        let mut curr_idx = index;
         let mut curr_order = order;
 
-        // Double-Free Check
-        unsafe { self.check_double_free(curr_offset, curr_order) };
+        // Verify Tag
+        let tag = self.get_tag(curr_idx);
+        if (tag & TAG_ALLOCATED) == 0 {
+            return Err(BuddyError::DoubleFree);
+        }
+        if (tag & TAG_ORDER_MASK) as usize != order {
+            // This might happen if user passed wrong order, or corruption
+            return Err(BuddyError::InvalidFree);
+        }
 
-        // 立即标记为空闲
-        unsafe { self.mark_unallocated(curr_offset, curr_order) };
+        // Mark As Free immediately
+        self.set_tag(curr_idx, curr_order, false);
 
-        // 尝试向上合并
-        while curr_order < NUM_ORDERS - 1 {
-            let buddy_offset = self.calculator.buddy_offset(curr_offset, curr_order);
+        // Merge loop
+        while curr_order < MAX_ORDER {
+            let buddy_idx = self.calculator.buddy_index(curr_idx, curr_order);
 
-            if buddy_offset >= ARENA_SIZE.get() {
+            // Boundary Check
+            if buddy_idx.0 >= self.total_slots {
                 break;
             }
 
-            let buddy_idx = self.calculator.tag_index(buddy_offset);
-            // SAFETY: buddy_offset is checked to be within ARENA_SIZE,
-            // so buddy_idx is in bounds.
-            let buddy_tag = unsafe { *self.tags.get_unchecked(buddy_idx) };
+            // Check Buddy Status
+            let buddy_tag = self.get_tag(buddy_idx);
 
-            // 检查 Buddy 是否空闲且 Order 一致
-            // 注意: 被合并的 Buddy 必须不是 Allocated 也不是 internal Slab 状态(虽然 unallocated 肯定不是 slab)
-            // 只要 (buddy_tag & TAG_ALLOCATED) == 0，它就是真正的 Raw Free
-            if (buddy_tag & TAG_ALLOCATED) == 0 && (buddy_tag & TAG_ORDER_MASK) == curr_order as u8
+            // Can merge if:
+            // 1. Buddy is NOT allocated
+            // 2. Buddy is same order
+            if (buddy_tag & TAG_ALLOCATED) == 0
+                && ((buddy_tag & TAG_ORDER_MASK) as usize == curr_order)
             {
-                // 合并 Buddy
-                // SAFETY: buddy_offset 经过检查在 Arena 范围内
-                let buddy_ptr = unsafe { self.calculator.ptr_at(buddy_offset) };
-                let buddy_node_ptr = buddy_ptr.cast::<FreeNode>();
+                // Merge!
 
-                // 从空闲链表中移除 Buddy
-                // SAFETY: buddy 是空闲块，必定在链表中
+                // Remove buddy from free list
                 unsafe {
-                    let mut cursor =
-                        (*self.free_lists)[curr_order].cursor_mut_from_ptr(buddy_node_ptr);
-                    cursor.remove();
+                    self.remove_from_free_list(buddy_idx, curr_order);
+                }
 
-                    if (*self.free_lists)[curr_order].is_empty() {
-                        self.free_bitmap &= !(1 << curr_order);
-                    }
-                };
+                // Move current to the lower index (alignment)
+                if buddy_idx < curr_idx {
+                    curr_idx = buddy_idx;
+                }
 
-                // 更新为合并后的大块
-                curr_offset = std::cmp::min(curr_offset, buddy_offset);
                 curr_order += 1;
 
-                // 更新新块的 Tag (Upper level calls might reset this later, but keep consistent)
-                unsafe { self.mark_unallocated(curr_offset, curr_order) };
+                // Update tag for the new merged block head
+                self.set_tag(curr_idx, curr_order, false);
             } else {
                 break;
             }
         }
 
-        // 将最终的空闲块加入链表
-        // SAFETY: curr_offset 始终在 Arena 范围内
-        let final_ptr = unsafe { self.calculator.ptr_at(curr_offset) };
-        let final_node_ptr = final_ptr.cast::<FreeNode>();
-
-        // SAFETY: final_ptr 有效
+        // Add merged block to free list
         unsafe {
-            let final_node = &mut *final_node_ptr.as_ptr();
-            final_node.link = Link::new();
+            self.add_to_free_list(curr_idx, curr_order);
+        }
 
-            (*self.free_lists)[curr_order].push_front(Pin::new_unchecked(final_node));
-            self.free_bitmap |= 1 << curr_order;
-        };
+        Ok(())
+    }
+
+    /// Convert SlotIndex to Pointer
+    pub fn ptr_of(&self, index: SlotIndex) -> NonNull<u8> {
+        unsafe { self.calculator.ptr_from_index(index) }
+    }
+
+    /// Helper: Get allocated capacity in bytes
+    pub fn capacity_of(order: usize) -> usize {
+        (1 << order) * SLOT_SIZE
     }
 }
 
-impl Drop for RawBuddyAllocator {
+impl fmt::Debug for BuddyAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BuddyAllocator")
+            .field("total_slots", &self.total_slots)
+            .field("free_bitmap", &format_args!("{:b}", self.free_bitmap))
+            .finish()
+    }
+}
+
+impl Drop for BuddyAllocator {
     fn drop(&mut self) {
-        // SAFETY: 必须显式 drop free_lists，确保在 _memory_owner 析构前清理链表。
-        // 因为链表节点存储在 _memory_owner 管理的内存中。
         unsafe {
             ManuallyDrop::drop(&mut self.free_lists);
         }
     }
 }
 
-/// 包含缓存层 (Slab) 的分配器封装
-pub struct BuddyAllocator {
-    raw: RawBuddyAllocator,
-
-    // Slab 缓存：存储常用 Order 的空闲块 (Order 0..=MAX_SLAB_ORDER)
-    slabs: [Vec<NonNull<u8>>; MAX_SLAB_ORDER + 1],
-}
-
-// SAFETY: BuddyAllocator 管理自己的内存，指针指向的是它拥有的内存区域。
-// 整个结构体可以安全地跨线程传递（虽然不应该同时从多个线程访问）。
-unsafe impl Send for BuddyAllocator {}
-
-impl BuddyAllocator {
-    pub fn new(memory: ThreadMemory) -> Result<Self, AllocError> {
-        // Pre-allocate slab vectors to avoid reallocation jitter
-        let slabs = std::array::from_fn(|i| Vec::with_capacity(SLAB_CAPACITIES[i]));
-
-        Ok(Self {
-            raw: RawBuddyAllocator::new(memory)?,
-            slabs,
-        })
-    }
-
-    fn calculate_order(size: usize) -> Option<usize> {
-        if size > ARENA_SIZE.get() {
-            return None;
-        }
-        if size <= MIN_BLOCK_SIZE {
-            return Some(0);
-        }
-        // MIN_BLOCK_SIZE is 4096 (2^12)
-        let order = size.next_power_of_two().ilog2() as usize - 12;
-        if order >= NUM_ORDERS {
-            None
-        } else {
-            Some(order)
-        }
-    }
-
-    /// 分配指定大小的内存块
-    fn alloc(&mut self, size: usize) -> Option<(NonNull<u8>, usize)> {
-        let needed_order = Self::calculate_order(size)?;
-
-        // 1. 尝试从 Slab 分配
-        if needed_order <= MAX_SLAB_ORDER {
-            if let Some(ptr) = self.slabs[needed_order].pop() {
-                // Update Tag: Clear SLAB bit
-                unsafe { self.raw.unmark_slab(ptr) };
-                return Some((ptr, needed_order));
-            }
-        }
-
-        // 2. Buddy 分配逻辑
-        let ptr = self.raw.alloc(needed_order)?;
-        Some((ptr, needed_order))
-    }
-
-    /// 释放内存块
-    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, order: usize) {
-        // 1. 尝试放入 Slab 缓存
-        if order <= MAX_SLAB_ORDER {
-            if self.slabs[order].len() < SLAB_CAPACITIES[order] {
-                // Mark as in SLAB & Check Double Free
-                unsafe { self.raw.mark_slab(ptr) };
-
-                self.slabs[order].push(ptr);
-                return;
-            }
-        }
-
-        // 2. 委托给 RawBuddyAllocator
-        // SAFETY: Caller ensures ptr is valid for deallocation
-        unsafe { self.raw.dealloc(ptr, order) };
-    }
-
-    #[cfg(test)]
-    fn count_free(&self, order: usize) -> usize {
-        (*self.raw.free_lists)[order].len()
-    }
-
-    #[cfg(test)]
-    fn count_slab(&self, order: usize) -> usize {
-        if order <= MAX_SLAB_ORDER {
-            self.slabs[order].len()
-        } else {
-            0
-        }
-    }
-}
-
-// 实现 RawAllocator trait for BuddyAllocator
-impl crate::block::RawAllocator for BuddyAllocator {
-    fn alloc(&mut self, size: usize) -> Option<crate::block::RawAllocResult> {
-        let (ptr, order) = self.alloc(size)?;
-        let capacity = MIN_BLOCK_SIZE << order;
-        Some(crate::block::RawAllocResult {
-            ptr,
-            cap: unsafe { NonZeroUsize::new_unchecked(capacity) },
-            context: order,
-            is_registered: true,
-        })
-    }
-
-    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, _cap: usize, context: usize) {
-        // context is the order
-        unsafe {
-            self.dealloc(ptr, context);
-        }
-    }
-
-    fn global_region(&self) -> (NonNull<u8>, usize) {
-        self.raw.global_region()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-
     use super::*;
+    use std::alloc::{Layout, alloc, dealloc};
+
+    struct TestMemory {
+        ptr: NonNull<u8>,
+        layout: Layout,
+    }
+
+    impl TestMemory {
+        fn new(size: usize) -> Self {
+            let layout = Layout::from_size_align(size, 4096).unwrap();
+            let ptr = unsafe { NonNull::new(alloc(layout)).unwrap() };
+            unsafe { ptr.as_ptr().write_bytes(0, size) };
+            Self { ptr, layout }
+        }
+    }
+
+    impl Drop for TestMemory {
+        fn drop(&mut self) {
+            unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+        }
+    }
 
     #[test]
-    fn test_alloc_basic() {
-        // Create a real ThreadMemory for testing
-        let size = ARENA_SIZE;
-        let memory = crate::ThreadMemory::new_standalone(size).unwrap();
+    fn test_buddy_alloc_basic() {
+        // 1MB = 256 Slots
+        let mem_size = 1024 * 1024;
+        let memory = TestMemory::new(mem_size);
 
-        let mut allocator = BuddyAllocator::new(memory).unwrap();
-        // 初始状态：1个 MaxOrder 块 (Order 13)
-        assert_eq!(allocator.count_free(NUM_ORDERS - 1), 1);
+        let mut buddy = unsafe { BuddyAllocator::new(memory.ptr, mem_size) };
 
-        // 分配 4KB (Order 0)
-        let (ptr1, order1) = allocator.alloc(4096).unwrap();
-        assert_eq!(order1, 0);
+        // Alloc 4KB (Order 0)
+        let idx1 = buddy.alloc(0).unwrap();
 
-        // 分裂路径验证
-        // MaxOrder -> ... -> 8K -> 4K(Allocated) + 4K(Free)
-        // 所有的中间级 (4K ... MaxOrder) 都应该各有一个 Free 块
-        assert_eq!(allocator.count_free(0), 1); // 剩下一个 4K
-        assert_eq!(allocator.count_free(1), 1); // 剩下一个 8K
-        assert_eq!(allocator.count_free(NUM_ORDERS - 1), 0); // MaxOrder 没了
+        // Alloc 8KB (Order 1)
+        let idx2 = buddy.alloc(1).unwrap();
 
-        // 释放后应完全合并 (Slab 为空，因为 Order 0 被合并了? 不，dealloc 会先放 Slab)
-        // 第一次释放 4KB -> 放入 Slab
-        unsafe { allocator.dealloc(ptr1, order1) };
-        assert_eq!(allocator.count_slab(0), 1);
-        assert_eq!(allocator.count_free(0), 1); // 之前 alloc 留下的另一个 4K 还在 free list
+        // Valid Indices
+        assert!(idx1.offset() < mem_size);
+        assert!(idx2.offset() < mem_size);
+        assert_ne!(idx1, idx2);
 
-        // 只有 Slab 满了或者手动清空，才会合并。
-        // 这里手动从 Slab 取出并走正常的 dealloc 流程比较难模拟，除非我们在测试里不走 dealloc
-        // 但我们可以测试 Slab 复用
-        let (ptr2, order2) = allocator.alloc(4096).unwrap();
-        assert_eq!(order2, 0);
-        assert_eq!(ptr2, ptr1); // 应该复用 Slab 里的
-        assert_eq!(allocator.count_slab(0), 0);
+        // Dealloc
+        unsafe {
+            buddy.dealloc(idx1, 0).unwrap();
+            buddy.dealloc(idx2, 1).unwrap();
+        }
+
+        // Re-alloc should succeed
+        let _idx3 = buddy.alloc(MAX_ORDER).unwrap_or(SlotIndex(usize::MAX));
+        // Max order for 1MB??
+        // 1MB = 256 * 4096 = 2^8 * 4096.
+        // So max order is 8.
+        // MAX_ORDER is 18 (1GB). So alloc(18) should fail.
+        let idx_fail = buddy.alloc(18);
+        assert!(idx_fail.is_none());
+
+        let idx_full = buddy.alloc(8); // 1MB
+        assert!(idx_full.is_some());
     }
 }

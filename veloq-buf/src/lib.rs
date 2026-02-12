@@ -1,8 +1,8 @@
 mod buffer;
 mod os;
 
-pub mod block;
 pub mod global;
+pub mod slot;
 
 use std::{num::NonZeroUsize, ptr::NonNull, sync::Arc};
 

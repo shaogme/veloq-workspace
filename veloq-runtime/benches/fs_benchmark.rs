@@ -15,16 +15,16 @@ use veloq_runtime::spawn_local;
 
 fn create_local_executor() -> LocalExecutor {
     LocalExecutor::builder().build(move |registrar| {
-        use veloq_buf::{ThreadMemoryMultiplier, UniformBlock};
+        use veloq_buf::{PoolTopology, ThreadMemoryMultiplier, UniformSlot};
 
         // 128x multiplier -> ~256MB
         let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(128) });
-        let topology = UniformBlock::buddy(multiplier);
+        let topology = UniformSlot::new(multiplier);
 
         let global_pool = topology
             .create_pool(1)
             .expect("Failed to create global pool");
-        topology.build_for_worker(&global_pool, 0, registrar)
+        topology.build(&global_pool, 0, registrar)
     })
 }
 
@@ -159,7 +159,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                 // Re-initialized per iteration because block_on consumes the runtime.
                 let runtime = Runtime::builder()
                     .config(veloq_runtime::config::Config::default().worker_threads(WORKER_COUNT))
-                    .with_topology(veloq_buf::UniformBlock::buddy(
+                    .with_topology(veloq_buf::UniformSlot::new(
                         veloq_buf::ThreadMemoryMultiplier(nz!(32)),
                     ))
                     .build()

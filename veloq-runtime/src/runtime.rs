@@ -23,7 +23,7 @@ pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
-use veloq_buf::{PoolTopology, ThreadMemoryMultiplier, UniformBlock, nz};
+use veloq_buf::{PoolTopology, ThreadMemoryMultiplier, UniformSlot, nz};
 use veloq_driver::driver::RemoteWaker;
 
 use veloq_blocking::init_blocking_pool;
@@ -44,16 +44,16 @@ struct WorkerPrep<T: PoolTopology> {
     barrier: Arc<Barrier>,
 }
 
-pub struct RuntimeBuilder<T: PoolTopology = UniformBlock> {
+pub struct RuntimeBuilder<T: PoolTopology = UniformSlot> {
     config: Config,
     topology: T,
 }
 
-impl RuntimeBuilder<UniformBlock> {
+impl RuntimeBuilder<UniformSlot> {
     pub fn new() -> Self {
         Self {
             config: Config::default(),
-            topology: UniformBlock::hybrid(ThreadMemoryMultiplier(nz!(8))),
+            topology: UniformSlot::new(ThreadMemoryMultiplier(nz!(8))),
         }
     }
 }
@@ -218,7 +218,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
     }
 }
 
-pub struct Runtime<T: PoolTopology = UniformBlock> {
+pub struct Runtime<T: PoolTopology = UniformSlot> {
     handles: Vec<thread::JoinHandle<()>>,
     registry: Arc<ExecutorRegistry>,
     peer_handles: Arc<Vec<AtomicUsize>>,
@@ -244,8 +244,8 @@ impl<T: PoolTopology> Drop for Runtime<T> {
     }
 }
 
-impl Runtime<UniformBlock> {
-    pub fn builder() -> RuntimeBuilder<UniformBlock> {
+impl Runtime<UniformSlot> {
+    pub fn builder() -> RuntimeBuilder<UniformSlot> {
         RuntimeBuilder::new()
     }
 
