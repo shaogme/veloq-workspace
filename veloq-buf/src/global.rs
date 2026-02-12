@@ -36,11 +36,6 @@ pub struct GlobalMemoryInfo {
 unsafe impl Send for GlobalMemoryInfo {}
 unsafe impl Sync for GlobalMemoryInfo {}
 
-/// Constant defining the number of shards
-/// Must be power of 2 for optimal performance (optional with modulo, but good practice).
-/// Using 16 shards to balance memory overhead and contention reduction.
-const SHARD_COUNT: usize = 16;
-
 /// Local Cache Constants
 type PoolId = usize;
 
@@ -103,9 +98,26 @@ impl GlobalSlotPool {
             len: chunk.size,
         };
 
-        // 3. Initialize Buddy Allocators (Sharded)
+        // 2. Determine Shard Layout
+        // Dynamic sharding based on CPU cores, scaled for contention.
+        // We target at least 16 shards for baseline scalability.
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        // Start with parallelism next power of 2, minimum 16
+        let mut shard_count = parallelism.next_power_of_two().max(16);
+
         let total_slots = total_size / SLOT_SIZE;
-        let slots_per_shard = total_slots / SHARD_COUNT; // Integer division
+
+        // Constraint: Each shard must accomodate at least one Superblock (64 slots)
+        // to support potential superblock allocations.
+        // If memory is small, reduce shard count.
+        while shard_count > 1 && (total_slots / shard_count) < SUPERBLOCK_SIZE {
+            shard_count /= 2;
+        }
+
+        let slots_per_shard = total_slots / shard_count; // Integer division
         let bytes_per_shard = slots_per_shard * SLOT_SIZE;
 
         if slots_per_shard == 0 {
@@ -115,10 +127,11 @@ impl GlobalSlotPool {
             ));
         }
 
-        let mut shards = Vec::with_capacity(SHARD_COUNT);
+        // 3. Initialize Buddy Allocators (Sharded)
+        let mut shards = Vec::with_capacity(shard_count);
         let base_ptr = chunk.as_mut_ptr();
 
-        for i in 0..SHARD_COUNT {
+        for i in 0..shard_count {
             let offset_bytes = i * bytes_per_shard;
             let shard_ptr = unsafe { NonNull::new_unchecked(base_ptr.add(offset_bytes)) };
 
@@ -135,7 +148,7 @@ impl GlobalSlotPool {
             states.push(SuperblockState::new());
         }
 
-        // Warning: If total_slots % SHARD_COUNT != 0, the tail memory is ignored.
+        // Warning: If total_slots % shard_count != 0, the tail memory is ignored.
         // Given the huge page sizes and power-of-2 allocations, this is negligible.
 
         Ok(Self {
@@ -175,10 +188,6 @@ impl GlobalSlotPool {
                     let should_free = self.superblocks[sb_idx].set_inactive();
                     if should_free {
                         // This case (Full + Empty + Inactive) is impossible (Full != Empty).
-                        // Unless someone freed EVERYTHING while we were trying to alloc?
-                        // If alloc_one failed, it means free_mask is 0.
-                        // So it definitely isn't empty.
-                        // But let's follow the protocol strictly.
                         self.dealloc_superblock(sb_idx);
                     }
 
@@ -196,7 +205,7 @@ impl GlobalSlotPool {
 
                 // Initialize State
                 // CRITICAL: We must hold the state in "Active" mode before anyone else can touch it.
-                // Since we just alloced it, no one else has pointers to slots inside it (except danging ones? No, unique alloc).
+                // Since we just alloced it, no one else has pointers to slots inside it.
                 self.superblocks[sb_idx].init();
 
                 // Set as Active
@@ -216,9 +225,7 @@ impl GlobalSlotPool {
                 return Some((global_idx, ptr));
             }
 
-            // Fallback: If cannot allocate Superblock, fail for now.
-            // We could try alloc Order 0 directly from Buddy, but our design mandates Order 0 lives in Superblocks.
-            // Mixing direct Order 0 with Superblock Order 6 logic in same space is messy (State array assumes Order 6 chunks).
+            // Fallback
             return None;
         }
 
@@ -228,28 +235,56 @@ impl GlobalSlotPool {
 
     /// Internal helper for direct global operations
     fn alloc_global(&self, order: usize) -> Option<(SlotIndex, NonNull<u8>)> {
+        let shard_count = self.shards.len();
+
         // 1. Determine starting shard (Thread Affinity)
         let thread_id = std::thread::current().id();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         thread_id.hash(&mut hasher);
         let hash = hasher.finish() as usize;
 
-        // Use high bits for shard selection to avoid bias if low bits are similar?
-        // DefaultHasher is usually robust.
-        let start_shard = hash % SHARD_COUNT;
+        // Start shard based on hash
+        // Optimization: shard_count is always power of 2 (enforced in new)
+        let mask = shard_count - 1;
+        let start_shard = hash & mask;
 
-        // 2. Try Shards (Linearly Probing / Stealing)
-        for i in 0..SHARD_COUNT {
-            let shard_idx = (start_shard + i) % SHARD_COUNT;
-            let shard_mutex = &self.shards[shard_idx];
+        // Randomized Stealing Stride
+        // We use the upper bits of the hash to generate a stride.
+        // Stride must be odd to be coprime with shard_count (power of 2),
+        // ensuring we visit all shards exactly once in the permuted order.
+        let stride = (hash >> 16) | 1;
 
-            let mut buddy = shard_mutex.lock();
+        // 2. Phase 1: Try Lock (Optimistic)
+        // Scan ALL shards using the permuted order.
+        for i in 0..shard_count {
+            // idx = (start + i * stride) % count
+            let idx = (start_shard.wrapping_add(i.wrapping_mul(stride))) & mask;
+
+            if let Some(mut buddy) = self.shards[idx].try_lock() {
+                if let Some(local_idx) = buddy.alloc(order) {
+                    let ptr = buddy.ptr_of(local_idx);
+
+                    // Convert local slot index to global slot index
+                    // Global = ShardBase + Local
+                    let global_idx_val = (idx * self.slots_per_shard) + local_idx.0;
+
+                    return Some((SlotIndex(global_idx_val), ptr));
+                }
+            }
+        }
+
+        // 3. Phase 2: Blocking
+        // If we are here, either all shards are contented, or all are full.
+        // Iterate through all shards again, blocking on each.
+        for i in 0..shard_count {
+            let idx = (start_shard.wrapping_add(i.wrapping_mul(stride))) & mask;
+
+            // Block until lock acquired
+            let mut buddy = self.shards[idx].lock();
             if let Some(local_idx) = buddy.alloc(order) {
                 let ptr = buddy.ptr_of(local_idx);
 
-                // Convert local slot index to global slot index
-                // Global = ShardBase + Local
-                let global_idx_val = (shard_idx * self.slots_per_shard) + local_idx.0;
+                let global_idx_val = (idx * self.slots_per_shard) + local_idx.0;
 
                 return Some((SlotIndex(global_idx_val), ptr));
             }
@@ -269,7 +304,6 @@ impl GlobalSlotPool {
             let offset = (index.0 % SUPERBLOCK_SIZE) as u16;
 
             if sb_idx >= self.superblocks.len() {
-                // Should not happen for valid indices
                 return;
             }
 
@@ -296,12 +330,8 @@ impl GlobalSlotPool {
         let shard_idx = index.0 / self.slots_per_shard;
         let local_idx_val = index.0 % self.slots_per_shard;
 
-        // Boundary check (should not happen for valid indices)
+        // Boundary check
         if shard_idx >= self.shards.len() {
-            // In worst case (e.g. index inside the ignored tail), we panic.
-            // But alloc_slots never returns such index.
-            // Double check logic for tail?
-            // We ignored tail in `new`, so no indices >= (slots_per_shard * SHARD_COUNT) exist.
             panic!(
                 "GlobalSlotPool: Invalid slot index {} (shard {})",
                 index.0, shard_idx
@@ -311,8 +341,6 @@ impl GlobalSlotPool {
         // 2. Deallocate in strict shard
         let mut buddy = self.shards[shard_idx].lock();
         unsafe {
-            // Panic or return error? BuddyAllocator returns Result.
-            // For now, we unwrap/expect because dealloc failures are bugs.
             buddy
                 .dealloc(SlotIndex(local_idx_val), order)
                 .expect("GlobalSlotPool dealloc failed");
