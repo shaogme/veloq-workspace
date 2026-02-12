@@ -1,4 +1,4 @@
-use crate::slot::{SLOT_SIZE, SlotIndex};
+use crate::heap::slot::{SLOT_SIZE, SlotIndex};
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::pin::Pin;

@@ -12,6 +12,7 @@
 *   **注册优化 (Registration Friendly)**: 为了支持 io_uring 的 `IORING_REGISTER_BUFFERS` 或 Windows RIO，底层内存必须易于提取并以大块形式注册。
 *   **灵活的池拓扑 (Flexible Pool Topology)**: 通过 `PoolTopology` trait，支持多种内存管理策略（如全局共享池、独立池等）。
 *   **类型擦除**: 通过 `AnyBufPool` 和手动 VTable，使得上层应用无需关心底层的具体分配策略。
+*   **高内聚架构**: 所有的内存分配实现细节（Heap）与对外接口（Buffer）分离，互不干扰。
 
 核心组件结构：
 
@@ -19,18 +20,19 @@
 *   **`BufPool` Trait**: 面向用户的顶层接口，提供 `alloc` 方法返回 `FixedBuf`。
 *   **`PoolTopology` Trait**: 定义运行时内存池的初始化和构建逻辑。
 *   **`UniformSlot`**: 标准的拓扑实现，采用 **Sharded Global Pool + Superblock Cache** 策略。
-*   **`GlobalSlotPool`**: 全局内存管理器，管理整个系统的物理内存（Huge Pages），并将其切分为多个分片 (Shards) 以减少锁竞争。
+*   **`heap::GlobalSlotPool`**: 全局内存管理器，管理整个系统的物理内存（Huge Pages），并将其切分为多个分片 (Shards) 以减少锁竞争。
 *   **`SlotBasedPool`**: 线程本地的 Pool 句柄，指向全局的 `GlobalSlotPool`。
-*   **`BuddyAllocator`**: 底层分配算法，管理分片内的内存，支持 Order 0 (4KB) 到 Order 18 (1GB) 的分配。
-*   **`SuperblockState`**: 针对 4KB 小对象的快速分配缓存，使用原子操作管理 64 个 Slot。
+*   **`heap::buddy::BuddyAllocator`**: 底层分配算法，管理分片内的内存，支持 Order 0 (4KB) 到 Order 18 (1GB) 的分配。
+*   **`heap::superblock::SuperblockState`**: 针对 4KB 小对象的快速分配缓存，使用原子操作管理 64 个 Slot。
 
 ## 2. 理念和思路 (Philosophy and Design)
 
-### 2.1 灵活的池拓扑 (Pool Topology)
-为了适应不同的工作负载和硬件环境，`veloq-buf` 引入了 `PoolTopology` 抽象：
-*   **初始化 (`init`)**: 负责申请全局物理内存（如 1GB Huge Pages），并建立全局管理结构（如 `GlobalSlotPool`）。
-*   **构建 (`build`)**: 为每个 Worker 线程构建 `BufPool` 实例，并负责将内存区域注册到对应的驱动（如 io_uring）。
-*   **默认实现 (`UniformSlot`)**: 提供了基于分片 Buddy System 的标准实现，适用于通用高性能场景。
+### 2.1 架构分离：Heap vs Buffer
+`veloq-buf` 采用了**高内聚低耦合**的架构设计：
+*   **Heap Layer (`src/heap.rs`)**: 负责所有与“如何分配内存”相关的逻辑。包含物理内存申请 (`MemoryChunk`)、伙伴系统算法 (`BuddyAllocator`)、全局分片管理 (`GlobalSlotPool`) 以及无锁缓存 (`Superblock`)。
+*   **Buffer Layer (`src/buffer.rs`)**: 负责所有与“如何使用内存”相关的逻辑。包含句柄定义 (`FixedBuf`)、池接口 (`BufPool`)、类型擦除 (`AnyBufPool`) 以及拓扑定义 (`PoolTopology`)。
+
+这种分离确保了底层分配算法的变更不会影响上层接口，同时使得代码结构更加清晰。
 
 ### 2.2 全局分块与分片架构 (Sharded Global Pool Strategy)
 `UniformSlot` 拓扑摒弃了旧的 N*2 Block 策略，采用了更具扩展性的 **Sharded Global Slot** 架构：
@@ -51,23 +53,18 @@
 ### 2.4 Direct I/O 对齐
 核心单元 **Slot** 大小固定为 4KB。所有分配均基于 4KB 对齐，天然满足 `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` 以及各种 DMA 操作的严格对齐要求。
 
-### 2.5 核心与注册分离
-*   **BuddyAllocator**: 纯粹的内存算法，只管分配 Slot Index。
-*   **BufferRegistrar**: 驱动层接口，负责将 `GlobalSlotPool` 的大块内存注册给内核。
-*   **GlobalIndex**: 注册后的索引被编码在 `FixedBuf` 的 context 中，提交 I/O 时可直接获取。
-
 ## 3. 模块内结构 (Internal Structure)
 
 ```
 veloq-buf/src/
-├── lib.rs                 // 模块导出与基础宏定义 (nz!, MIN_THREAD_MEMORY)
-├── buffer.rs              // 核心定义：FixedBuf, BufPool, PoolTopology, UniformSlot, SlotBasedPool
-├── global.rs              // GlobalSlotPool: 全局内存管理、分片逻辑、Work Stealing
-├── slot.rs                // Slot 定义 (4KB) 与 SlotIndex
+├── lib.rs                 // 模块导出与基础宏定义 (nz!)
+├── buffer.rs              // 接口层：FixedBuf, BufPool, PoolTopology, UniformSlot, SlotBasedPool
+├── heap.rs                // 实现层入口：GlobalSlotPool, MemoryChunk
 ├── os.rs                  // OS 特定实现：Huge Page 分配
-└── buffer/
+└── heap/                  // 堆管理子模块
     ├── buddy.rs           // BuddyAllocator: 伙伴系统实现 (0~1GB)
-    └── superblock.rs      // SuperblockState: 4KB 对象的原子位图分配器
+    ├── superblock.rs      // SuperblockState: 4KB 对象的原子位图分配器
+    └── slot.rs            // Slot 定义 (4KB) 与 SlotIndex
 ```
 
 ## 4. 代码详细分析 (Detailed Analysis)
@@ -86,9 +83,9 @@ pub trait PoolTopology: Clone + Send + Sync + 'static {
     ) -> AnyBufPool;
 }
 ```
-在 `UniformSlot` 实现中，`State` 即为 `Arc<GlobalSlotPool>`。
+在 `UniformSlot` 实现中，`State` 即为 `Arc<crate::heap::GlobalSlotPool>`。
 
-### 4.2 Superblock 与原子分配 (`buffer/superblock.rs`)
+### 4.2 Superblock 与原子分配 (`heap/superblock.rs`)
 `Superblock` 是 4KB 分配的加速层。它管理一个 Order 6 (256KB) 的内存块。
 *   **状态管理**:
     *   `free_mask` (AtomicU64): 位图标记 64 个 Slot 的占用情况。
@@ -112,7 +109,7 @@ Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
 1.  **Tiny Alloc (<=4KB)**: 通过 TLS Cache 获取当前活跃的 `Superblock`，尝试原子分配。
 2.  **Large Alloc (>4KB) / Miss**: 穿透到 `GlobalSlotPool::alloc_slots`，走全局 Sharded Buddy 流程。
 
-### 4.4 Sharded BuddyAllocator (`global.rs` & `buffer/buddy.rs`)
+### 4.4 Sharded BuddyAllocator (`heap.rs` & `heap/buddy.rs`)
 `GlobalSlotPool` 内部维护了一组 `BuddyAllocator`。
 *   **Sharding**: 内存被均分。线程通过 `hash(thread_id)` 决定首选 Shard。
 *   **Buddy System**:

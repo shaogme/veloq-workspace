@@ -23,7 +23,7 @@ pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
-use veloq_buf::{PoolTopology, ThreadMemoryMultiplier, UniformSlot, nz};
+use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier, nz};
 use veloq_driver::driver::RemoteWaker;
 
 use veloq_blocking::init_blocking_pool;

@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use veloq_buf::{BufferRegion, PoolTopology, ThreadMemoryMultiplier, UniformSlot, nz};
+use veloq_buf::{BufferRegion, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 fn create_local_executor() -> LocalExecutor {
     let topology = UniformSlot::new(ThreadMemoryMultiplier(nz!(8)));

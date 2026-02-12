@@ -7,16 +7,92 @@
 //! To avoid global lock contention, the pool is partitioned into multiple **Shards**.
 //! Each shard manages a distinct slice of the global memory.
 
-use crate::buffer::buddy::BuddyAllocator;
-use crate::buffer::superblock::{SUPERBLOCK_ORDER, SUPERBLOCK_SIZE, SuperblockState};
-use crate::slot::{SLOT_SIZE, SlotIndex};
-use crate::{MIN_THREAD_MEMORY, MemoryChunk};
+pub mod buddy;
+pub mod slot;
+pub mod superblock;
+
+use self::buddy::BuddyAllocator;
+use self::slot::{SLOT_SIZE, SlotIndex};
+use self::superblock::{SUPERBLOCK_ORDER, SUPERBLOCK_SIZE, SuperblockState};
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::{io, num::NonZeroUsize, ptr::NonNull, sync::Arc};
+
+/// 2MB minimum memory per thread (Huge Page aligned)
+pub const MIN_THREAD_MEMORY: NonZeroUsize = crate::nz!(2 * 1024 * 1024);
+
+/// Underlying physical memory block (RAII Wrapper).
+/// Responsible for actual OS memory allocation and deallocation.
+#[derive(Debug)]
+pub struct MemoryChunk {
+    ptr: NonNull<u8>,
+    size: NonZeroUsize,
+}
+
+// Guarantee MemoryChunk can be shared across threads (needed for Arc internals)
+unsafe impl Send for MemoryChunk {}
+unsafe impl Sync for MemoryChunk {}
+
+impl MemoryChunk {
+    pub fn new(size: NonZeroUsize) -> std::io::Result<Self> {
+        let ptr = unsafe {
+            // Try Huge Pages first
+            match crate::os::alloc_huge_pages(size) {
+                Ok(p) => NonNull::new(p),
+                Err(_) => {
+                    // Fallback to standard pages if Huge Pages failed
+                    crate::os::alloc_pages(size).map(|p| NonNull::new(p))?
+                }
+            }
+        }
+        .ok_or(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Allocation failed",
+        ))?;
+        Ok(Self { ptr, size })
+    }
+
+    /// Get the start pointer of the memory region
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Get the mutable start pointer of the memory region
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Get the length of the memory region
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.size.get()
+    }
+
+    /// Obtain the raw parts
+    pub fn into_raw_parts(self) -> (NonNull<u8>, NonZeroUsize) {
+        let parts = (self.ptr, self.size);
+        std::mem::forget(self);
+        parts
+    }
+}
+
+impl Drop for MemoryChunk {
+    fn drop(&mut self) {
+        unsafe {
+            crate::os::free_pages(self.ptr, self.size);
+        }
+    }
+}
+
+/// Multiplier for thread memory scaling.
+/// Each unit represents `MIN_THREAD_MEMORY` (2MB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadMemoryMultiplier(pub NonZeroUsize);
 
 /// Configuration for GlobalSlotPool
 #[derive(Debug, Clone)]

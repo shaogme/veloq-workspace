@@ -15,7 +15,7 @@ use veloq_runtime::spawn_local;
 
 fn create_local_executor() -> LocalExecutor {
     LocalExecutor::builder().build(move |registrar| {
-        use veloq_buf::{PoolTopology, ThreadMemoryMultiplier, UniformSlot};
+        use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 
         // 128x multiplier -> ~256MB
         let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(128) });
@@ -160,7 +160,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                 let runtime = Runtime::builder()
                     .config(veloq_runtime::config::Config::default().worker_threads(WORKER_COUNT))
                     .with_topology(veloq_buf::UniformSlot::new(
-                        veloq_buf::ThreadMemoryMultiplier(nz!(32)),
+                        veloq_buf::heap::ThreadMemoryMultiplier(nz!(32)),
                     ))
                     .build()
                     .unwrap();

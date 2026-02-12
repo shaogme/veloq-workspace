@@ -52,9 +52,6 @@ use std::{
     sync::Arc,
 };
 
-pub mod buddy;
-pub mod superblock;
-
 const NO_REGISTRATION_INDEX: u16 = u16::MAX;
 
 /// A wrapper for `u16` that guarantees it never equals `S`.
@@ -236,12 +233,12 @@ pub trait PoolTopology: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct UniformSlot {
     /// 内存倍数 (用于计算总内存大小)
-    pub multiplier: crate::ThreadMemoryMultiplier,
+    pub multiplier: crate::heap::ThreadMemoryMultiplier,
 }
 
 impl UniformSlot {
     /// 创建新的 UniformSlot topology
-    pub fn new(multiplier: crate::ThreadMemoryMultiplier) -> Self {
+    pub fn new(multiplier: crate::heap::ThreadMemoryMultiplier) -> Self {
         Self { multiplier }
     }
 
@@ -249,22 +246,22 @@ impl UniformSlot {
     pub fn create_pool(
         &self,
         worker_count: usize,
-    ) -> std::io::Result<Arc<crate::global::GlobalSlotPool>> {
+    ) -> std::io::Result<Arc<crate::heap::GlobalSlotPool>> {
         self.init(worker_count)
     }
 }
 
 impl PoolTopology for UniformSlot {
-    type State = Arc<crate::global::GlobalSlotPool>;
+    type State = Arc<crate::heap::GlobalSlotPool>;
 
     fn init(&self, worker_count: usize) -> std::io::Result<Self::State> {
         let total_size =
-            self.multiplier.0.get() * crate::MIN_THREAD_MEMORY.get() * 2 * worker_count;
-        let config = crate::global::GlobalAllocatorConfig {
+            self.multiplier.0.get() * crate::heap::MIN_THREAD_MEMORY.get() * 2 * worker_count;
+        let config = crate::heap::GlobalAllocatorConfig {
             total_memory: total_size,
         };
 
-        let pool = crate::global::GlobalSlotPool::new(config)?;
+        let pool = crate::heap::GlobalSlotPool::new(config)?;
 
         // Return Arc instead of leaking
         Ok(Arc::new(pool))
@@ -524,17 +521,14 @@ impl std::fmt::Debug for AnyBufPool {
 #[derive(Clone)]
 pub struct SlotBasedPool {
     /// 全局 Slot Pool 的引用 (Arc)
-    pool: Arc<crate::global::GlobalSlotPool>,
+    pool: Arc<crate::heap::GlobalSlotPool>,
     /// 全局索引（用于驱动注册）
     global_index: Option<GlobalIndex>,
 }
 
 impl SlotBasedPool {
     /// 创建新的 SlotBasedPool
-    pub fn new(
-        pool: Arc<crate::global::GlobalSlotPool>,
-        global_index: Option<GlobalIndex>,
-    ) -> Self {
+    pub fn new(pool: Arc<crate::heap::GlobalSlotPool>, global_index: Option<GlobalIndex>) -> Self {
         Self { pool, global_index }
     }
 
@@ -566,7 +560,7 @@ impl BackingPool for SlotBasedPool {
         let order = Self::calculate_order(size_val);
 
         if let Some((slot_idx, ptr)) = self.pool.alloc_slots(order) {
-            let capacity = crate::buffer::buddy::BuddyAllocator::capacity_of(order);
+            let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
 
             // Pack Metadata into Context (64-bit)
             // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
@@ -616,13 +610,13 @@ static SLOT_BASED_POOL_VTABLE: PoolVTable = PoolVTable {
 };
 
 unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
-    let raw_ptr = pool_data.as_ptr() as *const crate::global::GlobalSlotPool;
+    let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
 
     // Unpack context (u64)
     // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
     let order = ((params.context >> 40) & 0xFF) as usize;
     let slot_idx_val = (params.context & 0xFFFFFFFFFF) as usize;
-    let slot_idx = crate::slot::SlotIndex(slot_idx_val);
+    let slot_idx = crate::heap::slot::SlotIndex(slot_idx_val);
 
     // Restore ownership of Arc to drop it (decrement ref count)
     let pool = unsafe { Arc::from_raw(raw_ptr) };
@@ -636,7 +630,7 @@ unsafe fn slot_based_resolve_region_info_shim(
     buf: &FixedBuf,
 ) -> (usize, usize) {
     // 1. Cast back to GlobalSlotPool
-    let pool = unsafe { &*(pool_data.as_ptr() as *const crate::global::GlobalSlotPool) };
+    let pool = unsafe { &*(pool_data.as_ptr() as *const crate::heap::GlobalSlotPool) };
 
     // 2. Get base address from global info
     let global_info = pool.global_info();
