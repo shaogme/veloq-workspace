@@ -7,7 +7,20 @@
 
 use crate::block::{Block, BlockMeta, RawAllocator};
 use crate::{MIN_THREAD_MEMORY, RawSlab, ThreadMemory, ThreadMemoryMultiplier};
-use std::{io, num::NonZeroUsize, ptr::NonNull, sync::Arc};
+use std::{
+    io,
+    num::NonZeroUsize,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+/// Global counter for randomizing steal attempts (Simple PRNG seed)
+static STEAL_ROTATION: AtomicUsize = AtomicUsize::new(0);
+/// Maximum number of threads to probe when stealing memory to avoid O(N) scan
+const MAX_STEAL_ATTEMPTS: usize = 4;
 
 /// Configuration for GlobalAllocator
 #[derive(Debug, Clone)]
@@ -86,23 +99,46 @@ impl GlobalBlockPool {
             return Some((backup_idx, result));
         }
 
-        // Level 3: Others' Backup (非阻塞，try_lock)
-        // 从 (thread_idx + 1) 开始遍历，避免所有线程都竞争线程 0
-        for i in 1..self.thread_count {
-            let other_idx = (thread_idx + i) % self.thread_count;
+        // Level 3: Others' Backup (Non-blocking, Bounded Random Probing)
+        // Limit attempts to avoid O(N) bus storm on large core counts.
+        let attempts = std::cmp::min(self.thread_count.saturating_sub(1), MAX_STEAL_ATTEMPTS);
+
+        // Start from a rotating offset to avoid convoys (randomize start point)
+        let mut current_seq = STEAL_ROTATION.fetch_add(1, Ordering::Relaxed);
+
+        let mut checked = 0;
+        while checked < attempts {
+            let other_idx = current_seq % self.thread_count;
+            current_seq = current_seq.wrapping_add(1);
+
+            // Skip self
+            if other_idx == thread_idx {
+                continue;
+            }
+
             let other_backup_idx = Self::backup_index(other_idx);
             if let Some(result) = self.blocks[other_backup_idx].try_alloc(size) {
                 return Some((other_backup_idx, result));
             }
+            checked += 1;
         }
 
-        // Level 4: Others' Primary (非阻塞，try_lock，最后兜底)
-        for i in 1..self.thread_count {
-            let other_idx = (thread_idx + i) % self.thread_count;
+        // Level 4: Others' Primary (Non-blocking, last resort)
+        // Continue probing sequence to try different candidates if possible
+        checked = 0;
+        while checked < attempts {
+            let other_idx = current_seq % self.thread_count;
+            current_seq = current_seq.wrapping_add(1);
+
+            if other_idx == thread_idx {
+                continue;
+            }
+
             let other_primary_idx = Self::primary_index(other_idx);
             if let Some(result) = self.blocks[other_primary_idx].try_alloc(size) {
                 return Some((other_primary_idx, result));
             }
+            checked += 1;
         }
 
         // 所有 Block 都无法分配
