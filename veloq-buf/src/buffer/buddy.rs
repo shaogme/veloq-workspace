@@ -3,21 +3,21 @@ use std::fmt;
 use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use veloq_bitset::BitSet;
 use veloq_intrusive_linklist::{Link, LinkedList};
 
 /// Buddy System Constants
 pub const MIN_ORDER: usize = 0; // 4KB
 pub const MAX_ORDER: usize = 18; // 2^18 * 4KB = 1GB (Maximum single allocation supported)
 
-// Allocator Tag Constants
-const TAG_ALLOCATED: u8 = 0x80;
-const TAG_ORDER_MASK: u8 = 0x3F;
-
 /// Intrusive Doubly Linked List Node
 /// Stored in the head of a free Slot.
 #[repr(C)]
 struct FreeNode {
     link: ManuallyDrop<Link>,
+    /// Order of the free block.
+    /// Only valid when the block is free.
+    order: u8,
 }
 
 struct FreeNodeAdapter;
@@ -26,8 +26,7 @@ unsafe impl veloq_intrusive_linklist::Adapter for FreeNodeAdapter {
     type Value = FreeNode;
 
     unsafe fn get_link(&self, value: NonNull<Self::Value>) -> NonNull<Link> {
-        // FreeNode is #[repr(C)] (implied for safe transmutability in this context) and link is the first field.
-        // ManuallyDrop<T> has the same layout as T.
+        // FreeNode is #[repr(C)] and link is the first field.
         value.cast()
     }
 
@@ -59,10 +58,10 @@ pub struct BuddyAllocator {
     // bit k is 1 if free_lists[k] is not empty
     free_bitmap: u32,
 
-    // Tags array to track the state of each block (allocated/order)
-    // One u8 per Slot.
-    // Optimization: This could be 2 bits per slot (4 values: Free, Used, Split, etc), but u8 is simpler for now.
-    tags: Vec<u8>,
+    // Allocated Bitmap (1 bit per Slot)
+    // 1: Allocated (Head of an allocated block)
+    // 0: Free (or part of a larger block, but we only check heads)
+    allocated: BitSet,
 
     // Total slots managed
     total_slots: usize,
@@ -80,7 +79,6 @@ impl BuddyAllocator {
     /// The memory region must be alive as long as this allocator is used.
     pub unsafe fn new(ptr: NonNull<u8>, len: usize) -> Self {
         assert!(len >= SLOT_SIZE, "Memory too small");
-        // Ensure alignment? Assuming ptr is 4K aligned from HugePage/Page alloc.
 
         let total_slots = len / SLOT_SIZE;
         let free_lists = std::array::from_fn(|_| LinkedList::new(FreeNodeAdapter));
@@ -89,7 +87,7 @@ impl BuddyAllocator {
             base_ptr: ptr,
             free_lists: ManuallyDrop::new(free_lists),
             free_bitmap: 0,
-            tags: vec![0; total_slots], // Initially all 0 (Implicitly means order 0?? No, need init)
+            allocated: BitSet::new(total_slots),
             total_slots,
         };
 
@@ -114,8 +112,6 @@ impl BuddyAllocator {
     #[inline(always)]
     fn buddy_index(&self, index: SlotIndex, order: usize) -> SlotIndex {
         // Buddy index is XORed by the size of the block (in slots)
-        // Order 0: 1 slot (1 << 0). XOR 1.
-        // Order k: 2^k slots. XOR (1 << k).
         SlotIndex(index.0 ^ (1 << order))
     }
 
@@ -126,23 +122,16 @@ impl BuddyAllocator {
 
         while remaining > 0 {
             // Find the largest order that fits in `remaining` AND satisfies alignment of `start_idx`
-            // A block of order K must start at index multiple of 2^K
-            // size = 1 << k
-
-            // 1. Largest power of two <= remaining
             let order_by_size = (usize::BITS - remaining.leading_zeros() - 1) as usize;
 
-            // 2. Largest alignment of start_idx
             let order_by_align = if start_idx == 0 {
                 MAX_ORDER // Aligned to anything
             } else {
                 start_idx.trailing_zeros() as usize
             };
 
-            // Constraint: Must fit in MAX_ORDER
             let order = order_by_size.min(order_by_align).min(MAX_ORDER);
 
-            // Add this block to the free list
             unsafe {
                 self.add_to_free_list(SlotIndex(start_idx), order);
             }
@@ -157,28 +146,23 @@ impl BuddyAllocator {
     unsafe fn add_to_free_list(&mut self, index: SlotIndex, order: usize) {
         let ptr = unsafe { self.ptr_from_index(index) };
         let node = unsafe { &mut *(ptr.as_ptr() as *mut FreeNode) };
+
+        // Initialize FreeNode
         // We use ManuallyDrop to wrap the Link. Assigning to it does NOT drop the old value
         // (which is implicitly ManuallyDrop::drop, doing nothing).
-        // This safely overwrites garbage data without panicking.
         node.link = ManuallyDrop::new(Link::new());
+        node.order = order as u8;
 
         unsafe {
             (*self.free_lists)[order].push_front(Pin::new_unchecked(node));
         }
         self.free_bitmap |= 1 << order;
-
-        // Mark tag as clean (Order K, Not Allocated)
-        self.set_tag(index, order, false);
     }
 
     /// Helper: Remove a block from the free list
     unsafe fn remove_from_free_list(&mut self, index: SlotIndex, order: usize) {
         let ptr = unsafe { self.ptr_from_index(index) };
         let node_ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr() as *mut FreeNode) };
-
-        // We need a cursor to remove specific node, or just pop if we don't care which one (for alloc).
-        // But for merging (dealloc), we have a specific node address (buddy).
-        // `veloq_intrusive_linklist` supports cursor removal.
 
         unsafe {
             let mut cursor = (*self.free_lists)[order].cursor_mut_from_ptr(node_ptr);
@@ -188,20 +172,6 @@ impl BuddyAllocator {
         if (*self.free_lists)[order].is_empty() {
             self.free_bitmap &= !(1 << order);
         }
-    }
-
-    /// Set tag for a block
-    /// We only set the tag for the *head* slot of the block.
-    fn set_tag(&mut self, index: SlotIndex, order: usize, allocated: bool) {
-        if index.0 >= self.tags.len() {
-            return;
-        }
-        let val = (order as u8) & TAG_ORDER_MASK;
-        self.tags[index.0] = if allocated { val | TAG_ALLOCATED } else { val };
-    }
-
-    fn get_tag(&self, index: SlotIndex) -> u8 {
-        self.tags[index.0]
     }
 
     /// Allocation: Request 2^order slots
@@ -221,14 +191,11 @@ impl BuddyAllocator {
         let found_order = candidates.trailing_zeros() as usize;
 
         // 2. Pop from the found list
-        // FIX: Extract raw pointer immediately to drop borrow of free_lists
         let ptr = unsafe {
             let node = (*self.free_lists)[found_order]
                 .pop_front()
                 .unwrap_unchecked();
-            // Assuming node is Pin<&mut FreeNode> or similar that allows get_unchecked_mut
-            // intrusive_linklist usually returns a cursor or reference.
-            // If it returns a reference, we need to convert to raw pointer.
+            // Get raw pointer
             NonNull::new_unchecked(node.get_unchecked_mut() as *mut FreeNode as *mut u8)
         };
 
@@ -240,7 +207,6 @@ impl BuddyAllocator {
 
         // 3. Split until needed order
         let mut curr_order = found_order;
-        // Fix unused mut warning
         let curr_idx = found_idx;
 
         while curr_order > order {
@@ -253,8 +219,9 @@ impl BuddyAllocator {
             }
         }
 
-        // 4. Mark allocated
-        self.set_tag(curr_idx, order, true);
+        // 4. Mark allocated (Head only)
+        // Ignoring error (OutOfBounds) because we know index is valid
+        let _ = self.allocated.set(curr_idx.0);
 
         Some(curr_idx)
     }
@@ -263,25 +230,22 @@ impl BuddyAllocator {
     ///
     /// # Safety
     /// index must be a valid allocated block start.
-    /// order must match allocation order (though we can verify with tags).
+    /// order must match allocation order.
     pub unsafe fn dealloc(&mut self, index: SlotIndex, order: usize) -> Result<(), BuddyError> {
         let mut curr_idx = index;
         let mut curr_order = order;
 
-        // Verify Tag
-        let tag = self.get_tag(curr_idx);
-        if (tag & TAG_ALLOCATED) == 0 {
-            return Err(BuddyError::DoubleFree);
-        }
-        if (tag & TAG_ORDER_MASK) as usize != order {
-            // This might happen if user passed wrong order, or corruption
-            return Err(BuddyError::InvalidFree);
+        // 1. Verify Allocation State
+        match self.allocated.get(curr_idx.0) {
+            Ok(true) => {
+                // Good, it is allocated. Mark as Free.
+                let _ = self.allocated.clear(curr_idx.0);
+            }
+            Ok(false) => return Err(BuddyError::DoubleFree),
+            Err(_) => return Err(BuddyError::InvalidFree), // Out of bounds
         }
 
-        // Mark As Free immediately
-        self.set_tag(curr_idx, curr_order, false);
-
-        // Merge loop
+        // 2. Merge Loop
         while curr_order < MAX_ORDER {
             let buddy_idx = self.buddy_index(curr_idx, curr_order);
 
@@ -290,34 +254,36 @@ impl BuddyAllocator {
                 break;
             }
 
-            // Check Buddy Status
-            let buddy_tag = self.get_tag(buddy_idx);
-
-            // Can merge if:
-            // 1. Buddy is NOT allocated
-            // 2. Buddy is same order
-            if (buddy_tag & TAG_ALLOCATED) == 0
-                && ((buddy_tag & TAG_ORDER_MASK) as usize == curr_order)
-            {
-                // Merge!
-
-                // Remove buddy from free list
-                unsafe {
-                    self.remove_from_free_list(buddy_idx, curr_order);
-                }
-
-                // Move current to the lower index (alignment)
-                if buddy_idx < curr_idx {
-                    curr_idx = buddy_idx;
-                }
-
-                curr_order += 1;
-
-                // Update tag for the new merged block head
-                self.set_tag(curr_idx, curr_order, false);
-            } else {
+            // Check if Buddy is Allocated
+            if self.allocated.get(buddy_idx.0).unwrap_or(true) {
+                // Buddy is allocated (or OOB), cannot merge
                 break;
             }
+
+            // Check Buddy Order (Intrusive)
+            // SAFETY: We know buddy is NOT allocated (from bitset).
+            // Assuming it is a valid FreeNode initialized by system.
+            unsafe {
+                let buddy_ptr = self.ptr_from_index(buddy_idx);
+                let buddy_node = &*(buddy_ptr.as_ptr() as *const FreeNode);
+
+                if buddy_node.order as usize != curr_order {
+                    // Buddy is free but split (different order), cannot merge
+                    break;
+                }
+            }
+
+            // Merge!
+            unsafe {
+                self.remove_from_free_list(buddy_idx, curr_order);
+            }
+
+            // Move to lower index
+            if buddy_idx < curr_idx {
+                curr_idx = buddy_idx;
+            }
+
+            curr_order += 1;
         }
 
         // Add merged block to free list
@@ -411,7 +377,6 @@ mod tests {
         // Max order for 1MB??
         // 1MB = 256 * 4096 = 2^8 * 4096.
         // So max order is 8.
-        // MAX_ORDER is 18 (1GB). So alloc(18) should fail.
         let idx_fail = buddy.alloc(18);
         assert!(idx_fail.is_none());
 
