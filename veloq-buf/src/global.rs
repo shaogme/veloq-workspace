@@ -8,6 +8,7 @@
 //! Each shard manages a distinct slice of the global memory.
 
 use crate::buffer::buddy::BuddyAllocator;
+use crate::buffer::superblock::{SUPERBLOCK_ORDER, SUPERBLOCK_SIZE, SuperblockState};
 use crate::slot::{SLOT_SIZE, SlotIndex};
 use crate::{MIN_THREAD_MEMORY, MemoryChunk};
 use crossbeam_utils::CachePadded;
@@ -40,14 +41,13 @@ unsafe impl Sync for GlobalMemoryInfo {}
 /// Using 16 shards to balance memory overhead and contention reduction.
 const SHARD_COUNT: usize = 16;
 
-// Local Cache Constants
-const CACHE_LIMIT: usize = 256; // Max 256 slots (1MB) per thread per pool
-
+/// Local Cache Constants
 type PoolId = usize;
 
 struct LocalCache {
-    // Map PoolID (Memory Base Address) -> Stack of Free Indices
-    pools: HashMap<PoolId, Vec<SlotIndex>>,
+    // Map PoolID (Memory Base Address) -> Active Superblock Index
+    // We only track ONE active superblock per pool for simplicity and cache locality.
+    pools: HashMap<PoolId, usize>,
 }
 
 thread_local! {
@@ -63,6 +63,10 @@ thread_local! {
 pub struct GlobalSlotPool {
     /// The sharded buddy allocators
     shards: Vec<CachePadded<Mutex<BuddyAllocator>>>,
+
+    /// Superblock States Array
+    /// Mapped 1:1 to the 64-slot chunks of the memory.
+    superblocks: Box<[SuperblockState]>,
 
     /// Number of slots per shard (uniform for all except potentially the last,
     /// but we currently enforce uniformity or ignore tail)
@@ -123,11 +127,20 @@ impl GlobalSlotPool {
             shards.push(CachePadded::new(Mutex::new(allocator)));
         }
 
+        // 4. Initialize Superblock States
+        // Total slots / 64
+        let num_superblocks = total_slots / SUPERBLOCK_SIZE;
+        let mut states = Vec::with_capacity(num_superblocks);
+        for _ in 0..num_superblocks {
+            states.push(SuperblockState::new());
+        }
+
         // Warning: If total_slots % SHARD_COUNT != 0, the tail memory is ignored.
         // Given the huge page sizes and power-of-2 allocations, this is negligible.
 
         Ok(Self {
             shards,
+            superblocks: states.into_boxed_slice(),
             slots_per_shard,
             memory: chunk,
             global_info,
@@ -140,51 +153,73 @@ impl GlobalSlotPool {
     /// - `SlotIndex`: The global index of the first slot.
     /// - `NonNull<u8>`: The raw pointer to the memory.
     pub fn alloc_slots(&self, order: usize) -> Option<(SlotIndex, NonNull<u8>)> {
-        // Fast Path: Order 0 (4KB) uses Thread Local Cache
+        // Fast Path: Order 0 (4KB) uses Thread Local Superblock Cache
         if order == 0 {
             let pool_id = self.memory.as_ptr() as usize;
-            // 1. Try Cache
-            let cached_idx = TLS_CACHE.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                let list = cache.pools.entry(pool_id).or_default();
-                list.pop()
-            });
 
-            if let Some(idx) = cached_idx {
-                let ptr = unsafe {
-                    NonNull::new_unchecked(self.memory.as_ptr().add(idx.offset()) as *mut u8)
-                };
-                return Some((idx, ptr));
+            // 1. Try Allocate from Active Superblock
+            let sb_idx_opt = TLS_CACHE.with(|cache| cache.borrow().pools.get(&pool_id).cloned());
+
+            if let Some(sb_idx) = sb_idx_opt {
+                if let Some(offset) = self.superblocks[sb_idx].alloc_one() {
+                    let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
+                    // Calculate Ptr
+                    let ptr = unsafe {
+                        NonNull::new_unchecked(
+                            self.memory.as_ptr().add(global_idx.offset()) as *mut u8
+                        )
+                    };
+                    return Some((global_idx, ptr));
+                } else {
+                    // Superblock Full! Retire it.
+                    let should_free = self.superblocks[sb_idx].set_inactive();
+                    if should_free {
+                        // This case (Full + Empty + Inactive) is impossible (Full != Empty).
+                        // Unless someone freed EVERYTHING while we were trying to alloc?
+                        // If alloc_one failed, it means free_mask is 0.
+                        // So it definitely isn't empty.
+                        // But let's follow the protocol strictly.
+                        self.dealloc_superblock(sb_idx);
+                    }
+
+                    // Remove from cache
+                    TLS_CACHE.with(|cache| {
+                        cache.borrow_mut().pools.remove(&pool_id);
+                    });
+                }
             }
 
-            // 2. Cache Miss: Allocate Batch from Global
-            // To reduce locking, we allocate a larger block (e.g., Order 6 = 64 slots)
-            // and break it down.
-            const BATCH_ORDER: usize = 6; // 64 slots
-            if let Some((base_idx, _)) = self.alloc_global(BATCH_ORDER) {
-                // Split order 6 block into 64 order 0 blocks
-                let start = base_idx.0;
-                let count = 1 << BATCH_ORDER;
+            // 2. No Active Superblock (or just retired). Alloc New.
+            // Alloc Order 6 from Buddy
+            if let Some((base_idx, _)) = self.alloc_global(SUPERBLOCK_ORDER) {
+                let sb_idx = base_idx.0 / SUPERBLOCK_SIZE;
 
+                // Initialize State
+                // CRITICAL: We must hold the state in "Active" mode before anyone else can touch it.
+                // Since we just alloced it, no one else has pointers to slots inside it (except danging ones? No, unique alloc).
+                self.superblocks[sb_idx].init();
+
+                // Set as Active
                 TLS_CACHE.with(|cache| {
-                    let mut cache = cache.borrow_mut();
-                    let list = cache.pools.entry(pool_id).or_default();
-                    // Keep one for return, push rest (count-1)
-                    // Push in reverse order to keep usage contiguous-ish? Doesn't matter much for free list.
-                    for i in 1..count {
-                        list.push(SlotIndex(start + i));
-                    }
+                    cache.borrow_mut().pools.insert(pool_id, sb_idx);
                 });
 
-                let ret_idx = SlotIndex(start);
+                // Alloc one
+                let offset = self.superblocks[sb_idx]
+                    .alloc_one()
+                    .expect("Fresh superblock must have space");
+
+                let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
                 let ptr = unsafe {
-                    NonNull::new_unchecked(self.memory.as_ptr().add(ret_idx.offset()) as *mut u8)
+                    NonNull::new_unchecked(self.memory.as_ptr().add(global_idx.offset()) as *mut u8)
                 };
-                return Some((ret_idx, ptr));
+                return Some((global_idx, ptr));
             }
 
-            // Fallback: If Batch alloc failed (fragmentation?), try alloc Order 0 directly from Global
-            return self.alloc_global(0);
+            // Fallback: If cannot allocate Superblock, fail for now.
+            // We could try alloc Order 0 directly from Buddy, but our design mandates Order 0 lives in Superblocks.
+            // Mixing direct Order 0 with Superblock Order 6 logic in same space is messy (State array assumes Order 6 chunks).
+            return None;
         }
 
         // Large Allocations: Direct Global
@@ -228,27 +263,20 @@ impl GlobalSlotPool {
     /// # Safety
     /// - `index` and `order` must match a previous allocation.
     pub unsafe fn dealloc_slots(&self, index: SlotIndex, order: usize) {
-        // Fast Path: Order 0 uses Thread Local Cache
+        // Fast Path: Order 0 uses Superblock State
         if order == 0 {
-            let pool_id = self.memory.as_ptr() as usize;
-            let overflow = TLS_CACHE.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                let list = cache.pools.entry(pool_id).or_default();
-                list.push(index);
+            let sb_idx = index.0 / SUPERBLOCK_SIZE;
+            let offset = (index.0 % SUPERBLOCK_SIZE) as u16;
 
-                if list.len() > CACHE_LIMIT {
-                    // Drain half
-                    let keep = CACHE_LIMIT / 2;
-                    let drain_from = keep;
-                    // Split off the tail (elements to free)
-                    Some(list.split_off(drain_from))
-                } else {
-                    None
-                }
-            });
+            if sb_idx >= self.superblocks.len() {
+                // Should not happen for valid indices
+                return;
+            }
 
-            if let Some(to_free) = overflow {
-                self.dealloc_batch_global(to_free, 0);
+            // Free slot in bitmap
+            // If returns true, Block is Empty AND Inactive -> Return to Buddy
+            if self.superblocks[sb_idx].free_one(offset) {
+                self.dealloc_superblock(sb_idx);
             }
             return;
         }
@@ -258,10 +286,9 @@ impl GlobalSlotPool {
         }
     }
 
-    fn dealloc_batch_global(&self, indices: Vec<SlotIndex>, order: usize) {
-        for idx in indices {
-            unsafe { self.dealloc_global(idx, order) };
-        }
+    fn dealloc_superblock(&self, sb_idx: usize) {
+        let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE);
+        unsafe { self.dealloc_global(global_idx, SUPERBLOCK_ORDER) };
     }
 
     unsafe fn dealloc_global(&self, index: SlotIndex, order: usize) {
