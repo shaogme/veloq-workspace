@@ -322,35 +322,32 @@ impl RioState {
         buf: &mut FixedBuf,
         user_data: usize,
     ) -> io::Result<Option<SubmissionResult>> {
-        if buf.buf_index().is_some() {
-            let (idx, offset) = buf.resolve_region_info();
-            // Solve borrow checker issue: extraction of Copy data (id)
-            let buffer_id = if let Some(info) = self.registered_bufs.get(idx) {
-                info.id
-            } else {
-                return Ok(None);
-            };
+        let (idx, offset) = buf.resolve_region_info();
+        // Solve borrow checker issue: extraction of Copy data (id)
+        let buffer_id = if let Some(info) = self.registered_bufs.get(idx) {
+            info.id
+        } else {
+            return Ok(None);
+        };
 
-            // Now self.registered_bufs borrow has ended
-            let rq = self.ensure_rq(handle, fd)?;
+        // Now self.registered_bufs borrow has ended
+        let rq = self.ensure_rq(handle, fd)?;
 
-            let rio_buf = RIO_BUF {
-                BufferId: buffer_id,
-                Offset: offset as u32,
-                Length: buf.capacity() as u32,
-            };
+        let rio_buf = RIO_BUF {
+            BufferId: buffer_id,
+            Offset: offset as u32,
+            Length: buf.capacity() as u32,
+        };
 
-            let recv_fn = self.dispatch.receive;
-            let request_context = user_data as *mut std::ffi::c_void;
+        let recv_fn = self.dispatch.receive;
+        let request_context = user_data as *mut std::ffi::c_void;
 
-            let ret = unsafe { recv_fn(rq, &rio_buf, 1, 0, request_context) };
+        let ret = unsafe { recv_fn(rq, &rio_buf, 1, 0, request_context) };
 
-            if ret == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            return Ok(Some(SubmissionResult::Pending));
+        if ret == 0 {
+            return Err(io::Error::last_os_error());
         }
-        Ok(None)
+        Ok(Some(SubmissionResult::Pending))
     }
 
     pub fn try_submit_send(
@@ -360,34 +357,31 @@ impl RioState {
         buf: &FixedBuf,
         user_data: usize,
     ) -> io::Result<Option<SubmissionResult>> {
-        if buf.buf_index().is_some() {
-            let (idx, offset) = buf.resolve_region_info();
-            // Solve borrow checker issue
-            let buffer_id = if let Some(info) = self.registered_bufs.get(idx) {
-                info.id
-            } else {
-                return Ok(None);
-            };
+        let (idx, offset) = buf.resolve_region_info();
+        // Solve borrow checker issue
+        let buffer_id = if let Some(info) = self.registered_bufs.get(idx) {
+            info.id
+        } else {
+            return Ok(None);
+        };
 
-            let rq = self.ensure_rq(handle, fd)?;
+        let rq = self.ensure_rq(handle, fd)?;
 
-            let rio_buf = RIO_BUF {
-                BufferId: buffer_id,
-                Offset: offset as u32,
-                Length: buf.len() as u32,
-            };
+        let rio_buf = RIO_BUF {
+            BufferId: buffer_id,
+            Offset: offset as u32,
+            Length: buf.len() as u32,
+        };
 
-            let send_fn = self.dispatch.send;
-            let request_context = user_data as *mut std::ffi::c_void;
+        let send_fn = self.dispatch.send;
+        let request_context = user_data as *mut std::ffi::c_void;
 
-            let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
+        let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
 
-            if ret == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            return Ok(Some(SubmissionResult::Pending));
+        if ret == 0 {
+            return Err(io::Error::last_os_error());
         }
-        Ok(None)
+        Ok(Some(SubmissionResult::Pending))
     }
 
     pub fn try_submit_send_to(
@@ -400,15 +394,15 @@ impl RioState {
         user_data: usize,
         // Removed `ops` here. Caller must ensure slab registration.
     ) -> io::Result<Option<SubmissionResult>> {
-        if buf.buf_index().is_none() {
-            return Ok(None);
-        }
-
         let (idx, offset) = buf.resolve_region_info();
         let buffer_id = match self.registered_bufs.get(idx) {
             Some(i) => i.id,
             None => {
-                eprintln!("RIO: Buffer index {} not found for send_to", idx);
+                // If index is invalid (e.g. usize::MAX), silently ignore and return None (fallback to normal IO?)
+                // Or log error? The original code returned Ok(None).
+                if idx != usize::MAX {
+                    eprintln!("RIO: Buffer index {} not found for send_to", idx);
+                }
                 return Ok(None);
             }
         };
@@ -474,15 +468,13 @@ impl RioState {
         user_data: usize,
         // Removed `ops`
     ) -> io::Result<Option<SubmissionResult>> {
-        if buf.buf_index().is_none() {
-            return Ok(None);
-        }
-
         let (idx, offset) = buf.resolve_region_info();
         let buffer_id = match self.registered_bufs.get(idx) {
             Some(i) => i.id,
             None => {
-                eprintln!("RIO: Buffer index {} not found for recv_from", idx);
+                if idx != usize::MAX {
+                    eprintln!("RIO: Buffer index {} not found for recv_from", idx);
+                }
                 return Ok(None);
             }
         };
