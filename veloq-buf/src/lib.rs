@@ -42,14 +42,19 @@ unsafe impl Sync for RawSlab {}
 impl RawSlab {
     fn new(size: NonZeroUsize) -> std::io::Result<Self> {
         let ptr = unsafe {
-            // Reuse existing os::alloc_huge_pages logic
-            crate::os::alloc_huge_pages(size).and_then(|p| {
-                NonNull::new(p).ok_or(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Allocation failed",
-                ))
-            })?
-        };
+            // Try Huge Pages first
+            match crate::os::alloc_huge_pages(size) {
+                Ok(p) => NonNull::new(p),
+                Err(_) => {
+                    // Fallback to standard pages if Huge Pages failed
+                    crate::os::alloc_pages(size).map(|p| NonNull::new(p))?
+                }
+            }
+        }
+        .ok_or(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Allocation failed",
+        ))?;
         Ok(Self { ptr, size })
     }
 }
@@ -57,7 +62,7 @@ impl RawSlab {
 impl Drop for RawSlab {
     fn drop(&mut self) {
         unsafe {
-            crate::os::free_huge_pages(self.ptr, self.size);
+            crate::os::free_pages(self.ptr, self.size);
         }
     }
 }
