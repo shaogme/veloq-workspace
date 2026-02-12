@@ -53,6 +53,7 @@ use std::{
 };
 
 pub mod buddy;
+pub mod superblock;
 
 const NO_REGISTRATION_INDEX: u16 = u16::MAX;
 
