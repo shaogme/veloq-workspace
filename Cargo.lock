@@ -1119,6 +1119,7 @@ dependencies = [
  "parking_lot",
  "tempfile",
  "veloq-bitset",
+ "veloq-intrusive-linklist",
  "windows-sys 0.61.2",
 ]
 

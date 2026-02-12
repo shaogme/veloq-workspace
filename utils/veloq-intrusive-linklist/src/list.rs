@@ -72,6 +72,38 @@ impl<A: Adapter> LinkedList<A> {
         }
     }
 
+    /// 将节点添加到头部
+    ///
+    /// # Safety
+    /// 必须保证 value 在链表中存在期间有效。
+    #[inline]
+    pub unsafe fn push_front(&mut self, value: Pin<&mut A::Value>) {
+        unsafe {
+            let raw_val = value.get_unchecked_mut();
+            let link_ptr = self.adapter.get_link(NonNull::from(raw_val));
+            let link = link_ptr.as_ref();
+
+            if link.is_linked() {
+                panic!("Node is already linked");
+            }
+
+            let old_head = self.head;
+            link.prev.with_mut(|p| *p = None);
+            link.next.with_mut(|n| *n = old_head);
+            link.linked.with_mut(|l| *l = true);
+
+            if let Some(head) = old_head {
+                let head_link = head.as_ref();
+                head_link.prev.with_mut(|p| *p = Some(link_ptr));
+            } else {
+                self.tail = Some(link_ptr);
+            }
+
+            self.head = Some(link_ptr);
+            self.len += 1;
+        }
+    }
+
     /// 从头部移除节点
     #[inline]
     pub fn pop_front(&mut self) -> Option<Pin<&mut A::Value>> {

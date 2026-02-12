@@ -1,7 +1,10 @@
 use super::AllocError;
-use crate::{nz, ThreadMemory};
+use crate::{ThreadMemory, nz};
+use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::ptr::NonNull;
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 // Buddy System Constants
 const ARENA_SIZE: NonZeroUsize = nz!(32 * 1024 * 1024); // 32MB Total to support higher concurrency with overhead
@@ -29,83 +32,10 @@ const TAG_ORDER_MASK: u8 = 0x7F;
 /// 侵入式双向链表节点，存储在空闲块的头部
 #[repr(C)]
 struct FreeNode {
-    prev: Option<NonNull<FreeNode>>,
-    next: Option<NonNull<FreeNode>>,
+    link: Link,
 }
 
-/// 侵入式链表封装，管理 FreeNode
-#[derive(Clone, Copy)]
-struct FreeList {
-    head: Option<NonNull<FreeNode>>,
-}
-
-impl FreeList {
-    fn new() -> Self {
-        Self { head: None }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.head.is_none()
-    }
-
-    ///将节点插入头部
-    unsafe fn push(&mut self, mut node_ptr: NonNull<FreeNode>) {
-        // SAFETY: Caller guarantees node_ptr is valid and exclusive for modification
-        let node = unsafe { node_ptr.as_mut() };
-        node.next = self.head;
-        node.prev = None;
-
-        if let Some(mut head_ptr) = self.head {
-            // SAFETY: Existing head is valid as per FreeList invariants
-            unsafe { head_ptr.as_mut() }.prev = Some(node_ptr);
-        }
-        self.head = Some(node_ptr);
-    }
-
-    /// 弹出头部节点
-    unsafe fn pop(&mut self) -> Option<NonNull<FreeNode>> {
-        let mut head_ptr = self.head?;
-        // SAFETY: Head pointer is valid as per FreeList invariants
-        let head = unsafe { head_ptr.as_mut() };
-        let next = head.next;
-
-        self.head = next;
-        if let Some(mut next_ptr) = next {
-            // SAFETY: Next pointer is valid as per FreeList invariants
-            unsafe { next_ptr.as_mut() }.prev = None;
-        }
-
-        // 清理指针
-        head.next = None;
-        head.prev = None;
-
-        Some(head_ptr)
-    }
-
-    /// 移除指定节点
-    unsafe fn remove(&mut self, mut node_ptr: NonNull<FreeNode>) {
-        // SAFETY: Caller guarantees node_ptr is valid and in this list
-        let node = unsafe { node_ptr.as_mut() };
-        let prev = node.prev;
-        let next = node.next;
-
-        if let Some(mut prev_ptr) = prev {
-            // SAFETY: Prev pointer is valid as per FreeList invariants
-            unsafe { prev_ptr.as_mut() }.next = next;
-        } else {
-            // 是头节点
-            self.head = next;
-        }
-
-        if let Some(mut next_ptr) = next {
-            // SAFETY: Next pointer is valid as per FreeList invariants
-            unsafe { next_ptr.as_mut() }.prev = prev;
-        }
-
-        node.prev = None;
-        node.next = None;
-    }
-}
+intrusive_adapter!(FreeNodeAdapter = FreeNode { link: Link });
 
 /// 地址计算辅助器
 struct BlockCalculator {
@@ -156,7 +86,7 @@ struct RawBuddyAllocator {
     calculator: BlockCalculator,
 
     // 每个阶数（Order）对应的空闲链表
-    free_lists: [FreeList; NUM_ORDERS],
+    free_lists: ManuallyDrop<[LinkedList<FreeNodeAdapter>; NUM_ORDERS]>,
 
     // 位图索引，加速空闲块查找
     free_bitmap: u16,
@@ -179,7 +109,7 @@ impl RawBuddyAllocator {
         let base_ptr = memory.as_mut_ptr();
         let calculator = BlockCalculator::new(base_ptr);
 
-        let mut free_lists = [FreeList::new(); NUM_ORDERS];
+        let mut free_lists = std::array::from_fn(|_| LinkedList::new(FreeNodeAdapter));
 
         // 初始化最大的块 (Order 12, 16MB) -> Wait, order 13 is 32MB. 2^12 * 4096 = 16M?
         // MIN_BLOCK = 4096 (2^12.
@@ -187,15 +117,12 @@ impl RawBuddyAllocator {
         let max_order = NUM_ORDERS - 1;
 
         // SAFETY: 刚刚分配的内存，指针有效且大小足够
-        let root_node_ptr = unsafe { NonNull::new_unchecked(base_ptr as *mut FreeNode) };
         unsafe {
-            *(base_ptr as *mut FreeNode) = FreeNode {
-                prev: None,
-                next: None,
-            };
-        }
+            let root_node = &mut *(base_ptr as *mut FreeNode);
+            root_node.link = Link::new();
 
-        free_lists[max_order].head = Some(root_node_ptr);
+            free_lists[max_order].push_front(Pin::new_unchecked(root_node));
+        }
         let free_bitmap = 1 << max_order;
 
         let leaf_count = ARENA_SIZE.get() / MIN_BLOCK_SIZE;
@@ -206,7 +133,7 @@ impl RawBuddyAllocator {
         Ok(Self {
             _memory_owner: memory,
             calculator,
-            free_lists,
+            free_lists: ManuallyDrop::new(free_lists),
             free_bitmap,
             tags,
         })
@@ -230,8 +157,15 @@ impl RawBuddyAllocator {
         let found_order = candidates.trailing_zeros() as usize;
 
         // SAFETY: bitmap 对应的位为 1，意味着 free_lists[found_order] 必定非空
-        let node_ptr = unsafe { self.free_lists[found_order].pop().unwrap_unchecked() };
-        if self.free_lists[found_order].is_empty() {
+        let node_ref = unsafe {
+            (*self.free_lists)[found_order]
+                .pop_front()
+                .unwrap_unchecked()
+        };
+        // Get raw pointer before we potentially invalidate the reference by splitting etc (though we own it now)
+        let node_ptr = unsafe { NonNull::from(node_ref.get_unchecked_mut()) };
+
+        if (*self.free_lists)[found_order].is_empty() {
             self.free_bitmap &= !(1 << found_order);
         }
 
@@ -253,7 +187,9 @@ impl RawBuddyAllocator {
             // 将 Buddy 初始化为 FreeNode 并加入对应的空闲链表
             // SAFETY: buddy_ptr 指向有效的未使用内存
             unsafe {
-                self.free_lists[curr_order].push(buddy_ptr.cast::<FreeNode>());
+                let buddy_node = &mut *(buddy_ptr.as_ptr() as *mut FreeNode);
+                buddy_node.link = Link::new();
+                (*self.free_lists)[curr_order].push_front(Pin::new_unchecked(buddy_node));
                 self.free_bitmap |= 1 << curr_order;
             };
 
@@ -317,8 +253,11 @@ impl RawBuddyAllocator {
                 // 从空闲链表中移除 Buddy
                 // SAFETY: buddy 是空闲块，必定在链表中
                 unsafe {
-                    self.free_lists[curr_order].remove(buddy_node_ptr);
-                    if self.free_lists[curr_order].is_empty() {
+                    let mut cursor =
+                        (*self.free_lists)[curr_order].cursor_mut_from_ptr(buddy_node_ptr);
+                    cursor.remove();
+
+                    if (*self.free_lists)[curr_order].is_empty() {
                         self.free_bitmap &= !(1 << curr_order);
                     }
                 };
@@ -346,9 +285,22 @@ impl RawBuddyAllocator {
 
         // SAFETY: final_ptr 有效
         unsafe {
-            self.free_lists[curr_order].push(final_node_ptr);
+            let final_node = &mut *final_node_ptr.as_ptr();
+            final_node.link = Link::new();
+
+            (*self.free_lists)[curr_order].push_front(Pin::new_unchecked(final_node));
             self.free_bitmap |= 1 << curr_order;
         };
+    }
+}
+
+impl Drop for RawBuddyAllocator {
+    fn drop(&mut self) {
+        // SAFETY: 必须显式 drop free_lists，确保在 _memory_owner 析构前清理链表。
+        // 因为链表节点存储在 _memory_owner 管理的内存中。
+        unsafe {
+            ManuallyDrop::drop(&mut self.free_lists);
+        }
     }
 }
 
@@ -424,15 +376,7 @@ impl BuddyAllocator {
 
     #[cfg(test)]
     fn count_free(&self, order: usize) -> usize {
-        let mut count = 0;
-        let mut curr = self.raw.free_lists[order].head;
-        unsafe {
-            while let Some(node) = curr {
-                count += 1;
-                curr = node.as_ref().next;
-            }
-        }
-        count
+        (*self.raw.free_lists)[order].len()
     }
 
     #[cfg(test)]
