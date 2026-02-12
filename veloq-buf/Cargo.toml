@@ -14,6 +14,7 @@ readme.workspace = true
 [dependencies]
 veloq-bitset.workspace = true
 veloq-intrusive-linklist.workspace = true
+crossbeam-utils.workspace = true
 parking_lot = "0.12"
 
 [target.'cfg(target_os = "linux")'.dependencies]

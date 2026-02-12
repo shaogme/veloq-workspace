@@ -44,48 +44,12 @@ pub enum BuddyError {
     DoubleFree,
 }
 
-/// Address calculation helper
-struct AddressCalculator {
-    base_ptr: *mut u8,
-    #[allow(dead_code)] // Keep for range checks if needed
-    total_len: usize,
-}
-
-impl AddressCalculator {
-    unsafe fn new(base_ptr: *mut u8, total_len: usize) -> Self {
-        Self {
-            base_ptr,
-            total_len,
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn ptr_from_index(&self, index: SlotIndex) -> NonNull<u8> {
-        // SAFETY: Caller must ensure index is valid
-        unsafe { NonNull::new_unchecked(self.base_ptr.add(index.offset())) }
-    }
-
-    #[inline(always)]
-    unsafe fn index_from_ptr(&self, ptr: NonNull<u8>) -> SlotIndex {
-        let offset = unsafe { ptr.as_ptr().offset_from(self.base_ptr) as usize };
-        SlotIndex::from_offset(offset)
-    }
-
-    #[inline(always)]
-    fn buddy_index(&self, index: SlotIndex, order: usize) -> SlotIndex {
-        // Buddy index is XORed by the size of the block (in slots)
-        // Order 0: 1 slot (1 << 0). XOR 1.
-        // Order k: 2^k slots. XOR (1 << k).
-        SlotIndex(index.0 ^ (1 << order))
-    }
-}
-
 /// Core Buddy Allocator
 ///
 /// Designed to manage a large continuous memory implementation `GlobalSlotPool`.
 /// It does NOT own the memory, but manages the state of the memory provided to it.
 pub struct BuddyAllocator {
-    calculator: AddressCalculator,
+    base_ptr: NonNull<u8>,
 
     // Free lists for each order
     // Order 0: 4KB, Order 1: 8KB, ..., Order 18: 1GB
@@ -119,11 +83,10 @@ impl BuddyAllocator {
         // Ensure alignment? Assuming ptr is 4K aligned from HugePage/Page alloc.
 
         let total_slots = len / SLOT_SIZE;
-        let calculator = unsafe { AddressCalculator::new(ptr.as_ptr(), len) };
         let free_lists = std::array::from_fn(|_| LinkedList::new(FreeNodeAdapter));
 
         let mut allocator = Self {
-            calculator,
+            base_ptr: ptr,
             free_lists: ManuallyDrop::new(free_lists),
             free_bitmap: 0,
             tags: vec![0; total_slots], // Initially all 0 (Implicitly means order 0?? No, need init)
@@ -134,6 +97,26 @@ impl BuddyAllocator {
         allocator.init_free_blocks(total_slots);
 
         allocator
+    }
+
+    #[inline(always)]
+    unsafe fn ptr_from_index(&self, index: SlotIndex) -> NonNull<u8> {
+        // SAFETY: Caller must ensure index is valid
+        unsafe { NonNull::new_unchecked(self.base_ptr.as_ptr().add(index.offset())) }
+    }
+
+    #[inline(always)]
+    unsafe fn index_from_ptr(&self, ptr: NonNull<u8>) -> SlotIndex {
+        let offset = unsafe { ptr.as_ptr().offset_from(self.base_ptr.as_ptr()) as usize };
+        SlotIndex::from_offset(offset)
+    }
+
+    #[inline(always)]
+    fn buddy_index(&self, index: SlotIndex, order: usize) -> SlotIndex {
+        // Buddy index is XORed by the size of the block (in slots)
+        // Order 0: 1 slot (1 << 0). XOR 1.
+        // Order k: 2^k slots. XOR (1 << k).
+        SlotIndex(index.0 ^ (1 << order))
     }
 
     /// Initialize the free lists by breaking down the total slots into maximal power-of-two blocks
@@ -172,7 +155,7 @@ impl BuddyAllocator {
 
     /// Helper: Add a block to the free list
     unsafe fn add_to_free_list(&mut self, index: SlotIndex, order: usize) {
-        let ptr = unsafe { self.calculator.ptr_from_index(index) };
+        let ptr = unsafe { self.ptr_from_index(index) };
         let node = unsafe { &mut *(ptr.as_ptr() as *mut FreeNode) };
         // We use ManuallyDrop to wrap the Link. Assigning to it does NOT drop the old value
         // (which is implicitly ManuallyDrop::drop, doing nothing).
@@ -190,7 +173,7 @@ impl BuddyAllocator {
 
     /// Helper: Remove a block from the free list
     unsafe fn remove_from_free_list(&mut self, index: SlotIndex, order: usize) {
-        let ptr = unsafe { self.calculator.ptr_from_index(index) };
+        let ptr = unsafe { self.ptr_from_index(index) };
         let node_ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr() as *mut FreeNode) };
 
         // We need a cursor to remove specific node, or just pop if we don't care which one (for alloc).
@@ -253,7 +236,7 @@ impl BuddyAllocator {
             self.free_bitmap &= !(1 << found_order);
         }
 
-        let found_idx = unsafe { self.calculator.index_from_ptr(ptr) };
+        let found_idx = unsafe { self.index_from_ptr(ptr) };
 
         // 3. Split until needed order
         let mut curr_order = found_order;
@@ -300,7 +283,7 @@ impl BuddyAllocator {
 
         // Merge loop
         while curr_order < MAX_ORDER {
-            let buddy_idx = self.calculator.buddy_index(curr_idx, curr_order);
+            let buddy_idx = self.buddy_index(curr_idx, curr_order);
 
             // Boundary Check
             if buddy_idx.0 >= self.total_slots {
@@ -347,7 +330,7 @@ impl BuddyAllocator {
 
     /// Convert SlotIndex to Pointer
     pub fn ptr_of(&self, index: SlotIndex) -> NonNull<u8> {
-        unsafe { self.calculator.ptr_from_index(index) }
+        unsafe { self.ptr_from_index(index) }
     }
 
     /// Helper: Get allocated capacity in bytes

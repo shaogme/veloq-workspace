@@ -32,7 +32,7 @@ impl MockPool {
         let layout = Layout::from_size_align(size.get(), 1).unwrap();
         let ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(ptr).unwrap();
-        unsafe { FixedBuf::new(ptr, size, None, NonNull::dangling(), &MOCK_VTABLE, 0) }
+        unsafe { FixedBuf::new(ptr, size, NonNull::dangling(), &MOCK_VTABLE, 0) }
     }
 }
 

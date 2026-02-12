@@ -69,12 +69,12 @@ macro_rules! make_rw_fixed {
     ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path) => {
         pub(crate) unsafe fn $fn_name(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
             let rw_op = unsafe { &mut *op.payload.$field };
-            let buf_index = rw_op.buf.buf_index();
+            let (region_idx, _offset) = rw_op.buf.resolve_region_info();
             let ptr = rw_op.buf.as_mut_ptr();
             let len = rw_op.buf.capacity() as u32;
 
-            if let Some(idx) = buf_index {
-                let fixed_idx = idx.get();
+            if region_idx != usize::MAX {
+                let fixed_idx = region_idx as u32;
                 match rw_op.fd {
                     IoFd::Raw(fd) => $type_fixed(types::Fd(fd.fd), ptr, len, fixed_idx)
                         .offset(rw_op.offset)
@@ -98,12 +98,12 @@ macro_rules! make_rw_fixed {
     ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path, write) => {
         pub(crate) unsafe fn $fn_name(op: &mut UringOp, _driver_id: usize) -> squeue::Entry {
             let rw_op = unsafe { &mut *op.payload.$field };
-            let buf_index = rw_op.buf.buf_index();
+            let (region_idx, _offset) = rw_op.buf.resolve_region_info();
             let ptr = rw_op.buf.as_slice().as_ptr();
             let len = rw_op.buf.len() as u32;
 
-            if let Some(idx) = buf_index {
-                let fixed_idx = idx.get();
+            if region_idx != usize::MAX {
+                let fixed_idx = region_idx as u32;
                 match rw_op.fd {
                     IoFd::Raw(fd) => $type_fixed(types::Fd(fd.fd), ptr, len, fixed_idx)
                         .offset(rw_op.offset)

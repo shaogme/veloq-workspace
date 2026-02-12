@@ -116,7 +116,6 @@ pub enum AllocResult {
     Allocated {
         ptr: NonNull<u8>,
         cap: NonZeroUsize,
-        global_index: Option<GlobalIndex>,
         context: usize,
     },
     Failed,
@@ -125,16 +124,10 @@ pub enum AllocResult {
 impl AllocResult {
     pub fn into_buf(self, pool: &dyn BackingPool) -> Option<FixedBuf> {
         match self {
-            AllocResult::Allocated {
-                ptr,
-                cap,
-                global_index,
-                context,
-            } => unsafe {
+            AllocResult::Allocated { ptr, cap, context } => unsafe {
                 Some(FixedBuf::new(
                     ptr,
                     cap,
-                    global_index,
                     pool.pool_data(),
                     pool.vtable(),
                     context,
@@ -251,11 +244,6 @@ impl UniformSlot {
         Self { multiplier }
     }
 
-    /// Convenience constructor (previously buddy)
-    pub fn buddy(multiplier: crate::ThreadMemoryMultiplier) -> Self {
-        Self::new(multiplier)
-    }
-
     // Backward compatibility shim for tests if needed
     pub fn create_pool(
         &self,
@@ -269,8 +257,10 @@ impl PoolTopology for UniformSlot {
     type State = Arc<crate::global::GlobalSlotPool>;
 
     fn init(&self, worker_count: usize) -> std::io::Result<Self::State> {
+        let total_size =
+            self.multiplier.0.get() * crate::MIN_THREAD_MEMORY.get() * 2 * worker_count;
         let config = crate::global::GlobalAllocatorConfig {
-            multipliers: vec![self.multiplier; worker_count],
+            total_memory: total_size,
         };
 
         let pool = crate::global::GlobalSlotPool::new(config)?;
@@ -306,7 +296,6 @@ pub struct FixedBuf {
     ptr: NonNull<u8>,
     len: NonZeroUsize,
     cap: NonZeroUsize,
-    global_index: Option<GlobalIndex>,
     // Metadata moved from Heap Header to Handle
     pool_data: NonNull<()>,
     vtable: &'static PoolVTable,
@@ -323,7 +312,6 @@ impl FixedBuf {
     pub unsafe fn new(
         ptr: NonNull<u8>,
         cap: NonZeroUsize,
-        global_index: Option<GlobalIndex>,
         pool_data: NonNull<()>,
         vtable: &'static PoolVTable,
         context: usize,
@@ -332,20 +320,16 @@ impl FixedBuf {
             ptr,
             len: cap,
             cap,
-            global_index,
             pool_data,
             vtable,
             context,
         }
     }
 
-    #[inline(always)]
-    pub fn buf_index(&self) -> Option<GlobalIndex> {
-        self.global_index
-    }
-
     /// Resolve which region this buffer belongs to and its offset.
     /// This is used for driver submission (RIO / io_uring).
+    ///
+    /// The interpretation of the region index is pool-dependent.
     #[inline(always)]
     pub fn resolve_region_info(&self) -> (usize, usize) {
         unsafe { (self.vtable.resolve_region_info)(self.pool_data, self) }
@@ -583,15 +567,21 @@ impl BackingPool for SlotBasedPool {
         if let Some((slot_idx, ptr)) = self.pool.alloc_slots(order) {
             let capacity = crate::buffer::buddy::BuddyAllocator::capacity_of(order);
 
-            let context = (slot_idx.0 << 8) | order;
+            // Pack Metadata into Context (64-bit)
+            // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
+            let global_idx_val = self
+                .global_index
+                .map(|g| g.get() as usize)
+                .unwrap_or(NO_REGISTRATION_INDEX as usize);
+
+            let s_idx = slot_idx.0;
+            debug_assert!(s_idx < (1 << 40), "SlotIndex exceeded 40 bits");
+
+            let context = (global_idx_val << 48) | ((order & 0xFF) << 40) | (s_idx & 0xFFFFFFFFFF);
+
             let cap = unsafe { NonZeroUsize::new_unchecked(capacity) };
 
-            AllocResult::Allocated {
-                ptr,
-                cap,
-                global_index: self.global_index,
-                context,
-            }
+            AllocResult::Allocated { ptr, cap, context }
         } else {
             AllocResult::Failed
         }
@@ -635,15 +625,16 @@ static SLOT_BASED_POOL_VTABLE: PoolVTable = PoolVTable {
 unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
     let raw_ptr = pool_data.as_ptr() as *const crate::global::GlobalSlotPool;
 
+    // Unpack context
+    // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
+    let order = (params.context >> 40) & 0xFF;
+    let slot_idx_val = params.context & 0xFFFFFFFFFF;
+    let slot_idx = crate::slot::SlotIndex(slot_idx_val);
+
     #[cfg(debug_assertions)]
     {
         // Debug Mode: Restore Arc
         let pool = unsafe { Arc::from_raw(raw_ptr) };
-
-        let order = params.context & 0xFF;
-        let slot_idx_val = params.context >> 8;
-        let slot_idx = crate::slot::SlotIndex(slot_idx_val);
-
         unsafe {
             pool.dealloc_slots(slot_idx, order);
         }
@@ -653,11 +644,6 @@ unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams)
     {
         // Release Mode
         let pool = unsafe { &*raw_ptr };
-
-        let order = params.context & 0xFF;
-        let slot_idx_val = params.context >> 8;
-        let slot_idx = crate::slot::SlotIndex(slot_idx_val);
-
         unsafe {
             pool.dealloc_slots(slot_idx, order);
         }
@@ -676,7 +662,14 @@ unsafe fn slot_based_resolve_region_info_shim(
     let base = global_info.ptr.as_ptr() as usize;
     let ptr = buf.as_ptr() as usize;
 
-    // 3. return (region_index, offset)
-    let region_index = buf.buf_index().map(|idx| idx.get() as usize).unwrap_or(0);
+    // 3. Unpack GlobalIndex from context
+    // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
+    let global_idx_val = (buf.context >> 48) & 0xFFFF;
+    let region_index = if global_idx_val == NO_REGISTRATION_INDEX as usize {
+        usize::MAX
+    } else {
+        global_idx_val
+    };
+
     (region_index, ptr.saturating_sub(base))
 }
