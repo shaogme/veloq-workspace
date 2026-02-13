@@ -13,7 +13,7 @@ pub trait Driver: 'static {
     type Op: PlatformOp;
 
     /// Register a new operation. Returns the user_data key and expected generation.
-    fn reserve_op(&mut self) -> (usize, u32);
+    fn reserve_op(&mut self) -> io::Result<(usize, u32)>;
 
     /// Get the shared slot table if available.
     fn slot_table(&self) -> std::sync::Arc<slot::SlotTable<Self::Op>>;

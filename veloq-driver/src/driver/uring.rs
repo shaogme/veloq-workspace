@@ -106,11 +106,18 @@ impl UringDriver {
 impl Driver for UringDriver {
     type Op = UringOp;
 
-    fn reserve_op(&mut self) -> (usize, u32) {
+    fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
         // Only one arg needed now
-        let (id, generation) = self.ops.insert(OpEntry::new(UringOpState::new()));
-        trace!(id, generation, "Reserved op slot");
-        (id, generation)
+        match self.ops.insert(OpEntry::new(UringOpState::new())) {
+            Ok((id, generation)) => {
+                trace!(id, generation, "Reserved op slot");
+                Ok((id, generation))
+            }
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "OpRegistry full",
+            )),
+        }
     }
 
     fn slot_table(&self) -> std::sync::Arc<crate::driver::slot::SlotTable<Self::Op>> {

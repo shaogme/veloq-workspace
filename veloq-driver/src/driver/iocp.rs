@@ -22,11 +22,19 @@ use submit::SubmissionResult;
 impl Driver for IocpDriver {
     type Op = IocpOp;
 
-    fn reserve_op(&mut self) -> (usize, u32) {
+    fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
         // OpRegistry::alloc handles internal vectors and free list management autonomously.
 
         let old_pages = self.ops.page_count();
-        let (user_data, generation) = self.ops.insert(OpEntry::new(IocpOpState::new()));
+        let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::new())) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "OpRegistry is full",
+                ));
+            }
+        };
         trace!(user_data, generation, "Reserved op slot");
 
         if self.ops.page_count() > old_pages {
@@ -36,7 +44,7 @@ impl Driver for IocpDriver {
                 rio.ensure_slab_page_registration(new_page_idx, &self.ops);
             }
         }
-        (user_data, generation)
+        Ok((user_data, generation))
     }
 
     fn slot_table(&self) -> std::sync::Arc<crate::driver::slot::SlotTable<Self::Op>> {
@@ -153,7 +161,7 @@ impl Driver for IocpDriver {
     }
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
-        let (user_data, _) = self.reserve_op();
+        let (user_data, _) = self.reserve_op()?;
 
         // BORROW CHECKER FIX: Split access
         let ops_local = &mut self.ops.local;

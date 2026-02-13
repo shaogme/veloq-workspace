@@ -42,7 +42,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    pub fn alloc(&mut self, data: P) -> Option<(usize, u32, &mut OpEntry<P>)> {
+    pub fn alloc(&mut self, data: P) -> Result<(usize, u32, &mut OpEntry<P>), P> {
         // 1. Recycle remote indices
         while let Some(idx) = self.shared.remote_free_queue.pop() {
             if idx < self.local.len() {
@@ -63,23 +63,23 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
             // Initialize local data
             self.local[idx].platform_data = data;
 
-            Some((idx, new_gen, &mut self.local[idx]))
+            Ok((idx, new_gen, &mut self.local[idx]))
         } else {
-            None
+            Err(data)
         }
     }
 
     /// Insert equivalent (for compatibility with previous interface)
     /// Note: This consumes entry but we only need platform_data.
     /// The actual resource Op should be placed into slot by caller.
-    pub fn insert(&mut self, entry: OpEntry<P>) -> (usize, u32) {
-        if let Some((idx, generation, _dest)) = self.alloc(entry.platform_data) {
-            (idx, generation)
-        } else {
-            // If full, we can't easily expand with this design (fixed size).
-            panic!("OpRegistry is full");
+    pub fn insert(&mut self, entry: OpEntry<P>) -> Result<(usize, u32), OpEntry<P>> {
+        match self.alloc(entry.platform_data) {
+            Ok((idx, generation, _)) => Ok((idx, generation)),
+            Err(data) => Err(OpEntry {
+                platform_data: data,
+            }),
         }
-    }
+    } 
 
     pub fn get(&self, user_data: usize) -> Option<&OpEntry<P>> {
         self.local.get(user_data)

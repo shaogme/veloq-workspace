@@ -155,27 +155,47 @@ impl<T> Op<T> {
         let data = self.data;
         trace!("Submitting detached op");
 
-        let op_platform = data.into_platform_op();
-        let (user_data, generation) = driver.reserve_op(); // driver.reserve_op returns (index, generation)
+        // Try reserve first
+        match driver.reserve_op() {
+            Ok((user_data, generation)) => {
+                let op_platform = data.into_platform_op();
+                let table = driver.slot_table();
 
-        // For detached ops, we REQUIRE a shared slot table.
-        // If the driver doesn't implement one (returns None), we cannot proceed safely.
-        let table = driver.slot_table();
-
-        if let Err((e, _op)) = driver.submit(user_data, op_platform) {
-            // If submission fails, we log it and cancel the slot.
-            trace!("Submit failed: {}", e);
-            driver.cancel_op(user_data);
-            // Return DetachedOp that will definitely fail.
-            // Slot logic: slot is cancelled or stays Pending forever?
-            // If cancel_op is called, it should wake with error.
-        }
-
-        DetachedOp {
-            table,
-            index: user_data,
-            expected_gen: generation,
-            _phantom: std::marker::PhantomData,
+                if let Err((e, _op)) = driver.submit(user_data, op_platform) {
+                    trace!("Submit failed: {}", e);
+                    driver.cancel_op(user_data);
+                    // Note: We proceeded with reservation but submit failed.
+                    // The slot is now pending cancellation.
+                    // We return a DetachedOp that monitors this slot.
+                    // The cancel_op should eventually trigger completion with error.
+                    DetachedOp {
+                        table: Some(table),
+                        index: user_data,
+                        expected_gen: generation,
+                        immediate_failure: None,
+                        _phantom: std::marker::PhantomData,
+                    }
+                } else {
+                    DetachedOp {
+                        table: Some(table),
+                        index: user_data,
+                        expected_gen: generation,
+                        immediate_failure: None,
+                        _phantom: std::marker::PhantomData,
+                    }
+                }
+            }
+            Err(e) => {
+                // Reservation failed (e.g. full).
+                // Return DetachedOp with immediate failure.
+                DetachedOp {
+                    table: None, // No table needed
+                    index: 0,    // Dummy
+                    expected_gen: 0,
+                    immediate_failure: Some((e, data)),
+                    _phantom: std::marker::PhantomData,
+                }
+            }
         }
     }
 
@@ -200,9 +220,10 @@ where
     D: Driver,
     T: IntoPlatformOp<D>,
 {
-    table: Arc<SlotTable<D::Op>>,
+    table: Option<Arc<SlotTable<D::Op>>>,
     index: usize,
     expected_gen: u32,
+    immediate_failure: Option<(std::io::Error, T)>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -224,11 +245,21 @@ where
     type Output = OpResult<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let slot = &self.table.slots[self.index];
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if let Some((e, data)) = this.immediate_failure.take() {
+            return Poll::Ready(OpResult::Completed(Err(e), data));
+        }
+
+        let table = this
+            .table
+            .as_ref()
+            .expect("DetachedOp missing table but no immediate_failure");
+        let slot = &table.slots[this.index];
 
         // 1. Generation check: Ensure slot hasn't been recycled for a new operation.
         let generation = slot.generation.load(Ordering::Acquire);
-        if generation != self.expected_gen {
+        if generation != this.expected_gen {
             return Poll::Ready(OpResult::Lost(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "Op slot recycled (generation mismatch)",
@@ -259,7 +290,7 @@ where
             // NOTE: The Slot index remains "occupied" in the Registry until someone frees it.
             // In the detached model, we need a mechanism to recycle the index.
             // We push the index to the "remote free queue" which sits in the SlotTable.
-            self.table.remote_free_queue.push(self.index);
+            table.remote_free_queue.push(this.index);
 
             Poll::Ready(OpResult::Completed(res, data))
         } else {
@@ -273,7 +304,7 @@ where
                 let op_platform = unsafe { (*slot.op.get()).take().expect("Op missing") };
                 let data = T::from_platform_op(op_platform);
                 slot.state.store(STATE_CONSUMED, Ordering::Release);
-                self.table.remote_free_queue.push(self.index);
+                table.remote_free_queue.push(this.index);
                 Poll::Ready(OpResult::Completed(res, data))
             } else {
                 Poll::Pending
@@ -327,7 +358,16 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
 
             // reserve_op now returns generation, but we ignore it for LocalOp
             // because LocalOp lifetime is tied to the driver via Rc/RefCell.
-            let (user_data, _generation) = driver.reserve_op();
+            let (user_data, _generation) = match driver.reserve_op() {
+                Ok(v) => v,
+                Err(e) => {
+                    // Failed to reserve
+                    return Poll::Ready(OpResult::Completed(
+                        Err(e),
+                        T::from_platform_op(driver_op),
+                    ));
+                }
+            };
             op.user_data = user_data;
 
             // Submit to driver.
