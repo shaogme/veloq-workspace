@@ -98,9 +98,21 @@ impl BuddyAllocator {
     }
 
     #[inline(always)]
-    unsafe fn ptr_from_index(&self, index: SlotIndex) -> NonNull<u8> {
-        // SAFETY: Caller must ensure index is valid
+    fn ptr_from_index(&self, index: SlotIndex) -> NonNull<u8> {
+        assert!(index.0 < self.total_slots, "Slot index out of bounds");
+        // SAFETY: base_ptr is valid for total_slots, index is checked above.
         unsafe { NonNull::new_unchecked(self.base_ptr.as_ptr().add(index.offset())) }
+    }
+
+    #[inline(always)]
+    fn get_free_node_ptr(&self, index: SlotIndex) -> NonNull<FreeNode> {
+        self.ptr_from_index(index).cast()
+    }
+
+    #[inline(always)]
+    unsafe fn get_free_node(&self, index: SlotIndex) -> &FreeNode {
+        let ptr = self.ptr_from_index(index);
+        unsafe { &*(ptr.as_ptr() as *const FreeNode) }
     }
 
     #[inline(always)]
@@ -140,8 +152,9 @@ impl BuddyAllocator {
 
     /// Helper: Add a block to the free list
     unsafe fn add_to_free_list(&mut self, index: SlotIndex, order: usize) {
-        let ptr = unsafe { self.ptr_from_index(index) };
-        let node = unsafe { &mut *(ptr.as_ptr() as *mut FreeNode) };
+        // SAFETY: Caller ensures index is valid and not allocated
+        let mut node_ptr = self.get_free_node_ptr(index);
+        let node = unsafe { node_ptr.as_mut() };
 
         // Initialize FreeNode
         // We use ManuallyDrop to wrap the Link. Assigning to it does NOT drop the old value
@@ -157,7 +170,7 @@ impl BuddyAllocator {
 
     /// Helper: Remove a block from the free list
     unsafe fn remove_from_free_list(&mut self, index: SlotIndex, order: usize) {
-        let ptr = unsafe { self.ptr_from_index(index) };
+        let ptr = self.ptr_from_index(index);
         let node_ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr() as *mut FreeNode) };
 
         unsafe {
@@ -256,8 +269,7 @@ impl BuddyAllocator {
             // SAFETY: We know buddy is NOT allocated (from bitset).
             // Assuming it is a valid FreeNode initialized by system.
             unsafe {
-                let buddy_ptr = self.ptr_from_index(buddy_idx);
-                let buddy_node = &*(buddy_ptr.as_ptr() as *const FreeNode);
+                let buddy_node = self.get_free_node(buddy_idx);
 
                 if buddy_node.order as usize != curr_order {
                     // Buddy is free but split (different order), cannot merge
@@ -286,9 +298,8 @@ impl BuddyAllocator {
         Ok(())
     }
 
-    /// Convert SlotIndex to Pointer
     pub fn ptr_of(&self, index: SlotIndex) -> NonNull<u8> {
-        unsafe { self.ptr_from_index(index) }
+        self.ptr_from_index(index)
     }
 
     /// Helper: Get allocated capacity in bytes

@@ -258,12 +258,8 @@ impl GlobalSlotPool {
             if let Some(sb_idx) = sb_idx_opt {
                 if let Some(offset) = self.superblocks[sb_idx].alloc_one() {
                     let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
-                    // Calculate Ptr
-                    let ptr = unsafe {
-                        NonNull::new_unchecked(
-                            self.memory.as_ptr().add(global_idx.offset()) as *mut u8
-                        )
-                    };
+                    // Calculate Ptr (Safe)
+                    let ptr = self.resolve_ptr(global_idx);
                     return Some((global_idx, ptr));
                 } else {
                     // Superblock Full! Retire it.
@@ -301,9 +297,7 @@ impl GlobalSlotPool {
                     .expect("Fresh superblock must have space");
 
                 let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
-                let ptr = unsafe {
-                    NonNull::new_unchecked(self.memory.as_ptr().add(global_idx.offset()) as *mut u8)
-                };
+                let ptr = self.resolve_ptr(global_idx);
                 return Some((global_idx, ptr));
             }
 
@@ -409,8 +403,7 @@ impl GlobalSlotPool {
 
     unsafe fn dealloc_global(&self, index: SlotIndex, order: usize) {
         // 1. Map Global Index -> Shard Index
-        let shard_idx = index.0 / self.slots_per_shard;
-        let local_idx_val = index.0 % self.slots_per_shard;
+        let (shard_idx, local_idx) = self.shard_for_index(index);
 
         // Boundary check
         if shard_idx >= self.shards.len() {
@@ -424,7 +417,7 @@ impl GlobalSlotPool {
         let mut buddy = self.shards[shard_idx].lock();
         unsafe {
             buddy
-                .dealloc(SlotIndex(local_idx_val), order)
+                .dealloc(local_idx, order)
                 .expect("GlobalSlotPool dealloc failed");
         }
     }
@@ -432,6 +425,24 @@ impl GlobalSlotPool {
     /// Get Global Memory Info
     pub fn global_info(&self) -> GlobalMemoryInfo {
         self.global_info
+    }
+
+    /// Resolve Global SlotIndex to Raw Pointer (Safe)
+    pub fn resolve_ptr(&self, index: SlotIndex) -> NonNull<u8> {
+        let offset = index.offset();
+        assert!(
+            offset < self.global_info.len.get(),
+            "GlobalSlotIndex out of bounds"
+        );
+        // SAFETY: Offset checked against total memory size.
+        unsafe { NonNull::new_unchecked(self.memory.as_ptr().add(offset) as *mut u8) }
+    }
+
+    /// Helper: Map Global SlotIndex to Shard and Local Index
+    fn shard_for_index(&self, index: SlotIndex) -> (usize, SlotIndex) {
+        let shard_idx = index.0 / self.slots_per_shard;
+        let local_idx = index.0 % self.slots_per_shard;
+        (shard_idx, SlotIndex(local_idx))
     }
 }
 
