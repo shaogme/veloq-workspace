@@ -178,7 +178,14 @@ impl UringDriver {
 
         let result = self.ops.alloc(state);
 
-        if let Ok((user_data, _gen, _entry)) = result {
+        if let Ok(crate::driver::op_registry::AllocResult {
+            handle:
+                crate::driver::op_registry::OpHandle {
+                    index: user_data, ..
+                },
+            ..
+        }) = result
+        {
             self.waker_token = Some(user_data);
             let slot = &self.ops.shared.slots[user_data];
 

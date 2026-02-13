@@ -27,7 +27,7 @@ impl Driver for IocpDriver {
 
         let old_pages = self.ops.page_count();
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::new())) {
-            Ok(v) => v,
+            Ok(handle) => (handle.index, handle.generation),
             Err(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::OutOfMemory,

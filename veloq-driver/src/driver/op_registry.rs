@@ -21,6 +21,17 @@ pub struct OpRegistry<Op: PlatformOp, P> {
     pub free_indices: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpHandle {
+    pub index: usize,
+    pub generation: u32,
+}
+
+pub struct AllocResult<'a, P> {
+    pub handle: OpHandle,
+    pub entry: &'a mut OpEntry<P>,
+}
+
 impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
     pub fn new(capacity: usize) -> Self {
         let shared = Arc::new(SlotTable::new(capacity));
@@ -42,7 +53,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    pub fn alloc(&mut self, data: P) -> Result<(usize, u32, &mut OpEntry<P>), P> {
+    pub fn alloc(&mut self, data: P) -> Result<AllocResult<'_, P>, P> {
         // 1. Recycle remote indices
         while let Some(idx) = self.shared.remote_free_queue.pop() {
             if idx < self.local.len() {
@@ -63,7 +74,13 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
             // Initialize local data
             self.local[idx].platform_data = data;
 
-            Ok((idx, new_gen, &mut self.local[idx]))
+            Ok(AllocResult {
+                handle: OpHandle {
+                    index: idx,
+                    generation: new_gen,
+                },
+                entry: &mut self.local[idx],
+            })
         } else {
             Err(data)
         }
@@ -72,14 +89,14 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
     /// Insert equivalent (for compatibility with previous interface)
     /// Note: This consumes entry but we only need platform_data.
     /// The actual resource Op should be placed into slot by caller.
-    pub fn insert(&mut self, entry: OpEntry<P>) -> Result<(usize, u32), OpEntry<P>> {
+    pub fn insert(&mut self, entry: OpEntry<P>) -> Result<OpHandle, OpEntry<P>> {
         match self.alloc(entry.platform_data) {
-            Ok((idx, generation, _)) => Ok((idx, generation)),
+            Ok(res) => Ok(res.handle),
             Err(data) => Err(OpEntry {
                 platform_data: data,
             }),
         }
-    } 
+    }
 
     pub fn get(&self, user_data: usize) -> Option<&OpEntry<P>> {
         self.local.get(user_data)

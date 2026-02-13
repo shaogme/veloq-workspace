@@ -109,7 +109,10 @@ impl Driver for UringDriver {
     fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
         // Only one arg needed now
         match self.ops.insert(OpEntry::new(UringOpState::new())) {
-            Ok((id, generation)) => {
+            Ok(crate::driver::op_registry::OpHandle {
+                index: id,
+                generation,
+            }) => {
                 trace!(id, generation, "Reserved op slot");
                 Ok((id, generation))
             }
