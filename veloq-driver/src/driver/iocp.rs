@@ -7,11 +7,13 @@ mod submit;
 mod tests;
 
 use crate::driver::op_registry::OpEntry;
-use crate::driver::{DetachedCompleter, Driver, RemoteWaker};
+use crate::driver::slot::{STATE_COMPLETED, STATE_CONSUMED, STATE_SUBMITTED};
+use crate::driver::{Driver, RemoteWaker};
 use std::io;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use tracing::{debug, trace};
-use windows_sys::Win32::System::IO::{OVERLAPPED, PostQueuedCompletionStatus};
+use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
 
 pub use inner::{IocpDriver, IocpOpState, OpLifecycle};
 use op::IocpOp;
@@ -20,10 +22,12 @@ use submit::SubmissionResult;
 impl Driver for IocpDriver {
     type Op = IocpOp;
 
-    fn reserve_op(&mut self) -> usize {
+    fn reserve_op(&mut self) -> (usize, u32) {
+        // OpRegistry::alloc handles internal vectors and free list management autonomously.
+
         let old_pages = self.ops.page_count();
-        let user_data = self.ops.insert(OpEntry::new(None, IocpOpState::new()));
-        trace!(user_data, "Reserved op slot");
+        let (user_data, generation) = self.ops.insert(OpEntry::new(IocpOpState::new()));
+        trace!(user_data, generation, "Reserved op slot");
 
         if self.ops.page_count() > old_pages {
             // New page allocated, register it immediately
@@ -32,17 +36,11 @@ impl Driver for IocpDriver {
                 rio.ensure_slab_page_registration(new_page_idx, &self.ops);
             }
         }
-        user_data
+        (user_data, generation)
     }
 
-    fn attach_detached_completer(
-        &mut self,
-        user_data: usize,
-        completer: Box<dyn DetachedCompleter<Self::Op>>,
-    ) {
-        if let Some(op) = self.ops.get_mut(user_data) {
-            op.platform_data.detached_completer = Some(completer);
-        }
+    fn slot_table(&self) -> std::sync::Arc<crate::driver::slot::SlotTable<Self::Op>> {
+        self.ops.shared.clone()
     }
 
     fn submit(
@@ -51,25 +49,28 @@ impl Driver for IocpDriver {
         op: Self::Op,
     ) -> Result<Poll<()>, (io::Error, Self::Op)> {
         trace!(user_data, "Submitting op");
-        // Since RIO slab registration is handled eagerly in reserve_op (and new),
-        // we no longer need to check/register it here.
-        // This resolves the borrow checker conflict.
 
-        if let Some(op_entry) = self.ops.get_mut(user_data) {
-            // Important: we must pin the op in resources first, then get pointers
-            op_entry.resources = Some(op);
-            let op_ref = op_entry.resources.as_mut().unwrap();
+        // BORROW CHECKER FIX: Split access
+        let ops_local = &mut self.ops.local;
+        let ops_shared = &self.ops.shared;
 
-            op_ref.header.user_data = user_data;
+        let slot = &ops_shared.slots[user_data];
+        unsafe { *slot.op.get() = Some(op) };
+        slot.state.store(STATE_SUBMITTED, Ordering::Release);
 
-            // Construct SubmitContext utilizing Split Borrow
+        let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
+        op_ref.header.user_data = user_data;
+
+        if let Some(op_entry) = ops_local.get_mut(user_data) {
+            // FIX: Use overlapped ptr directly
+            let overlapped_ptr = slot.overlapped_ptr();
+
             let mut ctx = crate::driver::iocp::op::SubmitContext {
                 port: self.port,
-                overlapped: &mut op_ref.header.inner as *mut OVERLAPPED,
+                overlapped: overlapped_ptr,
                 ext: &self.extensions,
                 registered_files: &self.registered_files,
                 rio: self.rio_state.as_mut(),
-                // ops removed from context
             };
 
             let result = unsafe { (op_ref.vtable.submit)(op_ref, &mut ctx) };
@@ -79,11 +80,9 @@ impl Driver for IocpDriver {
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
                 Ok(SubmissionResult::PostToQueue) => {
-                    // E.g. Wakeup. Post immediately.
                     let _ = unsafe {
                         PostQueuedCompletionStatus(self.port, 0, user_data, std::ptr::null_mut())
                     };
-                    // Treat as in-flight; completion comes immediately via CQ
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
                 Ok(SubmissionResult::Offload(task)) => {
@@ -92,9 +91,13 @@ impl Driver for IocpDriver {
                     if get_blocking_pool().execute(task).is_err() {
                         op_entry.platform_data.lifecycle =
                             OpLifecycle::Completed(Err(io::Error::other("Thread pool overloaded")));
-                        if let Some(waker) = op_entry.waker.take() {
-                            waker.wake();
-                        }
+                        // Update Slot State
+                        unsafe {
+                            *slot.result.get() =
+                                Some(Err(io::Error::other("Thread pool overloaded")))
+                        };
+                        slot.state.store(STATE_COMPLETED, Ordering::Release);
+                        slot.waker.wake();
                     }
                 }
                 Ok(SubmissionResult::Timer(duration)) => {
@@ -103,15 +106,21 @@ impl Driver for IocpDriver {
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
                 Err(e) => {
-                    op_entry.platform_data.lifecycle = OpLifecycle::Completed(Err(e));
-                    if let Some(waker) = op_entry.waker.take() {
-                        waker.wake();
-                    }
+                    op_entry.platform_data.lifecycle =
+                        OpLifecycle::Completed(Err(io::Error::other("Submit Error")));
+                    let op = unsafe { (*slot.op.get()).take().unwrap() };
+                    slot.state
+                        .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
+                    return Err((e, op));
                 }
             }
+        } else {
+            panic!("Op not found");
         }
 
-        let should_complete_detached = if let Some(op) = self.ops.get_mut(user_data) {
+        // Logic for detached completer
+        // Access ops_local again
+        let should_complete_detached = if let Some(op) = ops_local.get_mut(user_data) {
             matches!(op.platform_data.lifecycle, OpLifecycle::Completed(_))
                 && op.platform_data.detached_completer.is_some()
         } else {
@@ -119,13 +128,24 @@ impl Driver for IocpDriver {
         };
 
         if should_complete_detached {
-            let entry = self.ops.remove(user_data);
-            if let OpLifecycle::Completed(result) = entry.platform_data.lifecycle {
-                if let Some(completer) = entry.platform_data.detached_completer {
-                    if let Some(iocp_op) = entry.resources {
-                        completer.complete(result, iocp_op);
+            if let Some(entry) = ops_local.get_mut(user_data) {
+                if let OpLifecycle::Completed(result) = &entry.platform_data.lifecycle {
+                    let res_copy = result.as_ref().map(|x| *x).map_err(|e| {
+                        if let Some(code) = e.raw_os_error() {
+                            io::Error::from_raw_os_error(code)
+                        } else {
+                            io::Error::new(e.kind(), e.to_string())
+                        }
+                    });
+
+                    if let Some(completer) = entry.platform_data.detached_completer.take() {
+                        if let Some(iocp_op) = unsafe { (*slot.op.get()).take() } {
+                            completer.complete(res_copy, iocp_op);
+                        }
                     }
                 }
+                let _ = std::mem::replace(&mut entry.platform_data, IocpOpState::default());
+                self.ops.free_indices.push(user_data);
             }
         }
 
@@ -133,17 +153,26 @@ impl Driver for IocpDriver {
     }
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
-        let user_data = self.reserve_op();
+        let (user_data, _) = self.reserve_op();
 
-        if let Some(op_entry) = self.ops.get_mut(user_data) {
+        // BORROW CHECKER FIX: Split access
+        let ops_local = &mut self.ops.local;
+        let ops_shared = &self.ops.shared;
+
+        let slot = &ops_shared.slots[user_data];
+        unsafe { *slot.op.get() = Some(op) };
+        slot.state.store(STATE_SUBMITTED, Ordering::Release);
+
+        let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
+        op_ref.header.user_data = user_data;
+
+        if let Some(op_entry) = ops_local.get_mut(user_data) {
             op_entry.platform_data.is_background = true;
-            op_entry.resources = Some(op);
-            let op_ref = op_entry.resources.as_mut().unwrap();
-            op_ref.header.user_data = user_data;
+            let overlapped_ptr = slot.overlapped_ptr();
 
             let mut ctx = crate::driver::iocp::op::SubmitContext {
                 port: self.port,
-                overlapped: &mut op_ref.header.inner as *mut OVERLAPPED,
+                overlapped: overlapped_ptr,
                 ext: &self.extensions,
                 registered_files: &self.registered_files,
                 rio: self.rio_state.as_mut(),
@@ -156,7 +185,9 @@ impl Driver for IocpDriver {
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                     use veloq_blocking::get_blocking_pool;
                     if get_blocking_pool().execute(task).is_err() {
-                        self.ops.remove(user_data);
+                        let _ =
+                            std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
+                        self.ops.free_indices.push(user_data);
                         return Err(io::Error::other("Thread pool overloaded"));
                     }
                 }
@@ -165,7 +196,8 @@ impl Driver for IocpDriver {
                 }
                 Err(e) => {
                     debug!(error = ?e, user_data, "Background submit failed");
-                    self.ops.remove(user_data);
+                    let _ = std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
+                    self.ops.free_indices.push(user_data);
                     return Err(e);
                 }
             }
@@ -179,48 +211,39 @@ impl Driver for IocpDriver {
         cx: &mut Context<'_>,
     ) -> Poll<(io::Result<usize>, Self::Op)> {
         trace!(user_data, "IocpDriver::poll_op");
-        if let Some(op) = self.ops.get_mut(user_data) {
-            match op.platform_data.lifecycle {
-                OpLifecycle::Completed(_) => {
-                    // We can't move out of match arm if we match on &mut op.platform_data.lifecycle
-                    // So we check, then take.
-                }
-                OpLifecycle::Cancelled => {
-                    // If cancelled, usually it implies we are waiting for cancellation to finish or it already finished
-                    // with error. If we see Cancelled here, maybe we should return Error?
-                    // Similar to Completed(Err(Cancelled))
-                    let mut entry = self.ops.remove(user_data);
-                    if let Some(res) = entry.resources.take() {
-                        return Poll::Ready((
-                            Err(io::Error::from_raw_os_error(
-                                windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
-                            )),
-                            res,
-                        ));
-                    }
-                    panic!("Op cancelled but resources missing");
-                }
-                _ => {
-                    op.waker = Some(cx.waker().clone());
-                    return Poll::Pending;
-                }
-            }
-        } else {
-            panic!("Op not found in registry");
+        // Check Slot Logic first
+        let slot = &self.ops.shared.slots[user_data];
+
+        // No local registry access needed for pure poll check if we trust slot state?
+        // But we need to remove from registry on completion.
+
+        let state = slot.state.load(Ordering::Acquire);
+
+        if state == STATE_COMPLETED {
+            let res = unsafe { (*slot.result.get()).take().expect("Result missing") };
+            let op = unsafe { (*slot.op.get()).take().expect("Op missing") };
+
+            slot.state.store(STATE_CONSUMED, Ordering::Release);
+            // Remove from local registry
+            self.ops.remove(user_data);
+
+            return Poll::Ready((res, op));
         }
 
-        // If we refer to op above, we can't remove it. separate scope.
-        let mut entry = self.ops.remove(user_data);
-        if let OpLifecycle::Completed(res) = entry.platform_data.lifecycle {
-            let resources = entry
-                .resources
-                .take()
-                .expect("Op completed but resources missing");
-            Poll::Ready((res, resources))
-        } else {
-            // Should be unreachable due to check above
-            panic!("Inconsistent state in poll_op");
+        // Register waker if Pending
+        slot.waker.register(cx.waker());
+
+        // Double check state
+        let state = slot.state.load(Ordering::Acquire);
+        if state == STATE_COMPLETED {
+            let res = unsafe { (*slot.result.get()).take().expect("Result missing") };
+            let op = unsafe { (*slot.op.get()).take().expect("Op missing") };
+            slot.state.store(STATE_CONSUMED, Ordering::Release);
+            self.ops.remove(user_data);
+            return Poll::Ready((res, op));
         }
+
+        Poll::Pending
     }
 
     fn submit_queue(&mut self) -> io::Result<()> {

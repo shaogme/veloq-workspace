@@ -1,10 +1,10 @@
 # Linux io_uring 驱动文档
 
-本文档详细介绍了 `veloq-runtime` 中基于 Linux io_uring 的异步驱动实现。
+本文档详细介绍了 `veloq-driver` 中基于 Linux io_uring 的异步驱动实现。
 
 ## 1. 概要 (Overview)
 
-`veloq-runtime` 的 Linux 驱动层位于 `src/io/driver/uring/` 目录下。它实现了 `Driver` trait，利用 Linux 内核最新的 `io_uring` 接口提供高性能的异步 I/O 能力。该驱动采用 **Proactor** 模式，通过共享内存的提交队列 (SQ) 和完成队列 (CQ) 与内核进行零拷贝交互，避免了传统系统调用（syscall）的频繁上下文切换开销。
+`veloq-driver` 的 Linux 驱动层位于 `src/driver/uring/` 目录下。它实现了 `Driver` trait，利用 Linux 内核最新的 `io_uring` 接口提供高性能的异步 I/O 能力。该驱动采用 **Proactor** 模式，通过共享内存的提交队列 (SQ) 和完成队列 (CQ) 与内核进行零拷贝交互，避免了传统系统调用（syscall）的频繁上下文切换开销。
 
 ## 2. 理念和思路 (Philosophy and Design)
 
@@ -16,25 +16,33 @@
 - **`sqpoll` (可选)**: 如果启用 polling 模式，内核线程会轮询 SQ，实现真正的零系统调用提交。
 
 ### 2.2 类型擦除与动态分发 (Type Erasure)
-为了支持多种 I/O 操作（Read, Write, Connect, Accept 等）而不引入枚举 (Enum) 的巨大内存开销，本驱动采用了与 IOCP 驱动类似的类型擦除技术 (`src/io/driver/uring/op.rs`)。
+为了支持多种 I/O 操作（Read, Write, Connect, Accept 等）而不引入枚举 (Enum) 的巨大内存开销，本驱动采用了与 IOCP 驱动类似的类型擦除技术 (`src/driver/uring/op.rs`)。
 - **Union Payload**: 使用 `union UringOpPayload` 存储各种操作的具体参数结构。这确保了 `UringOp` 的大小仅等于最大负载的大小，而不是所有变体之和。
 - **VTable**: 每个操作类型通过宏 `define_uring_ops!` 自动生成对应的 `OpVTable`。包含 `make_sqe` (构建提交项), `on_complete` (处理完成), `drop` (资源清理) 等静态函数指针。
 - **生命周期管理**: 使用 `ManuallyDrop` 手动管理 Union 中字段的生命周期，确保在操作完成或取消时正确释放资源（如 `CString`, `Vec` 等）。
 
-### 2.3 提交积压处理 (Backlog Handling)
+### 2.3 基于 Slot 的零拷贝提交 (Slot-Based Submission)
+新架构引入了共享的 `SlotTable`。即便是在 `io_uring` 这种环形队列模型下，Slots 依然扮演着关键角色：
+- **资源持有**: `UringOp`（包含缓冲区、文件描述符等）被存放在 `Slot.op` 中，所有权属于 `Slot`。
+- **SQE 构建**: 驱动在构建 SQE (Submission Queue Entry) 时，直接从 `Slot` 中借用 `UringOp` 的指针。传递给内核的 `user_data` 即为 Slot 的索引。
+- **完成处理**: 当内核返回 CQE 时，驱动根据 `user_data` 索引找到 Slot，写入结果并唤醒从 Slot 等待的 Future。
+- **优势**: 这种机制允许 `DetachedOp` 直接从 Slot 等待结果，无需额外的 Channel 分配。
+
+### 2.4 提交积压处理 (Backlog Handling)
 `io_uring` 的提交队列 (SQ) 大小是固定的。当 SQ 满时，驱动必须暂存无法立即提交的操作。
-- 我们在 `UringOpState` 中维护了一个**侵入式单向链表** (`backlog_head`, `backlog_tail`, `next`)。
-- 当 `push_entry` 失败（SQ 满）时，操作被加入 backlog 链表。
+- 我们在 `UringOpState` (Driver Local) 中维护了一个**侵入式单向链表** (`backlog_head`, `backlog_tail`, `next`)。
+- 当 `push_entry` 失败（SQ 满）时，驱动不会尝试不断重试，而是将该 Slot 索引加入 backlog 链表。
+- 此时 `Op` 依然安全地驻留在 `Slot` 中，等待下一次提交。
 - 每次 `submit` 或 `wait` 后，驱动会尝试 `flush_backlog`，将暂存的操作重新推入 SQ。
 
-### 2.4 唤醒机制 (Waker)
+### 2.5 唤醒机制 (Waker)
 由于 `driver.wait()` 通常会阻塞在 `io_uring_enter` 系统调用上，我们需要一种机制从其他线程唤醒它（例如当新的任务通过 Mesh 通道发送过来时）。
 - 驱动使用 `eventfd` 创建一个特殊的唤醒文件描述符。
 - 注册一个 `Poll` 或 `Read` 操作 (`Wakeup`) 到 `io_uring` 监听该 fd。
 - `RemoteWaker` 的实现只是简单地向该 `eventfd` 写入 8 字节，从而触发 `io_uring` 完成事件，唤醒驱动主循环。
 
-### 2.5 内核兼容性与降级策略 (Kernel Compatibility)
-`veloq-runtime` 优先使用较新内核的特性以获得最佳性能，但也提供了针对较旧内核的回退支持。
+### 2.6 内核兼容性与降级策略 (Kernel Compatibility)
+`veloq-driver` 优先使用较新内核的特性以获得最佳性能，但也提供了针对较旧内核的回退支持。
 
 #### 功能降级矩阵 (Degradation Matrix)
 驱动初始化时会尝试启用所有高级特性 (`SingleIssuer`, `DeferTaskRun`, `CoopTaskRun`)。如果内核不支持（返回 `EINVAL`），将自动回退到基础模式。
@@ -50,16 +58,17 @@
 ## 3. 模块内结构 (Internal Structure)
 
 ```
-src/io/driver/uring/
+src/driver/uring/
 ├── mod.rs          // 驱动入口 (UringDriver)，主循环，Backlog 管理
 ├── op.rs           // UringOp 定义，VTable 定义，Union Payload 宏
+├── inner.rs        // 内部实现细节 (State, Lifecycle)
 ├── submit.rs       // 各个 Op 的具体实现 (make_sqe_*, on_complete_*)
 └── tests/          // (如果存在) 单元测试
 ```
 
 外部依赖：
-- `../op_registry.rs`: `OpRegistry` 负责存储所有飞行中的操作 (`UringOp`) 及其状态 (`UringOpState`)。
-- `../stable_slab.rs`: 提供地址稳定的内存分配，确保 `user_data` 索引在操作生命周期内有效。
+- `../op_registry.rs`: `OpRegistry` 负责存储所有飞行中的操作状态 (`UringOpState`)。
+- `../slot.rs`: 提供 `SlotTable`，持有实际的 `UringOp` 资源。
 
 ## 4. 代码详细分析 (Detailed Analysis)
 
@@ -71,13 +80,14 @@ src/io/driver/uring/
 - `pending_cancellations`: 等待取消的操作队列。
 
 **生命周期**:
-1.  **提交 (submit)**: 用户调用 `submit`，驱动分配 Slot，保存资源，调用 `vtable.make_sqe` 构建 SQE (Submission Queue Entry)，尝试推入 Ring。若 Ring 满，加入 Backlog。
+1.  **提交 (submit)**: 用户调用 `submit`，驱动分配 Slot，保存资源到 `Slot.op`，调用 `vtable.make_sqe` 构建 SQE ( Submission Queue Entry)，尝试推入 Ring。若 Ring 满，加入 Backlog。
 2.  **等待 (wait)**: 调用 `ring.submit_and_wait(1)`。
 3.  **处理 (process_completions)**:
     - 遍历 CQE (Completion Queue Entry)。
-    - 根据 `user_data` 找到对应的 `OpEntry`。
-    - 调用 `vtable.on_complete` 处理结果（转换错误码，解析地址等）。
-    - 移除 Op，唤醒对应的 `Waker`。
+    - 根据 `user_data` 找到对应的 `Slot` 和 `OpEntry`。
+    - 调用 `vtable.on_complete` 处理结果。
+    - 更新 `Slot.state` 为 `COMPLETED`，唤醒 `Slot.waker`。
+    - `Future` 醒来后，从 `Slot` 取走资源和结果，并释放 `Slot`。
 
 ### 4.2 操作定义 (`op.rs`)
 `UringOp` 是驱动中流转的核心数据结构：
@@ -92,7 +102,7 @@ pub struct UringOp {
 
 ### 4.3 静态分发 (`submit.rs`)
 该文件包含所有具体操作的逻辑。
-- **make_sqe_***: 将高层 Op 转换为 `io_uring::squeue::Entry`。处理 `IoFd::Fixed` (注册文件) 和 `IoFd::Raw` 的区别。
+- **make_sqe_***: 将高层 Op 转换为 `io_uring::squeue::Entry`。处理 `IoFd::Fixed` (注册文件) 和 `IoFd::Raw` 的区别。由于此时驱动拥有 Slot 的所有权，它可以安全地从 Slot 中读取 Op 数据构建 SQE。
 - **on_complete_***: 处理内核返回的 `i32` 结果。例如 `Accept` 操作在此处将内核写入的 `sockaddr` 字节解析为 Rust 的 `SocketAddr`。
 - **drop_***: 安全地释放 Union 中的资源。
 
@@ -104,7 +114,6 @@ pub struct UringOp {
 
 1.  **内核版本依赖**:
     - 当前使用了许多较新的 io_uring 特性（如 `Single Issuer`, `Defer Taskrun`）。在旧内核（< 5.10）上虽然有回退逻辑，但性能和功能可能受限。
-    - 降级策略与兼容性矩阵详见 [2.5 内核兼容性与降级策略](#25-内核兼容性与降级策略-kernel-compatibility)。
 
 2.  **Backlog 性能**:
     - 目前 Backlog 是一个单向链表。如果 Ring 长期处于满载状态，大量的 Backlog 插入/弹出可能导致 CPU 开销增加。

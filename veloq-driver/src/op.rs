@@ -7,23 +7,22 @@
 //! - `io/driver/uring/op.rs` for Linux io_uring
 //! - `io/driver/iocp/op.rs` for Windows IOCP
 
-use std::cell::{RefCell, UnsafeCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use veloq_atomic_waker::AtomicWaker;
-
+use std::cell::RefCell;
 use tracing::trace;
 use veloq_buf::FixedBuf;
 
 use crate::RawHandle;
 use crate::SockAddrStorage;
+use crate::driver::slot::{STATE_COMPLETED, STATE_CONSUMED, SlotTable};
 use crate::driver::{Driver, PlatformDriver};
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
@@ -48,6 +47,45 @@ impl IoFd {
 impl From<RawHandle> for IoFd {
     fn from(handle: RawHandle) -> Self {
         Self::Raw(handle)
+    }
+}
+
+// ============================================================================
+// OpResult
+// ============================================================================
+
+/// The result of an IO operation.
+///
+/// Since operations execute asynchronously and are detached from the submitter's lifetime,
+/// it is possible (though rare) for the operation slot to be recycled if the `Future`
+/// is polled after the driver has reclaimed the slot (Generation Mismatch).
+/// In such cases, the ownership of the resource `T` is lost.
+#[derive(Debug)]
+pub enum OpResult<T> {
+    /// Operation completed (successfully or with IO error).
+    /// Returns the result of the operation and the original resource.
+    Completed(std::io::Result<usize>, T),
+    /// Operation failed because the submitter/driver slot was recycled (Generation Mismatch).
+    /// The resource `T` is lost (polled too late, driver reset slot).
+    Lost(std::io::Error),
+}
+
+impl<T> OpResult<T> {
+    /// Unwraps the result, assuming the operation completed (panics if Lost).
+    pub fn unwrap(self) -> (usize, T) {
+        match self {
+            OpResult::Completed(Ok(res), data) => (res, data),
+            OpResult::Completed(Err(e), _) => panic!("OpResult::Completed(Err({}))", e),
+            OpResult::Lost(e) => panic!("OpResult::Lost({})", e),
+        }
+    }
+
+    /// Returns the result and the resource implementation (if available).
+    pub fn into_inner(self) -> (std::io::Result<usize>, Option<T>) {
+        match self {
+            OpResult::Completed(res, data) => (res, Some(data)),
+            OpResult::Lost(err) => (Err(err), None),
+        }
     }
 }
 
@@ -109,122 +147,38 @@ impl<T> Op<T> {
 
     /// Submit this operation manually to a specific driver instance.
     /// The operation is submitted synchronously, but completion is awaited asynchronously via the returned future.
-    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T>
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D>
     where
         T: IntoPlatformOp<D> + std::marker::Send + 'static,
         D: Driver,
     {
-        let state = Arc::new(DetachedState::new());
         let data = self.data;
-
         trace!("Submitting detached op");
 
         let op_platform = data.into_platform_op();
-        let user_data = driver.reserve_op();
+        let (user_data, generation) = driver.reserve_op(); // driver.reserve_op returns (index, generation)
 
-        let completer = Box::new(GenericCompleter {
-            state: state.clone(),
+        // For detached ops, we REQUIRE a shared slot table.
+        // If the driver doesn't implement one (returns None), we cannot proceed safely.
+        let table = driver.slot_table();
+
+        if let Err((e, _op)) = driver.submit(user_data, op_platform) {
+            // If submission fails, we log it and cancel the slot.
+            trace!("Submit failed: {}", e);
+            driver.cancel_op(user_data);
+            // Return DetachedOp that will definitely fail.
+            // Slot logic: slot is cancelled or stays Pending forever?
+            // If cancel_op is called, it should wake with error.
+        }
+
+        DetachedOp {
+            table,
+            index: user_data,
+            expected_gen: generation,
             _phantom: std::marker::PhantomData,
-        });
-        driver.attach_detached_completer(user_data, completer);
-
-        if let Err((_e, _op)) = driver.submit(user_data, op_platform) {
-            // Error handling: if submit fails, we can't easily return error via state
-            // as completer is already attached.
-            // We log failure or ignore (driver might handle it).
-        }
-
-        DetachedOp { state }
-    }
-}
-
-use crate::driver::DetachedCompleter;
-
-const STATE_WAITING: u8 = 0;
-const STATE_READY: u8 = 1;
-const STATE_CLOSED: u8 = 2;
-
-struct DetachedState<T> {
-    status: AtomicU8,
-    waker: AtomicWaker,
-    data: UnsafeCell<Option<(std::io::Result<usize>, T)>>,
-}
-
-unsafe impl<T: std::marker::Send> std::marker::Send for DetachedState<T> {}
-unsafe impl<T: std::marker::Send> std::marker::Sync for DetachedState<T> {}
-
-impl<T> DetachedState<T> {
-    fn new() -> Self {
-        Self {
-            status: AtomicU8::new(STATE_WAITING),
-            waker: AtomicWaker::new(),
-            data: UnsafeCell::new(None),
         }
     }
-}
 
-struct GenericCompleter<T, D> {
-    state: Arc<DetachedState<T>>,
-    _phantom: std::marker::PhantomData<fn() -> D>,
-}
-
-impl<T, D> DetachedCompleter<D::Op> for GenericCompleter<T, D>
-where
-    D: Driver,
-    T: IntoPlatformOp<D> + std::marker::Send,
-{
-    fn complete(self: Box<Self>, res: std::io::Result<usize>, op: D::Op) {
-        let data = T::from_platform_op(op);
-        // SAFETY: WAITING -> READY transition guarantees exclusive access to data cell.
-        // We own the Box<Self>, so we are the specific completer execution.
-        unsafe {
-            *self.state.data.get() = Some((res, data));
-        }
-        self.state.status.store(STATE_READY, Ordering::Release);
-        self.state.waker.wake();
-    }
-}
-
-impl<T, D> Drop for GenericCompleter<T, D> {
-    fn drop(&mut self) {
-        // If we are dropped while still in WAITING state, it means completion didn't happen.
-        // We must transition to CLOSED to let the Future know it will never complete.
-        if self.state.status.load(Ordering::Acquire) == STATE_WAITING {
-            self.state.status.store(STATE_CLOSED, Ordering::Release);
-            self.state.waker.wake();
-        }
-    }
-}
-
-pub struct DetachedOp<T> {
-    state: Arc<DetachedState<T>>,
-}
-
-impl<T> Future for DetachedOp<T> {
-    type Output = (std::io::Result<usize>, T);
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.state.waker.register(cx.waker());
-        match self.state.status.load(Ordering::Acquire) {
-            STATE_READY => {
-                let data = unsafe {
-                    (*self.state.data.get())
-                        .take()
-                        .expect("Data missing in READY state")
-                };
-                Poll::Ready(data)
-            }
-            STATE_CLOSED => {
-                panic!("Detached driver dropped operation without completion");
-            }
-            STATE_WAITING => Poll::Pending,
-            _ => unreachable!("Invalid state"),
-        }
-    }
-}
-
-// Reopen impl block to continue original methods
-impl<T> Op<T> {
     /// Submit this operation to a local IO driver.
     /// Returns a `LocalOp` future that resolves when the operation completes.
     pub fn submit_local(self, driver: Rc<RefCell<PlatformDriver>>) -> LocalOp<T>
@@ -232,6 +186,99 @@ impl<T> Op<T> {
         T: IntoPlatformOp<PlatformDriver> + 'static,
     {
         LocalOp::new(self.data, driver)
+    }
+}
+
+// ============================================================================
+// DetachedOp (Future Implementation for Shared/Send Ops)
+// ============================================================================
+
+/// A Future representing a detached operation.
+/// It holds a reference to the Shared Slot Table and polls the slot directly.
+pub struct DetachedOp<T, D>
+where
+    D: Driver,
+    T: IntoPlatformOp<D>,
+{
+    table: Arc<SlotTable<D::Op>>,
+    index: usize,
+    expected_gen: u32,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+// DetachedOp is Send/Sync if the Op data is Send and the Driver Op is Send (implied by SlotTable<Op> bound).
+unsafe impl<T: IntoPlatformOp<D> + std::marker::Send, D: Driver> std::marker::Send
+    for DetachedOp<T, D>
+{
+}
+unsafe impl<T: IntoPlatformOp<D> + std::marker::Send, D: Driver> std::marker::Sync
+    for DetachedOp<T, D>
+{
+}
+
+impl<T, D> Future for DetachedOp<T, D>
+where
+    D: Driver,
+    T: IntoPlatformOp<D>,
+{
+    type Output = OpResult<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let slot = &self.table.slots[self.index];
+
+        // 1. Generation check: Ensure slot hasn't been recycled for a new operation.
+        let generation = slot.generation.load(Ordering::Acquire);
+        if generation != self.expected_gen {
+            return Poll::Ready(OpResult::Lost(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Op slot recycled (generation mismatch)",
+            )));
+        }
+
+        // 2. Check for completion state
+        let state = slot.state.load(Ordering::Acquire);
+        if state == STATE_COMPLETED {
+            // Completed. Extract result and op.
+            let res = unsafe {
+                (*slot.result.get())
+                    .take()
+                    .expect("Result missing in COMPLETED slot")
+            };
+            let op_platform = unsafe {
+                (*slot.op.get())
+                    .take()
+                    .expect("Op missing in COMPLETED slot")
+            };
+
+            // Convert platform op back to user op
+            let data = T::from_platform_op(op_platform);
+
+            // Mark slot as CONSUMED so it can be reclaimed
+            slot.state.store(STATE_CONSUMED, Ordering::Release);
+
+            // NOTE: The Slot index remains "occupied" in the Registry until someone frees it.
+            // In the detached model, we need a mechanism to recycle the index.
+            // We push the index to the "remote free queue" which sits in the SlotTable.
+            self.table.remote_free_queue.push(self.index);
+
+            Poll::Ready(OpResult::Completed(res, data))
+        } else {
+            // 3. Register Waker
+            slot.waker.register(cx.waker());
+
+            // Double check state
+            let state = slot.state.load(Ordering::Acquire);
+            if state == STATE_COMPLETED {
+                let res = unsafe { (*slot.result.get()).take().expect("Result missing") };
+                let op_platform = unsafe { (*slot.op.get()).take().expect("Op missing") };
+                let data = T::from_platform_op(op_platform);
+                slot.state.store(STATE_CONSUMED, Ordering::Release);
+                self.table.remote_free_queue.push(self.index);
+                Poll::Ready(OpResult::Completed(res, data))
+            } else {
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -246,11 +293,6 @@ enum State {
 }
 
 /// A Future wrapper for asynchronous IO operations executed locally.
-///
-/// This struct manages the lifecycle of an IO operation submitted to the local driver:
-/// 1. Defined: Operation created but not submitted
-/// 2. Submitted: Operation submitted to the driver
-/// 3. Completed: Operation finished, result available
 pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
@@ -271,7 +313,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
 }
 
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
-    type Output = (std::io::Result<usize>, T);
+    type Output = OpResult<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let op = unsafe { self.get_unchecked_mut() };
@@ -282,18 +324,16 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
             // Submit to driver
             let data = op.data.take().expect("Op started without data");
             let driver_op = data.into_platform_op();
-            let user_data = driver.reserve_op();
+
+            // reserve_op now returns generation, but we ignore it for LocalOp
+            // because LocalOp lifetime is tied to the driver via Rc/RefCell.
+            let (user_data, _generation) = driver.reserve_op();
             op.user_data = user_data;
 
             // Submit to driver.
-            // Whether Ready or Pending, the op is now owned by the driver.
-            // If Pending, it effectively means "Accepted but queued".
-            // If Err((e, op)), driver rejected it and returned ownership.
             if let Err((e, val)) = driver.submit(user_data, driver_op) {
-                // Driver rejected submission and returned the op.
-                // Recover data and return error immediately.
                 let data = T::from_platform_op(val);
-                return Poll::Ready((Err(e), data));
+                return Poll::Ready(OpResult::Completed(Err(e), data));
             }
 
             op.state = State::Submitted;
@@ -306,7 +346,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
                 Poll::Ready((res, driver_op)) => {
                     op.state = State::Completed;
                     let data = T::from_platform_op(driver_op);
-                    Poll::Ready((res, data))
+                    Poll::Ready(OpResult::Completed(res, data))
                 }
                 Poll::Pending => Poll::Pending,
             }
@@ -319,6 +359,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for LocalOp<T> {
     fn drop(&mut self) {
         if let State::Submitted = self.state {
+            // LocalOp being dropped while submitted means we must cancel it.
             self.driver.borrow_mut().cancel_op(self.user_data);
         }
     }
@@ -330,7 +371,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for LocalOp<T> {
 
 pub trait OpSubmitter: Clone + std::marker::Send + Sync + 'static {
     type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static>: Future<
-        Output = (std::io::Result<usize>, T),
+        Output = OpResult<T>,
     >;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
@@ -350,7 +391,7 @@ pub struct LocalSubmitter;
 impl OpSubmitter for LocalSubmitter {
     type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> = LocalOp<T>;
 
-    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
+    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> LocalOp<T>
     where
         T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
     {
@@ -360,6 +401,22 @@ impl OpSubmitter for LocalSubmitter {
 
     fn from_current_context() -> std::io::Result<Self> {
         Ok(Self)
+    }
+}
+
+impl OpSubmitter for DetachedSubmitter {
+    type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> =
+        DetachedOp<T, PlatformDriver>;
+
+    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
+    where
+        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
+    {
+        op.submit_detached(&mut *driver.borrow_mut())
+    }
+
+    fn from_current_context() -> std::io::Result<Self> {
+        Self::new()
     }
 }
 
@@ -373,21 +430,6 @@ pub struct DetachedSubmitter;
 impl DetachedSubmitter {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self)
-    }
-}
-
-impl OpSubmitter for DetachedSubmitter {
-    type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> = DetachedOp<T>;
-
-    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
-    where
-        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
-    {
-        op.submit_detached(&mut *driver.borrow_mut())
-    }
-
-    fn from_current_context() -> std::io::Result<Self> {
-        Self::new()
     }
 }
 

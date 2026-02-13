@@ -1,7 +1,7 @@
 // use crate::buffer::FixedBuf;
 
 pub(crate) mod op_registry;
-pub(crate) mod stable_slab;
+pub(crate) mod slot;
 use std::io;
 use std::task::{Context, Poll};
 
@@ -12,21 +12,17 @@ pub trait Driver: 'static {
     /// Platform-specific operation type
     type Op: PlatformOp;
 
-    /// Register a new operation. Returns the user_data key.
-    fn reserve_op(&mut self) -> usize;
+    /// Register a new operation. Returns the user_data key and expected generation.
+    fn reserve_op(&mut self) -> (usize, u32);
+
+    /// Get the shared slot table if available.
+    fn slot_table(&self) -> std::sync::Arc<slot::SlotTable<Self::Op>>;
 
     /// Submit an operation with its resources directly.
     /// Returns `Ok(Poll::...)` on success (Ready or Pending/Queued).
     /// Returns `Err((Error, Op))` if submission failed and the Op was NOT consumed/stored.
     fn submit(&mut self, user_data: usize, op: Self::Op)
     -> Result<Poll<()>, (io::Error, Self::Op)>;
-
-    /// Attach a detached completer to an operation.
-    fn attach_detached_completer(
-        &mut self,
-        user_data: usize,
-        completer: Box<dyn DetachedCompleter<Self::Op>>,
-    );
 
     /// Poll operation status.
     fn poll_op(

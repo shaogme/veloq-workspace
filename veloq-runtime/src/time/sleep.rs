@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use veloq_driver::driver::PlatformDriver;
 use veloq_driver::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
 
 // ============================================================================
@@ -29,7 +30,7 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 
 pub struct Sleep {
     deadline: Instant,
-    inner: Option<DetachedOp<OpTimeout>>,
+    inner: Option<DetachedOp<OpTimeout, PlatformDriver>>,
 }
 
 impl Sleep {
@@ -55,12 +56,13 @@ impl Future for Sleep {
             if let Some(ref mut op) = self.inner {
                 // Poll existing detached op
                 // DetachedOp is Unpin
-                match Pin::new(op).poll(cx) {
+                let pinned = Pin::new(op);
+                match pinned.poll(cx) {
                     Poll::Ready(_) => {
+                        self.inner = None;
                         if Instant::now() >= self.deadline {
                             return Poll::Ready(());
                         }
-                        self.inner = None;
                     }
                     Poll::Pending => return Poll::Pending,
                 }

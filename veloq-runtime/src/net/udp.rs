@@ -80,8 +80,11 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             buf,
             addr: target,
         };
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
-        (res, op_back.buf)
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let buf = op_back
+            .map(|o| o.buf)
+            .unwrap_or_else(|| panic!("Op buffer lost"));
+        (res, buf)
     }
 
     pub async fn recv_from(&self, buf: FixedBuf) -> (io::Result<(usize, SocketAddr)>, FixedBuf) {
@@ -90,7 +93,8 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             buf,
             addr: None,
         };
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
+        let (res, op_back_opt) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let op_back = op_back_opt.expect("Op lost");
 
         match res {
             Ok(n) => {
@@ -109,7 +113,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
-        let (res, _) = submit(&self.submitter, Op::new(op)).await;
+        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
         res.map(|_| ())
     }
 
@@ -119,8 +123,11 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             buf,
             offset: 0,
         };
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
-        (res, op_back.buf)
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let buf = op_back
+            .map(|o| o.buf)
+            .unwrap_or_else(|| panic!("Op buffer lost"));
+        (res, buf)
     }
 
     pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
@@ -129,8 +136,11 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             buf,
             offset: 0,
         };
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
-        (res, op_back.buf)
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let buf = op_back
+            .map(|o| o.buf)
+            .unwrap_or_else(|| panic!("Op buffer lost"));
+        (res, buf)
     }
 }
 

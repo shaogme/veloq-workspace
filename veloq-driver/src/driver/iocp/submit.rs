@@ -75,6 +75,7 @@ macro_rules! impl_blocking_offload {
             let entry = &op.header;
             let user_data = entry.user_data;
 
+            // CompletionInfo now uses ctx.overlapped address which is from Slot
             let completion = CompletionInfo {
                 port: ctx.port as usize,
                 user_data,
@@ -132,10 +133,11 @@ macro_rules! submit_io_op {
             ctx: &mut SubmitContext,
         ) -> io::Result<SubmissionResult> {
             let val = unsafe { &mut *op.payload.$field };
-            let entry = &mut op.header;
+            // Using ctx.overlapped (Slot Overlapped)
+            let overlapped = unsafe { &mut *ctx.overlapped };
 
-            entry.inner.Anonymous.Anonymous.Offset = val.offset as u32;
-            entry.inner.Anonymous.Anonymous.OffsetHigh = (val.offset >> 32) as u32;
+            overlapped.Anonymous.Anonymous.Offset = val.offset as u32;
+            overlapped.Anonymous.Anonymous.OffsetHigh = (val.offset >> 32) as u32;
 
             let handle = resolve_fd(val.fd, ctx.registered_files)?;
             unsafe {
@@ -191,8 +193,10 @@ pub(crate) unsafe fn submit_recv(
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let val = unsafe { &mut *op.payload.recv };
-    op.header.inner.Anonymous.Anonymous.Offset = 0;
-    op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
+
+    let overlapped = unsafe { &mut *ctx.overlapped };
+    overlapped.Anonymous.Anonymous.Offset = 0;
+    overlapped.Anonymous.Anonymous.OffsetHigh = 0;
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
@@ -236,8 +240,10 @@ pub(crate) unsafe fn submit_send(
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let val = unsafe { &mut *op.payload.send };
-    op.header.inner.Anonymous.Anonymous.Offset = 0;
-    op.header.inner.Anonymous.Anonymous.OffsetHigh = 0;
+
+    let overlapped = unsafe { &mut *ctx.overlapped };
+    overlapped.Anonymous.Anonymous.Offset = 0;
+    overlapped.Anonymous.Anonymous.OffsetHigh = 0;
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 

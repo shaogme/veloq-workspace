@@ -106,7 +106,7 @@ impl OpenOptions {
         use veloq_driver::op::{LocalSubmitter, Op};
 
         let submitter = LocalSubmitter;
-        let (res, _) = submit(&submitter, Op::new(op)).await;
+        let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
 
         // 3. 转换结果
         let fd = veloq_driver::RawHandle::from(res?);
@@ -133,7 +133,7 @@ impl OpenOptions {
         let submitter = DetachedSubmitter::new()?;
 
         // 提交执行 (Result, Op) — Op 的所有权被返还
-        let (res, _) = submit(&submitter, Op::new(op)).await;
+        let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
 
         let fd = veloq_driver::RawHandle::from(res?);
 

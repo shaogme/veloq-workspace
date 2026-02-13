@@ -1,6 +1,7 @@
 use crate::driver::op_registry::OpEntry;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use tracing::{debug, trace};
 
@@ -10,27 +11,110 @@ pub mod submit;
 
 pub use inner::{UringDriver, UringOpState};
 
-use crate::driver::{DetachedCompleter, Driver, RemoteWaker};
+use crate::driver::slot::{STATE_COMPLETED, STATE_SUBMITTED};
+use crate::driver::{Driver, RemoteWaker};
 use inner::UringWaker;
 use op::UringOp;
+
+impl UringDriver {
+    fn submit_sqe(
+        &mut self,
+        user_data: usize,
+        op: <Self as Driver>::Op,
+    ) -> Result<Poll<()>, (io::Error, <Self as Driver>::Op)> {
+        // 1. Store resources FIRST in the Slot
+        {
+            let slot = &self.ops.shared.slots[user_data];
+            unsafe {
+                *slot.op.get() = Some(op);
+            }
+        }
+
+        // 2. Generate SQE from Slot
+        let sqe = {
+            let slot = &self.ops.shared.slots[user_data];
+            let mk_sqe = |op: &mut UringOp| unsafe {
+                (op.vtable.make_sqe)(op, self.waker_fd as usize).user_data(user_data as u64)
+            };
+            unsafe {
+                let op_ref = (*slot.op.get()).as_mut().unwrap();
+                mk_sqe(op_ref)
+            }
+        };
+
+        // 3. Push
+        if self.push_entry(sqe) {
+            trace!(user_data, "Submitted to SQ");
+            if let Some(entry) = self.ops.get_mut(user_data) {
+                entry.platform_data.lifecycle = inner::OpLifecycle::InFlight;
+            }
+            let slot = &self.ops.shared.slots[user_data];
+            slot.state.store(STATE_SUBMITTED, Ordering::Release);
+            Ok(Poll::Ready(()))
+        } else {
+            debug!(user_data, "SQ full, pushing to backlog");
+            if let Some(entry) = self.ops.get_mut(user_data) {
+                entry.platform_data.lifecycle = inner::OpLifecycle::Pending;
+            }
+            // Op remains in Slot, waiting for flush_backlog to pick it up
+            self.push_backlog(user_data);
+            Ok(Poll::Pending)
+        }
+    }
+
+    fn submit_timer(
+        &mut self,
+        user_data: usize,
+        op: <Self as Driver>::Op,
+    ) -> Result<Poll<()>, (io::Error, <Self as Driver>::Op)> {
+        // 1. Store resources FIRST
+        {
+            let slot = &self.ops.shared.slots[user_data];
+            unsafe {
+                *slot.op.get() = Some(op);
+            }
+        }
+
+        // 2. Extract duration
+        let duration_opt = {
+            let slot = &self.ops.shared.slots[user_data];
+            unsafe {
+                let op_ref = (*slot.op.get()).as_ref().unwrap();
+                (op_ref.vtable.get_timeout)(op_ref)
+            }
+        };
+
+        if let Some(duration) = duration_opt {
+            let task_id = self.wheel.insert(user_data, duration);
+            if let Some(entry) = self.ops.get_mut(user_data) {
+                entry.platform_data.lifecycle = inner::OpLifecycle::InFlight;
+                entry.platform_data.timer_id = Some(task_id);
+            }
+            let slot = &self.ops.shared.slots[user_data];
+            slot.state.store(STATE_SUBMITTED, Ordering::Release);
+            trace!(user_data, ?duration, "Registered software timer");
+            Ok(Poll::Pending)
+        } else {
+            // Recover op
+            let slot = &self.ops.shared.slots[user_data];
+            let op = unsafe { (*slot.op.get()).take().unwrap() };
+            return Err((io::Error::other("failed to get duration from timer op"), op));
+        }
+    }
+}
 
 impl Driver for UringDriver {
     type Op = UringOp;
 
-    fn reserve_op(&mut self) -> usize {
-        let id = self.ops.insert(OpEntry::new(None, UringOpState::new()));
-        trace!(id, "Reserved op slot");
-        id
+    fn reserve_op(&mut self) -> (usize, u32) {
+        // Only one arg needed now
+        let (id, generation) = self.ops.insert(OpEntry::new(UringOpState::new()));
+        trace!(id, generation, "Reserved op slot");
+        (id, generation)
     }
 
-    fn attach_detached_completer(
-        &mut self,
-        user_data: usize,
-        completer: Box<dyn DetachedCompleter<Self::Op>>,
-    ) {
-        if let Some(entry) = self.ops.get_mut(user_data) {
-            entry.platform_data.detached_completer = Some(completer);
-        }
+    fn slot_table(&self) -> std::sync::Arc<crate::driver::slot::SlotTable<Self::Op>> {
+        self.ops.shared.clone()
     }
 
     fn submit(
@@ -46,88 +130,8 @@ impl Driver for UringDriver {
                 ),
                 op,
             )),
-            op::SubmissionStrategy::SubmitSqe => {
-                // 1. Store resources FIRST to ensure stable address
-                let Some(entry) = self.ops.get_mut(user_data) else {
-                    return Err((io::Error::other("op slot not found"), op));
-                };
-                entry.resources = Some(op);
-
-                // 2. Generate SQE from STABLE location
-                let sqe_res = self
-                    .ops
-                    .get_mut(user_data)
-                    .and_then(|entry| entry.resources.as_mut())
-                    .map(|res| unsafe {
-                        (res.vtable.make_sqe)(res, self.waker_fd as usize)
-                            .user_data(user_data as u64)
-                    });
-
-                // 3. Push
-                if let Some(sqe) = sqe_res {
-                    if self.push_entry(sqe) {
-                        trace!(user_data, "Submitted to SQ");
-                        if let Some(entry) = self.ops.get_mut(user_data) {
-                            entry.platform_data.lifecycle = inner::OpLifecycle::InFlight;
-                        }
-                        Ok(Poll::Ready(()))
-                    } else {
-                        debug!(user_data, "SQ full, pushing to backlog");
-                        if let Some(entry) = self.ops.get_mut(user_data) {
-                            entry.platform_data.lifecycle = inner::OpLifecycle::Pending;
-                        }
-                        self.push_backlog(user_data);
-                        Ok(Poll::Pending)
-                    }
-                } else {
-                    // Logic error: resource missing immediately after insertion or slot gone
-                    // Try to recover op to return error, but it's tricky since we put it in.
-                    // If we can take it back, good.
-                    if let Some(entry) = self.ops.get_mut(user_data) {
-                        if let Some(op) = entry.resources.take() {
-                            return Err((io::Error::other("failed to access stored op"), op));
-                        }
-                    }
-                    panic!("Critical driver error: Ops resource lost during submission!");
-                }
-            }
-            op::SubmissionStrategy::SoftwareTimer => {
-                // 1. Store resources FIRST
-                if let Some(entry) = self.ops.get_mut(user_data) {
-                    entry.resources = Some(op);
-                } else {
-                    return Err((io::Error::other("op slot not found"), op));
-                }
-
-                // 2. Extract duration from STABLE location (via helper or direct access)
-                let duration_opt = self
-                    .ops
-                    .get_mut(user_data)
-                    .and_then(|entry| entry.resources.as_ref())
-                    .and_then(|res| unsafe { (res.vtable.get_timeout)(res) });
-
-                if let Some(duration) = duration_opt {
-                    let task_id = self.wheel.insert(user_data, duration);
-                    if let Some(entry) = self.ops.get_mut(user_data) {
-                        entry.platform_data.lifecycle = inner::OpLifecycle::InFlight;
-                        entry.platform_data.timer_id = Some(task_id);
-                    }
-                    trace!(user_data, ?duration, "Registered software timer");
-                    Ok(Poll::Pending)
-                } else {
-                    // Should not happen for SoftwareTimer strategy
-                    // Recover op
-                    if let Some(entry) = self.ops.get_mut(user_data) {
-                        if let Some(op) = entry.resources.take() {
-                            return Err((
-                                io::Error::other("failed to get duration from timer op"),
-                                op,
-                            ));
-                        }
-                    }
-                    panic!("Critical driver error: Ops resource lost during timer submission!");
-                }
-            }
+            op::SubmissionStrategy::SubmitSqe => self.submit_sqe(user_data, op),
+            op::SubmissionStrategy::SoftwareTimer => self.submit_timer(user_data, op),
         }
     }
 
@@ -156,11 +160,11 @@ impl Driver for UringDriver {
         cx: &mut Context<'_>,
     ) -> Poll<(io::Result<usize>, Self::Op)> {
         // 1. Check if we need to flush pending op
-        let is_pending = if let Some(entry) = self.ops.get_mut(user_data) {
+        let is_pending = if let Some(entry) = self.ops.get(user_data) {
             matches!(entry.platform_data.lifecycle, inner::OpLifecycle::Pending)
         } else {
-            // Op missing logic handled below or panic
-            panic!("Op not found in registry");
+            // If op missing, it might be already removed? Or invalid.
+            panic!("Op not found in registry during poll");
         };
 
         if is_pending {
@@ -168,32 +172,41 @@ impl Driver for UringDriver {
             self.flush_cancellations();
         }
 
-        // 2. Check for completion
-        if let Some(entry) = self.ops.get_mut(user_data) {
-            if let inner::OpLifecycle::Completed(_) = entry.platform_data.lifecycle {
-                // Completed, proceed to remove
-            } else {
-                // Not completed (InFlight, Pending, Cancelled, Detached)
-                if entry
-                    .waker
-                    .as_ref()
-                    .map_or(true, |w| !w.will_wake(cx.waker()))
-                {
-                    entry.waker = Some(cx.waker().clone());
-                }
-                return Poll::Pending;
-            }
-        } else {
-            panic!("Op not found in registry");
-        }
+        // Block to limit slot borrow
+        let state = {
+            let slot = &self.ops.shared.slots[user_data];
+            // 2. Register Waker
+            slot.waker.register(cx.waker());
+            // 3. Check for completion state
+            slot.state.load(Ordering::Acquire)
+        };
 
-        // 3. Remove and return result
-        let mut entry = self.ops.remove(user_data);
-        if let inner::OpLifecycle::Completed(res) = entry.platform_data.lifecycle {
-            let resources = entry.resources.take().expect("resources missing");
-            Poll::Ready((res, resources))
+        if state == STATE_COMPLETED {
+            // Completed. Extract result and op.
+            let (res, op) = {
+                let slot = &self.ops.shared.slots[user_data];
+                let res = unsafe {
+                    (*slot.result.get())
+                        .take()
+                        .expect("Result missing in COMPLETED slot")
+                };
+                let op = unsafe {
+                    (*slot.op.get())
+                        .take()
+                        .expect("Op missing in COMPLETED slot")
+                };
+                // Mark slot as consumed?
+                use crate::driver::slot::STATE_CONSUMED;
+                slot.state.store(STATE_CONSUMED, Ordering::Release);
+                (res, op)
+            };
+
+            // Cleanup registry
+            self.ops.remove(user_data);
+
+            Poll::Ready((res, op))
         } else {
-            unreachable!("Checked completed above");
+            Poll::Pending
         }
     }
 
@@ -204,8 +217,6 @@ impl Driver for UringDriver {
     }
 
     fn wait(&mut self) -> io::Result<()> {
-        // self.wait() calls inherent method defined in inner.rs (and imported via Deref? No re-exported struct impl)
-        // Rust structs have inherent methods. inner.rs defines them.
         UringDriver::wait(self)?;
         Ok(())
     }

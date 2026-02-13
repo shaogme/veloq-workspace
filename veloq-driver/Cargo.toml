@@ -18,6 +18,8 @@ veloq-buf.workspace = true
 veloq-wheel.workspace = true
 veloq-blocking.workspace = true
 
+crossbeam-utils.workspace = true
+crossbeam-queue.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

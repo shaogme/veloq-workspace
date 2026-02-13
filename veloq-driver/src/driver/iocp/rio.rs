@@ -4,9 +4,12 @@ use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::submit::SubmissionResult;
 use crate::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
+use crate::driver::slot::STATE_COMPLETED;
 use crate::op::IoFd;
 use rustc_hash::FxHashMap;
 use std::io;
+use std::sync::atomic::Ordering;
+use tracing::error;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -208,12 +211,16 @@ impl RioState {
                 break;
             }
 
+            let ops_local = &mut ops.local;
+            let ops_shared = &ops.shared;
+
             for i in 0..count as usize {
                 let res = &results[i];
                 let user_data = res.RequestContext as usize;
 
-                if ops.contains(user_data) {
-                    let op = &mut ops[user_data];
+                if user_data < ops_local.len() {
+                    let op = &mut ops_local[user_data];
+                    let slot = &ops_shared.slots[user_data];
 
                     if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
                         let result = if res.Status == 0 {
@@ -223,12 +230,21 @@ impl RioState {
                         };
 
                         op.platform_data.lifecycle = OpLifecycle::Completed(result);
-                        if let Some(waker) = op.waker.take() {
-                            waker.wake();
-                        }
+
+                        let result_for_slot = if res.Status == 0 {
+                            Ok(res.BytesTransferred as usize)
+                        } else {
+                            Err(io::Error::from_raw_os_error(res.Status as i32))
+                        };
+                        unsafe { *slot.result.get() = Some(result_for_slot) };
+                        slot.state.store(STATE_COMPLETED, Ordering::Release);
+                        slot.waker.wake();
                     } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
-                        // If cancelled, we can now remove it
-                        ops.remove(user_data);
+                        // We must remove it from registry because it was cancelled but RIO just completed it.
+                        // Can't invoke `ops.remove(user_data)` directly due to split.
+                        // But we can emulate it:
+                        let _ = std::mem::replace(&mut op.platform_data, IocpOpState::default());
+                        ops.free_indices.push(user_data);
                     }
                 }
             }
@@ -401,22 +417,20 @@ impl RioState {
                 // If index is invalid (e.g. usize::MAX), silently ignore and return None (fallback to normal IO?)
                 // Or log error? The original code returned Ok(None).
                 if idx != usize::MAX {
-                    eprintln!("RIO: Buffer index {} not found for send_to", idx);
+                    error!(idx, "RIO: Buffer index not found for send_to");
                 }
                 return Ok(None);
             }
         };
 
-        // Use the constant from OpRegistry to ensure we match the slab implementation
-        const PAGE_SHIFT: usize = OpRegistry::<IocpOp, IocpOpState>::PAGE_SHIFT;
-        let page_idx = user_data >> PAGE_SHIFT;
+        let page_idx = 0; // Simplified for now since OpRegistry allocated a single block
 
         // Copy values out to avoid holding borrow on self.slab_rio_pages while calling ensure_rq
         let (addr_buf_id, base_addr) = if let Some(Some(entry)) = self.slab_rio_pages.get(page_idx)
         {
             *entry
         } else {
-            eprintln!("RIO: Slab page not registered for send_to");
+            error!("RIO: Slab page not registered for send_to");
             return Ok(None);
         };
 
@@ -473,21 +487,21 @@ impl RioState {
             Some(i) => i.id,
             None => {
                 if idx != usize::MAX {
-                    eprintln!("RIO: Buffer index {} not found for recv_from", idx);
+                    error!(idx, "RIO: Buffer index not found for recv_from");
                 }
                 return Ok(None);
             }
         };
 
-        const PAGE_SHIFT: usize = OpRegistry::<IocpOp, IocpOpState>::PAGE_SHIFT;
-        let page_idx = user_data >> PAGE_SHIFT;
+        // Simplified page_idx = 0
+        let page_idx = 0;
 
         // Copy values out to avoid holding borrow on self
         let (addr_buf_id, base_addr) = if let Some(Some(entry)) = self.slab_rio_pages.get(page_idx)
         {
             *entry
         } else {
-            eprintln!("RIO: Slab page not registered for recv_from");
+            error!("RIO: Slab page not registered for recv_from");
             return Ok(None);
         };
 

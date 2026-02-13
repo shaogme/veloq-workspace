@@ -52,7 +52,7 @@ fn test_iocp_accept() {
 
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(accept_op);
 
-    let user_data = driver.reserve_op();
+    let (user_data, _) = driver.reserve_op();
     let _ = driver.submit(user_data, iocp_op);
 
     // Connect Client in background
@@ -118,7 +118,7 @@ fn test_iocp_connect() {
     };
 
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(connect_op);
-    let user_data = driver.reserve_op();
+    let (user_data, _) = driver.reserve_op();
     let _ = driver.submit(user_data, iocp_op);
 
     // Poll
@@ -151,7 +151,7 @@ fn test_iocp_timeout() {
     };
 
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(timeout_op);
-    let user_data = driver.reserve_op();
+    let (user_data, _) = driver.reserve_op();
     let _ = driver.submit(user_data, iocp_op);
 
     let waker = noop_waker();
@@ -245,7 +245,7 @@ fn test_iocp_recv_with_buffer_pool() {
     };
 
     let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op);
-    let user_data = driver.borrow_mut().reserve_op();
+    let (user_data, _) = driver.borrow_mut().reserve_op();
     let _ = driver.borrow_mut().submit(user_data, iocp_op);
 
     // Poll

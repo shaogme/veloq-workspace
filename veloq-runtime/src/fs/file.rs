@@ -137,7 +137,10 @@ impl<S: OpSubmitter> Future for SyncRangeFuture<S> {
                     // Safety: `fut` is structurally pinned because `self` is pinned.
                     let fut = unsafe { Pin::new_unchecked(fut) };
                     match fut.poll(cx) {
-                        Poll::Ready((res, _)) => return Poll::Ready(res.map(|_| ())),
+                        Poll::Ready(op_res) => {
+                            let (res, _) = op_res.into_inner();
+                            return Poll::Ready(res.map(|_| ()));
+                        }
                         Poll::Pending => return Poll::Pending,
                     }
                 }
@@ -247,8 +250,15 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             offset,
         };
 
-        let (res, op) = submit(&self.submitter, Op::new(op)).await;
-        (res, op.buf)
+        let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
+
+        // If Op is lost (Generation Mismatch), we lost the buffer.
+        // We cannot return the buffer as promised by the API.
+        // Panic is the only option to satisfy the signature without changing it.
+        let buf = op
+            .map(|o| o.buf)
+            .unwrap_or_else(|| panic!("Op buffer lost"));
+        (res, buf)
     }
 
     pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
@@ -258,8 +268,12 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             offset,
         };
 
-        let (res, op) = submit(&self.submitter, Op::new(op)).await;
-        (res, op.buf)
+        let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
+
+        let buf = op
+            .map(|o| o.buf)
+            .unwrap_or_else(|| panic!("Op buffer lost"));
+        (res, buf)
     }
 
     pub async fn sync_all(&self) -> io::Result<()> {
@@ -268,7 +282,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             datasync: false,
         };
 
-        let (res, _) = submit(&self.submitter, Op::new(op)).await;
+        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
         res.map(|_| ())
     }
 
@@ -278,7 +292,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             datasync: true,
         };
 
-        let (res, _) = submit(&self.submitter, Op::new(op)).await;
+        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
         res.map(|_| ())
     }
 
@@ -300,7 +314,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
             len,
         };
 
-        let (res, _) = submit(&self.submitter, Op::new(op)).await;
+        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
         res.map(|_| ())
     }
 }

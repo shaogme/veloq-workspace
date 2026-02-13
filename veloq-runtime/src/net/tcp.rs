@@ -77,9 +77,11 @@ impl<S: OpSubmitter> GenericTcpListener<S> {
         let op = Accept::prepare_op(self.inner.raw())?;
 
         // Wait for connection
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let op = op_back.expect("Accept op lost");
+
         // Check result and get fd, addr
-        let (fd, addr) = op_back.into_output(res)?;
+        let (fd, addr) = op.into_output(res)?;
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(fd),
@@ -118,7 +120,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
             addr_len: raw_addr_len as u32,
         };
 
-        let (res, _) = submit(&submitter, Op::new(op)).await;
+        let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
         res?;
 
         Ok(Self { inner, submitter })
@@ -130,8 +132,11 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
             buf,
             offset: 0,
         };
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
-        (res, op_back.buf)
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let buf = op_back
+            .map(|o| o.buf)
+            .unwrap_or_else(|| panic!("Op buffer lost"));
+        (res, buf)
     }
 
     pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
@@ -140,8 +145,11 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
             buf,
             offset: 0,
         };
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await;
-        (res, op_back.buf)
+        let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let buf = op_back
+            .map(|o| o.buf)
+            .unwrap_or_else(|| panic!("Op buffer lost"));
+        (res, buf)
     }
 }
 
