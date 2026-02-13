@@ -189,8 +189,15 @@ impl GlobalSlotPool {
         // Constraint: Each shard must accomodate at least one Superblock (64 slots)
         // to support potential superblock allocations.
         // If memory is small, reduce shard count.
-        while shard_count > 1 && (total_slots / shard_count) < SUPERBLOCK_SIZE {
-            shard_count /= 2;
+        let max_shards = total_slots / SUPERBLOCK_SIZE;
+        if max_shards > 0 && shard_count > max_shards {
+            // Find largest power of 2 less than or equal to max_shards
+            // This replaces the iterative loop
+            shard_count = 1 << (usize::BITS - 1 - max_shards.leading_zeros());
+        } else if max_shards == 0 {
+            // Edge case: Total memory is less than SUPERBLOCK_SIZE * SLOT_SIZE
+            // Should effectively be 1 or handled by error later
+            shard_count = 1;
         }
 
         let slots_per_shard = total_slots / shard_count; // Integer division
@@ -219,10 +226,9 @@ impl GlobalSlotPool {
         // 4. Initialize Superblock States
         // Total slots / 64
         let num_superblocks = total_slots / SUPERBLOCK_SIZE;
-        let mut states = Vec::with_capacity(num_superblocks);
-        for _ in 0..num_superblocks {
-            states.push(SuperblockState::new());
-        }
+        let states: Vec<SuperblockState> = (0..num_superblocks)
+            .map(|_| SuperblockState::new())
+            .collect();
 
         // Warning: If total_slots % shard_count != 0, the tail memory is ignored.
         // Given the huge page sizes and power-of-2 allocations, this is negligible.

@@ -121,16 +121,12 @@ impl BuddyAllocator {
         let mut remaining = total_slots;
 
         while remaining > 0 {
-            // Find the largest order that fits in `remaining` AND satisfies alignment of `start_idx`
+            // Find the largest order that fits in `remaining`.
+            // Note: We don't need to check alignment because we always strip
+            // the largest possible power of two (or MAX_ORDER chunk), so `start_idx`
+            // stays naturally aligned to the block size.
             let order_by_size = (usize::BITS - remaining.leading_zeros() - 1) as usize;
-
-            let order_by_align = if start_idx == 0 {
-                MAX_ORDER // Aligned to anything
-            } else {
-                start_idx.trailing_zeros() as usize
-            };
-
-            let order = order_by_size.min(order_by_align).min(MAX_ORDER);
+            let order = order_by_size.min(MAX_ORDER);
 
             unsafe {
                 self.add_to_free_list(SlotIndex(start_idx), order);
@@ -249,12 +245,8 @@ impl BuddyAllocator {
         while curr_order < MAX_ORDER {
             let buddy_idx = self.buddy_index(curr_idx, curr_order);
 
-            // Boundary Check
-            if buddy_idx.0 >= self.total_slots {
-                break;
-            }
-
             // Check if Buddy is Allocated
+            // Note: allocated.get() implicitly handles OOB by returning Err
             if self.allocated.get(buddy_idx.0).unwrap_or(true) {
                 // Buddy is allocated (or OOB), cannot merge
                 break;
