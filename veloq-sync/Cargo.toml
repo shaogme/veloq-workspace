@@ -22,7 +22,7 @@ crossbeam-queue.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "rt-multi-thread"] }
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion.workspace = true
 
 [dependencies.loom]
 version = "0.7"

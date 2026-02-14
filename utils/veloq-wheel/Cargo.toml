@@ -18,4 +18,4 @@ name = "wheel_bench"
 harness = false
 
 [dev-dependencies]
-criterion = "0.7.0"
+criterion.workspace = true

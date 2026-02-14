@@ -1,6 +1,6 @@
-use criterion::{criterion_group, criterion_main, Criterion, black_box};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::{hint::black_box, sync::Arc};
 use veloq_sync::mutex::Mutex;
-use std::sync::Arc;
 
 fn bench_mutex_uncontended(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
