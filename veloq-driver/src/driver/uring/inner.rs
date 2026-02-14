@@ -159,6 +159,81 @@ impl UringDriver {
         Ok(driver)
     }
 
+    /// Tries to submit the op at `user_data` to the ring or timer wheel.
+    /// Returns:
+    /// - Ok(true): Submitted (SQE pushed or Timer started)
+    /// - Ok(false): SQ Full (SQE not pushed)
+    /// - Err(e): Fatal error (e.g. missing timer duration)
+    pub(crate) fn submit_from_slot(&mut self, user_data: usize) -> io::Result<bool> {
+        let (sqe_opt, strategy, duration_opt) = {
+            let slot = &self.ops.shared.slots[user_data];
+            unsafe {
+                if let Some(res) = (*slot.op.get()).as_mut() {
+                    let strategy = res.vtable.as_ref().strategy;
+                    match strategy {
+                        crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
+                            let s = (res.vtable.as_ref().make_sqe)(
+                                res,
+                                self.waker_fd as usize,
+                            )
+                            .user_data(user_data as u64);
+                            (Some(s), strategy, None)
+                        }
+                        crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
+                            let d = (res.vtable.as_ref().get_timeout)(res);
+                            (None, strategy, d)
+                        }
+                        _ => (None, strategy, None),
+                    }
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::Other, "Op missing in slot"));
+                }
+            }
+        };
+
+        match strategy {
+            crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
+                if let Some(sqe) = sqe_opt {
+                    if self.push_entry(sqe) {
+                        if let Some(entry) = self.ops.get_mut(user_data) {
+                            entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                        }
+                        let slot = &self.ops.shared.slots[user_data];
+                        slot.state.store(STATE_SUBMITTED, Ordering::Release);
+                        trace!(user_data, "Submitted to SQ");
+                        Ok(true)
+                    } else {
+                        debug!(user_data, "SQ full");
+                        Ok(false)
+                    }
+                } else {
+                    Err(io::Error::new(io::ErrorKind::Other, "SQE generation failed"))
+                }
+            }
+            crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
+                if let Some(duration) = duration_opt {
+                    let task_id = self.wheel.insert(user_data, duration);
+                    if let Some(entry) = self.ops.get_mut(user_data) {
+                        entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                        entry.platform_data.timer_id = Some(task_id);
+                    }
+                    let slot = &self.ops.shared.slots[user_data];
+                    slot.state.store(STATE_SUBMITTED, Ordering::Release);
+                    trace!(user_data, ?duration, "Registered software timer");
+                    Ok(true)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::Other, "Timer duration missing"))
+                }
+            }
+            _ => {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Unsupported strategy for slot submission",
+                ))
+            }
+        }
+    }
+
     fn submit_waker(&mut self) {
         if self.waker_token.is_some() {
             return;
@@ -452,71 +527,17 @@ impl UringDriver {
                     self.pop_backlog();
                 }
                 BacklogAction::Submit => {
-                    // Generate SQE
-                    // Safe to get_mut now
-                    let (sqe_opt, strategy_opt, duration_opt) = {
-                        let slot = &self.ops.shared.slots[user_data];
-                        unsafe {
-                            if let Some(res) = (*slot.op.get()).as_mut() {
-                                let strategy = res.vtable.as_ref().strategy;
-                                match strategy {
-                                    crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
-                                        let s = (res.vtable.as_ref().make_sqe)(
-                                            res,
-                                            self.waker_fd as usize,
-                                        )
-                                        .user_data(user_data as u64);
-                                        (Some(s), Some(strategy), None)
-                                    }
-                                    crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
-                                        let d = (res.vtable.as_ref().get_timeout)(res);
-                                        (None, Some(strategy), d)
-                                    }
-                                    _ => (None, Some(strategy), None),
-                                }
-                            } else {
-                                (None, None, None)
-                            }
+                    match self.submit_from_slot(user_data) {
+                        Ok(true) => {
+                            self.pop_backlog();
                         }
-                    };
-
-                    if let None = strategy_opt {
-                        self.pop_backlog();
-                        continue;
-                    }
-
-                    match strategy_opt.unwrap() {
-                        crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
-                            if let Some(sqe) = sqe_opt {
-                                if self.push_entry(sqe) {
-                                    self.pop_backlog();
-                                    if let Some(entry) = self.ops.get_mut(user_data) {
-                                        entry.platform_data.lifecycle = OpLifecycle::InFlight;
-                                    }
-                                    let slot = &self.ops.shared.slots[user_data];
-                                    slot.state.store(STATE_SUBMITTED, Ordering::Release);
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                self.pop_backlog();
-                            }
+                        Ok(false) => {
+                            // SQ Full, stop processing backlog
+                            break;
                         }
-                        crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
-                            if let Some(duration) = duration_opt {
-                                let task_id = self.wheel.insert(user_data, duration);
-                                self.pop_backlog();
-                                if let Some(entry) = self.ops.get_mut(user_data) {
-                                    entry.platform_data.lifecycle = OpLifecycle::InFlight;
-                                    entry.platform_data.timer_id = Some(task_id);
-                                }
-                                let slot = &self.ops.shared.slots[user_data];
-                                slot.state.store(STATE_SUBMITTED, Ordering::Release);
-                            } else {
-                                self.pop_backlog();
-                            }
-                        }
-                        _ => {
+                        Err(_) => {
+                            // Error during submission (e.g. invalid op state)
+                            // We should probably drop it from backlog to avoid infinite loop
                             self.pop_backlog();
                         }
                     }

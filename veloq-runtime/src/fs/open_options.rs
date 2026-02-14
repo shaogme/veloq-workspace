@@ -152,12 +152,14 @@ impl OpenOptions {
     #[cfg(unix)]
     fn build_op(&self, path: &Path) -> std::io::Result<Open> {
         use std::os::unix::ffi::OsStrExt;
+        use std::num::NonZeroUsize;
 
         let path_bytes = path.as_os_str().as_bytes();
         // ensure null termination
         let len = path_bytes.len() + 1;
+        let len_nz = NonZeroUsize::new(len).unwrap();
 
-        let mut buf = crate::runtime::context::try_alloc(len).ok_or_else(|| {
+        let mut buf = crate::runtime::context::try_alloc(len_nz).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::OutOfMemory, "buf pool exhausted")
         })?;
 
@@ -172,7 +174,7 @@ impl OpenOptions {
         slice[..len - 1].copy_from_slice(path_bytes);
         slice[len - 1] = 0;
 
-        buf.set_len(NonZeroUsize::new(len).unwrap());
+        buf.set_len(len);
 
         // 标志位计算
         let mut flags = if self.read && !self.write && !self.append {
