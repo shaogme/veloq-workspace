@@ -75,21 +75,21 @@ where
     S: OpSubmitter,
     T: IntoPlatformOp<PlatformDriver> + 'static,
 {
-    let driver = CONTEXT.with(|ctx| {
-        ctx.borrow()
-            .as_ref()
-            .expect("Runtime context not set. Are you running inside an executor?")
-            .driver
-            .clone()
-    })
-    .upgrade()
-    .expect("Runtime driver missing");
+    let driver = CONTEXT
+        .with(|ctx| {
+            ctx.borrow()
+                .as_ref()
+                .expect("Runtime context not set. Are you running inside an executor?")
+                .driver
+                .clone()
+        })
+        .upgrade()
+        .expect("Runtime driver missing");
     submitter.submit(op, driver)
 }
 
 /// Try to allocate a buffer from the current runtime context.
-pub fn try_alloc(size: usize) -> Option<FixedBuf> {
-    let size = NonZeroUsize::new(size)?;
+pub fn try_alloc(size: NonZeroUsize) -> Option<FixedBuf> {
     CONTEXT.with(|ctx| {
         ctx.borrow()
             .as_ref()
@@ -103,10 +103,7 @@ pub fn try_alloc(size: usize) -> Option<FixedBuf> {
 ///
 /// # Panics
 /// Panics when called outside a runtime context or when the buffer pool is full.
-pub fn alloc(size: usize) -> FixedBuf {
-    if size == 0 {
-        panic!("Cannot allocate 0 size");
-    }
+pub fn alloc(size: NonZeroUsize) -> FixedBuf {
     try_alloc(size).expect("Buffer pool is full")
 }
 
@@ -284,9 +281,7 @@ impl Future for YieldNow {
 
 /// Get the current thread's buffer pool.
 pub fn current_pool() -> Option<AnyBufPool> {
-    CONTEXT.with(|ctx| {
-        ctx.borrow().as_ref().map(|ctx| ctx.buf_pool.clone())
-    })
+    CONTEXT.with(|ctx| ctx.borrow().as_ref().map(|ctx| ctx.buf_pool.clone()))
 }
 
 /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.

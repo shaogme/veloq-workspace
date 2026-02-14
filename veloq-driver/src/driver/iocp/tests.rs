@@ -267,8 +267,7 @@ fn test_iocp_recv_with_buffer_pool() {
 
                 let mut op =
                     <Recv as crate::op::IntoPlatformOp<IocpDriver>>::from_platform_op(iocp_op);
-                op.buf
-                    .set_len(std::num::NonZeroUsize::new(bytes_read).unwrap());
+                op.buf.set_len(bytes_read);
                 assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
                 unsafe { windows_sys::Win32::Foundation::CloseHandle(stream_handle.into()) };

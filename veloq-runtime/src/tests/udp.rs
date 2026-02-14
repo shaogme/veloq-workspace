@@ -1,5 +1,7 @@
 //! UDP network tests - single-threaded and multi-threaded.
 
+use veloq_buf::nz;
+
 use crate::net::udp::UdpSocket;
 use crate::runtime::Runtime;
 use std::net::SocketAddr;
@@ -33,7 +35,7 @@ fn test_udp_bind() {
 /// Test UDP send and receive
 #[test]
 fn test_udp_send_receive() {
-    for size in [8192, 16384] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             println!("Testing with BufferSize: {:?}", size);
 
@@ -85,7 +87,7 @@ fn test_udp_send_receive() {
 /// Test UDP echo (send and receive response)
 #[test]
 fn test_udp_echo() {
-    for size in [8192, 16384] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             println!("Testing with BufferSize: {:?}", size);
             let runtime = Runtime::builder()
@@ -160,7 +162,7 @@ fn test_udp_echo() {
 /// Test multiple UDP messages
 #[test]
 fn test_udp_multiple_messages() {
-    for size in [8192, 16384] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
@@ -214,7 +216,7 @@ fn test_udp_multiple_messages() {
 /// Test UDP with large data
 #[test]
 fn test_udp_large_data() {
-    for size in [8192, 16384] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
@@ -297,7 +299,7 @@ fn test_udp_ipv6() {
 /// Test UDP across multiple worker threads
 #[test]
 fn test_multithread_udp_no_echo() {
-    for size in [8192, 16384] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             let message_count = Arc::new(AtomicUsize::new(0));
             const NUM_WORKERS: usize = 3;
@@ -391,7 +393,7 @@ fn test_multithread_udp_no_echo() {
 /// Test UDP echo server on one worker, clients on another
 #[test]
 fn test_multithread_udp_echo() {
-    for size in [8192, 16384] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
             let runtime = Runtime::builder()
@@ -485,7 +487,7 @@ fn test_multithread_concurrent_udp_clients() {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    for size in [8192, 16384] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
             let addr_rx = Arc::new(Mutex::new(addr_rx));

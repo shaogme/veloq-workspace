@@ -1,4 +1,3 @@
-use std::num::NonZeroUsize;
 use std::path::Path;
 use veloq_driver::op::Open;
 
@@ -221,6 +220,7 @@ impl OpenOptions {
     // ==========================================
     #[cfg(windows)]
     fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+        use std::num::NonZeroUsize;
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
         use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
@@ -236,14 +236,14 @@ impl OpenOptions {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let len_bytes = path_w.len() * 2;
+        let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
 
         let mut buf = crate::runtime::context::try_alloc(len_bytes).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::OutOfMemory, "buf pool exhausted")
         })?;
 
         let slice = buf.as_slice_mut();
-        if slice.len() < len_bytes {
+        if slice.len() < len_bytes.get() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 "path too long for buffer",
@@ -255,9 +255,9 @@ impl OpenOptions {
             std::ptr::copy_nonoverlapping(
                 path_w.as_ptr() as *const u8,
                 slice.as_mut_ptr(),
-                len_bytes,
+                len_bytes.get(),
             );
-            buf.set_len(NonZeroUsize::new(len_bytes).unwrap());
+            buf.set_len(len_bytes.get());
         }
 
         // 2. Process Access

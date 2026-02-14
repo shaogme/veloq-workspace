@@ -36,7 +36,7 @@ fn create_local_executor() -> LocalExecutor {
 fn test_file_integrity() {
     init_blocking_pool(BlockingPoolConfig::default());
 
-    for size in [8192, 16384, 65536] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             println!("Testing with BufferSize: {:?}", size);
             let mut exec = create_local_executor();
@@ -61,7 +61,7 @@ fn test_file_integrity() {
 
                     let (res, _) = file.write_at(write_buf, 0).await;
                     let wrote = res.expect("Write failed");
-                    assert_eq!(wrote, size);
+                    assert_eq!(wrote, size.get());
 
                     file.sync_all().await.expect("Sync failed");
                 }
@@ -74,7 +74,7 @@ fn test_file_integrity() {
 
                     let (res, read_buf) = file.read_at(read_buf, 0).await;
                     let n = res.expect("Read failed");
-                    assert_eq!(n, size);
+                    assert_eq!(n, size.get());
                     assert_eq!(&read_buf.as_slice()[..12], b"Hello World!");
                 }
 
@@ -118,18 +118,18 @@ fn test_multithread_file_ops() {
                 }
 
                 let content = format!("Task {} content", i);
-                let len = content.len();
+                let len = NonZeroUsize::new(content.len()).unwrap();
 
                 // 1. Create and Write
                 {
                     let file = File::create(path).await.expect("Failed to create file");
                     let mut write_buf = alloc(len);
-                    write_buf.set_len(NonZeroUsize::new(len).unwrap());
+                    write_buf.set_len(len.get());
                     write_buf.as_slice_mut().copy_from_slice(content.as_bytes());
 
                     let (res, _) = file.write_at(write_buf, 0).await;
                     let wrote = res.expect("Write failed");
-                    assert_eq!(wrote, len);
+                    assert_eq!(wrote, len.get());
 
                     file.sync_all().await.expect("Sync failed");
                 }
@@ -141,7 +141,7 @@ fn test_multithread_file_ops() {
 
                     let (res, read_buf) = file.read_at(read_buf, 0).await;
                     let n = res.expect("Read failed");
-                    assert_eq!(n, len);
+                    assert_eq!(n, len.get());
                     assert_eq!(&read_buf.as_slice()[..n], content.as_bytes());
                 }
 

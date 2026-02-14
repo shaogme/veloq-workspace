@@ -1,3 +1,5 @@
+use veloq_buf::nz;
+
 use crate::net::socket::{TcpSocket, UdpSocketBuilder};
 use crate::runtime::Runtime;
 
@@ -88,11 +90,11 @@ fn test_udp_socket_options() {
             .bind("127.0.0.1:0")
             .expect("Failed to bind UDP client");
 
-        let buf = crate::runtime::context::alloc(1024);
+        let buf = crate::runtime::context::alloc(nz!(1024));
         let (res, _) = client.send_to(buf, addr).await;
         res.expect("Failed to send");
 
-        let buf = crate::runtime::context::alloc(1024);
+        let buf = crate::runtime::context::alloc(nz!(1024));
         let (res, _) = socket.recv_from(buf).await;
         res.expect("Failed to recv");
     });

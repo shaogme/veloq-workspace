@@ -292,7 +292,7 @@ impl PoolTopology for UniformSlot {
 #[derive(Debug)]
 pub struct FixedBuf {
     ptr: NonNull<u8>,
-    len: NonZeroUsize,
+    len: usize,
     cap: NonZeroUsize,
     // Metadata moved from Heap Header to Handle
     pool_data: NonNull<()>,
@@ -316,7 +316,7 @@ impl FixedBuf {
     ) -> Self {
         Self {
             ptr,
-            len: cap,
+            len: cap.get(),
             cap,
             pool_data,
             vtable,
@@ -335,12 +335,12 @@ impl FixedBuf {
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len.get()) }
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     #[inline(always)]
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len.get()) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
     /// Access the full capacity as a mutable slice for writing data before set_len is called.
@@ -367,7 +367,7 @@ impl FixedBuf {
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.len.get()
+        self.len
     }
 
     #[inline(always)]
@@ -376,8 +376,8 @@ impl FixedBuf {
     }
 
     #[inline(always)]
-    pub fn set_len(&mut self, len: NonZeroUsize) {
-        assert!(len <= self.cap);
+    pub fn set_len(&mut self, len: usize) {
+        assert!(len <= self.cap.get());
         self.len = len;
     }
 }

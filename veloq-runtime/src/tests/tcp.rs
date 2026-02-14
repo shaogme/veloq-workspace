@@ -1,5 +1,7 @@
 //! TCP network tests - single-threaded and multi-threaded.
 
+use veloq_buf::nz;
+
 use crate::net::tcp::{TcpListener, TcpStream};
 use crate::runtime::Runtime;
 use std::net::SocketAddr;
@@ -48,7 +50,7 @@ fn test_tcp_connect_with_global_api() {
 /// Test TCP data send and receive (echo)
 #[test]
 fn test_tcp_send_recv() {
-    for size in [8192, 16384, 65536] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             println!("Testing with BufferSize: {:?}", size);
 
@@ -77,7 +79,7 @@ fn test_tcp_send_recv() {
                         };
 
                         // Echo exact bytes received
-                        buf.set_len(std::num::NonZeroUsize::new(bytes_read).unwrap());
+                        buf.set_len(bytes_read);
                         if let Err(e) = stream.send(buf).await.0 {
                             println!("Server echo failed: {}", e);
                             break;
@@ -182,7 +184,7 @@ fn test_tcp_multiple_connections() {
 /// Test large data transfer
 #[test]
 fn test_tcp_large_data_transfer() {
-    for size in [8192, 16384, 65536] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
@@ -295,7 +297,7 @@ fn test_tcp_connect_refused() {
 /// Test receiving zero bytes (EOF)
 #[test]
 fn test_tcp_recv_zero_bytes() {
-    for size in [8192, 16384, 65536] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             let runtime = Runtime::builder()
                 .config(crate::config::Config::default().worker_threads(1))
@@ -445,7 +447,7 @@ fn test_multithread_tcp_connections() {
 /// Test TCP echo server on one worker, clients on another
 #[test]
 fn test_multithread_tcp_echo() {
-    for size in [8192, 16384, 65536] {
+    for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
             let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
             // 2 Workers
