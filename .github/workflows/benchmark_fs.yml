@@ -23,7 +23,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: shaogme/speedy-rust@main
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry
         uses: actions/cache@v4

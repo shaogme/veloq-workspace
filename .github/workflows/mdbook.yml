@@ -23,8 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: shaogme/speedy-rust@main
+        with:
+          toolchain: stable
 
       - name: Cache Rust dependencies
         uses: swatinem/rust-cache@v2
