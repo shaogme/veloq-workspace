@@ -70,7 +70,7 @@ fn test_udp_send_receive() {
                 // Sender: socket2 sends data to socket1
                 let mut send_buf = crate::runtime::context::alloc(size);
                 let test_data = b"Hello, UDP!";
-                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data); send_buf.set_len(test_data.len());
 
                 let (result, _) = socket2_arc.send_to(send_buf, addr1).await;
                 let bytes_sent = result.expect("send_to failed");
@@ -120,7 +120,7 @@ fn test_udp_echo() {
                     // Echo back
                     let mut echo_buf = crate::runtime::context::alloc(size);
                     echo_buf.spare_capacity_mut()[..bytes_read as usize]
-                        .copy_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                        .copy_from_slice(&buf.as_slice()[..bytes_read as usize]); echo_buf.set_len(bytes_read as usize);
 
                     let (result, _) = server_clone.send_to(echo_buf, from_addr).await;
                     result.expect("Server send_to failed");
@@ -130,7 +130,7 @@ fn test_udp_echo() {
                 // Client: send data to server
                 let mut send_buf = crate::runtime::context::alloc(size);
                 let test_data = b"Echo this message!";
-                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data); send_buf.set_len(test_data.len());
 
                 let (result, _) = client_arc.send_to(send_buf, server_addr).await;
                 let bytes_sent = result.expect("Client send_to failed");
@@ -197,7 +197,7 @@ fn test_udp_multiple_messages() {
                 for i in 0..NUM_MESSAGES {
                     let mut buf = crate::runtime::context::alloc(size);
                     let msg = format!("Message {}", i);
-                    buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+                    buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes()); buf.set_len(msg.len());
 
                     let (result, _) = socket2_arc.send_to(buf, addr1).await;
                     result.expect("send_to failed");
@@ -256,6 +256,7 @@ fn test_udp_large_data() {
                     buf.spare_capacity_mut()[i] = (i % 256) as u8;
                 }
 
+                buf.set_len(DATA_SIZE);
                 let (result, _) = socket2_arc.send_to(buf, addr1).await;
                 let bytes = result.expect("send_to failed") as usize;
                 println!("Sent {} bytes", bytes);
@@ -358,7 +359,7 @@ fn test_multithread_udp_no_echo() {
                         // Sender
                         let mut buf = crate::runtime::context::alloc(size);
                         let msg = format!("Hello from worker {}", worker_id);
-                        buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+                        buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes()); buf.set_len(msg.len());
 
                         let (result, _) = socket2_arc.send_to(buf, addr1).await;
                         result.expect("send_to failed");
@@ -428,7 +429,7 @@ fn test_multithread_udp_echo() {
                     // Echo back
                     let mut echo_buf = crate::runtime::context::alloc(size);
                     echo_buf.spare_capacity_mut()[..bytes as usize]
-                        .copy_from_slice(&buf.as_slice()[..bytes as usize]);
+                        .copy_from_slice(&buf.as_slice()[..bytes as usize]); echo_buf.set_len(bytes as usize);
 
                     let (result, _) = socket.send_to(echo_buf, from_addr).await;
                     result.expect("Server send_to failed");
@@ -452,7 +453,7 @@ fn test_multithread_udp_echo() {
                     // Send data
                     let mut send_buf = crate::runtime::context::alloc(size);
                     let data = b"Hello from worker 2!";
-                    send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+                    send_buf.as_slice_mut()[..data.len()].copy_from_slice(data); send_buf.set_len(data.len());
 
                     let (result, _) = client.send_to(send_buf, server_addr).await;
                     let sent = result.expect("Client send_to failed");
@@ -554,7 +555,7 @@ fn test_multithread_concurrent_udp_clients() {
 
                         let mut buf = crate::runtime::context::alloc(size);
                         let msg = format!("Hello from client {}", client_id);
-                        buf.as_slice_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+                        buf.as_slice_mut()[..msg.len()].copy_from_slice(msg.as_bytes()); buf.set_len(msg.len());
 
                         let (result, _) = client.send_to(buf, server_addr).await;
                         result.expect("Client send_to failed");
