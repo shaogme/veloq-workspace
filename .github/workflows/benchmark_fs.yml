@@ -36,8 +36,33 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-bench-
 
+      - name: Setup RAM Disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo modprobe brd rd_nr=1 rd_size=4194304
+          sudo mkfs.ext4 -E nodiscard /dev/ram0
+          sudo mkdir -p /mnt/ramdisk
+          sudo mount /dev/ram0 /mnt/ramdisk
+          sudo chmod 777 /mnt/ramdisk
+
+      - name: Install Benchmark Tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y sysbench fio
+
+      - name: Baseline - Memory & I/O (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "==== Sysbench Memory Test (RAM Bandwidth) ===="
+          sysbench memory --memory-block-size=1M --memory-total-size=10G run
+          
+          echo "==== FIO RAM Disk Write Test (Baseline I/O) ===="
+          # Benchmark raw write speed to RAM disk to compare with Veloq
+          fio --name=ram_write --directory=/mnt/ramdisk --ioengine=io_uring --rw=write --bs=4M --direct=1 --size=2G --numjobs=1 --group_reporting
+
       - name: Run FS Benchmark (Linux)
         if: runner.os == 'Linux'
+        env:
+          VELOQ_BENCH_DIR: /mnt/ramdisk
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
           cargo bench -p veloq-runtime --bench fs_benchmark --verbose

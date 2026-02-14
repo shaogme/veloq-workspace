@@ -1,7 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -53,10 +53,11 @@ fn benchmark_1gb_write(c: &mut Criterion) {
             exec.block_on(async move {
                 const CHUNK_SIZE: NonZeroUsize = nz!(4 * 1024 * 1024);
                 let chunk_size = CHUNK_SIZE;
-                let file_path = Path::new("bench_1gb_test.tmp");
+                let base_dir = std::env::var("VELOQ_BENCH_DIR").unwrap_or_else(|_| ".".to_string());
+                let file_path = Path::new(&base_dir).join("bench_1gb_test.tmp");
 
                 if file_path.exists() {
-                    let _ = std::fs::remove_file(file_path);
+                    let _ = std::fs::remove_file(&file_path);
                 }
 
                 // Use File::create which takes pool and context
@@ -190,10 +191,11 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                             let mut files = Vec::with_capacity(FILES_PER_WORKER);
                             let mut file_paths = Vec::with_capacity(FILES_PER_WORKER);
 
+                            let base_dir = std::env::var("VELOQ_BENCH_DIR").unwrap_or_else(|_| ".".to_string());
+
                             // 1. Open and Fallocate files
                             for f_idx in start_file_idx..end_file_idx {
-                                let path_str = format!("bench_32_{}.tmp", f_idx);
-                                let path = PathBuf::from(path_str);
+                                let path = Path::new(&base_dir).join(format!("bench_32_{}.tmp", f_idx));
 
                                 if path.exists() {
                                     let _ = std::fs::remove_file(&path);
