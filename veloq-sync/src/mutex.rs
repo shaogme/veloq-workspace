@@ -3,6 +3,7 @@ use crate::shim::cell::UnsafeCell;
 use crate::shim::lock::SpinLock;
 use crate::waker::{WaiterAdapter, WaiterNode};
 use std::future::Future;
+use std::marker::PhantomPinned;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -86,8 +87,9 @@ impl<T: ?Sized> Mutex<T> {
     pub fn lock(&self) -> MutexLockFuture<'_, T> {
         MutexLockFuture {
             lock: self,
-            node: Box::pin(WaiterNode::new()),
+            node: WaiterNode::new(),
             queued: false,
+            _pin: PhantomPinned,
         }
     }
 }
@@ -142,8 +144,9 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
 /// A future that resolves to a `MutexGuard`.
 pub struct MutexLockFuture<'a, T: ?Sized> {
     lock: &'a Mutex<T>,
-    node: Pin<Box<WaiterNode>>,
+    node: WaiterNode,
     queued: bool,
+    _pin: PhantomPinned,
 }
 
 impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
@@ -170,9 +173,9 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                         // We successfully acquired the lock.
                         // If we were queued, we must ensure we are removed.
                         let mut waiters = this.lock.waiters.lock();
-                        if this.node.as_ref().link.is_linked() {
+                        if this.node.link.is_linked() {
                             unsafe {
-                                let ptr = NonNull::from(&*this.node);
+                                let ptr = NonNull::from(&this.node);
                                 let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                                 cursor.remove();
                             }
@@ -208,16 +211,15 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
             }
 
             // 2. If locked, ensure it is marked CONTENDED before we wait
-            if state == LOCKED {
-                if this
+            if state == LOCKED
+                && this
                     .lock
                     .state
                     .compare_exchange(LOCKED, CONTENDED, Ordering::Relaxed, Ordering::Relaxed)
                     .is_err()
-                {
-                    // State changed, retry
-                    continue;
-                }
+            {
+                // State changed, retry
+                continue;
             }
 
             // 3. Register waker
@@ -235,7 +237,8 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
 
                 // Enqueue
                 unsafe {
-                    waiters.push_back(this.node.as_mut());
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    waiters.push_back(node_pin);
                 }
                 this.queued = true;
 
@@ -248,7 +251,7 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                 // If we are queued, check if we were woken
                 let is_linked = {
                     let _waiters = this.lock.waiters.lock();
-                    this.node.as_ref().link.is_linked()
+                    this.node.link.is_linked()
                 };
 
                 if !is_linked {
@@ -267,9 +270,9 @@ impl<'a, T: ?Sized> Drop for MutexLockFuture<'a, T> {
     fn drop(&mut self) {
         if self.queued {
             let mut waiters = self.lock.waiters.lock();
-            if self.node.as_ref().link.is_linked() {
+            if self.node.link.is_linked() {
                 unsafe {
-                    let ptr = NonNull::from(&*self.node);
+                    let ptr = NonNull::from(&self.node);
                     let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                     cursor.remove();
                 }
