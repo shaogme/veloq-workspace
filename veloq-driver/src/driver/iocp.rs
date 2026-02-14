@@ -81,7 +81,7 @@ impl Driver for IocpDriver {
                 rio: self.rio_state.as_mut(),
             };
 
-            let result = unsafe { (op_ref.vtable.submit)(op_ref, &mut ctx) };
+            let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
 
             match result {
                 Ok(SubmissionResult::Pending) => {
@@ -186,7 +186,7 @@ impl Driver for IocpDriver {
                 rio: self.rio_state.as_mut(),
             };
 
-            let result = unsafe { (op_ref.vtable.submit)(op_ref, &mut ctx) };
+            let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
 
             match result {
                 Ok(SubmissionResult::Offload(task)) => {

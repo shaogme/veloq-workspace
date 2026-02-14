@@ -81,13 +81,15 @@ pub struct OpVTable {
 // IocpOp Struct & Union (Type-Erased)
 // ============================================================================
 
+use std::ptr::NonNull;
+
 #[repr(C)]
 pub struct IocpOp {
+    /// Virtual Table for dynamic dispatch
+    pub vtable: NonNull<OpVTable>,
+
     /// Public header accessible directly by Driver
     pub header: OverlappedEntry,
-
-    /// Virtual Table for dynamic dispatch
-    pub vtable: &'static OpVTable,
 
     /// Type-erased payload
     pub payload: IocpOpPayload,
@@ -103,13 +105,13 @@ impl IocpOp {
     }
 
     pub fn get_fd(&self) -> Option<IoFd> {
-        unsafe { (self.vtable.get_fd)(self) }
+        unsafe { (self.vtable.as_ref().get_fd)(self) }
     }
 }
 
 impl Drop for IocpOp {
     fn drop(&mut self) {
-        unsafe { (self.vtable.drop)(self) };
+        unsafe { (self.vtable.as_ref().drop)(self) };
     }
 }
 
@@ -143,7 +145,7 @@ macro_rules! define_iocp_ops {
         $(
             impl IntoPlatformOp<IocpDriver> for $OpType {
                 fn into_platform_op(self) -> IocpOp {
-                    const TABLE: OpVTable = OpVTable {
+                    static TABLE: OpVTable = OpVTable {
                         submit: $submit,
                         on_complete: define_iocp_ops!(@optional_complete $($complete)?),
                         drop: $drop,
@@ -153,8 +155,8 @@ macro_rules! define_iocp_ops {
                     let payload = define_iocp_ops!(@construct self, $($construct)?, $OpType $(, $Payload)?);
 
                     IocpOp {
+                        vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
                         header: OverlappedEntry::new(0),
-                        vtable: &TABLE,
                         payload: IocpOpPayload {
                             $field: ManuallyDrop::new(payload),
                         },

@@ -331,7 +331,7 @@ impl IocpDriver {
             if let Some(blocking_res) = slot_overlapped.blocking_result.take() {
                 io_result = blocking_res;
             } else if io_result.is_ok() {
-                if let Some(on_comp) = iocp_op.vtable.on_complete {
+                if let Some(on_comp) = unsafe { iocp_op.vtable.as_ref().on_complete } {
                     let val = io_result.unwrap();
                     io_result = unsafe { (on_comp)(iocp_op, val, &self.extensions) };
                 }

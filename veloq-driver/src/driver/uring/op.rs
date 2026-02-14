@@ -50,10 +50,12 @@ pub struct OpVTable {
 // UringOp Struct & Union (Type-Erased)
 // ============================================================================
 
+use std::ptr::NonNull;
+
 #[repr(C)]
 pub struct UringOp {
     /// Virtual Table for dynamic dispatch
-    pub vtable: &'static OpVTable,
+    pub vtable: NonNull<OpVTable>,
 
     /// Type-erased payload
     pub payload: UringOpPayload,
@@ -63,13 +65,13 @@ impl PlatformOp for UringOp {}
 
 impl UringOp {
     pub fn get_fd(&self) -> Option<IoFd> {
-        unsafe { (self.vtable.get_fd)(self) }
+        unsafe { (self.vtable.as_ref().get_fd)(self) }
     }
 }
 
 impl Drop for UringOp {
     fn drop(&mut self) {
-        unsafe { (self.vtable.drop)(self) };
+        unsafe { (self.vtable.as_ref().drop)(self) };
     }
 }
 
@@ -105,7 +107,7 @@ macro_rules! define_uring_ops {
         $(
             impl IntoPlatformOp<UringDriver> for $OpType {
                 fn into_platform_op(self) -> UringOp {
-                    const TABLE: OpVTable = OpVTable {
+                    static TABLE: OpVTable = OpVTable {
                         make_sqe: $make_sqe,
                         on_complete: $complete,
                         drop: $drop,
@@ -117,7 +119,7 @@ macro_rules! define_uring_ops {
                     let payload = define_uring_ops!(@construct self, $($construct)?, $OpType $(, $Payload)?);
 
                     UringOp {
-                        vtable: &TABLE,
+                        vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
                         payload: UringOpPayload {
                             $field: ManuallyDrop::new(payload),
                         },

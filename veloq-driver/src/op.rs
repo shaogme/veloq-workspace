@@ -8,8 +8,8 @@
 //! - `io/driver/iocp/op.rs` for Windows IOCP
 
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{
     future::Future,
     pin::Pin,
@@ -20,10 +20,10 @@ use std::cell::RefCell;
 use tracing::trace;
 use veloq_buf::FixedBuf;
 
+use crate::driver::slot::{SlotTable, STATE_COMPLETED, STATE_CONSUMED};
+use crate::driver::{Driver, PlatformDriver};
 use crate::RawHandle;
 use crate::SockAddrStorage;
-use crate::driver::slot::{STATE_COMPLETED, STATE_CONSUMED, SlotTable};
-use crate::driver::{Driver, PlatformDriver};
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

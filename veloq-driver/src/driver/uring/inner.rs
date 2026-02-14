@@ -183,7 +183,6 @@ impl UringDriver {
                 crate::driver::op_registry::OpHandle {
                     index: user_data, ..
                 },
-            ..
         }) = result
         {
             self.waker_token = Some(user_data);
@@ -199,7 +198,7 @@ impl UringDriver {
                 let slot = &self.ops.shared.slots[user_data];
                 unsafe {
                     let op_ref = (*slot.op.get()).as_mut().unwrap();
-                    (op_ref.vtable.make_sqe)(op_ref, self.waker_fd as usize)
+                    (op_ref.vtable.as_ref().make_sqe)(op_ref, self.waker_fd as usize)
                         .user_data(user_data as u64)
                 }
             };
@@ -331,7 +330,7 @@ impl UringDriver {
                         // Call on_complete
                         let final_res = unsafe {
                             if let Some(op) = (*slot.op.get()).as_mut() {
-                                (op.vtable.on_complete)(op, res_val)
+                                (op.vtable.as_ref().on_complete)(op, res_val)
                             } else {
                                 // Op missing? unexpected
                                 if res_val >= 0 {
@@ -459,15 +458,18 @@ impl UringDriver {
                         let slot = &self.ops.shared.slots[user_data];
                         unsafe {
                             if let Some(res) = (*slot.op.get()).as_mut() {
-                                let strategy = res.vtable.strategy;
+                                let strategy = res.vtable.as_ref().strategy;
                                 match strategy {
                                     crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
-                                        let s = (res.vtable.make_sqe)(res, self.waker_fd as usize)
-                                            .user_data(user_data as u64);
+                                        let s = (res.vtable.as_ref().make_sqe)(
+                                            res,
+                                            self.waker_fd as usize,
+                                        )
+                                        .user_data(user_data as u64);
                                         (Some(s), Some(strategy), None)
                                     }
                                     crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
-                                        let d = (res.vtable.get_timeout)(res);
+                                        let d = (res.vtable.as_ref().get_timeout)(res);
                                         (None, Some(strategy), d)
                                     }
                                     _ => (None, Some(strategy), None),
@@ -478,7 +480,7 @@ impl UringDriver {
                         }
                     };
 
-                    if strategy_opt.is_none() {
+                    if let None = strategy_opt {
                         self.pop_backlog();
                         continue;
                     }

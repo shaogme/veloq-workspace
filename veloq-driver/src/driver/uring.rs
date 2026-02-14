@@ -34,7 +34,8 @@ impl UringDriver {
         let sqe = {
             let slot = &self.ops.shared.slots[user_data];
             let mk_sqe = |op: &mut UringOp| unsafe {
-                (op.vtable.make_sqe)(op, self.waker_fd as usize).user_data(user_data as u64)
+                (op.vtable.as_ref().make_sqe)(op, self.waker_fd as usize)
+                    .user_data(user_data as u64)
             };
             unsafe {
                 let op_ref = (*slot.op.get()).as_mut().unwrap();
@@ -80,7 +81,7 @@ impl UringDriver {
             let slot = &self.ops.shared.slots[user_data];
             unsafe {
                 let op_ref = (*slot.op.get()).as_ref().unwrap();
-                (op_ref.vtable.get_timeout)(op_ref)
+                (op_ref.vtable.as_ref().get_timeout)(op_ref)
             }
         };
 
@@ -132,7 +133,8 @@ impl Driver for UringDriver {
         user_data: usize,
         op: Self::Op,
     ) -> Result<Poll<()>, (io::Error, Self::Op)> {
-        match op.vtable.strategy {
+        let strategy = unsafe { op.vtable.as_ref().strategy };
+        match strategy {
             op::SubmissionStrategy::BackgroundOnly => Err((
                 io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -146,9 +148,10 @@ impl Driver for UringDriver {
     }
 
     fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
-        if op.vtable.strategy == op::SubmissionStrategy::BackgroundOnly {
+        let strategy = unsafe { op.vtable.as_ref().strategy };
+        if strategy == op::SubmissionStrategy::BackgroundOnly {
             let sqe = unsafe {
-                (op.vtable.make_sqe)(&mut op, self.waker_fd as usize)
+                (op.vtable.as_ref().make_sqe)(&mut op, self.waker_fd as usize)
                     .user_data(inner::BACKGROUND_USER_DATA)
             };
 

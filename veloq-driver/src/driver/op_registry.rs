@@ -27,9 +27,8 @@ pub struct OpHandle {
     pub generation: u32,
 }
 
-pub struct AllocResult<'a, P> {
+pub struct AllocResult {
     pub handle: OpHandle,
-    pub entry: &'a mut OpEntry<P>,
 }
 
 impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
@@ -53,7 +52,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    pub fn alloc(&mut self, data: P) -> Result<AllocResult<'_, P>, P> {
+    pub fn alloc(&mut self, data: P) -> Result<AllocResult, P> {
         // 1. Recycle remote indices
         while let Some(idx) = self.shared.remote_free_queue.pop() {
             if idx < self.local.len() {
@@ -79,7 +78,6 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
                     index: idx,
                     generation: new_gen,
                 },
-                entry: &mut self.local[idx],
             })
         } else {
             Err(data)
