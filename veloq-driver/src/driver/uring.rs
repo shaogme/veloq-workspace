@@ -11,7 +11,7 @@ pub mod submit;
 
 pub use inner::{UringDriver, UringOpState};
 
-use crate::driver::slot::{STATE_COMPLETED, STATE_SUBMITTED};
+use crate::driver::slot::STATE_COMPLETED;
 use crate::driver::{Driver, RemoteWaker};
 use inner::UringWaker;
 use op::UringOp;
@@ -30,36 +30,24 @@ impl UringDriver {
             }
         }
 
-        // 2. Generate SQE from Slot
-        let sqe = {
-            let slot = &self.ops.shared.slots[user_data];
-            let mk_sqe = |op: &mut UringOp| unsafe {
-                (op.vtable.as_ref().make_sqe)(op, self.waker_fd as usize)
-                    .user_data(user_data as u64)
-            };
-            unsafe {
-                let op_ref = (*slot.op.get()).as_mut().unwrap();
-                mk_sqe(op_ref)
+        // 2. Try submit using centralized logic
+        match self.submit_from_slot(user_data) {
+            Ok(true) => Ok(Poll::Ready(())),
+            Ok(false) => {
+                debug!(user_data, "SQ full, pushing to backlog");
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    entry.platform_data.lifecycle = inner::OpLifecycle::Pending;
+                }
+                // Op remains in Slot, waiting for flush_backlog to pick it up
+                self.push_backlog(user_data);
+                Ok(Poll::Pending)
             }
-        };
-
-        // 3. Push
-        if self.push_entry(sqe) {
-            trace!(user_data, "Submitted to SQ");
-            if let Some(entry) = self.ops.get_mut(user_data) {
-                entry.platform_data.lifecycle = inner::OpLifecycle::InFlight;
+            Err(e) => {
+                // Recover op
+                let slot = &self.ops.shared.slots[user_data];
+                let op = unsafe { (*slot.op.get()).take().unwrap() };
+                Err((e, op))
             }
-            let slot = &self.ops.shared.slots[user_data];
-            slot.state.store(STATE_SUBMITTED, Ordering::Release);
-            Ok(Poll::Ready(()))
-        } else {
-            debug!(user_data, "SQ full, pushing to backlog");
-            if let Some(entry) = self.ops.get_mut(user_data) {
-                entry.platform_data.lifecycle = inner::OpLifecycle::Pending;
-            }
-            // Op remains in Slot, waiting for flush_backlog to pick it up
-            self.push_backlog(user_data);
-            Ok(Poll::Pending)
         }
     }
 
@@ -76,30 +64,24 @@ impl UringDriver {
             }
         }
 
-        // 2. Extract duration
-        let duration_opt = {
-            let slot = &self.ops.shared.slots[user_data];
-            unsafe {
-                let op_ref = (*slot.op.get()).as_ref().unwrap();
-                (op_ref.vtable.as_ref().get_timeout)(op_ref)
+        // 2. Try submit
+        match self.submit_from_slot(user_data) {
+            Ok(true) => Ok(Poll::Ready(())),
+            Ok(false) => {
+                // Should technically not happen for SoftwareTimer unless we change logic later
+                debug!(user_data, "SQ full (unexpected for timer), pushing to backlog");
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    entry.platform_data.lifecycle = inner::OpLifecycle::Pending;
+                }
+                self.push_backlog(user_data);
+                Ok(Poll::Pending)
             }
-        };
-
-        if let Some(duration) = duration_opt {
-            let task_id = self.wheel.insert(user_data, duration);
-            if let Some(entry) = self.ops.get_mut(user_data) {
-                entry.platform_data.lifecycle = inner::OpLifecycle::InFlight;
-                entry.platform_data.timer_id = Some(task_id);
+            Err(e) => {
+                // Recover op
+                let slot = &self.ops.shared.slots[user_data];
+                let op = unsafe { (*slot.op.get()).take().unwrap() };
+                Err((e, op))
             }
-            let slot = &self.ops.shared.slots[user_data];
-            slot.state.store(STATE_SUBMITTED, Ordering::Release);
-            trace!(user_data, ?duration, "Registered software timer");
-            Ok(Poll::Pending)
-        } else {
-            // Recover op
-            let slot = &self.ops.shared.slots[user_data];
-            let op = unsafe { (*slot.op.get()).take().unwrap() };
-            return Err((io::Error::other("failed to get duration from timer op"), op));
         }
     }
 }
