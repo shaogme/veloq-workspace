@@ -160,6 +160,33 @@ impl LocalExecutorBuilder {
             processed_chunk_count: Cell::new(0),
         }
     }
+    pub fn build_with_uniform_pool(self, memory_multiplier: usize) -> LocalExecutor {
+        use veloq_buf::{BufferRegion, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+
+        let multiplier =
+            std::num::NonZeroUsize::new(memory_multiplier).expect("Memory multiplier must be > 0");
+        let topology = UniformSlot::new(ThreadMemoryMultiplier(multiplier));
+
+        // We are creating a single-threaded executor, so worker_count = 1
+        let global_pool = topology
+            .create_pool(1)
+            .expect("Failed to create global pool");
+
+        // We are worker 0
+        let worker_idx = 0;
+
+        self.build(move |registrar| {
+            // Register global memory
+            let info = global_pool.global_info();
+            let regions = [BufferRegion::new(info.ptr, info.len)];
+            registrar
+                .register(&regions)
+                .expect("Failed to register global memory");
+
+            // Use topology to build pool
+            topology.build(&global_pool, worker_idx, registrar)
+        })
+    }
 }
 
 pub struct LocalExecutor {
@@ -201,6 +228,12 @@ impl LocalExecutor {
     /// Create a new builder for LocalExecutor.
     pub fn builder() -> LocalExecutorBuilder {
         LocalExecutorBuilder::new()
+    }
+
+    /// Create a default LocalExecutor with a UniformSlot pool (multiplier 8).
+    /// Suitable for tests and simple single-threaded use cases.
+    pub fn new_default() -> Self {
+        Self::builder().build_with_uniform_pool(8)
     }
 
     /// Attach this executor to a registry.

@@ -4,28 +4,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use veloq_buf::{BufferRegion, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier, nz};
-
 fn create_local_executor() -> LocalExecutor {
-    let topology = UniformSlot::new(ThreadMemoryMultiplier(nz!(8)));
-    // We are creating a single-threaded executor for test, so worker_count = 1
-    let global_pool = topology
-        .create_pool(1)
-        .expect("Failed to create global pool");
-
-    // We are worker 0
-    let worker_idx = 0;
-
-    LocalExecutor::builder().build(move |registrar| {
-        // Register global memory
-        let info = global_pool.global_info();
-        let regions = [BufferRegion::new(info.ptr, info.len)];
-        registrar.register(&regions).expect("Failed to register");
-
-        // Use topology to build pool
-        topology.build(&global_pool, worker_idx, registrar)
-    })
+    LocalExecutor::new_default()
 }
+
 struct ReadyFuture<T>(Option<T>);
 impl<T: Unpin + Copy> Future for ReadyFuture<T> {
     type Output = T;
