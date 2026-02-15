@@ -227,6 +227,17 @@ pub trait PoolTopology: Clone + Send + Sync + 'static {
         worker_idx: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool;
+
+    /// Connect a listener to the shared state to receive notifications about new memory chunks.
+    /// Used for dynamic expansion.
+    #[allow(unused_variables)]
+    fn connect_listener(
+        &self,
+        state: &Self::State,
+        listener: Box<dyn Fn(crate::heap::ChunkInfo) + Send + Sync>,
+    ) {
+        // Default implementation does nothing
+    }
 }
 
 /// 标准 Slot 拓扑：使用 GlobalSlotPool
@@ -293,6 +304,14 @@ impl PoolTopology for UniformSlot {
 
         let slot_pool = SlotBasedPool::new(pool.clone());
         AnyBufPool::new(slot_pool)
+    }
+
+    fn connect_listener(
+        &self,
+        state: &Self::State,
+        listener: Box<dyn Fn(crate::heap::ChunkInfo) + Send + Sync>,
+    ) {
+        state.set_listener(listener);
     }
 }
 

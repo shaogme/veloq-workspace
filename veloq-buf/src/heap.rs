@@ -428,6 +428,11 @@ impl Chunk {
 pub struct GlobalSlotPool {
     /// Active chunks
     chunks: RwLock<Vec<Arc<Chunk>>>,
+    /// Configuration
+    #[allow(dead_code)]
+    config: GlobalAllocatorConfig,
+    /// Listener for new chunk allocation (used to notify Runtime/Driver)
+    listener: RwLock<Option<Box<dyn Fn(ChunkInfo) + Send + Sync>>>,
 }
 
 impl GlobalSlotPool {
@@ -447,7 +452,17 @@ impl GlobalSlotPool {
 
         Ok(Self {
             chunks: RwLock::new(vec![Arc::new(chunk0)]),
+            config,
+            listener: RwLock::new(None),
         })
+    }
+
+    /// Set a listener to be notified when a new chunk is allocated.
+    pub fn set_listener<F>(&self, f: F)
+    where
+        F: Fn(ChunkInfo) + Send + Sync + 'static,
+    {
+        *self.listener.write() = Some(Box::new(f));
     }
 
     /// Allocates a block of `1 << order` slots.
@@ -457,20 +472,74 @@ impl GlobalSlotPool {
     /// - `SlotIndex`: The within-chunk index.
     /// - `NonNull<u8>`: The raw pointer to the memory.
     pub fn alloc_slots(&self, order: usize) -> Option<(u16, SlotIndex, NonNull<u8>)> {
-        // Optimistic Read Lock
-        let chunks = self.chunks.read();
-
-        // Strategy: Iterate through chunks.
-        // In the future, we might want to prioritize the last used chunk or current_chunk.
-        // For now, just try existing chunks.
-        for chunk in chunks.iter() {
-            if let Some((idx, ptr)) = chunk.alloc_slots(order) {
-                return Some((chunk.id, idx, ptr));
+        // 1. Optimistic Read Lock: Try existing chunks
+        {
+            let chunks = self.chunks.read();
+            for chunk in chunks.iter() {
+                if let Some((idx, ptr)) = chunk.alloc_slots(order) {
+                    return Some((chunk.id, idx, ptr));
+                }
             }
         }
 
-        // TODO: Dynamic Expansion (Phase 1 logic ends here, expansion logic to be added)
-        // If we reach here, we are OOM.
+        // 2. Dynamic Expansion (Write Lock)
+        {
+            let mut chunks = self.chunks.write();
+
+            // Double-check: Someone might have expanded while we waited for the lock
+            for chunk in chunks.iter() {
+                if let Some((idx, ptr)) = chunk.alloc_slots(order) {
+                    return Some((chunk.id, idx, ptr));
+                }
+            }
+
+            // 3. Expand Pool
+            let next_id = chunks.len();
+            if next_id > u16::MAX as usize {
+                // ID overflow
+                return None;
+            }
+            let next_id_u16 = next_id as u16;
+
+            // Strategy: fixed expansion size (e.g. 64 MB) to prevent fragmentation from small chunks
+            // optimize: maybe exponential growth or configurable?
+            const EXPANSION_SIZE: usize = 64 * 1024 * 1024;
+
+            tracing::info!(
+                "GlobalSlotPool: Expanding pool with Chunk ID {}",
+                next_id_u16
+            );
+
+            let new_chunk = match Chunk::new(next_id_u16, EXPANSION_SIZE) {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    tracing::error!("Failed to allocate new chunk: {}", e);
+                    return None;
+                }
+            };
+
+            // Try alloc from new chunk
+            let res = new_chunk.alloc_slots(order);
+
+            // Commit new chunk
+            chunks.push(new_chunk.clone());
+
+            // Notify listener (while holding lock to ensure sequential ordering if needed,
+            // though listener usually just updates atomic flag/registry)
+            if let Some(listener) = self.listener.read().as_ref() {
+                let info = ChunkInfo {
+                    id: new_chunk.id,
+                    ptr: new_chunk.memory.ptr,
+                    len: new_chunk.memory.size,
+                };
+                listener(info);
+            }
+
+            if let Some((idx, ptr)) = res {
+                return Some((next_id_u16, idx, ptr));
+            }
+        }
+
         None
     }
 
