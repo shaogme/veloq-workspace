@@ -6,6 +6,9 @@
 //! # Scalability Update
 //! To avoid global lock contention, the pool is partitioned into multiple **Shards**.
 //! Each shard manages a distinct slice of the global memory.
+//!
+//! # Dynamic Extension (Phase 1)
+//! The pool now supports multiple `Chunk`s. Startups with one chunk, but can grow.
 
 pub mod buddy;
 pub mod slot;
@@ -15,7 +18,7 @@ use self::buddy::BuddyAllocator;
 use self::slot::{SLOT_SIZE, SlotIndex};
 use self::superblock::{SUPERBLOCK_ORDER, SUPERBLOCK_SIZE, SuperblockState};
 use crossbeam_utils::CachePadded;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -101,16 +104,17 @@ pub struct GlobalAllocatorConfig {
     pub total_memory: usize,
 }
 
-/// Information about the global memory block (God View)
+/// Information about a memory chunk (God View)
 #[derive(Debug, Clone, Copy)]
-pub struct GlobalMemoryInfo {
+pub struct ChunkInfo {
+    pub id: u16,
     pub ptr: NonNull<u8>,
     pub len: NonZeroUsize,
 }
 
 // Guarantee thread safety for the info pointing to shared memory
-unsafe impl Send for GlobalMemoryInfo {}
-unsafe impl Sync for GlobalMemoryInfo {}
+unsafe impl Send for ChunkInfo {}
+unsafe impl Sync for ChunkInfo {}
 
 /// Local Cache Constants
 type PoolId = usize;
@@ -127,72 +131,61 @@ thread_local! {
     });
 }
 
-/// Global Slot Pool
-///
-/// Manages a large contiguous memory arena using a sharded Buddy System.
-/// The basic unit is a 4KB `Slot`.
-pub struct GlobalSlotPool {
+/// A Managed Chunk of memory with its own Allocator(s).
+pub struct Chunk {
+    pub id: u16,
+
     /// The sharded buddy allocators
-    shards: Vec<CachePadded<Mutex<BuddyAllocator>>>,
+    ///
+    /// # Drop Order (CRITICAL)
+    /// This field MUST be defined BEFORE `memory`.
+    /// `BuddyAllocator` accesses the raw pointers in `memory` during its Drop implementation.
+    /// Rust drops fields in declaration order, so `shards` will be dropped first, allowing
+    /// safe access to `memory`.
+    shards: Box<[CachePadded<Mutex<BuddyAllocator>>]>,
 
     /// Superblock States Array
     /// Mapped 1:1 to the 64-slot chunks of the memory.
+    ///
+    /// # Drop Order
+    /// Should also be dropped before `memory`.
     superblocks: Box<[SuperblockState]>,
 
-    /// Number of slots per shard (uniform for all except potentially the last,
-    /// but we currently enforce uniformity or ignore tail)
-    slots_per_shard: usize,
-
     /// Ownership of the underlying memory.
-    /// MUST be declared after `shards` so that shards are dropped first.
+    ///
+    /// # Drop Order (CRITICAL)
+    /// This field MUST be defined LAST to ensure it is dropped AFTER all other fields
+    /// that might access the memory (like `shards` and `superblocks`).
     #[allow(dead_code)]
     memory: Arc<MemoryChunk>,
 
-    /// Global memory info for registration
-    global_info: GlobalMemoryInfo,
+    /// Number of slots per shard
+    slots_per_shard: usize,
 }
 
-impl GlobalSlotPool {
-    /// Create a new GlobalSlotPool
-    pub fn new(config: GlobalAllocatorConfig) -> io::Result<Self> {
-        let total_size = config.total_memory;
-
-        if total_size < MIN_THREAD_MEMORY.get() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Total memory too small",
-            ));
-        }
-
+impl Chunk {
+    pub fn new(id: u16, size: usize) -> io::Result<Self> {
         // 1. Allocate the massive slab
         let chunk = Arc::new(MemoryChunk::new(unsafe {
-            NonZeroUsize::new_unchecked(total_size)
+            NonZeroUsize::new_unchecked(size)
         })?);
 
-        let global_info = GlobalMemoryInfo {
-            ptr: chunk.ptr,
-            len: chunk.size,
-        };
+        let total_slots = size / SLOT_SIZE;
 
         // 2. Determine Shard Layout
         // Dynamic sharding based on CPU cores, scaled for contention.
-        // We target at least 16 shards for baseline scalability.
         let parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
 
         // Start with parallelism next power of 2, minimum 16
+        // Note: For dynamically added smaller chunks, we might want fewer shards?
+        // But for consistency let's keep it similar for now.
         let mut shard_count = parallelism.next_power_of_two().max(16);
 
-        let total_slots = total_size / SLOT_SIZE;
-
         // Constraint: Each shard must accomodate at least one Superblock (64 slots)
-        // to support potential superblock allocations.
-        // If memory is small, reduce shard count.
         let max_shards = total_slots / SUPERBLOCK_SIZE;
         if max_shards > 0 && shard_count > max_shards {
-            // Find largest power of 2 less than or equal to max_shards
-            // This replaces the iterative loop
             shard_count = 1 << (usize::BITS - 1 - max_shards.leading_zeros());
         } else if max_shards == 0 {
             // Edge case: Total memory is less than SUPERBLOCK_SIZE * SLOT_SIZE
@@ -206,7 +199,7 @@ impl GlobalSlotPool {
         if slots_per_shard == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
-                "Total memory too small for sharding",
+                "Chunk memory size too small for sharding",
             ));
         }
 
@@ -224,30 +217,34 @@ impl GlobalSlotPool {
         }
 
         // 4. Initialize Superblock States
-        // Total slots / 64
         let num_superblocks = total_slots / SUPERBLOCK_SIZE;
         let states: Vec<SuperblockState> = (0..num_superblocks)
             .map(|_| SuperblockState::new())
             .collect();
 
-        // Warning: If total_slots % shard_count != 0, the tail memory is ignored.
-        // Given the huge page sizes and power-of-2 allocations, this is negligible.
-
         Ok(Self {
-            shards,
+            id,
+            shards: shards.into_boxed_slice(),
             superblocks: states.into_boxed_slice(),
-            slots_per_shard,
+            // memory MUST be after shards/superblocks in struct definition
             memory: chunk,
-            global_info,
+            slots_per_shard,
         })
     }
 
-    /// Allocates a block of `1 << order` slots.
-    ///
-    /// Returns:
-    /// - `SlotIndex`: The global index of the first slot.
-    /// - `NonNull<u8>`: The raw pointer to the memory.
-    pub fn alloc_slots(&self, order: usize) -> Option<(SlotIndex, NonNull<u8>)> {
+    /// Resolve SlotIndex to Raw Pointer within this Chunk
+    pub fn resolve_ptr(&self, index: SlotIndex) -> NonNull<u8> {
+        let offset = index.offset();
+        assert!(
+            offset < self.memory.len(),
+            "SlotIndex out of bounds in Chunk {}",
+            self.id
+        );
+        unsafe { NonNull::new_unchecked(self.memory.as_ptr().add(offset) as *mut u8) }
+    }
+
+    // Internal alloc/dealloc methods specific to this Chunk
+    fn alloc_slots(&self, order: usize) -> Option<(SlotIndex, NonNull<u8>)> {
         // Fast Path: Order 0 (4KB) uses Thread Local Superblock Cache
         if order == 0 {
             let pool_id = self.memory.as_ptr() as usize;
@@ -258,14 +255,12 @@ impl GlobalSlotPool {
             if let Some(sb_idx) = sb_idx_opt {
                 if let Some(offset) = self.superblocks[sb_idx].alloc_one() {
                     let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
-                    // Calculate Ptr (Safe)
                     let ptr = self.resolve_ptr(global_idx);
                     return Some((global_idx, ptr));
                 } else {
                     // Superblock Full! Retire it.
                     let should_free = self.superblocks[sb_idx].set_inactive();
                     if should_free {
-                        // This case (Full + Empty + Inactive) is impossible (Full != Empty).
                         self.dealloc_superblock(sb_idx);
                     }
 
@@ -276,8 +271,7 @@ impl GlobalSlotPool {
                 }
             }
 
-            // 2. No Active Superblock (or just retired). Alloc New.
-            // Alloc Order 6 from Buddy
+            // 2. No Active Superblock. Alloc New.
             if let Some((base_idx, _)) = self.alloc_global(SUPERBLOCK_ORDER) {
                 let sb_idx = base_idx.0 / SUPERBLOCK_SIZE;
 
@@ -370,10 +364,7 @@ impl GlobalSlotPool {
     }
 
     /// Deallocates a block of slots.
-    ///
-    /// # Safety
-    /// - `index` and `order` must match a previous allocation.
-    pub unsafe fn dealloc_slots(&self, index: SlotIndex, order: usize) {
+    unsafe fn dealloc_slots(&self, index: SlotIndex, order: usize) {
         // Fast Path: Order 0 uses Superblock State
         if order == 0 {
             let sb_idx = index.0 / SUPERBLOCK_SIZE;
@@ -408,8 +399,8 @@ impl GlobalSlotPool {
         // Boundary check
         if shard_idx >= self.shards.len() {
             panic!(
-                "GlobalSlotPool: Invalid slot index {} (shard {})",
-                index.0, shard_idx
+                "Chunk {}: Invalid slot index {} (shard {})",
+                self.id, index.0, shard_idx
             );
         }
 
@@ -418,24 +409,8 @@ impl GlobalSlotPool {
         unsafe {
             buddy
                 .dealloc(local_idx, order)
-                .expect("GlobalSlotPool dealloc failed");
+                .expect("Chunk dealloc failed");
         }
-    }
-
-    /// Get Global Memory Info
-    pub fn global_info(&self) -> GlobalMemoryInfo {
-        self.global_info
-    }
-
-    /// Resolve Global SlotIndex to Raw Pointer (Safe)
-    pub fn resolve_ptr(&self, index: SlotIndex) -> NonNull<u8> {
-        let offset = index.offset();
-        assert!(
-            offset < self.global_info.len.get(),
-            "GlobalSlotIndex out of bounds"
-        );
-        // SAFETY: Offset checked against total memory size.
-        unsafe { NonNull::new_unchecked(self.memory.as_ptr().add(offset) as *mut u8) }
     }
 
     /// Helper: Map Global SlotIndex to Shard and Local Index
@@ -446,12 +421,99 @@ impl GlobalSlotPool {
     }
 }
 
+/// Global Slot Pool
+///
+/// Manages a large contiguous memory arena using a sharded Buddy System.
+/// The basic unit is a 4KB `Slot`.
+pub struct GlobalSlotPool {
+    /// Active chunks
+    chunks: RwLock<Vec<Arc<Chunk>>>,
+}
+
+impl GlobalSlotPool {
+    /// Create a new GlobalSlotPool
+    pub fn new(config: GlobalAllocatorConfig) -> io::Result<Self> {
+        let total_size = config.total_memory;
+
+        if total_size < MIN_THREAD_MEMORY.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Total memory too small",
+            ));
+        }
+
+        // Initial Chunk (ID=0)
+        let chunk0 = Chunk::new(0, total_size)?;
+
+        Ok(Self {
+            chunks: RwLock::new(vec![Arc::new(chunk0)]),
+        })
+    }
+
+    /// Allocates a block of `1 << order` slots.
+    ///
+    /// Returns:
+    /// - `u16`: Chunk ID
+    /// - `SlotIndex`: The within-chunk index.
+    /// - `NonNull<u8>`: The raw pointer to the memory.
+    pub fn alloc_slots(&self, order: usize) -> Option<(u16, SlotIndex, NonNull<u8>)> {
+        // Optimistic Read Lock
+        let chunks = self.chunks.read();
+
+        // Strategy: Iterate through chunks.
+        // In the future, we might want to prioritize the last used chunk or current_chunk.
+        // For now, just try existing chunks.
+        for chunk in chunks.iter() {
+            if let Some((idx, ptr)) = chunk.alloc_slots(order) {
+                return Some((chunk.id, idx, ptr));
+            }
+        }
+
+        // TODO: Dynamic Expansion (Phase 1 logic ends here, expansion logic to be added)
+        // If we reach here, we are OOM.
+        None
+    }
+
+    /// Deallocates a block of slots.
+    ///
+    /// # Safety
+    /// - `chunk_id`, `index`, and `order` must match a previous allocation.
+    pub unsafe fn dealloc_slots(&self, chunk_id: u16, index: SlotIndex, order: usize) {
+        let chunks = self.chunks.read();
+        if let Some(chunk) = chunks.get(chunk_id as usize) {
+            // Verify ID just in case
+            debug_assert_eq!(chunk.id, chunk_id);
+            unsafe {
+                chunk.dealloc_slots(index, order);
+            }
+        } else {
+            // This can happen if we have a logic error or if we support unloading chunks (unlikely for now)
+            panic!("GlobalSlotPool: Dealloc on invalid chunk_id {}", chunk_id);
+        }
+    }
+
+    /// Get Memory Info for a Chunk
+    pub fn chunk_info(&self, chunk_id: u16) -> Option<ChunkInfo> {
+        let chunks = self.chunks.read();
+        chunks.get(chunk_id as usize).map(|c| ChunkInfo {
+            id: c.id,
+            ptr: c.memory.ptr,
+            len: c.memory.size,
+        })
+    }
+
+    /// Get Global Memory Info (Legacy/Compat for single chunk)
+    /// Returns info for Chunk 0.
+    pub fn global_info(&self) -> ChunkInfo {
+        self.chunk_info(0).expect("Chunk 0 must exist")
+    }
+}
+
 impl std::fmt::Debug for GlobalSlotPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let chunks = self.chunks.read();
         f.debug_struct("GlobalSlotPool")
-            .field("global_info", &self.global_info)
-            .field("shards_count", &self.shards.len())
-            .field("slots_per_shard", &self.slots_per_shard)
+            .field("chunk_count", &chunks.len())
             .finish()
     }
 }
