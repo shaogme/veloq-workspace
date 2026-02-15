@@ -12,9 +12,17 @@ use veloq_driver::driver::RemoteWaker;
 // --- Job Definition ---
 
 pub type Job = SpawnedTask;
+use parking_lot::RwLock;
 
 // Alias for the new stealable task type
 use crate::runtime::task::harness::{self, Runnable, Schedule};
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkInfo {
+    pub id: u16,
+    pub ptr: usize,
+    pub len: usize,
+}
 
 pub(crate) fn pack_job<F, Output>(async_fn: F) -> (crate::runtime::join::JoinHandle<Output>, Job)
 where
@@ -136,6 +144,9 @@ impl ExecutorHandle {
 /// Workers are pre-allocated at runtime startup.
 pub struct ExecutorRegistry {
     handles: Arc<Vec<ExecutorHandle>>,
+    // Pull Model Support
+    pub(crate) epoch: AtomicUsize,
+    pub(crate) memory_chunks: RwLock<Vec<ChunkInfo>>,
 }
 
 impl Default for ExecutorRegistry {
@@ -148,11 +159,27 @@ impl ExecutorRegistry {
     pub fn new(handles: Vec<ExecutorHandle>) -> Self {
         Self {
             handles: Arc::new(handles),
+            epoch: AtomicUsize::new(0),
+            memory_chunks: RwLock::new(Vec::new()),
         }
     }
 
     pub fn all(&self) -> &[ExecutorHandle] {
         &self.handles
+    }
+
+    pub fn register_chunk(&self, id: u16, ptr: usize, len: usize) {
+        let chunk = ChunkInfo { id, ptr, len };
+        {
+            let mut chunks = self.memory_chunks.write();
+            chunks.push(chunk);
+        }
+        self.epoch.fetch_add(1, Ordering::Release);
+
+        // Notify all workers
+        for handle in self.handles.iter() {
+            let _ = handle.shared.waker.wake();
+        }
     }
 }
 

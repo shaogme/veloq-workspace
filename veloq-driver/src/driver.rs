@@ -43,13 +43,11 @@ pub trait Driver: 'static {
     /// Cancel an operation.
     fn cancel_op(&mut self, user_data: usize);
 
-    /// Register memory regions with the driver.
-    /// Returns a list of handles (tokens) corresponding to the regions.
-    /// Replaces `register_buffers`.
-    fn register_buffer_regions(
-        &mut self,
-        regions: &[veloq_buf::BufferRegion],
-    ) -> io::Result<Vec<usize>>;
+    /// Register a memory chunk with the driver.
+    /// `id` is the ChunkID (0..MAX_CHUNKS).
+    /// `ptr` and `len` define the memory region.
+    /// This allows incremental registration without stopping the world.
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()>;
 
     /// Register a set of file descriptors/handles.
     /// Returns a list of `IoFd` that can be used in subsequent operations.

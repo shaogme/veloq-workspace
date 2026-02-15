@@ -210,7 +210,13 @@ fn test_iocp_recv_with_buffer_pool() {
 
     impl veloq_buf::BufferRegistrar for LegacyDriverRegistrar {
         fn register(&self, regions: &[veloq_buf::BufferRegion]) -> std::io::Result<Vec<usize>> {
-            self.driver.borrow_mut().register_buffer_regions(regions)
+            let mut driver = self.driver.borrow_mut();
+            let mut ids = Vec::new();
+            for (i, region) in regions.iter().enumerate() {
+                driver.register_chunk(i as u16, region.as_ptr() as *const u8, region.len())?;
+                ids.push(i);
+            }
+            Ok(ids)
         }
     }
 

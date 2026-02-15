@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::Rc;
@@ -156,6 +156,8 @@ impl LocalExecutorBuilder {
             registry: None,
             id: usize::MAX,
             buf_pool,
+            last_seen_epoch: Cell::new(0),
+            processed_chunk_count: Cell::new(0),
         }
     }
 }
@@ -179,6 +181,10 @@ pub struct LocalExecutor {
     id: usize,
     // Buffer Pool
     buf_pool: veloq_buf::AnyBufPool,
+
+    // Pull Model State
+    last_seen_epoch: Cell<usize>,
+    processed_chunk_count: Cell<usize>,
 }
 
 impl LocalExecutor {
@@ -341,6 +347,43 @@ impl LocalExecutor {
         false
     }
 
+    fn check_for_memory_updates(&self) {
+        if let Some(registry) = &self.registry {
+            let global_epoch = registry.epoch.load(Ordering::Acquire);
+            if global_epoch > self.last_seen_epoch.get() {
+                self.sync_memory_chunks(global_epoch);
+            }
+        }
+    }
+
+    fn sync_memory_chunks(&self, target_epoch: usize) {
+        if let Some(registry) = &self.registry {
+            let chunks_guard = registry.memory_chunks.read();
+            let current_len = chunks_guard.len();
+            let processed = self.processed_chunk_count.get();
+
+            if processed < current_len {
+                let mut driver = self.driver.borrow_mut();
+                for chunk in chunks_guard.iter().skip(processed) {
+                    if let Err(e) =
+                        driver.register_chunk(chunk.id, chunk.ptr as *const u8, chunk.len)
+                    {
+                        tracing::error!(
+                            ?e,
+                            chunk_id = chunk.id,
+                            "Failed to register new memory chunk"
+                        );
+                    } else {
+                        // tracing::info!(chunk_id = chunk.id, "Registered new memory chunk");
+                    }
+                }
+                self.processed_chunk_count.set(current_len);
+            }
+
+            self.last_seen_epoch.set(target_epoch);
+        }
+    }
+
     fn park_and_wait(&self, main_woken: &AtomicBool) {
         let has_pending_tasks =
             !self.queue.borrow().is_empty() || main_woken.load(Ordering::Acquire);
@@ -412,6 +455,9 @@ impl LocalExecutor {
         const BUDGET: usize = 64;
 
         loop {
+            // Check for dynamic memory updates (Pull Model)
+            self.check_for_memory_updates();
+
             if self.shared.shutdown.load(Ordering::Relaxed) {
                 debug!("Shutting down LocalExecutor");
                 break;
@@ -501,6 +547,9 @@ impl LocalExecutor {
         const BUDGET: usize = 64;
 
         loop {
+            // Check for dynamic memory updates (Pull Model)
+            self.check_for_memory_updates();
+
             let mut executed = 0;
 
             while executed < BUDGET {
@@ -639,6 +688,12 @@ impl<D: Driver> BufferRegistrar for ExecutorRegistrar<D> {
             .upgrade()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Driver dropped"))?;
         let mut driver = driver_rc.borrow_mut();
-        driver.register_buffer_regions(regions)
+
+        let mut indices = Vec::with_capacity(regions.len());
+        for (i, region) in regions.iter().enumerate() {
+            driver.register_chunk(i as u16, region.as_ptr(), region.len())?;
+            indices.push(i);
+        }
+        Ok(indices)
     }
 }

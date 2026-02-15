@@ -514,6 +514,7 @@ pub(crate) unsafe fn submit_send_to(
 
     // Try RIO upgrade logic
     if let Some(rio) = &mut ctx.rio {
+        let page_idx = op.header.user_data / ctx.slots_per_page;
         if let Some(res) = rio.try_submit_send_to(
             payload.op.fd,
             handle,
@@ -521,6 +522,7 @@ pub(crate) unsafe fn submit_send_to(
             &payload.addr as *const _ as *const std::ffi::c_void,
             payload.addr_len,
             op.header.user_data,
+            page_idx,
         )? {
             return Ok(res);
         }
@@ -572,6 +574,7 @@ pub(crate) unsafe fn submit_recv_from(
 
     // Try RIO upgrade
     if let Some(rio) = &mut ctx.rio {
+        let page_idx = op.header.user_data / ctx.slots_per_page;
         if let Some(res) = rio.try_submit_recv_from(
             payload.op.fd,
             handle,
@@ -579,6 +582,7 @@ pub(crate) unsafe fn submit_recv_from(
             &payload.addr as *const _ as *const std::ffi::c_void,
             &payload.addr_len,
             op.header.user_data,
+            page_idx,
         )? {
             return Ok(res);
         }

@@ -227,6 +227,17 @@ pub trait PoolTopology: Clone + Send + Sync + 'static {
         worker_idx: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool;
+
+    /// Connect a listener to the shared state to receive notifications about new memory chunks.
+    /// Used for dynamic expansion.
+    #[allow(unused_variables)]
+    fn connect_listener(
+        &self,
+        state: &Self::State,
+        listener: Box<dyn Fn(crate::heap::ChunkInfo) + Send + Sync>,
+    ) {
+        // Default implementation does nothing
+    }
 }
 
 /// 标准 Slot 拓扑：使用 GlobalSlotPool
@@ -274,18 +285,33 @@ impl PoolTopology for UniformSlot {
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool {
         // 在 Slot 架构中，所有线程共享一个大的连续区域
-        let global_info = pool.global_info();
+        // Phase 1: For now, we only register the initial chunk (Chunk 0).
+        let global_info = pool.chunk_info(0).expect("Chunk 0 missing");
         let region = crate::buffer::BufferRegion::new(global_info.ptr, global_info.len);
 
         // 注册内存区域
-        let ids = registrar
+        let _ids = registrar
             .register(&[region])
             .expect("Failed to register global buffer region (check 'ulimit -l' / RLIMIT_MEMLOCK)");
 
-        let global_index = ids.first().and_then(|&id| GlobalIndex::new(id as u16));
+        // Build mapping: ChunkID (Index) -> RegionIndex (Value)
+        // Since we only registered Chunk 0, the first ID corresponds to Chunk 0.
+        // Even if registration happens here, SlotBasedPool no longer tracks it.
+        // It's up to the Driver to verify registration.
 
-        let slot_pool = SlotBasedPool::new(pool.clone(), global_index);
+        // We still call register for now to keep existing behavior until Driver is updated,
+        // but we ignore the returned IDs in SlotBasedPool.
+
+        let slot_pool = SlotBasedPool::new(pool.clone());
         AnyBufPool::new(slot_pool)
+    }
+
+    fn connect_listener(
+        &self,
+        state: &Self::State,
+        listener: Box<dyn Fn(crate::heap::ChunkInfo) + Send + Sync>,
+    ) {
+        state.set_listener(listener);
     }
 }
 
@@ -522,14 +548,12 @@ impl std::fmt::Debug for AnyBufPool {
 pub struct SlotBasedPool {
     /// 全局 Slot Pool 的引用 (Arc)
     pool: Arc<crate::heap::GlobalSlotPool>,
-    /// 全局索引（用于驱动注册）
-    global_index: Option<GlobalIndex>,
 }
 
 impl SlotBasedPool {
     /// 创建新的 SlotBasedPool
-    pub fn new(pool: Arc<crate::heap::GlobalSlotPool>, global_index: Option<GlobalIndex>) -> Self {
-        Self { pool, global_index }
+    pub fn new(pool: Arc<crate::heap::GlobalSlotPool>) -> Self {
+        Self { pool }
     }
 
     /// Calculate order for a given size
@@ -548,9 +572,7 @@ impl SlotBasedPool {
 
 impl std::fmt::Debug for SlotBasedPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlotBasedPool")
-            .field("global_index", &self.global_index)
-            .finish()
+        f.debug_struct("SlotBasedPool").finish()
     }
 }
 
@@ -559,21 +581,26 @@ impl BackingPool for SlotBasedPool {
         let size_val = size.get();
         let order = Self::calculate_order(size_val);
 
-        if let Some((slot_idx, ptr)) = self.pool.alloc_slots(order) {
+        if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order) {
             let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
 
             // Pack Metadata into Context (64-bit)
-            // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
-            let global_idx_val = self
-                .global_index
-                .map(|g| g.get() as u64)
-                .unwrap_or(NO_REGISTRATION_INDEX as u64);
+            // Layout: [ChunkID 16b] [Reserved 16b] [Order 8b] [SlotIndex 24b]
+            // Constraint: SlotIndex must fit in 24 bits (16 Million slots = 64GB @ 4KB).
 
+            let chunk_id_val = chunk_id as u64;
+            // Reserved: 0
             let s_idx = slot_idx.0 as u64;
-            debug_assert!(s_idx < (1 << 40), "SlotIndex exceeded 40 bits");
 
-            let context =
-                (global_idx_val << 48) | ((order as u64 & 0xFF) << 40) | (s_idx & 0xFFFFFFFFFF);
+            debug_assert!(
+                s_idx < (1 << 24),
+                "SlotIndex exceeded 24 bits (Chunk too large)"
+            );
+
+            let context = (chunk_id_val << 48)
+                // | (0 << 32) // Reserved
+                | ((order as u64 & 0xFF) << 24)
+                | (s_idx & 0xFFFFFF);
 
             let cap = unsafe { NonZeroUsize::new_unchecked(capacity) };
 
@@ -613,15 +640,16 @@ unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams)
     let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
 
     // Unpack context (u64)
-    // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
-    let order = ((params.context >> 40) & 0xFF) as usize;
-    let slot_idx_val = (params.context & 0xFFFFFFFFFF) as usize;
+    // Layout: [ChunkID 16b] [RegionIndex 16b] [Order 8b] [SlotIndex 24b]
+    let chunk_id = ((params.context >> 48) & 0xFFFF) as u16;
+    let order = ((params.context >> 24) & 0xFF) as usize;
+    let slot_idx_val = (params.context & 0xFFFFFF) as usize;
     let slot_idx = crate::heap::slot::SlotIndex(slot_idx_val);
 
     // Restore ownership of Arc to drop it (decrement ref count)
     let pool = unsafe { Arc::from_raw(raw_ptr) };
     unsafe {
-        pool.dealloc_slots(slot_idx, order);
+        pool.dealloc_slots(chunk_id, slot_idx, order);
     }
 }
 
@@ -632,19 +660,17 @@ unsafe fn slot_based_resolve_region_info_shim(
     // 1. Cast back to GlobalSlotPool
     let pool = unsafe { &*(pool_data.as_ptr() as *const crate::heap::GlobalSlotPool) };
 
-    // 2. Get base address from global info
-    let global_info = pool.global_info();
-    let base = global_info.ptr.as_ptr() as usize;
+    // 2. Unpack ChunkID
+    // Layout: [ChunkID 16b] [Reserved 16b] [Order 8b] [SlotIndex 24b]
+    let chunk_id = ((buf.context >> 48) & 0xFFFF) as u16;
+
+    // 3. Get base address from ChunkInfo
+    let chunk_info = pool
+        .chunk_info(chunk_id)
+        .expect("FixedBuf has invalid ChunkID");
+    let base = chunk_info.ptr.as_ptr() as usize;
     let ptr = buf.as_ptr() as usize;
 
-    // 3. Unpack GlobalIndex from context
-    // Layout: [GlobalIndex 16b] [Order 8b] [SlotIndex 40b]
-    let global_idx_val = (buf.context >> 48) & 0xFFFF;
-    let region_index = if global_idx_val == NO_REGISTRATION_INDEX as u64 {
-        usize::MAX
-    } else {
-        global_idx_val as usize
-    };
-
-    (region_index, ptr.saturating_sub(base))
+    // Return (ChunkID, Offset)
+    (chunk_id as usize, ptr.saturating_sub(base))
 }

@@ -389,16 +389,11 @@ impl IocpDriver {
         }
     }
 
-    pub fn register_buffer_regions(
-        &mut self,
-        regions: &[veloq_buf::BufferRegion],
-    ) -> io::Result<Vec<usize>> {
+    pub fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
         if let Some(rio) = &mut self.rio_state {
-            rio.register_buffers(regions)?;
-            // RIO state stores IDs sequentially in registered_bufs matching the regions input
-            return Ok((0..regions.len()).collect());
+            rio.register_chunk(id, ptr, len)?;
         }
-        Ok((0..regions.len()).collect())
+        Ok(())
     }
 
     pub fn cancel_op_internal(&mut self, user_data: usize) {

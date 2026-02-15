@@ -134,6 +134,21 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 
         let registry = Arc::new(ExecutorRegistry::new(handles));
 
+        // Connect Dynamic Memory Listener
+        // This bridges the gap between veloq-buf (Allocation) and veloq-runtime (Registration).
+        // When the pool expands, this callback notifies the registry, incrementing the epoch.
+        let registry_clone = registry.clone();
+        self.topology.connect_listener(
+            &state,
+            Box::new(move |chunk_info| {
+                registry_clone.register_chunk(
+                    chunk_info.id,
+                    chunk_info.ptr.as_ptr() as usize,
+                    chunk_info.len.get(),
+                );
+            }),
+        );
+
         // Initialize peer file descriptors storage (initially 0)
         let peer_handles = Arc::new(
             (0..worker_count)

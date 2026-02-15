@@ -17,6 +17,7 @@ veloq-atomic-waker.workspace = true
 veloq-buf.workspace = true
 veloq-wheel.workspace = true
 veloq-blocking.workspace = true
+veloq-bitset.workspace = true
 
 crossbeam-utils.workspace = true
 crossbeam-queue.workspace = true

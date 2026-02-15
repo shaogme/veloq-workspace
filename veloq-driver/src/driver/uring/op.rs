@@ -21,7 +21,7 @@ use std::time::Duration;
 // VTable Definition
 // ============================================================================
 
-pub type MakeSqeFn = unsafe fn(op: &mut UringOp, driver_id: usize) -> squeue::Entry;
+pub type MakeSqeFn = unsafe fn(op: &mut UringOp, driver: &UringDriver) -> squeue::Entry;
 pub type OnCompleteFn = unsafe fn(op: &mut UringOp, result: i32) -> io::Result<usize>;
 pub type DropFn = unsafe fn(op: &mut UringOp);
 pub type GetFdFn = unsafe fn(op: &UringOp) -> Option<IoFd>;
