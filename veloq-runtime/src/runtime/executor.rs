@@ -639,6 +639,12 @@ impl<D: Driver> BufferRegistrar for ExecutorRegistrar<D> {
             .upgrade()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Driver dropped"))?;
         let mut driver = driver_rc.borrow_mut();
-        driver.register_buffer_regions(regions)
+
+        let mut indices = Vec::with_capacity(regions.len());
+        for (i, region) in regions.iter().enumerate() {
+            driver.register_chunk(i as u16, region.as_ptr(), region.len())?;
+            indices.push(i);
+        }
+        Ok(indices)
     }
 }

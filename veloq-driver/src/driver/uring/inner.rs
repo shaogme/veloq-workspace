@@ -88,6 +88,7 @@ impl Drop for UringWaker {
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 pub(crate) const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
+pub(crate) const MAX_CHUNKS: usize = 1024;
 
 pub struct UringDriver {
     pub(crate) ring: IoUring,
@@ -98,7 +99,7 @@ pub struct UringDriver {
 
     pub(crate) waker_fd: RawFd,
     pub(crate) waker_token: Option<usize>,
-    pub(crate) buffers_registered: bool,
+    pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
     pub(crate) wheel: veloq_wheel::Wheel<usize>,
@@ -147,7 +148,7 @@ impl UringDriver {
             pending_cancellations: VecDeque::new(),
             waker_fd,
             waker_token: None,
-            buffers_registered: false,
+            registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
             is_waked,
 
             wheel: veloq_wheel::Wheel::new(veloq_wheel::WheelConfig::default()),
@@ -155,6 +156,21 @@ impl UringDriver {
         };
 
         driver.submit_waker();
+
+        // Sparse registration
+        let iovecs = vec![
+            libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0
+            };
+            MAX_CHUNKS
+        ];
+
+        // We ignore errors here? Or warn?
+        // If this fails, then subsequent register_chunk will likely fail or revert to slow path.
+        if let Err(e) = unsafe { driver.ring.submitter().register_buffers(&iovecs) } {
+            tracing::warn!("Failed to register sparse buffers: {}", e);
+        }
 
         Ok(driver)
     }
@@ -172,11 +188,9 @@ impl UringDriver {
                     let strategy = res.vtable.as_ref().strategy;
                     match strategy {
                         crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
-                            let s = (res.vtable.as_ref().make_sqe)(
-                                res,
-                                self.waker_fd as usize,
-                            )
-                            .user_data(user_data as u64);
+                            let driver_ref = &*(self as *mut Self as *const Self);
+                            let s = (res.vtable.as_ref().make_sqe)(res, driver_ref)
+                                .user_data(user_data as u64);
                             (Some(s), strategy, None)
                         }
                         crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
@@ -207,7 +221,10 @@ impl UringDriver {
                         Ok(false)
                     }
                 } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "SQE generation failed"))
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "SQE generation failed",
+                    ))
                 }
             }
             crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
@@ -222,15 +239,16 @@ impl UringDriver {
                     trace!(user_data, ?duration, "Registered software timer");
                     Ok(true)
                 } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "Timer duration missing"))
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "Timer duration missing",
+                    ))
                 }
             }
-            _ => {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "Unsupported strategy for slot submission",
-                ))
-            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported strategy for slot submission",
+            )),
         }
     }
 
@@ -273,7 +291,8 @@ impl UringDriver {
                 let slot = &self.ops.shared.slots[user_data];
                 unsafe {
                     let op_ref = (*slot.op.get()).as_mut().unwrap();
-                    (op_ref.vtable.as_ref().make_sqe)(op_ref, self.waker_fd as usize)
+                    let driver_ref = &*(self as *mut Self as *const Self);
+                    (op_ref.vtable.as_ref().make_sqe)(op_ref, driver_ref)
                         .user_data(user_data as u64)
                 }
             };
@@ -581,36 +600,32 @@ impl UringDriver {
         Some(head)
     }
 
-    pub(crate) fn register_buffer_regions(
-        &mut self,
-        regions: &[veloq_buf::BufferRegion],
-    ) -> io::Result<Vec<usize>> {
-        if self.buffers_registered {
-            return Ok((0..regions.len()).collect());
+    pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
+        let index = id as usize;
+        if index >= MAX_CHUNKS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ChunkID exceeds MAX_CHUNKS",
+            ));
         }
 
-        let iovecs: Vec<libc::iovec> = regions
-            .iter()
-            .map(|region| libc::iovec {
-                iov_base: region.as_mut_ptr() as *mut _,
-                iov_len: region.len(),
-            })
-            .collect();
+        let iovecs = [libc::iovec {
+            iov_base: ptr as *mut _,
+            iov_len: len,
+        }];
 
-        match unsafe { self.ring.submitter().register_buffers(&iovecs) } {
-            Ok(_) => {
-                self.buffers_registered = true;
-                Ok((0..regions.len()).collect())
-            }
-            Err(e) => {
-                if e.raw_os_error() == Some(libc::EBUSY) {
-                    self.buffers_registered = true;
-                    Ok((0..regions.len()).collect())
-                } else {
-                    Err(e)
-                }
-            }
+        // Use register_buffers_update
+        // offset = index
+        unsafe {
+            self.ring
+                .submitter()
+                .register_buffers_update(index as u32, &iovecs, None)?;
         }
+
+        // Mark as registered in local bitset
+        let _ = self.registered_chunks.set(index); // ignore out of bounds error as we checked
+
+        Ok(())
     }
 
     pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {

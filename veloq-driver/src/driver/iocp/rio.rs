@@ -20,11 +20,6 @@ use windows_sys::Win32::Networking::WinSock::{
 const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0 as RIO_BUFFERID;
 const RIO_NOTIFICATION_COMPLETION_TYPE_IOCP: u32 = 1;
 
-#[derive(Debug, Clone, Copy)]
-pub struct RioBufferInfo {
-    pub(crate) id: RIO_BUFFERID,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct RioDispatch {
     pub create_cq: unsafe extern "system" fn(u32, *const RIO_NOTIFICATION_COMPLETION) -> RIO_CQ,
@@ -71,7 +66,7 @@ pub(crate) struct RioDispatch {
 
 pub struct RioState {
     pub(crate) cq: RIO_CQ,
-    pub(crate) registered_bufs: Vec<RioBufferInfo>,
+    pub(crate) chunk_registry: Vec<RIO_BUFFERID>,
     // RIO Request Queues per socket (raw handle)
     pub(crate) rio_rqs: FxHashMap<HANDLE, RIO_RQ>,
     // RIO Request Queues for registered files (O(1) lookup)
@@ -145,7 +140,7 @@ impl RioState {
 
             Ok(Some(Self {
                 cq,
-                registered_bufs: Vec::new(),
+                chunk_registry: Vec::new(),
                 rio_rqs: FxHashMap::default(),
                 registered_rio_rqs: Vec::new(),
                 slab_rio_pages: Vec::new(),
@@ -168,22 +163,24 @@ impl RioState {
         }
     }
 
-    pub fn register_buffers(&mut self, regions: &[veloq_buf::BufferRegion]) -> io::Result<()> {
+    pub fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
         let reg_fn = self.dispatch.register_buffer;
+        let id_idx = id as usize;
 
-        self.registered_bufs.clear();
-        self.registered_bufs.reserve(regions.len());
-
-        for region in regions {
-            let len = region.len();
-            let id = unsafe { reg_fn(region.as_ptr() as *const u8, len as u32) };
-
-            if id == RIO_INVALID_BUFFERID {
-                return Err(io::Error::last_os_error());
-            }
-
-            self.registered_bufs.push(RioBufferInfo { id });
+        if id_idx >= self.chunk_registry.len() {
+            self.chunk_registry.resize(id_idx + 1, RIO_INVALID_BUFFERID);
         }
+
+        // Check if already registered? For now assuming simple update or overwrite.
+        // Note: RIO buffers need to be deregistered? implementation specific.
+        // Here we assume new registration.
+
+        let buf_id = unsafe { reg_fn(ptr, len as u32) };
+        if buf_id == RIO_INVALID_BUFFERID {
+            return Err(io::Error::last_os_error());
+        }
+
+        self.chunk_registry[id_idx] = buf_id;
         Ok(())
     }
 
@@ -339,11 +336,10 @@ impl RioState {
         user_data: usize,
     ) -> io::Result<Option<SubmissionResult>> {
         let (idx, offset) = buf.resolve_region_info();
-        // Solve borrow checker issue: extraction of Copy data (id)
-        let buffer_id = if let Some(info) = self.registered_bufs.get(idx) {
-            info.id
-        } else {
-            return Ok(None);
+        // Check chunk registry
+        let buffer_id = match self.chunk_registry.get(idx) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => id,
+            _ => return Ok(None),
         };
 
         // Now self.registered_bufs borrow has ended
@@ -374,11 +370,10 @@ impl RioState {
         user_data: usize,
     ) -> io::Result<Option<SubmissionResult>> {
         let (idx, offset) = buf.resolve_region_info();
-        // Solve borrow checker issue
-        let buffer_id = if let Some(info) = self.registered_bufs.get(idx) {
-            info.id
-        } else {
-            return Ok(None);
+        // Check chunk registry
+        let buffer_id = match self.chunk_registry.get(idx) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => id,
+            _ => return Ok(None),
         };
 
         let rq = self.ensure_rq(handle, fd)?;
@@ -411,14 +406,11 @@ impl RioState {
         // Removed `ops` here. Caller must ensure slab registration.
     ) -> io::Result<Option<SubmissionResult>> {
         let (idx, offset) = buf.resolve_region_info();
-        let buffer_id = match self.registered_bufs.get(idx) {
-            Some(i) => i.id,
-            None => {
-                // If index is invalid (e.g. usize::MAX), silently ignore and return None (fallback to normal IO?)
-                // Or log error? The original code returned Ok(None).
-                if idx != usize::MAX {
-                    error!(idx, "RIO: Buffer index not found for send_to");
-                }
+        // Check chunk registry
+        let buffer_id = match self.chunk_registry.get(idx) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => id,
+            _ => {
+                // If index is invalid, fallback to normal IO
                 return Ok(None);
             }
         };
@@ -483,14 +475,10 @@ impl RioState {
         // Removed `ops`
     ) -> io::Result<Option<SubmissionResult>> {
         let (idx, offset) = buf.resolve_region_info();
-        let buffer_id = match self.registered_bufs.get(idx) {
-            Some(i) => i.id,
-            None => {
-                if idx != usize::MAX {
-                    error!(idx, "RIO: Buffer index not found for recv_from");
-                }
-                return Ok(None);
-            }
+        // Check chunk registry
+        let buffer_id = match self.chunk_registry.get(idx) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => id,
+            _ => return Ok(None),
         };
 
         // Simplified page_idx = 0

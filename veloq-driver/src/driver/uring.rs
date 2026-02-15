@@ -69,7 +69,10 @@ impl UringDriver {
             Ok(true) => Ok(Poll::Ready(())),
             Ok(false) => {
                 // Should technically not happen for SoftwareTimer unless we change logic later
-                debug!(user_data, "SQ full (unexpected for timer), pushing to backlog");
+                debug!(
+                    user_data,
+                    "SQ full (unexpected for timer), pushing to backlog"
+                );
                 if let Some(entry) = self.ops.get_mut(user_data) {
                     entry.platform_data.lifecycle = inner::OpLifecycle::Pending;
                 }
@@ -133,7 +136,8 @@ impl Driver for UringDriver {
         let strategy = unsafe { op.vtable.as_ref().strategy };
         if strategy == op::SubmissionStrategy::BackgroundOnly {
             let sqe = unsafe {
-                (op.vtable.as_ref().make_sqe)(&mut op, self.waker_fd as usize)
+                let driver_ref = &*(self as *mut Self as *const Self);
+                (op.vtable.as_ref().make_sqe)(&mut op, driver_ref)
                     .user_data(inner::BACKGROUND_USER_DATA)
             };
 
@@ -226,11 +230,8 @@ impl Driver for UringDriver {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_buffer_regions(
-        &mut self,
-        regions: &[veloq_buf::BufferRegion],
-    ) -> io::Result<Vec<usize>> {
-        UringDriver::register_buffer_regions(self, regions)
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
+        UringDriver::register_chunk(self, id, ptr, len)
     }
 
     fn register_files(&mut self, files: &[crate::RawHandle]) -> io::Result<Vec<crate::op::IoFd>> {

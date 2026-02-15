@@ -270,11 +270,8 @@ impl Driver for IocpDriver {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_buffer_regions(
-        &mut self,
-        regions: &[veloq_buf::BufferRegion],
-    ) -> io::Result<Vec<usize>> {
-        IocpDriver::register_buffer_regions(self, regions)
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
+        IocpDriver::register_chunk(self, id, ptr, len)
     }
 
     fn register_files(&mut self, files: &[crate::RawHandle]) -> io::Result<Vec<crate::op::IoFd>> {

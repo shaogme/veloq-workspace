@@ -525,7 +525,6 @@ impl std::fmt::Debug for AnyBufPool {
 /// 基于 GlobalSlotPool 的 Pool 实现
 ///
 /// 这个 Pool 使用 GlobalSlotPool 来分配内存。
-//
 #[derive(Clone)]
 pub struct SlotBasedPool {
     /// 全局 Slot Pool 的引用 (Arc)

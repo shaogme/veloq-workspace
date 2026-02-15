@@ -1136,6 +1136,7 @@ dependencies = [
  "rustc-hash",
  "tracing",
  "veloq-atomic-waker",
+ "veloq-bitset",
  "veloq-blocking",
  "veloq-buf",
  "veloq-wheel",
