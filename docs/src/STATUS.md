@@ -2,7 +2,7 @@
 
 本文档汇总了 Veloq 项目各模块的开发状态、已完成特性以及待办事项列表。
 
-**最后更新时间**: 2026-01-13
+**最后更新时间**: 2026-02-15
 **总体状态**: 🚧 **Alpha 阶段** (核心架构已定型，API 尚未冻结)
 
 ## 仪表盘 (Dashboard)
@@ -29,8 +29,8 @@ pie title 核心模块完成度估算
 - [x] **调度算法**:
     - [x] **P2C (Power of Two Choices)**: 发送端负载均衡。
     - [x] **Work Stealing**: 接收端负载均衡。
+- [x] **Blocking Pool**: 处理 CPU 密集型或同步系统调用的全局线程池 (`runtime/blocking.rs`)。
 - [ ] **待办 (TODO)**:
-    - [ ] **Blocking Pool**: 缺乏处理 CPU 密集型或同步系统调用的专用线程池。
     - [ ] **协作式抢占**: 防止死循环任务卡死 Worker。
     - [ ] **Task Debugging**: 增加任务追踪和调试视图。
 
@@ -48,10 +48,10 @@ pie title 核心模块完成度估算
 - [x] **基础支持**: 提交队列 (SQ) 和完成队列 (CQ) 的管理。
 - [x] **特性开关**: 支持 `Single Issuer` 和 `Defer Taskrun` 等新内核特性。
 - [x] **Backlog**: 简单的链表 Backlog 处理 SQ 满的情况。
+- [x] **Fixed Files**: 支持文件描述符注册 (`IoFd::Fixed`) 以减少内核开销。
 - [ ] **待办 (TODO)**:
     - [ ] **Zero Copy**: 集成 `IORING_OP_SEND_ZC`。
     - [ ] **Multishot**: 利用 `IORING_RECV_MULTISHOT` 优化吞吐。
-    - [ ] **Fixed Files**: 支持文件描述符注册以减少内核开销。
 
 ### 2.3 Windows (IOCP)
 - [x] **基础支持**: 基于 `GetQueuedCompletionStatus` 的事件循环。
@@ -62,17 +62,20 @@ pie title 核心模块完成度估算
     - [ ] **SyncFileRange**: 寻找比 `FlushFileBuffers` 更细粒度的刷盘方案。
 
 ## 3. 内存管理 (Memory)
-> **状态**: ✅ **可用 (Functional)**
+> **状态**: ✅ **成熟 (Mature)**
 
-- [x] **FixedBuf**: 实现了拥有权的缓冲区抽象，适配 Proactor 模型。
+独立为 `veloq-buf` crate，架构分离为 Heap Layer 和 Buffer Layer。
+
+- [x] **PoolTopology**: 支持 `GlobalSlotPool` + `Superblock` 的分片全局池架构。
+- [x] **Dynamic Expansion**: 支持 Chunk 的动态分配，并自动通知 Driver 注册新内存。
+- [x] **FixedBuf**: 实现了拥有权的缓冲区抽象，内嵌 `ChunkID` 实现 O(1) 路由。
 - [x] **分配器**:
-    - [x] **BuddyPool**: 通用的伙伴系统分配器。
-    - [x] **HybridPool**: 针对网络包优化的 Slab + Global 混合分配器。
-- [x] **对齐**: 强制 4KB 对齐，满足 Direct I/O 需求。
-- [x] **跨线程归还**: 支持 `FixedBuf` 在不同线程间流转并安全释放。
+    - [x] **BuddyAllocator**: 分片化的伙伴系统 (Sharded Buddy System)。
+    - [x] **Superblock**: 针对 4KB 对象的 TLS 无锁缓存。
+- [x] **对齐**: 强制 4KB 对齐，满足 `O_DIRECT`。
 - [ ] **待办 (TODO)**:
-    - [ ] **动态扩容**: 支持 Arena 的动态增长。
-    - [ ] **Huge Page**: 支持大页分配。
+    - [ ] **Huge Page**: 完善大页分配支持。
+    - [ ] **NUMA 感知**: 优化跨 NUMA 节点的内存分配。
 
 ## 4. 上层 API (Net & FS)
 > **状态**: 🛠️ **基础功能 (Basic)**
