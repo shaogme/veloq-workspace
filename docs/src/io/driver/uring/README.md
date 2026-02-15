@@ -106,9 +106,11 @@ pub struct UringOp {
 - **on_complete_***: 处理内核返回的 `i32` 结果。例如 `Accept` 操作在此处将内核写入的 `sockaddr` 字节解析为 Rust 的 `SocketAddr`。
 - **drop_***: 安全地释放 Union 中的资源。
 
-### 4.4 缓冲区管理
-驱动支持 `FixedBuf`，对应 `io_uring` 的 `IOSQE_FIXED_FILE` 和预注册缓冲区 (`IORING_REGISTER_BUFFERS`)。
-- 在 `make_sqe` 中，如果检测到 `buf_index != NO_REGISTRATION_INDEX`，会自动使用 `opcode::ReadFixed` / `WriteFixed` 等变体，实现零拷贝和内核侧缓冲区复用。
+### 4.4 缓冲区管理 (Sparse Buffer Registration)
+为了支持动态内存扩展并避免全量重新注册的开销，驱动实现了 **稀疏缓冲注册 (Sparse Registration)**：
+- **初始化**: 在 `UringDriver::new` 中，驱动会使用 `IORING_REGISTER_BUFFERS` 注册一个全空的 `iovec` 数组，大小为 `MAX_CHUNKS` (默认为 1024)。
+- **增量更新**: 当调用 `register_chunk` 时，驱动使用 `IORING_REGISTER_BUFFERS_UPDATE` 指令，仅更新指定 `ChunkID` 对应的槽位。这使得新内存块的注册成本极低，且不影响正在进行的 I/O。
+- **零拷贝**: 在 `make_sqe` 中，如果检测到 Op 携带的 `FixedBuf` 指向有效的注册 Chunk，会自动使用 `opcode::ReadFixed` / `WriteFixed` 等变体，指示内核直接使用预注册的缓冲区，实现零拷贝。
 
 ## 5. 存在的问题和 TODO (Issues and TODOs)
 

@@ -80,7 +80,7 @@ pub trait Driver: 'static {
     type Op: PlatformOp;
 
     // 核心生命周期
-    fn reserve_op(&mut self) -> (usize, u32); // 返回 (index, generation)
+    fn reserve_op(&mut self) -> io::Result<(usize, u32)>; // 返回 (index, generation)
     fn slot_table(&self) -> Arc<SlotTable<Self::Op>>;
     fn submit(&mut self, user_data: usize, op: Self::Op) -> Result<Poll<()>, ...>;
     fn poll_op(&mut self, user_data: usize, cx: &mut Context) -> Poll<...>;
@@ -91,6 +91,8 @@ pub trait Driver: 'static {
 
     // 资源管理
     fn register_files(...) -> ...;
+    fn unregister_files(...) -> ...;
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()>;
     fn submit_background(&mut self, op: Self::Op) -> ...;
 }
 ```

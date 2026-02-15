@@ -50,6 +50,7 @@ src/runtime/
 `Runtime` 结构体持有所有 Worker 线程的句柄 (`JoinHandle`) 和全局注册表 (`ExecutorRegistry`)。
 在 `RuntimeBuilder::build()` 过程中，会进行如下关键初始化：
 - **Shared States**: 预分配所有 Worker 的共享状态 (`ExecutorShared`)，包含注入队列 (`Injector`)、Pinned 通道 (`mpsc`) 和负载计数器。
+- **Dynamic Memory Listener**: 连接 `PoolTopology` 的扩容监听器。当缓冲池动态分配新 Chunk 时，自动通知全局注册表，触发所有 Worker 的 Driver 进行内存注册。
 - **Thread Spawning**: 启动 Worker 线程，每个线程运行一个 `LocalExecutor`，并绑定 Buffer Pool。
 
 ### 4.2 Context (`context.rs`)

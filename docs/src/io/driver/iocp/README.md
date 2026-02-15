@@ -39,10 +39,10 @@ IOCP 是原生的 Proactor 模型。应用程序“投递”一个 I/O 请求（
 ### 2.5 Registered I/O (RIO) 集成
 为了追求极致的网络性能，驱动集成了 Windows RIO 扩展，并实现了多项优化：
 
-- **缓冲区注册**: 通过 `register_buffers` 接口，预先将内存注册到内核。
+- **缓冲区注册**: 实现了 `Driver::register_chunk` 接口。驱动内部维护 `chunk_registry`，将 `veloq-buf` 的 `ChunkID` 映射到 Windows RIO 的 `RIO_BUFFERID`。这允许内存块的动态与增量注册。
 - **逻辑区域映射 (Logical Region Mapping)**: Veloq 引入了创新的缓冲区管理设计。Windows 驱动将逻辑区域索引直接映射到 RIO Buffer ID，实现了 O(1) 的缓冲区解析。
 - **O(1) 请求队列 (RQ) 查找**: 对于注册文件 (`IoFd::Fixed`)，驱动在 `RioState` 中维护了一个直接映射表 `registered_rio_rqs`。这消除了哈希表查找的开销，使得获取 Request Queue 的操作也是 O(1) 的。
-- **Slab 页注册**: 为了支持 `SendTo`/`RecvFrom` 等操作中的地址结构体（`SOCKADDR`），驱动会自动将 `SlotTable` 占用的内存页注册到 RIO。这允许 `Slot` 内的元数据结构也通过 RIO 零拷贝地传递。
+- **Slab 页注册**: 为了支持 `SendTo`/`RecvFrom` 等操作中的地址结构体（`SOCKADDR`），驱动会自动将 `SlotTable` 占用的内存页通过 `register_buffer` 注册到 RIO。这允许 `Slot` 内的元数据结构也通过 RIO 零拷贝地传递。
 - **自动降级**: 在提交操作时 (`submit.rs`)，驱动会自动检测是否满足 RIO 条件（Buffer 已注册、RQ 获取成功）。如果满足则走 RIO 路径；否则无缝回退到普通 IOCP。
 
 ## 3. 模块内结构 (Internal Structure)
@@ -82,7 +82,7 @@ src/driver/iocp/
 - **RQ 管理**: 
     - `rio_rqs`: `HashMap<HANDLE, RIO_RQ>` 用于原始句柄。
     - `registered_rio_rqs`: `Vec<Option<RIO_RQ>>` 用于注册文件，提供 O(1) 访问。
-- **Buffer 管理**: 维护 `registered_bufs` 以及 `slab_rio_pages`（用于内部地址缓冲区的 RIO 注册）。
+- **Buffer 管理**: 维护 `chunk_registry: Vec<RIO_BUFFERID>` 以及 `slab_rio_pages`（用于内部地址缓冲区的 RIO 注册）。
 - **完成处理**: `process_completions` 使用 `RIODequeueCompletion` 批量获取完成结果，并更新对应 `Slot` 的状态。
 
 ### 4.3 智能提交 (`submit.rs`)

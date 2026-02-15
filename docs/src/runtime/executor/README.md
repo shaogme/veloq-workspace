@@ -59,6 +59,10 @@ Veloq 结合了发送端和接收端的负载均衡：
 核心是一个带有 **Budget** (预算) 的循环：
 ```rust
 loop {
+    // 0. Check Memory Updates
+    // 检查并注册新扩展的内存块 (Pull Model)
+    self.check_for_memory_updates();
+
     let mut executed = 0;
     while executed < BUDGET {
         
