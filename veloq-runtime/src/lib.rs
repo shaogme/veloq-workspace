@@ -20,10 +20,11 @@ pub use runtime::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
 #[cfg(test)]
 mod tests {
     mod basic;
+    mod buffer_test;
     mod fs;
     mod select_test;
-    mod spawn_to_test;
     mod socket_opts;
+    mod spawn_to_test;
     mod tcp;
     mod time;
     mod udp;
