@@ -403,7 +403,7 @@ impl RioState {
         addr_ptr: *const std::ffi::c_void,
         addr_len: i32,
         user_data: usize,
-        // Removed `ops` here. Caller must ensure slab registration.
+        page_idx: usize,
     ) -> io::Result<Option<SubmissionResult>> {
         let (idx, offset) = buf.resolve_region_info();
         // Check chunk registry
@@ -414,8 +414,6 @@ impl RioState {
                 return Ok(None);
             }
         };
-
-        let page_idx = 0; // Simplified for now since OpRegistry allocated a single block
 
         // Copy values out to avoid holding borrow on self.slab_rio_pages while calling ensure_rq
         let (addr_buf_id, base_addr) = if let Some(Some(entry)) = self.slab_rio_pages.get(page_idx)
@@ -472,7 +470,7 @@ impl RioState {
         addr_ptr: *const std::ffi::c_void,
         len_ptr: *const i32,
         user_data: usize,
-        // Removed `ops`
+        page_idx: usize,
     ) -> io::Result<Option<SubmissionResult>> {
         let (idx, offset) = buf.resolve_region_info();
         // Check chunk registry
@@ -480,9 +478,6 @@ impl RioState {
             Some(&id) if id != RIO_INVALID_BUFFERID => id,
             _ => return Ok(None),
         };
-
-        // Simplified page_idx = 0
-        let page_idx = 0;
 
         // Copy values out to avoid holding borrow on self
         let (addr_buf_id, base_addr) = if let Some(Some(entry)) = self.slab_rio_pages.get(page_idx)

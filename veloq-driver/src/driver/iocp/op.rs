@@ -54,6 +54,7 @@ pub struct SubmitContext<'a> {
 
     // RIO Support
     pub rio: Option<&'a mut RioState>,
+    pub slots_per_page: usize,
 }
 
 // ============================================================================
