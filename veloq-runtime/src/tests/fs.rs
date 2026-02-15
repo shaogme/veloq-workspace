@@ -162,3 +162,78 @@ fn test_multithread_file_ops() {
 
     assert_eq!(completion_count.load(Ordering::SeqCst), NUM_TASKS);
 }
+
+/// Test File read cancellation
+#[test]
+fn test_fs_cancel_read() {
+    use crate::select;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    // Helper to yield once to allow the IO future to be polled and submitted
+    struct YieldOnce(bool);
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    let completion_count = Arc::new(AtomicUsize::new(0));
+    let completion_count_clone = completion_count.clone();
+
+    let runtime = Runtime::builder()
+        .config(crate::config::Config::default().worker_threads(1))
+        .build()
+        .unwrap();
+
+    runtime.block_on(async move {
+        // Create a large file
+        let path = Path::new("test_fs_cancel.tmp");
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+
+        let file = File::create(path).await.expect("Failed to create file");
+        let size = nz!(65536);
+        let mut write_buf = alloc(size);
+        write_buf.set_len(size.get());
+        // Fill properly to avoid sparse optimization if any?
+        write_buf.as_slice_mut().fill(1);
+
+        file.write_at(write_buf, 0).await.0.expect("Write failed");
+        file.sync_all().await.expect("Sync failed");
+        drop(file);
+
+        // Re-open for read
+        let file = File::open(path).await.expect("Failed to open file");
+        let read_buf = alloc(size);
+
+        select! {
+            res = file.read_at(read_buf, 0) => {
+                 let _ = res.0.expect("Read success");
+                 println!("Read completed instantly - cancellation skipped");
+            },
+            _ = YieldOnce(false) => {
+                 println!("File read cancelled successfully");
+            }
+        };
+
+        // Cleanup
+        drop(file);
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+
+        completion_count_clone.fetch_add(1, Ordering::SeqCst);
+    });
+
+    assert_eq!(completion_count.load(Ordering::SeqCst), 1);
+}

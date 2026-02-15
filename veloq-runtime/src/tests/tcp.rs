@@ -606,3 +606,66 @@ fn test_multithread_concurrent_clients() {
     assert_eq!(connection_count.load(Ordering::SeqCst), NUM_CLIENTS);
     println!("All {} clients completed", NUM_CLIENTS);
 }
+/// Test TCP recv cancellation
+#[test]
+fn test_tcp_cancel_recv() {
+    use crate::select;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    // Helper to yield once to allow the IO future to be polled and submitted
+    struct YieldOnce(bool);
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    let runtime = Runtime::builder()
+        .config(crate::config::Config::default().worker_threads(1))
+        .build()
+        .unwrap();
+
+    runtime.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        let listener_arc = Arc::new(listener);
+        let listener_clone = listener_arc.clone();
+
+        let server_h = crate::runtime::context::spawn(async move {
+            let (stream, _) = listener_clone.accept().await.expect("Accept failed");
+            // Don't send anything, just hold connection
+            // Keep stream alive until cancelled
+            YieldOnce(false).await; // Yield a bit
+            drop(stream);
+        });
+
+        let stream = TcpStream::connect(listen_addr)
+            .await
+            .expect("Failed to connect");
+
+        let buf = crate::runtime::context::alloc(nz!(1024));
+
+        // Use select to cancel recv
+        select! {
+            _ = stream.recv(buf) => {
+                panic!("Recv should have been cancelled, but it completed (unexpectedly)");
+            },
+            _ = YieldOnce(false) => {
+                println!("TCP recv cancelled successfully");
+            }
+        };
+
+        drop(stream);
+        server_h.await;
+    });
+}

@@ -587,3 +587,47 @@ fn test_multithread_concurrent_udp_clients() {
         .unwrap();
     }
 }
+/// Test UDP recv cancellation
+#[test]
+fn test_udp_cancel_recv_from() {
+    use crate::select;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    // Helper to yield once to allow the IO future to be polled and submitted
+    struct YieldOnce(bool);
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    let runtime = Runtime::builder()
+        .config(crate::config::Config::default().worker_threads(1))
+        .build()
+        .unwrap();
+
+    runtime.block_on(async move {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP socket");
+        let _addr = socket.local_addr().expect("Failed to get local address");
+
+        let buf = crate::runtime::context::alloc(nz!(1024));
+
+        select! {
+            _ = socket.recv_from(buf) => {
+                panic!("RecvFrom should have been cancelled, but it completed (unexpectedly)");
+            },
+            _ = YieldOnce(false) => {
+                println!("UDP recv cancelled successfully");
+            }
+        };
+    });
+}
