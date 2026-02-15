@@ -329,7 +329,7 @@ impl LocalExecutor {
     fn try_poll_future_injector(&self) -> bool {
         if let Some(task) = self.shared.future_injector.pop() {
             self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
-            task.run();
+            crate::runtime::coop::budget(|| task.run());
             return true;
         }
         false
@@ -355,7 +355,7 @@ impl LocalExecutor {
                     // Steal from future_injector (Runnable)
                     if let Some(task) = target.shared.future_injector.pop() {
                         target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
-                        task.run();
+                        crate::runtime::coop::budget(|| task.run());
                         return true;
                     }
 
@@ -366,7 +366,7 @@ impl LocalExecutor {
                             // We assume if we stole it, it was part of the load.
                             target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
                             trace!("Stole task from worker");
-                            task.run();
+                            crate::runtime::coop::budget(|| task.run());
                             return true;
                         }
                         Steal::Retry => {
@@ -507,7 +507,7 @@ impl LocalExecutor {
                     // Spawner: future_injector -> injected_load.
                     // Context: stealable -> injected_load (we decided this).
                     self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
-                    task.run();
+                    crate::runtime::coop::budget(|| task.run());
                     executed += 1;
                     continue;
                 }
@@ -518,7 +518,7 @@ impl LocalExecutor {
                 let task = self.queue.borrow_mut().pop_front();
                 if let Some(task) = task {
                     self.shared.local_load.fetch_sub(1, Ordering::Relaxed);
-                    task.run();
+                    crate::runtime::coop::budget(|| task.run());
                     executed += 1;
                     continue;
                 }
@@ -591,7 +591,7 @@ impl LocalExecutor {
                 // 1. Poll Stealable (Send Tasks - LIFO)
                 if let Some(task) = self.stealable.pop() {
                     self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
-                    task.run();
+                    crate::runtime::coop::budget(|| task.run());
                     executed += 1;
                     continue;
                 }
@@ -600,7 +600,7 @@ impl LocalExecutor {
                 if state.flag.swap(false, Ordering::AcqRel) {
                     did_work = true;
                     executed += 1;
-                    if let Poll::Ready(val) = pinned_future.as_mut().poll(&mut cx) {
+                    if let Poll::Ready(val) = crate::runtime::coop::budget(|| pinned_future.as_mut().poll(&mut cx)) {
                         return val;
                     }
                 }
@@ -610,7 +610,7 @@ impl LocalExecutor {
                 if let Some(task) = task {
                     self.shared.local_load.fetch_sub(1, Ordering::Relaxed);
                     // task is Arc<Task>, run() takes self: Arc<Task>
-                    task.run();
+                    crate::runtime::coop::budget(|| task.run());
                     executed += 1;
                     continue;
                 }

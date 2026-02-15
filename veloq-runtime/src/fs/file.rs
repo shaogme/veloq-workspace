@@ -1,4 +1,4 @@
-use crate::runtime::context::submit;
+use crate::runtime::context::{submit, CoopFuture};
 
 use super::open_options::OpenOptions;
 
@@ -105,7 +105,7 @@ pub type File = GenericFile<DetachedSubmitter, AtomicU64>;
 
 enum SyncRangeState<S: OpSubmitter> {
     Idle(Option<(S, SyncFileRange)>),
-    Submitted(S::Future<SyncFileRange>),
+    Submitted(CoopFuture<S::Future<SyncFileRange>>),
 }
 
 pub struct SyncRangeFuture<S: OpSubmitter> {

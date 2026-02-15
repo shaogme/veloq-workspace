@@ -1,4 +1,5 @@
 pub mod context;
+pub mod coop;
 pub mod executor;
 pub mod join;
 pub mod task;

@@ -7,7 +7,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::rc::{Rc, Weak};
+use std::task::{Context, Poll};
 
 use crossbeam_deque::Worker;
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
@@ -70,7 +72,33 @@ pub fn try_current() -> Option<RuntimeContext> {
     CONTEXT.with(|ctx| ctx.borrow().clone())
 }
 
-pub fn submit<T, S>(submitter: &S, op: Op<T>) -> S::Future<T>
+/// Future wrapper that enforces cooperative budget.
+pub struct CoopFuture<F> {
+    fut: F,
+    checked: bool,
+}
+
+impl<F: Future> Future for CoopFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Safety: We never move `fut` out of `self`.
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if !this.checked {
+            if let Poll::Pending = crate::runtime::coop::poll_proceed(cx) {
+                return Poll::Pending;
+            }
+            this.checked = true;
+        }
+
+        // Poll inner
+        // Safety: `this.fut` is pinned because `self` was pinned.
+        unsafe { Pin::new_unchecked(&mut this.fut) }.poll(cx)
+    }
+}
+
+pub fn submit<T, S>(submitter: &S, op: Op<T>) -> CoopFuture<S::Future<T>>
 where
     S: OpSubmitter,
     T: IntoPlatformOp<PlatformDriver> + 'static,
@@ -85,7 +113,12 @@ where
         })
         .upgrade()
         .expect("Runtime driver missing");
-    submitter.submit(op, driver)
+
+    let fut = submitter.submit(op, driver);
+    CoopFuture {
+        fut,
+        checked: false,
+    }
 }
 
 /// Try to allocate a buffer from the current runtime context.
@@ -265,16 +298,16 @@ impl Future for YieldNow {
     type Output = ();
 
     fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
         if self.yielded {
-            std::task::Poll::Ready(())
+            Poll::Ready(())
         } else {
             self.yielded = true;
             // Wake ourselves so we get polled again
             cx.waker().wake_by_ref();
-            std::task::Poll::Pending
+            Poll::Pending
         }
     }
 }

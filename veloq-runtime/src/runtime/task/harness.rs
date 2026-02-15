@@ -214,6 +214,17 @@ unsafe fn poll_future<F: Future<Output = ()>>(ptr: NonNull<HarnessedHeader>) {
                     let old = header.state.fetch_and(!RUNNING, Ordering::Release);
 
                     if (old & NOTIFIED) != 0 {
+                        // Check if we should yield due to budget exhaustion
+                        if !crate::runtime::coop::has_remaining() {
+                            // We are notified, but we must yield.
+                            // We need to schedule the task manually because wake_impl
+                            // only set the NOTIFIED bit and returned (since we were RUNNING).
+                            // We are now leaving execution, so we must schedule.
+                            unsafe { (header.vtable.schedule)(ptr) };
+                            unsafe { drop_reference(ptr) };
+                            return;
+                        }
+
                         // We received a notification *while* running.
                         // We must loop back and poll again immediately.
                         continue;
