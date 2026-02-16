@@ -9,7 +9,8 @@ use crate::driver::slot::{STATE_COMPLETED, Slot, SlotEntry}; // Removed Detached
 use crate::driver::iocp::op::IocpOp;
 
 use std::io;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::{debug, trace};
 
@@ -76,23 +77,29 @@ pub struct IocpDriver {
     pub(crate) timer_buffer: Vec<usize>,
     pub(crate) registered_files: Vec<Option<HANDLE>>,
     pub(crate) free_slots: Vec<usize>,
+    pub(crate) is_waked: Arc<AtomicBool>,
 
     // RIO Support (Decoupled)
     pub(crate) rio_state: Option<RioState>,
 }
 
-pub(crate) struct IocpWaker(pub(crate) HANDLE);
+pub(crate) struct IocpWaker {
+    pub(crate) handle: HANDLE,
+    pub(crate) is_waked: Arc<AtomicBool>,
+}
 
 unsafe impl Send for IocpWaker {}
 unsafe impl Sync for IocpWaker {}
 
 impl RemoteWaker for IocpWaker {
     fn wake(&self) -> io::Result<()> {
-        let res = unsafe {
-            PostQueuedCompletionStatus(self.0, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
-        };
-        if res == 0 {
-            return Err(io::Error::last_os_error());
+        if !self.is_waked.swap(true, Ordering::AcqRel) {
+            let res = unsafe {
+                PostQueuedCompletionStatus(self.handle, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
+            };
+            if res == 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
         Ok(())
     }
@@ -101,7 +108,7 @@ impl RemoteWaker for IocpWaker {
 impl Drop for IocpWaker {
     fn drop(&mut self) {
         unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
         }
     }
 }
@@ -147,6 +154,8 @@ impl IocpDriver {
             }
         }
 
+        let is_waked = Arc::new(AtomicBool::new(false));
+
         Ok(Self {
             port,
             ops,
@@ -155,6 +164,7 @@ impl IocpDriver {
             timer_buffer: Vec::new(),
             registered_files: Vec::new(),
             free_slots: Vec::new(),
+            is_waked,
             rio_state,
         })
     }
@@ -248,6 +258,7 @@ impl IocpDriver {
         };
 
         if user_data == WAKEUP_USER_DATA {
+            self.is_waked.store(false, Ordering::Release);
             trace!("Wakeup received");
             return Ok(());
         }
@@ -521,7 +532,10 @@ impl IocpDriver {
         if res == 0 {
             panic!("Failed to dup handle");
         }
-        std::sync::Arc::new(IocpWaker(new_handle))
+        std::sync::Arc::new(IocpWaker {
+            handle: new_handle,
+            is_waked: self.is_waked.clone(),
+        })
     }
 }
 

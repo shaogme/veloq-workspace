@@ -63,7 +63,7 @@ pub(crate) struct UringWaker {
 
 impl RemoteWaker for UringWaker {
     fn wake(&self) -> io::Result<()> {
-        if !self.is_waked.swap(true, Ordering::SeqCst) {
+        if !self.is_waked.swap(true, Ordering::AcqRel) {
             let buf = 1u64.to_ne_bytes();
             let ret = unsafe { libc::write(self.fd, buf.as_ptr() as *const _, 8) };
             if ret < 0 {
@@ -450,7 +450,7 @@ impl UringDriver {
         }
 
         if needs_waker_resubmit {
-            self.is_waked.store(false, Ordering::SeqCst);
+            self.is_waked.store(false, Ordering::Release);
             if let Some(token) = self.waker_token.take() {
                 // Remove existing waker op/slot
                 self.ops.remove(token);
