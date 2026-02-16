@@ -12,7 +12,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-slotmap = "1.0"
+slotmap = "1.1"
 [[bench]]
 name = "wheel_bench"
 harness = false

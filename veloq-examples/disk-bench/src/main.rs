@@ -386,7 +386,7 @@ fn main() {
             .collect();
 
         if matches!(args.mode, WriteMode::Rand) {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             offsets.shuffle(&mut rng);
         }
 

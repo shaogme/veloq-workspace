@@ -47,13 +47,10 @@ veloq-blocking = { path = "utils/veloq-blocking", version = "0.1.0" }
 crossbeam-utils = { version = "0.8", default-features = false }
 futures-core = "0.3"
 crossbeam-queue = "0.3"
-libc = "0.2.178"
+libc = "0.2.182"
 windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
-    "Win32_System_Threading",
-    "Win32_System_WindowsProgramming",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_Memory",
@@ -62,4 +59,4 @@ tracing = "0.1.44"
 parking_lot = "0.12"
 
 
-criterion = { version = "0.7", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
