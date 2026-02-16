@@ -8,8 +8,8 @@
 //! - `io/driver/iocp/op.rs` for Windows IOCP
 
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::{
     future::Future,
     pin::Pin,
@@ -20,10 +20,10 @@ use std::cell::RefCell;
 use tracing::trace;
 use veloq_buf::FixedBuf;
 
-use crate::driver::slot::{SlotTable, STATE_COMPLETED, STATE_CONSUMED};
-use crate::driver::{Driver, PlatformDriver};
 use crate::RawHandle;
 use crate::SockAddrStorage;
+use crate::driver::slot::{STATE_COMPLETED, STATE_CONSUMED, SlotTable};
+use crate::driver::{Driver, PlatformDriver};
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,7 +290,7 @@ where
             // NOTE: The Slot index remains "occupied" in the Registry until someone frees it.
             // In the detached model, we need a mechanism to recycle the index.
             // We push the index to the "remote free queue" which sits in the SlotTable.
-            table.remote_free_queue.push(this.index);
+            table.push_free(this.index);
 
             Poll::Ready(OpResult::Completed(res, data))
         } else {
@@ -304,7 +304,7 @@ where
                 let op_platform = unsafe { (*slot.op.get()).take().expect("Op missing") };
                 let data = T::from_platform_op(op_platform);
                 slot.state.store(STATE_CONSUMED, Ordering::Release);
-                table.remote_free_queue.push(this.index);
+                table.push_free(this.index);
                 Poll::Ready(OpResult::Completed(res, data))
             } else {
                 Poll::Pending

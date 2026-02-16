@@ -54,10 +54,19 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
 
     pub fn alloc(&mut self, data: P) -> Result<AllocResult, P> {
         // 1. Recycle remote indices
-        while let Some(idx) = self.shared.remote_free_queue.pop() {
-            if idx < self.local.len() {
-                self.free_indices.push(idx);
+        let mut head = self.shared.pop_all();
+        while head != SlotTable::<Op>::NULL_INDEX {
+            // Read next before we potentially lose track or reuse the slot
+            // (Though for simply moving it to free list, order matters less,
+            // we just need to traverse the chain we just claimed ownership of)
+            let next = self.shared.slots[head]
+                .next_free
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+            if head < self.local.len() {
+                self.free_indices.push(head);
             }
+            head = next;
         }
 
         // 2. Alloc from free list

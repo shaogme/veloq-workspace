@@ -1,7 +1,6 @@
-use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use veloq_atomic_waker::AtomicWaker;
 
 #[cfg(windows)]
@@ -41,6 +40,9 @@ pub struct Slot<Op> {
     pub generation: AtomicU32, // Generation to prevent ABA
     pub state: AtomicU8,       // Atomic state
 
+    // Intrusive free list pointer (replaces remote_free_queue)
+    pub next_free: AtomicUsize,
+
     // Synchronization primitive
     pub waker: AtomicWaker, // Consumer waker
 
@@ -64,11 +66,16 @@ pub struct Slot<Op> {
 unsafe impl<Op: Send> Sync for Slot<Op> {}
 
 impl<Op> Slot<Op> {
+    // Should be consistent with SlotTable::NULL_INDEX, but we can't easily reference it here without generic.
+    // We use usize::MAX as sentinel.
+    const NULL_INDEX: usize = usize::MAX;
+
     pub fn new(index: usize) -> Self {
         Self {
             index,
             generation: AtomicU32::new(0),
             state: AtomicU8::new(STATE_EMPTY),
+            next_free: AtomicUsize::new(Self::NULL_INDEX),
             waker: AtomicWaker::new(),
             result: UnsafeCell::new(None),
             op: UnsafeCell::new(None),
@@ -103,13 +110,16 @@ pub type SlotEntry<Op> = CachePadded<Slot<Op>>;
 
 pub struct SlotTable<Op> {
     pub slots: Box<[SlotEntry<Op>]>,
-    pub remote_free_queue: SegQueue<usize>,
+    // Intrusive Treiber stack head
+    pub remote_free_head: AtomicUsize,
 }
 
 unsafe impl<Op: Send> Sync for SlotTable<Op> {}
 unsafe impl<Op: Send> Send for SlotTable<Op> {}
 
 impl<Op> SlotTable<Op> {
+    pub const NULL_INDEX: usize = usize::MAX;
+
     pub fn new(capacity: usize) -> Self {
         let mut slots = Vec::with_capacity(capacity);
         for i in 0..capacity {
@@ -117,7 +127,36 @@ impl<Op> SlotTable<Op> {
         }
         Self {
             slots: slots.into_boxed_slice(),
-            remote_free_queue: SegQueue::new(),
+            remote_free_head: AtomicUsize::new(Self::NULL_INDEX),
         }
+    }
+
+    /// Pushes an index onto the remote free stack.
+    /// This is lock-free and can be called from multiple threads.
+    pub fn push_free(&self, idx: usize) {
+        let slot = &self.slots[idx];
+        let mut head = self.remote_free_head.load(Ordering::Relaxed);
+        loop {
+            // Point the new node to the current head
+            slot.next_free.store(head, Ordering::Relaxed);
+            // Try to swap the head
+            match self.remote_free_head.compare_exchange_weak(
+                head,
+                idx,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => head = current,
+            }
+        }
+    }
+
+    /// Pops all items from the remote free stack.
+    /// Returns the head of the linked list.
+    /// This is used by the driver to bulk-reclaim slots.
+    pub fn pop_all(&self) -> usize {
+        self.remote_free_head
+            .swap(Self::NULL_INDEX, Ordering::Acquire)
     }
 }
