@@ -14,14 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::{debug, trace};
 
-use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_TIMEOUT,
-};
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
@@ -70,7 +66,7 @@ impl IocpOpState {
 pub type PreInit = usize;
 
 pub struct IocpDriver {
-    pub(crate) port: HANDLE,
+    pub(crate) port: Arc<CompletionPort>,
     pub(crate) ops: OpRegistry<IocpOp, IocpOpState>,
     pub(crate) extensions: Extensions,
     pub(crate) wheel: Wheel<usize>,
@@ -83,8 +79,23 @@ pub struct IocpDriver {
     pub(crate) rio_state: Option<RioState>,
 }
 
+pub(crate) struct CompletionPort {
+    pub handle: HANDLE,
+}
+
+impl Drop for CompletionPort {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+unsafe impl Send for CompletionPort {}
+unsafe impl Sync for CompletionPort {}
+
 pub(crate) struct IocpWaker {
-    pub(crate) handle: HANDLE,
+    pub(crate) port: Arc<CompletionPort>,
     pub(crate) is_waked: Arc<AtomicBool>,
 }
 
@@ -93,23 +104,23 @@ unsafe impl Sync for IocpWaker {}
 
 impl RemoteWaker for IocpWaker {
     fn wake(&self) -> io::Result<()> {
+        if self.is_waked.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         if !self.is_waked.swap(true, Ordering::AcqRel) {
             let res = unsafe {
-                PostQueuedCompletionStatus(self.handle, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
+                PostQueuedCompletionStatus(
+                    self.port.handle,
+                    0,
+                    WAKEUP_USER_DATA,
+                    std::ptr::null_mut(),
+                )
             };
             if res == 0 {
                 return Err(io::Error::last_os_error());
             }
         }
         Ok(())
-    }
-}
-
-impl Drop for IocpWaker {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.handle);
-        }
     }
 }
 
@@ -157,7 +168,7 @@ impl IocpDriver {
         let is_waked = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
-            port,
+            port: Arc::new(CompletionPort { handle: port }),
             ops,
             extensions,
             wheel: Wheel::new(WheelConfig::default()),
@@ -187,7 +198,7 @@ impl IocpDriver {
         let start = Instant::now();
         let res = unsafe {
             GetQueuedCompletionStatus(
-                self.port,
+                self.port.handle,
                 &mut bytes_transferred,
                 &mut completion_key,
                 &mut overlapped,
@@ -506,7 +517,7 @@ impl IocpDriver {
 
     pub fn wake(&self) -> io::Result<()> {
         let res = unsafe {
-            PostQueuedCompletionStatus(self.port, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
+            PostQueuedCompletionStatus(self.port.handle, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
         };
         trace!("Wake up posted");
         if res == 0 {
@@ -516,24 +527,8 @@ impl IocpDriver {
     }
 
     pub fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker> {
-        let process = unsafe { GetCurrentProcess() };
-        let mut new_handle = INVALID_HANDLE_VALUE;
-        let res = unsafe {
-            DuplicateHandle(
-                process,
-                self.port,
-                process,
-                &mut new_handle,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-        if res == 0 {
-            panic!("Failed to dup handle");
-        }
         std::sync::Arc::new(IocpWaker {
-            handle: new_handle,
+            port: self.port.clone(),
             is_waked: self.is_waked.clone(),
         })
     }
@@ -582,7 +577,13 @@ impl Drop for IocpDriver {
             let mut overlapped = std::ptr::null_mut();
 
             let res = unsafe {
-                GetQueuedCompletionStatus(self.port, &mut bytes, &mut key, &mut overlapped, 100)
+                GetQueuedCompletionStatus(
+                    self.port.handle,
+                    &mut bytes,
+                    &mut key,
+                    &mut overlapped,
+                    100,
+                )
             };
 
             if !overlapped.is_null() {
@@ -605,6 +606,6 @@ impl Drop for IocpDriver {
             }
         }
 
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.port) };
+        // Port is closed when Arc<CompletionPort> drops
     }
 }

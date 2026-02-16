@@ -75,7 +75,7 @@ impl Driver for IocpDriver {
             let overlapped_ptr = slot.overlapped_ptr();
 
             let mut ctx = crate::driver::iocp::op::SubmitContext {
-                port: self.port,
+                port: self.port.handle,
                 overlapped: overlapped_ptr,
                 ext: &self.extensions,
                 registered_files: &self.registered_files,
@@ -91,7 +91,12 @@ impl Driver for IocpDriver {
                 }
                 Ok(SubmissionResult::PostToQueue) => {
                     let _ = unsafe {
-                        PostQueuedCompletionStatus(self.port, 0, user_data, std::ptr::null_mut())
+                        PostQueuedCompletionStatus(
+                            self.port.handle,
+                            0,
+                            user_data,
+                            std::ptr::null_mut(),
+                        )
                     };
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
@@ -182,7 +187,7 @@ impl Driver for IocpDriver {
             let overlapped_ptr = slot.overlapped_ptr();
 
             let mut ctx = crate::driver::iocp::op::SubmitContext {
-                port: self.port,
+                port: self.port.handle,
                 overlapped: overlapped_ptr,
                 ext: &self.extensions,
                 registered_files: &self.registered_files,
@@ -291,7 +296,9 @@ impl Driver for IocpDriver {
     }
 
     fn inner_handle(&self) -> crate::RawHandle {
-        self.port.into()
+        crate::RawHandle {
+            handle: self.port.handle as _,
+        }
     }
 
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker> {

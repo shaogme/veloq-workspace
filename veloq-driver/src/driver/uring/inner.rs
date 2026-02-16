@@ -56,16 +56,31 @@ impl UringOpState {
     }
 }
 
+pub(crate) struct EventFd {
+    pub fd: RawFd,
+}
+
+impl Drop for EventFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
 pub(crate) struct UringWaker {
-    pub(crate) fd: RawFd,
+    pub(crate) fd: Arc<EventFd>,
     pub(crate) is_waked: Arc<AtomicBool>,
 }
 
 impl RemoteWaker for UringWaker {
     fn wake(&self) -> io::Result<()> {
+        if self.is_waked.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         if !self.is_waked.swap(true, Ordering::AcqRel) {
             let buf = 1u64.to_ne_bytes();
-            let ret = unsafe { libc::write(self.fd, buf.as_ptr() as *const _, 8) };
+            let ret = unsafe { libc::write(self.fd.fd, buf.as_ptr() as *const _, 8) };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EAGAIN) {
@@ -75,14 +90,6 @@ impl RemoteWaker for UringWaker {
             }
         }
         Ok(())
-    }
-}
-
-impl Drop for UringWaker {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
     }
 }
 
@@ -97,7 +104,7 @@ pub struct UringDriver {
     pub(crate) backlog_tail: Option<usize>,
     pub(crate) pending_cancellations: VecDeque<usize>,
 
-    pub(crate) waker_fd: RawFd,
+    pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_token: Option<usize>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
@@ -146,7 +153,7 @@ impl UringDriver {
             backlog_head: None,
             backlog_tail: None,
             pending_cancellations: VecDeque::new(),
-            waker_fd,
+            waker_fd: Arc::new(EventFd { fd: waker_fd }),
             waker_token: None,
             registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
             is_waked,
@@ -257,7 +264,7 @@ impl UringDriver {
             return;
         }
 
-        let fd = self.waker_fd;
+        let fd = self.waker_fd.fd;
         let op = crate::op::Wakeup {
             fd: crate::op::IoFd::Raw(crate::RawHandle { fd }),
         };
@@ -691,8 +698,6 @@ impl UringDriver {
 
 impl Drop for UringDriver {
     fn drop(&mut self) {
-        unsafe {
-            libc::close(self.waker_fd);
-        }
+        // waker_fd is closed when Arc<EventFd> drops
     }
 }

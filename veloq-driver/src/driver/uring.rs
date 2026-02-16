@@ -251,7 +251,7 @@ impl Driver for UringDriver {
 
     fn wake(&mut self) -> io::Result<()> {
         let buf = 1u64.to_ne_bytes();
-        let ret = unsafe { libc::write(self.waker_fd, buf.as_ptr() as *const _, 8) };
+        let ret = unsafe { libc::write(self.waker_fd.fd, buf.as_ptr() as *const _, 8) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EAGAIN) {
@@ -270,17 +270,13 @@ impl Driver for UringDriver {
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
-        let new_fd = unsafe { libc::dup(self.waker_fd) };
-        if new_fd < 0 {
-            panic!("Failed to dup waker fd");
-        }
         Arc::new(UringWaker {
-            fd: new_fd,
+            fd: self.waker_fd.clone(),
             is_waked: self.is_waked.clone(),
         })
     }
 
     fn driver_id(&self) -> usize {
-        self.waker_fd as usize
+        self.waker_fd.fd as usize
     }
 }
