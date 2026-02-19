@@ -1,8 +1,8 @@
 pub mod common;
+pub mod socket;
 pub mod tcp;
 pub mod udp;
-pub mod socket;
 
+pub use socket::{TcpSocket, UdpSocketBuilder};
 pub use tcp::{TcpListener, TcpStream};
 pub use udp::UdpSocket;
-pub use socket::{TcpSocket, UdpSocketBuilder};

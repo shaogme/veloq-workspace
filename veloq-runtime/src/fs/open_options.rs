@@ -151,8 +151,8 @@ impl OpenOptions {
     // ==========================================
     #[cfg(unix)]
     fn build_op(&self, path: &Path) -> std::io::Result<Open> {
-        use std::os::unix::ffi::OsStrExt;
         use std::num::NonZeroUsize;
+        use std::os::unix::ffi::OsStrExt;
 
         let path_bytes = path.as_os_str().as_bytes();
         // ensure null termination
