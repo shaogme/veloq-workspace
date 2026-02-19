@@ -18,3 +18,8 @@ veloq-intrusive-linklist.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "stream_bench"
+harness = false

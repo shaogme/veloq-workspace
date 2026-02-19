@@ -421,18 +421,18 @@ impl<T> Drop for LocalReceiver<T> {
 
 struct ChannelStream<'a, T> {
     channel: &'a LocalChannel<T>,
-    node: Pin<Box<WaiterNode>>,
+    node: WaiterNode,
 }
 
 impl<'a, T> ChannelStream<'a, T> {
     fn new(channel: &'a LocalChannel<T>) -> Self {
         ChannelStream {
             channel,
-            node: Box::pin(WaiterNode {
+            node: WaiterNode {
                 waker: RefCell::new(None),
                 link: Link::new(),
                 _p: PhantomPinned,
-            }),
+            },
         }
     }
 }
@@ -443,13 +443,14 @@ impl<T> Stream for ChannelStream<'_, T> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let result = self.channel.state.borrow_mut().recv_one();
         let this = unsafe { self.get_unchecked_mut() };
+        let node = unsafe { Pin::new_unchecked(&mut this.node) };
 
         match result {
             PollResult::Pending => {
-                *this.node.waker.borrow_mut() = Some(cx.waker().clone());
+                *node.waker.borrow_mut() = Some(cx.waker().clone());
 
                 register_into_waiting_queue::<T, ReceiverAction>(
-                    this.node.as_mut(),
+                    node,
                     &mut this.channel.state.borrow_mut(),
                 );
 
@@ -457,7 +458,7 @@ impl<T> Stream for ChannelStream<'_, T> {
             }
             PollResult::Ready(result) => {
                 remove_from_the_waiting_queue::<T, ReceiverAction>(
-                    this.node.as_mut(),
+                    node,
                     &mut this.channel.state.borrow_mut(),
                 );
 
@@ -478,7 +479,12 @@ impl<T> Drop for ChannelStream<'_, T> {
         // 使用 borrow_mut() 而非 try_borrow_mut() 以确保在异常情况下也能清理。
         // 如果 panic 发生，RefCell 已经 poison 也没关系，主要是防止后续 UB。
         let mut state = self.channel.state.borrow_mut();
-        remove_from_the_waiting_queue::<T, ReceiverAction>(self.node.as_mut(), &mut state);
+        // Safety: ChannelStream contains PhantomPinned via WaiterNode, so it is !Unpin.
+        // Once pinned (which must happen before node is linked), it cannot be moved.
+        // Drop is called with &mut self, so we can access fields.
+        // If node is linked, it must be valid to pin it here as it hasn't moved since being linked.
+        let node = unsafe { Pin::new_unchecked(&mut self.node) };
+        remove_from_the_waiting_queue::<T, ReceiverAction>(node, &mut state);
     }
 }
 
