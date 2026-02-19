@@ -1,10 +1,10 @@
-#![cfg(loom)]
+#![cfg(feature = "loom")]
 
 use loom::sync::Arc;
 use loom::sync::atomic::{AtomicBool, Ordering};
 use loom::thread;
-use veloq_atomic_waker::AtomicWaker;
 use std::task::Wake;
+use veloq_atomic_waker::AtomicWaker;
 
 struct TestWaker(Arc<AtomicBool>);
 

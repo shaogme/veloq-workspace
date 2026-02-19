@@ -18,4 +18,4 @@ veloq-shim.workspace = true
 loom = ["veloq-shim/loom"]
 
 [dev-dependencies]
-loom = "0.7"
+loom.workspace = true
