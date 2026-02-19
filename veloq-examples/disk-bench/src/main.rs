@@ -366,18 +366,15 @@ fn main() {
 
         // Generate Ops
         let num_blocks = file_size_per_file / block_size_bytes.get() as u64;
-        let mut ops = Vec::with_capacity(num_blocks as usize);
-        let mut offsets: Vec<u64> = (0..num_blocks)
-            .map(|i| i * block_size_bytes.get() as u64)
+        let mut ops: Vec<WriteOp> = (0..num_blocks)
+            .map(|i| WriteOp {
+                offset: i * block_size_bytes.get() as u64,
+            })
             .collect();
 
         if matches!(args.mode, WriteMode::Rand) {
             let mut rng = rand::rng();
-            offsets.shuffle(&mut rng);
-        }
-
-        for offset in offsets {
-            ops.push(WriteOp { offset });
+            ops.shuffle(&mut rng);
         }
 
         configs.push(ThreadConfig {
