@@ -111,7 +111,11 @@ impl Socket {
 
     pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
         let val = if nodelay { 1i32 } else { 0i32 };
-        self.setsockopt(IPPROTO_TCP, windows_sys::Win32::Networking::WinSock::TCP_NODELAY, val)
+        self.setsockopt(
+            IPPROTO_TCP,
+            windows_sys::Win32::Networking::WinSock::TCP_NODELAY,
+            val,
+        )
     }
 
     pub fn set_recv_buffer_size(&self, size: usize) -> std::io::Result<()> {

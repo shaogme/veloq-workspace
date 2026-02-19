@@ -340,8 +340,9 @@ impl AtomicWaker {
                             //
                             // SAFETY: We hold the lock (state is REGISTERING | WAKING), so we have exclusive access.
                             let waker = unsafe {
-                                self.waker
-                                    .with_mut(|w| w.take().expect("invariant broken: waker must exist"))
+                                self.waker.with_mut(|w| {
+                                    w.take().expect("invariant broken: waker must exist")
+                                })
                             };
 
                             // We need to return to WAITING state (clear our lock and

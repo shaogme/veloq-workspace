@@ -1,8 +1,8 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use futures_core::Stream;
 use std::future::poll_fn;
-use veloq_local::mpsc;
 use tokio::pin;
+use veloq_local::mpsc;
 
 fn bench_stream_creation(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()

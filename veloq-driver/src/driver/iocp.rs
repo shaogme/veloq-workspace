@@ -204,8 +204,7 @@ impl Driver for IocpDriver {
                 op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 use veloq_blocking::get_blocking_pool;
                 if get_blocking_pool().execute(task).is_err() {
-                    let _ =
-                        std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
+                    let _ = std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
                     self.ops.free_indices.push(user_data);
                     return Err(io::Error::other("Thread pool overloaded"));
                 }
