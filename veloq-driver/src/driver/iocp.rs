@@ -73,7 +73,6 @@ impl Driver for IocpDriver {
             let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
             op_ref.header.user_data = user_data;
 
-        if let Some(op_entry) = ops_local.get_mut(user_data) {
             // Use the overlapped pointer from the slot.
             // This is safe because:
             // 1. The Slot is pinned in memory (part of Arc<SlotTable>).
