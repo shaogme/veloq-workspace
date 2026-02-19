@@ -4,7 +4,7 @@ use super::submit;
 use crate::config::IocpConfig;
 use crate::driver::RemoteWaker;
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED, Slot, SlotEntry}; // Removed DetachedCompleter if unused, or keep if used in public API
+use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED}; // Removed DetachedCompleter if unused, or keep if used in public API
 // Removed STATE_SUBMITTED if unused here.
 use crate::driver::iocp::op::IocpOp;
 
