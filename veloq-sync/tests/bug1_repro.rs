@@ -1,3 +1,4 @@
+#![cfg(not(feature = "loom"))]
 use std::sync::Arc;
 use std::time::Duration;
 use veloq_sync::rwlock::RwLock;
