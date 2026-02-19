@@ -513,14 +513,9 @@ impl Drop for IocpDriver {
         debug!("Dropping IocpDriver");
         let mut pending_count = 0;
 
-        // BORROW CHECKER FIX
-        // Iterate manual to split borrows
-        let ops_local = &mut self.ops.local;
-        let ops_shared = &self.ops.shared;
-
-        for (user_data, op) in ops_local.iter_mut().enumerate() {
+        for (user_data, op) in self.ops.local.iter_mut().enumerate() {
             if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                let slot = &ops_shared.slots[user_data];
+                let slot = &self.ops.shared.slots[user_data];
 
                 if let Some(tid) = op.platform_data.timer_id {
                     self.wheel.cancel(tid);
@@ -571,8 +566,8 @@ impl Drop for IocpDriver {
         }
 
         // Safety cleanup for remote ops
-        for (user_data, op_entry) in ops_local.iter_mut().enumerate() {
-            let slot = &ops_shared.slots[user_data];
+        for (user_data, op_entry) in self.ops.local.iter_mut().enumerate() {
+            let slot = &self.ops.shared.slots[user_data];
             if let Some(completer) = op_entry.platform_data.detached_completer.take() {
                 if let Some(op) = unsafe { (*slot.op.get()).take() } {
                     completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
