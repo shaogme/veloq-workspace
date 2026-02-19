@@ -1,0 +1,16 @@
+Starting Disk Benchmark
+Mode: Seq, Threads: 1, QD: 64
+Block Size: 1MB (1048576 Bytes)
+Pre-allocating files...
+Initializing disk files (creating & fallocating)... This may take a while.
+Files prepared. Starting Benchmark Measurement...
+--------------------------------------------------
+Benchmark Completed.
+Total Data Measured: 3072.00 MB
+Wall Time (Approx):  7.15 s
+System Throughput:   429.69 MB/s
+--------------------------------------------------
+Average Iteration Throughput: 436.51 MB/s
+Filtered Avg Throughput (IQR): 436.51 MB/s
+Cleaning up files...
+Done.
