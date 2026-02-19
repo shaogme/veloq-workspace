@@ -95,8 +95,10 @@ jobs:
           key: ${{ runner.os }}-cargo-loom-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-loom-
-      - name: Run Loom tests
+      - name: Run Veloq Sync Loom tests
         run: cargo test --release -p veloq-sync --tests --features loom
+      - name: Run Veloq Atomic Waker Loom tests
+        run: cargo test --release -p veloq-atomic-waker --tests --features loom
 
   ci-success:
     name: CI Success
