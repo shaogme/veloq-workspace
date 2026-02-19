@@ -10,6 +10,7 @@ use veloq_runtime::io::buffer::{BufPool, FixedBuf};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
 use veloq_runtime::sync::mpsc;
+use veloq_runtime::LocalJoinHandle;
 
 /// 创建 NonZeroUsize 的宏
 /// - 输入 0：编译失败
@@ -188,8 +189,9 @@ async fn run_iteration_measured(
     file: Rc<File>,
     ops: &[WriteOp],
     block_size: NonZeroUsize,
-    initial_buffers: &mut Vec<FixedBuf>, // Take buffers to reuse
-) -> (IterationResult, Vec<FixedBuf>) {
+    available_buffers: &mut Vec<FixedBuf>,
+    pending_tasks: &mut VecDeque<LocalJoinHandle<(std::io::Result<usize>, FixedBuf)>>,
+) -> IterationResult {
     let pool =
         veloq_runtime::runtime::context::current_pool().expect("Worker should have bound pool");
 
@@ -198,25 +200,13 @@ async fn run_iteration_measured(
 
     // Safety check
     if ops.is_empty() {
-        return (
-            IterationResult {
-                bytes: 0,
-                duration: Duration::ZERO,
-            },
-            initial_buffers.drain(..).collect(),
-        );
+        return IterationResult {
+            bytes: 0,
+            duration: Duration::ZERO,
+        };
     }
 
     let start_time = Instant::now();
-
-    // Use a VecDeque for pending tasks
-    // Task returns: (io::Result<usize>, Buf)
-    let mut pending_tasks = VecDeque::with_capacity(qdepth);
-    let mut recycled_buffers = Vec::with_capacity(qdepth);
-
-    // Move initial buffers to a local available list
-    // efficiently swap out
-    let mut available_buffers = std::mem::take(initial_buffers);
 
     let total_ops = ops.len();
     let mut current_op_idx = 0;
@@ -271,17 +261,10 @@ async fn run_iteration_measured(
 
     let duration = start_time.elapsed();
 
-    // Return recycled buffers for next iteration
-    // We might have extra buffers if we alloc'd more from pool fallback
-    recycled_buffers.extend(available_buffers);
-
-    (
-        IterationResult {
-            bytes: written_bytes,
-            duration,
-        },
-        recycled_buffers,
-    )
+    IterationResult {
+        bytes: written_bytes,
+        duration,
+    }
 }
 
 async fn run_worker(
@@ -314,6 +297,9 @@ async fn run_worker(
         }
     }
 
+    // Pre-allocate pending tasks queue
+    let mut pending_tasks = VecDeque::with_capacity(qdepth);
+
     let mut results = Vec::new();
     let start_total = Instant::now();
     let mut iter_count = 0;
@@ -324,17 +310,17 @@ async fn run_worker(
             break;
         }
 
-        let (res, buffers) = run_iteration_measured(
+        let res = run_iteration_measured(
             qdepth,
             file.clone(),
             &config.ops,
             config.block_size,
             &mut reuse_buffers,
+            &mut pending_tasks,
         )
         .await;
 
         results.push(res);
-        reuse_buffers = buffers; // reclaiming ownership
         iter_count += 1;
     }
 
