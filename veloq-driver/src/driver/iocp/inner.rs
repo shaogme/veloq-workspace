@@ -4,7 +4,7 @@ use super::submit;
 use crate::config::IocpConfig;
 use crate::driver::RemoteWaker;
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::{STATE_COMPLETED, Slot, SlotEntry}; // Removed DetachedCompleter if unused, or keep if used in public API
+use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED, Slot, SlotEntry}; // Removed DetachedCompleter if unused, or keep if used in public API
 // Removed STATE_SUBMITTED if unused here.
 use crate::driver::iocp::op::IocpOp;
 
@@ -218,37 +218,11 @@ impl IocpDriver {
                 return Ok(());
             }
         } else if !overlapped.is_null() {
-            // FIX: Safe calculation of offset using runtime pointers from a valid slot
-            let base_ptr = self.ops.shared.slots.as_ptr() as usize;
-            let slot_size = std::mem::size_of::<SlotEntry<IocpOp>>();
-
-            // Runtime offset calculation
-            // We use the first slot to determine offset of 'overlapped' relative to 'SlotEntry'
-            let first_slot = &self.ops.shared.slots[0];
-            let first_slot_addr = first_slot as *const _ as usize;
-            // The slot structure is inside CachePadded.
-            // But we know 'first_slot' points to CachePadded<Slot>.
-
-            // To be safe, we don't try to access private fields of CachePadded.
-            // We just ask Slot for overlapped ptr.
-            // `SlotEntry` implements Deref to `Slot`.
-            let overlapped_offset = unsafe {
-                let slot_ptr = &**first_slot as *const Slot<IocpOp>;
-                let ov_ptr = (*slot_ptr).overlapped_ptr();
-                ov_ptr as usize - first_slot_addr
-            };
-
-            let overlap_addr = overlapped as usize;
-            if overlap_addr < base_ptr {
-                return Ok(());
-            }
-            // Check alignment/validity?
-            let offset_from_base = overlap_addr - base_ptr;
-            if offset_from_base < overlapped_offset {
-                return Ok(());
-            }
-
-            let idx = (offset_from_base - overlapped_offset) / slot_size;
+            // Since OverlappedEntry is #[repr(C)], and inner is the first field,
+            // we can safely cast *mut OVERLAPPED to *const OverlappedEntry to access user_data.
+            // This relies on Slot::reset preserving the user_data (index).
+            let entry = overlapped as *const OverlappedEntry;
+            let idx = unsafe { (*entry).user_data };
 
             if idx >= self.ops.local.len() {
                 debug!(idx, "Completed index out of bounds");
