@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["full", "rt-multi-thread"] }
 criterion.workspace = true
 
 [dependencies.loom]
-version = "0.7"
+workspace = true
 features = ["futures"]
 optional = true
 

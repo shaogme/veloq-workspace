@@ -217,6 +217,9 @@ pub use alloc::sync::Arc;
 #[cfg(feature = "loom")]
 pub use loom::sync::Arc;
 
+#[cfg(feature = "loom")]
+pub use loom::thread;
+
 pub mod cell {
     #[cfg(not(feature = "loom"))]
     #[repr(transparent)]
