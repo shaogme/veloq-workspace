@@ -58,19 +58,21 @@ impl Driver for IocpDriver {
     ) -> Result<Poll<()>, (io::Error, Self::Op)> {
         trace!(user_data, "Submitting op");
 
-        // BORROW CHECKER FIX: Split access
         let slots_per_page = self.ops.local.len();
-        let ops_local = &mut self.ops.local;
-        let ops_shared = &self.ops.shared;
 
-        let slot = &ops_shared.slots[user_data];
-        unsafe { *slot.op.get() = Some(op) };
-        slot.state.store(STATE_SUBMITTED, Ordering::Release);
+        // Scope for initial submission
+        {
+            let (slot, op_entry) = match self.ops.get_slot_and_entry_mut(user_data) {
+                Some(pair) => pair,
+                None => panic!("Op not found"),
+            };
 
-        let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
-        op_ref.header.user_data = user_data;
+            unsafe { *slot.op.get() = Some(op) };
+            slot.state.store(STATE_SUBMITTED, Ordering::Release);
 
-        if let Some(op_entry) = ops_local.get_mut(user_data) {
+            let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
+            op_ref.header.user_data = user_data;
+
             // FIX: Use overlapped ptr directly
             let overlapped_ptr = slot.overlapped_ptr();
 
@@ -129,13 +131,11 @@ impl Driver for IocpDriver {
                     return Err((e, op));
                 }
             }
-        } else {
-            panic!("Op not found");
-        }
+        } // End of submission scope
 
         // Logic for detached completer
-        // Access ops_local again
-        let should_complete_detached = if let Some(op) = ops_local.get_mut(user_data) {
+        // Access self.ops directly
+        let should_complete_detached = if let Some(op) = self.ops.get(user_data) {
             matches!(op.platform_data.lifecycle, OpLifecycle::Completed(_))
                 && op.platform_data.detached_completer.is_some()
         } else {
@@ -143,7 +143,7 @@ impl Driver for IocpDriver {
         };
 
         if should_complete_detached {
-            if let Some(entry) = ops_local.get_mut(user_data) {
+            if let Some((slot, entry)) = self.ops.get_slot_and_entry_mut(user_data) {
                 if let OpLifecycle::Completed(result) = &entry.platform_data.lifecycle {
                     let res_copy = result.as_ref().map(|x| *x).map_err(|e| {
                         if let Some(code) = e.raw_os_error() {
@@ -170,53 +170,51 @@ impl Driver for IocpDriver {
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
         let (user_data, _) = self.reserve_op()?;
 
-        // BORROW CHECKER FIX: Split access
         let slots_per_page = self.ops.local.len();
-        let ops_local = &mut self.ops.local;
-        let ops_shared = &self.ops.shared;
+        let (slot, op_entry) = match self.ops.get_slot_and_entry_mut(user_data) {
+            Some(pair) => pair,
+            None => panic!("Op not found after reserve"),
+        };
 
-        let slot = &ops_shared.slots[user_data];
         unsafe { *slot.op.get() = Some(op) };
         slot.state.store(STATE_SUBMITTED, Ordering::Release);
 
         let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
         op_ref.header.user_data = user_data;
 
-        if let Some(op_entry) = ops_local.get_mut(user_data) {
-            op_entry.platform_data.is_background = true;
-            let overlapped_ptr = slot.overlapped_ptr();
+        op_entry.platform_data.is_background = true;
+        let overlapped_ptr = slot.overlapped_ptr();
 
-            let mut ctx = crate::driver::iocp::op::SubmitContext {
-                port: self.port.handle,
-                overlapped: overlapped_ptr,
-                ext: &self.extensions,
-                registered_files: &self.registered_files,
-                rio: self.rio_state.as_mut(),
-                slots_per_page,
-            };
+        let mut ctx = crate::driver::iocp::op::SubmitContext {
+            port: self.port.handle,
+            overlapped: overlapped_ptr,
+            ext: &self.extensions,
+            registered_files: &self.registered_files,
+            rio: self.rio_state.as_mut(),
+            slots_per_page,
+        };
 
-            let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
+        let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
 
-            match result {
-                Ok(SubmissionResult::Offload(task)) => {
-                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
-                    use veloq_blocking::get_blocking_pool;
-                    if get_blocking_pool().execute(task).is_err() {
-                        let _ =
-                            std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
-                        self.ops.free_indices.push(user_data);
-                        return Err(io::Error::other("Thread pool overloaded"));
-                    }
-                }
-                Ok(_) => {
-                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
-                }
-                Err(e) => {
-                    debug!(error = ?e, user_data, "Background submit failed");
-                    let _ = std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
+        match result {
+            Ok(SubmissionResult::Offload(task)) => {
+                op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                use veloq_blocking::get_blocking_pool;
+                if get_blocking_pool().execute(task).is_err() {
+                    let _ =
+                        std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
                     self.ops.free_indices.push(user_data);
-                    return Err(e);
+                    return Err(io::Error::other("Thread pool overloaded"));
                 }
+            }
+            Ok(_) => {
+                op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
+            }
+            Err(e) => {
+                debug!(error = ?e, user_data, "Background submit failed");
+                let _ = std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
+                self.ops.free_indices.push(user_data);
+                return Err(e);
             }
         }
         Ok(())

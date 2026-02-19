@@ -1,5 +1,5 @@
 use crate::driver::PlatformOp;
-use crate::driver::slot::SlotTable;
+use crate::driver::slot::{SlotEntry, SlotTable};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
@@ -111,6 +111,18 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
 
     pub fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<P>> {
         self.local.get_mut(user_data)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_slot_and_entry_mut(
+        &mut self,
+        user_data: usize,
+    ) -> Option<(&SlotEntry<Op>, &mut OpEntry<P>)> {
+        if user_data < self.local.len() {
+            Some((&self.shared.slots[user_data], &mut self.local[user_data]))
+        } else {
+            None
+        }
     }
 
     pub fn contains(&self, user_data: usize) -> bool {
