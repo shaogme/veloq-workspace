@@ -71,7 +71,10 @@ impl Driver for IocpDriver {
         op_ref.header.user_data = user_data;
 
         if let Some(op_entry) = ops_local.get_mut(user_data) {
-            // FIX: Use overlapped ptr directly
+            // Use the overlapped pointer from the slot.
+            // This is safe because:
+            // 1. The Slot is pinned in memory (part of Arc<SlotTable>).
+            // 2. OverlappedEntry is #[repr(C)], so we can recover the user_data from the pointer.
             let overlapped_ptr = slot.overlapped_ptr();
 
             let mut ctx = crate::driver::iocp::op::SubmitContext {
