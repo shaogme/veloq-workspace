@@ -79,6 +79,7 @@ jobs:
 
   loom-test:
     name: Loom Test
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -136,6 +137,7 @@ jobs:
   ci-success:
     name: CI Success
     needs: [test, loom-test, fmt, clippy]
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     steps:
       - name: Success
