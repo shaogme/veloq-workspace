@@ -47,14 +47,11 @@ impl MemoryChunk {
                 Ok(p) => NonNull::new(p),
                 Err(_) => {
                     // Fallback to standard pages if Huge Pages failed
-                    crate::os::alloc_pages(size).map(|p| NonNull::new(p))?
+                    crate::os::alloc_pages(size).map(NonNull::new)?
                 }
             }
         }
-        .ok_or(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Allocation failed",
-        ))?;
+        .ok_or_else(|| std::io::Error::other("Allocation failed"))?;
         Ok(Self { ptr, size })
     }
 
@@ -74,6 +71,11 @@ impl MemoryChunk {
     #[inline]
     pub fn len(&self) -> usize {
         self.size.get()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Obtain the raw parts
@@ -330,16 +332,16 @@ impl Chunk {
             // idx = (start + i * stride) % count
             let idx = (start_shard.wrapping_add(i.wrapping_mul(stride))) & mask;
 
-            if let Some(mut buddy) = self.shards[idx].try_lock() {
-                if let Some(local_idx) = buddy.alloc(order) {
-                    let ptr = buddy.ptr_of(local_idx);
+            if let Some(mut buddy) = self.shards[idx].try_lock()
+                && let Some(local_idx) = buddy.alloc(order)
+            {
+                let ptr = buddy.ptr_of(local_idx);
 
-                    // Convert local slot index to global slot index
-                    // Global = ShardBase + Local
-                    let global_idx_val = (idx * self.slots_per_shard) + local_idx.0;
+                // Convert local slot index to global slot index
+                // Global = ShardBase + Local
+                let global_idx_val = (idx * self.slots_per_shard) + local_idx.0;
 
-                    return Some((SlotIndex(global_idx_val), ptr));
-                }
+                return Some((SlotIndex(global_idx_val), ptr));
             }
         }
 
@@ -421,6 +423,8 @@ impl Chunk {
     }
 }
 
+pub type ChunkListener = Box<dyn Fn(ChunkInfo) + Send + Sync>;
+
 /// Global Slot Pool
 ///
 /// Manages a large contiguous memory arena using a sharded Buddy System.
@@ -432,7 +436,7 @@ pub struct GlobalSlotPool {
     #[allow(dead_code)]
     config: GlobalAllocatorConfig,
     /// Listener for new chunk allocation (used to notify Runtime/Driver)
-    listener: RwLock<Option<Box<dyn Fn(ChunkInfo) + Send + Sync>>>,
+    listener: RwLock<Option<ChunkListener>>,
 }
 
 impl GlobalSlotPool {

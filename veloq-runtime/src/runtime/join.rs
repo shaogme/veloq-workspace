@@ -64,12 +64,10 @@ pub(crate) struct LocalJoinProducer<T> {
 impl<T> LocalJoinProducer<T> {
     pub(crate) fn set(self, value: T) {
         let mut state = self.state.borrow_mut();
-        if let LocalJoinState::Pending(waker) =
+        if let LocalJoinState::Pending(Some(w)) =
             std::mem::replace(&mut *state, LocalJoinState::Ready(value))
         {
-            if let Some(w) = waker {
-                w.wake();
-            }
+            w.wake();
         }
     }
 }
@@ -148,15 +146,14 @@ impl<T> Future for JoinHandle<T> {
 
             // If we are currently WAITING, try to reset to IDLE to update the waker.
             // This is necessary if poll is called multiple times with different wakers.
-            if current == WAITING {
-                if state
+            if current == WAITING
+                && state
                     .state
                     .compare_exchange(WAITING, IDLE, Ordering::Acquire, Ordering::Relaxed)
                     .is_err()
-                {
-                    // State changed (likely to READY or ABORTED), retry loop
-                    continue;
-                }
+            {
+                // State changed (likely to READY or ABORTED), retry loop
+                continue;
             }
 
             // Now state is effectively IDLE (either we saw IDLE or we successfully transitioned WAITING -> IDLE).

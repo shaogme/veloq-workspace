@@ -57,14 +57,17 @@ impl Socket {
         Ok(())
     }
 
-    pub fn into_raw(self) -> RawFd {
+    pub fn into_raw(self) -> RawHandle {
         let fd = self.fd;
         std::mem::forget(self);
-        fd
+        fd.into()
     }
 
-    pub unsafe fn from_raw(fd: RawFd) -> Self {
-        Self { fd }
+    /// # Safety
+    ///
+    /// The provided raw handle must be a valid file descriptor, and it must outlive the returned `Socket`.
+    pub unsafe fn from_raw(handle: RawHandle) -> Self {
+        Self { fd: handle.fd }
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {

@@ -95,8 +95,10 @@ impl<Op> Slot<Op> {
         // Result and Op are logically empty/invalid
         #[cfg(windows)]
         unsafe {
-            let mut entry = OverlappedEntry::default();
-            entry.user_data = self.index;
+            let entry = OverlappedEntry {
+                user_data: self.index,
+                ..Default::default()
+            };
             *self.overlapped.get() = entry;
         }
     }

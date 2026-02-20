@@ -51,7 +51,7 @@ fn bench_sync_into_future_alloc(c: &mut Criterion) {
         b.iter(|| {
             // Create the builder and convert to future.
             let fut = file.sync_range(black_box(0), black_box(1024)).into_future();
-            let _ = black_box(fut);
+            drop(black_box(fut));
         })
     });
 

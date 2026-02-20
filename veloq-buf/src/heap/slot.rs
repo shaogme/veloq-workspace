@@ -12,7 +12,7 @@ pub const SLOT_SIZE: usize = 4096;
 /// Calculate the number of slots required for a given size
 #[inline]
 pub const fn slots_needed(size: usize) -> usize {
-    (size + SLOT_SIZE - 1) / SLOT_SIZE
+    size.div_ceil(SLOT_SIZE)
 }
 
 /// Slot Index

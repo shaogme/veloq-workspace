@@ -49,7 +49,7 @@ where
 
             // Poll delay
             let delay_pin = Pin::new_unchecked(&mut this.delay);
-            if let Poll::Ready(_) = delay_pin.poll(cx) {
+            if delay_pin.poll(cx).is_ready() {
                 return Poll::Ready(Err(Elapsed::new()));
             }
 
@@ -102,7 +102,7 @@ where
 
             // Poll delay
             let delay_pin = Pin::new_unchecked(&mut this.delay);
-            if let Poll::Ready(_) = delay_pin.poll(cx) {
+            if delay_pin.poll(cx).is_ready() {
                 return Poll::Ready(Err(Elapsed::new()));
             }
 

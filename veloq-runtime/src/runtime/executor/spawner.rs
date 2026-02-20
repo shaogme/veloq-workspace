@@ -242,7 +242,7 @@ impl Spawner {
         self.seed.set(seed);
 
         let idx1 = seed % count;
-        let idx2 = (seed >> 32) as usize % count;
+        let idx2 = (seed >> 32) % count;
 
         let w1 = &workers[idx1];
         let w2 = &workers[idx2];

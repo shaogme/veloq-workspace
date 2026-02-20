@@ -77,10 +77,10 @@ impl<T> Drop for Sender<T> {
         let mut state = self.state.borrow_mut();
         state.is_tx_closed = true;
         // 如果发送端 drop 了且没发送值，唤醒接收端以让其感知错误
-        if state.value.is_none() {
-            if let Some(waker) = state.waker.take() {
-                waker.wake();
-            }
+        if state.value.is_none()
+            && let Some(waker) = state.waker.take()
+        {
+            waker.wake();
         }
     }
 }

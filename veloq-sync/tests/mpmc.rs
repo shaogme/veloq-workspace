@@ -43,13 +43,8 @@ async fn test_mpmc_unbounded_concurrent() {
         let rx = rx.clone();
         let total = total_received.clone();
         tasks.push(tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(_) => {
-                        total.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => break,
-                }
+            while rx.recv().await.is_ok() {
+                total.fetch_add(1, Ordering::Relaxed);
             }
         }));
     }

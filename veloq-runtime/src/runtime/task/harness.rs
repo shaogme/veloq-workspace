@@ -108,7 +108,7 @@ where
         poll: poll_future::<F>,
         drop_future: drop_future::<F>,
         dealloc: dealloc_task::<F>,
-        schedule: schedule_task::<F>,
+        schedule: schedule_task,
     };
 
     let data = HarnessedData {
@@ -137,7 +137,7 @@ unsafe fn drop_future<F>(ptr: NonNull<HarnessedHeader>) {
     unsafe { raw::drop_future::<F, _, _>(ptr) };
 }
 
-unsafe fn schedule_task<F>(ptr: NonNull<HarnessedHeader>) {
+unsafe fn schedule_task(ptr: NonNull<HarnessedHeader>) {
     trace!("Rescheduling harnessed task");
     let header = unsafe { ptr.as_ref() };
     // We must increment refcount before handing off to scheduler

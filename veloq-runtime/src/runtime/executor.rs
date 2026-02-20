@@ -43,6 +43,12 @@ pub struct LocalExecutorBuilder {
     stealer: Option<crossbeam_deque::Stealer<Runnable>>,
 }
 
+impl Default for LocalExecutorBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalExecutorBuilder {
     pub fn new() -> Self {
         Self {
@@ -663,7 +669,7 @@ impl Drop for LocalExecutor {
         // as the kernel might try to write to buffers that are being freed.
         if let Ok(mut driver) = self.driver.try_borrow_mut() {
             let _ = driver.submit_queue();
-            let _ = driver.process_completions();
+            driver.process_completions();
         }
     }
 }
@@ -719,7 +725,7 @@ impl<D: Driver> BufferRegistrar for ExecutorRegistrar<D> {
         let driver_rc = self
             .driver
             .upgrade()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Driver dropped"))?;
+            .ok_or_else(|| std::io::Error::other("Driver dropped"))?;
         let mut driver = driver_rc.borrow_mut();
 
         let mut indices = Vec::with_capacity(regions.len());

@@ -77,7 +77,6 @@ fn test_cursor_integration() {
         }
     }
 
-    drop(cursor);
     assert_eq!(list.len(), 2);
 
     let v1 = list.pop_front().unwrap();

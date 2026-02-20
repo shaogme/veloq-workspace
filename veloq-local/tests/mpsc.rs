@@ -63,7 +63,7 @@ async fn test_multiple_senders() {
             drop(tx); // Close the original sender
 
             let mut count = 0;
-            while let Some(_) = rx.recv().await {
+            while rx.recv().await.is_some() {
                 count += 1;
             }
             assert_eq!(count, 5);

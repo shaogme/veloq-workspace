@@ -9,8 +9,10 @@ fn bench_wheel_advance(c: &mut Criterion) {
     group.bench_function("advance_expiry", |b| {
         b.iter_batched(
             || {
-                let mut config = WheelConfig::default();
-                config.l0_tick_duration = Duration::from_millis(1);
+                let config = WheelConfig {
+                    l0_tick_duration: Duration::from_millis(1),
+                    ..Default::default()
+                };
                 let mut wheel = Wheel::new(config);
                 // Insert tasks that will expire sequentially
                 for i in 0..1000 {

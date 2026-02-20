@@ -244,7 +244,6 @@ mod tests {
         assert!(cursor.get().is_none());
 
         // List should have 1 left
-        drop(cursor);
         assert_eq!(list.len(), 1);
         let head = list.pop_front().unwrap();
         assert_eq!(head.val, 1);

@@ -44,12 +44,10 @@ impl BlockingTask {
     pub fn run(self) {
         match self {
             BlockingTask::Fn(f) => f(),
-            BlockingTask::SysOp(op) => {
-                #[cfg(target_os = "windows")]
-                op.run();
-                #[cfg(target_os = "linux")]
-                let _ = op;
-            }
+            #[cfg(target_os = "windows")]
+            BlockingTask::SysOp(op) => op.run(),
+            #[cfg(target_os = "linux")]
+            BlockingTask::SysOp(_) => {}
         }
     }
 }

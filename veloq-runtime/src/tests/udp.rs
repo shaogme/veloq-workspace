@@ -120,9 +120,9 @@ fn test_udp_echo() {
 
                     // Echo back
                     let mut echo_buf = crate::runtime::context::alloc(size);
-                    echo_buf.spare_capacity_mut()[..bytes_read as usize]
-                        .copy_from_slice(&buf.as_slice()[..bytes_read as usize]);
-                    echo_buf.set_len(bytes_read as usize);
+                    echo_buf.spare_capacity_mut()[..bytes_read]
+                        .copy_from_slice(&buf.as_slice()[..bytes_read]);
+                    echo_buf.set_len(bytes_read);
 
                     let (result, _) = server_clone.send_to(echo_buf, from_addr).await;
                     result.expect("Server send_to failed");
@@ -262,7 +262,7 @@ fn test_udp_large_data() {
 
                 buf.set_len(DATA_SIZE);
                 let (result, _) = socket2_arc.send_to(buf, addr1).await;
-                let bytes = result.expect("send_to failed") as usize;
+                let bytes = result.expect("send_to failed");
                 println!("Sent {} bytes", bytes);
 
                 h_recv.await;
@@ -433,9 +433,9 @@ fn test_multithread_udp_echo() {
 
                     // Echo back
                     let mut echo_buf = crate::runtime::context::alloc(size);
-                    echo_buf.spare_capacity_mut()[..bytes as usize]
-                        .copy_from_slice(&buf.as_slice()[..bytes as usize]);
-                    echo_buf.set_len(bytes as usize);
+                    echo_buf.spare_capacity_mut()[..bytes]
+                        .copy_from_slice(&buf.as_slice()[..bytes]);
+                    echo_buf.set_len(bytes);
 
                     let (result, _) = socket.send_to(echo_buf, from_addr).await;
                     result.expect("Server send_to failed");

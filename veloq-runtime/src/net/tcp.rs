@@ -49,7 +49,7 @@ fn bind_listener_inner<A: ToSocketAddrs>(addr: A) -> io::Result<InnerSocket> {
     socket.bind(addr)?;
     socket.listen(1024)?; // backlog
 
-    Ok(InnerSocket::new(socket.into_raw().into()))
+    Ok(InnerSocket::new(socket.into_raw()))
 }
 
 fn new_stream_inner(addr: &SocketAddr) -> io::Result<InnerSocket> {
@@ -58,7 +58,7 @@ fn new_stream_inner(addr: &SocketAddr) -> io::Result<InnerSocket> {
     } else {
         Socket::new_tcp_v6()?
     };
-    Ok(InnerSocket::new(socket.into_raw().into()))
+    Ok(InnerSocket::new(socket.into_raw()))
 }
 
 // ============================================================================

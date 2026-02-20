@@ -56,7 +56,7 @@ async fn test_drop_tx_notify() {
         .run_until(async move {
             let (tx, rx) = oneshot::channel::<i32>();
 
-            let handle = task::spawn_local(async move { rx.await });
+            let handle = task::spawn_local(rx);
 
             // Drop tx without sending
             drop(tx);

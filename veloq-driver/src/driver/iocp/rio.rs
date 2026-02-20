@@ -86,33 +86,33 @@ impl RioState {
 
         // Construct dispatch table, failing if any required function is missing
         let dispatch = RioDispatch {
-            create_cq: table.RIOCreateCompletionQueue.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "RIOCreateCompletionQueue missing")
-            })?,
-            create_rq: table.RIOCreateRequestQueue.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "RIOCreateRequestQueue missing")
-            })?,
+            create_cq: table
+                .RIOCreateCompletionQueue
+                .ok_or_else(|| io::Error::other("RIOCreateCompletionQueue missing"))?,
+            create_rq: table
+                .RIOCreateRequestQueue
+                .ok_or_else(|| io::Error::other("RIOCreateRequestQueue missing"))?,
             register_buffer: table
                 .RIORegisterBuffer
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIORegisterBuffer missing"))?,
-            dequeue: table.RIODequeueCompletion.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "RIODequeueCompletion missing")
-            })?,
+                .ok_or_else(|| io::Error::other("RIORegisterBuffer missing"))?,
+            dequeue: table
+                .RIODequeueCompletion
+                .ok_or_else(|| io::Error::other("RIODequeueCompletion missing"))?,
             notify: table
                 .RIONotify
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIONotify missing"))?,
+                .ok_or_else(|| io::Error::other("RIONotify missing"))?,
             receive: table
                 .RIOReceive
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIOReceive missing"))?,
+                .ok_or_else(|| io::Error::other("RIOReceive missing"))?,
             send: table
                 .RIOSend
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIOSend missing"))?,
+                .ok_or_else(|| io::Error::other("RIOSend missing"))?,
             send_ex: table
                 .RIOSendEx
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIOSendEx missing"))?,
+                .ok_or_else(|| io::Error::other("RIOSendEx missing"))?,
             receive_ex: table
                 .RIOReceiveEx
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "RIOReceiveEx missing"))?,
+                .ok_or_else(|| io::Error::other("RIOReceiveEx missing"))?,
         };
 
         if let Some(create_fn) = Some(dispatch.create_cq) {
@@ -211,8 +211,7 @@ impl RioState {
             let ops_local = &mut ops.local;
             let ops_shared = &ops.shared;
 
-            for i in 0..count as usize {
-                let res = &results[i];
+            for res in results.iter().take(count as usize) {
                 let user_data = res.RequestContext as usize;
 
                 if user_data < ops_local.len() {
@@ -223,7 +222,7 @@ impl RioState {
                         let result = if res.Status == 0 {
                             Ok(res.BytesTransferred as usize)
                         } else {
-                            Err(io::Error::from_raw_os_error(res.Status as i32))
+                            Err(io::Error::from_raw_os_error(res.Status))
                         };
 
                         op.platform_data.lifecycle = OpLifecycle::Completed(result);
@@ -231,7 +230,7 @@ impl RioState {
                         let result_for_slot = if res.Status == 0 {
                             Ok(res.BytesTransferred as usize)
                         } else {
-                            Err(io::Error::from_raw_os_error(res.Status as i32))
+                            Err(io::Error::from_raw_os_error(res.Status))
                         };
                         unsafe { *slot.result.get() = Some(result_for_slot) };
                         slot.state.store(STATE_COMPLETED, Ordering::Release);
@@ -240,7 +239,7 @@ impl RioState {
                         // We must remove it from registry because it was cancelled but RIO just completed it.
                         // Can't invoke `ops.remove(user_data)` directly due to split.
                         // But we can emulate it:
-                        let _ = std::mem::replace(&mut op.platform_data, IocpOpState::default());
+                        let _ = std::mem::take(&mut op.platform_data);
                         ops.free_indices.push(user_data);
                     }
                 }
@@ -254,7 +253,7 @@ impl RioState {
         let notify_fn = self.dispatch.notify;
         let ret = unsafe { notify_fn(self.cq) };
         if ret != 0 {
-            return Err(io::Error::from_raw_os_error(ret as i32));
+            return Err(io::Error::from_raw_os_error(ret));
         }
         Ok(())
     }
@@ -269,13 +268,13 @@ impl RioState {
             self.slab_rio_pages.resize(page_idx + 1, None);
         }
 
-        if self.slab_rio_pages[page_idx].is_none() {
-            if let Some((ptr, len)) = ops.get_page_slice(page_idx) {
-                let reg_fn = self.dispatch.register_buffer;
-                let id = unsafe { reg_fn(ptr, len as u32) };
-                if id != RIO_INVALID_BUFFERID {
-                    self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
-                }
+        if self.slab_rio_pages[page_idx].is_none()
+            && let Some((ptr, len)) = ops.get_page_slice(page_idx)
+        {
+            let reg_fn = self.dispatch.register_buffer;
+            let id = unsafe { reg_fn(ptr, len as u32) };
+            if id != RIO_INVALID_BUFFERID {
+                self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
             }
         }
     }
@@ -395,6 +394,7 @@ impl RioState {
         Ok(Some(SubmissionResult::Pending))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn try_submit_send_to(
         &mut self,
         fd: IoFd,
@@ -462,6 +462,7 @@ impl RioState {
         Ok(Some(SubmissionResult::Pending))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn try_submit_recv_from(
         &mut self,
         fd: IoFd,

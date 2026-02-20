@@ -14,23 +14,17 @@ use crate::driver::slot::{STATE_COMPLETED, STATE_SUBMITTED};
 use crate::driver::uring::op::UringOp;
 use crate::op::IntoPlatformOp;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpLifecycle {
     /// Created, waiting to be submitted
     Pending,
     /// Submitted to ring or timer wheel
     InFlight,
     /// Completion arrived (result is in Slot)
+    #[default]
     Completed,
     /// Aborted by user
     Cancelled,
-}
-
-impl Default for OpLifecycle {
-    fn default() -> Self {
-        Self::Completed
-        // Safe default; will be overwritten on allocation.
-    }
 }
 
 #[derive(Clone)]
@@ -207,7 +201,7 @@ impl UringDriver {
                         _ => (None, strategy, None),
                     }
                 } else {
-                    return Err(io::Error::new(io::ErrorKind::Other, "Op missing in slot"));
+                    return Err(io::Error::other("Op missing in slot"));
                 }
             }
         };
@@ -228,10 +222,7 @@ impl UringDriver {
                         Ok(false)
                     }
                 } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "SQE generation failed",
-                    ))
+                    Err(io::Error::other("SQE generation failed"))
                 }
             }
             crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
@@ -246,10 +237,7 @@ impl UringDriver {
                     trace!(user_data, ?duration, "Registered software timer");
                     Ok(true)
                 } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Timer duration missing",
-                    ))
+                    Err(io::Error::other("Timer duration missing"))
                 }
             }
             _ => Err(io::Error::new(
@@ -366,18 +354,18 @@ impl UringDriver {
             self.wheel.advance(elapsed, &mut self.timer_buffer);
 
             for &user_data in &self.timer_buffer {
-                if let Some(entry) = self.ops.get_mut(user_data) {
-                    if matches!(entry.platform_data.lifecycle, OpLifecycle::InFlight) {
-                        entry.platform_data.lifecycle = OpLifecycle::Completed;
-                        entry.platform_data.timer_id = None;
+                if let Some(entry) = self.ops.get_mut(user_data)
+                    && matches!(entry.platform_data.lifecycle, OpLifecycle::InFlight)
+                {
+                    entry.platform_data.lifecycle = OpLifecycle::Completed;
+                    entry.platform_data.timer_id = None;
 
-                        let slot = &self.ops.shared.slots[user_data];
-                        unsafe {
-                            *slot.result.get() = Some(Ok(0));
-                        }
-                        slot.state.store(STATE_COMPLETED, Ordering::Release);
-                        slot.waker.wake();
+                    let slot = &self.ops.shared.slots[user_data];
+                    unsafe {
+                        *slot.result.get() = Some(Ok(0));
                     }
+                    slot.state.store(STATE_COMPLETED, Ordering::Release);
+                    slot.waker.wake();
                 }
             }
             self.timer_buffer.clear();
@@ -670,7 +658,7 @@ impl UringDriver {
 
                 if let Some(tid) = timer_id {
                     self.wheel.cancel(tid);
-                    if let Some(_) = self.ops.get_mut(user_data) {
+                    if self.ops.get_mut(user_data).is_some() {
                         let slot = &self.ops.shared.slots[user_data];
                         unsafe {
                             *slot.result.get() =

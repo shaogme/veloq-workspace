@@ -245,6 +245,9 @@ pub mod cell {
 
     #[cfg(not(feature = "loom"))]
     impl<T: ?Sized> UnsafeCell<T> {
+        /// # Safety
+        ///
+        /// The caller must ensure that there are no other references to the underlying data while the closure is executing.
         pub unsafe fn with_mut<F, R>(&self, f: F) -> R
         where
             F: FnOnce(&mut T) -> R,
@@ -252,6 +255,9 @@ pub mod cell {
             unsafe { f(&mut *self.cell.get()) }
         }
 
+        /// # Safety
+        ///
+        /// The caller must ensure that there are no mutable references to the underlying data while the closure is executing.
         pub unsafe fn with<F, R>(&self, f: F) -> R
         where
             F: FnOnce(&T) -> R,

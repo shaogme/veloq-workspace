@@ -13,9 +13,6 @@ pub struct InnerSocket(pub(crate) RawHandle);
 
 impl Drop for InnerSocket {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        let _ = unsafe { Socket::from_raw(*self.0) };
-        #[cfg(windows)]
         let _ = unsafe { Socket::from_raw(self.0) };
     }
 }
@@ -30,9 +27,6 @@ impl InnerSocket {
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        #[cfg(unix)]
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(*self.0)) };
-        #[cfg(windows)]
         let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.0)) };
         socket.local_addr()
     }

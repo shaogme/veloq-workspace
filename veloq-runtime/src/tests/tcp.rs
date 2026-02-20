@@ -74,7 +74,7 @@ fn test_tcp_send_recv() {
                         let buf = crate::runtime::context::alloc(size);
                         let (result, mut buf) = stream.recv(buf).await;
                         let bytes_read = match result {
-                            Ok(n) if n > 0 => n as usize,
+                            Ok(n) if n > 0 => n,
                             _ => break, // EOF or Error
                         };
 
@@ -101,7 +101,7 @@ fn test_tcp_send_recv() {
                 // Send data
                 let bytes_to_send = send_buf.len();
                 let (result, _) = stream.send(send_buf).await;
-                let bytes_sent = result.expect("Client send failed") as usize;
+                let bytes_sent = result.expect("Client send failed");
                 assert_eq!(bytes_sent, bytes_to_send);
                 println!("Client sent {} bytes", bytes_sent);
 
@@ -111,7 +111,7 @@ fn test_tcp_send_recv() {
                 while total_received < bytes_sent {
                     let recv_buf = crate::runtime::context::alloc(size);
                     let (result, recv_buf) = stream.recv(recv_buf).await;
-                    let n = result.expect("Client recv failed") as usize;
+                    let n = result.expect("Client recv failed");
                     if n == 0 {
                         break;
                     } // Unexpected EOF?
@@ -209,7 +209,7 @@ fn test_tcp_large_data_transfer() {
                         let buf = crate::runtime::context::alloc(size);
                         // buf.set_len(buf.capacity());
                         let (result, _buf) = stream.recv(buf).await;
-                        let bytes = result.expect("Recv failed") as usize;
+                        let bytes = result.expect("Recv failed");
                         if bytes == 0 {
                             break;
                         }
@@ -240,7 +240,7 @@ fn test_tcp_large_data_transfer() {
                     }
 
                     let (result, _buf) = stream.send(buf).await;
-                    let bytes = result.expect("Send failed") as usize;
+                    let bytes = result.expect("Send failed");
                     total_sent += bytes;
                     println!("Client sent {} bytes (total: {})", bytes, total_sent);
                 }
@@ -476,7 +476,7 @@ fn test_multithread_tcp_echo() {
                     let buf = crate::runtime::context::alloc(size);
 
                     let (result, buf) = stream.recv(buf).await;
-                    let bytes = result.expect("Recv failed") as usize;
+                    let bytes = result.expect("Recv failed");
 
                     // Echo back
                     let mut echo_buf = crate::runtime::context::alloc(size);
@@ -508,7 +508,7 @@ fn test_multithread_tcp_echo() {
                     // Receive echo
                     let recv_buf = crate::runtime::context::alloc(size);
                     let (result, recv_buf) = stream.recv(recv_buf).await;
-                    let _received = result.expect("Recv failed") as usize;
+                    let _received = result.expect("Recv failed");
 
                     assert_eq!(&recv_buf.as_slice()[..data.len()], data);
                     println!("Client received correct echo");

@@ -207,10 +207,10 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
         // It will then likely wake subsequent readers (cascade).
         {
             let mut waiters = lock.waiters.lock();
-            if let Some(node) = waiters.front_mut().get() {
-                if node.kind == KIND_READER {
-                    node.waker.wake();
-                }
+            if let Some(node) = waiters.front_mut().get()
+                && node.kind == KIND_READER
+            {
+                node.waker.wake();
             }
         }
 
@@ -298,10 +298,10 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
                             }
 
                             // Cascade wake: if next is reader, wake it
-                            if let Some(next) = waiters.front_mut().get() {
-                                if next.kind == KIND_READER {
-                                    next.waker.wake();
-                                }
+                            if let Some(next) = waiters.front_mut().get()
+                                && next.kind == KIND_READER
+                            {
+                                next.waker.wake();
                             }
 
                             this.queued = false;

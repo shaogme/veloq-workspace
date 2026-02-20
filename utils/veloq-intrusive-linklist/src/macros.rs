@@ -38,9 +38,7 @@ macro_rules! container_of {
 ///
 /// intrusive_adapter!(pub MyAdapter = MyNode { link: Link });
 ///
-/// fn main() {
-///     let adapter = MyAdapter;
-/// }
+/// let adapter = MyAdapter;
 /// ```
 #[macro_export]
 macro_rules! intrusive_adapter {

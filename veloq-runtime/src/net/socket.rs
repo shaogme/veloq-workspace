@@ -82,7 +82,7 @@ impl TcpSocket {
     pub fn listen(self, backlog: u32) -> io::Result<TcpListener> {
         self.inner.listen(backlog as i32)?;
         Ok(GenericTcpListener {
-            inner: InnerSocket::new(self.inner.into_raw().into()),
+            inner: InnerSocket::new(self.inner.into_raw()),
             submitter: DetachedSubmitter::new()?,
         })
     }
@@ -91,7 +91,7 @@ impl TcpSocket {
     ///
     /// Consumes the `TcpSocket` and returns a `TcpStream` future.
     pub async fn connect(self, addr: SocketAddr) -> io::Result<TcpStream> {
-        let inner = InnerSocket::new(self.inner.into_raw().into());
+        let inner = InnerSocket::new(self.inner.into_raw());
         TcpStream::connect_from_inner(inner, addr).await
     }
 }
@@ -156,7 +156,7 @@ impl UdpSocketBuilder {
         self.inner.bind(addr)?;
 
         Ok(GenericUdpSocket {
-            inner: InnerSocket::new(self.inner.into_raw().into()),
+            inner: InnerSocket::new(self.inner.into_raw()),
             submitter: DetachedSubmitter::new()?,
         })
     }

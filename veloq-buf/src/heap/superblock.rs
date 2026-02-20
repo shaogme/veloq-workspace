@@ -21,6 +21,12 @@ pub struct SuperblockState {
     pub is_active: AtomicBool,
 }
 
+impl Default for SuperblockState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SuperblockState {
     pub const fn new() -> Self {
         Self {

@@ -32,7 +32,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("fs_throughput");
 
     // 1GB Total Size
-    const TOTAL_SIZE: u64 = 1 * 1024 * 1024 * 1024;
+    const TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
 
     // 设置吞吐量统计单位
     group.throughput(Throughput::Bytes(TOTAL_SIZE));
@@ -142,7 +142,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
     // 1GB Total Size
     const FILE_COUNT: usize = 32;
     const WORKER_COUNT: usize = 4;
-    const TOTAL_SIZE: u64 = 1 * 1024 * 1024 * 1024;
+    const TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
     const FILE_SIZE: u64 = TOTAL_SIZE / FILE_COUNT as u64;
     const FILES_PER_WORKER: usize = FILE_COUNT / WORKER_COUNT;
 
@@ -222,7 +222,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                             // 2. Concurrent Write Loop for this worker's files
                             let concurrency_limit = 8; // Maybe lower per worker? 32 total / 4 = 8.
                             let mut tasks = VecDeque::new();
-                            let mut offsets = vec![0u64; FILES_PER_WORKER];
+                            let mut offsets = [0u64; FILES_PER_WORKER];
                             let mut current_local_idx = 0;
 
                             loop {
@@ -244,30 +244,28 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                         current_local_idx = (current_local_idx + 1) % FILES_PER_WORKER;
                                     }
 
-                                    if let Some(idx) = found {
-                                        if let Some(buf) = pool.alloc(CHUNK_SIZE) {
-                                            let remaining = FILE_SIZE - offsets[idx];
-                                            let write_len = std::cmp::min(remaining, chunk_size.get() as u64) as usize;
+                                    if let Some(idx) = found
+                                        && let Some(buf) = pool.alloc(CHUNK_SIZE)
+                                    {
+                                        let remaining = FILE_SIZE - offsets[idx];
+                                        let write_len = std::cmp::min(remaining, chunk_size.get() as u64) as usize;
 
-                                            let file_clone = files[idx].clone();
-                                            let current_offset = offsets[idx];
+                                        let file_clone = files[idx].clone();
+                                        let current_offset = offsets[idx];
 
-                                            let fut = async move { file_clone.write_at(buf, current_offset).await };
+                                        let fut = async move { file_clone.write_at(buf, current_offset).await };
 
-                                            tasks.push_back(spawn_local(fut));
-                                            offsets[idx] += write_len as u64;
-                                            continue;
-                                        }
+                                        tasks.push_back(spawn_local(fut));
+                                        offsets[idx] += write_len as u64;
+                                        continue;
                                     }
                                 }
 
                                 if let Some(handle) = tasks.pop_front() {
                                     let (res, _buf): (std::io::Result<usize>, _) = handle.await;
                                     res.expect("Write failed");
-                                } else {
-                                    if !all_submitted {
-                                        panic!("Deadlock in worker {}: No tasks to wait for but cannot allocate buffer", i);
-                                    }
+                                } else if !all_submitted {
+                                    panic!("Deadlock in worker {}: No tasks to wait for but cannot allocate buffer", i);
                                 }
                             }
 

@@ -106,12 +106,12 @@ pub(crate) unsafe fn poll_future_impl<F: Future<Output = ()>>(
             // We must reschedule it to run later.
             // We transfer the ownership of this reference (ptr) back to the queue.
             let queue_ptr = header.data.queue.get();
-            if let Some(weak_queue) = unsafe { &*queue_ptr } {
-                if let Some(queue) = weak_queue.upgrade() {
-                    let task = Task { ptr };
-                    queue.borrow_mut().push_back(task);
-                    return;
-                }
+            if let Some(weak_queue) = unsafe { &*queue_ptr }
+                && let Some(queue) = weak_queue.upgrade()
+            {
+                let task = Task { ptr };
+                queue.borrow_mut().push_back(task);
+                return;
             }
             // If queue is gone, we have to drop.
             unsafe { drop_reference(ptr) };
@@ -254,13 +254,13 @@ unsafe fn wake_task(ptr: NonNull<raw::Header<PinnedData, PinnedVTable>>) {
     if is_local {
         // Push to local queue
         let queue_ptr = header.data.queue.get();
-        if let Some(weak_queue) = unsafe { &*queue_ptr } {
-            if let Some(queue) = weak_queue.upgrade() {
-                // Here we need to reconstruct the Task struct to push it into the queue.
-                header.references.fetch_add(1, Ordering::Relaxed);
-                let task = Task { ptr };
-                queue.borrow_mut().push_back(task);
-            }
+        if let Some(weak_queue) = unsafe { &*queue_ptr }
+            && let Some(queue) = weak_queue.upgrade()
+        {
+            // Here we need to reconstruct the Task struct to push it into the queue.
+            header.references.fetch_add(1, Ordering::Relaxed);
+            let task = Task { ptr };
+            queue.borrow_mut().push_back(task);
         }
     } else {
         // Remote Wake

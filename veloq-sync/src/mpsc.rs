@@ -398,7 +398,7 @@ mod tests {
         // Wait for all messages
         let mut count = 0;
         // Drain the channel
-        while let Ok(_) = rx.try_recv() {
+        while rx.try_recv().is_ok() {
             count += 1;
         }
         assert_eq!(count, 1000);
