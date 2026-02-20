@@ -104,7 +104,7 @@ async fn test_bounded_stream() {
     });
 
     let mut received = 0;
-    while let Some(_) = rx.recv().await {
+    while rx.recv().await.is_some() {
         received += 1;
     }
     // Receiver keeps going until all senders drop.

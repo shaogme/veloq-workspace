@@ -270,35 +270,32 @@ impl IocpDriver {
             if is_detached {
                 let slot = &ops_shared.slots[user_data];
 
-                if let Some(op) = ops_local.get_mut(user_data) {
-                    if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                        if let Some(completer) = op.platform_data.detached_completer.take() {
-                            op.platform_data.lifecycle = OpLifecycle::Detached;
-                            op.platform_data.timer_id = None;
-
-                            let resources = unsafe { (*slot.op.get()).take() };
-
-                            if let Some(res) = resources {
-                                completer.complete(Ok(0), res);
-                            }
-                            unsafe { *slot.result.get() = Some(Ok(0)) };
-                            slot.state.store(STATE_COMPLETED, Ordering::Release);
-                            slot.waker.wake();
-                        }
-                    }
-                }
-            } else {
-                if let Some(op) = ops_local.get_mut(user_data) {
-                    if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                        op.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
-
-                        let slot = &ops_shared.slots[user_data];
-                        unsafe { *slot.result.get() = Some(Ok(0)) };
-                        slot.state.store(STATE_COMPLETED, Ordering::Release);
-                        slot.waker.wake();
-                    }
+                if let Some(op) = ops_local.get_mut(user_data)
+                    && matches!(op.platform_data.lifecycle, OpLifecycle::InFlight)
+                    && let Some(completer) = op.platform_data.detached_completer.take()
+                {
+                    op.platform_data.lifecycle = OpLifecycle::Detached;
                     op.platform_data.timer_id = None;
+
+                    let resources = unsafe { (*slot.op.get()).take() };
+
+                    if let Some(res) = resources {
+                        completer.complete(Ok(0), res);
+                    }
+                    unsafe { *slot.result.get() = Some(Ok(0)) };
+                    slot.state.store(STATE_COMPLETED, Ordering::Release);
+                    slot.waker.wake();
                 }
+            } else if let Some(op) = ops_local.get_mut(user_data) {
+                if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                    op.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
+
+                    let slot = &ops_shared.slots[user_data];
+                    unsafe { *slot.result.get() = Some(Ok(0)) };
+                    slot.state.store(STATE_COMPLETED, Ordering::Release);
+                    slot.waker.wake();
+                }
+                op.platform_data.timer_id = None;
             }
         }
         timer_buffer.clear();
@@ -326,11 +323,11 @@ impl IocpDriver {
             let slot_overlapped = unsafe { &mut *slot.overlapped.get() };
             if let Some(blocking_res) = slot_overlapped.blocking_result.take() {
                 io_result = blocking_res;
-            } else if io_result.is_ok() {
-                if let Some(on_comp) = unsafe { iocp_op.vtable.as_ref().on_complete } {
-                    let val = io_result.unwrap();
-                    io_result = unsafe { (on_comp)(iocp_op, val, &self.extensions) };
-                }
+            } else if io_result.is_ok()
+                && let Some(on_comp) = unsafe { iocp_op.vtable.as_ref().on_complete }
+            {
+                let val = io_result.unwrap();
+                io_result = unsafe { (on_comp)(iocp_op, val, &self.extensions) };
             }
         }
 
@@ -344,7 +341,7 @@ impl IocpDriver {
                     // We need to mark slot as free in registry.
                     // Can't use self.ops.remove here because borrowing split.
                     // Manually implement remove logic on local
-                    let _data = std::mem::replace(&mut op.platform_data, IocpOpState::default());
+                    let _data = std::mem::take(&mut op.platform_data);
                     self.ops.free_indices.push(user_data);
                 } else if let Some(completer) = op.platform_data.detached_completer.take() {
                     op.platform_data.lifecycle = OpLifecycle::Detached;
@@ -355,7 +352,7 @@ impl IocpDriver {
                     }
                     // Remove from registry
                     // self.ops.remove(user_data);
-                    let _data = std::mem::replace(&mut op.platform_data, IocpOpState::default());
+                    let _data = std::mem::take(&mut op.platform_data);
                     self.ops.free_indices.push(user_data);
                 } else {
                     // Normal completion
@@ -568,10 +565,10 @@ impl Drop for IocpDriver {
         // Safety cleanup for remote ops
         for (user_data, op_entry) in self.ops.local.iter_mut().enumerate() {
             let slot = &self.ops.shared.slots[user_data];
-            if let Some(completer) = op_entry.platform_data.detached_completer.take() {
-                if let Some(op) = unsafe { (*slot.op.get()).take() } {
-                    completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
-                }
+            if let Some(completer) = op_entry.platform_data.detached_completer.take()
+                && let Some(op) = unsafe { (*slot.op.get()).take() }
+            {
+                completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
             }
         }
 

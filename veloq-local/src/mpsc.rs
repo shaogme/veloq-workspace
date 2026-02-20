@@ -243,9 +243,7 @@ impl<T> State<T> {
     }
 
     fn wait_for_room(&mut self) -> PollResult<()> {
-        if self.is_closed {
-            PollResult::Ready(())
-        } else if !self.is_full() {
+        if self.is_closed || !self.is_full() {
             PollResult::Ready(())
         } else {
             PollResult::Pending
@@ -289,17 +287,16 @@ impl<T> Drop for LocalChannel<T> {
         #[cfg(debug_assertions)]
         {
             let should_check = Rc::strong_count(&self.state) == 1;
-            if should_check {
-                if let Ok(state) = self.state.try_borrow() {
-                    assert!(state.recv_waiters.is_empty(), "Receiver waiters mismatch");
-                    assert!(state.send_waiters.is_empty(), "Sender waiters mismatch");
-                }
+            if should_check && let Ok(state) = self.state.try_borrow() {
+                assert!(state.recv_waiters.is_empty(), "Receiver waiters mismatch");
+                assert!(state.send_waiters.is_empty(), "Sender waiters mismatch");
             }
         }
     }
 }
 
 impl<T> LocalChannel<T> {
+    #[allow(clippy::new_ret_no_self)]
     fn new(capacity: ChannelCapacity) -> (LocalSender<T>, LocalReceiver<T>) {
         let channel_buffer = match capacity {
             ChannelCapacity::Unbounded => VecDeque::new(),

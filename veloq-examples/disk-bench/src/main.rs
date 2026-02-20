@@ -123,7 +123,7 @@ struct Args {
 }
 
 // 1GB data per thread for benchmarking
-const FILE_SIZE_PER_THREAD: u64 = 1 * 1024 * 1024 * 1024;
+const FILE_SIZE_PER_THREAD: u64 = 1024 * 1024 * 1024;
 
 struct IterationResult {
     bytes: u64,

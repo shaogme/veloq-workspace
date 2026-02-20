@@ -15,10 +15,7 @@ fn test_spawn_to_worker() {
         // Target worker 2
         let target_id = 2;
 
-        let handle = spawn_to(target_id, || async move {
-            let id = current_worker_id();
-            id
-        });
+        let handle = spawn_to(target_id, || async move { current_worker_id() });
 
         let executed_id = handle.await;
 

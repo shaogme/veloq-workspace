@@ -201,10 +201,10 @@ pub(crate) unsafe fn submit_recv(
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
     // Try RIO upgrade
-    if let Some(rio) = &mut ctx.rio {
-        if let Some(res) = rio.try_submit_recv(val.fd, handle, &mut val.buf, op.header.user_data)? {
-            return Ok(res);
-        }
+    if let Some(rio) = &mut ctx.rio
+        && let Some(res) = rio.try_submit_recv(val.fd, handle, &mut val.buf, op.header.user_data)?
+    {
+        return Ok(res);
     }
 
     // Fallback to normal IOCP
@@ -248,10 +248,10 @@ pub(crate) unsafe fn submit_send(
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
     // Try RIO upgrade
-    if let Some(rio) = &mut ctx.rio {
-        if let Some(res) = rio.try_submit_send(val.fd, handle, &val.buf, op.header.user_data)? {
-            return Ok(res);
-        }
+    if let Some(rio) = &mut ctx.rio
+        && let Some(res) = rio.try_submit_send(val.fd, handle, &val.buf, op.header.user_data)?
+    {
+        return Ok(res);
     }
 
     // Fallback

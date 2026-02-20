@@ -71,6 +71,7 @@ macro_rules! select {
     // Case: Single branch
     ($pat:pat = $fut:expr => $handler:expr $(,)?) => {
         {
+            #[allow(clippy::let_unit_value)]
             let $pat = $fut.await;
             $handler
         }
@@ -88,6 +89,7 @@ macro_rules! select {
 
             match cmd.await {
                 Either::Left(res) => {
+                    #[allow(clippy::let_unit_value)]
                     let $pat = res;
                     $handler
                 },
@@ -115,6 +117,7 @@ macro_rules! select {
     // Base case: One remaining
     (@recurse_match $val:ident, $pat:pat = $fut:expr => $handler:expr) => {
         {
+            #[allow(clippy::let_unit_value)]
             let $pat = $val;
             $handler
         }
@@ -123,6 +126,7 @@ macro_rules! select {
     (@recurse_match $val:ident, $pat:pat = $fut:expr => $handler:expr, $($rest:tt)*) => {
         match $val {
             $crate::macros::Either::Left(res) => {
+                 #[allow(clippy::let_unit_value)]
                  let $pat = res;
                  $handler
             },

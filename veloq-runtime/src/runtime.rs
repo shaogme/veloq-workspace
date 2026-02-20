@@ -49,6 +49,12 @@ pub struct RuntimeBuilder<T: PoolTopology = UniformSlot> {
     topology: T,
 }
 
+impl Default for RuntimeBuilder<UniformSlot> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuntimeBuilder<UniformSlot> {
     pub fn new() -> Self {
         Self {

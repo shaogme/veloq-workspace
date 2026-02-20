@@ -158,10 +158,10 @@ impl<T> Op<T> {
         // Try reserve first
         match driver.reserve_op() {
             Ok((user_data, generation)) => {
-                let op_platform = data.into_platform_op();
+                let mut op_platform = Some(data.into_platform_op());
                 let table = driver.slot_table();
 
-                if let Err((e, _op)) = driver.submit(user_data, op_platform) {
+                if let Err(e) = driver.submit(user_data, &mut op_platform) {
                     trace!("Submit failed: {}", e);
                     driver.cancel_op(user_data);
                     // Note: We proceeded with reservation but submit failed.
@@ -260,8 +260,7 @@ where
         // 1. Generation check: Ensure slot hasn't been recycled for a new operation.
         let generation = slot.generation.load(Ordering::Acquire);
         if generation != this.expected_gen {
-            return Poll::Ready(OpResult::Lost(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Poll::Ready(OpResult::Lost(std::io::Error::other(
                 "Op slot recycled (generation mismatch)",
             )));
         }
@@ -371,7 +370,9 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
             op.user_data = user_data;
 
             // Submit to driver.
-            if let Err((e, val)) = driver.submit(user_data, driver_op) {
+            let mut driver_op_opt = Some(driver_op);
+            if let Err(e) = driver.submit(user_data, &mut driver_op_opt) {
+                let val = driver_op_opt.unwrap();
                 let data = T::from_platform_op(val);
                 return Poll::Ready(OpResult::Completed(Err(e), data));
             }
@@ -382,9 +383,11 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
         if let State::Submitted = op.state {
             let mut driver = op.driver.borrow_mut();
 
-            match driver.poll_op(op.user_data, cx) {
-                Poll::Ready((res, driver_op)) => {
+            let mut op_out = None;
+            match driver.poll_op(op.user_data, cx, &mut op_out) {
+                Poll::Ready(res) => {
                     op.state = State::Completed;
+                    let driver_op = op_out.expect("Op missing on complete");
                     let data = T::from_platform_op(driver_op);
                     Poll::Ready(OpResult::Completed(res, data))
                 }

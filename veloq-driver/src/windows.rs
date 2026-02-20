@@ -73,6 +73,9 @@ impl Socket {
         h
     }
 
+    /// # Safety
+    ///
+    /// The provided raw handle must be a valid handle, and it must outlive the returned `Socket`.
     pub unsafe fn from_raw(handle: RawHandle) -> Self {
         Self { handle }
     }

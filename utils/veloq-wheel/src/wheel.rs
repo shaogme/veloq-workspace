@@ -465,11 +465,12 @@ mod tests {
 
     #[test]
     fn test_cascade_l1_to_l0() {
-        let mut config = WheelConfig::default();
-        config.l0_slot_count = 10; // Small L0 for easy cascade
-        config.l0_tick_duration = Duration::from_millis(10);
-        config.l1_slot_count = 4;
-        config.l1_tick_duration = Duration::from_millis(100); // 10 * 10
+        let config = WheelConfig {
+            l0_slot_count: 10, // Small L0 for easy cascade
+            l0_tick_duration: Duration::from_millis(10),
+            l1_slot_count: 4,
+            l1_tick_duration: Duration::from_millis(100), // 10 * 10
+        };
 
         let mut wheel: Wheel<&str> = Wheel::new(config);
 
@@ -497,11 +498,12 @@ mod tests {
 
     #[test]
     fn test_large_advance() {
-        let mut config = WheelConfig::default();
-        config.l0_slot_count = 4;
-        config.l0_tick_duration = Duration::from_millis(10);
-        config.l1_slot_count = 4;
-        config.l1_tick_duration = Duration::from_millis(40);
+        let config = WheelConfig {
+            l0_slot_count: 4,
+            l0_tick_duration: Duration::from_millis(10),
+            l1_slot_count: 4,
+            l1_tick_duration: Duration::from_millis(40),
+        };
 
         let mut wheel = Wheel::new(config);
 
@@ -521,8 +523,10 @@ mod tests {
 
     #[test]
     fn test_next_timeout() {
-        let mut config = WheelConfig::default();
-        config.l0_tick_duration = Duration::from_millis(10);
+        let config = WheelConfig {
+            l0_tick_duration: Duration::from_millis(10),
+            ..Default::default()
+        };
         let mut wheel = Wheel::new(config);
 
         assert!(wheel.next_timeout().is_none());
@@ -541,11 +545,12 @@ mod tests {
     #[test]
     fn test_heavy_overflow() {
         // Setup a wheel with small capacity to force overflow
-        let mut config = WheelConfig::default();
-        config.l0_slot_count = 16;
-        config.l0_tick_duration = Duration::from_millis(10);
-        config.l1_slot_count = 4;
-        config.l1_tick_duration = Duration::from_millis(160); // 16 * 10ms
+        let config = WheelConfig {
+            l0_slot_count: 16,
+            l0_tick_duration: Duration::from_millis(10),
+            l1_slot_count: 4,
+            l1_tick_duration: Duration::from_millis(160), // 16 * 10ms
+        };
 
         // Total L1 range = 4 * 160ms = 640ms.
         // If we insert something > 640ms, it wraps safely.

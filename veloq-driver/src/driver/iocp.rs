@@ -54,8 +54,8 @@ impl Driver for IocpDriver {
     fn submit(
         &mut self,
         user_data: usize,
-        op: Self::Op,
-    ) -> Result<Poll<()>, (io::Error, Self::Op)> {
+        op_in: &mut Option<Self::Op>,
+    ) -> Result<Poll<()>, io::Error> {
         trace!(user_data, "Submitting op");
 
         let slots_per_page = self.ops.local.len();
@@ -67,6 +67,7 @@ impl Driver for IocpDriver {
                 None => panic!("Op not found"),
             };
 
+            let op = op_in.take().unwrap();
             unsafe { *slot.op.get() = Some(op) };
             slot.state.store(STATE_SUBMITTED, Ordering::Release);
 
@@ -128,10 +129,10 @@ impl Driver for IocpDriver {
                 Err(e) => {
                     op_entry.platform_data.lifecycle =
                         OpLifecycle::Completed(Err(io::Error::other("Submit Error")));
-                    let op = unsafe { (*slot.op.get()).take().unwrap() };
+                    *op_in = unsafe { (*slot.op.get()).take() };
                     slot.state
                         .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
-                    return Err((e, op));
+                    return Err(e);
                 }
             }
         } // End of submission scope
@@ -145,26 +146,26 @@ impl Driver for IocpDriver {
             false
         };
 
-        if should_complete_detached {
-            if let Some((slot, entry)) = self.ops.get_slot_and_entry_mut(user_data) {
-                if let OpLifecycle::Completed(result) = &entry.platform_data.lifecycle {
-                    let res_copy = result.as_ref().map(|x| *x).map_err(|e| {
-                        if let Some(code) = e.raw_os_error() {
-                            io::Error::from_raw_os_error(code)
-                        } else {
-                            io::Error::new(e.kind(), e.to_string())
-                        }
-                    });
-
-                    if let Some(completer) = entry.platform_data.detached_completer.take() {
-                        if let Some(iocp_op) = unsafe { (*slot.op.get()).take() } {
-                            completer.complete(res_copy, iocp_op);
-                        }
+        if should_complete_detached
+            && let Some((slot, entry)) = self.ops.get_slot_and_entry_mut(user_data)
+        {
+            if let OpLifecycle::Completed(result) = &entry.platform_data.lifecycle {
+                let res_copy = result.as_ref().map(|x| *x).map_err(|e| {
+                    if let Some(code) = e.raw_os_error() {
+                        io::Error::from_raw_os_error(code)
+                    } else {
+                        io::Error::new(e.kind(), e.to_string())
                     }
+                });
+
+                if let Some(completer) = entry.platform_data.detached_completer.take()
+                    && let Some(iocp_op) = unsafe { (*slot.op.get()).take() }
+                {
+                    completer.complete(res_copy, iocp_op);
                 }
-                let _ = std::mem::replace(&mut entry.platform_data, IocpOpState::default());
-                self.ops.free_indices.push(user_data);
             }
+            let _ = std::mem::take(&mut entry.platform_data);
+            self.ops.free_indices.push(user_data);
         }
 
         Ok(Poll::Ready(()))
@@ -204,7 +205,7 @@ impl Driver for IocpDriver {
                 op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 use veloq_blocking::get_blocking_pool;
                 if get_blocking_pool().execute(task).is_err() {
-                    let _ = std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
+                    let _ = std::mem::take(&mut op_entry.platform_data);
                     self.ops.free_indices.push(user_data);
                     return Err(io::Error::other("Thread pool overloaded"));
                 }
@@ -214,7 +215,7 @@ impl Driver for IocpDriver {
             }
             Err(e) => {
                 debug!(error = ?e, user_data, "Background submit failed");
-                let _ = std::mem::replace(&mut op_entry.platform_data, IocpOpState::default());
+                let _ = std::mem::take(&mut op_entry.platform_data);
                 self.ops.free_indices.push(user_data);
                 return Err(e);
             }
@@ -226,7 +227,8 @@ impl Driver for IocpDriver {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<usize>, Self::Op)> {
+        op_out: &mut Option<Self::Op>,
+    ) -> Poll<io::Result<usize>> {
         trace!(user_data, "IocpDriver::poll_op");
         // Check Slot Logic first
         let slot = &self.ops.shared.slots[user_data];
@@ -238,13 +240,13 @@ impl Driver for IocpDriver {
 
         if state == STATE_COMPLETED {
             let res = unsafe { (*slot.result.get()).take().expect("Result missing") };
-            let op = unsafe { (*slot.op.get()).take().expect("Op missing") };
+            *op_out = Some(unsafe { (*slot.op.get()).take().expect("Op missing") });
 
             slot.state.store(STATE_CONSUMED, Ordering::Release);
             // Remove from local registry
             self.ops.remove(user_data);
 
-            return Poll::Ready((res, op));
+            return Poll::Ready(res);
         }
 
         // Register waker if Pending
@@ -254,10 +256,10 @@ impl Driver for IocpDriver {
         let state = slot.state.load(Ordering::Acquire);
         if state == STATE_COMPLETED {
             let res = unsafe { (*slot.result.get()).take().expect("Result missing") };
-            let op = unsafe { (*slot.op.get()).take().expect("Op missing") };
+            *op_out = Some(unsafe { (*slot.op.get()).take().expect("Op missing") });
             slot.state.store(STATE_CONSUMED, Ordering::Release);
             self.ops.remove(user_data);
-            return Poll::Ready((res, op));
+            return Poll::Ready(res);
         }
 
         Poll::Pending

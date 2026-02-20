@@ -48,7 +48,7 @@ mod flavor {
             ArrayQueue::new(cap)
         }
         fn push(&self, val: T) -> Result<(), T> {
-            self.push(val).map_err(|e| e)
+            self.push(val)
         }
         fn pop(&self) -> Option<T> {
             self.pop()
@@ -328,8 +328,8 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericSender<T, F, Q> {
     pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
         // Optimistic path
         match self.try_send(msg) {
-            Ok(_) => return Ok(()),
-            Err(TrySendError::Closed(m)) => return Err(SendError(m)),
+            Ok(_) => Ok(()),
+            Err(TrySendError::Closed(m)) => Err(SendError(m)),
             Err(TrySendError::Full(m)) => {
                 // Slow path
                 SendFuture {

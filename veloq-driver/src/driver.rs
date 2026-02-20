@@ -21,15 +21,19 @@ pub trait Driver: 'static {
     /// Submit an operation with its resources directly.
     /// Returns `Ok(Poll::...)` on success (Ready or Pending/Queued).
     /// Returns `Err((Error, Op))` if submission failed and the Op was NOT consumed/stored.
-    fn submit(&mut self, user_data: usize, op: Self::Op)
-    -> Result<Poll<()>, (io::Error, Self::Op)>;
+    fn submit(
+        &mut self,
+        user_data: usize,
+        op_in: &mut Option<Self::Op>,
+    ) -> Result<Poll<()>, io::Error>;
 
     /// Poll operation status.
     fn poll_op(
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-    ) -> Poll<(io::Result<usize>, Self::Op)>;
+        op_out: &mut Option<Self::Op>,
+    ) -> Poll<io::Result<usize>>;
 
     /// Submit queued operations to the kernel.
     fn submit_queue(&mut self) -> io::Result<()>;

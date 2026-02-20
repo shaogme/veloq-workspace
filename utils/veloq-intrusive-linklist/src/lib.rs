@@ -18,9 +18,13 @@ pub unsafe trait Adapter {
     type Value: ?Sized;
 
     /// 给定数据指针，返回该数据中 Link 字段的指针
+    /// # Safety
+    /// Caller must ensure values are valid.
     unsafe fn get_link(&self, value: NonNull<Self::Value>) -> NonNull<Link>;
 
     /// 给定 Link 指针，返回包含该 Link 的数据指针
+    /// # Safety
+    /// Caller must ensure links are valid.
     unsafe fn get_value(&self, link: NonNull<Link>) -> NonNull<Self::Value>;
 }
 

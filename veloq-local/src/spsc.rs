@@ -35,6 +35,18 @@ impl<T> fmt::Display for SendError<T> {
 
 impl<T> std::error::Error for SendError<T> {}
 
+/// 非阻塞接收操作可能遇到的错误
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TryRecvError;
+
+impl fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Channel is empty")
+    }
+}
+
+impl std::error::Error for TryRecvError {}
+
 /// 通道容量配置
 #[derive(Debug, Clone, Copy)]
 pub enum ChannelCapacity {
@@ -188,7 +200,7 @@ impl<'a, T> Future for SendFuture<'a, T> {
 
 impl<T> Receiver<T> {
     /// 尝试接收数据
-    pub fn try_recv(&self) -> Result<Option<T>, ()> {
+    pub fn try_recv(&self) -> Result<Option<T>, TryRecvError> {
         let mut state = self.state.borrow_mut();
 
         if let Some(item) = state.buffer.pop_front() {
@@ -200,7 +212,7 @@ impl<T> Receiver<T> {
         } else if state.is_closed {
             Ok(None)
         } else {
-            Err(()) // Pending
+            Err(TryRecvError) // Pending
         }
     }
 

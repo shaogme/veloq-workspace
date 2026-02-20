@@ -137,7 +137,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
             panic!("Invalid user_data for remove");
         }
 
-        let data = std::mem::replace(&mut self.local[user_data].platform_data, P::default());
+        let data = std::mem::take(&mut self.local[user_data].platform_data);
         self.free_indices.push(user_data);
 
         OpEntry {

@@ -47,13 +47,13 @@ fn test_iocp_accept() {
     let acceptor_handle = acceptor.into_raw();
 
     // Prepare Accept Op using OpLifecycle
-    let mut accept_op = Accept::into_op(listener_handle.into(), acceptor_handle.into());
-    accept_op.accept_socket = acceptor_handle.into();
+    let mut accept_op = Accept::into_op(listener_handle.into(), acceptor_handle);
+    accept_op.accept_socket = acceptor_handle;
 
-    let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(accept_op);
+    let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(accept_op));
 
     let (user_data, _) = driver.reserve_op().unwrap();
-    let _ = driver.submit(user_data, iocp_op);
+    let _ = driver.submit(user_data, &mut iocp_op);
 
     // Connect Client in background
     std::thread::spawn(move || {
@@ -73,8 +73,10 @@ fn test_iocp_accept() {
 
         driver.process_completions();
 
-        match driver.poll_op(user_data, &mut cx) {
-            Poll::Ready((res, iocp_op)) => {
+        let mut op_out = None;
+        match driver.poll_op(user_data, &mut cx, &mut op_out) {
+            Poll::Ready(res) => {
+                let iocp_op = op_out.unwrap();
                 assert!(res.is_ok(), "Accept failed: {:?}", res.err());
                 let op =
                     <Accept as crate::op::IntoPlatformOp<IocpDriver>>::from_platform_op(iocp_op);
@@ -105,7 +107,7 @@ fn test_iocp_connect() {
 
     // Client Socket
     let client = Socket::new_tcp_v4().unwrap();
-    let client_handle = client.into_raw().into();
+    let client_handle = client.into_raw();
 
     // Create Connect Op manually as it doesn't have into_op
     use crate::socket_addr_to_storage;
@@ -117,9 +119,9 @@ fn test_iocp_connect() {
         addr_len: addr_len as u32,
     };
 
-    let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(connect_op);
+    let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(connect_op));
     let (user_data, _) = driver.reserve_op().unwrap();
-    let _ = driver.submit(user_data, iocp_op);
+    let _ = driver.submit(user_data, &mut iocp_op);
 
     // Poll
     let waker = noop_waker();
@@ -131,8 +133,10 @@ fn test_iocp_connect() {
             panic!("Connect Timed out");
         }
         driver.process_completions();
-        match driver.poll_op(user_data, &mut cx) {
-            Poll::Ready((res, _)) => {
+        let mut op_out = None;
+        match driver.poll_op(user_data, &mut cx, &mut op_out) {
+            Poll::Ready(res) => {
+                let _ = op_out.unwrap();
                 assert!(res.is_ok(), "Connect failed: {:?}", res.err());
                 unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
                 break;
@@ -150,9 +154,9 @@ fn test_iocp_timeout() {
         duration: std::time::Duration::from_millis(100),
     };
 
-    let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(timeout_op);
+    let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(timeout_op));
     let (user_data, _) = driver.reserve_op().unwrap();
-    let _ = driver.submit(user_data, iocp_op);
+    let _ = driver.submit(user_data, &mut iocp_op);
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -166,8 +170,10 @@ fn test_iocp_timeout() {
 
         driver.process_completions();
 
-        match driver.poll_op(user_data, &mut cx) {
-            Poll::Ready((res, _)) => {
+        let mut op_out = None;
+        match driver.poll_op(user_data, &mut cx, &mut op_out) {
+            Poll::Ready(res) => {
+                let _ = op_out.unwrap();
                 assert!(res.is_ok(), "Timeout should succeed");
                 let elapsed = start.elapsed();
                 assert!(
@@ -213,7 +219,7 @@ fn test_iocp_recv_with_buffer_pool() {
             let mut driver = self.driver.borrow_mut();
             let mut ids = Vec::new();
             for (i, region) in regions.iter().enumerate() {
-                driver.register_chunk(i as u16, region.as_ptr() as *const u8, region.len())?;
+                driver.register_chunk(i as u16, region.as_ptr(), region.len())?;
                 ids.push(i);
             }
             Ok(ids)
@@ -250,9 +256,9 @@ fn test_iocp_recv_with_buffer_pool() {
         buf,
     };
 
-    let iocp_op = IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op);
+    let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
     let (user_data, _) = driver.borrow_mut().reserve_op().unwrap();
-    let _ = driver.borrow_mut().submit(user_data, iocp_op);
+    let _ = driver.borrow_mut().submit(user_data, &mut iocp_op);
 
     // Poll
     let waker = noop_waker();
@@ -265,8 +271,10 @@ fn test_iocp_recv_with_buffer_pool() {
         }
         driver.borrow_mut().process_completions();
 
-        match driver.borrow_mut().poll_op(user_data, &mut cx) {
-            Poll::Ready((res, iocp_op)) => {
+        let mut op_out = None;
+        match driver.borrow_mut().poll_op(user_data, &mut cx, &mut op_out) {
+            Poll::Ready(res) => {
+                let iocp_op = op_out.unwrap();
                 assert!(res.is_ok(), "Recv failed: {:?}", res.err());
                 let bytes_read = res.unwrap();
                 assert_eq!(bytes_read, 12);
