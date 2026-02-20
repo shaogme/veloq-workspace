@@ -114,9 +114,28 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  clippy:
+    name: Clippy on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: shaogme/speedy-rust@main
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
   ci-success:
     name: CI Success
-    needs: [test, loom-test, fmt]
+    needs: [test, loom-test, fmt, clippy]
     runs-on: ubuntu-latest
     steps:
       - name: Success
