@@ -112,10 +112,10 @@ impl<T> Future for Receiver<T> {
             return Poll::Ready(Err(RecvError));
         }
 
-        if let Some(w) = &state.waker {
-            if w.will_wake(cx.waker()) {
-                return Poll::Pending;
-            }
+        if let Some(w) = &state.waker
+            && w.will_wake(cx.waker())
+        {
+            return Poll::Pending;
         }
 
         state.waker = Some(cx.waker().clone());
