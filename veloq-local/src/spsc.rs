@@ -1,14 +1,13 @@
 use futures_core::Future;
 use futures_core::stream::Stream;
 use std::{
+    alloc::{Layout, alloc, dealloc, handle_alloc_error},
     cell::UnsafeCell,
-    fmt,
+    fmt, mem,
     pin::Pin,
+    ptr::{self, NonNull},
     rc::Rc,
     task::{Context, Poll, Waker},
-    alloc::{Layout, alloc, dealloc, handle_alloc_error},
-    ptr::{self, NonNull},
-    mem,
 };
 
 /// 发送操作可能遇到的错误
@@ -168,24 +167,20 @@ impl<T> Inner<T> {
 
                 if head_idx < tail_idx {
                     // Contiguous
-                    ptr::copy_nonoverlapping(
-                        self.buffer.as_ptr().add(head_idx),
-                        new_ptr,
-                        count
-                    );
+                    ptr::copy_nonoverlapping(self.buffer.as_ptr().add(head_idx), new_ptr, count);
                 } else {
                     // Wrapped or full
                     let first_part = old_cap - head_idx;
                     ptr::copy_nonoverlapping(
                         self.buffer.as_ptr().add(head_idx),
                         new_ptr,
-                        first_part
+                        first_part,
                     );
                     let second_part = count - first_part;
                     ptr::copy_nonoverlapping(
                         self.buffer.as_ptr(),
                         new_ptr.add(first_part),
-                        second_part
+                        second_part,
                     );
                 }
 
@@ -217,7 +212,7 @@ impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
         // Drop remaining elements
         if mem::needs_drop::<T>() {
-            while let Some(_) = self.pop() {}
+            while self.pop().is_some() {}
         }
 
         // Deallocate buffer
@@ -337,15 +332,19 @@ impl<'a, T> Future for SendFuture<'a, T> {
             let inner = unsafe { &mut *self.sender.inner.get() };
 
             if inner.is_closed {
-                let item = self.item.take().expect("Polled SendFuture after completion");
+                let item = self
+                    .item
+                    .take()
+                    .expect("Polled SendFuture after completion");
                 return Poll::Ready(Err(SendError::Closed(item)));
             }
 
-            let item = self.item.take().expect("Polled SendFuture after completion");
+            let item = self
+                .item
+                .take()
+                .expect("Polled SendFuture after completion");
             match inner.push(item) {
-                Ok(()) => {
-                    inner.consumer_waker.take()
-                }
+                Ok(()) => inner.consumer_waker.take(),
                 Err(item) => {
                     self.item = Some(item);
 
@@ -454,7 +453,7 @@ impl<'a, T> Stream for ChannelStream<'a, T> {
             } else if inner.is_closed {
                 return Poll::Ready(None);
             } else {
-                 if let Some(w) = &inner.consumer_waker {
+                if let Some(w) = &inner.consumer_waker {
                     if !w.will_wake(cx.waker()) {
                         inner.consumer_waker = Some(cx.waker().clone());
                     }
