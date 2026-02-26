@@ -222,10 +222,7 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                 continue;
             }
 
-            // 3. Register waker
-            this.node.waker.register(cx.waker());
-
-            // 4. Enqueue if needed
+            // 3. Enqueue if needed
             if !this.queued {
                 let mut waiters = this.lock.waiters.lock();
 
@@ -234,6 +231,9 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                     drop(waiters);
                     continue;
                 }
+
+                // Register waker
+                this.node.waker.register(cx.waker());
 
                 // Enqueue
                 unsafe {
@@ -257,8 +257,13 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                 if !is_linked {
                     // Woken up
                     this.queued = false;
+                    // Register waker to reset AtomicWaker state
+                    this.node.waker.register(cx.waker());
                     continue;
                 }
+
+                // Register waker
+                this.node.waker.register(cx.waker());
             }
 
             return Poll::Pending;
