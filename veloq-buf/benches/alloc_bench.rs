@@ -40,7 +40,7 @@ fn bench_threaded(c: &mut Criterion) {
             let start = std::time::Instant::now();
             let mut handles = Vec::with_capacity(4);
             // Ensure even distribution, prevent 0 iter threads
-            let iters_per_thread = (iters + 3) / 4;
+            let iters_per_thread = iters.div_ceil(4);
 
             for _ in 0..4 {
                 let pool = SlotBasedPool::new(global_pool.clone());
