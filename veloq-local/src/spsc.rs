@@ -149,9 +149,6 @@ impl<T> Inner<T> {
         let old_cap = self.capacity;
         let new_cap = old_cap * 2;
 
-        // Update pointers if ZST? No, ZST uses dangling.
-        // If not ZST, allocate.
-
         if mem::size_of::<T>() > 0 {
             let layout = Layout::array::<T>(new_cap).unwrap();
             let new_ptr = unsafe { alloc(layout) } as *mut T;
@@ -189,20 +186,15 @@ impl<T> Inner<T> {
                 dealloc(self.buffer.as_ptr() as *mut u8, old_layout);
             }
             self.buffer = unsafe { NonNull::new_unchecked(new_ptr) };
-        } else {
-            // ZST: nothing to do for buffer, just update capacity
         }
 
         // Common updates
         self.capacity = new_cap;
         self.mask = new_cap - 1;
-        // Re-normalize head/tail
-        // For ZST, head/tail are just counters, we don't need to normalize if we don't copy?
-        // Wait, for non-ZST we copied to linear buffer starting at 0.
-        // So head becomes 0.
-        // For ZST, we didn't copy anything. Indices are virtual.
-        // Can we reset head/tail for ZST?
-        // If we reset head=0, tail=count, it's valid.
+
+        // When growing, we realign the buffer (if it was wrapped) to start at 0.
+        // This applies to both normal types (where we physically moved memory)
+        // and ZSTs (where we conceptually reset the window).
         self.head = 0;
         self.tail = self.len(); // old length
     }
