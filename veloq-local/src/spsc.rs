@@ -493,3 +493,5 @@ fn new<T>(capacity: ChannelCapacity) -> (Sender<T>, Receiver<T>) {
         Receiver { inner: state },
     )
 }
+
+// End of file
