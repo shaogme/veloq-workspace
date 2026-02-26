@@ -3,57 +3,15 @@ use futures_core::stream::Stream;
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     cell::UnsafeCell,
-    fmt, mem,
+    mem,
     pin::Pin,
     ptr::{self, NonNull},
     rc::Rc,
     task::{Context, Poll, Waker},
 };
 
-/// Error types for send operations
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SendError<T> {
-    /// The receiver has been closed.
-    Closed(T),
-    /// The channel is full.
-    Full(T),
-}
-
-impl<T> fmt::Debug for SendError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SendError::Closed(_) => write!(f, "SendError::Closed(..)"),
-            SendError::Full(_) => write!(f, "SendError::Full(..)"),
-        }
-    }
-}
-
-impl<T> fmt::Display for SendError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl<T> std::error::Error for SendError<T> {}
-
-/// Error type for non-blocking receive operations
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TryRecvError;
-
-impl fmt::Display for TryRecvError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Channel is empty")
-    }
-}
-
-impl std::error::Error for TryRecvError {}
-
-/// Channel capacity configuration
-#[derive(Debug, Clone, Copy)]
-pub enum ChannelCapacity {
-    Unbounded,
-    Bounded(usize),
-}
+use crate::common::update_waker;
+pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
 
 struct Inner<T> {
     buffer: NonNull<T>,
@@ -340,13 +298,7 @@ impl<'a, T> Future for SendFuture<'a, T> {
                 Err(item) => {
                     self.item = Some(item);
 
-                    if let Some(w) = &inner.producer_waker {
-                        if !w.will_wake(cx.waker()) {
-                            inner.producer_waker = Some(cx.waker().clone());
-                        }
-                    } else {
-                        inner.producer_waker = Some(cx.waker().clone());
-                    }
+                    update_waker(&mut inner.producer_waker, cx.waker());
                     return Poll::Pending;
                 }
             }
@@ -362,7 +314,7 @@ impl<'a, T> Future for SendFuture<'a, T> {
 
 impl<T> Receiver<T> {
     /// Attempts to receive a message.
-    pub fn try_recv(&self) -> Result<Option<T>, TryRecvError> {
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
         let (item, waker) = {
             let inner = unsafe { &mut *self.inner.get() };
 
@@ -371,7 +323,7 @@ impl<T> Receiver<T> {
             } else if inner.is_closed {
                 (None, None)
             } else {
-                return Err(TryRecvError);
+                return Err(TryRecvError::Empty);
             }
         };
 
@@ -379,7 +331,11 @@ impl<T> Receiver<T> {
             waker.wake();
         }
 
-        Ok(item)
+        if let Some(item) = item {
+            Ok(item)
+        } else {
+            Err(TryRecvError::Closed)
+        }
     }
 
     /// Asynchronously receives a message.
@@ -409,15 +365,7 @@ impl<T> Future for RecvFuture<'_, T> {
             } else if inner.is_closed {
                 return Poll::Ready(None);
             } else {
-                // Register waker
-                if let Some(w) = &inner.consumer_waker {
-                    if !w.will_wake(cx.waker()) {
-                        inner.consumer_waker = Some(cx.waker().clone());
-                    }
-                } else {
-                    inner.consumer_waker = Some(cx.waker().clone());
-                }
-
+                update_waker(&mut inner.consumer_waker, cx.waker());
                 return Poll::Pending;
             }
         };
@@ -445,14 +393,7 @@ impl<'a, T> Stream for ChannelStream<'a, T> {
             } else if inner.is_closed {
                 return Poll::Ready(None);
             } else {
-                if let Some(w) = &inner.consumer_waker {
-                    if !w.will_wake(cx.waker()) {
-                        inner.consumer_waker = Some(cx.waker().clone());
-                    }
-                } else {
-                    inner.consumer_waker = Some(cx.waker().clone());
-                }
-
+                update_waker(&mut inner.consumer_waker, cx.waker());
                 return Poll::Pending;
             }
         };
@@ -485,5 +426,3 @@ fn new<T>(capacity: ChannelCapacity) -> (Sender<T>, Receiver<T>) {
         Receiver { inner: state },
     )
 }
-
-// End of file

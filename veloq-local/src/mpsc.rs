@@ -2,52 +2,18 @@ use futures_core::Future;
 use futures_core::stream::Stream;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
+use crate::common::update_waker;
+pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
+
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    fmt,
     marker::PhantomPinned,
     pin::Pin,
     ptr::NonNull,
     rc::Rc,
     task::{Context, Poll, Waker},
 };
-
-/// 发送操作可能遇到的错误
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SendError<T> {
-    /// 接收端已关闭
-    Closed(T), // 返回未发送的消息
-    /// 通道已满（仅限有界通道）
-    Full(T), // 返回未发送的消息
-}
-
-impl<T> fmt::Debug for SendError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SendError::Closed(_) => write!(f, "SendError::Closed(..)"),
-            SendError::Full(_) => write!(f, "SendError::Full(..)"),
-        }
-    }
-}
-
-impl<T> fmt::Display for SendError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SendError::Closed(_) => write!(f, "SendError::Closed(..)"),
-            SendError::Full(_) => write!(f, "SendError::Full(..)"),
-        }
-    }
-}
-
-impl<T> std::error::Error for SendError<T> {}
-
-/// 通道容量配置
-#[derive(Debug, Clone, Copy)]
-pub enum ChannelCapacity {
-    Unbounded,
-    Bounded(usize),
-}
 
 /// 本地通道的发送端
 ///
@@ -136,9 +102,7 @@ where
         match result {
             PollResult::Pending => {
                 let mut waker = pinned_node.waker.borrow_mut();
-                if waker.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
-                    *waker = Some(cx.waker().clone());
-                }
+                update_waker(&mut waker, cx.waker());
                 drop(waker);
 
                 if !pinned_node.link.is_linked() {
@@ -451,9 +415,7 @@ impl<T> Stream for ChannelStream<'_, T> {
         match result {
             PollResult::Pending => {
                 let mut waker = node.waker.borrow_mut();
-                if waker.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
-                    *waker = Some(cx.waker().clone());
-                }
+                update_waker(&mut waker, cx.waker());
                 drop(waker);
 
                 if !node.link.is_linked() {
@@ -498,6 +460,23 @@ impl<T> Drop for ChannelStream<'_, T> {
 }
 
 impl<T> LocalReceiver<T> {
+    /// 尝试非阻塞接收
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let result = self.channel.state.borrow_mut().recv_one();
+        match result {
+            PollResult::Pending => Err(TryRecvError::Empty),
+            PollResult::Ready(opt) => match opt {
+                Some((ret, mw)) => {
+                    if let Some(w) = mw {
+                        w.wake();
+                    }
+                    Ok(ret)
+                }
+                None => Err(TryRecvError::Closed),
+            },
+        }
+    }
+
     /// 接收下一条消息
     pub async fn recv(&self) -> Option<T> {
         Waiter::<T, ReceiverAction, _>::new(|| self.recv_one(), &self.channel).await
