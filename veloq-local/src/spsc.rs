@@ -10,12 +10,12 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-/// 发送操作可能遇到的错误
+/// Error types for send operations
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SendError<T> {
-    /// 接收端已关闭
+    /// The receiver has been closed.
     Closed(T),
-    /// 通道已满
+    /// The channel is full.
     Full(T),
 }
 
@@ -36,7 +36,7 @@ impl<T> fmt::Display for SendError<T> {
 
 impl<T> std::error::Error for SendError<T> {}
 
-/// 非阻塞接收操作可能遇到的错误
+/// Error type for non-blocking receive operations
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TryRecvError;
 
@@ -48,7 +48,7 @@ impl fmt::Display for TryRecvError {
 
 impl std::error::Error for TryRecvError {}
 
-/// 通道容量配置
+/// Channel capacity configuration
 #[derive(Debug, Clone, Copy)]
 pub enum ChannelCapacity {
     Unbounded,
@@ -225,13 +225,13 @@ impl<T> Drop for Inner<T> {
     }
 }
 
-/// SPSC 通道发送端
+/// SPSC Channel Sender
 #[derive(Debug)]
 pub struct Sender<T> {
     inner: Rc<UnsafeCell<Inner<T>>>,
 }
 
-/// SPSC 通道接收端
+/// SPSC Channel Receiver
 #[derive(Debug)]
 pub struct Receiver<T> {
     inner: Rc<UnsafeCell<Inner<T>>>,
@@ -266,7 +266,7 @@ impl<T> Drop for Receiver<T> {
 }
 
 impl<T> Sender<T> {
-    /// 尝试发送数据
+    /// Attempts to send a message.
     pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
         let waker = {
             let inner = unsafe { &mut *self.inner.get() };
@@ -289,7 +289,7 @@ impl<T> Sender<T> {
         Ok(())
     }
 
-    /// 异步发送数据
+    /// Asynchronously sends a message.
     pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
         SendFuture {
             sender: self,
@@ -298,19 +298,19 @@ impl<T> Sender<T> {
         .await
     }
 
-    /// 检查通道是否已满
+    /// Checks if the channel is full.
     pub fn is_full(&self) -> bool {
         let inner = unsafe { &*self.inner.get() };
         inner.is_full()
     }
 
-    /// 获取当前通道中的消息数量
+    /// Returns the number of messages currently in the channel.
     pub fn len(&self) -> usize {
         let inner = unsafe { &*self.inner.get() };
         inner.len()
     }
 
-    /// 检查通道是否为空
+    /// Checks if the channel is empty.
     pub fn is_empty(&self) -> bool {
         let inner = unsafe { &*self.inner.get() };
         inner.is_empty()
@@ -369,7 +369,7 @@ impl<'a, T> Future for SendFuture<'a, T> {
 }
 
 impl<T> Receiver<T> {
-    /// 尝试接收数据
+    /// Attempts to receive a message.
     pub fn try_recv(&self) -> Result<Option<T>, TryRecvError> {
         let (item, waker) = {
             let inner = unsafe { &mut *self.inner.get() };
@@ -390,12 +390,12 @@ impl<T> Receiver<T> {
         Ok(item)
     }
 
-    /// 异步接收数据
+    /// Asynchronously receives a message.
     pub async fn recv(&self) -> Option<T> {
         RecvFuture { receiver: self }.await
     }
 
-    /// 转换为 Stream
+    /// Converts the receiver into a `Stream`.
     pub fn stream(&self) -> impl Stream<Item = T> + '_ {
         ChannelStream { receiver: self }
     }
@@ -472,12 +472,12 @@ impl<'a, T> Stream for ChannelStream<'a, T> {
     }
 }
 
-/// 创建一个新的无界 SPSC 通道
+/// Creates a new unbounded SPSC channel.
 pub fn new_unbounded<T>() -> (Sender<T>, Receiver<T>) {
     new(ChannelCapacity::Unbounded)
 }
 
-/// 创建一个新的有界 SPSC 通道
+/// Creates a new bounded SPSC channel.
 pub fn new_bounded<T>(size: usize) -> (Sender<T>, Receiver<T>) {
     new(ChannelCapacity::Bounded(size))
 }
