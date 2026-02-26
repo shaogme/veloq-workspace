@@ -5,6 +5,9 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use crate::common::update_waker;
+pub use crate::common::TryRecvError;
+
 /// 接收端已关闭错误
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RecvError;
@@ -112,31 +115,25 @@ impl<T> Future for Receiver<T> {
             return Poll::Ready(Err(RecvError));
         }
 
-        if let Some(w) = &state.waker
-            && w.will_wake(cx.waker())
-        {
-            return Poll::Pending;
-        }
-
-        state.waker = Some(cx.waker().clone());
+        update_waker(&mut state.waker, cx.waker());
         Poll::Pending
     }
 }
 
 impl<T> Receiver<T> {
     /// 尝试非阻塞接收
-    pub fn try_recv(&mut self) -> Result<Option<T>, RecvError> {
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
         let state = unsafe { &mut *self.state.get() };
 
         if let Some(val) = state.value.take() {
-            return Ok(Some(val));
+            return Ok(val);
         }
 
         if state.is_tx_closed {
-            return Err(RecvError);
+            return Err(TryRecvError::Closed);
         }
 
-        Ok(None)
+        Err(TryRecvError::Empty)
     }
 
     /// 关闭接收端

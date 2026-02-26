@@ -169,3 +169,21 @@ async fn test_stream_conversion() {
         })
         .await;
 }
+
+#[tokio::test]
+async fn test_try_recv() {
+    let (tx, rx) = mpsc::new_unbounded();
+
+    assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+    tx.send(100).await.unwrap();
+
+    assert_eq!(rx.try_recv(), Ok(100));
+
+    // After consuming, it should be empty again
+    assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+    drop(tx);
+    // After drop, it should be closed
+    assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Closed));
+}

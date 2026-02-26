@@ -38,15 +38,15 @@ async fn test_rx_closed() {
 
 #[tokio::test]
 async fn test_try_recv() {
-    let (tx, mut rx) = oneshot::channel();
+    let (tx, rx) = oneshot::channel();
 
-    assert!(rx.try_recv().unwrap().is_none());
+    assert_eq!(rx.try_recv(), Err(oneshot::TryRecvError::Empty));
 
     tx.send(100).unwrap();
 
-    assert_eq!(rx.try_recv().unwrap(), Some(100));
+    assert_eq!(rx.try_recv(), Ok(100));
 
-    assert!(rx.try_recv().is_err());
+    assert_eq!(rx.try_recv(), Err(oneshot::TryRecvError::Closed));
 }
 
 #[tokio::test]
