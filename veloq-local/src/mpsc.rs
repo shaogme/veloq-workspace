@@ -102,7 +102,7 @@ where
         match result {
             PollResult::Pending => {
                 let mut waker = pinned_node.waker.borrow_mut();
-                update_waker(&mut *waker, cx.waker());
+                update_waker(&mut waker, cx.waker());
                 drop(waker);
 
                 if !pinned_node.link.is_linked() {
@@ -415,7 +415,7 @@ impl<T> Stream for ChannelStream<'_, T> {
         match result {
             PollResult::Pending => {
                 let mut waker = node.waker.borrow_mut();
-                update_waker(&mut *waker, cx.waker());
+                update_waker(&mut waker, cx.waker());
                 drop(waker);
 
                 if !node.link.is_linked() {

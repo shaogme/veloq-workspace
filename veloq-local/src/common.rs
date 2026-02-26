@@ -57,10 +57,8 @@ impl std::error::Error for TryRecvError {}
 
 /// Updates the stored waker if it does not match the current context waker.
 pub fn update_waker(waker_slot: &mut Option<Waker>, new_waker: &Waker) {
-    if let Some(w) = waker_slot {
-        if w.will_wake(new_waker) {
-            return;
-        }
+    if waker_slot.as_ref().is_some_and(|w| w.will_wake(new_waker)) {
+        return;
     }
     *waker_slot = Some(new_waker.clone());
 }
