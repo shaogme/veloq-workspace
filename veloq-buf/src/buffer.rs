@@ -47,6 +47,7 @@
 
 use std::{
     alloc::LayoutError,
+    cell::RefCell,
     num::{NonZeroU16, NonZeroUsize},
     ptr::NonNull,
     sync::Arc,
@@ -580,6 +581,33 @@ impl std::fmt::Debug for SlotBasedPool {
     }
 }
 
+const ARC_CACHE_LIMIT: usize = 64;
+
+struct ThreadLocalPoolCache {
+    ptr: *const crate::heap::GlobalSlotPool,
+    balance: usize,
+}
+
+impl Drop for ThreadLocalPoolCache {
+    fn drop(&mut self) {
+        if self.balance > 0 && !self.ptr.is_null() {
+            // Flush remaining credits on thread exit
+            for _ in 0..self.balance {
+                unsafe {
+                    Arc::decrement_strong_count(self.ptr);
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    static POOL_CACHE: RefCell<ThreadLocalPoolCache> = RefCell::new(ThreadLocalPoolCache {
+        ptr: std::ptr::null(),
+        balance: 0,
+    });
+}
+
 impl BackingPool for SlotBasedPool {
     fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
         let size_val = size.get();
@@ -619,12 +647,40 @@ impl BackingPool for SlotBasedPool {
     }
 
     fn pool_data(&self) -> NonNull<()> {
-        let ptr = {
-            // Always acquire strong reference to ensure safety for FixedBuf lifetime
-            Arc::into_raw(self.pool.clone())
-        };
+        let current_ptr = Arc::as_ptr(&self.pool);
 
-        unsafe { NonNull::new_unchecked(ptr as *mut ()) }
+        POOL_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+
+            if cache.ptr == current_ptr {
+                if cache.balance > 0 {
+                    // Fast path: Reuse credit
+                    cache.balance -= 1;
+                    return unsafe { NonNull::new_unchecked(current_ptr as *mut ()) };
+                }
+            } else {
+                // Flush old pool logic
+                if cache.balance > 0 && !cache.ptr.is_null() {
+                    let old_ptr = cache.ptr;
+                    let count = cache.balance;
+                    // Standard Arc doesn't support batch decrement, so we loop.
+                    // This is acceptable as pool switching is rare.
+                    for _ in 0..count {
+                        unsafe {
+                            Arc::decrement_strong_count(old_ptr);
+                        }
+                    }
+                }
+                cache.ptr = current_ptr;
+                cache.balance = 0;
+            }
+
+            // Fallback: Clone Arc (atomic increment)
+            // We only increment by 1 here because we can't batch-increment easily.
+            // But we rely on dealloc recycling to build up balance.
+            let ptr = Arc::into_raw(self.pool.clone());
+            unsafe { NonNull::new_unchecked(ptr as *mut ()) }
+        })
     }
 }
 
@@ -650,10 +706,31 @@ unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams)
     let slot_idx_val = (params.context & 0xFFFFFF) as usize;
     let slot_idx = crate::heap::slot::SlotIndex(slot_idx_val);
 
-    // Restore ownership of Arc to drop it (decrement ref count)
-    let pool = unsafe { Arc::from_raw(raw_ptr) };
-    unsafe {
-        pool.dealloc_slots(chunk_id, slot_idx, order);
+    // Try recycle
+    let recycled = POOL_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.ptr == raw_ptr {
+            if cache.balance < ARC_CACHE_LIMIT {
+                cache.balance += 1;
+                return true;
+            }
+        }
+        false
+    });
+
+    if recycled {
+        // We recycled the ref (put into TLS balance).
+        // So we do NOT drop the Arc.
+        let pool = unsafe { &*raw_ptr };
+        unsafe {
+            pool.dealloc_slots(chunk_id, slot_idx, order);
+        }
+    } else {
+        // Standard drop (Atomic Decrement)
+        let pool = unsafe { Arc::from_raw(raw_ptr) };
+        unsafe {
+            pool.dealloc_slots(chunk_id, slot_idx, order);
+        }
     }
 }
 
