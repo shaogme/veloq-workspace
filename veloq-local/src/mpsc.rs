@@ -135,12 +135,21 @@ where
         let result = (future_mut.poll_fn)();
         match result {
             PollResult::Pending => {
-                *pinned_node.waker.borrow_mut() = Some(cx.waker().clone());
+                let mut waker = pinned_node.waker.borrow_mut();
+                if waker
+                    .as_ref()
+                    .is_none_or(|w| !w.will_wake(cx.waker()))
+                {
+                    *waker = Some(cx.waker().clone());
+                }
+                drop(waker);
 
-                register_into_waiting_queue::<T, A>(
-                    pinned_node,
-                    &mut future_mut.channel.state.borrow_mut(),
-                );
+                if !pinned_node.link.is_linked() {
+                    register_into_waiting_queue::<T, A>(
+                        pinned_node,
+                        &mut future_mut.channel.state.borrow_mut(),
+                    );
+                }
                 Poll::Pending
             }
             PollResult::Ready(result) => {
@@ -444,12 +453,21 @@ impl<T> Stream for ChannelStream<'_, T> {
 
         match result {
             PollResult::Pending => {
-                *node.waker.borrow_mut() = Some(cx.waker().clone());
+                let mut waker = node.waker.borrow_mut();
+                if waker
+                    .as_ref()
+                    .is_none_or(|w| !w.will_wake(cx.waker()))
+                {
+                    *waker = Some(cx.waker().clone());
+                }
+                drop(waker);
 
-                register_into_waiting_queue::<T, ReceiverAction>(
-                    node,
-                    &mut this.channel.state.borrow_mut(),
-                );
+                if !node.link.is_linked() {
+                    register_into_waiting_queue::<T, ReceiverAction>(
+                        node,
+                        &mut this.channel.state.borrow_mut(),
+                    );
+                }
 
                 Poll::Pending
             }

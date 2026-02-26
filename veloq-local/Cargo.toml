@@ -23,3 +23,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "stream_bench"
 harness = false
+
+[[bench]]
+name = "mpsc_poll_bench"
+harness = false
