@@ -602,10 +602,12 @@ impl Drop for ThreadLocalPoolCache {
 }
 
 thread_local! {
-    static POOL_CACHE: RefCell<ThreadLocalPoolCache> = RefCell::new(ThreadLocalPoolCache {
-        ptr: std::ptr::null(),
-        balance: 0,
-    });
+    static POOL_CACHE: RefCell<ThreadLocalPoolCache> = const {
+        RefCell::new(ThreadLocalPoolCache {
+            ptr: std::ptr::null(),
+            balance: 0,
+        })
+    };
 }
 
 impl BackingPool for SlotBasedPool {
@@ -709,11 +711,9 @@ unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams)
     // Try recycle
     let recycled = POOL_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.ptr == raw_ptr {
-            if cache.balance < ARC_CACHE_LIMIT {
-                cache.balance += 1;
-                return true;
-            }
+        if cache.ptr == raw_ptr && cache.balance < ARC_CACHE_LIMIT {
+            cache.balance += 1;
+            return true;
         }
         false
     });
