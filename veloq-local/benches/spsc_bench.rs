@@ -17,7 +17,7 @@ fn bench_spsc_bounded(c: &mut Criterion) {
 
                 let rx_fut = async move {
                     let mut count = 0;
-                    while let Some(_) = rx.recv().await {
+                    while rx.recv().await.is_some() {
                         count += 1;
                     }
                     count
@@ -56,7 +56,7 @@ fn bench_spsc_unbounded(c: &mut Criterion) {
 
             let rx_fut = async move {
                 let mut c = 0;
-                while let Some(_) = rx.recv().await {
+                while rx.recv().await.is_some() {
                     c += 1;
                 }
                 c
