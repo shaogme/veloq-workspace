@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Wake, Waker};

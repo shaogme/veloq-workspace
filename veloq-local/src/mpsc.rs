@@ -136,10 +136,7 @@ where
         match result {
             PollResult::Pending => {
                 let mut waker = pinned_node.waker.borrow_mut();
-                if waker
-                    .as_ref()
-                    .is_none_or(|w| !w.will_wake(cx.waker()))
-                {
+                if waker.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
                     *waker = Some(cx.waker().clone());
                 }
                 drop(waker);
@@ -454,10 +451,7 @@ impl<T> Stream for ChannelStream<'_, T> {
         match result {
             PollResult::Pending => {
                 let mut waker = node.waker.borrow_mut();
-                if waker
-                    .as_ref()
-                    .is_none_or(|w| !w.will_wake(cx.waker()))
-                {
+                if waker.as_ref().is_none_or(|w| !w.will_wake(cx.waker())) {
                     *waker = Some(cx.waker().clone());
                 }
                 drop(waker);
