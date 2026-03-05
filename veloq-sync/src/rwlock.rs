@@ -444,7 +444,7 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
                             // Clear CONTENDED if no one else
                             this.lock.state.fetch_and(!CONTENDED, Ordering::Release);
                         } else {
-                            // Fix Bug #1: Ensure CONTENDED bit is set if there are other waiters
+                            // Ensure CONTENDED bit is set if there are other waiters
                             this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
                         }
                         this.queued = false;
