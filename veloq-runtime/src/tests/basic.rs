@@ -183,8 +183,7 @@ fn test_multi_worker_throughput() {
             if start.elapsed() > std::time::Duration::from_secs(5) {
                 break;
             }
-            crate::runtime::context::yield_now().await;
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     });
 
