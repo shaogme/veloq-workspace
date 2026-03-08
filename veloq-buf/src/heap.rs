@@ -137,20 +137,65 @@ impl Drop for LocalCacheEntry {
 /// Local Cache Constants
 type PoolId = usize;
 
-struct LocalCache {
-    // Single-slot "hot" cache for the most recently used pool.
-    hot_pool_id: Cell<PoolId>,
+/// Internal structure to manage the "hot" Fast Path of the TLS cache.
+/// Uses individual Cells to ensure zero-cost register-friendly access.
+struct HotSegment {
+    pool_id: Cell<PoolId>,
 
     // --- Fast Path Flattened Primitives ---
-    // These pointers/values are mirrored from the hot_owner to avoid take()/set() or RefCell overhead.
-    hot_sb_state: Cell<*const SuperblockState>,
-    hot_chunk_base: Cell<*const u8>,
-    hot_sb_idx: Cell<usize>,
-    hot_chunk_id: Cell<u16>,
+    // These pointers/values are updated whenever `owner` is set.
+    sb_state: Cell<*const SuperblockState>,
+    chunk_base: Cell<*const u8>,
+    sb_idx: Cell<usize>,
+    chunk_id: Cell<u16>,
 
-    // Ownership preservation (keeps Chunk alive and handles superblock retirement on drop)
-    hot_owner: Cell<Option<LocalCacheEntry>>,
+    // Ownership preservation.
+    // Setting this to None will automatically trigger Superblock retirement via `LocalCacheEntry::drop`.
+    owner: Cell<Option<LocalCacheEntry>>,
+}
 
+impl HotSegment {
+    const fn new() -> Self {
+        Self {
+            pool_id: Cell::new(0),
+            sb_state: Cell::new(ptr::null()),
+            chunk_base: Cell::new(ptr::null()),
+            sb_idx: Cell::new(0),
+            chunk_id: Cell::new(0),
+            owner: Cell::new(None),
+        }
+    }
+
+    /// Update the hot segment with a new entry.
+    fn set(&self, pool_id: PoolId, entry: LocalCacheEntry) {
+        // Mirror metadata to primitive cells for fast access
+        let sb_ref = &*entry.chunk.superblocks[entry.sb_idx];
+        self.sb_state.set(sb_ref as *const SuperblockState);
+        self.chunk_base.set(entry.chunk.memory.as_ptr());
+        self.sb_idx.set(entry.sb_idx);
+        self.chunk_id.set(entry.chunk_id);
+        self.pool_id.set(pool_id);
+
+        // Ownership transfer
+        self.owner.set(Some(entry));
+    }
+
+    /// Clear the hot segment. This triggers the retirement of the active superblock.
+    fn clear(&self) {
+        self.sb_state.set(ptr::null());
+        self.chunk_base.set(ptr::null());
+        self.owner.set(None); // Triggers Drop logic in LocalCacheEntry
+    }
+
+    /// Transfers ownership of the current hot entry without clearing primitives immediately.
+    /// Caller is responsible for re-syncing or clearing.
+    fn take_owner(&self) -> Option<LocalCacheEntry> {
+        self.owner.take()
+    }
+}
+
+struct LocalCache {
+    hot: HotSegment,
     // Fallback for multi-pool scenarios (rare)
     others: RefCell<HashMap<PoolId, LocalCacheEntry>>,
 }
@@ -158,29 +203,29 @@ struct LocalCache {
 impl LocalCache {
     #[inline(always)]
     fn try_alloc(&self, pool_id: PoolId) -> Option<(u16, SlotIndex, NonNull<u8>)> {
-        let sb_ptr = self.hot_sb_state.get();
-        if self.hot_pool_id.get() == pool_id && !sb_ptr.is_null() {
-            // CRITICAL: We access raw pointers directly.
-            // Safety: hot_owner ensures that Chunk (and thus SuperblockState) remains valid.
+        let sb_ptr = self.hot.sb_state.get();
+
+        // One-check fast path: identity match and non-null state
+        if self.hot.pool_id.get() == pool_id && !sb_ptr.is_null() {
+            // Safety: hot.owner guarantees that Chunk and its SuperblockState remain valid.
             let sb = unsafe { &*sb_ptr };
 
             if let Some(offset) = sb.alloc_one() {
-                let sb_idx = self.hot_sb_idx.get();
-                let chunk_id = self.hot_chunk_id.get();
+                let sb_idx = self.hot.sb_idx.get();
+                let chunk_id = self.hot.chunk_id.get();
                 let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
 
-                // Inline calculation: Base + Offset
                 let ptr = unsafe {
                     NonNull::new_unchecked(
-                        self.hot_chunk_base.get().add(global_idx.offset()) as *mut u8
+                        self.hot.chunk_base.get().add(global_idx.offset()) as *mut u8
                     )
                 };
 
                 return Some((chunk_id, global_idx, ptr));
             }
 
-            // Superblock Full! Retire it.
-            self.retire_hot();
+            // Superblock Full! Clear hot segment to retire it and trigger global dealloc if empty.
+            self.hot.clear();
         }
         self.try_alloc_slow(pool_id)
     }
@@ -189,68 +234,37 @@ impl LocalCache {
     fn try_alloc_slow(&self, pool_id: PoolId) -> Option<(u16, SlotIndex, NonNull<u8>)> {
         let mut others = self.others.borrow_mut();
         if let Some(entry) = others.remove(&pool_id) {
-            // Swap out current hot entry
-            self.retire_hot_to_others(&mut others);
+            // 1. Move current hot entry to others
+            if let Some(old_hot_entry) = self.hot.take_owner() {
+                others.insert(self.hot.pool_id.get(), old_hot_entry);
+            }
 
-            // Set new hot
-            self.set_hot(pool_id, entry);
+            // 2. Promote this entry to hot
+            self.hot.set(pool_id, entry);
 
-            // Recurse once into try_alloc (will hit fast path)
+            // 3. Re-try (will now hit the fast path)
+            drop(others);
             return self.try_alloc(pool_id);
         }
         None
     }
 
-    /// Moves current hot cache to 'others' map.
-    fn retire_hot_to_others(&self, others: &mut HashMap<PoolId, LocalCacheEntry>) {
-        if let Some(old_owner) = self.hot_owner.take() {
-            others.insert(self.hot_pool_id.get(), old_owner);
-        }
-        self.clear_hot_primitives();
-    }
-
-    /// Clears and retires the current hot superblock (handles memory safety via drop).
-    fn retire_hot(&self) {
-        // Taking hot_owner will trigger its Drop impl (set_inactive & potential dealloc).
-        let _ = self.hot_owner.take();
-        self.clear_hot_primitives();
-    }
-
-    fn clear_hot_primitives(&self) {
-        self.hot_sb_state.set(ptr::null());
-        self.hot_chunk_base.set(ptr::null());
-    }
-
-    fn set_hot(&self, pool_id: PoolId, entry: LocalCacheEntry) {
-        // Mirror data to primitives
-        // CachePadded<T> has the same address as T.
-        self.hot_sb_state
-            .set(&entry.chunk.superblocks[entry.sb_idx] as *const _ as *const SuperblockState);
-        self.hot_chunk_base.set(entry.chunk.memory.as_ptr());
-        self.hot_sb_idx.set(entry.sb_idx);
-        self.hot_chunk_id.set(entry.chunk_id);
-        self.hot_pool_id.set(pool_id);
-
-        self.hot_owner.set(Some(entry));
-    }
-
     #[inline(always)]
     fn insert(&self, pool_id: PoolId, entry: LocalCacheEntry) {
         let mut others = self.others.borrow_mut();
-        self.retire_hot_to_others(&mut others);
-        drop(others); // Release borrow before set_hot
-        self.set_hot(pool_id, entry);
+        // Retire current hot if any
+        if let Some(old_hot_entry) = self.hot.take_owner() {
+            others.insert(self.hot.pool_id.get(), old_hot_entry);
+        }
+
+        // Apply new hot
+        self.hot.set(pool_id, entry);
     }
 }
 
 thread_local! {
     static TLS_CACHE: LocalCache = LocalCache {
-        hot_pool_id: Cell::new(0),
-        hot_sb_state: Cell::new(ptr::null()),
-        hot_chunk_base: Cell::new(ptr::null()),
-        hot_sb_idx: Cell::new(0),
-        hot_chunk_id: Cell::new(0),
-        hot_owner: Cell::new(None),
+        hot: HotSegment::new(),
         others: RefCell::new(HashMap::new()),
     };
 }
