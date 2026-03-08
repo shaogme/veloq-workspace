@@ -118,18 +118,74 @@ pub struct ChunkInfo {
 unsafe impl Send for ChunkInfo {}
 unsafe impl Sync for ChunkInfo {}
 
+struct LocalCacheEntry {
+    chunk: Arc<Chunk>,
+    sb_idx: usize,
+    chunk_id: u16,
+}
+
+impl Drop for LocalCacheEntry {
+    fn drop(&mut self) {
+        // Retire active superblock on thread exit
+        let should_free = self.chunk.superblocks[self.sb_idx].set_inactive();
+        if should_free {
+            self.chunk.dealloc_superblock(self.sb_idx);
+        }
+    }
+}
+
 /// Local Cache Constants
 type PoolId = usize;
 
 struct LocalCache {
-    // Map PoolID (Memory Base Address) -> Active Superblock Index
-    // We only track ONE active superblock per pool for simplicity and cache locality.
-    pools: HashMap<PoolId, usize>,
+    // Single-slot "hot" cache for the most recently used pool.
+    // This eliminates HashMap overhead for 99.9% of calls.
+    hot_id: PoolId,
+    hot_entry: Option<LocalCacheEntry>,
+    // Fallback for multi-pool scenarios (rare)
+    others: HashMap<PoolId, LocalCacheEntry>,
+}
+
+impl LocalCache {
+    #[inline(always)]
+    fn get_mut(&mut self, pool_id: PoolId) -> Option<&mut LocalCacheEntry> {
+        if self.hot_id == pool_id {
+            return self.hot_entry.as_mut();
+        }
+        self.get_mut_slow(pool_id)
+    }
+
+    #[inline(never)]
+    fn get_mut_slow(&mut self, pool_id: PoolId) -> Option<&mut LocalCacheEntry> {
+        // Swap out current hot entry
+        if let Some(old_hot) = self.hot_entry.take() {
+            self.others.insert(self.hot_id, old_hot);
+        }
+
+        // Try load from others
+        if let Some(new_hot) = self.others.remove(&pool_id) {
+            self.hot_id = pool_id;
+            self.hot_entry = Some(new_hot);
+            return self.hot_entry.as_mut();
+        }
+
+        None
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, pool_id: PoolId, entry: LocalCacheEntry) {
+        if let Some(old_hot) = self.hot_entry.replace(entry) {
+            self.others.insert(self.hot_id, old_hot);
+        }
+        self.hot_id = pool_id;
+    }
 }
 
 thread_local! {
     static TLS_CACHE: RefCell<LocalCache> = RefCell::new(LocalCache {
-        pools: HashMap::new(),
+        hot_id: 0,
+        hot_entry: None,
+        others: HashMap::new(),
     });
 }
 
@@ -246,46 +302,20 @@ impl Chunk {
     }
 
     // Internal alloc/dealloc methods specific to this Chunk
-    fn alloc_slots(&self, order: usize) -> Option<(SlotIndex, NonNull<u8>)> {
+    fn alloc_slots(&self, order: usize, seed: Option<usize>) -> Option<(SlotIndex, NonNull<u8>)> {
         // Fast Path: Order 0 (4KB) uses Thread Local Superblock Cache
         if order == 0 {
-            let pool_id = self.memory.as_ptr() as usize;
-
-            // 1. Try Allocate from Active Superblock
-            let sb_idx_opt = TLS_CACHE.with(|cache| cache.borrow().pools.get(&pool_id).cloned());
-
-            if let Some(sb_idx) = sb_idx_opt {
-                if let Some(offset) = self.superblocks[sb_idx].alloc_one() {
-                    let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
-                    let ptr = self.resolve_ptr(global_idx);
-                    return Some((global_idx, ptr));
-                } else {
-                    // Superblock Full! Retire it.
-                    let should_free = self.superblocks[sb_idx].set_inactive();
-                    if should_free {
-                        self.dealloc_superblock(sb_idx);
-                    }
-
-                    // Remove from cache
-                    TLS_CACHE.with(|cache| {
-                        cache.borrow_mut().pools.remove(&pool_id);
-                    });
-                }
-            }
+            // 1. No Active Superblock in global. Just find one via global.
+            // Note: with FastPath enabled in GlobalSlotPool, we rarely hit this for order 0.
 
             // 2. No Active Superblock. Alloc New.
-            if let Some((base_idx, _)) = self.alloc_global(SUPERBLOCK_ORDER) {
+            if let Some((base_idx, _)) = self.alloc_global(SUPERBLOCK_ORDER, seed) {
                 let sb_idx = base_idx.0 / SUPERBLOCK_SIZE;
 
                 // Initialize State
                 // CRITICAL: We must hold the state in "Active" mode before anyone else can touch it.
                 // Since we just alloced it, no one else has pointers to slots inside it.
                 self.superblocks[sb_idx].init();
-
-                // Set as Active
-                TLS_CACHE.with(|cache| {
-                    cache.borrow_mut().pools.insert(pool_id, sb_idx);
-                });
 
                 // Alloc one
                 let offset = self.superblocks[sb_idx]
@@ -302,18 +332,24 @@ impl Chunk {
         }
 
         // Large Allocations: Direct Global
-        self.alloc_global(order)
+        self.alloc_global(order, seed)
     }
 
     /// Internal helper for direct global operations
-    fn alloc_global(&self, order: usize) -> Option<(SlotIndex, NonNull<u8>)> {
+    fn alloc_global(&self, order: usize, seed: Option<usize>) -> Option<(SlotIndex, NonNull<u8>)> {
         let shard_count = self.shards.len();
 
-        // 1. Determine starting shard (Thread Affinity)
-        let thread_id = std::thread::current().id();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        thread_id.hash(&mut hasher);
-        let hash = hasher.finish() as usize;
+        // 1. Determine starting shard (Thread Affinity or Seed)
+        let hash = if let Some(s) = seed {
+            // Use a simple LCG or just the seed directly for maximum determinism across processes
+            // (s * 0x27bb2ee687b0b0fd) is a simple way to spread bits if needed, but s is usually small
+            s.wrapping_mul(0x27bb2ee687b0b0fd)
+        } else {
+            let thread_id = std::thread::current().id();
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            thread_id.hash(&mut hasher);
+            hasher.finish() as usize
+        };
 
         // Start shard based on hash
         // Optimization: shard_count is always power of 2 (enforced in new)
@@ -431,12 +467,12 @@ pub type ChunkListener = Box<dyn Fn(ChunkInfo) + Send + Sync>;
 /// The basic unit is a 4KB `Slot`.
 pub struct GlobalSlotPool {
     /// Active chunks
-    chunks: RwLock<Vec<Arc<Chunk>>>,
+    chunks: CachePadded<RwLock<Vec<Arc<Chunk>>>>,
     /// Configuration
     #[allow(dead_code)]
     config: GlobalAllocatorConfig,
     /// Listener for new chunk allocation (used to notify Runtime/Driver)
-    listener: RwLock<Option<ChunkListener>>,
+    listener: CachePadded<RwLock<Option<ChunkListener>>>,
 }
 
 impl GlobalSlotPool {
@@ -455,9 +491,9 @@ impl GlobalSlotPool {
         let chunk0 = Chunk::new(0, total_size)?;
 
         Ok(Self {
-            chunks: RwLock::new(vec![Arc::new(chunk0)]),
+            chunks: CachePadded::new(RwLock::new(vec![Arc::new(chunk0)])),
             config,
-            listener: RwLock::new(None),
+            listener: CachePadded::new(RwLock::new(None)),
         })
     }
 
@@ -475,15 +511,78 @@ impl GlobalSlotPool {
     /// - `u16`: Chunk ID
     /// - `SlotIndex`: The within-chunk index.
     /// - `NonNull<u8>`: The raw pointer to the memory.
-    pub fn alloc_slots(&self, order: usize) -> Option<(u16, SlotIndex, NonNull<u8>)> {
+    pub fn alloc_slots(
+        &self,
+        order: usize,
+        seed: Option<usize>,
+    ) -> Option<(u16, SlotIndex, NonNull<u8>)> {
+        // --- Phase 0: Lockless TLS Fast Path (Order 0) ---
+        if order == 0 {
+            let pool_id = self as *const _ as usize;
+
+            let res = TLS_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if let Some(entry) = cache.get_mut(pool_id) {
+                    if let Some(offset) = entry.chunk.superblocks[entry.sb_idx].alloc_one() {
+                        let global_idx =
+                            SlotIndex(entry.sb_idx * SUPERBLOCK_SIZE + offset as usize);
+                        let ptr = entry.chunk.resolve_ptr(global_idx);
+                        return Some((entry.chunk_id, global_idx, ptr));
+                    } else {
+                        // Superblock Full! Retire it.
+                        // We must clone Chunk before dropping cache borrow or modifying it
+                        let chunk = entry.chunk.clone();
+                        let sb_idx = entry.sb_idx;
+                        // Invalidate this entry in TLS as it's full
+                        cache.hot_entry = None;
+
+                        // Drop Mutex/RefCell borrow explicitly to avoid double-borrow during dealloc_superblock if any
+                        drop(cache);
+
+                        let should_free = chunk.superblocks[sb_idx].set_inactive();
+                        if should_free {
+                            chunk.dealloc_superblock(sb_idx);
+                        }
+                    }
+                }
+                None
+            });
+
+            if res.is_some() {
+                return res;
+            }
+        }
+
         // 1. Optimistic Read Lock: Try existing chunks
-        {
+        let res = {
             let chunks = self.chunks.read();
+            let mut found = None;
             for chunk in chunks.iter() {
-                if let Some((idx, ptr)) = chunk.alloc_slots(order) {
-                    return Some((chunk.id, idx, ptr));
+                if let Some((idx, ptr)) = chunk.alloc_slots(order, seed) {
+                    found = Some((chunk.id, idx, ptr, chunk.clone()));
+                    break;
                 }
             }
+            found
+        };
+
+        if let Some((chunk_id, idx, ptr, chunk_ref)) = res {
+            // If order 0, cache the chunk/superblock for future lockless access
+            if order == 0 {
+                let pool_id = self as *const _ as usize;
+                let sb_idx = idx.0 / SUPERBLOCK_SIZE;
+                TLS_CACHE.with(|cache| {
+                    cache.borrow_mut().insert(
+                        pool_id,
+                        LocalCacheEntry {
+                            chunk: chunk_ref,
+                            sb_idx,
+                            chunk_id,
+                        },
+                    );
+                });
+            }
+            return Some((chunk_id, idx, ptr));
         }
 
         // 2. Dynamic Expansion (Write Lock)
@@ -492,7 +591,7 @@ impl GlobalSlotPool {
 
             // Double-check: Someone might have expanded while we waited for the lock
             for chunk in chunks.iter() {
-                if let Some((idx, ptr)) = chunk.alloc_slots(order) {
+                if let Some((idx, ptr)) = chunk.alloc_slots(order, seed) {
                     return Some((chunk.id, idx, ptr));
                 }
             }
@@ -523,7 +622,7 @@ impl GlobalSlotPool {
             };
 
             // Try alloc from new chunk
-            let res = new_chunk.alloc_slots(order);
+            let res = new_chunk.alloc_slots(order, seed);
 
             // Commit new chunk
             chunks.push(new_chunk.clone());

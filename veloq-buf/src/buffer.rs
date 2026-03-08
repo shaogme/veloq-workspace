@@ -307,7 +307,7 @@ impl PoolTopology for UniformSlot {
         // We still call register for now to keep existing behavior until Driver is updated,
         // but we ignore the returned IDs in SlotBasedPool.
 
-        let slot_pool = SlotBasedPool::new(pool.clone());
+        let slot_pool = SlotBasedPool::with_seed(pool.clone(), _worker_idx);
         AnyBufPool::new(slot_pool)
     }
 
@@ -593,12 +593,22 @@ impl std::fmt::Debug for AnyBufPool {
 pub struct SlotBasedPool {
     /// 全局 Slot Pool 的引用 (Arc)
     pool: Arc<crate::heap::GlobalSlotPool>,
+    /// Optional seed for deterministic shard selection
+    seed: Option<usize>,
 }
 
 impl SlotBasedPool {
     /// 创建新的 SlotBasedPool
     pub fn new(pool: Arc<crate::heap::GlobalSlotPool>) -> Self {
-        Self { pool }
+        Self { pool, seed: None }
+    }
+
+    /// 使用特定的 seed 创建 SlotBasedPool，确保 shard 选择是确定性的
+    pub fn with_seed(pool: Arc<crate::heap::GlobalSlotPool>, seed: usize) -> Self {
+        Self {
+            pool,
+            seed: Some(seed),
+        }
     }
 
     /// Calculate order for a given size
@@ -659,7 +669,7 @@ impl BackingPool for SlotBasedPool {
         let size_val = size.get();
         let order = Self::calculate_order(size_val);
 
-        if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order) {
+        if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order, self.seed) {
             let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
 
             // Pack Metadata into Context (64-bit)
