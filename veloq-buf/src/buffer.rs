@@ -612,7 +612,8 @@ impl SlotBasedPool {
     }
 
     /// Calculate order for a given size
-    fn calculate_order(size: usize) -> usize {
+    fn calculate_order(size: NonZeroUsize) -> usize {
+        let size = size.get();
         if size <= 4096 {
             0
         } else {
@@ -666,8 +667,7 @@ thread_local! {
 
 impl BackingPool for SlotBasedPool {
     fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult {
-        let size_val = size.get();
-        let order = Self::calculate_order(size_val);
+        let order = Self::calculate_order(size);
 
         if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order, self.seed) {
             let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
@@ -680,9 +680,9 @@ impl BackingPool for SlotBasedPool {
             // Reserved: 0
             let s_idx = slot_idx.0 as u64;
 
-            debug_assert!(
+            assert!(
                 s_idx < (1 << 24),
-                "SlotIndex exceeded 24 bits (Chunk too large)"
+                "SlotIndex exceeded 24 bits (Chunk size > 64GB not supported by 24-bit addressing in FixedBuf handle)"
             );
 
             let context = (chunk_id_val << 48)

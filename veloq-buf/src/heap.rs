@@ -19,7 +19,7 @@ use self::slot::{SLOT_SIZE, SlotIndex};
 use self::superblock::{SUPERBLOCK_ORDER, SUPERBLOCK_SIZE, SuperblockState};
 use crossbeam_utils::CachePadded;
 use parking_lot::{Mutex, RwLock};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::{io, num::NonZeroUsize, ptr::NonNull, sync::Arc};
@@ -140,53 +140,70 @@ type PoolId = usize;
 struct LocalCache {
     // Single-slot "hot" cache for the most recently used pool.
     // This eliminates HashMap overhead for 99.9% of calls.
-    hot_id: PoolId,
-    hot_entry: Option<LocalCacheEntry>,
+    hot_id: Cell<PoolId>,
+    hot_entry: Cell<Option<LocalCacheEntry>>,
     // Fallback for multi-pool scenarios (rare)
-    others: HashMap<PoolId, LocalCacheEntry>,
+    others: RefCell<HashMap<PoolId, LocalCacheEntry>>,
 }
 
 impl LocalCache {
     #[inline(always)]
-    fn get_mut(&mut self, pool_id: PoolId) -> Option<&mut LocalCacheEntry> {
-        if self.hot_id == pool_id {
-            return self.hot_entry.as_mut();
+    fn try_alloc(&self, pool_id: PoolId) -> Option<(u16, SlotIndex, NonNull<u8>)> {
+        if self.hot_id.get() == pool_id {
+            let entry_opt = self.hot_entry.take();
+            if let Some(entry) = &entry_opt
+                && let Some(offset) = entry.chunk.superblocks[entry.sb_idx].alloc_one() {
+                    let global_idx = SlotIndex(entry.sb_idx * SUPERBLOCK_SIZE + offset as usize);
+                    let ptr = entry.chunk.resolve_ptr(global_idx);
+                    let res = Some((entry.chunk_id, global_idx, ptr));
+                    self.hot_entry.set(entry_opt);
+                    return res;
+                }
+            // If we are here, either None or Superblock Full.
+            // entry_opt is already out (taken), so it will be dropped and retired.
         }
-        self.get_mut_slow(pool_id)
+        self.try_alloc_slow(pool_id)
     }
 
     #[inline(never)]
-    fn get_mut_slow(&mut self, pool_id: PoolId) -> Option<&mut LocalCacheEntry> {
-        // Swap out current hot entry
-        if let Some(old_hot) = self.hot_entry.take() {
-            self.others.insert(self.hot_id, old_hot);
-        }
+    fn try_alloc_slow(&self, pool_id: PoolId) -> Option<(u16, SlotIndex, NonNull<u8>)> {
+        let mut others = self.others.borrow_mut();
+        if let Some(entry) = others.remove(&pool_id) {
+            // Swap out current hot entry
+            let old_hot_id = self.hot_id.replace(pool_id);
+            let old_hot_entry = self.hot_entry.replace(None);
+            if let Some(old) = old_hot_entry {
+                others.insert(old_hot_id, old);
+            }
 
-        // Try load from others
-        if let Some(new_hot) = self.others.remove(&pool_id) {
-            self.hot_id = pool_id;
-            self.hot_entry = Some(new_hot);
-            return self.hot_entry.as_mut();
+            // Try alloc from new hot entry
+            if let Some(offset) = entry.chunk.superblocks[entry.sb_idx].alloc_one() {
+                let global_idx = SlotIndex(entry.sb_idx * SUPERBLOCK_SIZE + offset as usize);
+                let ptr = entry.chunk.resolve_ptr(global_idx);
+                let res = Some((entry.chunk_id, global_idx, ptr));
+                self.hot_entry.set(Some(entry));
+                return res;
+            }
         }
-
         None
     }
 
     #[inline(always)]
-    fn insert(&mut self, pool_id: PoolId, entry: LocalCacheEntry) {
-        if let Some(old_hot) = self.hot_entry.replace(entry) {
-            self.others.insert(self.hot_id, old_hot);
+    fn insert(&self, pool_id: PoolId, entry: LocalCacheEntry) {
+        let old_id = self.hot_id.replace(pool_id);
+        let old_entry = self.hot_entry.replace(Some(entry));
+        if let Some(old) = old_entry {
+            self.others.borrow_mut().insert(old_id, old);
         }
-        self.hot_id = pool_id;
     }
 }
 
 thread_local! {
-    static TLS_CACHE: RefCell<LocalCache> = RefCell::new(LocalCache {
-        hot_id: 0,
-        hot_entry: None,
-        others: HashMap::new(),
-    });
+    static TLS_CACHE: LocalCache = LocalCache {
+        hot_id: Cell::new(0),
+        hot_entry: Cell::new(None),
+        others: RefCell::new(HashMap::new()),
+    };
 }
 
 /// A Managed Chunk of memory with its own Allocator(s).
@@ -519,37 +536,8 @@ impl GlobalSlotPool {
         // --- Phase 0: Lockless TLS Fast Path (Order 0) ---
         if order == 0 {
             let pool_id = self as *const _ as usize;
-
-            let res = TLS_CACHE.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                if let Some(entry) = cache.get_mut(pool_id) {
-                    if let Some(offset) = entry.chunk.superblocks[entry.sb_idx].alloc_one() {
-                        let global_idx =
-                            SlotIndex(entry.sb_idx * SUPERBLOCK_SIZE + offset as usize);
-                        let ptr = entry.chunk.resolve_ptr(global_idx);
-                        return Some((entry.chunk_id, global_idx, ptr));
-                    } else {
-                        // Superblock Full! Retire it.
-                        // We must clone Chunk before dropping cache borrow or modifying it
-                        let chunk = entry.chunk.clone();
-                        let sb_idx = entry.sb_idx;
-                        // Invalidate this entry in TLS as it's full
-                        cache.hot_entry = None;
-
-                        // Drop Mutex/RefCell borrow explicitly to avoid double-borrow during dealloc_superblock if any
-                        drop(cache);
-
-                        let should_free = chunk.superblocks[sb_idx].set_inactive();
-                        if should_free {
-                            chunk.dealloc_superblock(sb_idx);
-                        }
-                    }
-                }
-                None
-            });
-
-            if res.is_some() {
-                return res;
+            if let Some(res) = TLS_CACHE.with(|cache| cache.try_alloc(pool_id)) {
+                return Some(res);
             }
         }
 
@@ -572,7 +560,7 @@ impl GlobalSlotPool {
                 let pool_id = self as *const _ as usize;
                 let sb_idx = idx.0 / SUPERBLOCK_SIZE;
                 TLS_CACHE.with(|cache| {
-                    cache.borrow_mut().insert(
+                    cache.insert(
                         pool_id,
                         LocalCacheEntry {
                             chunk: chunk_ref,

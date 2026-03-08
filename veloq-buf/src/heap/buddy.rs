@@ -259,7 +259,18 @@ impl BuddyAllocator {
             let buddy_idx = self.buddy_index(curr_idx, curr_order);
 
             // Check if Buddy is Allocated
-            // Note: allocated.get() implicitly handles OOB by returning Err
+            //
+            // SAFETY/DESIGN NOTE:
+            // The `allocated` BitSet only marks the HEAD of an allocated block.
+            // Due to Buddy system properties, if we are at `curr_order`, any buddy that is NOT
+            // a free block of the SAME order must either be:
+            // 1. A free block of a different order (handled by order check below)
+            // 2. An allocated block (or part of one).
+            //
+            // If the buddy is part of a LARGER allocated block, its head would have been
+            // marked in the bitset at a higher alignment, and it wouldn't be 'free' at this level.
+            // If it's part of a SMALLER allocated block, its head (one of the slots)
+            // inside the buddy range will be marked.
             if self.allocated.get(buddy_idx.0).unwrap_or(true) {
                 // Buddy is allocated (or OOB), cannot merge
                 break;
