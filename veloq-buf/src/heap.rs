@@ -151,7 +151,7 @@ pub struct Chunk {
     ///
     /// # Drop Order
     /// Should also be dropped before `memory`.
-    superblocks: Box<[SuperblockState]>,
+    superblocks: Box<[CachePadded<SuperblockState>]>,
 
     /// Ownership of the underlying memory.
     ///
@@ -220,8 +220,8 @@ impl Chunk {
 
         // 4. Initialize Superblock States
         let num_superblocks = total_slots / SUPERBLOCK_SIZE;
-        let states: Vec<SuperblockState> = (0..num_superblocks)
-            .map(|_| SuperblockState::new())
+        let states: Vec<CachePadded<SuperblockState>> = (0..num_superblocks)
+            .map(|_| CachePadded::new(SuperblockState::new()))
             .collect();
 
         Ok(Self {

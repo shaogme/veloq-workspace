@@ -36,27 +36,47 @@ fn bench_threaded(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("alloc_dealloc_4_threads", |b| {
+        let size = NonZeroUsize::new(4096).unwrap();
         b.iter_custom(|iters| {
-            let start = std::time::Instant::now();
+            // Barrier for 4 worker threads + 1 controller thread
+            let barrier = Arc::new(std::sync::Barrier::new(5));
             let mut handles = Vec::with_capacity(4);
-            // Ensure even distribution, prevent 0 iter threads
             let iters_per_thread = iters.div_ceil(4);
 
             for _ in 0..4 {
                 let pool = SlotBasedPool::new(global_pool.clone());
-                let size = NonZeroUsize::new(4096).unwrap();
+                let b = barrier.clone();
                 handles.push(std::thread::spawn(move || {
+                    let mut warmup_bufs = Vec::with_capacity(64);
+                    // Warm up: trigger page faults and populate superblocks
+                    for _ in 0..64 {
+                        if let Some(buf) = pool.alloc(size) {
+                            warmup_bufs.push(buf);
+                        }
+                    }
+                    drop(warmup_bufs);
+
+                    b.wait(); // Sync Start: Wait for all threads to be ready
                     for _ in 0..iters_per_thread {
                         let buf = pool.alloc(size);
                         black_box(buf);
                     }
+                    b.wait(); // Sync End: Signal work completed
                 }));
             }
+
+            // Phase 1: Wait for workers to be ready
+            barrier.wait();
+            let start = std::time::Instant::now();
+
+            // Phase 2: Wait for workers to finish
+            barrier.wait();
+            let elapsed = start.elapsed();
 
             for h in handles {
                 h.join().unwrap();
             }
-            start.elapsed()
+            elapsed
         })
     });
 

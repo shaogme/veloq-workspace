@@ -720,10 +720,19 @@ impl BackingPool for SlotBasedPool {
                 inner.balance = 0;
             }
 
-            // Fallback: Clone Arc (atomic increment)
-            let ptr = Arc::into_raw(self.pool.clone());
+            // Fallback: Batch Prefetching
+            // Instead of 1, we increment by BATCH.
+            // This reduces atomics on future allocs significantly.
+            const PREFETCH_COUNT: u32 = 32;
+            for _ in 0..PREFETCH_COUNT {
+                std::mem::forget(self.pool.clone());
+            }
+
+            // Since we used clone() PREFETCH_COUNT times, we have PREFETCH_COUNT references.
+            // 1 will be used now, others go to balance.
+            inner.balance = PREFETCH_COUNT - 1;
             cache.0.set(inner);
-            unsafe { NonNull::new_unchecked(ptr as *mut ()) }
+            unsafe { NonNull::new_unchecked(current_ptr as *mut ()) }
         })
     }
 }
