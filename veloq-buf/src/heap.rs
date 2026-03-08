@@ -22,7 +22,7 @@ use parking_lot::{Mutex, RwLock};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::{io, num::NonZeroUsize, ptr::NonNull, sync::Arc};
+use std::{io, num::NonZeroUsize, ptr, ptr::NonNull, sync::Arc};
 
 /// 2MB minimum memory per thread (Huge Page aligned)
 pub const MIN_THREAD_MEMORY: NonZeroUsize = crate::nz!(2 * 1024 * 1024);
@@ -139,9 +139,18 @@ type PoolId = usize;
 
 struct LocalCache {
     // Single-slot "hot" cache for the most recently used pool.
-    // This eliminates HashMap overhead for 99.9% of calls.
-    hot_id: Cell<PoolId>,
-    hot_entry: Cell<Option<LocalCacheEntry>>,
+    hot_pool_id: Cell<PoolId>,
+
+    // --- Fast Path Flattened Primitives ---
+    // These pointers/values are mirrored from the hot_owner to avoid take()/set() or RefCell overhead.
+    hot_sb_state: Cell<*const SuperblockState>,
+    hot_chunk_base: Cell<*const u8>,
+    hot_sb_idx: Cell<usize>,
+    hot_chunk_id: Cell<u16>,
+
+    // Ownership preservation (keeps Chunk alive and handles superblock retirement on drop)
+    hot_owner: Cell<Option<LocalCacheEntry>>,
+
     // Fallback for multi-pool scenarios (rare)
     others: RefCell<HashMap<PoolId, LocalCacheEntry>>,
 }
@@ -149,18 +158,29 @@ struct LocalCache {
 impl LocalCache {
     #[inline(always)]
     fn try_alloc(&self, pool_id: PoolId) -> Option<(u16, SlotIndex, NonNull<u8>)> {
-        if self.hot_id.get() == pool_id {
-            let entry_opt = self.hot_entry.take();
-            if let Some(entry) = &entry_opt
-                && let Some(offset) = entry.chunk.superblocks[entry.sb_idx].alloc_one() {
-                    let global_idx = SlotIndex(entry.sb_idx * SUPERBLOCK_SIZE + offset as usize);
-                    let ptr = entry.chunk.resolve_ptr(global_idx);
-                    let res = Some((entry.chunk_id, global_idx, ptr));
-                    self.hot_entry.set(entry_opt);
-                    return res;
-                }
-            // If we are here, either None or Superblock Full.
-            // entry_opt is already out (taken), so it will be dropped and retired.
+        let sb_ptr = self.hot_sb_state.get();
+        if self.hot_pool_id.get() == pool_id && !sb_ptr.is_null() {
+            // CRITICAL: We access raw pointers directly.
+            // Safety: hot_owner ensures that Chunk (and thus SuperblockState) remains valid.
+            let sb = unsafe { &*sb_ptr };
+
+            if let Some(offset) = sb.alloc_one() {
+                let sb_idx = self.hot_sb_idx.get();
+                let chunk_id = self.hot_chunk_id.get();
+                let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
+
+                // Inline calculation: Base + Offset
+                let ptr = unsafe {
+                    NonNull::new_unchecked(
+                        self.hot_chunk_base.get().add(global_idx.offset()) as *mut u8
+                    )
+                };
+
+                return Some((chunk_id, global_idx, ptr));
+            }
+
+            // Superblock Full! Retire it.
+            self.retire_hot();
         }
         self.try_alloc_slow(pool_id)
     }
@@ -170,38 +190,67 @@ impl LocalCache {
         let mut others = self.others.borrow_mut();
         if let Some(entry) = others.remove(&pool_id) {
             // Swap out current hot entry
-            let old_hot_id = self.hot_id.replace(pool_id);
-            let old_hot_entry = self.hot_entry.replace(None);
-            if let Some(old) = old_hot_entry {
-                others.insert(old_hot_id, old);
-            }
+            self.retire_hot_to_others(&mut others);
 
-            // Try alloc from new hot entry
-            if let Some(offset) = entry.chunk.superblocks[entry.sb_idx].alloc_one() {
-                let global_idx = SlotIndex(entry.sb_idx * SUPERBLOCK_SIZE + offset as usize);
-                let ptr = entry.chunk.resolve_ptr(global_idx);
-                let res = Some((entry.chunk_id, global_idx, ptr));
-                self.hot_entry.set(Some(entry));
-                return res;
-            }
+            // Set new hot
+            self.set_hot(pool_id, entry);
+
+            // Recurse once into try_alloc (will hit fast path)
+            return self.try_alloc(pool_id);
         }
         None
     }
 
+    /// Moves current hot cache to 'others' map.
+    fn retire_hot_to_others(&self, others: &mut HashMap<PoolId, LocalCacheEntry>) {
+        if let Some(old_owner) = self.hot_owner.take() {
+            others.insert(self.hot_pool_id.get(), old_owner);
+        }
+        self.clear_hot_primitives();
+    }
+
+    /// Clears and retires the current hot superblock (handles memory safety via drop).
+    fn retire_hot(&self) {
+        // Taking hot_owner will trigger its Drop impl (set_inactive & potential dealloc).
+        let _ = self.hot_owner.take();
+        self.clear_hot_primitives();
+    }
+
+    fn clear_hot_primitives(&self) {
+        self.hot_sb_state.set(ptr::null());
+        self.hot_chunk_base.set(ptr::null());
+    }
+
+    fn set_hot(&self, pool_id: PoolId, entry: LocalCacheEntry) {
+        // Mirror data to primitives
+        // CachePadded<T> has the same address as T.
+        self.hot_sb_state
+            .set(&entry.chunk.superblocks[entry.sb_idx] as *const _ as *const SuperblockState);
+        self.hot_chunk_base.set(entry.chunk.memory.as_ptr());
+        self.hot_sb_idx.set(entry.sb_idx);
+        self.hot_chunk_id.set(entry.chunk_id);
+        self.hot_pool_id.set(pool_id);
+
+        self.hot_owner.set(Some(entry));
+    }
+
     #[inline(always)]
     fn insert(&self, pool_id: PoolId, entry: LocalCacheEntry) {
-        let old_id = self.hot_id.replace(pool_id);
-        let old_entry = self.hot_entry.replace(Some(entry));
-        if let Some(old) = old_entry {
-            self.others.borrow_mut().insert(old_id, old);
-        }
+        let mut others = self.others.borrow_mut();
+        self.retire_hot_to_others(&mut others);
+        drop(others); // Release borrow before set_hot
+        self.set_hot(pool_id, entry);
     }
 }
 
 thread_local! {
     static TLS_CACHE: LocalCache = LocalCache {
-        hot_id: Cell::new(0),
-        hot_entry: Cell::new(None),
+        hot_pool_id: Cell::new(0),
+        hot_sb_state: Cell::new(ptr::null()),
+        hot_chunk_base: Cell::new(ptr::null()),
+        hot_sb_idx: Cell::new(0),
+        hot_chunk_id: Cell::new(0),
+        hot_owner: Cell::new(None),
         others: RefCell::new(HashMap::new()),
     };
 }
