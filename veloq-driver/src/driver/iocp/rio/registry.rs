@@ -20,6 +20,7 @@ pub struct RioRegistry {
     pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize, usize)>>,
     /// Heap-buffer lazy registrations: (ptr, cap, cookie) -> RIO_BUFFERID
     pub(crate) heap_rio_bufs: FxHashMap<(usize, usize, u64), RIO_BUFFERID>,
+    pub(crate) pending_deregistrations: Vec<RIO_BUFFERID>,
     pub(crate) rq_depth: u32,
 }
 
@@ -31,6 +32,7 @@ impl RioRegistry {
             registered_rio_rqs: Vec::new(),
             slab_rio_pages: Vec::new(),
             heap_rio_bufs: FxHashMap::default(),
+            pending_deregistrations: Vec::new(),
             rq_depth,
         }
     }
@@ -137,7 +139,7 @@ impl RioRegistry {
         if let Some(existing) = self.chunk_registry.get(id_idx).copied()
             && existing != RIO_INVALID_BUFFERID
         {
-            unsafe { (dispatch.deregister_buffer)(existing) };
+            self.pending_deregistrations.push(existing);
         }
 
         let buf_id = unsafe { reg_fn(ptr, len as u32) };
@@ -252,6 +254,11 @@ impl RioRegistry {
         let mut deregistered = HashSet::new();
 
         for id in self.chunk_registry.iter().copied() {
+            if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
+                unsafe { (dispatch.deregister_buffer)(id) };
+            }
+        }
+        for id in self.pending_deregistrations.drain(..) {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
                 unsafe { (dispatch.deregister_buffer)(id) };
             }

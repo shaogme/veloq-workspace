@@ -72,6 +72,7 @@ pub struct RioState {
     pub(crate) registry: RioRegistry,
     pub(crate) pool_manager: UdpPoolManager,
     pub(crate) dispatch: RioDispatch,
+    pub(crate) outstanding_count: usize,
 }
 
 impl RioState {
@@ -207,6 +208,7 @@ impl RioState {
             registry: RioRegistry::new(rq_depth),
             pool_manager: UdpPoolManager::new(),
             dispatch,
+            outstanding_count: 0,
         })
     }
 
@@ -274,6 +276,7 @@ impl RioState {
                     ) {
                         self.registry.rio_rqs.remove(&drained_handle);
                     }
+                    self.outstanding_count -= 1;
                     continue;
                 }
 
@@ -312,6 +315,7 @@ impl RioState {
                             ops.free_indices.push(user_data);
                         }
                     }
+                    self.outstanding_count -= 1;
                 }
             }
 
@@ -362,6 +366,7 @@ impl RioState {
                 format!("RIOReceive submission failed: fd={fd:?}, handle={handle:?}"),
             ));
         }
+        self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }
 
@@ -395,6 +400,7 @@ impl RioState {
                 format!("RIOSend submission failed: fd={fd:?}, handle={handle:?}"),
             ));
         }
+        self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }
 
@@ -523,6 +529,7 @@ impl RioState {
                 ),
             ));
         }
+        self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }
 
@@ -620,6 +627,7 @@ impl RioState {
                 ),
             ));
         }
+        self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }
 
@@ -634,10 +642,11 @@ impl RioState {
         addr_len: &mut i32,
         overlapped: *mut OVERLAPPED,
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
+        use crate::driver::iocp::submit::SubmissionResult;
         let rq = self
             .registry
             .ensure_rq(handle, fd, self.cq, &self.dispatch)?;
-        self.pool_manager.try_submit_recv_from_pooled(
+        let res = self.pool_manager.try_submit_recv_from_pooled(
             handle,
             rq,
             user_data,
@@ -647,7 +656,11 @@ impl RioState {
             addr_len,
             overlapped,
             &self.dispatch,
-        )
+        )?;
+        if matches!(res, SubmissionResult::Pending) {
+            self.outstanding_count += 1;
+        }
+        Ok(res)
     }
 
     #[cfg(test)]
@@ -683,6 +696,35 @@ impl Drop for RioState {
             &self.dispatch,
             Self::decode_request_context,
         );
+
+        // Standard I/O drain: Wait for all outstanding RIO requests to finish.
+        // This ensures the kernel is no longer touching any registered buffers.
+        let start = std::time::Instant::now();
+        while self.outstanding_count > 0 {
+            if start.elapsed() >= std::time::Duration::from_secs(5) {
+                tracing::warn!(
+                    outstanding = self.outstanding_count,
+                    "RioState::drop: Timeout waiting for outstanding RIO requests"
+                );
+                break;
+            }
+
+            const MAX_RESULTS: usize = 128;
+            let mut results: [RIORESULT; MAX_RESULTS] = unsafe { std::mem::zeroed() };
+            let count = unsafe {
+                (self.dispatch.dequeue)(self.cq, results.as_mut_ptr(), MAX_RESULTS as u32)
+            };
+
+            if count == RIO_CORRUPT_CQ || count == 0 {
+                std::thread::yield_now();
+            } else {
+                // We just need to decrement the counter for each result.
+                // Note: We don't have access to OpRegistry here to properly clean up ops,
+                // but since the driver is dropping, that's okay (memory is leaked/dropped anyway).
+                self.outstanding_count -= count as usize;
+            }
+        }
+
         self.pool_manager.udp_ctx_map.clear();
         self.pool_manager
             .forget_in_flight_and_deregister_rest(&self.dispatch);
