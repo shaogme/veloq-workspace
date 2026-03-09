@@ -21,6 +21,17 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 use self::pool::{POOL_CTX_TAG, UDP_POOL_USER_DATA, UdpPoolManager};
 use self::registry::RioRegistry;
 
+#[derive(Clone, Copy)]
+pub struct RioEnv<'a> {
+    pub registrar: &'a dyn veloq_buf::BufferRegistrar,
+    pub dispatch: &'a RioDispatch,
+}
+
+pub struct RioContext<'a> {
+    pub registry: &'a mut RioRegistry,
+    pub env: RioEnv<'a>,
+}
+
 pub struct RioSendToArgs<'a> {
     pub fd: IoFd,
     pub handle: HANDLE,
@@ -266,14 +277,21 @@ impl RioState {
     }
 
     pub fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
-        self.registry.register_chunk(id, (ptr, len), &self.dispatch)
+        let env = RioEnv {
+            registrar: &veloq_buf::NoopRegistrar,
+            dispatch: &self.dispatch,
+        };
+        self.registry.register_chunk(id, (ptr, len), env)
     }
 
     pub fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
-        let mut ctx = pool::UdpPoolContext {
-            registry: &mut self.registry,
+        let env = RioEnv {
             registrar: &veloq_buf::NoopRegistrar,
             dispatch: &self.dispatch,
+        };
+        let mut ctx = RioContext {
+            registry: &mut self.registry,
+            env,
         };
         self.pool_manager
             .begin_udp_pool_shutdown_for_handle(handle, &mut ctx);
@@ -289,10 +307,13 @@ impl RioState {
         uid: (usize, u32),
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) {
-        let mut ctx = pool::UdpPoolContext {
-            registry: &mut self.registry,
+        let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+        };
+        let mut ctx = RioContext {
+            registry: &mut self.registry,
+            env,
         };
         self.pool_manager
             .cancel_udp_recv_waiter(handle, uid, &mut ctx);
@@ -330,10 +351,13 @@ impl RioState {
                 };
 
                 if user_data == UDP_POOL_USER_DATA {
-                    let mut ctx = pool::UdpPoolContext {
-                        registry: &mut self.registry,
+                    let env = RioEnv {
                         registrar,
                         dispatch: &self.dispatch,
+                    };
+                    let mut ctx = RioContext {
+                        registry: &mut self.registry,
+                        env,
                     };
                     let (drained_handle, pool_submissions) = self.pool_manager.handle_completion(
                         ops,
@@ -414,12 +438,12 @@ impl RioState {
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
         use crate::driver::iocp::submit::SubmissionResult;
         let (fd, handle, overlapped) = target;
-        let (buffer_id, offset) =
-            self.registry
-                .resolve_buffer_id(buf, registrar, &self.dispatch)?;
-        let rq = self
-            .registry
-            .ensure_rq((handle, fd), self.cq, &self.dispatch)?;
+        let env = RioEnv {
+            registrar,
+            dispatch: &self.dispatch,
+        };
+        let (buffer_id, offset) = self.registry.resolve_buffer_id(buf, env)?;
+        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
 
         let rio_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -447,12 +471,12 @@ impl RioState {
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
         use crate::driver::iocp::submit::SubmissionResult;
         let (fd, handle, overlapped) = target;
-        let (buffer_id, offset) =
-            self.registry
-                .resolve_buffer_id(buf, registrar, &self.dispatch)?;
-        let rq = self
-            .registry
-            .ensure_rq((handle, fd), self.cq, &self.dispatch)?;
+        let env = RioEnv {
+            registrar,
+            dispatch: &self.dispatch,
+        };
+        let (buffer_id, offset) = self.registry.resolve_buffer_id(buf, env)?;
+        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
 
         let rio_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -492,15 +516,15 @@ impl RioState {
             page_idx,
         } = args;
 
-        let (buffer_id, data_offset) =
-            self.registry
-                .resolve_buffer_id(buf, registrar, &self.dispatch)?;
+        let env = RioEnv {
+            registrar,
+            dispatch: &self.dispatch,
+        };
+        let (buffer_id, data_offset) = self.registry.resolve_buffer_id(buf, env)?;
         self.registry
-            .ensure_slab_page_registration(page_idx, slab_resolver, &self.dispatch)?;
+            .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
-        let rq = self
-            .registry
-            .ensure_rq((handle, fd), self.cq, &self.dispatch)?;
+        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
 
         let data_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -619,15 +643,15 @@ impl RioState {
             overlapped,
             page_idx,
         } = args;
-        let (buffer_id, data_offset) =
-            self.registry
-                .resolve_buffer_id(buf, registrar, &self.dispatch)?;
+        let env = RioEnv {
+            registrar,
+            dispatch: &self.dispatch,
+        };
+        let (buffer_id, data_offset) = self.registry.resolve_buffer_id(buf, env)?;
         self.registry
-            .ensure_slab_page_registration(page_idx, slab_resolver, &self.dispatch)?;
+            .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
-        let rq = self
-            .registry
-            .ensure_rq((handle, fd), self.cq, &self.dispatch)?;
+        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
 
         let data_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -716,13 +740,14 @@ impl RioState {
             user_data,
             generation,
         } = args;
-        let rq = self
-            .registry
-            .ensure_rq((handle, fd), self.cq, &self.dispatch)?;
-        let mut ctx = pool::UdpPoolContext {
-            registry: &mut self.registry,
+        let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+        };
+        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
+        let mut ctx = RioContext {
+            registry: &mut self.registry,
+            env,
         };
         let (res, pool_submissions) = self.pool_manager.try_submit_udp_recv_stream_pooled(
             (handle, rq),
@@ -744,13 +769,14 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
         let (fd, handle) = target;
-        let rq = self
-            .registry
-            .ensure_rq((handle, fd), self.cq, &self.dispatch)?;
-        let mut ctx = pool::UdpPoolContext {
-            registry: &mut self.registry,
+        let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+        };
+        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
+        let mut ctx = RioContext {
+            registry: &mut self.registry,
+            env,
         };
         let pool_submissions =
             self.pool_manager
@@ -774,10 +800,13 @@ impl RioState {
         ticks: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
-        let mut ctx = pool::UdpPoolContext {
-            registry: &mut self.registry,
+        let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+        };
+        let mut ctx = RioContext {
+            registry: &mut self.registry,
+            env,
         };
         for _ in 0..ticks {
             self.pool_manager.rebalance_udp_pool(handle, &mut ctx)?;
@@ -832,14 +861,17 @@ impl Drop for RioState {
         }
 
         self.pool_manager.udp_ctx_map.clear();
-        let mut ctx = pool::UdpPoolContext {
-            registry: &mut self.registry,
+        let env = RioEnv {
             registrar: &veloq_buf::NoopRegistrar,
             dispatch: &self.dispatch,
         };
+        let mut ctx = RioContext {
+            registry: &mut self.registry,
+            env,
+        };
         self.pool_manager
             .forget_in_flight_and_deregister_rest(&mut ctx);
-        self.registry.cleanup_deregister(&self.dispatch);
+        self.registry.cleanup_deregister(env);
         if self.cq != 0 {
             unsafe { (self.dispatch.close_cq)(self.cq) };
         }

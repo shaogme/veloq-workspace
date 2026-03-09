@@ -1,4 +1,4 @@
-use super::RioDispatch;
+use super::RioEnv;
 use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::op::IoFd;
 use rustc_hash::FxHashMap;
@@ -44,8 +44,7 @@ impl RioRegistry {
     pub fn resolve_buffer_id(
         &mut self,
         buf: &FixedBuf,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-        dispatch: &RioDispatch,
+        env: RioEnv<'_>,
     ) -> io::Result<(RIO_BUFFERID, u32)> {
         let info = buf.resolve_region_info();
 
@@ -63,12 +62,12 @@ impl RioRegistry {
                 // UNRESOLVED: This is only 100% safe if no heap-based IO is pended.
                 // However, the cookie already prevents the dangerous "wrong buffer mapping" crash.
                 for id in self.heap_rio_bufs.values().copied() {
-                    unsafe { (dispatch.deregister_buffer)(id) };
+                    unsafe { (env.dispatch.deregister_buffer)(id) };
                 }
                 self.heap_rio_bufs.clear();
             }
 
-            let id = unsafe { (dispatch.register_buffer)(buf.as_ptr(), buf.capacity() as u32) };
+            let id = unsafe { (env.dispatch.register_buffer)(buf.as_ptr(), buf.capacity() as u32) };
             if id == RIO_INVALID_BUFFERID {
                 return Err(io_error(
                     IocpErrorContext::Rio,
@@ -90,12 +89,12 @@ impl RioRegistry {
         };
 
         if buffer_id.is_none()
-            && let Some(chunk_info) = registrar.resolve_chunk_info(info.id)
+            && let Some(chunk_info) = env.registrar.resolve_chunk_info(info.id)
         {
             self.register_chunk(
                 info.id,
                 (chunk_info.ptr.as_ptr(), chunk_info.len.get()),
-                dispatch,
+                env,
             )?;
             buffer_id = Some(self.chunk_registry[info.id as usize]);
         }
@@ -125,10 +124,10 @@ impl RioRegistry {
         &mut self,
         id: u16,
         mem: (*const u8, usize),
-        dispatch: &RioDispatch,
+        env: RioEnv<'_>,
     ) -> io::Result<()> {
         let (ptr, len) = mem;
-        let reg_fn = dispatch.register_buffer;
+        let reg_fn = env.dispatch.register_buffer;
         let id_idx = id as usize;
 
         if id_idx >= self.chunk_registry.len() {
@@ -158,7 +157,7 @@ impl RioRegistry {
         &mut self,
         page_idx: usize,
         resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-        dispatch: &RioDispatch,
+        env: RioEnv<'_>,
     ) -> io::Result<()> {
         if page_idx >= self.slab_rio_pages.len() {
             self.slab_rio_pages.resize(page_idx + 1, None);
@@ -166,7 +165,7 @@ impl RioRegistry {
 
         if self.slab_rio_pages[page_idx].is_none() {
             if let Some((ptr, len)) = resolver(page_idx) {
-                let reg_fn = dispatch.register_buffer;
+                let reg_fn = env.dispatch.register_buffer;
                 let id = unsafe { reg_fn(ptr, len as u32) };
                 if id == RIO_INVALID_BUFFERID {
                     return Err(io_error(
@@ -192,7 +191,7 @@ impl RioRegistry {
         &mut self,
         target: (HANDLE, IoFd),
         cq: RIO_CQ,
-        dispatch: &RioDispatch,
+        env: RioEnv<'_>,
     ) -> io::Result<RIO_RQ> {
         let (handle, fd) = target;
         // fast path for registered files
@@ -208,7 +207,7 @@ impl RioRegistry {
             }
         }
 
-        let create_fn = dispatch.create_rq;
+        let create_fn = env.dispatch.create_rq;
 
         let max_outstanding_recvs = self.rq_depth;
         let max_outstanding_sends = self.rq_depth;
@@ -248,7 +247,7 @@ impl RioRegistry {
         Ok(rq)
     }
 
-    pub fn deregister_heap_buffer_for_buf(&mut self, buf: &FixedBuf, dispatch: &RioDispatch) {
+    pub fn deregister_heap_buffer_for_buf(&mut self, buf: &FixedBuf, env: RioEnv<'_>) {
         let info = buf.resolve_region_info();
         if info.id != u16::MAX {
             return;
@@ -257,32 +256,32 @@ impl RioRegistry {
         if let Some(id) = self.heap_rio_bufs.remove(&key)
             && id != RIO_INVALID_BUFFERID
         {
-            unsafe { (dispatch.deregister_buffer)(id) };
+            unsafe { (env.dispatch.deregister_buffer)(id) };
         }
     }
 
-    pub fn cleanup_deregister(&mut self, dispatch: &RioDispatch) {
+    pub fn cleanup_deregister(&mut self, env: RioEnv<'_>) {
         use std::collections::HashSet;
         let mut deregistered = HashSet::new();
 
         for id in self.chunk_registry.iter().copied() {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
-                unsafe { (dispatch.deregister_buffer)(id) };
+                unsafe { (env.dispatch.deregister_buffer)(id) };
             }
         }
         for id in self.pending_deregistrations.drain(..) {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
-                unsafe { (dispatch.deregister_buffer)(id) };
+                unsafe { (env.dispatch.deregister_buffer)(id) };
             }
         }
         for (id, _, _) in self.slab_rio_pages.iter().flatten().copied() {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
-                unsafe { (dispatch.deregister_buffer)(id) };
+                unsafe { (env.dispatch.deregister_buffer)(id) };
             }
         }
         for id in self.heap_rio_bufs.values().copied() {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
-                unsafe { (dispatch.deregister_buffer)(id) };
+                unsafe { (env.dispatch.deregister_buffer)(id) };
             }
         }
 
