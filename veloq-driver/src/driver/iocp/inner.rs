@@ -238,9 +238,12 @@ impl IocpDriver {
         self.wheel.advance(elapsed, &mut self.timer_buffer);
         self.process_timer_completions();
 
-        let user_data = if completion_key == RIO_EVENT_KEY {
-            return self.rio_state.process_completions(&mut self.ops);
-        } else if !overlapped.is_null() {
+        if completion_key == RIO_EVENT_KEY {
+            self.rio_state.process_completions(&mut self.ops)?;
+            return Ok(());
+        }
+
+        let user_data = if !overlapped.is_null() {
             // Since OverlappedEntry is #[repr(C)], and inner is the first field,
             // we can safely cast *mut OVERLAPPED to *const OverlappedEntry to access user_data.
             // This relies on Slot::reset preserving the user_data (index).
@@ -619,7 +622,15 @@ impl Drop for IocpDriver {
                 )
             };
 
-            if !overlapped.is_null() {
+            if key == RIO_EVENT_KEY {
+                if let Ok(count) = self.rio_state.process_completions(&mut self.ops) {
+                    ops_drained += count;
+                }
+            } else if !overlapped.is_null() {
+                // Since OverlappedEntry is #[repr(C)], we can recover user_data.
+                let entry = overlapped as *const OverlappedEntry;
+                let user_data = unsafe { (*entry).user_data };
+                self.process_iocp_completion(user_data, res, bytes);
                 ops_drained += 1;
             } else if res == 0 {
                 let err = unsafe { GetLastError() };

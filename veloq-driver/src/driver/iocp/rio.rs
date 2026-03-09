@@ -241,7 +241,8 @@ impl RioState {
     pub fn process_completions(
         &mut self,
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
-    ) -> io::Result<()> {
+    ) -> io::Result<usize> {
+        let mut completed_count = 0;
         let dequeue_fn = self.dispatch.dequeue;
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
@@ -268,15 +269,18 @@ impl RioState {
                 };
 
                 if user_data == UDP_POOL_USER_DATA {
-                    if let Some(drained_handle) = self.pool_manager.handle_completion(
+                    let (drained_handle, pool_submissions) = self.pool_manager.handle_completion(
                         ops,
                         res,
                         completion_generation,
                         &self.dispatch,
-                    ) {
-                        self.registry.rio_rqs.remove(&drained_handle);
+                    );
+                    if let Some(h) = drained_handle {
+                        self.registry.rio_rqs.remove(&h);
                     }
                     self.outstanding_count -= 1;
+                    self.outstanding_count += pool_submissions;
+                    completed_count += 1;
                     continue;
                 }
 
@@ -316,6 +320,7 @@ impl RioState {
                         }
                     }
                     self.outstanding_count -= 1;
+                    completed_count += 1;
                 }
             }
 
@@ -333,7 +338,7 @@ impl RioState {
                 "RIONotify failed when rearming CQ",
             ));
         }
-        Ok(())
+        Ok(completed_count)
     }
 
     pub fn try_submit_recv(
@@ -646,7 +651,7 @@ impl RioState {
         let rq = self
             .registry
             .ensure_rq(handle, fd, self.cq, &self.dispatch)?;
-        let res = self.pool_manager.try_submit_recv_from_pooled(
+        let (res, pool_submissions) = self.pool_manager.try_submit_recv_from_pooled(
             handle,
             rq,
             user_data,
@@ -657,6 +662,7 @@ impl RioState {
             overlapped,
             &self.dispatch,
         )?;
+        self.outstanding_count += pool_submissions;
         if matches!(res, SubmissionResult::Pending) {
             self.outstanding_count += 1;
         }
@@ -691,14 +697,9 @@ impl Drop for RioState {
         // 1) forbid new submissions; 2) mark in-flight slots as stop-requested;
         // 3) drain CQ until all slot acknowledgements arrive; 4) release buffers/CQ.
         self.pool_manager.begin_udp_pool_shutdown();
-        self.pool_manager.drain_udp_pool_shutdown_acks(
-            self.cq,
-            &self.dispatch,
-            Self::decode_request_context,
-        );
 
-        // Standard I/O drain: Wait for all outstanding RIO requests to finish.
-        // This ensures the kernel is no longer touching any registered buffers.
+        // Consolidate drain: Wait for all outstanding RIO requests (Pool + Standard) to finish.
+        // This ensures the kernel is no longer touching any registered buffers or pool slots.
         let start = std::time::Instant::now();
         while self.outstanding_count > 0 {
             if start.elapsed() >= std::time::Duration::from_secs(5) {
@@ -718,10 +719,28 @@ impl Drop for RioState {
             if count == RIO_CORRUPT_CQ || count == 0 {
                 std::thread::yield_now();
             } else {
-                // We just need to decrement the counter for each result.
-                // Note: We don't have access to OpRegistry here to properly clean up ops,
-                // but since the driver is dropping, that's okay (memory is leaked/dropped anyway).
-                self.outstanding_count -= count as usize;
+                for res in results.iter().take(count as usize) {
+                    if let Some((user_data, completion_generation)) =
+                        Self::decode_request_context(res.RequestContext)
+                    {
+                        if user_data == UDP_POOL_USER_DATA {
+                            if let Some((handle, slot_idx)) = self
+                                .pool_manager
+                                .ack_udp_pool_completion(completion_generation)
+                            {
+                                if let Some(pool) =
+                                    self.pool_manager.udp_recv_pools.get_mut(&handle)
+                                {
+                                    if let Some(slot) = pool.slots.get_mut(slot_idx) {
+                                        slot.in_flight = false;
+                                        slot.stop_requested = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.outstanding_count -= 1;
+                }
             }
         }
 
