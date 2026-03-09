@@ -674,11 +674,21 @@ fn test_multithread_concurrent_udp_clients() {
                 let server_addr = socket.local_addr().expect("Failed to get server address");
                 println!("Server listening on {}", server_addr);
 
-                // Publish server address once; main task fans out to clients.
+                // Pre-post recv collection before publishing address to avoid first-packet race.
+                let (ready_tx, mut ready_rx) = crate::sync::mpsc::unbounded::<()>();
+                let recv_h = crate::runtime::context::spawn(async move {
+                    ready_tx.send(()).unwrap();
+                    udp_recv_unique_peers(&socket, size, NUM_CLIENTS, NUM_CLIENTS * 3, 5).await
+                });
+                crate::tests::timeout_op("server", "recv_unique_ready", 5, ready_rx.recv())
+                    .await
+                    .expect("server unique-recv readiness channel closed");
+
+                // Publish server address once recv path is ready; main task fans out to clients.
                 addr_tx_clone.send(server_addr).unwrap();
 
                 let seen =
-                    udp_recv_unique_peers(&socket, size, NUM_CLIENTS, NUM_CLIENTS * 3, 2).await;
+                    crate::tests::timeout_op("server", "wait_unique_recv_join", 10, recv_h).await;
                 assert_eq!(
                     seen.len(),
                     NUM_CLIENTS,
