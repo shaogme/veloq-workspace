@@ -4,7 +4,7 @@ use super::*;
 use crate::Socket;
 use crate::config::IocpConfig;
 use crate::driver::Driver;
-use crate::op::{Accept, Connect, IntoPlatformOp, OpLifecycle, Recv, Timeout};
+use crate::op::{Accept, Connect, IntoPlatformOp, IoFd, OpLifecycle, Recv, RecvFrom, SendTo, Timeout};
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -544,4 +544,268 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
 #[test]
 fn test_rio_extensions_load() {
     let _ext = Extensions::new().expect("RIO Extensions should load");
+}
+
+#[test]
+fn test_rio_udp_send_to_recv_from_address_path() {
+    use std::time::{Duration, Instant};
+    use veloq_buf::BufPool;
+    use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+
+    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+
+    let server = Socket::new_udp_v4().expect("server socket create failed");
+    let client = Socket::new_udp_v4().expect("client socket create failed");
+
+    server
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("server bind failed");
+    client
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("client bind failed");
+
+    let server_addr = server.local_addr().expect("server local_addr failed");
+    let client_addr = client.local_addr().expect("client local_addr failed");
+
+    let server_handle = server.into_raw();
+    let client_handle = client.into_raw();
+
+    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let topology = UniformSlot::new(multiplier);
+    let global_pool = topology.create_pool(1).expect("Create pool failed");
+    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+
+    let mut send_buf = reg_pool
+        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .expect("send alloc failed");
+    let test_data = b"rio-udp-sendto-regression";
+    send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+    send_buf.set_len(test_data.len());
+
+    let recv_buf = reg_pool
+        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .expect("recv alloc failed");
+
+    // Register backing chunks for strict RIO path
+    let send_region = send_buf.resolve_region_info();
+    let send_chunk = global_pool
+        .chunk_info(send_region.id)
+        .expect("send chunk not found");
+    driver
+        .register_chunk(send_region.id, send_chunk.ptr.as_ptr(), send_chunk.len.get())
+        .expect("register send chunk failed");
+
+    let recv_region = recv_buf.resolve_region_info();
+    if recv_region.id != send_region.id {
+        let recv_chunk = global_pool
+            .chunk_info(recv_region.id)
+            .expect("recv chunk not found");
+        driver
+            .register_chunk(recv_region.id, recv_chunk.ptr.as_ptr(), recv_chunk.len.get())
+            .expect("register recv chunk failed");
+    }
+
+    let recv_op = RecvFrom {
+        fd: IoFd::Raw(server_handle),
+        buf: recv_buf,
+        addr: None,
+    };
+    let send_op = SendTo {
+        fd: IoFd::Raw(client_handle),
+        buf: send_buf,
+        addr: server_addr,
+    };
+
+    let mut recv_iocp = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
+    let (recv_ud, _) = driver.reserve_op().expect("reserve recv op failed");
+    let _ = driver
+        .submit(recv_ud, &mut recv_iocp)
+        .expect("submit recv_from failed");
+
+    let mut send_iocp = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(send_op));
+    let (send_ud, _) = driver.reserve_op().expect("reserve send op failed");
+    let _ = driver
+        .submit(send_ud, &mut send_iocp)
+        .expect("submit send_to failed");
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let start = Instant::now();
+
+    let mut send_done = false;
+    let mut recv_done = false;
+
+    while !(send_done && recv_done) {
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("RIO UDP send_to/recv_from regression test timed out");
+        }
+        driver.process_completions();
+
+        if !send_done {
+            let mut op_out = None;
+            if let Poll::Ready(res) = driver.poll_op(send_ud, &mut cx, &mut op_out) {
+                let sent = res.expect("send_to completion failed");
+                assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
+                let _ = op_out.expect("send_to op missing");
+                send_done = true;
+            }
+        }
+
+        if !recv_done {
+            let mut op_out = None;
+            if let Poll::Ready(res) = driver.poll_op(recv_ud, &mut cx, &mut op_out) {
+                let bytes = res.expect("recv_from completion failed");
+                let iocp_op = op_out.expect("recv_from op missing");
+                let mut recv_out =
+                    <RecvFrom as crate::op::IntoPlatformOp<IocpDriver>>::from_platform_op(iocp_op);
+                recv_out.buf.set_len(bytes);
+                assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
+                assert_eq!(&recv_out.buf.as_slice()[..bytes], test_data);
+                assert_eq!(recv_out.addr, Some(client_addr), "recv_from source addr mismatch");
+                recv_done = true;
+            }
+        }
+
+        if !(send_done && recv_done) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    unsafe {
+        windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize);
+        windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
+    }
+}
+
+#[test]
+fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
+    use std::time::{Duration, Instant};
+    use veloq_buf::BufPool;
+    use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+
+    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+
+    let server = Socket::new_udp_v6().expect("server v6 socket create failed");
+    let client = Socket::new_udp_v6().expect("client v6 socket create failed");
+
+    // Some Windows environments disable IPv6 loopback. Skip gracefully in that case.
+    if let Err(e) = server.bind("[::1]:0".parse().unwrap()) {
+        println!("IPv6 loopback unavailable for server bind, skip: {}", e);
+        return;
+    }
+    if let Err(e) = client.bind("[::1]:0".parse().unwrap()) {
+        println!("IPv6 loopback unavailable for client bind, skip: {}", e);
+        return;
+    }
+
+    let server_addr = server.local_addr().expect("server local_addr failed");
+    let client_addr = client.local_addr().expect("client local_addr failed");
+
+    let server_handle = server.into_raw();
+    let client_handle = client.into_raw();
+
+    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let topology = UniformSlot::new(multiplier);
+    let global_pool = topology.create_pool(1).expect("Create pool failed");
+    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+
+    let mut send_buf = reg_pool
+        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .expect("send alloc failed");
+    let test_data = b"rio-udp-sendto-regression-ipv6";
+    send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+    send_buf.set_len(test_data.len());
+
+    let recv_buf = reg_pool
+        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .expect("recv alloc failed");
+
+    let send_region = send_buf.resolve_region_info();
+    let send_chunk = global_pool
+        .chunk_info(send_region.id)
+        .expect("send chunk not found");
+    driver
+        .register_chunk(send_region.id, send_chunk.ptr.as_ptr(), send_chunk.len.get())
+        .expect("register send chunk failed");
+
+    let recv_region = recv_buf.resolve_region_info();
+    if recv_region.id != send_region.id {
+        let recv_chunk = global_pool
+            .chunk_info(recv_region.id)
+            .expect("recv chunk not found");
+        driver
+            .register_chunk(recv_region.id, recv_chunk.ptr.as_ptr(), recv_chunk.len.get())
+            .expect("register recv chunk failed");
+    }
+
+    let recv_op = RecvFrom {
+        fd: IoFd::Raw(server_handle),
+        buf: recv_buf,
+        addr: None,
+    };
+    let send_op = SendTo {
+        fd: IoFd::Raw(client_handle),
+        buf: send_buf,
+        addr: server_addr,
+    };
+
+    let mut recv_iocp = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
+    let (recv_ud, _) = driver.reserve_op().expect("reserve recv op failed");
+    let _ = driver
+        .submit(recv_ud, &mut recv_iocp)
+        .expect("submit recv_from failed");
+
+    let mut send_iocp = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(send_op));
+    let (send_ud, _) = driver.reserve_op().expect("reserve send op failed");
+    let _ = driver
+        .submit(send_ud, &mut send_iocp)
+        .expect("submit send_to failed");
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let start = Instant::now();
+
+    let mut send_done = false;
+    let mut recv_done = false;
+
+    while !(send_done && recv_done) {
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("RIO UDP IPv6 send_to/recv_from regression test timed out");
+        }
+        driver.process_completions();
+
+        if !send_done {
+            let mut op_out = None;
+            if let Poll::Ready(res) = driver.poll_op(send_ud, &mut cx, &mut op_out) {
+                let sent = res.expect("send_to completion failed");
+                assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
+                let _ = op_out.expect("send_to op missing");
+                send_done = true;
+            }
+        }
+
+        if !recv_done {
+            let mut op_out = None;
+            if let Poll::Ready(res) = driver.poll_op(recv_ud, &mut cx, &mut op_out) {
+                let bytes = res.expect("recv_from completion failed");
+                let iocp_op = op_out.expect("recv_from op missing");
+                let mut recv_out =
+                    <RecvFrom as crate::op::IntoPlatformOp<IocpDriver>>::from_platform_op(iocp_op);
+                recv_out.buf.set_len(bytes);
+                assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
+                assert_eq!(&recv_out.buf.as_slice()[..bytes], test_data);
+                assert_eq!(recv_out.addr, Some(client_addr), "recv_from source addr mismatch");
+                recv_done = true;
+            }
+        }
+
+        if !(send_done && recv_done) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    unsafe {
+        windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize);
+        windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
+    }
 }

@@ -16,7 +16,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_IOCP_COMPLETION,
     RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
-    SOCKET_ERROR, WSAGetLastError,
+    SOCKADDR_INET, SOCKET_ERROR, WSAGetLastError,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -78,8 +78,8 @@ pub struct RioState {
     // RIO Request Queues for registered files (O(1) lookup)
     pub(crate) registered_rio_rqs: Vec<Option<RIO_RQ>>,
     // RIO Registration for Slab Pages (for Address Buffers)
-    // Maps PageIndex -> (RIO_BUFFERID, BaseAddress)
-    pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize)>>,
+    // Maps PageIndex -> (RIO_BUFFERID, BaseAddress, Length)
+    pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize, usize)>>,
     pub(crate) rq_depth: u32,
     pub(crate) dispatch: RioDispatch,
 }
@@ -387,7 +387,7 @@ impl RioState {
                         format!("RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"),
                     ));
                 }
-                self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
+                self.slab_rio_pages[page_idx] = Some((id, ptr as usize, len));
             } else {
                 return Err(io_msg(
                     IocpErrorContext::Rio,
@@ -601,7 +601,7 @@ impl RioState {
         self.ensure_slab_page_registration(page_idx, slab_resolver)?;
 
         // Values are now guaranteed to be present if ensure_slab_page_registration succeeded
-        let (addr_buf_id, base_addr) = self.slab_rio_pages[page_idx].unwrap();
+        let (addr_buf_id, base_addr, slab_len) = self.slab_rio_pages[page_idx].unwrap();
 
         let rq = self.ensure_rq(handle, fd)?;
 
@@ -618,31 +618,56 @@ impl RioState {
             ));
         }
         let family = unsafe { (*(addr_ptr as *const SOCKADDR)).sa_family };
-        let expected_addr_len = if family == AF_INET {
-            std::mem::size_of::<SOCKADDR_IN>() as i32
+        let min_addr_len = if family == AF_INET {
+            std::mem::size_of::<SOCKADDR_IN>() as usize
         } else if family == AF_INET6 {
-            std::mem::size_of::<SOCKADDR_IN6>() as i32
+            std::mem::size_of::<SOCKADDR_IN6>() as usize
         } else {
             return Err(io_msg(
                 IocpErrorContext::Rio,
                 format!("RIO send_to unsupported address family: family={family}"),
             ));
         };
-        if addr_len != expected_addr_len {
+        if (addr_len as usize) < min_addr_len {
             return Err(io_msg(
                 IocpErrorContext::Rio,
                 format!(
-                    "RIO send_to invalid address length: addr_len={}, expected={}, family={}",
-                    addr_len, expected_addr_len, family
+                    "RIO send_to invalid address length: addr_len={}, min_required={}, family={}",
+                    addr_len, min_addr_len, family
                 ),
             ));
         }
 
-        let addr_offset = (addr_ptr as usize - base_addr) as u32;
+        // RIO address buffers are consumed as SOCKADDR_INET shape.
+        let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>();
+
+        let addr_addr = addr_ptr as usize;
+        let slab_end = base_addr.saturating_add(slab_len);
+        if addr_addr < base_addr || addr_addr >= slab_end {
+            return Err(io_msg(
+                IocpErrorContext::Rio,
+                format!(
+                    "RIO send_to address pointer is outside registered slab: page_idx={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}, slab_end=0x{:x}",
+                    page_idx, addr_addr, base_addr, slab_len, slab_end
+                ),
+            ));
+        }
+        let addr_end = addr_addr.saturating_add(rio_addr_len);
+        if addr_end > slab_end {
+            return Err(io_msg(
+                IocpErrorContext::Rio,
+                format!(
+                    "RIO send_to address range exceeds registered slab: page_idx={}, addr_ptr=0x{:x}, addr_len={}, addr_end=0x{:x}, slab_end=0x{:x}",
+                    page_idx, addr_addr, rio_addr_len, addr_end, slab_end
+                ),
+            ));
+        }
+
+        let addr_offset = (addr_addr - base_addr) as u32;
         let addr_buf = RIO_BUF {
             BufferId: addr_buf_id,
             Offset: addr_offset,
-            Length: addr_len as u32,
+            Length: rio_addr_len as u32,
         };
 
         let send_ex_fn = self.dispatch.send_ex;
@@ -666,7 +691,20 @@ impl RioState {
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
-                format!("RIOSendEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={page_idx}"),
+                format!(
+                    "RIOSendEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={}, rq=0x{:x}, data_buf_id=0x{:x}, data_off={}, data_len={}, addr_buf_id=0x{:x}, addr_off={}, addr_len={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}",
+                    page_idx,
+                    rq as usize,
+                    data_buf.BufferId as usize,
+                    data_buf.Offset,
+                    data_buf.Length,
+                    addr_buf.BufferId as usize,
+                    addr_buf.Offset,
+                    addr_buf.Length,
+                    addr_addr,
+                    base_addr,
+                    slab_len
+                ),
             ));
         }
         Ok(SubmissionResult::Pending)
@@ -713,7 +751,7 @@ impl RioState {
         self.ensure_slab_page_registration(page_idx, slab_resolver)?;
 
         // Values are now guaranteed to be present
-        let (addr_buf_id, base_addr) = self.slab_rio_pages[page_idx].unwrap();
+        let (addr_buf_id, base_addr, slab_len) = self.slab_rio_pages[page_idx].unwrap();
 
         let rq = self.ensure_rq(handle, fd)?;
 
@@ -723,7 +761,30 @@ impl RioState {
             Length: buf.capacity() as u32,
         };
 
-        let addr_offset = (addr_ptr as usize - base_addr) as u32;
+        let addr_addr = addr_ptr as usize;
+        let slab_end = base_addr.saturating_add(slab_len);
+        let addr_len = std::mem::size_of::<SockAddrStorage>();
+        if addr_addr < base_addr || addr_addr >= slab_end {
+            return Err(io_msg(
+                IocpErrorContext::Rio,
+                format!(
+                    "RIO recv_from address pointer is outside registered slab: page_idx={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}, slab_end=0x{:x}",
+                    page_idx, addr_addr, base_addr, slab_len, slab_end
+                ),
+            ));
+        }
+        let addr_end = addr_addr.saturating_add(addr_len);
+        if addr_end > slab_end {
+            return Err(io_msg(
+                IocpErrorContext::Rio,
+                format!(
+                    "RIO recv_from address range exceeds registered slab: page_idx={}, addr_ptr=0x{:x}, addr_len={}, addr_end=0x{:x}, slab_end=0x{:x}",
+                    page_idx, addr_addr, addr_len, addr_end, slab_end
+                ),
+            ));
+        }
+
+        let addr_offset = (addr_addr - base_addr) as u32;
         let addr_buf = RIO_BUF {
             BufferId: addr_buf_id,
             Offset: addr_offset,
@@ -751,7 +812,20 @@ impl RioState {
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
-                format!("RIOReceiveEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={page_idx}"),
+                format!(
+                    "RIOReceiveEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={}, rq=0x{:x}, data_buf_id=0x{:x}, data_off={}, data_len={}, addr_buf_id=0x{:x}, addr_off={}, addr_len={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}",
+                    page_idx,
+                    rq as usize,
+                    data_buf.BufferId as usize,
+                    data_buf.Offset,
+                    data_buf.Length,
+                    addr_buf.BufferId as usize,
+                    addr_buf.Offset,
+                    addr_buf.Length,
+                    addr_addr,
+                    base_addr,
+                    slab_len
+                ),
             ));
         }
         Ok(SubmissionResult::Pending)
@@ -766,7 +840,7 @@ impl Drop for RioState {
                 unsafe { (self.dispatch.deregister_buffer)(id) };
             }
         }
-        for (id, _) in self.slab_rio_pages.iter().flatten().copied() {
+        for (id, _, _) in self.slab_rio_pages.iter().flatten().copied() {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
                 unsafe { (self.dispatch.deregister_buffer)(id) };
             }
