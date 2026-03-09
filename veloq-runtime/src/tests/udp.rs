@@ -671,18 +671,22 @@ fn test_multithread_udp_echo() {
                     println!("Client received correct echo");
                 });
 
+                println!("UDP echo phase: wait_client_join");
                 timeout(Duration::from_secs(5), async move { client_h.await })
                     .await
                     .unwrap_or_else(|_| {
                         panic!("UDP echo timeout: phase=wait_client_join; timeout_ms={}", 5000)
                     });
+                println!("UDP echo phase: wait_server_join");
                 timeout(Duration::from_secs(5), async move { server_h.await })
                     .await
                     .unwrap_or_else(|_| {
                         panic!("UDP echo timeout: phase=wait_server_join; timeout_ms={}", 5000)
                     });
+                println!("UDP echo phase: joins_done");
             });
 
+            println!("UDP echo phase: block_on_done");
             println!("Multi-thread UDP echo test completed");
         })
         .join()

@@ -427,6 +427,10 @@ impl IocpDriver {
         Ok(())
     }
 
+    pub fn shutdown_udp_pool_for_handle(&mut self, handle: crate::RawHandle) {
+        self.rio_state.begin_udp_pool_shutdown_for_handle(handle.handle);
+    }
+
     pub fn cancel_op_internal(&mut self, user_data: usize) {
         let ops_local = &mut self.ops.local;
         let ops_shared = &self.ops.shared;

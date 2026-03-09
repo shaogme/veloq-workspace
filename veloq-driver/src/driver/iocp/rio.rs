@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::thread;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use tracing::warn;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -32,7 +33,8 @@ const UDP_RECV_POOL_INITIAL_CREDITS: usize = 4;
 const UDP_RECV_POOL_MAX_CREDITS: usize = 16;
 const UDP_RECV_POOL_BUF_SIZE: usize = 65_536;
 const UDP_RECV_POOL_QUEUE_CAP: usize = 256;
-const UDP_POOL_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+const UDP_POOL_DRAIN_SOFT_TIMEOUT: Duration = Duration::from_secs(5);
+const UDP_POOL_DRAIN_HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const UDP_POOL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 struct UdpRecvDatagram {
@@ -47,6 +49,7 @@ struct UdpRecvPoolSlot {
     data_buf_id: RIO_BUFFERID,
     addr_buf_id: RIO_BUFFERID,
     in_flight: bool,
+    stop_requested: bool,
 }
 
 struct UdpRecvPool {
@@ -58,6 +61,7 @@ struct UdpRecvPool {
     max_credits: usize,
     target_credits: usize,
     idle_hits: u32,
+    shutting_down: bool,
 }
 
 #[cfg(test)]
@@ -470,6 +474,7 @@ impl RioState {
             data_buf_id,
             addr_buf_id,
             in_flight: false,
+            stop_requested: false,
         })
     }
 
@@ -483,11 +488,18 @@ impl RioState {
     }
 
     fn submit_udp_pool_slot(&mut self, handle: HANDLE, slot_idx: usize) -> io::Result<()> {
-        let rq = self
-            .udp_recv_pools
-            .get(&handle)
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?
-            .rq;
+        let rq = {
+            let pool = self
+                .udp_recv_pools
+                .get(&handle)
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
+            if pool.shutting_down {
+                return Err(io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+                ));
+            }
+            pool.rq
+        };
 
         let token = self.alloc_udp_ctx_token(handle, slot_idx);
         let pool = self
@@ -499,6 +511,7 @@ impl RioState {
             .get_mut(slot_idx)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool slot missing"))?;
         slot.in_flight = true;
+        slot.stop_requested = false;
 
         let data_buf = RIO_BUF {
             BufferId: slot.data_buf_id,
@@ -532,6 +545,7 @@ impl RioState {
                 && let Some(slot) = pool.slots.get_mut(slot_idx)
             {
                 slot.in_flight = false;
+                slot.stop_requested = false;
             }
             return Err(io_error(
                 IocpErrorContext::Rio,
@@ -547,12 +561,16 @@ impl RioState {
 
     fn grow_udp_pool_to(&mut self, handle: HANDLE, target: usize) -> io::Result<()> {
         loop {
-            let current = self
-                .udp_recv_pools
-                .get(&handle)
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?
-                .slots
-                .len();
+            let (current, shutting_down) = {
+                let pool = self
+                    .udp_recv_pools
+                    .get(&handle)
+                    .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
+                (pool.slots.len(), pool.shutting_down)
+            };
+            if shutting_down {
+                return Ok(());
+            }
             if current >= target {
                 return Ok(());
             }
@@ -585,7 +603,7 @@ impl RioState {
                 let Some(pool) = self.udp_recv_pools.get_mut(&handle) else {
                     return;
                 };
-                if pool.slots.len() <= pool.target_credits {
+                if !pool.shutting_down && pool.slots.len() <= pool.target_credits {
                     return;
                 }
                 if pool.slots.last().is_some_and(|slot| slot.in_flight) {
@@ -602,6 +620,15 @@ impl RioState {
     }
 
     fn rebalance_udp_pool(&mut self, handle: HANDLE) -> io::Result<()> {
+        if self
+            .udp_recv_pools
+            .get(&handle)
+            .is_some_and(|pool| pool.shutting_down)
+        {
+            self.trim_udp_pool_tail(handle);
+            return Ok(());
+        }
+
         let desired = {
             let pool = self
                 .udp_recv_pools
@@ -650,6 +677,7 @@ impl RioState {
                 max_credits: max,
                 target_credits: initial,
                 idle_hits: 0,
+                shutting_down: false,
             },
         );
 
@@ -744,6 +772,12 @@ impl RioState {
                 .get_mut(&handle)
                 .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
 
+            if pool.shutting_down {
+                return Err(io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+                ));
+            }
+
             if let Some(datagram) = pool.queue.pop_front() {
                 let copy_len = std::cmp::min(buf.capacity(), datagram.data.len());
                 buf.as_slice_mut()[..copy_len].copy_from_slice(&datagram.data[..copy_len]);
@@ -779,27 +813,95 @@ impl RioState {
             .sum()
     }
 
-    fn ack_udp_pool_completion_for_drop(&mut self, completion_generation: u32) {
+    fn ack_udp_pool_completion(&mut self, completion_generation: u32) -> bool {
         let Some((handle, slot_idx)) = self.udp_ctx_map.remove(&completion_generation) else {
-            return;
+            return false;
         };
         if let Some(pool) = self.udp_recv_pools.get_mut(&handle)
             && let Some(slot) = pool.slots.get_mut(slot_idx)
         {
             slot.in_flight = false;
+            slot.stop_requested = false;
+            return true;
+        }
+        false
+    }
+
+    fn begin_udp_pool_shutdown(&mut self) {
+        for pool in self.udp_recv_pools.values_mut() {
+            pool.shutting_down = true;
+            pool.target_credits = 0;
+            pool.queue.clear();
+            pool.waiters.clear();
+            for slot in &mut pool.slots {
+                if slot.in_flight {
+                    slot.stop_requested = true;
+                }
+            }
         }
     }
 
-    fn drain_udp_pool_completions_on_drop(&mut self) {
+    pub(crate) fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
+        if let Some(pool) = self.udp_recv_pools.get_mut(&handle) {
+            pool.shutting_down = true;
+            pool.target_credits = 0;
+            pool.queue.clear();
+            pool.waiters.clear();
+            for slot in &mut pool.slots {
+                if slot.in_flight {
+                    slot.stop_requested = true;
+                }
+            }
+        }
+        self.cleanup_shutdown_udp_pool_if_drained(handle);
+    }
+
+    fn cleanup_shutdown_udp_pool_if_drained(&mut self, handle: HANDLE) {
+        let drained = self
+            .udp_recv_pools
+            .get(&handle)
+            .is_some_and(|pool| pool.shutting_down && pool.slots.iter().all(|slot| !slot.in_flight));
+        if !drained {
+            return;
+        }
+
+        self.udp_ctx_map.retain(|_, (h, _)| *h != handle);
+        if let Some(pool) = self.udp_recv_pools.remove(&handle) {
+            for slot in pool.slots {
+                self.deregister_udp_pool_slot(slot);
+            }
+        }
+        self.rio_rqs.remove(&handle);
+    }
+
+    fn drain_udp_pool_shutdown_acks(&mut self) {
         if self.udp_recv_pools.is_empty() {
             return;
         }
 
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
-        let deadline = Instant::now() + UDP_POOL_DRAIN_TIMEOUT;
+        let start = Instant::now();
+        let mut soft_logged = false;
 
-        while self.count_udp_pool_in_flight() > 0 && Instant::now() < deadline {
+        while self.count_udp_pool_in_flight() > 0 {
+            if !soft_logged && start.elapsed() >= UDP_POOL_DRAIN_SOFT_TIMEOUT {
+                soft_logged = true;
+                warn!(
+                    in_flight = self.count_udp_pool_in_flight(),
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "UDP pool shutdown drain is taking longer than expected"
+                );
+            }
+            if start.elapsed() >= UDP_POOL_DRAIN_HARD_TIMEOUT {
+                warn!(
+                    in_flight = self.count_udp_pool_in_flight(),
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "UDP pool shutdown drain timed out before all acks arrived"
+                );
+                break;
+            }
+
             let count = unsafe {
                 (self.dispatch.dequeue)(self.cq, results.as_mut_ptr(), MAX_RIO_RESULTS as u32)
             };
@@ -819,7 +921,7 @@ impl RioState {
                     continue;
                 };
                 if user_data == UDP_POOL_USER_DATA {
-                    self.ack_udp_pool_completion_for_drop(completion_generation);
+                    let _ = self.ack_udp_pool_completion(completion_generation);
                 }
             }
         }
@@ -863,10 +965,17 @@ impl RioState {
                         continue;
                     };
 
-                    let should_resubmit = if let Some(pool) = self.udp_recv_pools.get_mut(&handle)
+                    let mut should_resubmit = false;
+                    let mut should_dispatch = false;
+                    let mut should_rebalance = false;
+                    if let Some(pool) = self.udp_recv_pools.get_mut(&handle)
+                        && let Some(slot) = pool.slots.get_mut(slot_idx)
                     {
-                        if let Some(slot) = pool.slots.get_mut(slot_idx) {
-                            slot.in_flight = false;
+                        slot.in_flight = false;
+                        let stopping = slot.stop_requested;
+                        slot.stop_requested = false;
+
+                        if !pool.shutting_down {
                             if res.Status == 0 && res.BytesTransferred > 0 {
                                 if pool.queue.len() >= UDP_RECV_POOL_QUEUE_CAP {
                                     let _ = pool.queue.pop_front();
@@ -877,20 +986,23 @@ impl RioState {
                                     addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
                                 });
                             }
-                            slot_idx < pool.target_credits
-                        } else {
-                            false
+                            should_resubmit = !stopping && slot_idx < pool.target_credits;
+                            should_dispatch = true;
+                            should_rebalance = true;
                         }
-                    } else {
-                        false
-                    };
+                    }
 
                     if should_resubmit {
                         let _ = self.submit_udp_pool_slot(handle, slot_idx);
                     }
-                    self.trim_udp_pool_tail(handle);
-                    self.dispatch_udp_waiters_for_handle(handle, ops);
-                    let _ = self.rebalance_udp_pool(handle);
+                    if should_dispatch {
+                        self.dispatch_udp_waiters_for_handle(handle, ops);
+                    }
+                    if should_rebalance {
+                        self.trim_udp_pool_tail(handle);
+                        let _ = self.rebalance_udp_pool(handle);
+                    }
+                    self.cleanup_shutdown_udp_pool_if_drained(handle);
                     continue;
                 }
 
@@ -1336,8 +1448,11 @@ impl RioState {
 
 impl Drop for RioState {
     fn drop(&mut self) {
-        // Explicit drain/ack for UDP pool slots before deregistering their buffers.
-        self.drain_udp_pool_completions_on_drop();
+        // Explicit UDP pool shutdown protocol:
+        // 1) forbid new submissions; 2) mark in-flight slots as stop-requested;
+        // 3) drain CQ until all slot acknowledgements arrive; 4) release buffers/CQ.
+        self.begin_udp_pool_shutdown();
+        self.drain_udp_pool_shutdown_acks();
         self.udp_ctx_map.clear();
 
         let mut deregistered = FxHashSet::default();
@@ -1359,8 +1474,7 @@ impl Drop for RioState {
         for (_handle, pool) in std::mem::take(&mut self.udp_recv_pools) {
             for slot in pool.slots {
                 if slot.in_flight {
-                    // Late completion not acknowledged within drain timeout.
-                    // Keep this slot alive to avoid UAF; OS will reclaim at process exit.
+                    // Hard-timeout fallback: keep memory alive instead of freeing while kernel may still touch it.
                     std::mem::forget(slot);
                     continue;
                 }
