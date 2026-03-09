@@ -11,10 +11,6 @@ pub const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0 as RIO_BUFFERID;
 
 pub struct RioRegistry {
     pub(crate) chunk_registry: Vec<RIO_BUFFERID>,
-    /// RIO Request Queues per socket (raw handle)
-    pub(crate) rio_rqs: FxHashMap<HANDLE, RIO_RQ>,
-    /// RIO Request Queues for registered files (O(1) lookup)
-    pub(crate) registered_rio_rqs: Vec<Option<RIO_RQ>>,
     /// RIO Registration for Slab Pages (for Address Buffers)
     /// Maps PageIndex -> (RIO_BUFFERID, BaseAddress, Length)
     pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize, usize)>>,
@@ -28,8 +24,6 @@ impl RioRegistry {
     pub fn new(rq_depth: u32) -> Self {
         Self {
             chunk_registry: Vec::new(),
-            rio_rqs: FxHashMap::default(),
-            registered_rio_rqs: Vec::new(),
             slab_rio_pages: Vec::new(),
             heap_rio_bufs: FxHashMap::default(),
             pending_deregistrations: Vec::new(),
@@ -110,33 +104,23 @@ impl RioRegistry {
 
     pub fn prepare_data_submission(
         &mut self,
-        target: (IoFd, HANDLE),
+        _target: (IoFd, HANDLE),
         buf: &FixedBuf,
         len: u32,
         env: RioEnv<'_>,
-    ) -> io::Result<(RIO_RQ, RIO_BUF)> {
-        let (fd, handle) = target;
+    ) -> io::Result<RIO_BUF> {
         let (buffer_id, offset) = self.resolve_buffer_id(buf, env)?;
-        let rq = self.ensure_rq((handle, fd), env)?;
         let rio_buf = RIO_BUF {
             BufferId: buffer_id,
             Offset: offset,
             Length: len,
         };
-        Ok((rq, rio_buf))
+        Ok(rio_buf)
     }
 
-    pub fn resize_registered_rqs(&mut self, size: usize) {
-        if size > self.registered_rio_rqs.len() {
-            self.registered_rio_rqs.resize(size, None);
-        }
-    }
+    pub fn resize_registered_rqs(&mut self, _size: usize) {}
 
-    pub fn clear_registered_rq(&mut self, idx: usize) {
-        if idx < self.registered_rio_rqs.len() {
-            self.registered_rio_rqs[idx] = None;
-        }
-    }
+    pub fn clear_registered_rq(&mut self, _idx: usize) {}
 
     pub fn register_chunk(
         &mut self,
@@ -205,21 +189,8 @@ impl RioRegistry {
         Ok(())
     }
 
-    pub fn ensure_rq(&mut self, target: (HANDLE, IoFd), env: RioEnv<'_>) -> io::Result<RIO_RQ> {
+    pub fn create_rq(&mut self, target: (HANDLE, IoFd), env: RioEnv<'_>) -> io::Result<RIO_RQ> {
         let (handle, fd) = target;
-        // fast path for registered files
-        if let IoFd::Fixed(idx) = fd {
-            let idx = idx as usize;
-            if let Some(Some(rq)) = self.registered_rio_rqs.get(idx) {
-                return Ok(*rq);
-            }
-        } else {
-            // Fallback for raw handles
-            if let Some(&rq) = self.rio_rqs.get(&handle) {
-                return Ok(rq);
-            }
-        }
-
         let create_fn = env.dispatch.create_rq;
 
         let max_outstanding_recvs = self.rq_depth;
@@ -247,15 +218,6 @@ impl RioRegistry {
                     self.rq_depth
                 ),
             ));
-        }
-
-        if let IoFd::Fixed(idx) = fd {
-            let idx = idx as usize;
-            if idx < self.registered_rio_rqs.len() {
-                self.registered_rio_rqs[idx] = Some(rq);
-            }
-        } else {
-            self.rio_rqs.insert(handle, rq);
         }
         Ok(rq)
     }
@@ -301,7 +263,5 @@ impl RioRegistry {
         self.chunk_registry.clear();
         self.slab_rio_pages.clear();
         self.heap_rio_bufs.clear();
-        self.rio_rqs.clear();
-        self.registered_rio_rqs.clear();
     }
 }

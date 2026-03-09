@@ -8,6 +8,7 @@ use crate::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
 use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED, STATE_CONSUMED};
 use crate::op::IoFd;
+use rustc_hash::FxHashMap;
 use std::io;
 use std::sync::atomic::Ordering;
 use veloq_buf::FixedBuf;
@@ -35,8 +36,24 @@ pub struct RioContext<'a> {
 
 #[derive(Clone, Copy)]
 enum RioCompletionKind {
-    Pool { generation: u32 },
+    Pool { actor_id: u32, generation: u32 },
     Op { user_data: usize, generation: u32 },
+}
+
+struct RioSocketActor {
+    actor_id: u32,
+    rq: RIO_RQ,
+    pool_manager: UdpPoolManager,
+}
+
+impl RioSocketActor {
+    fn new(actor_id: u32, rq: RIO_RQ) -> Self {
+        Self {
+            actor_id,
+            rq,
+            pool_manager: UdpPoolManager::new(),
+        }
+    }
 }
 
 pub struct RioSendToArgs<'a> {
@@ -116,7 +133,9 @@ pub(crate) struct RioDispatch {
 pub struct RioState {
     pub(crate) kernel: RioKernel,
     pub(crate) registry: RioRegistry,
-    pub(crate) pool_manager: UdpPoolManager,
+    actors: FxHashMap<HANDLE, RioSocketActor>,
+    actor_routes: FxHashMap<u32, HANDLE>,
+    next_actor_id: u32,
     pub(crate) outstanding_count: usize,
 }
 
@@ -335,7 +354,8 @@ impl RioKernel {
 struct RioCompletionRouter<'a> {
     ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
     registry: &'a mut RioRegistry,
-    pool_manager: &'a mut UdpPoolManager,
+    actors: &'a mut FxHashMap<HANDLE, RioSocketActor>,
+    actor_routes: &'a mut FxHashMap<u32, HANDLE>,
     env: RioEnv<'a>,
     outstanding_count: &'a mut usize,
     completed_count: usize,
@@ -345,14 +365,16 @@ impl<'a> RioCompletionRouter<'a> {
     fn new(
         ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
         registry: &'a mut RioRegistry,
-        pool_manager: &'a mut UdpPoolManager,
+        actors: &'a mut FxHashMap<HANDLE, RioSocketActor>,
+        actor_routes: &'a mut FxHashMap<u32, HANDLE>,
         env: RioEnv<'a>,
         outstanding_count: &'a mut usize,
     ) -> Self {
         Self {
             ops,
             registry,
-            pool_manager,
+            actors,
+            actor_routes,
             env,
             outstanding_count,
             completed_count: 0,
@@ -365,16 +387,39 @@ impl<'a> RioCompletionRouter<'a> {
         };
 
         match kind {
-            RioCompletionKind::Pool { generation } => {
-                let mut ctx = RioContext {
-                    registry: self.registry,
-                    env: self.env,
+            RioCompletionKind::Pool {
+                actor_id,
+                generation,
+            } => {
+                let Some(&handle) = self.actor_routes.get(&actor_id) else {
+                    return;
                 };
-                let (drained_handle, pool_submissions) =
-                    self.pool_manager
-                        .handle_completion(self.ops, (res, generation), &mut ctx);
-                if let Some(h) = drained_handle {
-                    self.registry.rio_rqs.remove(&h);
+                let (pool_submissions, remove_actor) = {
+                    let Some(actor) = self.actors.get_mut(&handle) else {
+                        return;
+                    };
+                    let Some(slot_idx) = actor.pool_manager.ack_udp_pool_completion(generation)
+                    else {
+                        return;
+                    };
+                    let mut ctx = RioContext {
+                        registry: self.registry,
+                        env: self.env,
+                    };
+                    let submissions = actor.pool_manager.handle_completion(
+                        self.ops,
+                        actor.rq,
+                        actor.actor_id,
+                        slot_idx,
+                        res,
+                        &mut ctx,
+                    );
+                    let remove = actor.pool_manager.cleanup_shutdown_udp_pool_if_drained(&mut ctx);
+                    (submissions, remove)
+                };
+                if remove_actor {
+                    self.actors.remove(&handle);
+                    self.actor_routes.remove(&actor_id);
                 }
                 *self.outstanding_count -= 1;
                 *self.outstanding_count += pool_submissions;
@@ -443,11 +488,15 @@ impl RioState {
         }
         let raw = ctx as usize;
         if (raw & POOL_CTX_TAG) == POOL_CTX_TAG {
-            let token = (raw >> 1) as u32;
-            if token == 0 {
+            let token = ((raw >> 1) & 0xffff_ffff) as u32;
+            let actor_id = ((raw >> 33) & 0xffff_ffff) as u32;
+            if token == 0 || actor_id == 0 {
                 return None;
             }
-            return Some(RioCompletionKind::Pool { generation: token });
+            return Some(RioCompletionKind::Pool {
+                actor_id,
+                generation: token,
+            });
         }
         let entry = ctx as usize as *const OverlappedEntry;
         let user_data = unsafe { (*entry).user_data };
@@ -459,7 +508,7 @@ impl RioState {
     }
 
     #[inline]
-    fn decode_pool_context(ctx: u64) -> Option<u32> {
+    fn decode_pool_context(ctx: u64) -> Option<(u32, u32)> {
         if ctx == 0 {
             return None;
         }
@@ -467,11 +516,12 @@ impl RioState {
         if (raw & POOL_CTX_TAG) != POOL_CTX_TAG {
             return None;
         }
-        let token = (raw >> 1) as u32;
-        if token == 0 {
+        let token = ((raw >> 1) & 0xffff_ffff) as u32;
+        let actor_id = ((raw >> 33) & 0xffff_ffff) as u32;
+        if token == 0 || actor_id == 0 {
             return None;
         }
-        Some(token)
+        Some((actor_id, token))
     }
 
     fn last_wsa_error() -> io::Error {
@@ -483,6 +533,34 @@ impl RioState {
         RioContext { registry, env }
     }
 
+    fn alloc_actor_id(&mut self) -> u32 {
+        loop {
+            let id = self.next_actor_id;
+            self.next_actor_id = self.next_actor_id.wrapping_add(1);
+            if id == 0 {
+                continue;
+            }
+            if !self.actor_routes.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    fn ensure_actor(
+        &mut self,
+        target: (IoFd, HANDLE),
+        env: RioEnv<'_>,
+    ) -> io::Result<&mut RioSocketActor> {
+        let (fd, handle) = target;
+        if !self.actors.contains_key(&handle) {
+            let rq = self.registry.create_rq((handle, fd), env)?;
+            let actor_id = self.alloc_actor_id();
+            self.actor_routes.insert(actor_id, handle);
+            self.actors.insert(handle, RioSocketActor::new(actor_id, rq));
+        }
+        Ok(self.actors.get_mut(&handle).expect("actor inserted"))
+    }
+
     pub fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
         let kernel = RioKernel::from_extensions(port, entries, ext)?;
 
@@ -491,7 +569,9 @@ impl RioState {
         Ok(Self {
             kernel,
             registry: RioRegistry::new(rq_depth),
-            pool_manager: UdpPoolManager::new(),
+            actors: FxHashMap::default(),
+            actor_routes: FxHashMap::default(),
+            next_actor_id: 1,
             outstanding_count: 0,
         })
     }
@@ -512,11 +592,16 @@ impl RioState {
     pub fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
         let env = self.kernel.env(&veloq_buf::NoopRegistrar);
         let mut ctx = Self::build_ctx(&mut self.registry, env);
-        self.pool_manager
-            .begin_udp_pool_shutdown_for_handle(handle, &mut ctx);
-        // If pool was fully drained, also remove the stale RQ mapping.
-        if !self.pool_manager.udp_recv_pools.contains_key(&handle) {
-            self.registry.rio_rqs.remove(&handle);
+        let mut remove_actor = None;
+        if let Some(actor) = self.actors.get_mut(&handle) {
+            actor.pool_manager.begin_udp_pool_shutdown();
+            if actor.pool_manager.cleanup_shutdown_udp_pool_if_drained(&mut ctx) {
+                remove_actor = Some(actor.actor_id);
+            }
+        }
+        if let Some(actor_id) = remove_actor {
+            self.actors.remove(&handle);
+            self.actor_routes.remove(&actor_id);
         }
     }
 
@@ -528,8 +613,11 @@ impl RioState {
     ) {
         let env = self.kernel.env(registrar);
         let mut ctx = Self::build_ctx(&mut self.registry, env);
-        self.pool_manager
-            .cancel_udp_recv_waiter(handle, uid, &mut ctx);
+        if let Some(actor) = self.actors.get_mut(&handle) {
+            actor
+                .pool_manager
+                .cancel_udp_recv_waiter(uid, actor.rq, actor.actor_id, &mut ctx);
+        }
     }
 
     pub fn process_completions(
@@ -543,7 +631,8 @@ impl RioState {
         let mut router = RioCompletionRouter::new(
             ops,
             &mut self.registry,
-            &mut self.pool_manager,
+            &mut self.actors,
+            &mut self.actor_routes,
             env,
             &mut self.outstanding_count,
         );
@@ -584,8 +673,14 @@ impl RioState {
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
         use crate::driver::iocp::submit::SubmissionResult;
         let (fd, handle, overlapped) = target;
-        let env = self.kernel.env(registrar);
-        let (rq, rio_buf) =
+        let dispatch = self.kernel.dispatch;
+        let env = RioEnv {
+            registrar,
+            dispatch: &dispatch,
+            cq: self.kernel.cq,
+        };
+        let rq = self.ensure_actor((fd, handle), env)?.rq;
+        let rio_buf =
             self.registry
                 .prepare_data_submission((fd, handle), buf, buf.capacity() as u32, env)?;
         let request_context = Self::encode_request_context(overlapped);
@@ -609,8 +704,14 @@ impl RioState {
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
         use crate::driver::iocp::submit::SubmissionResult;
         let (fd, handle, overlapped) = target;
-        let env = self.kernel.env(registrar);
-        let (rq, rio_buf) =
+        let dispatch = self.kernel.dispatch;
+        let env = RioEnv {
+            registrar,
+            dispatch: &dispatch,
+            cq: self.kernel.cq,
+        };
+        let rq = self.ensure_actor((fd, handle), env)?.rq;
+        let rio_buf =
             self.registry
                 .prepare_data_submission((fd, handle), buf, buf.len() as u32, env)?;
         let request_context = Self::encode_request_context(overlapped);
@@ -646,8 +747,14 @@ impl RioState {
             page_idx,
         } = args;
 
-        let env = self.kernel.env(registrar);
-        let (rq, data_buf) =
+        let dispatch = self.kernel.dispatch;
+        let env = RioEnv {
+            registrar,
+            dispatch: &dispatch,
+            cq: self.kernel.cq,
+        };
+        let rq = self.ensure_actor((fd, handle), env)?.rq;
+        let data_buf =
             self.registry
                 .prepare_data_submission((fd, handle), buf, buf.len() as u32, env)?;
         self.registry.ensure_slab_page_registration(page_idx, slab_resolver, env)?;
@@ -754,8 +861,14 @@ impl RioState {
             overlapped,
             page_idx,
         } = args;
-        let env = self.kernel.env(registrar);
-        let (rq, data_buf) =
+        let dispatch = self.kernel.dispatch;
+        let env = RioEnv {
+            registrar,
+            dispatch: &dispatch,
+            cq: self.kernel.cq,
+        };
+        let rq = self.ensure_actor((fd, handle), env)?.rq;
+        let data_buf =
             self.registry
                 .prepare_data_submission((fd, handle), buf, buf.capacity() as u32, env)?;
         self.registry
@@ -833,10 +946,19 @@ impl RioState {
             user_data,
             generation,
         } = args;
-        let env = self.kernel.env(registrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
-        let (res, pool_submissions) = self.pool_manager.try_submit_udp_recv_stream_pooled(
-            (fd, handle),
+        let dispatch = self.kernel.dispatch;
+        let env = RioEnv {
+            registrar,
+            dispatch: &dispatch,
+            cq: self.kernel.cq,
+        };
+        let _ = self.ensure_actor((fd, handle), env)?;
+        let (registry, actors) = (&mut self.registry, &mut self.actors);
+        let actor = actors.get_mut(&handle).expect("actor exists");
+        let mut ctx = Self::build_ctx(registry, env);
+        let (res, pool_submissions) = actor.pool_manager.try_submit_udp_recv_stream_pooled(
+            actor.rq,
+            actor.actor_id,
             stream_op,
             (user_data, generation),
             &mut ctx,
@@ -854,11 +976,21 @@ impl RioState {
         buf: FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
-        let env = self.kernel.env(registrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
-        let pool_submissions = self
-            .pool_manager
-            .try_refill_udp_pool(target, buf, &mut ctx)?;
+        let dispatch = self.kernel.dispatch;
+        let env = RioEnv {
+            registrar,
+            dispatch: &dispatch,
+            cq: self.kernel.cq,
+        };
+        let (fd, handle) = target;
+        let _ = self.ensure_actor((fd, handle), env)?;
+        let (registry, actors) = (&mut self.registry, &mut self.actors);
+        let actor = actors.get_mut(&handle).expect("actor exists");
+        let mut ctx = Self::build_ctx(registry, env);
+        let pool_submissions =
+            actor
+                .pool_manager
+                .try_refill_udp_pool(actor.rq, actor.actor_id, buf, &mut ctx)?;
         self.outstanding_count += pool_submissions;
         Ok(())
     }
@@ -868,7 +1000,9 @@ impl RioState {
         &self,
         handle: HANDLE,
     ) -> Option<pool::UdpRecvPoolDebugStats> {
-        self.pool_manager.udp_pool_debug_stats(handle)
+        self.actors
+            .get(&handle)
+            .and_then(|actor| actor.pool_manager.udp_pool_debug_stats())
     }
 
     #[cfg(test)]
@@ -880,8 +1014,12 @@ impl RioState {
     ) -> io::Result<()> {
         let env = self.kernel.env(registrar);
         let mut ctx = Self::build_ctx(&mut self.registry, env);
-        for _ in 0..ticks {
-            self.pool_manager.rebalance_udp_pool(handle, &mut ctx)?;
+        if let Some(actor) = self.actors.get_mut(&handle) {
+            for _ in 0..ticks {
+                actor
+                    .pool_manager
+                    .rebalance_udp_pool(actor.rq, actor.actor_id, &mut ctx)?;
+            }
         }
         Ok(())
     }
@@ -892,7 +1030,9 @@ impl Drop for RioState {
         // Explicit UDP pool shutdown protocol:
         // 1) forbid new submissions; 2) mark in-flight slots as stop-requested;
         // 3) drain CQ until all slot acknowledgements arrive; 4) release buffers/CQ.
-        self.pool_manager.begin_udp_pool_shutdown();
+        for actor in self.actors.values_mut() {
+            actor.pool_manager.begin_udp_pool_shutdown();
+        }
 
         // Consolidate drain: Wait for all outstanding RIO requests (Pool + Standard) to finish.
         // This ensures the kernel is no longer touching any registered buffers or pool slots.
@@ -916,16 +1056,22 @@ impl Drop for RioState {
                 std::thread::yield_now();
             } else {
                 for res in results.iter().take(count as usize) {
-                    if let Some(completion_generation) =
+                    if let Some((actor_id, completion_generation)) =
                         Self::decode_pool_context(res.RequestContext)
                     {
-                        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-                        let mut ctx = Self::build_ctx(&mut self.registry, env);
-                        if let Some(drained_handle) = self
-                            .pool_manager
-                            .handle_completion_drain_only((res, completion_generation), &mut ctx)
+                        if let Some(handle) = self.actor_routes.get(&actor_id).copied()
+                            && let Some(actor) = self.actors.get_mut(&handle)
                         {
-                            self.registry.rio_rqs.remove(&drained_handle);
+                            let _ = actor
+                                .pool_manager
+                                .ack_udp_pool_completion(completion_generation);
+                            actor.pool_manager.handle_completion_drain_only();
+                            let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+                            let mut ctx = Self::build_ctx(&mut self.registry, env);
+                            if actor.pool_manager.cleanup_shutdown_udp_pool_if_drained(&mut ctx) {
+                                self.actor_routes.remove(&actor_id);
+                                self.actors.remove(&handle);
+                            }
                         }
                     }
                     self.outstanding_count -= 1;
@@ -933,11 +1079,18 @@ impl Drop for RioState {
             }
         }
 
-        self.pool_manager.udp_ctx_map.clear();
+        for actor in self.actors.values_mut() {
+            actor.pool_manager.udp_ctx_map.clear();
+        }
         let env = self.kernel.env(&veloq_buf::NoopRegistrar);
         let mut ctx = Self::build_ctx(&mut self.registry, env);
-        self.pool_manager
-            .forget_in_flight_and_deregister_rest(&mut ctx);
+        for actor in self.actors.values_mut() {
+            actor
+                .pool_manager
+                .forget_in_flight_and_deregister_rest(&mut ctx);
+        }
+        self.actors.clear();
+        self.actor_routes.clear();
         let _ = ctx;
         let env = self.kernel.env(&veloq_buf::NoopRegistrar);
         self.registry.cleanup_deregister(env);

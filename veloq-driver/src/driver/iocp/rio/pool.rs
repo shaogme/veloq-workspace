@@ -6,13 +6,13 @@ use crate::driver::iocp::submit::SubmissionResult;
 use crate::driver::iocp::{IocpOp, IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
 use crate::driver::slot::STATE_COMPLETED;
-use crate::op::{IoFd, UdpRecvStream};
+use crate::op::UdpRecvStream;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::Ordering;
 use veloq_buf::FixedBuf;
-use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, HANDLE};
+use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_RQ, RIORESULT, WSAGetLastError,
 };
@@ -39,7 +39,6 @@ pub struct UdpRecvPoolSlot {
 }
 
 pub struct UdpRecvPool {
-    pub rq: RIO_RQ,
     pub slots: Vec<UdpRecvPoolSlot>,
     pub queue: VecDeque<UdpRecvDatagram>,
     pub waiters: VecDeque<(usize, u32)>,
@@ -89,15 +88,15 @@ pub struct UdpRecvPoolDebugStats {
 }
 
 pub struct UdpPoolManager {
-    pub(crate) udp_recv_pools: FxHashMap<HANDLE, UdpRecvPool>,
-    pub(crate) udp_ctx_map: FxHashMap<u32, (HANDLE, usize)>,
+    pub(crate) pool: Option<UdpRecvPool>,
+    pub(crate) udp_ctx_map: FxHashMap<u32, usize>,
     pub(crate) udp_next_ctx: u32,
 }
 
 impl UdpPoolManager {
     pub fn new() -> Self {
         Self {
-            udp_recv_pools: FxHashMap::default(),
+            pool: None,
             udp_ctx_map: FxHashMap::default(),
             udp_next_ctx: 1,
         }
@@ -108,11 +107,12 @@ impl UdpPoolManager {
     }
 
     #[inline]
-    pub fn encode_pool_context(token: u32) -> *const std::ffi::c_void {
-        (((token as usize) << 1) | POOL_CTX_TAG) as *const std::ffi::c_void
+    pub fn encode_pool_context(actor_id: u32, token: u32) -> *const std::ffi::c_void {
+        (((actor_id as usize) << 33) | ((token as usize) << 1) | POOL_CTX_TAG)
+            as *const std::ffi::c_void
     }
 
-    fn alloc_udp_ctx_token(&mut self, handle: HANDLE, slot_idx: usize) -> u32 {
+    fn alloc_udp_ctx_token(&mut self, slot_idx: usize) -> u32 {
         loop {
             let token = self.udp_next_ctx;
             self.udp_next_ctx = self.udp_next_ctx.wrapping_add(1);
@@ -120,7 +120,7 @@ impl UdpPoolManager {
                 continue;
             }
             if let std::collections::hash_map::Entry::Vacant(e) = self.udp_ctx_map.entry(token) {
-                e.insert((handle, slot_idx));
+                e.insert(slot_idx);
                 return token;
             }
         }
@@ -173,9 +173,6 @@ impl UdpPoolManager {
     }
 
     fn deregister_udp_pool_slot(&self, slot: UdpRecvPoolSlot, dispatch: &RioDispatch) {
-        // If this slot currently uses a lazily-registered heap buffer, deregister it
-        // before dropping the FixedBuf memory.
-        // Note: callers that need this must use `deregister_udp_pool_slot_with_registry`.
         if slot.addr_buf_id != RIO_INVALID_BUFFERID {
             unsafe { (dispatch.deregister_buffer)(slot.addr_buf_id) };
         }
@@ -187,28 +184,21 @@ impl UdpPoolManager {
         self.deregister_udp_pool_slot(slot, ctx.env.dispatch);
     }
 
-    pub fn submit_udp_pool_slot(
+    fn submit_udp_pool_slot(
         &mut self,
-        target: (HANDLE, usize),
+        target: (usize, u32),
+        rq: RIO_RQ,
+        actor_id: u32,
         ctx: &mut RioContext,
     ) -> io::Result<usize> {
-        let (handle, slot_idx) = target;
-        let rq = {
-            let pool = self
-                .udp_recv_pools
-                .get(&handle)
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
-            if !matches!(pool.state, UdpPoolState::Running) {
-                return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
-            }
-            pool.rq
+        let (slot_idx, completion_token) = target;
+        let Some(pool) = self.pool.as_mut() else {
+            return Err(io_msg(IocpErrorContext::Rio, "UDP recv pool missing"));
         };
+        if !matches!(pool.state, UdpPoolState::Running) {
+            return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
+        }
 
-        let token = self.alloc_udp_ctx_token(handle, slot_idx);
-        let pool = self
-            .udp_recv_pools
-            .get_mut(&handle)
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
         let slot = pool
             .slots
             .get_mut(slot_idx)
@@ -230,7 +220,7 @@ impl UdpPoolManager {
             Length: std::mem::size_of::<SockAddrStorage>() as u32,
         };
         let recv_ex_fn = ctx.env.dispatch.receive_ex;
-        let req_ctx = Self::encode_pool_context(token);
+        let req_ctx = Self::encode_pool_context(actor_id, completion_token);
 
         let ret = unsafe {
             recv_ex_fn(
@@ -246,8 +236,8 @@ impl UdpPoolManager {
             )
         };
         if ret == 0 {
-            self.udp_ctx_map.remove(&token);
-            if let Some(pool) = self.udp_recv_pools.get_mut(&handle)
+            self.udp_ctx_map.remove(&completion_token);
+            if let Some(pool) = self.pool.as_mut()
                 && let Some(slot) = pool.slots.get_mut(slot_idx)
             {
                 slot.in_flight = false;
@@ -257,26 +247,27 @@ impl UdpPoolManager {
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
                 format!(
-                    "RIOReceiveEx submit failed for UDP recv pool: handle=0x{:x}, slot_idx={}, rq=0x{:x}",
-                    handle as usize, slot_idx, rq as usize
+                    "RIOReceiveEx submit failed for UDP recv pool: slot_idx={}, rq=0x{:x}",
+                    slot_idx, rq as usize
                 ),
             ));
         }
         Ok(1)
     }
 
-    pub fn grow_udp_pool_to(
+    fn grow_udp_pool_to(
         &mut self,
-        handle: HANDLE,
         target: usize,
+        rq: RIO_RQ,
+        actor_id: u32,
         ctx: &mut RioContext,
     ) -> io::Result<usize> {
         let mut submissions = 0;
         loop {
             let (current, state) = {
                 let pool = self
-                    .udp_recv_pools
-                    .get_mut(&handle)
+                    .pool
+                    .as_mut()
                     .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
                 (pool.slots.len(), pool.state)
             };
@@ -289,8 +280,8 @@ impl UdpPoolManager {
 
             let slot_buf = {
                 let pool = self
-                    .udp_recv_pools
-                    .get_mut(&handle)
+                    .pool
+                    .as_mut()
                     .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
                 match pool.spare_bufs.pop_front() {
                     Some(b) => b,
@@ -301,18 +292,19 @@ impl UdpPoolManager {
             let slot = self.create_udp_pool_slot(slot_buf, ctx.env.dispatch)?;
             {
                 let pool = self
-                    .udp_recv_pools
-                    .get_mut(&handle)
+                    .pool
+                    .as_mut()
                     .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
                 pool.slots.push(slot);
             }
 
             let idx = current;
-            match self.submit_udp_pool_slot((handle, idx), ctx) {
+            let token = self.alloc_udp_ctx_token(idx);
+            match self.submit_udp_pool_slot((idx, token), rq, actor_id, ctx) {
                 Ok(n) => submissions += n,
                 Err(e) => {
                     let (popped_slot, is_running) = {
-                        let mut pool = self.udp_recv_pools.get_mut(&handle);
+                        let mut pool = self.pool.as_mut();
                         (
                             pool.as_mut().and_then(|p| p.slots.pop()),
                             pool.as_ref()
@@ -326,7 +318,7 @@ impl UdpPoolManager {
                             unsafe { (ctx.env.dispatch.deregister_buffer)(s.addr_buf_id) };
                         }
                         if is_running
-                            && let Some(pool) = self.udp_recv_pools.get_mut(&handle)
+                            && let Some(pool) = self.pool.as_mut()
                         {
                             pool.spare_bufs.push_front(buf);
                         }
@@ -337,10 +329,10 @@ impl UdpPoolManager {
         }
     }
 
-    pub fn trim_udp_pool_tail(&mut self, handle: HANDLE, ctx: &mut RioContext) {
+    fn trim_udp_pool_tail(&mut self, ctx: &mut RioContext) {
         loop {
             let maybe_slot = {
-                let Some(pool) = self.udp_recv_pools.get_mut(&handle) else {
+                let Some(pool) = self.pool.as_mut() else {
                     return;
                 };
                 if matches!(pool.state, UdpPoolState::Running) && pool.slots.len() <= pool.target_credits {
@@ -361,13 +353,14 @@ impl UdpPoolManager {
 
     pub fn rebalance_udp_pool(
         &mut self,
-        handle: HANDLE,
+        rq: RIO_RQ,
+        actor_id: u32,
         ctx: &mut RioContext,
     ) -> io::Result<usize> {
         let (desired, state) = {
             let pool = self
-                .udp_recv_pools
-                .get_mut(&handle)
+                .pool
+                .as_mut()
                 .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
 
             if !matches!(pool.state, UdpPoolState::Running) {
@@ -391,46 +384,37 @@ impl UdpPoolManager {
         };
 
         if !matches!(state, UdpPoolState::Running) {
-            self.trim_udp_pool_tail(handle, ctx);
+            self.trim_udp_pool_tail(ctx);
             return Ok(0);
         }
 
-        let submissions = self.grow_udp_pool_to(handle, desired, ctx)?;
-        self.trim_udp_pool_tail(handle, ctx);
+        let submissions = self.grow_udp_pool_to(desired, rq, actor_id, ctx)?;
+        self.trim_udp_pool_tail(ctx);
         Ok(submissions)
     }
 
-    pub fn ensure_udp_recv_pool(
-        &mut self,
-        target: (IoFd, HANDLE),
-        ctx: &mut RioContext,
-    ) -> io::Result<usize> {
-        let (fd, handle) = target;
-        if self.udp_recv_pools.contains_key(&handle) {
+    fn ensure_udp_recv_pool(&mut self, rq: RIO_RQ, actor_id: u32, ctx: &mut RioContext) -> io::Result<usize> {
+        if self.pool.is_some() {
             return Ok(0);
         }
-        let rq = ctx.registry.ensure_rq((handle, fd), ctx.env)?;
+
         let min = UDP_RECV_POOL_MIN_CREDITS;
         let max = UDP_RECV_POOL_MAX_CREDITS.max(min);
         let initial = UDP_RECV_POOL_INITIAL_CREDITS.clamp(min, max);
 
-        self.udp_recv_pools.insert(
-            handle,
-            UdpRecvPool {
-                rq,
-                slots: Vec::with_capacity(max),
-                queue: VecDeque::with_capacity(initial),
-                waiters: VecDeque::new(),
-                spare_bufs: VecDeque::with_capacity(initial),
-                min_credits: min,
-                max_credits: max,
-                target_credits: initial,
-                idle_hits: 0,
-                state: UdpPoolState::Running,
-            },
-        );
+        self.pool = Some(UdpRecvPool {
+            slots: Vec::with_capacity(max),
+            queue: VecDeque::with_capacity(initial),
+            waiters: VecDeque::new(),
+            spare_bufs: VecDeque::with_capacity(initial),
+            min_credits: min,
+            max_credits: max,
+            target_credits: initial,
+            idle_hits: 0,
+            state: UdpPoolState::Running,
+        });
 
-        self.grow_udp_pool_to(handle, initial, ctx)
+        self.grow_udp_pool_to(initial, rq, actor_id, ctx)
     }
 
     fn deliver_udp_datagram_to_waiter(
@@ -494,14 +478,13 @@ impl UdpPoolManager {
         }
     }
 
-    pub fn dispatch_udp_waiters_for_handle(
+    fn dispatch_udp_waiters(
         &mut self,
-        handle: HANDLE,
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
     ) {
         loop {
             let (waiter, datagram) = {
-                let Some(pool) = self.udp_recv_pools.get_mut(&handle) else {
+                let Some(pool) = self.pool.as_mut() else {
                     return;
                 };
                 let Some(waiter) = pool.waiters.pop_front() else {
@@ -516,7 +499,7 @@ impl UdpPoolManager {
 
             let (user_data, generation) = waiter;
             if !Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram)
-                && let Some(pool) = self.udp_recv_pools.get_mut(&handle)
+                && let Some(pool) = self.pool.as_mut()
                 && pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP
             {
                 let _ = pool.queue.pop_front();
@@ -524,21 +507,20 @@ impl UdpPoolManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_submit_udp_recv_stream_pooled(
         &mut self,
-        target: (IoFd, HANDLE),
+        rq: RIO_RQ,
+        actor_id: u32,
         stream_op: &mut crate::op::UdpRecvStream,
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> io::Result<(SubmissionResult, usize)> {
-        let (fd, handle) = target;
         let (user_data, generation) = uid;
-        let mut total_submissions = self.ensure_udp_recv_pool((fd, handle), ctx)?;
+        let mut total_submissions = self.ensure_udp_recv_pool(rq, actor_id, ctx)?;
         {
             let pool = self
-                .udp_recv_pools
-                .get_mut(&handle)
+                .pool
+                .as_mut()
                 .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
 
             if !matches!(pool.state, UdpPoolState::Running) {
@@ -547,64 +529,49 @@ impl UdpPoolManager {
 
             if let Some(datagram) = pool.queue.pop_front() {
                 stream_op.result = Some(Self::into_op_udp_datagram(datagram));
-                total_submissions += self.rebalance_udp_pool(handle, ctx)?;
+                total_submissions += self.rebalance_udp_pool(rq, actor_id, ctx)?;
                 return Ok((SubmissionResult::PostToQueue, total_submissions));
             }
 
             pool.waiters.push_back((user_data, generation));
         }
-        total_submissions += self.rebalance_udp_pool(handle, ctx)?;
+        total_submissions += self.rebalance_udp_pool(rq, actor_id, ctx)?;
         Ok((SubmissionResult::Pending, total_submissions))
     }
 
     pub fn try_refill_udp_pool(
         &mut self,
-        target: (IoFd, HANDLE),
+        rq: RIO_RQ,
+        actor_id: u32,
         buf: FixedBuf,
         ctx: &mut RioContext,
     ) -> io::Result<usize> {
-        let (fd, handle) = target;
-        let mut total_submissions = self.ensure_udp_recv_pool((fd, handle), ctx)?;
-        let pool = self.udp_recv_pools.get_mut(&handle).unwrap();
+        let mut total_submissions = self.ensure_udp_recv_pool(rq, actor_id, ctx)?;
+        let pool = self.pool.as_mut().unwrap();
 
         pool.spare_bufs.push_back(buf);
-        total_submissions += self.rebalance_udp_pool(handle, ctx)?;
+        total_submissions += self.rebalance_udp_pool(rq, actor_id, ctx)?;
         Ok(total_submissions)
     }
 
     pub fn cancel_udp_recv_waiter(
         &mut self,
-        handle: HANDLE,
         uid: (usize, u32),
+        rq: RIO_RQ,
+        actor_id: u32,
         ctx: &mut RioContext,
     ) {
         let (user_data, generation) = uid;
-        if let Some(pool) = self.udp_recv_pools.get_mut(&handle) {
+        if let Some(pool) = self.pool.as_mut() {
             pool.waiters.retain(|&(ud, waiter_generation)| {
                 !(ud == user_data && waiter_generation == generation)
             });
         }
-        let _ = self.rebalance_udp_pool(handle, ctx);
+        let _ = self.rebalance_udp_pool(rq, actor_id, ctx);
     }
 
-    pub fn ack_udp_pool_completion(
-        &mut self,
-        completion_generation: u32,
-    ) -> Option<(HANDLE, usize)> {
+    pub fn ack_udp_pool_completion(&mut self, completion_generation: u32) -> Option<usize> {
         self.udp_ctx_map.remove(&completion_generation)
-    }
-
-    fn ack_pool_completion_event(
-        &mut self,
-        res: &RIORESULT,
-        completion_generation: u32,
-    ) -> Option<(HANDLE, usize, PoolCompletionEvent)> {
-        let (handle, slot_idx) = self.ack_udp_pool_completion(completion_generation)?;
-        let event = match self.udp_recv_pools.get_mut(&handle) {
-            Some(pool) => Self::transition_pool_on_completion(pool, slot_idx, res),
-            None => PoolCompletionEvent::PoolMissing,
-        };
-        Some((handle, slot_idx, event))
     }
 
     fn transition_pool_on_completion(
@@ -676,70 +643,50 @@ impl UdpPoolManager {
     pub fn handle_completion(
         &mut self,
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
-        comp_info: (&RIORESULT, u32),
+        rq: RIO_RQ,
+        actor_id: u32,
+        slot_idx: usize,
+        res: &RIORESULT,
         ctx: &mut RioContext,
-    ) -> (Option<HANDLE>, usize) {
-        let (res, completion_generation) = comp_info;
-        let mut submissions = 0;
-        let Some((handle, slot_idx, event)) =
-            self.ack_pool_completion_event(res, completion_generation)
-        else {
-            return (None, 0);
+    ) -> usize {
+        let Some(pool) = self.pool.as_mut() else {
+            return 0;
         };
+        let event = Self::transition_pool_on_completion(pool, slot_idx, res);
 
+        let mut submissions = 0;
         let actions = Self::plan_completion_actions(event, slot_idx);
 
-        if let Some(idx) = actions.resubmit_slot
-            && let Ok(n) = self.submit_udp_pool_slot((handle, idx), ctx)
-        {
-            submissions += n;
-        }
-        if actions.dispatch_waiters {
-            self.dispatch_udp_waiters_for_handle(handle, ops);
-        }
-        if actions.rebalance_pool {
-            self.trim_udp_pool_tail(handle, ctx);
-            if let Ok(n) = self.rebalance_udp_pool(handle, ctx) {
+        if let Some(idx) = actions.resubmit_slot {
+            let token = self.alloc_udp_ctx_token(idx);
+            if let Ok(n) = self.submit_udp_pool_slot((idx, token), rq, actor_id, ctx) {
                 submissions += n;
             }
         }
-        if self.cleanup_shutdown_udp_pool_if_drained(handle, ctx) {
-            (Some(handle), submissions)
-        } else {
-            (None, submissions)
+        if actions.dispatch_waiters {
+            self.dispatch_udp_waiters(ops);
         }
+        if actions.rebalance_pool {
+            self.trim_udp_pool_tail(ctx);
+            if let Ok(n) = self.rebalance_udp_pool(rq, actor_id, ctx) {
+                submissions += n;
+            }
+        }
+        submissions
     }
 
-    pub fn handle_completion_drain_only(
-        &mut self,
-        comp_info: (&RIORESULT, u32),
-        ctx: &mut RioContext,
-    ) -> Option<HANDLE> {
-        let (res, completion_generation) = comp_info;
-        let (handle, _slot_idx, _event) = self.ack_pool_completion_event(res, completion_generation)?;
-        self.cleanup_shutdown_udp_pool_if_drained(handle, ctx)
-            .then_some(handle)
+    pub fn handle_completion_drain_only(&mut self) {
+        let _ = self.pool.as_mut().map(|_| PoolCompletionEvent::PoolMissing);
     }
 
     pub fn begin_udp_pool_shutdown(&mut self) {
-        for pool in self.udp_recv_pools.values_mut() {
+        if let Some(pool) = self.pool.as_mut() {
             Self::begin_draining(pool);
         }
     }
 
-    pub fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE, ctx: &mut RioContext) {
-        if let Some(pool) = self.udp_recv_pools.get_mut(&handle) {
-            Self::begin_draining(pool);
-        }
-        self.cleanup_shutdown_udp_pool_if_drained(handle, ctx);
-    }
-
-    pub fn cleanup_shutdown_udp_pool_if_drained(
-        &mut self,
-        handle: HANDLE,
-        ctx: &mut RioContext,
-    ) -> bool {
-        let drained = self.udp_recv_pools.get(&handle).is_some_and(|pool| {
+    pub fn cleanup_shutdown_udp_pool_if_drained(&mut self, ctx: &mut RioContext) -> bool {
+        let drained = self.pool.as_ref().is_some_and(|pool| {
             !matches!(pool.state, UdpPoolState::Running)
                 && pool.slots.iter().all(|slot| !slot.in_flight)
         });
@@ -747,20 +694,20 @@ impl UdpPoolManager {
             return false;
         }
 
-        if let Some(pool) = self.udp_recv_pools.get_mut(&handle) {
+        if let Some(pool) = self.pool.as_mut() {
             pool.state = UdpPoolState::Closed;
         }
-        self.udp_ctx_map.retain(|_, (h, _)| *h != handle);
-        if let Some(pool) = self.udp_recv_pools.remove(&handle) {
+        if let Some(pool) = self.pool.take() {
             for slot in pool.slots {
                 self.deregister_udp_pool_slot_with_registry(slot, ctx);
             }
         }
+        self.udp_ctx_map.clear();
         true
     }
 
     pub fn forget_in_flight_and_deregister_rest(&mut self, ctx: &mut RioContext) {
-        for (_handle, pool) in std::mem::take(&mut self.udp_recv_pools) {
+        if let Some(pool) = self.pool.take() {
             for slot in pool.slots {
                 if slot.in_flight {
                     std::mem::forget(slot);
@@ -769,12 +716,13 @@ impl UdpPoolManager {
                 self.deregister_udp_pool_slot_with_registry(slot, ctx);
             }
         }
+        self.udp_ctx_map.clear();
     }
 
     #[cfg(test)]
-    pub fn udp_pool_debug_stats(&self, handle: HANDLE) -> Option<UdpRecvPoolDebugStats> {
-        self.udp_recv_pools
-            .get(&handle)
+    pub fn udp_pool_debug_stats(&self) -> Option<UdpRecvPoolDebugStats> {
+        self.pool
+            .as_ref()
             .map(|pool| UdpRecvPoolDebugStats {
                 min_credits: pool.min_credits,
                 max_credits: pool.max_credits,
