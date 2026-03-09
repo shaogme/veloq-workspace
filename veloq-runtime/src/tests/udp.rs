@@ -6,8 +6,8 @@ use crate::net::udp::UdpSocket;
 use crate::runtime::Runtime;
 use crate::time::timeout;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 // ============ Helper Functions ============

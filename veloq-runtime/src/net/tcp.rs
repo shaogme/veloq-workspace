@@ -6,8 +6,8 @@ use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
-    Accept, Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter,
-    Recv, Send as OpSend,
+    Accept, Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter, Recv,
+    Send as OpSend,
 };
 
 // ============================================================================

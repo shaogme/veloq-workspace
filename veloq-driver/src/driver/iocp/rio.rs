@@ -1,8 +1,8 @@
 use crate::SockAddrStorage;
-use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::IocpOp;
-use crate::driver::iocp::op::RecvFromPayload;
+use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::ext::Extensions;
+use crate::driver::iocp::op::RecvFromPayload;
 use crate::driver::iocp::submit::SubmissionResult;
 use crate::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
@@ -10,10 +10,10 @@ use crate::driver::slot::OverlappedEntry;
 use crate::driver::slot::{STATE_COMPLETED, STATE_CONSUMED};
 use crate::op::IoFd;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::io;
 use std::collections::VecDeque;
-use std::thread;
+use std::io;
 use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::{Duration, Instant};
 use tracing::warn;
 use veloq_buf::FixedBuf;
@@ -182,16 +182,18 @@ impl RioState {
 
     #[cfg(test)]
     pub(crate) fn udp_pool_debug_stats(&self, handle: HANDLE) -> Option<UdpRecvPoolDebugStats> {
-        self.udp_recv_pools.get(&handle).map(|pool| UdpRecvPoolDebugStats {
-            min_credits: pool.min_credits,
-            max_credits: pool.max_credits,
-            target_credits: pool.target_credits,
-            slots_len: pool.slots.len(),
-            in_flight: pool.slots.iter().filter(|s| s.in_flight).count(),
-            waiters_len: pool.waiters.len(),
-            queue_len: pool.queue.len(),
-            idle_hits: pool.idle_hits,
-        })
+        self.udp_recv_pools
+            .get(&handle)
+            .map(|pool| UdpRecvPoolDebugStats {
+                min_credits: pool.min_credits,
+                max_credits: pool.max_credits,
+                target_credits: pool.target_credits,
+                slots_len: pool.slots.len(),
+                in_flight: pool.slots.iter().filter(|s| s.in_flight).count(),
+                waiters_len: pool.waiters.len(),
+                queue_len: pool.queue.len(),
+                idle_hits: pool.idle_hits,
+            })
     }
 
     #[cfg(test)]
@@ -211,73 +213,60 @@ impl RioState {
 
         // Construct dispatch table, failing if any required function is missing
         let dispatch = RioDispatch {
-            create_cq: table
-                .RIOCreateCompletionQueue
-                .ok_or_else(|| {
-                    io_msg(
-                        IocpErrorContext::Rio,
-                        "RIOCreateCompletionQueue function pointer missing",
-                    )
-                })?,
-            create_rq: table
-                .RIOCreateRequestQueue
-                .ok_or_else(|| {
-                    io_msg(
-                        IocpErrorContext::Rio,
-                        "RIOCreateRequestQueue function pointer missing",
-                    )
-                })?,
-            register_buffer: table
-                .RIORegisterBuffer
-                .ok_or_else(|| {
-                    io_msg(
-                        IocpErrorContext::Rio,
-                        "RIORegisterBuffer function pointer missing",
-                    )
-                })?,
-            deregister_buffer: table
-                .RIODeregisterBuffer
-                .ok_or_else(|| {
-                    io_msg(
-                        IocpErrorContext::Rio,
-                        "RIODeregisterBuffer function pointer missing",
-                    )
-                })?,
-            dequeue: table
-                .RIODequeueCompletion
-                .ok_or_else(|| {
-                    io_msg(
-                        IocpErrorContext::Rio,
-                        "RIODequeueCompletion function pointer missing",
-                    )
-                })?,
-            notify: table
-                .RIONotify
-                .ok_or_else(|| {
-                    io_msg(IocpErrorContext::Rio, "RIONotify function pointer missing")
-                })?,
-            close_cq: table
-                .RIOCloseCompletionQueue
-                .ok_or_else(|| {
-                    io_msg(
-                        IocpErrorContext::Rio,
-                        "RIOCloseCompletionQueue function pointer missing",
-                    )
-                })?,
-            receive: table
-                .RIOReceive
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOReceive function pointer missing"))?,
+            create_cq: table.RIOCreateCompletionQueue.ok_or_else(|| {
+                io_msg(
+                    IocpErrorContext::Rio,
+                    "RIOCreateCompletionQueue function pointer missing",
+                )
+            })?,
+            create_rq: table.RIOCreateRequestQueue.ok_or_else(|| {
+                io_msg(
+                    IocpErrorContext::Rio,
+                    "RIOCreateRequestQueue function pointer missing",
+                )
+            })?,
+            register_buffer: table.RIORegisterBuffer.ok_or_else(|| {
+                io_msg(
+                    IocpErrorContext::Rio,
+                    "RIORegisterBuffer function pointer missing",
+                )
+            })?,
+            deregister_buffer: table.RIODeregisterBuffer.ok_or_else(|| {
+                io_msg(
+                    IocpErrorContext::Rio,
+                    "RIODeregisterBuffer function pointer missing",
+                )
+            })?,
+            dequeue: table.RIODequeueCompletion.ok_or_else(|| {
+                io_msg(
+                    IocpErrorContext::Rio,
+                    "RIODequeueCompletion function pointer missing",
+                )
+            })?,
+            notify: table.RIONotify.ok_or_else(|| {
+                io_msg(IocpErrorContext::Rio, "RIONotify function pointer missing")
+            })?,
+            close_cq: table.RIOCloseCompletionQueue.ok_or_else(|| {
+                io_msg(
+                    IocpErrorContext::Rio,
+                    "RIOCloseCompletionQueue function pointer missing",
+                )
+            })?,
+            receive: table.RIOReceive.ok_or_else(|| {
+                io_msg(IocpErrorContext::Rio, "RIOReceive function pointer missing")
+            })?,
             send: table
                 .RIOSend
                 .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSend function pointer missing"))?,
-            send_ex: table
-                .RIOSendEx
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSendEx function pointer missing"))?,
-            receive_ex: table
-                .RIOReceiveEx
-                .ok_or_else(|| {
-                    io_msg(IocpErrorContext::Rio, "RIOReceiveEx function pointer missing")
-                })?,
+            send_ex: table.RIOSendEx.ok_or_else(|| {
+                io_msg(IocpErrorContext::Rio, "RIOSendEx function pointer missing")
+            })?,
+            receive_ex: table.RIOReceiveEx.ok_or_else(|| {
+                io_msg(
+                    IocpErrorContext::Rio,
+                    "RIOReceiveEx function pointer missing",
+                )
+            })?,
         };
 
         // RIO_EVENT_KEY is defined in iocp.rs as usize::MAX - 1
@@ -302,7 +291,9 @@ impl RioState {
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
-                format!("RIOCreateCompletionQueue failed: entries={entries}, queue_size={queue_size}"),
+                format!(
+                    "RIOCreateCompletionQueue failed: entries={entries}, queue_size={queue_size}"
+                ),
             ));
         }
 
@@ -345,7 +336,8 @@ impl RioState {
                 return Ok((id, info.offset as u32));
             }
 
-            let id = unsafe { (self.dispatch.register_buffer)(buf.as_ptr(), buf.capacity() as u32) };
+            let id =
+                unsafe { (self.dispatch.register_buffer)(buf.as_ptr(), buf.capacity() as u32) };
             if id == RIO_INVALID_BUFFERID {
                 return Err(io_error(
                     IocpErrorContext::Rio,
@@ -800,8 +792,9 @@ impl RioState {
 
     pub fn cancel_udp_recv_waiter(&mut self, handle: HANDLE, user_data: usize, generation: u32) {
         if let Some(pool) = self.udp_recv_pools.get_mut(&handle) {
-            pool.waiters
-                .retain(|&(ud, waiter_generation)| !(ud == user_data && waiter_generation == generation));
+            pool.waiters.retain(|&(ud, waiter_generation)| {
+                !(ud == user_data && waiter_generation == generation)
+            });
         }
         let _ = self.rebalance_udp_pool(handle);
     }
@@ -857,10 +850,9 @@ impl RioState {
     }
 
     fn cleanup_shutdown_udp_pool_if_drained(&mut self, handle: HANDLE) {
-        let drained = self
-            .udp_recv_pools
-            .get(&handle)
-            .is_some_and(|pool| pool.shutting_down && pool.slots.iter().all(|slot| !slot.in_flight));
+        let drained = self.udp_recv_pools.get(&handle).is_some_and(|pool| {
+            pool.shutting_down && pool.slots.iter().all(|slot| !slot.in_flight)
+        });
         if !drained {
             return;
         }
@@ -1086,7 +1078,9 @@ impl RioState {
                     return Err(io_error(
                         IocpErrorContext::Rio,
                         Self::last_wsa_error(),
-                        format!("RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"),
+                        format!(
+                            "RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"
+                        ),
                     ));
                 }
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize, len));
@@ -1136,7 +1130,10 @@ impl RioState {
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
-                format!("RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}", self.rq_depth),
+                format!(
+                    "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",
+                    self.rq_depth
+                ),
             ));
         }
 

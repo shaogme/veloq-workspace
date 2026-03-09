@@ -573,12 +573,18 @@ fn test_multithread_tcp_echo() {
                 timeout(Duration::from_secs(5), async move { client_h.await })
                     .await
                     .unwrap_or_else(|_| {
-                        panic!("TCP echo timeout: phase=wait_client_join; timeout_ms={}", 5000)
+                        panic!(
+                            "TCP echo timeout: phase=wait_client_join; timeout_ms={}",
+                            5000
+                        )
                     });
                 timeout(Duration::from_secs(5), async move { server_h.await })
                     .await
                     .unwrap_or_else(|_| {
-                        panic!("TCP echo timeout: phase=wait_server_join; timeout_ms={}", 5000)
+                        panic!(
+                            "TCP echo timeout: phase=wait_server_join; timeout_ms={}",
+                            5000
+                        )
                     });
             });
 

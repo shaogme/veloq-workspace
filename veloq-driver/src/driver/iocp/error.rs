@@ -70,7 +70,9 @@ fn structured_line(
     source: Option<&str>,
     os_code: Option<i32>,
 ) -> String {
-    let source = source.map(sanitize_field).unwrap_or_else(|| "none".to_string());
+    let source = source
+        .map(sanitize_field)
+        .unwrap_or_else(|| "none".to_string());
     let os_code = os_code
         .map(|v| v.to_string())
         .unwrap_or_else(|| "none".to_string());
@@ -89,9 +91,7 @@ pub(crate) fn io_error(
     let raw_source = err.to_string();
     let (source, nested_os) = parse_nested_source(&raw_source);
     let os_code = err.raw_os_error().or(nested_os);
-    let report = Report::new(err)
-        .change_context(ctx)
-        .attach(detail.clone());
+    let report = Report::new(err).change_context(ctx).attach(detail.clone());
     let msg = structured_line(ctx, &detail, Some(&source), os_code);
     tracing::error!(
         context = %ctx,

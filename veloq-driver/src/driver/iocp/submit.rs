@@ -3,8 +3,8 @@
 //! This module implements the logic for submitting operations, handling completions,
 //! and accessing FDs, exposed as static functions for VTable construction.
 
-use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
+use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::op::{IocpOp, SubmitContext};
 use crate::op::IoFd;
 use std::io;
@@ -279,13 +279,7 @@ pub(crate) unsafe fn submit_send(
 
     // RIO path is mandatory for socket send.
     ctx.rio
-        .try_submit_send(
-            val.fd,
-            handle,
-            &val.buf,
-            ctx.overlapped,
-            ctx.registrar,
-        )
+        .try_submit_send(val.fd, handle, &val.buf, ctx.overlapped, ctx.registrar)
         .map_err(|e| {
             io_error(
                 IocpErrorContext::Submission,
@@ -434,9 +428,7 @@ pub(crate) unsafe fn submit_accept(
         ctx.port,
         format!(
             "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
-            handle as usize,
-            op.header.user_data,
-            op.header.generation
+            handle as usize, op.header.user_data, op.header.generation
         ),
     )?;
 
@@ -446,10 +438,7 @@ pub(crate) unsafe fn submit_accept(
         ctx.port,
         format!(
             "submit_accept: associate accept socket failed: accept=0x{:x}, listen=0x{:x}, user_data={}, generation={}",
-            accept_socket_raw,
-            handle as usize,
-            op.header.user_data,
-            op.header.generation
+            accept_socket_raw, handle as usize, op.header.user_data, op.header.generation
         ),
     )?;
 

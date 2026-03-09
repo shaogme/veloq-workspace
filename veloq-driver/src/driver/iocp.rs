@@ -1,5 +1,5 @@
-mod ext;
 mod error;
+mod ext;
 mod inner;
 pub mod op;
 pub mod rio;
@@ -295,7 +295,8 @@ impl Driver for IocpDriver {
 
             slot.state.store(STATE_CONSUMED, Ordering::Release);
             let entry = &self.ops.local[user_data];
-            let can_recycle_now = !entry.platform_data.rio_needs_drain || entry.platform_data.rio_drained;
+            let can_recycle_now =
+                !entry.platform_data.rio_needs_drain || entry.platform_data.rio_drained;
             if can_recycle_now {
                 // Remove from local registry
                 self.ops.remove(user_data);
@@ -314,7 +315,8 @@ impl Driver for IocpDriver {
             *op_out = Some(unsafe { (*slot.op.get()).take().expect("Op missing") });
             slot.state.store(STATE_CONSUMED, Ordering::Release);
             let entry = &self.ops.local[user_data];
-            let can_recycle_now = !entry.platform_data.rio_needs_drain || entry.platform_data.rio_drained;
+            let can_recycle_now =
+                !entry.platform_data.rio_needs_drain || entry.platform_data.rio_drained;
             if can_recycle_now {
                 self.ops.remove(user_data);
             }

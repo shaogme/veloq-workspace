@@ -4,7 +4,9 @@ use super::*;
 use crate::Socket;
 use crate::config::IocpConfig;
 use crate::driver::Driver;
-use crate::op::{Accept, Connect, IntoPlatformOp, IoFd, OpLifecycle, Recv, RecvFrom, SendTo, Timeout};
+use crate::op::{
+    Accept, Connect, IntoPlatformOp, IoFd, OpLifecycle, Recv, RecvFrom, SendTo, Timeout,
+};
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -53,7 +55,9 @@ fn test_iocp_accept() {
     let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(accept_op));
 
     let (user_data, _) = driver.reserve_op().unwrap();
-    let _ = driver.submit(user_data, &mut iocp_op).expect("submit accept failed");
+    let _ = driver
+        .submit(user_data, &mut iocp_op)
+        .expect("submit accept failed");
 
     // Connect Client in background
     std::thread::spawn(move || {
@@ -592,7 +596,11 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         .chunk_info(send_region.id)
         .expect("send chunk not found");
     driver
-        .register_chunk(send_region.id, send_chunk.ptr.as_ptr(), send_chunk.len.get())
+        .register_chunk(
+            send_region.id,
+            send_chunk.ptr.as_ptr(),
+            send_chunk.len.get(),
+        )
         .expect("register send chunk failed");
 
     let recv_region = recv_buf.resolve_region_info();
@@ -601,7 +609,11 @@ fn test_rio_udp_send_to_recv_from_address_path() {
             .chunk_info(recv_region.id)
             .expect("recv chunk not found");
         driver
-            .register_chunk(recv_region.id, recv_chunk.ptr.as_ptr(), recv_chunk.len.get())
+            .register_chunk(
+                recv_region.id,
+                recv_chunk.ptr.as_ptr(),
+                recv_chunk.len.get(),
+            )
             .expect("register recv chunk failed");
     }
 
@@ -661,7 +673,11 @@ fn test_rio_udp_send_to_recv_from_address_path() {
                 recv_out.buf.set_len(bytes);
                 assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
                 assert_eq!(&recv_out.buf.as_slice()[..bytes], test_data);
-                assert_eq!(recv_out.addr, Some(client_addr), "recv_from source addr mismatch");
+                assert_eq!(
+                    recv_out.addr,
+                    Some(client_addr),
+                    "recv_from source addr mismatch"
+                );
                 recv_done = true;
             }
         }
@@ -725,7 +741,11 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         .chunk_info(send_region.id)
         .expect("send chunk not found");
     driver
-        .register_chunk(send_region.id, send_chunk.ptr.as_ptr(), send_chunk.len.get())
+        .register_chunk(
+            send_region.id,
+            send_chunk.ptr.as_ptr(),
+            send_chunk.len.get(),
+        )
         .expect("register send chunk failed");
 
     let recv_region = recv_buf.resolve_region_info();
@@ -734,7 +754,11 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
             .chunk_info(recv_region.id)
             .expect("recv chunk not found");
         driver
-            .register_chunk(recv_region.id, recv_chunk.ptr.as_ptr(), recv_chunk.len.get())
+            .register_chunk(
+                recv_region.id,
+                recv_chunk.ptr.as_ptr(),
+                recv_chunk.len.get(),
+            )
             .expect("register recv chunk failed");
     }
 
@@ -794,7 +818,11 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
                 recv_out.buf.set_len(bytes);
                 assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
                 assert_eq!(&recv_out.buf.as_slice()[..bytes], test_data);
-                assert_eq!(recv_out.addr, Some(client_addr), "recv_from source addr mismatch");
+                assert_eq!(
+                    recv_out.addr,
+                    Some(client_addr),
+                    "recv_from source addr mismatch"
+                );
                 recv_done = true;
             }
         }
