@@ -13,8 +13,9 @@ use std::sync::atomic::Ordering;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
-    RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_IOCP_COMPLETION,
-    RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT, SOCKET_ERROR, WSAGetLastError,
+    AF_INET, AF_INET6, RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_IOCP_COMPLETION,
+    RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+    SOCKET_ERROR, WSAGetLastError,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -541,6 +542,33 @@ impl RioState {
             Offset: info.offset as u32,
             Length: buf.len() as u32,
         };
+
+        if addr_ptr.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RIO send_to: remote address pointer is null",
+            ));
+        }
+        let family = unsafe { (*(addr_ptr as *const SOCKADDR)).sa_family };
+        let expected_addr_len = if family == AF_INET {
+            std::mem::size_of::<SOCKADDR_IN>() as i32
+        } else if family == AF_INET6 {
+            std::mem::size_of::<SOCKADDR_IN6>() as i32
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("RIO send_to: unsupported address family {}", family),
+            ));
+        };
+        if addr_len != expected_addr_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "RIO send_to: invalid remote address length {}, expected {} for family {}",
+                    addr_len, expected_addr_len, family
+                ),
+            ));
+        }
 
         let addr_offset = (addr_ptr as usize - base_addr) as u32;
         let addr_buf = RIO_BUF {

@@ -18,7 +18,7 @@ use crate::op::{
 use std::io;
 use std::mem::ManuallyDrop;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::WSABUF;
+use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, WSABUF};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // ============================================================================
@@ -314,7 +314,13 @@ define_iocp_ops! {
         drop: submit::drop_send_to,
         get_fd: submit::get_fd_send_to,
         construct: |op: SendTo| {
-            let (addr, addr_len) = crate::socket_addr_to_storage(op.addr);
+            let (addr, raw_addr_len) = crate::socket_addr_to_storage(op.addr);
+            let addr_len = if op.addr.is_ipv4() {
+                std::mem::size_of::<SOCKADDR_IN>() as i32
+            } else {
+                std::mem::size_of::<SOCKADDR_IN6>() as i32
+            };
+            debug_assert_eq!(raw_addr_len, addr_len);
             let wsabuf = WSABUF {
                 len: op.buf.len() as u32,
                 buf: op.buf.as_slice().as_ptr() as *mut u8,
