@@ -1,4 +1,5 @@
 use super::ext::Extensions;
+use super::error::{IocpErrorContext, io_error, io_msg};
 use super::rio::RioState;
 use super::submit;
 use crate::config::IocpConfig;
@@ -167,10 +168,22 @@ impl IocpDriver {
         let port = port_val as HANDLE;
         debug!(port = ?port, "Initializing IocpDriver");
         // Load extensions
-        let extensions = Extensions::new()?;
+        let extensions = Extensions::new().map_err(|e| {
+            io_error(
+                IocpErrorContext::DriverInit,
+                e,
+                format!("failed to load IOCP extensions, port={port:?}"),
+            )
+        })?;
 
         // Initialize RIO State
-        let rio_state = RioState::new(port, entries, &extensions)?;
+        let rio_state = RioState::new(port, entries, &extensions).map_err(|e| {
+            io_error(
+                IocpErrorContext::DriverInit,
+                e,
+                format!("failed to initialize RIO state, entries={entries}, port={port:?}"),
+            )
+        })?;
 
         // Changed from with_capacity to new
         let ops = OpRegistry::new(entries as usize);
@@ -243,7 +256,13 @@ impl IocpDriver {
                     return Ok(());
                 }
                 if completion_key == 0 && overlapped.is_null() {
-                    return Err(io::Error::from_raw_os_error(err as i32));
+                    return Err(io_msg(
+                        IocpErrorContext::CompletionWait,
+                        format!(
+                            "GetQueuedCompletionStatus failed: err={}, wait_ms={}, completion_key={}, overlapped=null",
+                            err, wait_ms, completion_key
+                        ),
+                    ));
                 }
             }
             completion_key

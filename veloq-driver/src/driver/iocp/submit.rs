@@ -4,6 +4,7 @@
 //! and accessing FDs, exposed as static functions for VTable construction.
 
 use crate::driver::iocp::ext::Extensions;
+use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::op::{IocpOp, SubmitContext};
 use crate::op::IoFd;
 use std::io;
@@ -113,9 +114,9 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
             if let Some(Some(h)) = registered_files.get(idx as usize) {
                 Ok(*h)
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Invalid registered file descriptor",
+                Err(io_msg(
+                    IocpErrorContext::ResolveFd,
+                    format!("invalid registered file descriptor: fd={fd:?}, idx={idx}"),
                 ))
             }
         }
@@ -202,13 +203,18 @@ pub(crate) unsafe fn submit_recv(
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
     // RIO path is mandatory for socket recv.
-    return ctx.rio.try_submit_recv(
-        val.fd,
-        handle,
-        &mut val.buf,
-        ctx.overlapped,
-        ctx.registrar,
-    );
+    ctx.rio
+        .try_submit_recv(val.fd, handle, &mut val.buf, ctx.overlapped, ctx.registrar)
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, op.header.user_data, op.header.generation
+                ),
+            )
+        })
 }
 impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
 
@@ -225,15 +231,24 @@ pub(crate) unsafe fn submit_send(
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
     // RIO path is mandatory for socket send.
-    return ctx
-        .rio
+    ctx.rio
         .try_submit_send(
             val.fd,
             handle,
             &val.buf,
             ctx.overlapped,
             ctx.registrar,
-        );
+        )
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO send submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, op.header.user_data, op.header.generation
+                ),
+            )
+        })
 }
 impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
@@ -472,17 +487,28 @@ pub(crate) unsafe fn submit_send_to(
 
     // RIO path is mandatory for socket send_to.
     let page_idx = op.header.user_data / ctx.slots_per_page;
-    return ctx.rio.try_submit_send_to(
-        payload.op.fd,
-        handle,
-        &payload.op.buf,
-        &payload.addr as *const _ as *const std::ffi::c_void,
-        payload.addr_len,
-        ctx.overlapped,
-        page_idx,
-        ctx.registrar,
-        ctx.slab_resolver,
-    );
+    ctx.rio
+        .try_submit_send_to(
+            payload.op.fd,
+            handle,
+            &payload.op.buf,
+            &payload.addr as *const _ as *const std::ffi::c_void,
+            payload.addr_len,
+            ctx.overlapped,
+            page_idx,
+            ctx.registrar,
+            ctx.slab_resolver,
+        )
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
+                    payload.op.fd, op.header.user_data, op.header.generation, page_idx
+                ),
+            )
+        })
 }
 
 impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
@@ -500,17 +526,28 @@ pub(crate) unsafe fn submit_recv_from(
 
     // RIO path is mandatory for socket recv_from.
     let page_idx = op.header.user_data / ctx.slots_per_page;
-    return ctx.rio.try_submit_recv_from(
-        payload.op.fd,
-        handle,
-        &mut payload.op.buf,
-        &payload.addr as *const _ as *const std::ffi::c_void,
-        &payload.addr_len,
-        ctx.overlapped,
-        page_idx,
-        ctx.registrar,
-        ctx.slab_resolver,
-    );
+    ctx.rio
+        .try_submit_recv_from(
+            payload.op.fd,
+            handle,
+            &mut payload.op.buf,
+            &payload.addr as *const _ as *const std::ffi::c_void,
+            &payload.addr_len,
+            ctx.overlapped,
+            page_idx,
+            ctx.registrar,
+            ctx.slab_resolver,
+        )
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO recv_from submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
+                    payload.op.fd, op.header.user_data, op.header.generation, page_idx
+                ),
+            )
+        })
 }
 
 impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);

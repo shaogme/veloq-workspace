@@ -1,4 +1,5 @@
 mod ext;
+mod error;
 mod inner;
 pub mod op;
 pub mod rio;

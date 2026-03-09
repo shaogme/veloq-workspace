@@ -1,4 +1,5 @@
 use crate::SockAddrStorage;
+use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::IocpOp;
 use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::submit::SubmissionResult;
@@ -111,37 +112,71 @@ impl RioState {
         let dispatch = RioDispatch {
             create_cq: table
                 .RIOCreateCompletionQueue
-                .ok_or_else(|| io::Error::other("RIOCreateCompletionQueue missing"))?,
+                .ok_or_else(|| {
+                    io_msg(
+                        IocpErrorContext::Rio,
+                        "RIOCreateCompletionQueue function pointer missing",
+                    )
+                })?,
             create_rq: table
                 .RIOCreateRequestQueue
-                .ok_or_else(|| io::Error::other("RIOCreateRequestQueue missing"))?,
+                .ok_or_else(|| {
+                    io_msg(
+                        IocpErrorContext::Rio,
+                        "RIOCreateRequestQueue function pointer missing",
+                    )
+                })?,
             register_buffer: table
                 .RIORegisterBuffer
-                .ok_or_else(|| io::Error::other("RIORegisterBuffer missing"))?,
+                .ok_or_else(|| {
+                    io_msg(
+                        IocpErrorContext::Rio,
+                        "RIORegisterBuffer function pointer missing",
+                    )
+                })?,
             deregister_buffer: table
                 .RIODeregisterBuffer
-                .ok_or_else(|| io::Error::other("RIODeregisterBuffer missing"))?,
+                .ok_or_else(|| {
+                    io_msg(
+                        IocpErrorContext::Rio,
+                        "RIODeregisterBuffer function pointer missing",
+                    )
+                })?,
             dequeue: table
                 .RIODequeueCompletion
-                .ok_or_else(|| io::Error::other("RIODequeueCompletion missing"))?,
+                .ok_or_else(|| {
+                    io_msg(
+                        IocpErrorContext::Rio,
+                        "RIODequeueCompletion function pointer missing",
+                    )
+                })?,
             notify: table
                 .RIONotify
-                .ok_or_else(|| io::Error::other("RIONotify missing"))?,
+                .ok_or_else(|| {
+                    io_msg(IocpErrorContext::Rio, "RIONotify function pointer missing")
+                })?,
             close_cq: table
                 .RIOCloseCompletionQueue
-                .ok_or_else(|| io::Error::other("RIOCloseCompletionQueue missing"))?,
+                .ok_or_else(|| {
+                    io_msg(
+                        IocpErrorContext::Rio,
+                        "RIOCloseCompletionQueue function pointer missing",
+                    )
+                })?,
             receive: table
                 .RIOReceive
-                .ok_or_else(|| io::Error::other("RIOReceive missing"))?,
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOReceive function pointer missing"))?,
             send: table
                 .RIOSend
-                .ok_or_else(|| io::Error::other("RIOSend missing"))?,
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSend function pointer missing"))?,
             send_ex: table
                 .RIOSendEx
-                .ok_or_else(|| io::Error::other("RIOSendEx missing"))?,
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSendEx function pointer missing"))?,
             receive_ex: table
                 .RIOReceiveEx
-                .ok_or_else(|| io::Error::other("RIOReceiveEx missing"))?,
+                .ok_or_else(|| {
+                    io_msg(IocpErrorContext::Rio, "RIOReceiveEx function pointer missing")
+                })?,
         };
 
         // RIO_EVENT_KEY is defined in iocp.rs as usize::MAX - 1
@@ -163,12 +198,20 @@ impl RioState {
         let cq = unsafe { (dispatch.create_cq)(queue_size, &notification as *const _) };
 
         if cq == 0 {
-            return Err(Self::last_wsa_error());
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                format!("RIOCreateCompletionQueue failed: entries={entries}, queue_size={queue_size}"),
+            ));
         }
 
         let notify_ret = unsafe { (dispatch.notify)(cq) };
         if notify_ret == SOCKET_ERROR {
-            return Err(Self::last_wsa_error());
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                "RIONotify failed after CQ creation",
+            ));
         }
 
         Ok(Self {
@@ -215,7 +258,11 @@ impl RioState {
 
         let buf_id = unsafe { reg_fn(ptr, len as u32) };
         if buf_id == RIO_INVALID_BUFFERID {
-            return Err(Self::last_wsa_error());
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                format!("RIORegisterBuffer failed: chunk_id={id}, len={len}"),
+            ));
         }
 
         self.chunk_registry[id_idx] = buf_id;
@@ -237,8 +284,9 @@ impl RioState {
                 unsafe { dequeue_fn(self.cq, results.as_mut_ptr(), MAX_RIO_RESULTS as u32) };
 
             if count == RIO_CORRUPT_CQ {
-                return Err(io::Error::from_raw_os_error(
-                    windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32,
+                return Err(io_msg(
+                    IocpErrorContext::Rio,
+                    "RIO completion queue is corrupt (RIO_CORRUPT_CQ)",
                 ));
             }
 
@@ -309,7 +357,11 @@ impl RioState {
         let notify_fn = self.dispatch.notify;
         let ret = unsafe { notify_fn(self.cq) };
         if ret == SOCKET_ERROR {
-            return Err(Self::last_wsa_error());
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                "RIONotify failed when rearming CQ",
+            ));
         }
         Ok(())
     }
@@ -329,13 +381,17 @@ impl RioState {
                 let reg_fn = self.dispatch.register_buffer;
                 let id = unsafe { reg_fn(ptr, len as u32) };
                 if id == RIO_INVALID_BUFFERID {
-                    return Err(Self::last_wsa_error());
+                    return Err(io_error(
+                        IocpErrorContext::Rio,
+                        Self::last_wsa_error(),
+                        format!("RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"),
+                    ));
                 }
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
             } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("RIO: Slab page {} not found in registry", page_idx),
+                return Err(io_msg(
+                    IocpErrorContext::Rio,
+                    format!("RIO slab page not found in registry: page_idx={page_idx}"),
                 ));
             }
         }
@@ -375,7 +431,11 @@ impl RioState {
         };
 
         if rq == 0 {
-            return Err(Self::last_wsa_error());
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                format!("RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}", self.rq_depth),
+            ));
         }
 
         if let IoFd::Fixed(idx) = fd {
@@ -414,9 +474,9 @@ impl RioState {
         let buffer_id = match buffer_id {
             Some(id) => id,
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("RIO chunk {} not registered", info.id),
+                return Err(io_msg(
+                    IocpErrorContext::Rio,
+                    format!("RIO chunk not registered for recv: chunk_id={}", info.id),
                 ));
             }
         };
@@ -436,7 +496,11 @@ impl RioState {
         let ret = unsafe { recv_fn(rq, &rio_buf, 1, 0, request_context) };
 
         if ret == 0 {
-            return Err(Self::last_wsa_error());
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                format!("RIOReceive submission failed: fd={fd:?}, handle={handle:?}"),
+            ));
         }
         Ok(SubmissionResult::Pending)
     }
@@ -466,9 +530,9 @@ impl RioState {
         let buffer_id = match buffer_id {
             Some(id) => id,
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("RIO chunk {} not registered", info.id),
+                return Err(io_msg(
+                    IocpErrorContext::Rio,
+                    format!("RIO chunk not registered for send: chunk_id={}", info.id),
                 ));
             }
         };
@@ -487,7 +551,11 @@ impl RioState {
         let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
 
         if ret == 0 {
-            return Err(Self::last_wsa_error());
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                format!("RIOSend submission failed: fd={fd:?}, handle={handle:?}"),
+            ));
         }
         Ok(SubmissionResult::Pending)
     }
@@ -522,9 +590,9 @@ impl RioState {
         let buffer_id = match buffer_id {
             Some(id) => id,
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("RIO chunk {} not registered", info.id),
+                return Err(io_msg(
+                    IocpErrorContext::Rio,
+                    format!("RIO chunk not registered for send_to: chunk_id={}", info.id),
                 ));
             }
         };
@@ -544,9 +612,9 @@ impl RioState {
         };
 
         if addr_ptr.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "RIO send_to: remote address pointer is null",
+            return Err(io_msg(
+                IocpErrorContext::Rio,
+                "RIO send_to received null remote address pointer",
             ));
         }
         let family = unsafe { (*(addr_ptr as *const SOCKADDR)).sa_family };
@@ -555,16 +623,16 @@ impl RioState {
         } else if family == AF_INET6 {
             std::mem::size_of::<SOCKADDR_IN6>() as i32
         } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("RIO send_to: unsupported address family {}", family),
+            return Err(io_msg(
+                IocpErrorContext::Rio,
+                format!("RIO send_to unsupported address family: family={family}"),
             ));
         };
         if addr_len != expected_addr_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(io_msg(
+                IocpErrorContext::Rio,
                 format!(
-                    "RIO send_to: invalid remote address length {}, expected {} for family {}",
+                    "RIO send_to invalid address length: addr_len={}, expected={}, family={}",
                     addr_len, expected_addr_len, family
                 ),
             ));
@@ -595,7 +663,11 @@ impl RioState {
         };
 
         if ret == 0 {
-            return Err(Self::last_wsa_error());
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                format!("RIOSendEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={page_idx}"),
+            ));
         }
         Ok(SubmissionResult::Pending)
     }
@@ -630,9 +702,9 @@ impl RioState {
         let buffer_id = match buffer_id {
             Some(id) => id,
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("RIO chunk {} not registered", info.id),
+                return Err(io_msg(
+                    IocpErrorContext::Rio,
+                    format!("RIO chunk not registered for recv_from: chunk_id={}", info.id),
                 ));
             }
         };
@@ -676,7 +748,11 @@ impl RioState {
         };
 
         if ret == 0 {
-            return Err(Self::last_wsa_error());
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                format!("RIOReceiveEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={page_idx}"),
+            ));
         }
         Ok(SubmissionResult::Pending)
     }
