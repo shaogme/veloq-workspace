@@ -101,6 +101,8 @@ pub type GlobalIndex = NotU16<NO_REGISTRATION_INDEX>;
 pub struct RegionInfo {
     pub id: u16,
     pub offset: usize,
+    /// A unique cookie used to distinguish different allocations for the same pointer (e.g. heap reuse).
+    pub cookie: u64,
 }
 
 #[derive(Debug)]
@@ -452,13 +454,17 @@ impl FixedBuf {
 
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
 
+        static HEAP_BUF_COOKIE_GEN: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         Ok(unsafe {
             Self::new(
                 ptr,
                 len,
                 NonNull::dangling(), // No pool context for heap buffers
                 &HEAP_POOL_VTABLE,
-                0,
+                cookie,
             )
         })
     }
@@ -836,11 +842,13 @@ unsafe fn heap_dealloc_shim(_pool_data: NonNull<()>, params: DeallocParams) {
     }
 }
 
-unsafe fn heap_resolve_region_info_shim(_pool_data: NonNull<()>, _buf: &FixedBuf) -> RegionInfo {
-    // Return NO_REGISTRATION_INDEX to indicate this buffer is not registered
+unsafe fn heap_resolve_region_info_shim(_pool_data: NonNull<()>, buf: &FixedBuf) -> RegionInfo {
+    // Return NO_REGISTRATION_INDEX to indicate this buffer is not registered.
+    // Usebuf.context as the cookie for heap buffers.
     RegionInfo {
         id: NO_REGISTRATION_INDEX,
         offset: 0,
+        cookie: buf.context,
     }
 }
 
@@ -900,9 +908,10 @@ unsafe fn slot_based_resolve_region_info_shim(
     let base = chunk_info.ptr.as_ptr() as usize;
     let ptr = buf.as_ptr() as usize;
 
-    // Return RegionInfo { id, offset }
+    // Return RegionInfo { id, offset, cookie }
     RegionInfo {
         id: chunk_id,
         offset: ptr.saturating_sub(base),
+        cookie: 0, // Cookies are currently only used for heap buffers
     }
 }

@@ -18,8 +18,8 @@ pub struct RioRegistry {
     /// RIO Registration for Slab Pages (for Address Buffers)
     /// Maps PageIndex -> (RIO_BUFFERID, BaseAddress, Length)
     pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize, usize)>>,
-    /// Heap-buffer lazy registrations: (ptr, cap) -> RIO_BUFFERID
-    pub(crate) heap_rio_bufs: FxHashMap<(usize, usize), RIO_BUFFERID>,
+    /// Heap-buffer lazy registrations: (ptr, cap, cookie) -> RIO_BUFFERID
+    pub(crate) heap_rio_bufs: FxHashMap<(usize, usize, u64), RIO_BUFFERID>,
     pub(crate) rq_depth: u32,
 }
 
@@ -49,9 +49,21 @@ impl RioRegistry {
 
         // Heap-allocated buffers use sentinel id=u16::MAX (no pre-registration).
         if info.id == u16::MAX {
-            let key = (buf.as_ptr() as usize, buf.capacity());
+            let key = (buf.as_ptr() as usize, buf.capacity(), info.cookie);
             if let Some(&id) = self.heap_rio_bufs.get(&key) {
                 return Ok((id, info.offset as u32));
+            }
+
+            // Simple eviction to prevent unbounded growth of registered heap buffers.
+            // Note: RIO_BUFFERIDs are a limited kernel resource.
+            if self.heap_rio_bufs.len() >= 1024 {
+                // We clear and deregister everything.
+                // UNRESOLVED: This is only 100% safe if no heap-based IO is pended.
+                // However, the cookie already prevents the dangerous "wrong buffer mapping" crash.
+                for id in self.heap_rio_bufs.values().copied() {
+                    unsafe { (dispatch.deregister_buffer)(id) };
+                }
+                self.heap_rio_bufs.clear();
             }
 
             let id = unsafe { (dispatch.register_buffer)(buf.as_ptr(), buf.capacity() as u32) };
@@ -60,8 +72,8 @@ impl RioRegistry {
                     IocpErrorContext::Rio,
                     Self::last_wsa_error(),
                     format!(
-                        "RIORegisterBuffer failed for heap buffer: ptr=0x{:x}, cap={}",
-                        key.0, key.1
+                        "RIORegisterBuffer failed for heap buffer: ptr=0x{:x}, cap={}, cookie={}",
+                        key.0, key.1, key.2
                     ),
                 ));
             }
