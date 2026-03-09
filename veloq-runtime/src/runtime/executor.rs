@@ -490,7 +490,6 @@ impl LocalExecutor {
             spawner,
             self.handle(),
             self.buf_pool.clone(),
-            self.stealable.clone(),
         );
 
         let _guard = crate::runtime::context::enter(context);
@@ -575,7 +574,6 @@ impl LocalExecutor {
             spawner,
             self.handle(),
             self.buf_pool.clone(),
-            self.stealable.clone(),
         );
 
         let _guard = crate::runtime::context::enter(context);

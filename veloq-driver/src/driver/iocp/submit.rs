@@ -13,7 +13,8 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, bind, getsockname, setsockopt,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, bind,
+    getsockname, setsockopt,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::CreateIoCompletionPort;
@@ -139,8 +140,9 @@ macro_rules! submit_io_op {
             overlapped.Anonymous.Anonymous.OffsetHigh = (val.offset >> 32) as u32;
 
             let handle = resolve_fd(val.fd, ctx.registered_files)?;
-            unsafe {
-                CreateIoCompletionPort(handle, ctx.port, 0, 0);
+            let port = unsafe { CreateIoCompletionPort(handle, ctx.port, 0, 0) };
+            if port.is_null() {
+                return Err(io::Error::last_os_error());
             }
 
             let mut bytes = 0;
@@ -204,7 +206,7 @@ pub(crate) unsafe fn submit_recv(
         val.fd,
         handle,
         &mut val.buf,
-        op.header.user_data,
+        ctx.overlapped,
         ctx.registrar,
     );
 }
@@ -225,7 +227,13 @@ pub(crate) unsafe fn submit_send(
     // RIO path is mandatory for socket send.
     return ctx
         .rio
-        .try_submit_send(val.fd, handle, &val.buf, op.header.user_data, ctx.registrar);
+        .try_submit_send(
+            val.fd,
+            handle,
+            &val.buf,
+            ctx.overlapped,
+            ctx.registrar,
+        );
 }
 impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
@@ -239,8 +247,9 @@ pub(crate) unsafe fn submit_connect(
 ) -> io::Result<SubmissionResult> {
     let connect_op = unsafe { &mut *op.payload.connect };
     let handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
+    let port = unsafe { CreateIoCompletionPort(handle, ctx.port, 0, 0) };
+    if port.is_null() {
+        return Err(io::Error::last_os_error());
     }
 
     let mut need_bind = true;
@@ -288,8 +297,9 @@ pub(crate) unsafe fn submit_connect(
                 std::mem::size_of::<SOCKADDR_IN6>() as i32,
             )
         };
-        unsafe {
-            bind(handle as SOCKET, ptr, len);
+        let bind_ret = unsafe { bind(handle as SOCKET, ptr, len) };
+        if bind_ret == SOCKET_ERROR {
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
         }
     }
 
@@ -352,8 +362,9 @@ pub(crate) unsafe fn submit_accept(
     let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
     let accept_socket = payload.op.accept_socket;
 
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
+    let port = unsafe { CreateIoCompletionPort(handle, ctx.port, 0, 0) };
+    if port.is_null() {
+        return Err(io::Error::last_os_error());
     }
 
     const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
@@ -467,7 +478,7 @@ pub(crate) unsafe fn submit_send_to(
         &payload.op.buf,
         &payload.addr as *const _ as *const std::ffi::c_void,
         payload.addr_len,
-        op.header.user_data,
+        ctx.overlapped,
         page_idx,
         ctx.registrar,
         ctx.slab_resolver,
@@ -495,7 +506,7 @@ pub(crate) unsafe fn submit_recv_from(
         &mut payload.op.buf,
         &payload.addr as *const _ as *const std::ffi::c_void,
         &payload.addr_len,
-        op.header.user_data,
+        ctx.overlapped,
         page_idx,
         ctx.registrar,
         ctx.slab_resolver,

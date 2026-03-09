@@ -48,6 +48,7 @@ impl Driver for IocpDriver {
         op_in: &mut Option<Self::Op>,
     ) -> Result<Poll<()>, io::Error> {
         trace!(user_data, "Submitting op");
+        let mut submit_error: Option<io::Error> = None;
 
         let slots_per_page = self.ops.local.len();
         // On Windows, the slab is currently a single contiguous block (page 0).
@@ -73,6 +74,9 @@ impl Driver for IocpDriver {
 
             let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
             op_ref.header.user_data = user_data;
+            let generation = slot.generation.load(Ordering::Acquire);
+            op_ref.header.generation = generation;
+            op_entry.platform_data.generation = generation;
 
             // Use the overlapped pointer from the slot.
             // This is safe because:
@@ -98,7 +102,7 @@ impl Driver for IocpDriver {
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
                 Ok(SubmissionResult::PostToQueue) => {
-                    let _ = unsafe {
+                    let posted = unsafe {
                         PostQueuedCompletionStatus(
                             self.port.handle,
                             0,
@@ -106,7 +110,15 @@ impl Driver for IocpDriver {
                             std::ptr::null_mut(),
                         )
                     };
-                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                    if posted == 0 {
+                        *op_in = unsafe { (*slot.op.get()).take() };
+                        unsafe { *slot.result.get() = None };
+                        slot.state
+                            .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
+                        submit_error = Some(io::Error::last_os_error());
+                    } else {
+                        op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                    }
                 }
                 Ok(SubmissionResult::Offload(task)) => {
                     use veloq_blocking::get_blocking_pool;
@@ -129,15 +141,20 @@ impl Driver for IocpDriver {
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
                 Err(e) => {
-                    op_entry.platform_data.lifecycle =
-                        OpLifecycle::Completed(Err(io::Error::other("Submit Error")));
                     *op_in = unsafe { (*slot.op.get()).take() };
+                    unsafe { *slot.result.get() = None };
                     slot.state
                         .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
-                    return Err(e);
+                    submit_error = Some(e);
                 }
             }
         } // End of submission scope
+
+        if let Some(e) = submit_error {
+            // Reclaim reserved registry slot on submit failure.
+            self.ops.remove(user_data);
+            return Err(e);
+        }
 
         // Logic for detached completer
         // Access self.ops directly
@@ -175,6 +192,7 @@ impl Driver for IocpDriver {
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
         let (user_data, _) = self.reserve_op()?;
+        let mut submit_error: Option<io::Error> = None;
 
         let slots_per_page = self.ops.local.len();
         // Pre-fetch slab info to avoid borrow conflicts
@@ -197,6 +215,9 @@ impl Driver for IocpDriver {
 
         let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
         op_ref.header.user_data = user_data;
+        let generation = slot.generation.load(Ordering::Acquire);
+        op_ref.header.generation = generation;
+        op_entry.platform_data.generation = generation;
 
         op_entry.platform_data.is_background = true;
         let overlapped_ptr = slot.overlapped_ptr();
@@ -229,10 +250,17 @@ impl Driver for IocpDriver {
             }
             Err(e) => {
                 debug!(error = ?e, user_data, "Background submit failed");
-                let _ = std::mem::take(&mut op_entry.platform_data);
-                self.ops.free_indices.push(user_data);
-                return Err(e);
+                let _ = unsafe { (*slot.op.get()).take() };
+                unsafe { *slot.result.get() = None };
+                slot.state
+                    .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
+                submit_error = Some(e);
             }
+        }
+
+        if let Some(e) = submit_error {
+            self.ops.remove(user_data);
+            return Err(e);
         }
         Ok(())
     }
@@ -257,8 +285,12 @@ impl Driver for IocpDriver {
             *op_out = Some(unsafe { (*slot.op.get()).take().expect("Op missing") });
 
             slot.state.store(STATE_CONSUMED, Ordering::Release);
-            // Remove from local registry
-            self.ops.remove(user_data);
+            let entry = &self.ops.local[user_data];
+            let can_recycle_now = !entry.platform_data.rio_needs_drain || entry.platform_data.rio_drained;
+            if can_recycle_now {
+                // Remove from local registry
+                self.ops.remove(user_data);
+            }
 
             return Poll::Ready(res);
         }
@@ -272,7 +304,11 @@ impl Driver for IocpDriver {
             let res = unsafe { (*slot.result.get()).take().expect("Result missing") };
             *op_out = Some(unsafe { (*slot.op.get()).take().expect("Op missing") });
             slot.state.store(STATE_CONSUMED, Ordering::Release);
-            self.ops.remove(user_data);
+            let entry = &self.ops.local[user_data];
+            let can_recycle_now = !entry.platform_data.rio_needs_drain || entry.platform_data.rio_drained;
+            if can_recycle_now {
+                self.ops.remove(user_data);
+            }
             return Poll::Ready(res);
         }
 
@@ -309,8 +345,12 @@ impl Driver for IocpDriver {
 
     fn wake(&mut self) -> io::Result<()> {
         if !self.is_waked.swap(true, Ordering::AcqRel) {
-            unsafe {
-                PostQueuedCompletionStatus(self.port.handle, 0, WAKEUP_USER_DATA, std::ptr::null());
+            let posted = unsafe {
+                PostQueuedCompletionStatus(self.port.handle, 0, WAKEUP_USER_DATA, std::ptr::null())
+            };
+            if posted == 0 {
+                self.is_waked.store(false, Ordering::Release);
+                return Err(io::Error::last_os_error());
             }
         }
         Ok(())

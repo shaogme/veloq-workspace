@@ -315,6 +315,233 @@ fn test_iocp_recv_with_buffer_pool() {
 }
 
 #[test]
+fn test_rio_cancel_poll_returns_aborted_without_hang() {
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use veloq_buf::BufPool;
+    use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+
+    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let topology = UniformSlot::new(multiplier);
+    let global_pool = topology.create_pool(1).expect("Create pool failed");
+    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx_send, rx_send) = mpsc::channel::<()>();
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = rx_send.recv();
+        stream.write_all(b"late").unwrap();
+    });
+
+    let client = Socket::new_tcp_v4().expect("client socket create failed");
+    let client_handle = client.into_raw();
+    let (addr_storage, addr_len) = crate::socket_addr_to_storage(addr);
+    let connect_op = Connect {
+        fd: crate::op::IoFd::Raw(client_handle),
+        addr: addr_storage,
+        addr_len: addr_len as u32,
+    };
+    let mut connect_iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(connect_op));
+    let connect_user_data = driver.reserve_op().unwrap().0;
+    let _ = driver
+        .submit(connect_user_data, &mut connect_iocp_op)
+        .expect("submit connect failed");
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let connect_start = Instant::now();
+    loop {
+        if connect_start.elapsed() > Duration::from_secs(5) {
+            panic!("Connect timed out");
+        }
+        driver.process_completions();
+        let mut op_out = None;
+        match driver.poll_op(connect_user_data, &mut cx, &mut op_out) {
+            Poll::Ready(res) => {
+                assert!(res.is_ok(), "Connect failed: {:?}", res.err());
+                let _ = op_out.unwrap();
+                break;
+            }
+            Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+
+    let buf = reg_pool
+        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .expect("Failed to alloc buffer");
+    let region = buf.resolve_region_info();
+    let chunk = global_pool
+        .chunk_info(region.id)
+        .expect("Chunk info for buffer not found");
+    driver
+        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .expect("register chunk failed");
+
+    let recv_op = Recv {
+        fd: crate::op::IoFd::Raw(client_handle),
+        buf,
+    };
+    let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
+    let (user_data, _) = driver.reserve_op().unwrap();
+    let _ = driver
+        .submit(user_data, &mut iocp_op)
+        .expect("submit recv failed");
+
+    driver.cancel_op(user_data);
+
+    let poll_start = Instant::now();
+    let mut polled = false;
+    while poll_start.elapsed() < Duration::from_secs(1) {
+        driver.process_completions();
+        let mut op_out = None;
+        match driver.poll_op(user_data, &mut cx, &mut op_out) {
+            Poll::Ready(res) => {
+                let _ = op_out.expect("cancelled op should still be returned");
+                let err = res.expect_err("cancelled op should return aborted");
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+                );
+                polled = true;
+                break;
+            }
+            Poll::Pending => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    assert!(polled, "cancel后 poll 不应卡住");
+
+    let _ = tx_send.send(());
+    server_thread.join().unwrap();
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
+}
+
+#[test]
+fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
+    use std::io::Write;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use veloq_buf::BufPool;
+    use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+
+    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let topology = UniformSlot::new(multiplier);
+    let global_pool = topology.create_pool(1).expect("Create pool failed");
+    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx_send, rx_send) = mpsc::channel::<()>();
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = rx_send.recv();
+        stream.write_all(b"late").unwrap();
+    });
+
+    let client = Socket::new_tcp_v4().expect("client socket create failed");
+    let client_handle = client.into_raw();
+    let (addr_storage, addr_len) = crate::socket_addr_to_storage(addr);
+    let connect_op = Connect {
+        fd: crate::op::IoFd::Raw(client_handle),
+        addr: addr_storage,
+        addr_len: addr_len as u32,
+    };
+    let mut connect_iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(connect_op));
+    let connect_user_data = driver.reserve_op().unwrap().0;
+    let _ = driver
+        .submit(connect_user_data, &mut connect_iocp_op)
+        .expect("submit connect failed");
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let connect_start = Instant::now();
+    loop {
+        if connect_start.elapsed() > Duration::from_secs(5) {
+            panic!("Connect timed out");
+        }
+        driver.process_completions();
+        let mut op_out = None;
+        match driver.poll_op(connect_user_data, &mut cx, &mut op_out) {
+            Poll::Ready(res) => {
+                assert!(res.is_ok(), "Connect failed: {:?}", res.err());
+                let _ = op_out.unwrap();
+                break;
+            }
+            Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+
+    let buf = reg_pool
+        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .expect("Failed to alloc buffer");
+    let region = buf.resolve_region_info();
+    let chunk = global_pool
+        .chunk_info(region.id)
+        .expect("Chunk info for buffer not found");
+    driver
+        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .expect("register chunk failed");
+
+    let recv_op = Recv {
+        fd: crate::op::IoFd::Raw(client_handle),
+        buf,
+    };
+    let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
+    let (user_data, _) = driver.reserve_op().unwrap();
+    let _ = driver
+        .submit(user_data, &mut iocp_op)
+        .expect("submit recv failed");
+
+    driver.cancel_op(user_data);
+
+    let mut op_out = None;
+    let res = loop {
+        driver.process_completions();
+        match driver.poll_op(user_data, &mut cx, &mut op_out) {
+            Poll::Ready(res) => break res,
+            Poll::Pending => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    let _ = op_out.expect("cancelled op should still be returned");
+    let err = res.expect_err("cancelled op should return aborted");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+    );
+
+    assert!(
+        !driver.ops.free_indices.contains(&user_data),
+        "late RIO completion 前不应回收槽位"
+    );
+
+    let _ = tx_send.send(());
+    let drain_start = Instant::now();
+    while drain_start.elapsed() < Duration::from_secs(2) {
+        driver.process_completions();
+        if driver.ops.free_indices.contains(&user_data) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert!(
+        driver.ops.free_indices.contains(&user_data),
+        "晚到 RIO completion 到来后应回收槽位"
+    );
+
+    server_thread.join().unwrap();
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
+}
+
+#[test]
 fn test_rio_extensions_load() {
     let _ext = Extensions::new().expect("RIO Extensions should load");
 }

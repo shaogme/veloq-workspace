@@ -39,20 +39,28 @@ pub enum OpLifecycle {
 }
 
 pub struct IocpOpState {
+    pub generation: u32,
     pub lifecycle: OpLifecycle,
     pub detached_completer:
         Option<Box<dyn crate::driver::DetachedCompleter<crate::driver::iocp::op::IocpOp>>>,
     pub timer_id: Option<TaskId>,
     pub is_background: bool,
+    // For RIO cancel path: the slot can be recycled only after both:
+    // 1) user has consumed completion; 2) late RIO CQE has been drained.
+    pub rio_needs_drain: bool,
+    pub rio_drained: bool,
 }
 
 impl Default for IocpOpState {
     fn default() -> Self {
         Self {
+            generation: 0,
             lifecycle: OpLifecycle::Pending,
             detached_completer: None,
             timer_id: None,
             is_background: false,
+            rio_needs_drain: false,
+            rio_drained: false,
         }
     }
 }
@@ -126,6 +134,14 @@ impl RemoteWaker for IocpWaker {
 }
 
 impl IocpDriver {
+    fn is_rio_op(op: &IocpOp) -> bool {
+        let submit_fn = unsafe { op.vtable.as_ref().submit as *const () as usize };
+        submit_fn == crate::driver::iocp::submit::submit_recv as *const () as usize
+            || submit_fn == crate::driver::iocp::submit::submit_send as *const () as usize
+            || submit_fn == crate::driver::iocp::submit::submit_send_to as *const () as usize
+            || submit_fn == crate::driver::iocp::submit::submit_recv_from as *const () as usize
+    }
+
     pub fn create_pre_init() -> io::Result<PreInit> {
         // Create a new completion port.
         let port =
@@ -303,6 +319,16 @@ impl IocpDriver {
 
         let slot = &ops_shared.slots[user_data];
         let op = &mut ops_local[user_data];
+        let slot_generation = slot.generation.load(Ordering::Acquire);
+        if op.platform_data.generation != slot_generation {
+            debug!(
+                user_data,
+                op_generation = op.platform_data.generation,
+                slot_generation,
+                "Ignoring stale completion due to generation mismatch"
+            );
+            return;
+        }
 
         let mut io_result = if res == 0 {
             Err(io::Error::last_os_error())
@@ -422,6 +448,18 @@ impl IocpDriver {
                         && let Some(fd) = res.get_fd()
                         && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files)
                     {
+                        if Self::is_rio_op(res) {
+                            op.platform_data.rio_needs_drain = true;
+                            op.platform_data.rio_drained = false;
+                            unsafe {
+                                *slot.result.get() = Some(Err(io::Error::from_raw_os_error(
+                                    windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+                                )))
+                            };
+                            slot.state.store(STATE_COMPLETED, Ordering::Release);
+                            slot.waker.wake();
+                        }
+
                         // Safe usage of overlapped ptr
                         let overlapped_ptr = slot.overlapped_ptr();
                         unsafe {

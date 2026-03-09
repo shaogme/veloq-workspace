@@ -4,7 +4,8 @@ use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::submit::SubmissionResult;
 use crate::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::STATE_COMPLETED;
+use crate::driver::slot::OverlappedEntry;
+use crate::driver::slot::{STATE_COMPLETED, STATE_CONSUMED};
 use crate::op::IoFd;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
@@ -82,6 +83,22 @@ pub struct RioState {
 }
 
 impl RioState {
+    #[inline]
+    fn encode_request_context(overlapped: *mut OVERLAPPED) -> *const std::ffi::c_void {
+        overlapped as *const std::ffi::c_void
+    }
+
+    #[inline]
+    fn decode_request_context(ctx: u64) -> Option<(usize, u32)> {
+        if ctx == 0 {
+            return None;
+        }
+        let entry = ctx as usize as *const OverlappedEntry;
+        let user_data = unsafe { (*entry).user_data };
+        let generation = unsafe { (*entry).generation };
+        Some((user_data, generation))
+    }
+
     fn last_wsa_error() -> io::Error {
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
@@ -232,11 +249,19 @@ impl RioState {
             let ops_shared = &ops.shared;
 
             for res in results.iter().take(count as usize) {
-                let user_data = res.RequestContext as usize;
+                let Some((user_data, completion_generation)) =
+                    Self::decode_request_context(res.RequestContext)
+                else {
+                    continue;
+                };
 
                 if user_data < ops_local.len() {
                     let op = &mut ops_local[user_data];
                     let slot = &ops_shared.slots[user_data];
+                    if op.platform_data.generation != completion_generation {
+                        // Stale RIO completion for a previously recycled slot.
+                        continue;
+                    }
 
                     if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
                         let result = if res.Status == 0 {
@@ -256,11 +281,21 @@ impl RioState {
                         slot.state.store(STATE_COMPLETED, Ordering::Release);
                         slot.waker.wake();
                     } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
-                        // We must remove it from registry because it was cancelled but RIO just completed it.
-                        // Can't invoke `ops.remove(user_data)` directly due to split.
-                        // But we can emulate it:
-                        let _ = std::mem::take(&mut op.platform_data);
-                        ops.free_indices.push(user_data);
+                        // Two-phase reclaim for cancelled RIO ops:
+                        // 1) cancel path may have already completed user future;
+                        // 2) this late CQE only marks drain complete;
+                        // 3) recycle slot only after future consumed the completion.
+                        if op.platform_data.rio_needs_drain {
+                            op.platform_data.rio_drained = true;
+                            let slot_state = slot.state.load(Ordering::Acquire);
+                            if slot_state == STATE_CONSUMED {
+                                let _ = std::mem::take(&mut op.platform_data);
+                                ops.free_indices.push(user_data);
+                            }
+                        } else {
+                            let _ = std::mem::take(&mut op.platform_data);
+                            ops.free_indices.push(user_data);
+                        }
                     }
                 }
             }
@@ -358,7 +393,7 @@ impl RioState {
         fd: IoFd,
         handle: HANDLE,
         buf: &mut FixedBuf,
-        user_data: usize,
+        overlapped: *mut OVERLAPPED,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<SubmissionResult> {
         let info = buf.resolve_region_info();
@@ -395,7 +430,7 @@ impl RioState {
         };
 
         let recv_fn = self.dispatch.receive;
-        let request_context = user_data as *mut std::ffi::c_void;
+        let request_context = Self::encode_request_context(overlapped);
 
         let ret = unsafe { recv_fn(rq, &rio_buf, 1, 0, request_context) };
 
@@ -410,7 +445,7 @@ impl RioState {
         fd: IoFd,
         handle: HANDLE,
         buf: &FixedBuf,
-        user_data: usize,
+        overlapped: *mut OVERLAPPED,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<SubmissionResult> {
         let info = buf.resolve_region_info();
@@ -446,7 +481,7 @@ impl RioState {
         };
 
         let send_fn = self.dispatch.send;
-        let request_context = user_data as *mut std::ffi::c_void;
+        let request_context = Self::encode_request_context(overlapped);
 
         let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
 
@@ -464,7 +499,7 @@ impl RioState {
         buf: &FixedBuf,
         addr_ptr: *const std::ffi::c_void,
         addr_len: i32,
-        user_data: usize,
+        overlapped: *mut OVERLAPPED,
         page_idx: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
@@ -515,7 +550,7 @@ impl RioState {
         };
 
         let send_ex_fn = self.dispatch.send_ex;
-        let request_context = user_data as *mut std::ffi::c_void;
+        let request_context = Self::encode_request_context(overlapped);
 
         let ret = unsafe {
             send_ex_fn(
@@ -544,8 +579,8 @@ impl RioState {
         handle: HANDLE,
         buf: &mut FixedBuf,
         addr_ptr: *const std::ffi::c_void,
-        len_ptr: *const i32,
-        user_data: usize,
+        _len_ptr: *const i32,
+        overlapped: *mut OVERLAPPED,
         page_idx: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
@@ -595,15 +630,8 @@ impl RioState {
             Length: std::mem::size_of::<SockAddrStorage>() as u32,
         };
 
-        let len_offset = (len_ptr as usize - base_addr) as u32;
-        let len_buf = RIO_BUF {
-            BufferId: addr_buf_id,
-            Offset: len_offset,
-            Length: 4,
-        };
-
         let recv_ex_fn = self.dispatch.receive_ex;
-        let request_context = user_data as *mut std::ffi::c_void;
+        let request_context = Self::encode_request_context(overlapped);
 
         let ret = unsafe {
             recv_ex_fn(
@@ -612,7 +640,7 @@ impl RioState {
                 1,
                 std::ptr::null(),
                 &addr_buf,
-                &len_buf,
+                std::ptr::null(),
                 std::ptr::null(),
                 0,
                 request_context,

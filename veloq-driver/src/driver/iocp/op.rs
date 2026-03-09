@@ -29,6 +29,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 pub struct OverlappedEntry {
     pub inner: OVERLAPPED,
     pub user_data: usize,
+    pub generation: u32,
     pub blocking_result: Option<io::Result<usize>>,
 }
 
@@ -37,6 +38,7 @@ impl OverlappedEntry {
         Self {
             inner: unsafe { std::mem::zeroed() },
             user_data,
+            generation: 0,
             blocking_result: None,
         }
     }
