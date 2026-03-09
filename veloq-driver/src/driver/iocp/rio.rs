@@ -10,6 +10,7 @@ use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED, STATE_CONSUMED};
 use crate::op::IoFd;
 use rustc_hash::FxHashMap;
 use std::io;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -21,6 +22,8 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use self::pool::{POOL_CTX_TAG, UdpPoolManager};
 use self::registry::RioRegistry;
+
+const RIO_REAPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 pub struct RioEnv<'a> {
@@ -144,6 +147,120 @@ pub(crate) struct RioKernel {
     _notify_overlapped: Box<OVERLAPPED>,
     dispatch: RioDispatch,
 }
+struct DeferredRioCleanup {
+    kernel: RioKernel,
+    registry: RioRegistry,
+    actors: FxHashMap<HANDLE, RioSocketActor>,
+    actor_routes: FxHashMap<u32, HANDLE>,
+    outstanding_count: usize,
+}
+// Safety: deferred cleanup task is transferred by ownership to a single reaper thread.
+unsafe impl Send for DeferredRioCleanup {}
+
+impl DeferredRioCleanup {
+    fn run(self) {
+        let mut state = RioState {
+            kernel: self.kernel,
+            registry: self.registry,
+            actors: self.actors,
+            actor_routes: self.actor_routes,
+            next_actor_id: 1,
+            outstanding_count: self.outstanding_count,
+        };
+        state.begin_shutdown();
+        if let Err(e) = state.drain_outstanding_for(RIO_REAPER_DRAIN_TIMEOUT) {
+            tracing::warn!(error = ?e, "RioReaper: background drain timed out");
+        }
+        state.finalize_shutdown_cleanup();
+    }
+}
+
+fn reaper_sender() -> &'static std::sync::mpsc::Sender<DeferredRioCleanup> {
+    static SENDER: OnceLock<std::sync::mpsc::Sender<DeferredRioCleanup>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<DeferredRioCleanup>();
+        std::thread::Builder::new()
+            .name("veloq-rio-reaper".to_string())
+            .spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    task.run();
+                }
+            })
+            .expect("failed to spawn veloq-rio-reaper");
+        tx
+    })
+}
+
+unsafe extern "system" fn noop_create_cq(_: u32, _: *const RIO_NOTIFICATION_COMPLETION) -> RIO_CQ {
+    0
+}
+unsafe extern "system" fn noop_create_rq(
+    _: usize,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u32,
+    _: RIO_CQ,
+    _: RIO_CQ,
+    _: *const std::ffi::c_void,
+) -> RIO_RQ {
+    0
+}
+unsafe extern "system" fn noop_register_buffer(_: *const u8, _: u32) -> RIO_BUFFERID {
+    0 as RIO_BUFFERID
+}
+unsafe extern "system" fn noop_deregister_buffer(_: RIO_BUFFERID) {}
+unsafe extern "system" fn noop_dequeue(_: RIO_CQ, _: *mut RIORESULT, _: u32) -> u32 {
+    0
+}
+unsafe extern "system" fn noop_notify(_: RIO_CQ) -> i32 {
+    0
+}
+unsafe extern "system" fn noop_close_cq(_: RIO_CQ) {}
+unsafe extern "system" fn noop_receive(
+    _: RIO_RQ,
+    _: *const RIO_BUF,
+    _: u32,
+    _: u32,
+    _: *const std::ffi::c_void,
+) -> i32 {
+    0
+}
+unsafe extern "system" fn noop_send(
+    _: RIO_RQ,
+    _: *const RIO_BUF,
+    _: u32,
+    _: u32,
+    _: *const std::ffi::c_void,
+) -> i32 {
+    0
+}
+unsafe extern "system" fn noop_send_ex(
+    _: RIO_RQ,
+    _: *const RIO_BUF,
+    _: u32,
+    _: *const RIO_BUF,
+    _: *const RIO_BUF,
+    _: *const RIO_BUF,
+    _: *const RIO_BUF,
+    _: u32,
+    _: *const std::ffi::c_void,
+) -> i32 {
+    0
+}
+unsafe extern "system" fn noop_receive_ex(
+    _: RIO_RQ,
+    _: *const RIO_BUF,
+    _: u32,
+    _: *const RIO_BUF,
+    _: *const RIO_BUF,
+    _: *const RIO_BUF,
+    _: *const RIO_BUF,
+    _: u32,
+    _: *const std::ffi::c_void,
+) -> i32 {
+    0
+}
 
 impl RioKernel {
     fn from_extensions(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
@@ -247,6 +364,27 @@ impl RioKernel {
             _notify_overlapped: notify_overlapped,
             dispatch,
         })
+    }
+
+    fn noop() -> Self {
+        let dispatch = RioDispatch {
+            create_cq: noop_create_cq,
+            create_rq: noop_create_rq,
+            register_buffer: noop_register_buffer,
+            deregister_buffer: noop_deregister_buffer,
+            dequeue: noop_dequeue,
+            notify: noop_notify,
+            close_cq: noop_close_cq,
+            receive: noop_receive,
+            send: noop_send,
+            send_ex: noop_send_ex,
+            receive_ex: noop_receive_ex,
+        };
+        Self {
+            cq: 0,
+            _notify_overlapped: Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() }),
+            dispatch,
+        }
     }
 
     #[inline]
@@ -609,6 +747,104 @@ impl RioState {
             self.actors.remove(&handle);
             self.actor_routes.remove(&actor_id);
         }
+    }
+
+    pub fn begin_shutdown(&mut self) {
+        for actor in self.actors.values_mut() {
+            actor.pool_manager.begin_udp_pool_shutdown();
+        }
+    }
+
+    pub fn drain_outstanding_for(&mut self, timeout: std::time::Duration) -> io::Result<()> {
+        let start = std::time::Instant::now();
+        while self.outstanding_count > 0 {
+            if start.elapsed() >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "strict close timed out while draining RIO outstanding requests: {}",
+                        self.outstanding_count
+                    ),
+                ));
+            }
+
+            const MAX_RESULTS: usize = 128;
+            let mut results: [RIORESULT; MAX_RESULTS] = unsafe { std::mem::zeroed() };
+            let count = self
+                .kernel
+                .dequeue(results.as_mut_ptr(), MAX_RESULTS as u32);
+
+            if count == RIO_CORRUPT_CQ {
+                return Err(io_msg(
+                    IocpErrorContext::Rio,
+                    "RIO completion queue is corrupt (RIO_CORRUPT_CQ)",
+                ));
+            }
+
+            if count == 0 {
+                std::thread::yield_now();
+                continue;
+            }
+
+            for res in results.iter().take(count as usize) {
+                if let Some((actor_id, completion_generation)) =
+                    Self::decode_pool_context(res.RequestContext)
+                    && let Some(handle) = self.actor_routes.get(&actor_id).copied()
+                    && let Some(actor) = self.actors.get_mut(&handle)
+                {
+                    let _ = actor
+                        .pool_manager
+                        .ack_udp_pool_completion(completion_generation);
+                    actor.pool_manager.handle_completion_drain_only();
+                    let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+                    let mut ctx = Self::build_ctx(&mut self.registry, env);
+                    if actor
+                        .pool_manager
+                        .cleanup_shutdown_udp_pool_if_drained(&mut ctx)
+                    {
+                        self.actor_routes.remove(&actor_id);
+                        self.actors.remove(&handle);
+                    }
+                }
+                self.outstanding_count -= 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finalize_shutdown_cleanup(&mut self) {
+        for actor in self.actors.values_mut() {
+            actor.pool_manager.udp_ctx_map.clear();
+        }
+        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+        let mut ctx = Self::build_ctx(&mut self.registry, env);
+        for actor in self.actors.values_mut() {
+            actor
+                .pool_manager
+                .forget_in_flight_and_deregister_rest(&mut ctx);
+        }
+        self.actors.clear();
+        self.actor_routes.clear();
+        let _ = ctx;
+        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+        self.registry.cleanup_deregister(env);
+        self.kernel.close();
+    }
+
+    fn take_deferred_cleanup(&mut self) -> Option<DeferredRioCleanup> {
+        if self.kernel.cq == 0 {
+            return None;
+        }
+        let kernel = std::mem::replace(&mut self.kernel, RioKernel::noop());
+        let registry = std::mem::replace(&mut self.registry, RioRegistry::new(32));
+        Some(DeferredRioCleanup {
+            kernel,
+            registry,
+            actors: std::mem::take(&mut self.actors),
+            actor_routes: std::mem::take(&mut self.actor_routes),
+            outstanding_count: std::mem::take(&mut self.outstanding_count),
+        })
     }
 
     pub fn cancel_udp_recv_waiter(
@@ -1034,74 +1270,21 @@ impl RioState {
 
 impl Drop for RioState {
     fn drop(&mut self) {
-        // Explicit UDP pool shutdown protocol:
-        // 1) forbid new submissions; 2) mark in-flight slots as stop-requested;
-        // 3) drain CQ until all slot acknowledgements arrive; 4) release buffers/CQ.
-        for actor in self.actors.values_mut() {
-            actor.pool_manager.begin_udp_pool_shutdown();
+        self.begin_shutdown();
+        if self.outstanding_count == 0 {
+            self.finalize_shutdown_cleanup();
+            return;
         }
 
-        // Consolidate drain: Wait for all outstanding RIO requests (Pool + Standard) to finish.
-        // This ensures the kernel is no longer touching any registered buffers or pool slots.
-        let start = std::time::Instant::now();
-        while self.outstanding_count > 0 {
-            if start.elapsed() >= std::time::Duration::from_secs(5) {
-                tracing::warn!(
-                    outstanding = self.outstanding_count,
-                    "RioState::drop: Timeout waiting for outstanding RIO requests"
-                );
-                break;
+        if let Some(task) = self.take_deferred_cleanup() {
+            let tx = reaper_sender();
+            if let Err(err) = tx.send(task) {
+                tracing::warn!("RioReaper unavailable, falling back to inline cleanup");
+                err.0.run();
             }
-
-            const MAX_RESULTS: usize = 128;
-            let mut results: [RIORESULT; MAX_RESULTS] = unsafe { std::mem::zeroed() };
-            let count = self
-                .kernel
-                .dequeue(results.as_mut_ptr(), MAX_RESULTS as u32);
-
-            if count == RIO_CORRUPT_CQ || count == 0 {
-                std::thread::yield_now();
-            } else {
-                for res in results.iter().take(count as usize) {
-                    if let Some((actor_id, completion_generation)) =
-                        Self::decode_pool_context(res.RequestContext)
-                        && let Some(handle) = self.actor_routes.get(&actor_id).copied()
-                        && let Some(actor) = self.actors.get_mut(&handle)
-                    {
-                        let _ = actor
-                            .pool_manager
-                            .ack_udp_pool_completion(completion_generation);
-                        actor.pool_manager.handle_completion_drain_only();
-                        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-                        let mut ctx = Self::build_ctx(&mut self.registry, env);
-                        if actor
-                            .pool_manager
-                            .cleanup_shutdown_udp_pool_if_drained(&mut ctx)
-                        {
-                            self.actor_routes.remove(&actor_id);
-                            self.actors.remove(&handle);
-                        }
-                    }
-                    self.outstanding_count -= 1;
-                }
-            }
+            return;
         }
 
-        for actor in self.actors.values_mut() {
-            actor.pool_manager.udp_ctx_map.clear();
-        }
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
-        for actor in self.actors.values_mut() {
-            actor
-                .pool_manager
-                .forget_in_flight_and_deregister_rest(&mut ctx);
-        }
-        self.actors.clear();
-        self.actor_routes.clear();
-        let _ = ctx;
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-        self.registry.cleanup_deregister(env);
-        self.kernel.close();
+        self.finalize_shutdown_cleanup();
     }
 }

@@ -12,7 +12,7 @@ use crate::driver::iocp::op::IocpOp;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
@@ -77,6 +77,12 @@ impl IocpOpState {
 
 pub type PreInit = usize;
 
+#[derive(Clone, Copy, Debug)]
+pub enum CloseMode {
+    Fast,
+    Strict { timeout: Duration },
+}
+
 pub struct IocpDriver {
     pub(crate) port: Arc<CompletionPort>,
     pub(crate) ops: OpRegistry<IocpOp, IocpOpState>,
@@ -90,6 +96,8 @@ pub struct IocpDriver {
     // RIO Support (required)
     pub(crate) rio_state: RioState,
     pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
+    pub(crate) shutting_down: bool,
+    pub(crate) closed: bool,
 }
 
 pub(crate) struct CompletionPort {
@@ -206,6 +214,8 @@ impl IocpDriver {
             is_waked,
             rio_state,
             registrar: Box::new(veloq_buf::NoopRegistrar),
+            shutting_down: false,
+            closed: false,
         })
     }
 
@@ -576,41 +586,57 @@ impl IocpDriver {
             is_waked: self.is_waked.clone(),
         })
     }
-}
 
-impl Drop for IocpDriver {
-    fn drop(&mut self) {
-        debug!("Dropping IocpDriver");
+    fn shutdown_inflight_ops(&mut self) -> usize {
+        if self.shutting_down {
+            return 0;
+        }
+        self.shutting_down = true;
+
+        self.rio_state.begin_shutdown();
+
         let mut pending_count = 0;
-
-        for (user_data, op) in self.ops.local.iter_mut().enumerate() {
-            if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                let slot = &self.ops.shared.slots[user_data];
-
-                if let Some(tid) = op.platform_data.timer_id {
-                    self.wheel.cancel(tid);
-                    op.platform_data.timer_id = None;
-                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
-                    continue;
-                }
-
-                if let Some(res) = unsafe { &mut *slot.op.get() }
-                    && let Some(fd) = res.get_fd()
-                    && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files)
-                {
-                    let overlapped_ptr = slot.overlapped_ptr();
-                    unsafe {
-                        use windows_sys::Win32::System::IO::CancelIoEx;
-                        let _ = CancelIoEx(handle, overlapped_ptr);
-                    }
-                }
-                pending_count += 1;
+        for user_data in 0..self.ops.local.len() {
+            let Some(op) = self.ops.local.get(user_data) else {
+                continue;
+            };
+            if !matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                continue;
             }
+            if op.platform_data.timer_id.is_some() {
+                self.cancel_op_internal(user_data);
+                continue;
+            }
+            if op.platform_data.rio_pool_waiting {
+                self.cancel_op_internal(user_data);
+                continue;
+            }
+            pending_count += 1;
+            self.cancel_op_internal(user_data);
         }
 
-        let mut ops_drained = 0;
+        pending_count
+    }
+
+    fn drain_pending_iocp(&mut self, pending_count: usize, timeout: Duration) -> io::Result<()> {
+        if pending_count == 0 {
+            return Ok(());
+        }
+
+        let mut ops_drained = 0usize;
+        let deadline = Instant::now() + timeout;
 
         while ops_drained < pending_count {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "strict close timed out while draining IOCP: drained={}, pending={}",
+                        ops_drained, pending_count
+                    ),
+                ));
+            }
+
             let mut bytes = 0;
             let mut key = 0;
             let mut overlapped = std::ptr::null_mut();
@@ -621,7 +647,7 @@ impl Drop for IocpDriver {
                     &mut bytes,
                     &mut key,
                     &mut overlapped,
-                    100,
+                    10,
                 )
             };
 
@@ -632,21 +658,33 @@ impl Drop for IocpDriver {
                 {
                     ops_drained += count;
                 }
-            } else if !overlapped.is_null() {
-                // Since OverlappedEntry is #[repr(C)], we can recover user_data.
+                continue;
+            }
+
+            if !overlapped.is_null() {
                 let entry = overlapped as *const OverlappedEntry;
                 let user_data = unsafe { (*entry).user_data };
                 self.process_iocp_completion(user_data, res, bytes);
                 ops_drained += 1;
-            } else if res == 0 {
+                continue;
+            }
+
+            if res == 0 {
                 let err = unsafe { GetLastError() };
-                if err == WAIT_TIMEOUT {
-                    continue;
+                if err != WAIT_TIMEOUT {
+                    return Err(io_error(
+                        IocpErrorContext::CompletionWait,
+                        io::Error::from_raw_os_error(err as i32),
+                        "strict close failed while draining IOCP",
+                    ));
                 }
             }
         }
 
-        // Safety cleanup for remote ops
+        Ok(())
+    }
+
+    fn cleanup_detached_completers(&mut self) {
         for (user_data, op_entry) in self.ops.local.iter_mut().enumerate() {
             let slot = &self.ops.shared.slots[user_data];
             if let Some(completer) = op_entry.platform_data.detached_completer.take()
@@ -655,7 +693,38 @@ impl Drop for IocpDriver {
                 completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
             }
         }
+    }
 
-        // Port is closed when Arc<CompletionPort> drops
+    fn close_impl(&mut self, mode: CloseMode) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+
+        let pending = self.shutdown_inflight_ops();
+
+        if let CloseMode::Strict { timeout } = mode {
+            self.drain_pending_iocp(pending, timeout)?;
+            self.rio_state.drain_outstanding_for(timeout)?;
+        }
+
+        self.cleanup_detached_completers();
+        self.closed = true;
+        Ok(())
+    }
+
+    pub fn shutdown(&mut self) -> io::Result<()> {
+        let _ = self.shutdown_inflight_ops();
+        Ok(())
+    }
+
+    pub fn close_with_mode(mut self, mode: CloseMode) -> io::Result<()> {
+        self.close_impl(mode)
+    }
+}
+
+impl Drop for IocpDriver {
+    fn drop(&mut self) {
+        debug!("Dropping IocpDriver");
+        let _ = self.close_impl(CloseMode::Fast);
     }
 }

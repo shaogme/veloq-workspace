@@ -103,4 +103,6 @@ pub use uring::UringDriver as PlatformDriver;
 pub(crate) mod iocp;
 
 #[cfg(target_os = "windows")]
+pub use iocp::CloseMode;
+#[cfg(target_os = "windows")]
 pub use iocp::IocpDriver as PlatformDriver;

@@ -17,7 +17,7 @@ use tracing::{debug, trace};
 use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
 
 use inner::WAKEUP_USER_DATA;
-pub use inner::{IocpDriver, IocpOpState, OpLifecycle};
+pub use inner::{CloseMode, IocpDriver, IocpOpState, OpLifecycle};
 use op::IocpOp;
 use submit::SubmissionResult;
 
@@ -48,6 +48,11 @@ impl Driver for IocpDriver {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
     ) -> Result<Poll<()>, io::Error> {
+        if self.shutting_down {
+            return Err(io::Error::from_raw_os_error(
+                windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+            ));
+        }
         trace!(user_data, "Submitting op");
         let mut submit_error: Option<io::Error> = None;
 
@@ -202,6 +207,11 @@ impl Driver for IocpDriver {
     }
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
+        if self.shutting_down {
+            return Err(io::Error::from_raw_os_error(
+                windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+            ));
+        }
         let (user_data, _) = self.reserve_op()?;
         let mut submit_error: Option<io::Error> = None;
 
