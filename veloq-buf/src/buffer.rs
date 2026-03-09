@@ -97,18 +97,10 @@ impl<const S: u16> std::fmt::Debug for NotU16<S> {
 
 pub type GlobalIndex = NotU16<NO_REGISTRATION_INDEX>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RegionInfo {
-    pub id: u16,
-    pub offset: usize,
-    /// A unique cookie used to distinguish different allocations for the same pointer (e.g. heap reuse).
-    pub cookie: u64,
-}
-
 #[derive(Debug)]
 pub struct PoolVTable {
     pub dealloc: unsafe fn(pool_data: NonNull<()>, params: DeallocParams),
-    pub resolve_region_info: unsafe fn(pool_data: NonNull<()>, buf: &FixedBuf) -> RegionInfo,
+    pub resolve_region_info: unsafe fn(pool_data: NonNull<()>, buf: &FixedBuf) -> (usize, usize),
 }
 
 #[derive(Debug)]
@@ -185,23 +177,6 @@ pub trait BufferRegistrar {
     /// Returns a list of handles (tokens) corresponding to the regions.
     /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
     fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>>;
-
-    /// Resolve chunk info for a given chunk_id.
-    /// Used for lazy registration.
-    fn resolve_chunk_info(&self, chunk_id: u16) -> Option<crate::heap::ChunkInfo>;
-}
-
-/// A no-op registrar that does nothing.
-pub struct NoopRegistrar;
-
-impl BufferRegistrar for NoopRegistrar {
-    fn register(&self, _regions: &[BufferRegion]) -> std::io::Result<Vec<usize>> {
-        Ok(Vec::new())
-    }
-
-    fn resolve_chunk_info(&self, _chunk_id: u16) -> Option<crate::heap::ChunkInfo> {
-        None
-    }
 }
 
 /// Memory pool implementation providing raw memory allocation.
@@ -385,7 +360,7 @@ impl FixedBuf {
     ///
     /// The interpretation of the region index is pool-dependent.
     #[inline(always)]
-    pub fn resolve_region_info(&self) -> RegionInfo {
+    pub fn resolve_region_info(&self) -> (usize, usize) {
         unsafe { (self.vtable.resolve_region_info)(self.pool_data, self) }
     }
 
@@ -454,17 +429,13 @@ impl FixedBuf {
 
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
 
-        static HEAP_BUF_COOKIE_GEN: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1);
-        let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         Ok(unsafe {
             Self::new(
                 ptr,
                 len,
                 NonNull::dangling(), // No pool context for heap buffers
                 &HEAP_POOL_VTABLE,
-                cookie,
+                0,
             )
         })
     }
@@ -842,14 +813,12 @@ unsafe fn heap_dealloc_shim(_pool_data: NonNull<()>, params: DeallocParams) {
     }
 }
 
-unsafe fn heap_resolve_region_info_shim(_pool_data: NonNull<()>, buf: &FixedBuf) -> RegionInfo {
-    // Return NO_REGISTRATION_INDEX to indicate this buffer is not registered.
-    // Usebuf.context as the cookie for heap buffers.
-    RegionInfo {
-        id: NO_REGISTRATION_INDEX,
-        offset: 0,
-        cookie: buf.context,
-    }
+unsafe fn heap_resolve_region_info_shim(
+    _pool_data: NonNull<()>,
+    _buf: &FixedBuf,
+) -> (usize, usize) {
+    // Return NO_REGISTRATION_INDEX to indicate this buffer is not registered
+    (NO_REGISTRATION_INDEX as usize, 0)
 }
 
 unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
@@ -893,7 +862,7 @@ unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams)
 unsafe fn slot_based_resolve_region_info_shim(
     pool_data: NonNull<()>,
     buf: &FixedBuf,
-) -> RegionInfo {
+) -> (usize, usize) {
     // 1. Cast back to GlobalSlotPool
     let pool = unsafe { &*(pool_data.as_ptr() as *const crate::heap::GlobalSlotPool) };
 
@@ -908,10 +877,6 @@ unsafe fn slot_based_resolve_region_info_shim(
     let base = chunk_info.ptr.as_ptr() as usize;
     let ptr = buf.as_ptr() as usize;
 
-    // Return RegionInfo { id, offset, cookie }
-    RegionInfo {
-        id: chunk_id,
-        offset: ptr.saturating_sub(base),
-        cookie: 0, // Cookies are currently only used for heap buffers
-    }
+    // Return (ChunkID, Offset)
+    (chunk_id as usize, ptr.saturating_sub(base))
 }

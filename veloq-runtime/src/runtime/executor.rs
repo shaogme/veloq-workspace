@@ -10,7 +10,7 @@ use crossbeam_deque::Worker;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 use tracing::{debug, trace};
-use veloq_buf::BufferRegistrar;
+use veloq_buf::{BufferRegion, BufferRegistrar};
 use veloq_driver::driver::{Driver, PlatformDriver, RemoteWaker};
 
 use crate::runtime::context::RuntimeContext;
@@ -38,9 +38,9 @@ pub struct LocalExecutorBuilder {
     shared: Option<Arc<ExecutorShared>>,
     remote_receiver: Option<mpsc::Receiver<Task>>,
     pinned_receiver: Option<mpsc::Receiver<SpawnedTask>>,
+    // Worker provided externally (e.g. by RuntimeBuilder) or created internally
     stealable: Option<Worker<Runnable>>,
     stealer: Option<crossbeam_deque::Stealer<Runnable>>,
-    registry: Option<Arc<ExecutorRegistry>>,
 }
 
 impl Default for LocalExecutorBuilder {
@@ -58,7 +58,6 @@ impl LocalExecutorBuilder {
             pinned_receiver: None,
             stealable: None,
             stealer: None,
-            registry: None,
         }
     }
 
@@ -85,11 +84,6 @@ impl LocalExecutorBuilder {
 
     pub fn config(mut self, config: crate::config::Config) -> Self {
         self.config = config;
-        self
-    }
-
-    pub fn with_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
-        self.registry = Some(registry);
         self
     }
 
@@ -154,7 +148,6 @@ impl LocalExecutorBuilder {
         // Construct Registrar and Pool
         let registrar = Box::new(ExecutorRegistrar {
             driver: Rc::downgrade(&driver),
-            registry: self.registry.clone(),
         });
 
         let buf_pool = pool_constructor(registrar);
@@ -166,7 +159,7 @@ impl LocalExecutorBuilder {
             remote_receiver,
             pinned_receiver,
             stealable: Rc::new(stealable),
-            registry: self.registry,
+            registry: None,
             id: usize::MAX,
             buf_pool,
             last_seen_epoch: Cell::new(0),
@@ -276,7 +269,6 @@ impl LocalExecutor {
     pub fn registrar(&self) -> Box<dyn BufferRegistrar> {
         Box::new(ExecutorRegistrar {
             driver: Rc::downgrade(&self.driver),
-            registry: self.registry.clone(),
         })
     }
 
@@ -490,6 +482,7 @@ impl LocalExecutor {
             spawner,
             self.handle(),
             self.buf_pool.clone(),
+            self.stealable.clone(),
         );
 
         let _guard = crate::runtime::context::enter(context);
@@ -574,6 +567,7 @@ impl LocalExecutor {
             spawner,
             self.handle(),
             self.buf_pool.clone(),
+            self.stealable.clone(),
         );
 
         let _guard = crate::runtime::context::enter(context);
@@ -721,14 +715,13 @@ unsafe fn atomic_drop(ptr: *const ()) {
     let _ = unsafe { Arc::from_raw(ptr as *const AtomicWakerState) };
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct ExecutorRegistrar<D: Driver> {
     driver: std::rc::Weak<RefCell<D>>,
-    registry: Option<Arc<ExecutorRegistry>>,
 }
 
 impl<D: Driver> BufferRegistrar for ExecutorRegistrar<D> {
-    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> std::io::Result<Vec<usize>> {
+    fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>> {
         let driver_rc = self
             .driver
             .upgrade()
@@ -741,19 +734,5 @@ impl<D: Driver> BufferRegistrar for ExecutorRegistrar<D> {
             indices.push(i);
         }
         Ok(indices)
-    }
-
-    fn resolve_chunk_info(&self, chunk_id: u16) -> Option<veloq_buf::heap::ChunkInfo> {
-        self.registry.as_ref().and_then(|reg| {
-            let chunks = reg.memory_chunks.read();
-            chunks
-                .iter()
-                .find(|c| c.id == chunk_id)
-                .map(|c| veloq_buf::heap::ChunkInfo {
-                    id: c.id,
-                    ptr: unsafe { std::ptr::NonNull::new_unchecked(c.ptr as *mut u8) },
-                    len: unsafe { std::num::NonZeroUsize::new_unchecked(c.len) },
-                })
-        })
     }
 }

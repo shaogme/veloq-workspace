@@ -10,7 +10,7 @@ use crate::driver::uring::UringDriver;
 use crate::driver::uring::submit;
 use crate::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
-    Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
+    RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
 };
 use io_uring::squeue;
 use std::io;
@@ -21,12 +21,11 @@ use std::time::Duration;
 // VTable Definition
 // ============================================================================
 
-pub type MakeSqeFn = unsafe fn(op: &mut UringOp, driver: &mut UringDriver) -> squeue::Entry;
+pub type MakeSqeFn = unsafe fn(op: &mut UringOp, driver: &UringDriver) -> squeue::Entry;
 pub type OnCompleteFn = unsafe fn(op: &mut UringOp, result: i32) -> io::Result<usize>;
 pub type DropFn = unsafe fn(op: &mut UringOp);
 pub type GetFdFn = unsafe fn(op: &UringOp) -> Option<IoFd>;
 pub type GetTimeoutFn = unsafe fn(op: &UringOp) -> Option<Duration>;
-pub type ResolveChunksFn = unsafe fn(op: &UringOp, chunks: &mut [u16]) -> usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmissionStrategy {
@@ -45,7 +44,6 @@ pub struct OpVTable {
     pub get_fd: GetFdFn,
     pub strategy: SubmissionStrategy,
     pub get_timeout: GetTimeoutFn,
-    pub resolve_chunks: ResolveChunksFn,
 }
 
 // ============================================================================
@@ -93,7 +91,6 @@ macro_rules! define_uring_ops {
                 get_fd: $get_fd:path,
                 $(strategy: $strategy:expr,)?
                 $(get_timeout: $get_timeout:expr,)?
-                $(resolve_chunks: $resolve_chunks:expr,)?
                 $(construct: $construct:expr,)?
                 $(destruct: $destruct:expr,)?
             }
@@ -117,7 +114,6 @@ macro_rules! define_uring_ops {
                         get_fd: $get_fd,
                         strategy: define_uring_ops!(@strategy $($strategy)?),
                         get_timeout: define_uring_ops!(@get_timeout $($get_timeout)?),
-                        resolve_chunks: define_uring_ops!(@resolve_chunks $($resolve_chunks)?),
                     };
 
                     let payload = define_uring_ops!(@construct self, $($construct)?, $OpType $(, $Payload)?);
@@ -152,10 +148,6 @@ macro_rules! define_uring_ops {
     (@get_timeout ) => { submit::get_timeout_none };
     (@get_timeout $func:expr) => { $func };
 
-    // Default resolve_chunks: return 0
-    (@resolve_chunks ) => { submit::resolve_chunks_none };
-    (@resolve_chunks $func:expr) => { $func };
-
     // Default construct: return self
     (@construct $self:expr, , $OpType:ty) => { $self };
     // Custom construct
@@ -183,8 +175,8 @@ pub struct SendToPayload {
     pub msghdr: libc::msghdr,
 }
 
-pub struct UdpRecvStreamPayload {
-    pub op: UdpRecvStream,
+pub struct RecvFromPayload {
+    pub op: RecvFrom,
     pub msg_name: libc::sockaddr_storage,
     pub msg_namelen: libc::socklen_t,
     pub iovec: [libc::iovec; 1],
@@ -216,7 +208,6 @@ define_uring_ops! {
         on_complete: submit::on_complete_read_fixed,
         drop: submit::drop_read_fixed,
         get_fd: submit::get_fd_read_fixed,
-        resolve_chunks: submit::resolve_chunks_read_fixed,
     }, // Kernel 5.1+
     WriteFixed {
         field: write,
@@ -224,7 +215,6 @@ define_uring_ops! {
         on_complete: submit::on_complete_write_fixed,
         drop: submit::drop_write_fixed,
         get_fd: submit::get_fd_write_fixed,
-        resolve_chunks: submit::resolve_chunks_write_fixed,
     }, // Kernel 5.1+
     Recv {
         field: recv,
@@ -305,29 +295,22 @@ define_uring_ops! {
         },
         destruct: |p: SendToPayload| p.op,
     }, // Kernel 5.1+ (via SendMsg)
-    UdpRecvStream {
-        field: udp_recv_stream,
-        payload: UdpRecvStreamPayload,
-        make_sqe: submit::make_sqe_udp_recv_stream,
-        on_complete: submit::on_complete_udp_recv_stream,
-        drop: submit::drop_udp_recv_stream,
-        get_fd: submit::get_fd_udp_recv_stream,
-        construct: |op| UdpRecvStreamPayload {
+    RecvFrom {
+        field: recv_from,
+        payload: RecvFromPayload,
+        make_sqe: submit::make_sqe_recv_from,
+        on_complete: submit::on_complete_recv_from,
+        drop: submit::drop_recv_from,
+        get_fd: submit::get_fd_recv_from,
+        construct: |op| RecvFromPayload {
             op,
             msg_name: unsafe { std::mem::zeroed() },
             msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
         },
-        destruct: |p: UdpRecvStreamPayload| p.op,
+        destruct: |p: RecvFromPayload| p.op,
     }, // Kernel 5.1+ (via RecvMsg)
-    UdpRefill {
-        field: udp_refill,
-        make_sqe: submit::make_sqe_udp_refill,
-        on_complete: submit::on_complete_udp_refill,
-        drop: submit::drop_udp_refill,
-        get_fd: submit::get_fd_udp_refill,
-    }, // No-op on io_uring, kept for cross-platform API parity
     Open {
         field: open,
         payload: OpenPayload,

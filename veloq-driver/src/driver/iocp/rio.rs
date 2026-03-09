@@ -1,88 +1,24 @@
-pub mod pool;
-pub mod registry;
-
+use crate::SockAddrStorage;
 use crate::driver::iocp::IocpOp;
-use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::ext::Extensions;
+use crate::driver::iocp::submit::SubmissionResult;
 use crate::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED, STATE_CONSUMED};
+use crate::driver::slot::STATE_COMPLETED;
 use crate::op::IoFd;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::sync::atomic::Ordering;
+use tracing::error;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
-    RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_IOCP_COMPLETION,
-    RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT, SOCKET_ERROR, WSAGetLastError,
+    RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT,
 };
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
-use self::pool::{POOL_CTX_TAG, UdpPoolManager};
-use self::registry::RioRegistry;
-
-#[derive(Clone, Copy)]
-pub struct RioEnv<'a> {
-    pub registrar: &'a dyn veloq_buf::BufferRegistrar,
-    pub dispatch: &'a RioDispatch,
-    pub cq: RIO_CQ,
-}
-
-pub struct RioContext<'a> {
-    pub registry: &'a mut RioRegistry,
-    pub env: RioEnv<'a>,
-}
-
-#[derive(Clone, Copy)]
-enum RioCompletionKind {
-    Pool { actor_id: u32, generation: u32 },
-    Op { user_data: usize, generation: u32 },
-}
-
-struct RioSocketActor {
-    actor_id: u32,
-    rq: RIO_RQ,
-    pool_manager: UdpPoolManager,
-}
-
-impl RioSocketActor {
-    fn new(actor_id: u32, rq: RIO_RQ) -> Self {
-        Self {
-            actor_id,
-            rq,
-            pool_manager: UdpPoolManager::new(),
-        }
-    }
-}
-
-pub struct RioSendToArgs<'a> {
-    pub fd: IoFd,
-    pub handle: HANDLE,
-    pub buf: &'a veloq_buf::FixedBuf,
-    pub addr_ptr: *const std::ffi::c_void,
-    pub addr_len: i32,
-    pub overlapped: *mut OVERLAPPED,
-    pub page_idx: usize,
-}
-
-pub struct RioRecvFromArgs<'a> {
-    pub fd: IoFd,
-    pub handle: HANDLE,
-    pub buf: &'a mut veloq_buf::FixedBuf,
-    pub addr_ptr: *const std::ffi::c_void,
-    pub len_ptr: *const i32,
-    pub overlapped: *mut OVERLAPPED,
-    pub page_idx: usize,
-}
-
-pub struct RioUdpStreamArgs<'a> {
-    pub fd: IoFd,
-    pub handle: HANDLE,
-    pub stream_op: &'a mut crate::op::UdpRecvStream,
-    pub user_data: usize,
-    pub generation: u32,
-}
+// Define constants that might be missing or different in windows-sys
+const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0 as RIO_BUFFERID;
+const RIO_NOTIFICATION_COMPLETION_TYPE_IOCP: u32 = 1;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioDispatch {
@@ -98,10 +34,8 @@ pub(crate) struct RioDispatch {
         *const std::ffi::c_void,
     ) -> RIO_RQ,
     pub register_buffer: unsafe extern "system" fn(*const u8, u32) -> RIO_BUFFERID,
-    pub deregister_buffer: unsafe extern "system" fn(RIO_BUFFERID),
     pub dequeue: unsafe extern "system" fn(RIO_CQ, *mut RIORESULT, u32) -> u32,
     pub notify: unsafe extern "system" fn(RIO_CQ) -> i32,
-    pub close_cq: unsafe extern "system" fn(RIO_CQ),
     pub receive:
         unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
     pub send:
@@ -131,535 +65,184 @@ pub(crate) struct RioDispatch {
 }
 
 pub struct RioState {
-    pub(crate) kernel: RioKernel,
-    pub(crate) registry: RioRegistry,
-    actors: FxHashMap<HANDLE, RioSocketActor>,
-    actor_routes: FxHashMap<u32, HANDLE>,
-    next_actor_id: u32,
-    pub(crate) outstanding_count: usize,
-}
-
-pub(crate) struct RioKernel {
-    cq: RIO_CQ,
-    _notify_overlapped: Box<OVERLAPPED>,
-    dispatch: RioDispatch,
-}
-
-impl RioKernel {
-    fn from_extensions(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
-        let table = &ext.rio_table;
-        let dispatch = RioDispatch {
-            create_cq: table.RIOCreateCompletionQueue.ok_or_else(|| {
-                io_msg(
-                    IocpErrorContext::Rio,
-                    "RIOCreateCompletionQueue function pointer missing",
-                )
-            })?,
-            create_rq: table.RIOCreateRequestQueue.ok_or_else(|| {
-                io_msg(
-                    IocpErrorContext::Rio,
-                    "RIOCreateRequestQueue function pointer missing",
-                )
-            })?,
-            register_buffer: table.RIORegisterBuffer.ok_or_else(|| {
-                io_msg(
-                    IocpErrorContext::Rio,
-                    "RIORegisterBuffer function pointer missing",
-                )
-            })?,
-            deregister_buffer: table.RIODeregisterBuffer.ok_or_else(|| {
-                io_msg(
-                    IocpErrorContext::Rio,
-                    "RIODeregisterBuffer function pointer missing",
-                )
-            })?,
-            dequeue: table.RIODequeueCompletion.ok_or_else(|| {
-                io_msg(
-                    IocpErrorContext::Rio,
-                    "RIODequeueCompletion function pointer missing",
-                )
-            })?,
-            notify: table.RIONotify.ok_or_else(|| {
-                io_msg(IocpErrorContext::Rio, "RIONotify function pointer missing")
-            })?,
-            close_cq: table.RIOCloseCompletionQueue.ok_or_else(|| {
-                io_msg(
-                    IocpErrorContext::Rio,
-                    "RIOCloseCompletionQueue function pointer missing",
-                )
-            })?,
-            receive: table.RIOReceive.ok_or_else(|| {
-                io_msg(IocpErrorContext::Rio, "RIOReceive function pointer missing")
-            })?,
-            send: table
-                .RIOSend
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSend function pointer missing"))?,
-            send_ex: table.RIOSendEx.ok_or_else(|| {
-                io_msg(IocpErrorContext::Rio, "RIOSendEx function pointer missing")
-            })?,
-            receive_ex: table.RIOReceiveEx.ok_or_else(|| {
-                io_msg(
-                    IocpErrorContext::Rio,
-                    "RIOReceiveEx function pointer missing",
-                )
-            })?,
-        };
-        Self::new(port, entries, dispatch)
-    }
-
-    fn new(port: HANDLE, entries: u32, dispatch: RioDispatch) -> io::Result<Self> {
-        const RIO_EVENT_KEY: usize = usize::MAX - 1;
-        let mut notify_overlapped = Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() });
-        let notification = RIO_NOTIFICATION_COMPLETION {
-            Type: RIO_IOCP_COMPLETION,
-            Anonymous: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0 {
-                Iocp: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
-                    IocpHandle: port,
-                    CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
-                    Overlapped: (&mut *notify_overlapped as *mut OVERLAPPED).cast(),
-                },
-            },
-        };
-
-        let queue_size = entries.max(128);
-        let cq = unsafe { (dispatch.create_cq)(queue_size, &notification as *const _) };
-        if cq == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                format!(
-                    "RIOCreateCompletionQueue failed: entries={entries}, queue_size={queue_size}"
-                ),
-            ));
-        }
-
-        let notify_ret = unsafe { (dispatch.notify)(cq) };
-        if notify_ret == SOCKET_ERROR {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIONotify failed after CQ creation",
-            ));
-        }
-
-        Ok(Self {
-            cq,
-            _notify_overlapped: notify_overlapped,
-            dispatch,
-        })
-    }
-
-    #[inline]
-    fn env<'a>(&'a self, registrar: &'a dyn veloq_buf::BufferRegistrar) -> RioEnv<'a> {
-        RioEnv {
-            registrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        }
-    }
-
-    #[inline]
-    fn dequeue(&self, results: *mut RIORESULT, len: u32) -> u32 {
-        unsafe { (self.dispatch.dequeue)(self.cq, results, len) }
-    }
-
-    #[inline]
-    fn rearm_notify(&self) -> io::Result<()> {
-        let ret = unsafe { (self.dispatch.notify)(self.cq) };
-        if ret == SOCKET_ERROR {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIONotify failed when rearming CQ",
-            ));
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn submit_receive(
-        &self,
-        rq: RIO_RQ,
-        buf: &RIO_BUF,
-        request_context: *const std::ffi::c_void,
-    ) -> i32 {
-        unsafe { (self.dispatch.receive)(rq, buf, 1, 0, request_context) }
-    }
-
-    #[inline]
-    fn submit_send(
-        &self,
-        rq: RIO_RQ,
-        buf: &RIO_BUF,
-        request_context: *const std::ffi::c_void,
-    ) -> i32 {
-        unsafe { (self.dispatch.send)(rq, buf, 1, 0, request_context) }
-    }
-
-    #[inline]
-    fn submit_send_ex(
-        &self,
-        rq: RIO_RQ,
-        data_buf: &RIO_BUF,
-        addr_buf: &RIO_BUF,
-        request_context: *const std::ffi::c_void,
-    ) -> i32 {
-        unsafe {
-            (self.dispatch.send_ex)(
-                rq,
-                data_buf,
-                1,
-                std::ptr::null(),
-                addr_buf,
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                request_context,
-            )
-        }
-    }
-
-    #[inline]
-    fn submit_receive_ex(
-        &self,
-        rq: RIO_RQ,
-        data_buf: &RIO_BUF,
-        addr_buf: &RIO_BUF,
-        request_context: *const std::ffi::c_void,
-    ) -> i32 {
-        unsafe {
-            (self.dispatch.receive_ex)(
-                rq,
-                data_buf,
-                1,
-                std::ptr::null(),
-                addr_buf,
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                request_context,
-            )
-        }
-    }
-
-    #[inline]
-    fn close(&mut self) {
-        if self.cq != 0 {
-            unsafe { (self.dispatch.close_cq)(self.cq) };
-            self.cq = 0;
-        }
-    }
-}
-
-struct RioCompletionRouter<'a> {
-    ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
-    registry: &'a mut RioRegistry,
-    actors: &'a mut FxHashMap<HANDLE, RioSocketActor>,
-    actor_routes: &'a mut FxHashMap<u32, HANDLE>,
-    env: RioEnv<'a>,
-    outstanding_count: &'a mut usize,
-    completed_count: usize,
-}
-
-impl<'a> RioCompletionRouter<'a> {
-    fn new(
-        ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
-        registry: &'a mut RioRegistry,
-        actors: &'a mut FxHashMap<HANDLE, RioSocketActor>,
-        actor_routes: &'a mut FxHashMap<u32, HANDLE>,
-        env: RioEnv<'a>,
-        outstanding_count: &'a mut usize,
-    ) -> Self {
-        Self {
-            ops,
-            registry,
-            actors,
-            actor_routes,
-            env,
-            outstanding_count,
-            completed_count: 0,
-        }
-    }
-
-    fn handle_one(&mut self, res: &RIORESULT) {
-        let Some(kind) = RioState::decode_request_context(res.RequestContext) else {
-            return;
-        };
-
-        match kind {
-            RioCompletionKind::Pool {
-                actor_id,
-                generation,
-            } => {
-                let Some(&handle) = self.actor_routes.get(&actor_id) else {
-                    return;
-                };
-                let (pool_submissions, remove_actor) = {
-                    let Some(actor) = self.actors.get_mut(&handle) else {
-                        return;
-                    };
-                    let Some(slot_idx) = actor.pool_manager.ack_udp_pool_completion(generation)
-                    else {
-                        return;
-                    };
-                    let mut ctx = RioContext {
-                        registry: self.registry,
-                        env: self.env,
-                    };
-                    let submissions = actor.pool_manager.handle_completion(
-                        self.ops,
-                        actor.rq,
-                        actor.actor_id,
-                        slot_idx,
-                        res,
-                        &mut ctx,
-                    );
-                    let remove = actor
-                        .pool_manager
-                        .cleanup_shutdown_udp_pool_if_drained(&mut ctx);
-                    (submissions, remove)
-                };
-                if remove_actor {
-                    self.actors.remove(&handle);
-                    self.actor_routes.remove(&actor_id);
-                }
-                *self.outstanding_count -= 1;
-                *self.outstanding_count += pool_submissions;
-                self.completed_count += 1;
-            }
-            RioCompletionKind::Op {
-                user_data,
-                generation,
-            } => {
-                if user_data >= self.ops.local.len() {
-                    return;
-                }
-
-                let op = &mut self.ops.local[user_data];
-                let slot = &self.ops.shared.slots[user_data];
-                if op.platform_data.generation != generation {
-                    return;
-                }
-
-                if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                    let result = if res.Status == 0 {
-                        Ok(res.BytesTransferred as usize)
-                    } else {
-                        Err(io::Error::from_raw_os_error(res.Status))
-                    };
-                    op.platform_data.lifecycle = OpLifecycle::Completed(result);
-
-                    let result_for_slot = if res.Status == 0 {
-                        Ok(res.BytesTransferred as usize)
-                    } else {
-                        Err(io::Error::from_raw_os_error(res.Status))
-                    };
-                    unsafe { *slot.result.get() = Some(result_for_slot) };
-                    slot.state.store(STATE_COMPLETED, Ordering::Release);
-                    slot.waker.wake();
-                } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
-                    if op.platform_data.rio_needs_drain {
-                        op.platform_data.rio_drained = true;
-                        if slot.state.load(Ordering::Acquire) == STATE_CONSUMED {
-                            let _ = std::mem::take(&mut op.platform_data);
-                            self.ops.free_indices.push(user_data);
-                        }
-                    } else {
-                        let _ = std::mem::take(&mut op.platform_data);
-                        self.ops.free_indices.push(user_data);
-                    }
-                }
-
-                *self.outstanding_count -= 1;
-                self.completed_count += 1;
-            }
-        }
-    }
+    pub(crate) cq: RIO_CQ,
+    pub(crate) chunk_registry: Vec<RIO_BUFFERID>,
+    // RIO Request Queues per socket (raw handle)
+    pub(crate) rio_rqs: FxHashMap<HANDLE, RIO_RQ>,
+    // RIO Request Queues for registered files (O(1) lookup)
+    pub(crate) registered_rio_rqs: Vec<Option<RIO_RQ>>,
+    // RIO Registration for Slab Pages (for Address Buffers)
+    // Maps PageIndex -> (RIO_BUFFERID, BaseAddress)
+    pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize)>>,
+    pub(crate) dispatch: RioDispatch,
 }
 
 impl RioState {
-    #[inline]
-    fn encode_request_context(overlapped: *mut OVERLAPPED) -> *const std::ffi::c_void {
-        overlapped as *const std::ffi::c_void
-    }
+    pub fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Option<Self>> {
+        let table = match &ext.rio_table {
+            Some(t) => t,
+            None => return Ok(None),
+        };
 
-    #[inline]
-    fn decode_request_context(ctx: u64) -> Option<RioCompletionKind> {
-        if ctx == 0 {
-            return None;
-        }
-        let raw = ctx as usize;
-        if (raw & POOL_CTX_TAG) == POOL_CTX_TAG {
-            let token = ((raw >> 1) & 0xffff_ffff) as u32;
-            let actor_id = ((raw >> 33) & 0xffff_ffff) as u32;
-            if token == 0 || actor_id == 0 {
-                return None;
+        // Construct dispatch table, failing if any required function is missing
+        let dispatch = RioDispatch {
+            create_cq: table
+                .RIOCreateCompletionQueue
+                .ok_or_else(|| io::Error::other("RIOCreateCompletionQueue missing"))?,
+            create_rq: table
+                .RIOCreateRequestQueue
+                .ok_or_else(|| io::Error::other("RIOCreateRequestQueue missing"))?,
+            register_buffer: table
+                .RIORegisterBuffer
+                .ok_or_else(|| io::Error::other("RIORegisterBuffer missing"))?,
+            dequeue: table
+                .RIODequeueCompletion
+                .ok_or_else(|| io::Error::other("RIODequeueCompletion missing"))?,
+            notify: table
+                .RIONotify
+                .ok_or_else(|| io::Error::other("RIONotify missing"))?,
+            receive: table
+                .RIOReceive
+                .ok_or_else(|| io::Error::other("RIOReceive missing"))?,
+            send: table
+                .RIOSend
+                .ok_or_else(|| io::Error::other("RIOSend missing"))?,
+            send_ex: table
+                .RIOSendEx
+                .ok_or_else(|| io::Error::other("RIOSendEx missing"))?,
+            receive_ex: table
+                .RIOReceiveEx
+                .ok_or_else(|| io::Error::other("RIOReceiveEx missing"))?,
+        };
+
+        if let Some(create_fn) = Some(dispatch.create_cq) {
+            // RIO_EVENT_KEY is defined in iocp.rs as usize::MAX - 1
+            const RIO_EVENT_KEY: usize = usize::MAX - 1;
+
+            let notification = RIO_NOTIFICATION_COMPLETION {
+                Type: RIO_NOTIFICATION_COMPLETION_TYPE_IOCP as i32,
+                Anonymous: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0 {
+                    Iocp:
+                        windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
+                            IocpHandle: port,
+                            CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
+                            Overlapped: std::ptr::null_mut(),
+                        },
+                },
+            };
+
+            let queue_size = entries.max(1024);
+            let cq = unsafe { create_fn(queue_size, &notification as *const _) };
+
+            if cq == 0 {
+                return Ok(None);
             }
-            return Some(RioCompletionKind::Pool {
-                actor_id,
-                generation: token,
-            });
+
+            Ok(Some(Self {
+                cq,
+                chunk_registry: Vec::new(),
+                rio_rqs: FxHashMap::default(),
+                registered_rio_rqs: Vec::new(),
+                slab_rio_pages: Vec::new(),
+                dispatch,
+            }))
+        } else {
+            Ok(None)
         }
-        let entry = ctx as usize as *const OverlappedEntry;
-        let user_data = unsafe { (*entry).user_data };
-        let generation = unsafe { (*entry).generation };
-        Some(RioCompletionKind::Op {
-            user_data,
-            generation,
-        })
-    }
-
-    #[inline]
-    fn decode_pool_context(ctx: u64) -> Option<(u32, u32)> {
-        if ctx == 0 {
-            return None;
-        }
-        let raw = ctx as usize;
-        if (raw & POOL_CTX_TAG) != POOL_CTX_TAG {
-            return None;
-        }
-        let token = ((raw >> 1) & 0xffff_ffff) as u32;
-        let actor_id = ((raw >> 33) & 0xffff_ffff) as u32;
-        if token == 0 || actor_id == 0 {
-            return None;
-        }
-        Some((actor_id, token))
-    }
-
-    fn last_wsa_error() -> io::Error {
-        io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
-    }
-
-    #[inline]
-    fn build_ctx<'a>(registry: &'a mut RioRegistry, env: RioEnv<'a>) -> RioContext<'a> {
-        RioContext { registry, env }
-    }
-
-    fn alloc_actor_id(&mut self) -> u32 {
-        loop {
-            let id = self.next_actor_id;
-            self.next_actor_id = self.next_actor_id.wrapping_add(1);
-            if id == 0 {
-                continue;
-            }
-            if !self.actor_routes.contains_key(&id) {
-                return id;
-            }
-        }
-    }
-
-    fn ensure_actor(
-        &mut self,
-        target: (IoFd, HANDLE),
-        env: RioEnv<'_>,
-    ) -> io::Result<&mut RioSocketActor> {
-        let (fd, handle) = target;
-        if !self.actors.contains_key(&handle) {
-            let rq = self.registry.create_rq((handle, fd), env)?;
-            let actor_id = self.alloc_actor_id();
-            self.actor_routes.insert(actor_id, handle);
-            self.actors
-                .insert(handle, RioSocketActor::new(actor_id, rq));
-        }
-        Ok(self.actors.get_mut(&handle).expect("actor inserted"))
-    }
-
-    pub fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
-        let kernel = RioKernel::from_extensions(port, entries, ext)?;
-
-        let rq_depth = entries.clamp(32, 256);
-
-        Ok(Self {
-            kernel,
-            registry: RioRegistry::new(rq_depth),
-            actors: FxHashMap::default(),
-            actor_routes: FxHashMap::default(),
-            next_actor_id: 1,
-            outstanding_count: 0,
-        })
     }
 
     pub fn resize_registered_rqs(&mut self, size: usize) {
-        self.registry.resize_registered_rqs(size);
+        if size > self.registered_rio_rqs.len() {
+            self.registered_rio_rqs.resize(size, None);
+        }
     }
 
     pub fn clear_registered_rq(&mut self, idx: usize) {
-        self.registry.clear_registered_rq(idx);
+        if idx < self.registered_rio_rqs.len() {
+            self.registered_rio_rqs[idx] = None;
+        }
     }
 
     pub fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-        self.registry.register_chunk(id, (ptr, len), env)
-    }
+        let reg_fn = self.dispatch.register_buffer;
+        let id_idx = id as usize;
 
-    pub fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
-        let mut remove_actor = None;
-        if let Some(actor) = self.actors.get_mut(&handle) {
-            actor.pool_manager.begin_udp_pool_shutdown();
-            if actor
-                .pool_manager
-                .cleanup_shutdown_udp_pool_if_drained(&mut ctx)
-            {
-                remove_actor = Some(actor.actor_id);
-            }
+        if id_idx >= self.chunk_registry.len() {
+            self.chunk_registry.resize(id_idx + 1, RIO_INVALID_BUFFERID);
         }
-        if let Some(actor_id) = remove_actor {
-            self.actors.remove(&handle);
-            self.actor_routes.remove(&actor_id);
-        }
-    }
 
-    pub fn cancel_udp_recv_waiter(
-        &mut self,
-        handle: HANDLE,
-        uid: (usize, u32),
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) {
-        let env = self.kernel.env(registrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
-        if let Some(actor) = self.actors.get_mut(&handle) {
-            actor
-                .pool_manager
-                .cancel_udp_recv_waiter(uid, actor.rq, actor.actor_id, &mut ctx);
+        // Check if already registered? For now assuming simple update or overwrite.
+        // Note: RIO buffers need to be deregistered? implementation specific.
+        // Here we assume new registration.
+
+        let buf_id = unsafe { reg_fn(ptr, len as u32) };
+        if buf_id == RIO_INVALID_BUFFERID {
+            return Err(io::Error::last_os_error());
         }
+
+        self.chunk_registry[id_idx] = buf_id;
+        Ok(())
     }
 
     pub fn process_completions(
         &mut self,
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<usize> {
+    ) -> io::Result<()> {
+        let dequeue_fn = self.dispatch.dequeue;
+
+        // Stack buffer for completions
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
-        let env = self.kernel.env(registrar);
-        let mut router = RioCompletionRouter::new(
-            ops,
-            &mut self.registry,
-            &mut self.actors,
-            &mut self.actor_routes,
-            env,
-            &mut self.outstanding_count,
-        );
 
         loop {
-            let count = self
-                .kernel
-                .dequeue(results.as_mut_ptr(), MAX_RIO_RESULTS as u32);
+            let count =
+                unsafe { dequeue_fn(self.cq, results.as_mut_ptr(), MAX_RIO_RESULTS as u32) };
 
             if count == RIO_CORRUPT_CQ {
-                return Err(io_msg(
-                    IocpErrorContext::Rio,
-                    "RIO completion queue is corrupt (RIO_CORRUPT_CQ)",
+                return Err(io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32,
                 ));
             }
+
             if count == 0 {
                 break;
             }
 
+            let ops_local = &mut ops.local;
+            let ops_shared = &ops.shared;
+
             for res in results.iter().take(count as usize) {
-                router.handle_one(res);
+                let user_data = res.RequestContext as usize;
+
+                if user_data < ops_local.len() {
+                    let op = &mut ops_local[user_data];
+                    let slot = &ops_shared.slots[user_data];
+
+                    if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                        let result = if res.Status == 0 {
+                            Ok(res.BytesTransferred as usize)
+                        } else {
+                            Err(io::Error::from_raw_os_error(res.Status))
+                        };
+
+                        op.platform_data.lifecycle = OpLifecycle::Completed(result);
+
+                        let result_for_slot = if res.Status == 0 {
+                            Ok(res.BytesTransferred as usize)
+                        } else {
+                            Err(io::Error::from_raw_os_error(res.Status))
+                        };
+                        unsafe { *slot.result.get() = Some(result_for_slot) };
+                        slot.state.store(STATE_COMPLETED, Ordering::Release);
+                        slot.waker.wake();
+                    } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
+                        // We must remove it from registry because it was cancelled but RIO just completed it.
+                        // Can't invoke `ops.remove(user_data)` directly due to split.
+                        // But we can emulate it:
+                        let _ = std::mem::take(&mut op.platform_data);
+                        ops.free_indices.push(user_data);
+                    }
+                }
             }
 
             if count < MAX_RIO_RESULTS as u32 {
@@ -667,441 +250,287 @@ impl RioState {
             }
         }
 
-        self.kernel.rearm_notify()?;
-        Ok(router.completed_count)
+        let notify_fn = self.dispatch.notify;
+        let ret = unsafe { notify_fn(self.cq) };
+        if ret != 0 {
+            return Err(io::Error::from_raw_os_error(ret));
+        }
+        Ok(())
+    }
+
+    // Check if slab page is registered, register if not
+    pub fn ensure_slab_page_registration(
+        &mut self,
+        page_idx: usize,
+        ops: &OpRegistry<IocpOp, IocpOpState>,
+    ) {
+        if page_idx >= self.slab_rio_pages.len() {
+            self.slab_rio_pages.resize(page_idx + 1, None);
+        }
+
+        if self.slab_rio_pages[page_idx].is_none()
+            && let Some((ptr, len)) = ops.get_page_slice(page_idx)
+        {
+            let reg_fn = self.dispatch.register_buffer;
+            let id = unsafe { reg_fn(ptr, len as u32) };
+            if id != RIO_INVALID_BUFFERID {
+                self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
+            }
+        }
+    }
+
+    fn ensure_rq(&mut self, handle: HANDLE, fd: IoFd) -> io::Result<RIO_RQ> {
+        // fast path for registered files
+        if let IoFd::Fixed(idx) = fd {
+            let idx = idx as usize;
+            if let Some(Some(rq)) = self.registered_rio_rqs.get(idx) {
+                return Ok(*rq);
+            }
+        } else {
+            // Fallback for raw handles
+            if let Some(&rq) = self.rio_rqs.get(&handle) {
+                return Ok(rq);
+            }
+        }
+
+        let create_fn = self.dispatch.create_rq;
+
+        // Queue sizes
+        const MAX_OUTSTANDING_RECVS: u32 = 1024;
+        const MAX_OUTSTANDING_SENDS: u32 = 1024;
+
+        let rq = unsafe {
+            create_fn(
+                handle as usize, // Corrected cast handle: HANDLE (*mut c_void) -> usize
+                MAX_OUTSTANDING_RECVS,
+                1,
+                MAX_OUTSTANDING_SENDS,
+                1,
+                self.cq,
+                self.cq,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if rq == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        if let IoFd::Fixed(idx) = fd {
+            let idx = idx as usize;
+            if idx < self.registered_rio_rqs.len() {
+                self.registered_rio_rqs[idx] = Some(rq);
+            }
+        } else {
+            self.rio_rqs.insert(handle, rq);
+        }
+        Ok(rq)
     }
 
     pub fn try_submit_recv(
         &mut self,
-        target: (IoFd, HANDLE, *mut OVERLAPPED),
-        buf: &mut veloq_buf::FixedBuf,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
-        let (fd, handle, overlapped) = target;
-        let dispatch = self.kernel.dispatch;
-        let env = RioEnv {
-            registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
+        fd: IoFd,
+        handle: HANDLE,
+        buf: &mut FixedBuf,
+        user_data: usize,
+    ) -> io::Result<Option<SubmissionResult>> {
+        let (idx, offset) = buf.resolve_region_info();
+        // Check chunk registry
+        let buffer_id = match self.chunk_registry.get(idx) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => id,
+            _ => return Ok(None),
         };
-        let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let rio_buf =
-            self.registry
-                .prepare_data_submission((fd, handle), buf, buf.capacity() as u32, env)?;
-        let request_context = Self::encode_request_context(overlapped);
-        let ret = self.kernel.submit_receive(rq, &rio_buf, request_context);
+
+        // Now self.registered_bufs borrow has ended
+        let rq = self.ensure_rq(handle, fd)?;
+
+        let rio_buf = RIO_BUF {
+            BufferId: buffer_id,
+            Offset: offset as u32,
+            Length: buf.capacity() as u32,
+        };
+
+        let recv_fn = self.dispatch.receive;
+        let request_context = user_data as *mut std::ffi::c_void;
+
+        let ret = unsafe { recv_fn(rq, &rio_buf, 1, 0, request_context) };
+
         if ret == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!("RIOReceive submission failed: fd={fd:?}, handle={handle:?}"),
-            ));
+            return Err(io::Error::last_os_error());
         }
-        self.outstanding_count += 1;
-        Ok(SubmissionResult::Pending)
+        Ok(Some(SubmissionResult::Pending))
     }
 
     pub fn try_submit_send(
         &mut self,
-        target: (IoFd, HANDLE, *mut OVERLAPPED),
-        buf: &veloq_buf::FixedBuf,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
-        let (fd, handle, overlapped) = target;
-        let dispatch = self.kernel.dispatch;
-        let env = RioEnv {
-            registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
+        fd: IoFd,
+        handle: HANDLE,
+        buf: &FixedBuf,
+        user_data: usize,
+    ) -> io::Result<Option<SubmissionResult>> {
+        let (idx, offset) = buf.resolve_region_info();
+        // Check chunk registry
+        let buffer_id = match self.chunk_registry.get(idx) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => id,
+            _ => return Ok(None),
         };
-        let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let rio_buf =
-            self.registry
-                .prepare_data_submission((fd, handle), buf, buf.len() as u32, env)?;
-        let request_context = Self::encode_request_context(overlapped);
-        let ret = self.kernel.submit_send(rq, &rio_buf, request_context);
+
+        let rq = self.ensure_rq(handle, fd)?;
+
+        let rio_buf = RIO_BUF {
+            BufferId: buffer_id,
+            Offset: offset as u32,
+            Length: buf.len() as u32,
+        };
+
+        let send_fn = self.dispatch.send;
+        let request_context = user_data as *mut std::ffi::c_void;
+
+        let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
+
         if ret == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!("RIOSend submission failed: fd={fd:?}, handle={handle:?}"),
-            ));
+            return Err(io::Error::last_os_error());
         }
-        self.outstanding_count += 1;
-        Ok(SubmissionResult::Pending)
+        Ok(Some(SubmissionResult::Pending))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn try_submit_send_to(
         &mut self,
-        args: RioSendToArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
-        use windows_sys::Win32::Networking::WinSock::{
-            AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
-        };
-        let RioSendToArgs {
-            fd,
-            handle,
-            buf,
-            addr_ptr,
-            addr_len,
-            overlapped,
-            page_idx,
-        } = args;
-
-        let dispatch = self.kernel.dispatch;
-        let env = RioEnv {
-            registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
-        };
-        let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let data_buf =
-            self.registry
-                .prepare_data_submission((fd, handle), buf, buf.len() as u32, env)?;
-        self.registry
-            .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
-        let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
-
-        if addr_ptr.is_null() {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                "RIO send_to received null remote address pointer",
-            ));
-        }
-        let family = unsafe { (*(addr_ptr as *const SOCKADDR)).sa_family };
-        let min_addr_len = match family {
-            AF_INET => std::mem::size_of::<SOCKADDR_IN>(),
-            AF_INET6 => std::mem::size_of::<SOCKADDR_IN6>(),
+        fd: IoFd,
+        handle: HANDLE,
+        buf: &FixedBuf,
+        addr_ptr: *const std::ffi::c_void,
+        addr_len: i32,
+        user_data: usize,
+        page_idx: usize,
+    ) -> io::Result<Option<SubmissionResult>> {
+        let (idx, offset) = buf.resolve_region_info();
+        // Check chunk registry
+        let buffer_id = match self.chunk_registry.get(idx) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => id,
             _ => {
-                return Err(io_msg(
-                    IocpErrorContext::Rio,
-                    format!("RIO send_to unsupported address family: family={family}"),
-                ));
+                // If index is invalid, fallback to normal IO
+                return Ok(None);
             }
         };
-        if (addr_len as usize) < min_addr_len {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!(
-                    "RIO send_to invalid address length: addr_len={}, min_required={}, family={}",
-                    addr_len, min_addr_len, family
-                ),
-            ));
-        }
 
-        let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>();
-        let addr_addr = addr_ptr as usize;
-        let slab_end = base_addr.saturating_add(slab_len);
-        if addr_addr < base_addr || addr_addr >= slab_end {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!(
-                    "RIO send_to address pointer is outside registered slab: page_idx={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}, slab_end=0x{:x}",
-                    page_idx, addr_addr, base_addr, slab_len, slab_end
-                ),
-            ));
-        }
-        let addr_end = addr_addr.saturating_add(rio_addr_len);
-        if addr_end > slab_end {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!(
-                    "RIO send_to address range exceeds registered slab: page_idx={}, addr_ptr=0x{:x}, addr_len={}, addr_end=0x{:x}, slab_end=0x{:x}",
-                    page_idx, addr_addr, rio_addr_len, addr_end, slab_end
-                ),
-            ));
-        }
-
-        let addr_offset = (addr_addr - base_addr) as u32;
-        let addr_buf = RIO_BUF {
-            BufferId: addr_buf_id,
-            Offset: addr_offset,
-            Length: rio_addr_len as u32,
+        // Copy values out to avoid holding borrow on self.slab_rio_pages while calling ensure_rq
+        let (addr_buf_id, base_addr) = if let Some(Some(entry)) = self.slab_rio_pages.get(page_idx)
+        {
+            *entry
+        } else {
+            error!("RIO: Slab page not registered for send_to");
+            return Ok(None);
         };
-        let request_context = Self::encode_request_context(overlapped);
 
-        let ret = self
-            .kernel
-            .submit_send_ex(rq, &data_buf, &addr_buf, request_context);
-        if ret == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!(
-                    "RIOSendEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={}, rq=0x{:x}, data_buf_id=0x{:x}, data_off={}, data_len={}, addr_buf_id=0x{:x}, addr_off={}, addr_len={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}",
-                    page_idx,
-                    rq as usize,
-                    data_buf.BufferId as usize,
-                    data_buf.Offset,
-                    data_buf.Length,
-                    addr_buf.BufferId as usize,
-                    addr_buf.Offset,
-                    addr_buf.Length,
-                    addr_addr,
-                    base_addr,
-                    slab_len
-                ),
-            ));
-        }
-        self.outstanding_count += 1;
-        Ok(SubmissionResult::Pending)
-    }
+        let rq = self.ensure_rq(handle, fd)?;
 
-    pub fn try_submit_recv_from(
-        &mut self,
-        args: RioRecvFromArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
-        let RioRecvFromArgs {
-            fd,
-            handle,
-            buf,
-            addr_ptr,
-            len_ptr: _len_ptr,
-            overlapped,
-            page_idx,
-        } = args;
-        let dispatch = self.kernel.dispatch;
-        let env = RioEnv {
-            registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
+        let data_buf = RIO_BUF {
+            BufferId: buffer_id,
+            Offset: offset as u32,
+            Length: buf.len() as u32,
         };
-        let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let data_buf =
-            self.registry
-                .prepare_data_submission((fd, handle), buf, buf.capacity() as u32, env)?;
-        self.registry
-            .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
-        let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
 
-        let addr_addr = addr_ptr as usize;
-        let slab_end = base_addr.saturating_add(slab_len);
-        let addr_len = std::mem::size_of::<crate::SockAddrStorage>();
-        if addr_addr < base_addr || addr_addr >= slab_end {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!(
-                    "RIO recv_from address pointer is outside registered slab: page_idx={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}, slab_end=0x{:x}",
-                    page_idx, addr_addr, base_addr, slab_len, slab_end
-                ),
-            ));
-        }
-        let addr_end = addr_addr.saturating_add(addr_len);
-        if addr_end > slab_end {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!(
-                    "RIO recv_from address range exceeds registered slab: page_idx={}, addr_ptr=0x{:x}, addr_len={}, addr_end=0x{:x}, slab_end=0x{:x}",
-                    page_idx, addr_addr, addr_len, addr_end, slab_end
-                ),
-            ));
-        }
-
-        let addr_offset = (addr_addr - base_addr) as u32;
+        let addr_offset = (addr_ptr as usize - base_addr) as u32;
         let addr_buf = RIO_BUF {
             BufferId: addr_buf_id,
             Offset: addr_offset,
             Length: addr_len as u32,
         };
-        let request_context = Self::encode_request_context(overlapped);
 
-        let ret = self
-            .kernel
-            .submit_receive_ex(rq, &data_buf, &addr_buf, request_context);
+        let send_ex_fn = self.dispatch.send_ex;
+        let request_context = user_data as *mut std::ffi::c_void;
+
+        let ret = unsafe {
+            send_ex_fn(
+                rq,
+                &data_buf,
+                1,
+                std::ptr::null(),
+                &addr_buf,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                request_context,
+            )
+        };
+
         if ret == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!(
-                    "RIOReceiveEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={}, rq=0x{:x}, data_buf_id=0x{:x}, data_off={}, data_len={}, addr_buf_id=0x{:x}, addr_off={}, addr_len={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}",
-                    page_idx,
-                    rq as usize,
-                    data_buf.BufferId as usize,
-                    data_buf.Offset,
-                    data_buf.Length,
-                    addr_buf.BufferId as usize,
-                    addr_buf.Offset,
-                    addr_buf.Length,
-                    addr_addr,
-                    base_addr,
-                    slab_len
-                ),
-            ));
+            return Err(io::Error::last_os_error());
         }
-        self.outstanding_count += 1;
-        Ok(SubmissionResult::Pending)
+        Ok(Some(SubmissionResult::Pending))
     }
 
-    pub fn try_submit_udp_recv_stream_pooled(
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_submit_recv_from(
         &mut self,
-        args: RioUdpStreamArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
-        let RioUdpStreamArgs {
-            fd,
-            handle,
-            stream_op,
-            user_data,
-            generation,
-        } = args;
-        let dispatch = self.kernel.dispatch;
-        let env = RioEnv {
-            registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
-        };
-        let _ = self.ensure_actor((fd, handle), env)?;
-        let (registry, actors) = (&mut self.registry, &mut self.actors);
-        let actor = actors.get_mut(&handle).expect("actor exists");
-        let mut ctx = Self::build_ctx(registry, env);
-        let (res, pool_submissions) = actor.pool_manager.try_submit_udp_recv_stream_pooled(
-            actor.rq,
-            actor.actor_id,
-            stream_op,
-            (user_data, generation),
-            &mut ctx,
-        )?;
-        self.outstanding_count += pool_submissions;
-        if matches!(res, SubmissionResult::Pending) {
-            self.outstanding_count += 1;
-        }
-        Ok(res)
-    }
-
-    pub fn try_refill_udp_pool(
-        &mut self,
-        target: (IoFd, HANDLE),
-        buf: FixedBuf,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<()> {
-        let dispatch = self.kernel.dispatch;
-        let env = RioEnv {
-            registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
-        };
-        let (fd, handle) = target;
-        let _ = self.ensure_actor((fd, handle), env)?;
-        let (registry, actors) = (&mut self.registry, &mut self.actors);
-        let actor = actors.get_mut(&handle).expect("actor exists");
-        let mut ctx = Self::build_ctx(registry, env);
-        let pool_submissions =
-            actor
-                .pool_manager
-                .try_refill_udp_pool(actor.rq, actor.actor_id, buf, &mut ctx)?;
-        self.outstanding_count += pool_submissions;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn udp_pool_debug_stats(
-        &self,
+        fd: IoFd,
         handle: HANDLE,
-    ) -> Option<pool::UdpRecvPoolDebugStats> {
-        self.actors
-            .get(&handle)
-            .and_then(|actor| actor.pool_manager.udp_pool_debug_stats())
-    }
+        buf: &mut FixedBuf,
+        addr_ptr: *const std::ffi::c_void,
+        len_ptr: *const i32,
+        user_data: usize,
+        page_idx: usize,
+    ) -> io::Result<Option<SubmissionResult>> {
+        let (idx, offset) = buf.resolve_region_info();
+        // Check chunk registry
+        let buffer_id = match self.chunk_registry.get(idx) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => id,
+            _ => return Ok(None),
+        };
 
-    #[cfg(test)]
-    pub(crate) fn debug_tick_udp_pool_idle(
-        &mut self,
-        handle: HANDLE,
-        ticks: usize,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<()> {
-        let env = self.kernel.env(registrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
-        if let Some(actor) = self.actors.get_mut(&handle) {
-            for _ in 0..ticks {
-                actor
-                    .pool_manager
-                    .rebalance_udp_pool(actor.rq, actor.actor_id, &mut ctx)?;
-            }
+        // Copy values out to avoid holding borrow on self
+        let (addr_buf_id, base_addr) = if let Some(Some(entry)) = self.slab_rio_pages.get(page_idx)
+        {
+            *entry
+        } else {
+            error!("RIO: Slab page not registered for recv_from");
+            return Ok(None);
+        };
+
+        let rq = self.ensure_rq(handle, fd)?;
+
+        let data_buf = RIO_BUF {
+            BufferId: buffer_id,
+            Offset: offset as u32,
+            Length: buf.capacity() as u32,
+        };
+
+        let addr_offset = (addr_ptr as usize - base_addr) as u32;
+        let addr_buf = RIO_BUF {
+            BufferId: addr_buf_id,
+            Offset: addr_offset,
+            Length: std::mem::size_of::<SockAddrStorage>() as u32,
+        };
+
+        let len_offset = (len_ptr as usize - base_addr) as u32;
+        let len_buf = RIO_BUF {
+            BufferId: addr_buf_id,
+            Offset: len_offset,
+            Length: 4,
+        };
+
+        let recv_ex_fn = self.dispatch.receive_ex;
+        let request_context = user_data as *mut std::ffi::c_void;
+
+        let ret = unsafe {
+            recv_ex_fn(
+                rq,
+                &data_buf,
+                1,
+                std::ptr::null(),
+                &addr_buf,
+                &len_buf,
+                std::ptr::null(),
+                0,
+                request_context,
+            )
+        };
+
+        if ret == 0 {
+            return Err(io::Error::last_os_error());
         }
-        Ok(())
-    }
-}
-
-impl Drop for RioState {
-    fn drop(&mut self) {
-        // Explicit UDP pool shutdown protocol:
-        // 1) forbid new submissions; 2) mark in-flight slots as stop-requested;
-        // 3) drain CQ until all slot acknowledgements arrive; 4) release buffers/CQ.
-        for actor in self.actors.values_mut() {
-            actor.pool_manager.begin_udp_pool_shutdown();
-        }
-
-        // Consolidate drain: Wait for all outstanding RIO requests (Pool + Standard) to finish.
-        // This ensures the kernel is no longer touching any registered buffers or pool slots.
-        let start = std::time::Instant::now();
-        while self.outstanding_count > 0 {
-            if start.elapsed() >= std::time::Duration::from_secs(5) {
-                tracing::warn!(
-                    outstanding = self.outstanding_count,
-                    "RioState::drop: Timeout waiting for outstanding RIO requests"
-                );
-                break;
-            }
-
-            const MAX_RESULTS: usize = 128;
-            let mut results: [RIORESULT; MAX_RESULTS] = unsafe { std::mem::zeroed() };
-            let count = self
-                .kernel
-                .dequeue(results.as_mut_ptr(), MAX_RESULTS as u32);
-
-            if count == RIO_CORRUPT_CQ || count == 0 {
-                std::thread::yield_now();
-            } else {
-                for res in results.iter().take(count as usize) {
-                    if let Some((actor_id, completion_generation)) =
-                        Self::decode_pool_context(res.RequestContext)
-                        && let Some(handle) = self.actor_routes.get(&actor_id).copied()
-                        && let Some(actor) = self.actors.get_mut(&handle)
-                    {
-                        let _ = actor
-                            .pool_manager
-                            .ack_udp_pool_completion(completion_generation);
-                        actor.pool_manager.handle_completion_drain_only();
-                        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-                        let mut ctx = Self::build_ctx(&mut self.registry, env);
-                        if actor
-                            .pool_manager
-                            .cleanup_shutdown_udp_pool_if_drained(&mut ctx)
-                        {
-                            self.actor_routes.remove(&actor_id);
-                            self.actors.remove(&handle);
-                        }
-                    }
-                    self.outstanding_count -= 1;
-                }
-            }
-        }
-
-        for actor in self.actors.values_mut() {
-            actor.pool_manager.udp_ctx_map.clear();
-        }
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
-        for actor in self.actors.values_mut() {
-            actor
-                .pool_manager
-                .forget_in_flight_and_deregister_rest(&mut ctx);
-        }
-        self.actors.clear();
-        self.actor_routes.clear();
-        let _ = ctx;
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-        self.registry.cleanup_deregister(env);
-        self.kernel.close();
+        Ok(Some(SubmissionResult::Pending))
     }
 }

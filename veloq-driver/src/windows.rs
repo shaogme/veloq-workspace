@@ -2,8 +2,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::raw::c_void;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_STREAM, SOCKADDR,
-    SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSADATA, WSASocketW,
-    WSAStartup, bind, closesocket, getsockname, listen,
+    SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED, WSADATA, WSASocketW, WSAStartup, bind,
+    closesocket, getsockname, listen,
 };
 
 pub struct Socket {
@@ -19,7 +19,7 @@ impl Socket {
                 protocol,
                 std::ptr::null(),
                 0,
-                WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
+                WSA_FLAG_OVERLAPPED,
             )
         };
         if s == INVALID_SOCKET {

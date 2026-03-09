@@ -13,12 +13,12 @@ use crate::driver::iocp::rio::RioState;
 use crate::driver::iocp::submit::{self, SubmissionResult};
 use crate::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
-    Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
+    RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
 };
 use std::io;
 use std::mem::ManuallyDrop;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, WSABUF};
+use windows_sys::Win32::Networking::WinSock::WSABUF;
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // ============================================================================
@@ -29,7 +29,6 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 pub struct OverlappedEntry {
     pub inner: OVERLAPPED,
     pub user_data: usize,
-    pub generation: u32,
     pub blocking_result: Option<io::Result<usize>>,
 }
 
@@ -38,7 +37,6 @@ impl OverlappedEntry {
         Self {
             inner: unsafe { std::mem::zeroed() },
             user_data,
-            generation: 0,
             blocking_result: None,
         }
     }
@@ -53,12 +51,10 @@ pub struct SubmitContext<'a> {
     pub overlapped: *mut OVERLAPPED,
     pub ext: &'a Extensions,
     pub registered_files: &'a [Option<HANDLE>],
-    pub registrar: &'a dyn veloq_buf::BufferRegistrar,
 
     // RIO Support
-    pub rio: &'a mut RioState,
+    pub rio: Option<&'a mut RioState>,
     pub slots_per_page: usize,
-    pub slab_resolver: &'a dyn Fn(usize) -> Option<(*const u8, usize)>,
 }
 
 // ============================================================================
@@ -212,6 +208,14 @@ pub struct SendToPayload {
     pub addr_len: i32,
 }
 
+pub struct RecvFromPayload {
+    pub op: RecvFrom,
+    pub wsabuf: WSABUF,
+    pub flags: u32,
+    pub addr: SockAddrStorage,
+    pub addr_len: i32,
+}
+
 pub struct OpenPayload {
     pub op: Open,
 }
@@ -306,13 +310,7 @@ define_iocp_ops! {
         drop: submit::drop_send_to,
         get_fd: submit::get_fd_send_to,
         construct: |op: SendTo| {
-            let (addr, raw_addr_len) = crate::socket_addr_to_storage(op.addr);
-            let addr_len = if op.addr.is_ipv4() {
-                std::mem::size_of::<SOCKADDR_IN>() as i32
-            } else {
-                std::mem::size_of::<SOCKADDR_IN6>() as i32
-            };
-            debug_assert_eq!(raw_addr_len, addr_len);
+            let (addr, addr_len) = crate::socket_addr_to_storage(op.addr);
             let wsabuf = WSABUF {
                 len: op.buf.len() as u32,
                 buf: op.buf.as_slice().as_ptr() as *mut u8,
@@ -326,18 +324,35 @@ define_iocp_ops! {
         },
         destruct: |p: SendToPayload| p.op,
     },
-    UdpRecvStream {
-        field: udp_recv_stream,
-        submit: submit::submit_udp_recv_stream,
-        on_complete: submit::on_complete_udp_recv_stream,
-        drop: submit::drop_udp_recv_stream,
-        get_fd: submit::get_fd_udp_recv_stream,
-    },
-    UdpRefill {
-        field: udp_refill,
-        submit: submit::submit_udp_refill,
-        drop: submit::drop_udp_refill,
-        get_fd: submit::get_fd_udp_refill,
+    RecvFrom {
+        field: recv_from,
+        payload: RecvFromPayload,
+        submit: submit::submit_recv_from,
+        drop: submit::drop_recv_from,
+        get_fd: submit::get_fd_recv_from,
+        construct: |mut op: RecvFrom| {
+            let wsabuf = WSABUF {
+                len: op.buf.capacity() as u32,
+                buf: op.buf.as_mut_ptr(),
+            };
+            RecvFromPayload {
+                op,
+                wsabuf,
+                flags: 0,
+                addr: SockAddrStorage::default(),
+                addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
+            }
+        },
+        destruct: |p: RecvFromPayload| {
+            let mut val = p.op;
+            let len = p.addr_len as usize;
+            let addr = unsafe {
+                let s = std::slice::from_raw_parts(&p.addr as *const _ as *const u8, len);
+                crate::to_socket_addr(s).ok()
+            };
+            val.addr = addr;
+            val
+        },
     },
     Open {
         field: open,

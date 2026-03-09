@@ -105,7 +105,6 @@ pub struct UringDriver {
 
     pub(crate) wheel: veloq_wheel::Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
-    pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
 }
 
 impl UringDriver {
@@ -155,7 +154,6 @@ impl UringDriver {
 
             wheel: veloq_wheel::Wheel::new(veloq_wheel::WheelConfig::default()),
             timer_buffer: Vec::new(),
-            registrar: Box::new(veloq_buf::NoopRegistrar),
         };
 
         driver.submit_waker();
@@ -188,42 +186,16 @@ impl UringDriver {
             let slot = &self.ops.shared.slots[user_data];
             unsafe {
                 if let Some(res) = (*slot.op.get()).as_mut() {
-                    let vtable = res.vtable.as_ref();
-                    let strategy = vtable.strategy;
-
+                    let strategy = res.vtable.as_ref().strategy;
                     match strategy {
                         crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
-                            // --- Lazy Registration ---
-                            let mut chunks = [0u16; 4];
-                            let count = (vtable.resolve_chunks)(res, &mut chunks);
-                            for &chunk_id in chunks.iter().take(count) {
-                                let index = chunk_id as usize;
-                                // Explicitly handle bitset error
-                                let is_registered =
-                                    self.registered_chunks.get(index).map_err(|e| {
-                                        io::Error::other(format!(
-                                            "BitSet error getting {}: {:?}",
-                                            index, e
-                                        ))
-                                    })?;
-
-                                if !is_registered
-                                    && let Some(info) = self.registrar.resolve_chunk_info(chunk_id)
-                                {
-                                    self.register_chunk(
-                                        info.id,
-                                        info.ptr.as_ptr(),
-                                        info.len.get(),
-                                    )?;
-                                }
-                            }
-                            // -------------------------
-
-                            let s = (vtable.make_sqe)(res, self).user_data(user_data as u64);
+                            let driver_ref = &*(self as *mut Self as *const Self);
+                            let s = (res.vtable.as_ref().make_sqe)(res, driver_ref)
+                                .user_data(user_data as u64);
                             (Some(s), strategy, None)
                         }
                         crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
-                            let d = (vtable.get_timeout)(res);
+                            let d = (res.vtable.as_ref().get_timeout)(res);
                             (None, strategy, d)
                         }
                         _ => (None, strategy, None),
@@ -314,7 +286,9 @@ impl UringDriver {
                 let slot = &self.ops.shared.slots[user_data];
                 unsafe {
                     let op_ref = (*slot.op.get()).as_mut().unwrap();
-                    (op_ref.vtable.as_ref().make_sqe)(op_ref, self).user_data(user_data as u64)
+                    let driver_ref = &*(self as *mut Self as *const Self);
+                    (op_ref.vtable.as_ref().make_sqe)(op_ref, driver_ref)
+                        .user_data(user_data as u64)
                 }
             };
 

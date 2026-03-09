@@ -7,8 +7,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::rc::Weak;
+use std::rc::{Rc, Weak};
 
+use crossbeam_deque::Worker;
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver::driver::PlatformDriver;
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
@@ -17,6 +18,8 @@ use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
 use crate::runtime::executor::spawner::pack_job;
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
+// Runnable is needed for context methods
+use crate::runtime::task::harness::{self, Runnable};
 use crate::runtime::task::{SpawnedTask, Task};
 
 thread_local! {
@@ -122,6 +125,7 @@ pub struct RuntimeContext {
     pub(crate) spawner: Option<Spawner>,
     pub(crate) handle: ExecutorHandle,
     pub(crate) buf_pool: AnyBufPool,
+    pub(crate) stealable: Rc<Worker<Runnable>>,
 }
 
 impl RuntimeContext {
@@ -132,6 +136,7 @@ impl RuntimeContext {
         spawner: Option<Spawner>,
         handle: ExecutorHandle,
         buf_pool: AnyBufPool,
+        stealable: Rc<Worker<Runnable>>,
     ) -> Self {
         Self {
             driver,
@@ -139,6 +144,7 @@ impl RuntimeContext {
             spawner,
             handle,
             buf_pool,
+            stealable,
         }
     }
 
@@ -234,28 +240,19 @@ impl RuntimeContext {
         F: Future<Output = Output> + Send + 'static,
         Output: Send + 'static,
     {
-        let queue = self.queue.upgrade().expect("executor has been dropped");
-        let (handle, producer) = JoinHandle::new();
-
-        // Prioritize freshly spawned tasks on current worker so they can submit I/O
-        // before the caller continues deeper in the same logical flow.
-        let task = unsafe {
-            SpawnedTask::new_local(async move {
-                let output = future.await;
-                producer.set(output);
-            })
-            .bind(
-                self.handle.id,
-                self.queue.clone(),
-                self.handle.shared.clone(),
-            )
-        };
-
-        // Poll once immediately to raise spawn priority and reduce submit ordering races.
-        task.run();
-        // Ensure queue reference is retained for the task context; task.run may wake and push back.
-        drop(queue);
-        handle
+        // We are on a worker that supports stealing.
+        // Create task bound to THIS executor's scheduler.
+        let scheduler = self.handle.shared.clone();
+        unsafe {
+            let (job, handle) = harness::spawn_arc(future, scheduler);
+            self.stealable.push(job);
+            // Increment load
+            self.handle
+                .shared
+                .injected_load
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            handle
+        }
     }
 }
 

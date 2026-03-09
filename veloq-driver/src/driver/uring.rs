@@ -136,7 +136,9 @@ impl Driver for UringDriver {
         let strategy = unsafe { op.vtable.as_ref().strategy };
         if strategy == op::SubmissionStrategy::BackgroundOnly {
             let sqe = unsafe {
-                (op.vtable.as_ref().make_sqe)(&mut op, self).user_data(inner::BACKGROUND_USER_DATA)
+                let driver_ref = &*(self as *mut Self as *const Self);
+                (op.vtable.as_ref().make_sqe)(&mut op, driver_ref)
+                    .user_data(inner::BACKGROUND_USER_DATA)
             };
 
             if !self.push_entry(sqe) {
@@ -277,9 +279,5 @@ impl Driver for UringDriver {
 
     fn driver_id(&self) -> usize {
         self.waker_fd.fd as usize
-    }
-
-    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
-        self.registrar = registrar;
     }
 }
