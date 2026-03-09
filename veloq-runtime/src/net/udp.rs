@@ -1,5 +1,6 @@
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::num::NonZeroUsize;
 
 use crate::net::common::InnerSocket;
 use crate::runtime::context::submit;
@@ -66,6 +67,20 @@ impl UdpSocket {
 // ============================================================================
 
 impl<S: OpSubmitter> GenericUdpSocket<S> {
+    pub async fn recv_ready(&self, buf_capacity: NonZeroUsize, credits: usize) -> io::Result<()> {
+        let target = credits.max(1);
+        for _ in 0..target {
+            let buf = FixedBuf::alloc_heap(buf_capacity)?;
+            let refill = UdpRefill {
+                fd: IoFd::Raw(self.inner.raw()),
+                buf: Some(buf),
+            };
+            let (res, _op_back) = submit(&self.submitter, Op::new(refill)).await.into_inner();
+            res?;
+        }
+        Ok(())
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }

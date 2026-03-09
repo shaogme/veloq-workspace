@@ -56,6 +56,15 @@ async fn udp_recv_unique_peers(
     seen
 }
 
+async fn bind_udp_ready(bind_addr: &str, size: NonZeroUsize, credits: usize) -> UdpSocket {
+    let socket = UdpSocket::bind(bind_addr).expect("Failed to bind UDP socket");
+    socket
+        .recv_ready(size, credits)
+        .await
+        .expect("UdpSocket recv_ready warmup failed");
+    socket
+}
+
 // ============ Single-Thread UDP Tests (using Runtime/spawn) ============
 
 /// Test basic UDP socket binding and local_addr
@@ -535,8 +544,7 @@ fn test_multithread_udp_echo() {
             // Worker 0: Echo server
             let addr_tx_clone = addr_tx.clone();
             let server_h = crate::runtime::context::spawn_to(0, async move || {
-                let socket =
-                    Arc::new(UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket"));
+                let socket = Arc::new(bind_udp_ready("127.0.0.1:0", size, 8).await);
                 let server_addr = socket.local_addr().expect("Failed to get server address");
                 println!("UDP echo server listening on {}", server_addr);
 
@@ -670,7 +678,7 @@ fn test_multithread_concurrent_udp_clients() {
             // Server worker (0)
             let addr_tx_clone = addr_tx.clone();
             let server_handle = crate::runtime::context::spawn_to(0, async move || {
-                let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
+                let socket = bind_udp_ready("127.0.0.1:0", size, 8).await;
                 let server_addr = socket.local_addr().expect("Failed to get server address");
                 println!("Server listening on {}", server_addr);
 
