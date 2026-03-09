@@ -38,6 +38,8 @@ fn parse_nested_source(source: &str) -> (String, Option<i32>) {
         return (source.to_string(), None);
     }
 
+    let nested_ctx = extract_structured_field(source, "context=").unwrap_or("unknown");
+    let nested_detail = extract_structured_field(source, "detail=").unwrap_or("none");
     let nested_source = extract_structured_field(source, "source=");
     let nested_os = extract_structured_field(source, "os_error=").and_then(|v| {
         if v == "none" {
@@ -47,10 +49,19 @@ fn parse_nested_source(source: &str) -> (String, Option<i32>) {
         }
     });
 
-    match nested_source {
-        Some("none") | None => (source.to_string(), nested_os),
-        Some(val) => (val.to_string(), nested_os),
-    }
+    let nested_source = match nested_source {
+        Some("none") | None => "none".to_string(),
+        Some(val) => val.to_string(),
+    };
+    (
+        format!(
+            "nested_context={}; nested_detail={}; nested_source={}",
+            sanitize_field(nested_ctx),
+            sanitize_field(nested_detail),
+            sanitize_field(&nested_source)
+        ),
+        nested_os,
+    )
 }
 
 fn structured_line(
