@@ -45,13 +45,13 @@ pub struct Extensions {
     pub(crate) accept_ex: LpfnAcceptEx,
     pub(crate) connect_ex: LpfnConnectEx,
     pub(crate) get_accept_ex_sockaddrs: LpfnGetAcceptExSockaddrs,
-    pub(crate) rio_table: Option<RIO_EXTENSION_FUNCTION_TABLE>,
+    pub(crate) rio_table: RIO_EXTENSION_FUNCTION_TABLE,
 }
 
 impl std::fmt::Debug for Extensions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Extensions")
-            .field("rio_table", &self.rio_table.is_some())
+            .field("rio_table", &true)
             .finish_non_exhaustive()
     }
 }
@@ -74,7 +74,7 @@ impl Extensions {
         };
 
         let traditional = Self::load_traditional(socket);
-        let rio = Self::load_rio(socket);
+        let rio = Self::load_rio(socket)?;
 
         unsafe { closesocket(socket) };
 
@@ -110,7 +110,7 @@ impl Extensions {
         }
     }
 
-    fn load_rio(socket: SOCKET) -> Option<RIO_EXTENSION_FUNCTION_TABLE> {
+    fn load_rio(socket: SOCKET) -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
         unsafe {
             let mut guid = WSAID_MULTIPLE_RIO;
             let mut table: RIO_EXTENSION_FUNCTION_TABLE = std::mem::zeroed();
@@ -131,11 +131,9 @@ impl Extensions {
             );
 
             if ret == 0 {
-                Some(table)
+                Ok(table)
             } else {
-                let err = io::Error::last_os_error();
-                eprintln!("Failed to load RIO extension table: {:?}", err);
-                None
+                Err(io::Error::last_os_error())
             }
         }
     }

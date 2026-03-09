@@ -1,13 +1,14 @@
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::num::NonZeroUsize;
 
 use crate::net::common::InnerSocket;
 use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
-    Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed, RecvFrom, SendTo,
-    WriteFixed,
+    Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, Recv as OpRecv,
+    Send as OpSend, SendTo, UdpRecvDatagram, UdpRecvStream, UdpRefill,
 };
 
 // ============================================================================
@@ -66,6 +67,20 @@ impl UdpSocket {
 // ============================================================================
 
 impl<S: OpSubmitter> GenericUdpSocket<S> {
+    pub async fn recv_ready(&self, buf_capacity: NonZeroUsize, credits: usize) -> io::Result<()> {
+        let target = credits.max(1);
+        for _ in 0..target {
+            let buf = FixedBuf::alloc_heap(buf_capacity)?;
+            let refill = UdpRefill {
+                fd: IoFd::Raw(self.inner.raw()),
+                buf: Some(buf),
+            };
+            let (res, _op_back) = submit(&self.submitter, Op::new(refill)).await.into_inner();
+            res?;
+        }
+        Ok(())
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }
@@ -87,22 +102,63 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         (res, buf)
     }
 
-    pub async fn recv_from(&self, buf: FixedBuf) -> (io::Result<(usize, SocketAddr)>, FixedBuf) {
-        let op = RecvFrom {
+    pub async fn recv_stream(&self, buf: FixedBuf) -> io::Result<UdpRecvDatagram> {
+        const UDP_PREFILL_CREDITS: usize = 4;
+        let refill_capacity = buf.capacity();
+
+        let refill_op = UdpRefill {
             fd: IoFd::Raw(self.inner.raw()),
-            buf,
+            buf: Some(buf),
+        };
+        let (refill_res, refill_back_opt) = submit(&self.submitter, Op::new(refill_op))
+            .await
+            .into_inner();
+        let refill_back = refill_back_opt.ok_or_else(|| io::Error::other("UdpRefill op lost"))?;
+        refill_res?;
+
+        // Best-effort top-up to absorb burst packets on RIO pooled recv path.
+        for _ in 1..UDP_PREFILL_CREDITS {
+            let Some(extra_cap) = std::num::NonZeroUsize::new(refill_capacity) else {
+                break;
+            };
+            let Ok(extra_buf) = FixedBuf::alloc_heap(extra_cap) else {
+                break;
+            };
+
+            let top_up = UdpRefill {
+                fd: IoFd::Raw(self.inner.raw()),
+                buf: Some(extra_buf),
+            };
+            let (top_up_res, _top_up_back) =
+                submit(&self.submitter, Op::new(top_up)).await.into_inner();
+            // Non-fatal: main recv path still proceeds with at least one refill buffer.
+            let _ = top_up_res;
+        }
+
+        let op = UdpRecvStream {
+            fd: IoFd::Raw(self.inner.raw()),
+            buf: refill_back.buf,
             addr: None,
+            result: None,
         };
         let (res, op_back_opt) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let op_back = op_back_opt.expect("Op lost");
+        let mut op_back = op_back_opt.ok_or_else(|| io::Error::other("UdpRecvStream op lost"))?;
+        let n = res?;
 
-        match res {
-            Ok(n) => {
-                let addr = op_back.addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-                (Ok((n, addr)), op_back.buf)
-            }
-            Err(e) => (Err(e), op_back.buf),
+        if let Some(datagram) = op_back.result.take() {
+            return Ok(datagram);
         }
+
+        let mut recv_buf = op_back
+            .buf
+            .take()
+            .ok_or_else(|| io::Error::other("udp recv_stream buffer missing"))?;
+        recv_buf.set_len(n);
+        let addr = op_back.addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+        Ok(UdpRecvDatagram {
+            buf: recv_buf,
+            addr,
+        })
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
@@ -118,10 +174,9 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
     }
 
     pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = WriteFixed {
+        let op = OpSend {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
-            offset: 0,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let buf = op_back
@@ -131,10 +186,9 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
     }
 
     pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = ReadFixed {
+        let op = OpRecv {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
-            offset: 0,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let buf = op_back

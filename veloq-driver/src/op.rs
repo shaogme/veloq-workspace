@@ -163,17 +163,25 @@ impl<T> Op<T> {
 
                 if let Err(e) = driver.submit(user_data, &mut op_platform) {
                     trace!("Submit failed: {}", e);
-                    driver.cancel_op(user_data);
-                    // Note: We proceeded with reservation but submit failed.
-                    // The slot is now pending cancellation.
-                    // We return a DetachedOp that monitors this slot.
-                    // The cancel_op should eventually trigger completion with error.
-                    DetachedOp {
-                        table: Some(table),
-                        index: user_data,
-                        expected_gen: generation,
-                        immediate_failure: None,
-                        _phantom: std::marker::PhantomData,
+                    // Submit failed synchronously.
+                    // If the platform op is returned, propagate immediate failure with payload.
+                    // Otherwise, fall back to slot-monitoring path and let generation check resolve.
+                    if let Some(op) = op_platform.take() {
+                        DetachedOp {
+                            table: None,
+                            index: 0,
+                            expected_gen: 0,
+                            immediate_failure: Some((e, T::from_platform_op(op))),
+                            _phantom: std::marker::PhantomData,
+                        }
+                    } else {
+                        DetachedOp {
+                            table: Some(table),
+                            index: user_data,
+                            expected_gen: generation,
+                            immediate_failure: None,
+                            _phantom: std::marker::PhantomData,
+                        }
                     }
                 } else {
                     DetachedOp {
@@ -269,15 +277,15 @@ where
         let state = slot.state.load(Ordering::Acquire);
         if state == STATE_COMPLETED {
             // Completed. Extract result and op.
-            let res = unsafe {
-                (*slot.result.get())
-                    .take()
-                    .expect("Result missing in COMPLETED slot")
-            };
-            let op_platform = unsafe {
-                (*slot.op.get())
-                    .take()
-                    .expect("Op missing in COMPLETED slot")
+            let res = unsafe { (*slot.result.get()).take() };
+            let op_platform = unsafe { (*slot.op.get()).take() };
+            let (res, op_platform) = match (res, op_platform) {
+                (Some(res), Some(op_platform)) => (res, op_platform),
+                _ => {
+                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                        "Detached slot completed with missing payload",
+                    )));
+                }
             };
 
             // Convert platform op back to user op
@@ -299,8 +307,16 @@ where
             // Double check state
             let state = slot.state.load(Ordering::Acquire);
             if state == STATE_COMPLETED {
-                let res = unsafe { (*slot.result.get()).take().expect("Result missing") };
-                let op_platform = unsafe { (*slot.op.get()).take().expect("Op missing") };
+                let res = unsafe { (*slot.result.get()).take() };
+                let op_platform = unsafe { (*slot.op.get()).take() };
+                let (res, op_platform) = match (res, op_platform) {
+                    (Some(res), Some(op_platform)) => (res, op_platform),
+                    _ => {
+                        return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                            "Detached slot completed with missing payload",
+                        )));
+                    }
+                };
                 let data = T::from_platform_op(op_platform);
                 slot.state.store(STATE_CONSUMED, Ordering::Release);
                 table.push_free(this.index);
@@ -327,7 +343,9 @@ pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
     driver: Rc<RefCell<PlatformDriver>>,
+    table: Option<Arc<SlotTable<<PlatformDriver as Driver>::Op>>>,
     user_data: usize,
+    expected_gen: u32,
 }
 
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
@@ -337,7 +355,9 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
             state: State::Defined,
             data: Some(data),
             driver,
+            table: None,
             user_data: 0,
+            expected_gen: 0,
         }
     }
 }
@@ -357,7 +377,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
 
             // reserve_op now returns generation, but we ignore it for LocalOp
             // because LocalOp lifetime is tied to the driver via Rc/RefCell.
-            let (user_data, _generation) = match driver.reserve_op() {
+            let (user_data, generation) = match driver.reserve_op() {
                 Ok(v) => v,
                 Err(e) => {
                     // Failed to reserve
@@ -368,6 +388,8 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
                 }
             };
             op.user_data = user_data;
+            op.expected_gen = generation;
+            op.table = Some(driver.slot_table());
 
             // Submit to driver.
             let mut driver_op_opt = Some(driver_op);
@@ -381,6 +403,17 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
         }
 
         if let State::Submitted = op.state {
+            if let Some(table) = op.table.as_ref() {
+                let slot = &table.slots[op.user_data];
+                let generation = slot.generation.load(Ordering::Acquire);
+                if generation != op.expected_gen {
+                    op.state = State::Completed;
+                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                        "Op slot recycled (generation mismatch)",
+                    )));
+                }
+            }
+
             let mut driver = op.driver.borrow_mut();
 
             let mut op_out = None;
@@ -447,6 +480,19 @@ impl OpSubmitter for LocalSubmitter {
     }
 }
 
+// ============================================================================
+// DetachedSubmitter
+// ============================================================================
+
+#[derive(Clone, Copy)]
+pub struct DetachedSubmitter;
+
+impl DetachedSubmitter {
+    pub fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+}
+
 impl OpSubmitter for DetachedSubmitter {
     type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> =
         DetachedOp<T, PlatformDriver>;
@@ -460,19 +506,6 @@ impl OpSubmitter for DetachedSubmitter {
 
     fn from_current_context() -> std::io::Result<Self> {
         Self::new()
-    }
-}
-
-// ============================================================================
-// DetachedSubmitter
-// ============================================================================
-
-#[derive(Clone, Copy)]
-pub struct DetachedSubmitter;
-
-impl DetachedSubmitter {
-    pub fn new() -> std::io::Result<Self> {
-        Ok(Self)
     }
 }
 
@@ -574,14 +607,6 @@ pub struct SendTo {
     pub addr: std::net::SocketAddr,
 }
 
-/// Receive data and source address (UDP).
-pub struct RecvFrom {
-    pub fd: IoFd,
-    pub buf: FixedBuf,
-    /// Source address (populated after completion).
-    pub addr: Option<std::net::SocketAddr>,
-}
-
 /// Sync file range.
 pub struct SyncFileRange {
     pub fd: IoFd,
@@ -598,18 +623,27 @@ pub struct Fallocate {
     pub len: u64,
 }
 
-#[cfg(windows)]
-/// Receive data using Windows Registered I/O (RIO).
-pub struct RioRecv {
+/// Receive data as UDP datagram stream.
+pub struct UdpRecvStream {
     pub fd: IoFd,
-    pub buf: FixedBuf,
+    /// Unix io_uring path uses this provided buffer; Windows can leave it as None.
+    pub buf: Option<FixedBuf>,
+    /// Unix io_uring path: source address parsed from recvmsg.
+    pub addr: Option<std::net::SocketAddr>,
+    /// Windows RIO path: resulting datagram, populated on completion.
+    pub result: Option<UdpRecvDatagram>,
 }
 
-#[cfg(windows)]
-/// Send data using Windows Registered I/O (RIO).
-pub struct RioSend {
-    pub fd: IoFd,
+/// A received UDP datagram.
+pub struct UdpRecvDatagram {
     pub buf: FixedBuf,
+    pub addr: std::net::SocketAddr,
+}
+
+/// Provide a buffer to the driver's internal RIO UDP pool.
+pub struct UdpRefill {
+    pub fd: IoFd,
+    pub buf: Option<FixedBuf>,
 }
 
 // ============================================================================

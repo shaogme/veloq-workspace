@@ -1,9 +1,6 @@
 //! TCP network tests - single-threaded and multi-threaded.
 
-use veloq_buf::nz;
-
 use crate::net::tcp::{TcpListener, TcpStream};
-use crate::runtime::Runtime;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,414 +12,415 @@ use std::sync::{Arc, Mutex};
 /// Test basic TCP connection using global spawn
 #[test]
 fn test_tcp_connect_with_global_api() {
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(1))
-        .build()
-        .unwrap();
+    crate::tests::NetworkTestRunner::new("test_tcp_connect_with_global_api")
+        .worker_threads(1)
+        .run(|_| async move {
+            // Create listener inside block_on to access context
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
+            println!("Listener bound to: {}", listen_addr);
 
-    runtime.block_on(async move {
-        // Create listener inside block_on to access context
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
-        println!("Listener bound to: {}", listen_addr);
+            let listener_arc = Arc::new(listener);
+            let listener_clone = listener_arc.clone();
 
-        let listener_arc = Arc::new(listener);
-        let listener_clone = listener_arc.clone();
+            // Server task using cx.spawn
+            let server_h = crate::runtime::context::spawn(async move {
+                let (stream, peer_addr) =
+                    crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
+                        .await
+                        .expect("Accept failed");
+                println!("Accepted connection from: {}", peer_addr);
+                drop(stream);
+            });
 
-        // Server task using cx.spawn
-        let server_h = crate::runtime::context::spawn(async move {
-            let (stream, peer_addr) = listener_clone.accept().await.expect("Accept failed");
-            println!("Accepted connection from: {}", peer_addr);
+            // Client uses cx implicitly
+            let stream =
+                crate::tests::timeout_op("client", "connect", 5, TcpStream::connect(listen_addr))
+                    .await
+                    .expect("Failed to connect");
+            println!("Connected successfully");
             drop(stream);
+
+            crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
         });
-
-        // Client uses cx implicitly
-        let stream = TcpStream::connect(listen_addr)
-            .await
-            .expect("Failed to connect");
-        println!("Connected successfully");
-        drop(stream);
-
-        server_h.await;
-    });
 }
 
 /// Test TCP data send and receive (echo)
 #[test]
 fn test_tcp_send_recv() {
-    for size in [nz!(8192), nz!(16384), nz!(65536)] {
-        std::thread::spawn(move || {
-            println!("Testing with BufferSize: {:?}", size);
+    crate::tests::NetworkTestRunner::new("test_tcp_send_recv")
+        .worker_threads(1)
+        .run(|size| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-            let runtime = Runtime::builder()
-                .config(crate::config::Config::default().worker_threads(1))
-                .build()
-                .unwrap();
+            let listener_arc = Arc::new(listener);
+            let listener_clone = listener_arc.clone();
 
-            runtime.block_on(async move {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-                let listen_addr = listener.local_addr().expect("Failed to get local address");
+            // Server task: Robust Echo Loop
+            let server_h = crate::runtime::context::spawn(async move {
+                let (stream, _) =
+                    crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
+                        .await
+                        .expect("Accept failed");
 
-                let listener_arc = Arc::new(listener);
-                let listener_clone = listener_arc.clone();
+                loop {
+                    let buf = crate::runtime::context::alloc(size);
+                    let (result, mut buf) = stream.recv(buf).await;
+                    let bytes_read = match result {
+                        Ok(n) if n > 0 => n,
+                        _ => break, // EOF or Error
+                    };
 
-                // Server task: Robust Echo Loop
-                let server_h = crate::runtime::context::spawn(async move {
-                    let (stream, _) = listener_clone.accept().await.expect("Accept failed");
-
-                    loop {
-                        let buf = crate::runtime::context::alloc(size);
-                        let (result, mut buf) = stream.recv(buf).await;
-                        let bytes_read = match result {
-                            Ok(n) if n > 0 => n,
-                            _ => break, // EOF or Error
-                        };
-
-                        // Echo exact bytes received
-                        buf.set_len(bytes_read);
-                        if let Err(e) = stream.send(buf).await.0 {
-                            println!("Server echo failed: {}", e);
-                            break;
-                        }
+                    // Echo exact bytes received
+                    buf.set_len(bytes_read);
+                    if let Err(e) = stream.send(buf).await.0 {
+                        println!("Server echo failed: {}", e);
+                        break;
                     }
-                });
+                }
+            });
 
-                // Client
-                let stream = TcpStream::connect(listen_addr)
+            // Client
+            let stream =
+                crate::tests::timeout_op("client", "connect", 5, TcpStream::connect(listen_addr))
                     .await
                     .expect("Failed to connect");
 
-                // Prepare data
-                let mut send_buf = crate::runtime::context::alloc(size);
-                let test_data = b"Hello, TCP!";
-                send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
-                // Buffer is full length (clamped) by default, containing test_data + zeros
+            // Prepare data
+            let mut send_buf = crate::runtime::context::alloc(size);
+            let test_data = b"Hello, TCP!";
+            send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+            // Buffer is full length (clamped) by default, containing test_data + zeros
 
-                // Send data
-                let bytes_to_send = send_buf.len();
-                let (result, _) = stream.send(send_buf).await;
-                let bytes_sent = result.expect("Client send failed");
-                assert_eq!(bytes_sent, bytes_to_send);
-                println!("Client sent {} bytes", bytes_sent);
+            // Send data
+            let bytes_to_send = send_buf.len();
+            let (result, _) =
+                crate::tests::timeout_op("client", "send", 5, stream.send(send_buf)).await;
+            let bytes_sent = result.expect("Client send failed");
+            assert_eq!(bytes_sent, bytes_to_send);
+            println!("Client sent {} bytes", bytes_sent);
 
-                // Receive loop verify
-                let mut total_received = 0;
+            // Receive loop verify
+            let mut total_received = 0;
 
-                while total_received < bytes_sent {
-                    let recv_buf = crate::runtime::context::alloc(size);
-                    let (result, recv_buf) = stream.recv(recv_buf).await;
-                    let n = result.expect("Client recv failed");
-                    if n == 0 {
-                        break;
-                    } // Unexpected EOF?
+            while total_received < bytes_sent {
+                let recv_buf = crate::runtime::context::alloc(size);
+                let (result, recv_buf) =
+                    crate::tests::timeout_op("client", "recv", 5, stream.recv(recv_buf)).await;
+                let n = result.expect("Client recv failed");
+                if n == 0 {
+                    break;
+                } // Unexpected EOF?
 
-                    if total_received == 0 {
-                        // Verify first chunk header
-                        assert!(n >= test_data.len(), "First chunk too small");
-                        assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
-                    }
-                    total_received += n;
+                if total_received == 0 {
+                    // Verify first chunk header
+                    assert!(n >= test_data.len(), "First chunk too small");
+                    assert_eq!(&recv_buf.as_slice()[..test_data.len()], test_data);
                 }
+                total_received += n;
+            }
 
-                println!("Client received {} bytes", total_received);
+            println!("Client received {} bytes", total_received);
 
-                // Verify
-                assert_eq!(bytes_sent, total_received);
-                println!("Data verification successful!");
+            // Verify
+            assert_eq!(bytes_sent, total_received);
+            println!("Data verification successful!");
 
-                // Close client to let server exit loop
-                drop(stream);
-                server_h.await;
-            });
-        })
-        .join()
-        .unwrap()
-    }
+            // Close client to let server exit loop
+            drop(stream);
+            crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
+        });
 }
 
 /// Test multiple concurrent connections on single thread
 #[test]
 fn test_tcp_multiple_connections() {
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(1))
-        .build()
-        .unwrap();
+    crate::tests::NetworkTestRunner::new("test_tcp_multiple_connections")
+        .worker_threads(1)
+        .run(|_| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-    runtime.block_on(async move {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
+            const NUM_CONNECTIONS: usize = 5;
 
-        const NUM_CONNECTIONS: usize = 5;
+            let listener_arc = Arc::new(listener);
+            let listener_clone = listener_arc.clone();
 
-        let listener_arc = Arc::new(listener);
-        let listener_clone = listener_arc.clone();
+            // Server task: accept all connections
+            let server_h = crate::runtime::context::spawn(async move {
+                for i in 0..NUM_CONNECTIONS {
+                    let (stream, peer) =
+                        crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
+                            .await
+                            .expect("Accept failed");
+                    println!("Accepted connection {} from {}", i, peer);
+                    drop(stream);
+                }
+                println!("All {} connections accepted", NUM_CONNECTIONS);
+            });
 
-        // Server task: accept all connections
-        let server_h = crate::runtime::context::spawn(async move {
+            // Client: make connections sequentially
             for i in 0..NUM_CONNECTIONS {
-                let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
-                println!("Accepted connection {} from {}", i, peer);
-                drop(stream);
-            }
-            println!("All {} connections accepted", NUM_CONNECTIONS);
-        });
-
-        // Client: make connections sequentially
-        for i in 0..NUM_CONNECTIONS {
-            let stream = TcpStream::connect(listen_addr)
+                let stream = crate::tests::timeout_op(
+                    "client",
+                    "connect",
+                    5,
+                    TcpStream::connect(listen_addr),
+                )
                 .await
                 .expect("Failed to connect");
-            println!("Client {} connected", i);
-            drop(stream);
-        }
-        println!("All {} connections completed", NUM_CONNECTIONS);
+                println!("Client {} connected", i);
+                drop(stream);
+            }
+            println!("All {} connections completed", NUM_CONNECTIONS);
 
-        server_h.await;
-    });
+            crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
+        });
 }
 
 /// Test large data transfer
 #[test]
 fn test_tcp_large_data_transfer() {
-    for size in [nz!(8192), nz!(16384), nz!(65536)] {
-        std::thread::spawn(move || {
-            let runtime = Runtime::builder()
-                .config(crate::config::Config::default().worker_threads(1))
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-                let listen_addr = listener.local_addr().expect("Failed to get local address");
+    crate::tests::NetworkTestRunner::new("test_tcp_large_data_transfer")
+        .worker_threads(1)
+        .run(|size| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-                const DATA_SIZE: usize = 8192; // 8KB
-                const CHUNK_SIZE: usize = 4096;
+            const DATA_SIZE: usize = 8192; // 8KB
+            const CHUNK_SIZE: usize = 4096;
 
-                let listener_arc = Arc::new(listener);
-                let listener_clone = listener_arc.clone();
+            let listener_arc = Arc::new(listener);
+            let listener_clone = listener_arc.clone();
 
-                // Server task
-                let server_h = crate::runtime::context::spawn(async move {
-                    let (stream, _) = listener_clone.accept().await.expect("Accept failed");
+            // Server task
+            let server_h = crate::runtime::context::spawn(async move {
+                let (stream, _) =
+                    crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
+                        .await
+                        .expect("Accept failed");
 
-                    let mut total_received = 0;
-                    while total_received < DATA_SIZE {
-                        let buf = crate::runtime::context::alloc(size);
-                        // buf.set_len(buf.capacity());
-                        let (result, _buf) = stream.recv(buf).await;
-                        let bytes = result.expect("Recv failed");
-                        if bytes == 0 {
-                            break;
-                        }
-                        total_received += bytes;
-                        println!(
-                            "Server received {} bytes (total: {})",
-                            bytes, total_received
-                        );
+                let mut total_received = 0;
+                while total_received < DATA_SIZE {
+                    let buf = crate::runtime::context::alloc(size);
+                    // buf.set_len(buf.capacity());
+                    let (result, _buf) =
+                        crate::tests::timeout_op("server", "recv", 5, stream.recv(buf)).await;
+                    let bytes = result.expect("Recv failed");
+                    if bytes == 0 {
+                        break;
                     }
+                    total_received += bytes;
+                    println!(
+                        "Server received {} bytes (total: {})",
+                        bytes, total_received
+                    );
+                }
 
-                    assert!(total_received >= DATA_SIZE);
-                    println!("Server received all {} bytes", DATA_SIZE);
-                });
+                assert!(total_received >= DATA_SIZE);
+                println!("Server received all {} bytes", DATA_SIZE);
+            });
 
-                // Client
-                let stream = TcpStream::connect(listen_addr)
+            // Client
+            let stream =
+                crate::tests::timeout_op("client", "connect", 5, TcpStream::connect(listen_addr))
                     .await
                     .expect("Failed to connect");
 
-                let mut total_sent = 0;
-                while total_sent < DATA_SIZE {
-                    let chunk_size = std::cmp::min(CHUNK_SIZE, DATA_SIZE - total_sent);
+            let mut total_sent = 0;
+            while total_sent < DATA_SIZE {
+                let chunk_size = std::cmp::min(CHUNK_SIZE, DATA_SIZE - total_sent);
 
-                    let mut buf = crate::runtime::context::alloc(size);
+                let mut buf = crate::runtime::context::alloc(size);
 
-                    for i in 0..chunk_size {
-                        buf.spare_capacity_mut()[i] = (i % 256) as u8;
-                    }
-
-                    let (result, _buf) = stream.send(buf).await;
-                    let bytes = result.expect("Send failed");
-                    total_sent += bytes;
-                    println!("Client sent {} bytes (total: {})", bytes, total_sent);
+                for i in 0..chunk_size {
+                    buf.spare_capacity_mut()[i] = (i % 256) as u8;
                 }
 
-                assert!(total_sent >= DATA_SIZE);
-                println!("Client sent all {} bytes", total_sent);
+                let (result, _buf) =
+                    crate::tests::timeout_op("client", "send", 5, stream.send(buf)).await;
+                let bytes = result.expect("Send failed");
+                total_sent += bytes;
+                println!("Client sent {} bytes (total: {})", bytes, total_sent);
+            }
 
-                server_h.await;
-            });
-        })
-        .join()
-        .unwrap()
-    }
+            assert!(total_sent >= DATA_SIZE);
+            println!("Client sent all {} bytes", total_sent);
+
+            crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
+        });
 }
 
 /// Test listener local_addr
 #[test]
 fn test_listener_local_addr() {
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(1))
-        .build()
-        .unwrap();
+    crate::tests::NetworkTestRunner::new("test_listener_local_addr")
+        .worker_threads(1)
+        .run(|_| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
 
-    runtime.block_on(async move {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let addr = listener.local_addr().expect("Failed to get local address");
 
-        let addr = listener.local_addr().expect("Failed to get local address");
+            assert_eq!(addr.ip().to_string(), "127.0.0.1");
+            assert_ne!(addr.port(), 0);
 
-        assert_eq!(addr.ip().to_string(), "127.0.0.1");
-        assert_ne!(addr.port(), 0);
-
-        println!("Listener local address: {}", addr);
-    });
+            println!("Listener local address: {}", addr);
+        });
 }
 
 /// Test connection refused
 #[test]
 fn test_tcp_connect_refused() {
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(1))
-        .build()
-        .unwrap();
+    crate::tests::NetworkTestRunner::new("test_tcp_connect_refused")
+        .worker_threads(1)
+        .buffer_sizes(vec![veloq_buf::nz!(8192)])
+        .run(|_| async move {
+            // Reserve an ephemeral local port then close it immediately.
+            // Connecting to this now-closed port should fail fast with connection refused.
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let addr = listener
+                .local_addr()
+                .expect("Failed to get listener address");
+            drop(listener);
 
-    runtime.block_on(async move {
-        let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
+            let result = TcpStream::connect(addr).await;
 
-        let result = TcpStream::connect(addr).await;
-
-        assert!(result.is_err());
-        println!("Connection refused as expected: {:?}", result.err());
-    });
+            assert!(result.is_err());
+            println!("Connection refused as expected: {:?}", result.err());
+        });
 }
 
 /// Test receiving zero bytes (EOF)
 #[test]
 fn test_tcp_recv_zero_bytes() {
-    for size in [nz!(8192), nz!(16384), nz!(65536)] {
-        std::thread::spawn(move || {
-            let runtime = Runtime::builder()
-                .config(crate::config::Config::default().worker_threads(1))
-                .build()
-                .unwrap();
+    crate::tests::NetworkTestRunner::new("test_tcp_recv_zero_bytes")
+        .worker_threads(1)
+        .run(|size| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-            runtime.block_on(async move {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-                let listen_addr = listener.local_addr().expect("Failed to get local address");
+            let listener_arc = Arc::new(listener);
+            let listener_clone = listener_arc.clone();
+            // Server: accept and immediately close
+            let server_h = crate::runtime::context::spawn(async move {
+                let (stream, _) =
+                    crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
+                        .await
+                        .expect("Accept failed");
+                println!("Server accepted and closing connection");
+                drop(stream);
+            });
 
-                let listener_arc = Arc::new(listener);
-                let listener_clone = listener_arc.clone();
-                // Server: accept and immediately close
-                let server_h = crate::runtime::context::spawn(async move {
-                    let (stream, _) = listener_clone.accept().await.expect("Accept failed");
-                    println!("Server accepted and closing connection");
-                    drop(stream);
-                });
-
-                // Client
-                let stream = TcpStream::connect(listen_addr)
+            // Client
+            let stream =
+                crate::tests::timeout_op("client", "connect", 5, TcpStream::connect(listen_addr))
                     .await
                     .expect("Failed to connect");
 
-                let buf = crate::runtime::context::alloc(size);
-                let (result, _buf) = stream.recv(buf).await;
+            let buf = crate::runtime::context::alloc(size);
+            let (result, _buf) =
+                crate::tests::timeout_op("client", "recv", 5, stream.recv(buf)).await;
 
-                if let Ok(bytes) = result {
-                    assert_eq!(bytes, 0, "Should receive 0 bytes on closed connection");
-                    println!("Correctly received 0 bytes (EOF)");
-                } else {
-                    println!("Received error on closed connection: {:?}", result.err());
-                }
+            if let Ok(bytes) = result {
+                assert_eq!(bytes, 0, "Should receive 0 bytes on closed connection");
+                println!("Correctly received 0 bytes (EOF)");
+            } else {
+                println!("Received error on closed connection: {:?}", result.err());
+            }
 
-                server_h.await;
-            });
-        })
-        .join()
-        .unwrap();
-    }
+            crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
+        });
 }
 
 /// Test TCP using heap-allocated FixedBuf (fallback mechanism)
 #[test]
 fn test_tcp_heap_buffer() {
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(1))
-        .build()
-        .unwrap();
+    crate::tests::NetworkTestRunner::new("test_tcp_heap_buffer")
+        .worker_threads(1)
+        .run(|_| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-    runtime.block_on(async move {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
+            // Server task: Use heap-allocated buffer for receive
+            let server_h = crate::runtime::context::spawn(async move {
+                let (stream, _) =
+                    crate::tests::timeout_op("server", "accept", 5, listener.accept())
+                        .await
+                        .expect("Accept failed");
 
-        // Server task: Use heap-allocated buffer for receive
-        let server_h = crate::runtime::context::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Accept failed");
+                // Explicitly allocate from heap
+                let buf = veloq_buf::FixedBuf::alloc_heap(veloq_buf::nz!(4096))
+                    .expect("Heap allocation failed");
+                let (result, buf) =
+                    crate::tests::timeout_op("server", "recv", 5, stream.recv(buf)).await;
+                let n = result.expect("Server recv failed");
 
-            // Explicitly allocate from heap
-            let buf = veloq_buf::FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
-            let (result, buf) = stream.recv(buf).await;
-            let n = result.expect("Server recv failed");
+                assert_eq!(&buf.as_slice()[..n], b"Hello from heap!");
+                println!("Server received data in heap buffer correctly");
+            });
 
-            assert_eq!(&buf.as_slice()[..n], b"Hello from heap!");
-            println!("Server received data in heap buffer correctly");
+            // Client: Use heap-allocated buffer for send
+            let stream =
+                crate::tests::timeout_op("client", "connect", 5, TcpStream::connect(listen_addr))
+                    .await
+                    .expect("Failed to connect");
+
+            let mut buf = veloq_buf::FixedBuf::alloc_heap(veloq_buf::nz!(4096))
+                .expect("Heap allocation failed");
+            let data = b"Hello from heap!";
+            buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+            buf.set_len(data.len());
+
+            let (result, _) = crate::tests::timeout_op("client", "send", 5, stream.send(buf)).await;
+            result.expect("Client send failed");
+            println!("Client sent data from heap buffer correctly");
+
+            crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
         });
-
-        // Client: Use heap-allocated buffer for send
-        let stream = TcpStream::connect(listen_addr)
-            .await
-            .expect("Failed to connect");
-
-        let mut buf = veloq_buf::FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
-        let data = b"Hello from heap!";
-        buf.as_slice_mut()[..data.len()].copy_from_slice(data);
-        buf.set_len(data.len());
-
-        let (result, _) = stream.send(buf).await;
-        result.expect("Client send failed");
-        println!("Client sent data from heap buffer correctly");
-
-        server_h.await;
-    });
 }
 
 /// Test IPv6 connection
 #[test]
 fn test_tcp_ipv6() {
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(1))
-        .build()
-        .unwrap();
+    crate::tests::NetworkTestRunner::new("test_tcp_ipv6")
+        .worker_threads(1)
+        .run(|_| async move {
+            let listener_result = TcpListener::bind("::1:0");
 
-    runtime.block_on(async move {
-        let listener_result = TcpListener::bind("::1:0");
+            if listener_result.is_err() {
+                println!("IPv6 not available, skipping test");
+                return;
+            }
 
-        if listener_result.is_err() {
-            println!("IPv6 not available, skipping test");
-            return;
-        }
+            let listener = listener_result.unwrap();
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        let listener = listener_result.unwrap();
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
+            assert!(listen_addr.is_ipv6());
+            println!("IPv6 listener bound to: {}", listen_addr);
 
-        assert!(listen_addr.is_ipv6());
-        println!("IPv6 listener bound to: {}", listen_addr);
+            let listener_arc = Arc::new(listener);
+            let listener_clone = listener_arc.clone();
 
-        let listener_arc = Arc::new(listener);
-        let listener_clone = listener_arc.clone();
+            let server_h = crate::runtime::context::spawn(async move {
+                let (stream, peer) =
+                    crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
+                        .await
+                        .expect("Accept failed");
+                println!("Accepted IPv6 connection from: {}", peer);
+                drop(stream);
+            });
 
-        let server_h = crate::runtime::context::spawn(async move {
-            let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
-            println!("Accepted IPv6 connection from: {}", peer);
+            let stream =
+                crate::tests::timeout_op("client", "connect", 5, TcpStream::connect(listen_addr))
+                    .await
+                    .expect("Failed to connect via IPv6");
+
+            println!("IPv6 connection successful");
             drop(stream);
+
+            crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
         });
-
-        let stream = TcpStream::connect(listen_addr)
-            .await
-            .expect("Failed to connect via IPv6");
-
-        println!("IPv6 connection successful");
-        drop(stream);
-
-        server_h.await;
-    });
 }
 
 // ============ Multi-Thread TCP Tests ============
@@ -430,224 +428,246 @@ fn test_tcp_ipv6() {
 /// Test TCP connection across multiple worker threads (each thread is independent)
 #[test]
 fn test_multithread_tcp_connections() {
-    let connection_count = Arc::new(AtomicUsize::new(0));
-    const NUM_WORKERS: usize = 3;
+    crate::tests::NetworkTestRunner::new("test_multithread_tcp_connections")
+        .worker_threads(3)
+        .run(|_| async move {
+            let connection_count = Arc::new(AtomicUsize::new(0));
+            const NUM_WORKERS: usize = 3;
 
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(NUM_WORKERS))
-        .build()
-        .unwrap();
+            let connection_count_for_block = connection_count.clone();
 
-    let (tx, mut rx) = crate::sync::mpsc::unbounded();
+            let mut worker_handles = Vec::with_capacity(NUM_WORKERS);
+            // We will spawn a task for each worker pinned to that worker
+            for worker_id in 0..NUM_WORKERS {
+                let counter = connection_count_for_block.clone();
 
-    let connection_count_for_block = connection_count.clone();
+                let handle = crate::runtime::context::spawn_to(worker_id, async move || {
+                    let listener =
+                        TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                    let listen_addr = listener.local_addr().expect("Failed to get local address");
+                    println!("Worker {} listening on {}", worker_id, listen_addr);
 
-    runtime.block_on(async move {
-        // We will spawn a task for each worker pinned to that worker
-        for worker_id in 0..NUM_WORKERS {
-            let counter = connection_count_for_block.clone();
-            let tx_done = tx.clone();
+                    let server_h = {
+                        let listener_arc = Arc::new(listener);
+                        let listener_clone = listener_arc.clone();
 
-            crate::runtime::context::spawn(async move {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-                let listen_addr = listener.local_addr().expect("Failed to get local address");
-                println!("Worker {} listening on {}", worker_id, listen_addr);
+                        // Spawn server task
+                        crate::runtime::context::spawn(async move {
+                            let (stream, peer) = crate::tests::timeout_op(
+                                "server",
+                                "accept",
+                                5,
+                                listener_clone.accept(),
+                            )
+                            .await
+                            .expect("Accept failed");
+                            println!("Worker {} accepted from {}", worker_id, peer);
+                            drop(stream);
+                        })
+                    }; // Arc is dropped here
 
-                {
-                    let listener_arc = Arc::new(listener);
-                    let listener_clone = listener_arc.clone();
-
-                    // Spawn server task using spawn instead of spawn_local
-                    crate::runtime::context::spawn(async move {
-                        let (stream, peer) = listener_clone.accept().await.expect("Accept failed");
-                        println!("Worker {} accepted from {}", worker_id, peer);
-                        drop(stream);
-                    });
-                } // Arc is dropped here
-
-                // Client connects to self
-                let stream = TcpStream::connect(listen_addr)
+                    // Client connects to self
+                    let stream = crate::tests::timeout_op(
+                        "client",
+                        "connect",
+                        5,
+                        TcpStream::connect(listen_addr),
+                    )
                     .await
                     .expect("Failed to connect");
-                println!("Worker {} connected to self", worker_id);
-                drop(stream);
+                    println!("Worker {} connected to self", worker_id);
+                    drop(stream);
 
-                counter.fetch_add(1, Ordering::SeqCst);
-                tx_done.send(()).unwrap();
-            });
-        }
+                    crate::tests::timeout_op("worker", "wait_server_join", 5, server_h).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                });
+                worker_handles.push((worker_id, handle));
+            }
 
-        // Wait for all 3
-        for _ in 0..NUM_WORKERS {
-            rx.recv().await.unwrap();
-        }
-    });
+            for (worker_id, handle) in worker_handles {
+                crate::tests::timeout_op(
+                    &format!("main_wait_worker_{}", worker_id),
+                    "wait_worker_join",
+                    5,
+                    handle,
+                )
+                .await;
+            }
 
-    assert_eq!(connection_count.load(Ordering::SeqCst), NUM_WORKERS);
-    println!("All {} workers completed TCP self-connections", NUM_WORKERS);
+            assert_eq!(connection_count.load(Ordering::SeqCst), NUM_WORKERS);
+            println!("All {} workers completed TCP self-connections", NUM_WORKERS);
+        });
 }
 
 /// Test TCP echo server on one worker, clients on another
 #[test]
 fn test_multithread_tcp_echo() {
-    for size in [nz!(8192), nz!(16384), nz!(65536)] {
-        std::thread::spawn(move || {
+    crate::tests::NetworkTestRunner::new("test_multithread_tcp_echo")
+        .worker_threads(2)
+        .run(|size| async move {
             let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
-            // 2 Workers
-            let runtime = Runtime::builder()
-                .config(crate::config::Config::default().worker_threads(2))
-                .build()
-                .unwrap();
+            let addr_tx = addr_tx.clone(); // Move into task
 
-            let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
+            // Worker 0: Echo server
+            let server_h = crate::runtime::context::spawn_to(0, async move || {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                let listen_addr = listener.local_addr().expect("Failed to get local address");
+                println!("Echo server listening on {}", listen_addr);
 
-            runtime.block_on(async move {
-                let addr_tx = addr_tx.clone(); // Move into task
+                // Send address to client (via channel)
+                addr_tx.send(listen_addr).unwrap();
 
-                // Worker 0: Echo server
-                crate::runtime::context::spawn_to(0, async move || {
-                    let listener =
-                        TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-                    let listen_addr = listener.local_addr().expect("Failed to get local address");
-                    println!("Echo server listening on {}", listen_addr);
-
-                    // Send address to client (via channel)
-                    addr_tx.send(listen_addr).unwrap();
-
-                    // Accept and echo
-                    let (stream, _) = Arc::new(listener).accept().await.expect("Accept failed");
-                    let buf = crate::runtime::context::alloc(size);
-
-                    let (result, buf) = stream.recv(buf).await;
-                    let bytes = result.expect("Recv failed");
-
-                    // Echo back
-                    let mut echo_buf = crate::runtime::context::alloc(size);
-                    echo_buf.as_slice_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
-
-                    let (result, _) = stream.send(echo_buf).await;
-                    result.expect("Send failed");
-                    println!("Echo server sent response");
-                });
-
-                // Worker 1: Client
-                let done_tx = done_tx.clone();
-                crate::runtime::context::spawn_to(1, async move || {
-                    // Wait for server address
-                    let listen_addr = addr_rx.recv().await.expect("Channel closed");
-
-                    let stream = TcpStream::connect(listen_addr)
+                // Accept and echo
+                let (stream, _) =
+                    crate::tests::timeout_op("server", "accept", 5, Arc::new(listener).accept())
                         .await
-                        .expect("Failed to connect");
+                        .expect("Accept failed");
+                let buf = crate::runtime::context::alloc(size);
 
-                    // Send data
-                    let mut send_buf = crate::runtime::context::alloc(size);
-                    let data = b"Hello from worker 1!";
-                    send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+                let (result, buf) =
+                    crate::tests::timeout_op("server", "recv", 5, stream.recv(buf)).await;
+                let bytes = result.expect("Recv failed");
 
-                    let (result, _) = stream.send(send_buf).await;
-                    let _sent = result.expect("Send failed");
+                // Echo back
+                let mut echo_buf = crate::runtime::context::alloc(size);
+                echo_buf.as_slice_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
 
-                    // Receive echo
-                    let recv_buf = crate::runtime::context::alloc(size);
-                    let (result, recv_buf) = stream.recv(recv_buf).await;
-                    let _received = result.expect("Recv failed");
-
-                    assert_eq!(&recv_buf.as_slice()[..data.len()], data);
-                    println!("Client received correct echo");
-
-                    done_tx.send(()).unwrap();
-                });
-
-                // Wait for client to finish
-                done_rx.recv().await.unwrap();
+                let (result, _) =
+                    crate::tests::timeout_op("server", "send", 5, stream.send(echo_buf)).await;
+                result.expect("Send failed");
+                println!("Echo server sent response");
             });
 
+            // Worker 1: Client
+            let client_h = crate::runtime::context::spawn_to(1, async move || {
+                // Wait for server address
+                let listen_addr =
+                    crate::tests::timeout_op("client", "wait_server_addr", 5, addr_rx.recv())
+                        .await
+                        .expect("Channel closed");
+
+                let stream = crate::tests::timeout_op(
+                    "client",
+                    "connect",
+                    5,
+                    TcpStream::connect(listen_addr),
+                )
+                .await
+                .expect("Failed to connect");
+
+                // Send data
+                let mut send_buf = crate::runtime::context::alloc(size);
+                let data = b"Hello from worker 1!";
+                send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+
+                let (result, _) =
+                    crate::tests::timeout_op("client", "send", 5, stream.send(send_buf)).await;
+                let _sent = result.expect("Send failed");
+
+                // Receive echo
+                let recv_buf = crate::runtime::context::alloc(size);
+                let (result, recv_buf) =
+                    crate::tests::timeout_op("client", "recv", 5, stream.recv(recv_buf)).await;
+                let _received = result.expect("Recv failed");
+
+                assert_eq!(&recv_buf.as_slice()[..data.len()], data);
+                println!("Client received correct echo");
+            });
+
+            crate::tests::timeout_op("main", "wait_client_join", 5, client_h).await;
+            crate::tests::timeout_op("main", "wait_server_join", 5, server_h).await;
+
             println!("Multi-thread echo test completed");
-        })
-        .join()
-        .unwrap();
-    }
+        });
 }
 
 /// Test concurrent connections from multiple workers to shared server
 #[test]
 fn test_multithread_concurrent_clients() {
     use std::sync::mpsc;
-    use std::time::Duration;
 
-    let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
-    let addr_rx = Arc::new(Mutex::new(addr_rx));
-    let connection_count = Arc::new(AtomicUsize::new(0));
+    crate::tests::NetworkTestRunner::new("test_multithread_concurrent_clients")
+        .worker_threads(4) // 0=Server, 1,2,3=Clients
+        .run(|_| async move {
+            let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+            let addr_rx = Arc::new(Mutex::new(addr_rx));
+            let connection_count = Arc::new(AtomicUsize::new(0));
 
-    const NUM_CLIENTS: usize = 3;
-    const NUM_WORKERS: usize = 4; // 0=Server, 1,2,3=Clients
+            const NUM_CLIENTS: usize = 3;
 
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(NUM_WORKERS))
-        .build()
-        .unwrap();
+            let connection_count_clone = connection_count.clone();
 
-    let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
+            // Server worker (0)
+            let addr_tx = addr_tx.clone();
+            let server_h = crate::runtime::context::spawn_to(0, async move || {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-    let connection_count_clone = connection_count.clone();
-    runtime.block_on(async move {
-        // Server worker (0)
-        let addr_tx = addr_tx.clone();
-        crate::runtime::context::spawn_to(0, async move || {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-            let listen_addr = listener.local_addr().expect("Failed to get local address");
+                // Broadcast address to all clients
+                for _ in 0..NUM_CLIENTS {
+                    addr_tx.send(listen_addr).unwrap();
+                }
 
-            // Broadcast address to all clients
-            for _ in 0..NUM_CLIENTS {
-                addr_tx.send(listen_addr).unwrap();
-            }
+                let listener_arc = Arc::new(listener);
 
-            let listener_arc = Arc::new(listener);
+                // Accept all connections
+                for i in 0..NUM_CLIENTS {
+                    let (stream, peer) =
+                        crate::tests::timeout_op("server", "accept", 5, listener_arc.accept())
+                            .await
+                            .expect("Accept failed");
+                    println!("Server accepted connection {} from {}", i, peer);
+                    drop(stream);
+                }
+            });
 
-            // Accept all connections
-            for i in 0..NUM_CLIENTS {
-                let (stream, peer) = listener_arc.accept().await.expect("Accept failed");
-                println!("Server accepted connection {} from {}", i, peer);
-                drop(stream);
-            }
-        });
+            // Client workers (1..=3)
+            let connection_count_clone = connection_count_clone.clone();
+            let mut client_handles = Vec::with_capacity(NUM_CLIENTS);
+            for client_id in 1..=NUM_CLIENTS {
+                let rx = addr_rx.clone();
+                let counter = connection_count_clone.clone();
 
-        // Client workers (1..=3)
-        let connection_count_clone = connection_count_clone.clone();
-        for client_id in 1..=NUM_CLIENTS {
-            let rx = addr_rx.clone();
-            let counter = connection_count_clone.clone();
-            let done_tx = done_tx.clone();
+                let handle = crate::runtime::context::spawn_to(client_id, async move || {
+                    let listen_addr = {
+                        rx.lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("Timeout waiting for server address")
+                    };
 
-            crate::runtime::context::spawn_to(client_id, async move || {
-                let listen_addr = {
-                    rx.lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("Timeout waiting for server address")
-                };
-
-                let stream = TcpStream::connect(listen_addr)
+                    let stream = crate::tests::timeout_op(
+                        "client",
+                        "connect",
+                        5,
+                        TcpStream::connect(listen_addr),
+                    )
                     .await
                     .expect("Failed to connect");
 
-                println!("Client {} connected", client_id);
-                drop(stream);
+                    println!("Client {} connected", client_id);
+                    drop(stream);
 
-                counter.fetch_add(1, Ordering::SeqCst);
-                done_tx.send(()).unwrap();
-            });
-        }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                });
+                client_handles.push((client_id, handle));
+            }
 
-        // Wait for all clients
-        for _ in 0..NUM_CLIENTS {
-            done_rx.recv().await.unwrap();
-        }
-    });
+            for (client_id, handle) in client_handles {
+                crate::tests::timeout_op(
+                    &format!("main_wait_client_{}", client_id),
+                    "wait_client_join",
+                    5,
+                    handle,
+                )
+                .await;
+            }
 
-    assert_eq!(connection_count.load(Ordering::SeqCst), NUM_CLIENTS);
-    println!("All {} clients completed", NUM_CLIENTS);
+            crate::tests::timeout_op("main", "wait_server_join", 5, server_h).await;
+
+            assert_eq!(connection_count.load(Ordering::SeqCst), NUM_CLIENTS);
+            println!("All {} clients completed", NUM_CLIENTS);
+        });
 }
 /// Test TCP recv cancellation
 #[test]
@@ -672,43 +692,44 @@ fn test_tcp_cancel_recv() {
         }
     }
 
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(1))
-        .build()
-        .unwrap();
+    crate::tests::NetworkTestRunner::new("test_tcp_cancel_recv")
+        .worker_threads(1)
+        .run(|_| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-    runtime.block_on(async move {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
+            let listener_arc = Arc::new(listener);
+            let listener_clone = listener_arc.clone();
 
-        let listener_arc = Arc::new(listener);
-        let listener_clone = listener_arc.clone();
+            let server_h = crate::runtime::context::spawn(async move {
+                let (stream, _) =
+                    crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
+                        .await
+                        .expect("Accept failed");
+                // Don't send anything, just hold connection
+                // Keep stream alive until cancelled
+                YieldOnce(false).await; // Yield a bit
+                drop(stream);
+            });
 
-        let server_h = crate::runtime::context::spawn(async move {
-            let (stream, _) = listener_clone.accept().await.expect("Accept failed");
-            // Don't send anything, just hold connection
-            // Keep stream alive until cancelled
-            YieldOnce(false).await; // Yield a bit
+            let stream =
+                crate::tests::timeout_op("client", "connect", 5, TcpStream::connect(listen_addr))
+                    .await
+                    .expect("Failed to connect");
+
+            let buf = crate::runtime::context::alloc(veloq_buf::nz!(1024));
+
+            // Use select to cancel recv
+            select! {
+                _ = stream.recv(buf) => {
+                    panic!("Recv should have been cancelled, but it completed (unexpectedly)");
+                },
+                _ = YieldOnce(false) => {
+                    println!("TCP recv cancelled successfully");
+                }
+            };
+
             drop(stream);
+            crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
         });
-
-        let stream = TcpStream::connect(listen_addr)
-            .await
-            .expect("Failed to connect");
-
-        let buf = crate::runtime::context::alloc(nz!(1024));
-
-        // Use select to cancel recv
-        select! {
-            _ = stream.recv(buf) => {
-                panic!("Recv should have been cancelled, but it completed (unexpectedly)");
-            },
-            _ = YieldOnce(false) => {
-                println!("TCP recv cancelled successfully");
-            }
-        };
-
-        drop(stream);
-        server_h.await;
-    });
 }

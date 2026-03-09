@@ -113,9 +113,9 @@ fn test_multithreaded_expansion() {
         println!("Worker 0: Triggering expansion...");
         if let Some(buf) = pool.alloc(chunk_size) {
             // Verify it is from a new chunk (Chunk 0 has max 8MB, we just took 9th)
-            let (id, _) = buf.resolve_region_info();
-            assert_ne!(id, 0, "Should be new chunk");
-            println!("Worker 0: Expansion successful (Chunk {})", id);
+            let info = buf.resolve_region_info();
+            assert_ne!(info.id, 0, "Should be new chunk");
+            println!("Worker 0: Expansion successful (Chunk {})", info.id);
             holding.push(buf);
         } else {
             panic!("Worker 0 failed to trigger expansion");
@@ -136,9 +136,9 @@ fn test_multithreaded_expansion() {
                     // Try alloc. Since Main Thread holds ~9MB, and initial was ~8MB,
                     // any new alloc MUST come from the new 64MB chunk.
                     if let Some(buf) = pool.alloc(chunk_size) {
-                        let (chunk_id, _) = buf.resolve_region_info();
+                        let info = buf.resolve_region_info();
                         // Just return the chunk ID
-                        Some(chunk_id)
+                        Some(info.id)
                     } else {
                         None
                     }
