@@ -239,7 +239,8 @@ impl IocpDriver {
         self.process_timer_completions();
 
         if completion_key == RIO_EVENT_KEY {
-            self.rio_state.process_completions(&mut self.ops)?;
+            self.rio_state
+                .process_completions(&mut self.ops, &*self.registrar)?;
             return Ok(());
         }
 
@@ -484,6 +485,7 @@ impl IocpDriver {
                                 handle,
                                 user_data,
                                 op.platform_data.generation,
+                                &*self.registrar,
                             );
                             op.platform_data.rio_pool_waiting = false;
                             unsafe {
@@ -623,7 +625,10 @@ impl Drop for IocpDriver {
             };
 
             if key == RIO_EVENT_KEY {
-                if let Ok(count) = self.rio_state.process_completions(&mut self.ops) {
+                if let Ok(count) = self
+                    .rio_state
+                    .process_completions(&mut self.ops, &*self.registrar)
+                {
                     ops_drained += count;
                 }
             } else if !overlapped.is_null() {

@@ -955,7 +955,7 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
         }
         driver
             .rio_state
-            .debug_tick_udp_pool_idle(raw_handle, 1)
+            .debug_tick_udp_pool_idle(raw_handle, 1, &*driver.registrar)
             .expect("idle tick failed");
         stats = driver
             .rio_state

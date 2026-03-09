@@ -233,14 +233,27 @@ impl RioState {
         }
     }
 
-    pub fn cancel_udp_recv_waiter(&mut self, handle: HANDLE, user_data: usize, generation: u32) {
-        self.pool_manager
-            .cancel_udp_recv_waiter(handle, user_data, generation, &self.dispatch);
+    pub fn cancel_udp_recv_waiter(
+        &mut self,
+        handle: HANDLE,
+        user_data: usize,
+        generation: u32,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+    ) {
+        self.pool_manager.cancel_udp_recv_waiter(
+            handle,
+            user_data,
+            generation,
+            &mut self.registry,
+            registrar,
+            &self.dispatch,
+        );
     }
 
     pub fn process_completions(
         &mut self,
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
+        registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<usize> {
         let mut completed_count = 0;
         let dequeue_fn = self.dispatch.dequeue;
@@ -273,6 +286,8 @@ impl RioState {
                         ops,
                         res,
                         completion_generation,
+                        &mut self.registry,
+                        registrar,
                         &self.dispatch,
                     );
                     if let Some(h) = drained_handle {
@@ -642,6 +657,7 @@ impl RioState {
         handle: HANDLE,
         user_data: usize,
         generation: u32,
+        registrar: &dyn veloq_buf::BufferRegistrar,
         buf: &mut veloq_buf::FixedBuf,
         addr: &mut crate::SockAddrStorage,
         addr_len: &mut i32,
@@ -656,6 +672,8 @@ impl RioState {
             rq,
             user_data,
             generation,
+            &mut self.registry,
+            registrar,
             buf,
             addr,
             addr_len,
@@ -682,10 +700,15 @@ impl RioState {
         &mut self,
         handle: HANDLE,
         ticks: usize,
+        registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
         for _ in 0..ticks {
-            self.pool_manager
-                .rebalance_udp_pool(handle, &self.dispatch)?;
+            self.pool_manager.rebalance_udp_pool(
+                handle,
+                &mut self.registry,
+                registrar,
+                &self.dispatch,
+            )?;
         }
         Ok(())
     }

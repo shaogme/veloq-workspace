@@ -612,6 +612,7 @@ pub(crate) unsafe fn submit_recv_from(
             handle,
             op.header.user_data,
             op.header.generation,
+            ctx.registrar,
             &mut payload.op.buf,
             &mut payload.addr,
             &mut payload.addr_len,
