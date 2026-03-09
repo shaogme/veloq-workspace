@@ -9,7 +9,6 @@ use crate::op::IoFd;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::sync::atomic::Ordering;
-use tracing::error;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -258,25 +257,32 @@ impl RioState {
         Ok(())
     }
 
-    // Check if slab page is registered, register if not
+    // Check if slab page is registered, register if not (lazy)
     pub fn ensure_slab_page_registration(
         &mut self,
         page_idx: usize,
-        ops: &OpRegistry<IocpOp, IocpOpState>,
-    ) {
+        resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
+    ) -> io::Result<()> {
         if page_idx >= self.slab_rio_pages.len() {
             self.slab_rio_pages.resize(page_idx + 1, None);
         }
 
-        if self.slab_rio_pages[page_idx].is_none()
-            && let Some((ptr, len)) = ops.get_page_slice(page_idx)
-        {
-            let reg_fn = self.dispatch.register_buffer;
-            let id = unsafe { reg_fn(ptr, len as u32) };
-            if id != RIO_INVALID_BUFFERID {
+        if self.slab_rio_pages[page_idx].is_none() {
+            if let Some((ptr, len)) = resolver(page_idx) {
+                let reg_fn = self.dispatch.register_buffer;
+                let id = unsafe { reg_fn(ptr, len as u32) };
+                if id == RIO_INVALID_BUFFERID {
+                    return Err(io::Error::last_os_error());
+                }
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("RIO: Slab page {} not found in registry", page_idx),
+                ));
             }
         }
+        Ok(())
     }
 
     fn ensure_rq(&mut self, handle: HANDLE, fd: IoFd) -> io::Result<RIO_RQ> {
@@ -333,12 +339,25 @@ impl RioState {
         handle: HANDLE,
         buf: &mut FixedBuf,
         user_data: usize,
+        registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<Option<SubmissionResult>> {
-        let (idx, offset) = buf.resolve_region_info();
+        let info = buf.resolve_region_info();
         // Check chunk registry
-        let buffer_id = match self.chunk_registry.get(idx) {
-            Some(&id) if id != RIO_INVALID_BUFFERID => id,
-            _ => return Ok(None),
+        let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => Some(id),
+            _ => None,
+        };
+
+        if buffer_id.is_none()
+            && let Some(chunk_info) = registrar.resolve_chunk_info(info.id)
+        {
+            self.register_chunk(info.id, chunk_info.ptr.as_ptr(), chunk_info.len.get())?;
+            buffer_id = Some(self.chunk_registry[info.id as usize]);
+        }
+
+        let buffer_id = match buffer_id {
+            Some(id) => id,
+            None => return Ok(None),
         };
 
         // Now self.registered_bufs borrow has ended
@@ -346,7 +365,7 @@ impl RioState {
 
         let rio_buf = RIO_BUF {
             BufferId: buffer_id,
-            Offset: offset as u32,
+            Offset: info.offset as u32,
             Length: buf.capacity() as u32,
         };
 
@@ -367,19 +386,32 @@ impl RioState {
         handle: HANDLE,
         buf: &FixedBuf,
         user_data: usize,
+        registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<Option<SubmissionResult>> {
-        let (idx, offset) = buf.resolve_region_info();
+        let info = buf.resolve_region_info();
         // Check chunk registry
-        let buffer_id = match self.chunk_registry.get(idx) {
-            Some(&id) if id != RIO_INVALID_BUFFERID => id,
-            _ => return Ok(None),
+        let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => Some(id),
+            _ => None,
+        };
+
+        if buffer_id.is_none()
+            && let Some(chunk_info) = registrar.resolve_chunk_info(info.id)
+        {
+            self.register_chunk(info.id, chunk_info.ptr.as_ptr(), chunk_info.len.get())?;
+            buffer_id = Some(self.chunk_registry[info.id as usize]);
+        }
+
+        let buffer_id = match buffer_id {
+            Some(id) => id,
+            None => return Ok(None),
         };
 
         let rq = self.ensure_rq(handle, fd)?;
 
         let rio_buf = RIO_BUF {
             BufferId: buffer_id,
-            Offset: offset as u32,
+            Offset: info.offset as u32,
             Length: buf.len() as u32,
         };
 
@@ -404,31 +436,39 @@ impl RioState {
         addr_len: i32,
         user_data: usize,
         page_idx: usize,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> io::Result<Option<SubmissionResult>> {
-        let (idx, offset) = buf.resolve_region_info();
+        let info = buf.resolve_region_info();
         // Check chunk registry
-        let buffer_id = match self.chunk_registry.get(idx) {
-            Some(&id) if id != RIO_INVALID_BUFFERID => id,
-            _ => {
-                // If index is invalid, fallback to normal IO
-                return Ok(None);
-            }
+        let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => Some(id),
+            _ => None,
         };
 
-        // Copy values out to avoid holding borrow on self.slab_rio_pages while calling ensure_rq
-        let (addr_buf_id, base_addr) = if let Some(Some(entry)) = self.slab_rio_pages.get(page_idx)
+        if buffer_id.is_none()
+            && let Some(chunk_info) = registrar.resolve_chunk_info(info.id)
         {
-            *entry
-        } else {
-            error!("RIO: Slab page not registered for send_to");
-            return Ok(None);
+            self.register_chunk(info.id, chunk_info.ptr.as_ptr(), chunk_info.len.get())?;
+            buffer_id = Some(self.chunk_registry[info.id as usize]);
+        }
+
+        let buffer_id = match buffer_id {
+            Some(id) => id,
+            None => return Ok(None),
         };
+
+        // Lazy register slab page
+        self.ensure_slab_page_registration(page_idx, slab_resolver)?;
+
+        // Values are now guaranteed to be present if ensure_slab_page_registration succeeded
+        let (addr_buf_id, base_addr) = self.slab_rio_pages[page_idx].unwrap();
 
         let rq = self.ensure_rq(handle, fd)?;
 
         let data_buf = RIO_BUF {
             BufferId: buffer_id,
-            Offset: offset as u32,
+            Offset: info.offset as u32,
             Length: buf.len() as u32,
         };
 
@@ -472,28 +512,39 @@ impl RioState {
         len_ptr: *const i32,
         user_data: usize,
         page_idx: usize,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> io::Result<Option<SubmissionResult>> {
-        let (idx, offset) = buf.resolve_region_info();
+        let info = buf.resolve_region_info();
         // Check chunk registry
-        let buffer_id = match self.chunk_registry.get(idx) {
-            Some(&id) if id != RIO_INVALID_BUFFERID => id,
-            _ => return Ok(None),
+        let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
+            Some(&id) if id != RIO_INVALID_BUFFERID => Some(id),
+            _ => None,
         };
 
-        // Copy values out to avoid holding borrow on self
-        let (addr_buf_id, base_addr) = if let Some(Some(entry)) = self.slab_rio_pages.get(page_idx)
+        if buffer_id.is_none()
+            && let Some(chunk_info) = registrar.resolve_chunk_info(info.id)
         {
-            *entry
-        } else {
-            error!("RIO: Slab page not registered for recv_from");
-            return Ok(None);
+            self.register_chunk(info.id, chunk_info.ptr.as_ptr(), chunk_info.len.get())?;
+            buffer_id = Some(self.chunk_registry[info.id as usize]);
+        }
+
+        let buffer_id = match buffer_id {
+            Some(id) => id,
+            None => return Ok(None),
         };
+
+        // Lazy register slab page
+        self.ensure_slab_page_registration(page_idx, slab_resolver)?;
+
+        // Values are now guaranteed to be present
+        let (addr_buf_id, base_addr) = self.slab_rio_pages[page_idx].unwrap();
 
         let rq = self.ensure_rq(handle, fd)?;
 
         let data_buf = RIO_BUF {
             BufferId: buffer_id,
-            Offset: offset as u32,
+            Offset: info.offset as u32,
             Length: buf.capacity() as u32,
         };
 

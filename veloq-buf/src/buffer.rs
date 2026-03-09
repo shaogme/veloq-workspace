@@ -97,10 +97,16 @@ impl<const S: u16> std::fmt::Debug for NotU16<S> {
 
 pub type GlobalIndex = NotU16<NO_REGISTRATION_INDEX>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionInfo {
+    pub id: u16,
+    pub offset: usize,
+}
+
 #[derive(Debug)]
 pub struct PoolVTable {
     pub dealloc: unsafe fn(pool_data: NonNull<()>, params: DeallocParams),
-    pub resolve_region_info: unsafe fn(pool_data: NonNull<()>, buf: &FixedBuf) -> (usize, usize),
+    pub resolve_region_info: unsafe fn(pool_data: NonNull<()>, buf: &FixedBuf) -> RegionInfo,
 }
 
 #[derive(Debug)]
@@ -181,6 +187,19 @@ pub trait BufferRegistrar {
     /// Resolve chunk info for a given chunk_id.
     /// Used for lazy registration.
     fn resolve_chunk_info(&self, chunk_id: u16) -> Option<crate::heap::ChunkInfo>;
+}
+
+/// A no-op registrar that does nothing.
+pub struct NoopRegistrar;
+
+impl BufferRegistrar for NoopRegistrar {
+    fn register(&self, _regions: &[BufferRegion]) -> std::io::Result<Vec<usize>> {
+        Ok(Vec::new())
+    }
+
+    fn resolve_chunk_info(&self, _chunk_id: u16) -> Option<crate::heap::ChunkInfo> {
+        None
+    }
 }
 
 /// Memory pool implementation providing raw memory allocation.
@@ -364,7 +383,7 @@ impl FixedBuf {
     ///
     /// The interpretation of the region index is pool-dependent.
     #[inline(always)]
-    pub fn resolve_region_info(&self) -> (usize, usize) {
+    pub fn resolve_region_info(&self) -> RegionInfo {
         unsafe { (self.vtable.resolve_region_info)(self.pool_data, self) }
     }
 
@@ -817,12 +836,12 @@ unsafe fn heap_dealloc_shim(_pool_data: NonNull<()>, params: DeallocParams) {
     }
 }
 
-unsafe fn heap_resolve_region_info_shim(
-    _pool_data: NonNull<()>,
-    _buf: &FixedBuf,
-) -> (usize, usize) {
+unsafe fn heap_resolve_region_info_shim(_pool_data: NonNull<()>, _buf: &FixedBuf) -> RegionInfo {
     // Return NO_REGISTRATION_INDEX to indicate this buffer is not registered
-    (NO_REGISTRATION_INDEX as usize, 0)
+    RegionInfo {
+        id: NO_REGISTRATION_INDEX,
+        offset: 0,
+    }
 }
 
 unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
@@ -866,7 +885,7 @@ unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams)
 unsafe fn slot_based_resolve_region_info_shim(
     pool_data: NonNull<()>,
     buf: &FixedBuf,
-) -> (usize, usize) {
+) -> RegionInfo {
     // 1. Cast back to GlobalSlotPool
     let pool = unsafe { &*(pool_data.as_ptr() as *const crate::heap::GlobalSlotPool) };
 
@@ -881,6 +900,9 @@ unsafe fn slot_based_resolve_region_info_shim(
     let base = chunk_info.ptr.as_ptr() as usize;
     let ptr = buf.as_ptr() as usize;
 
-    // Return (ChunkID, Offset)
-    (chunk_id as usize, ptr.saturating_sub(base))
+    // Return RegionInfo { id, offset }
+    RegionInfo {
+        id: chunk_id,
+        offset: ptr.saturating_sub(base),
+    }
 }

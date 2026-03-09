@@ -77,6 +77,7 @@ pub struct IocpDriver {
 
     // RIO Support (Decoupled)
     pub(crate) rio_state: Option<RioState>,
+    pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
 }
 
 pub(crate) struct CompletionPort {
@@ -153,17 +154,10 @@ impl IocpDriver {
         let extensions = Extensions::new()?;
 
         // Initialize RIO State
-        let mut rio_state = RioState::new(port, entries, &extensions)?;
+        let rio_state = RioState::new(port, entries, &extensions)?;
 
         // Changed from with_capacity to new
         let ops = OpRegistry::new(entries as usize);
-
-        // Pre-register existing pages (created by new)
-        if let Some(rio) = &mut rio_state {
-            for i in 0..ops.page_count() {
-                rio.ensure_slab_page_registration(i, &ops);
-            }
-        }
 
         let is_waked = Arc::new(AtomicBool::new(false));
 
@@ -177,6 +171,7 @@ impl IocpDriver {
             free_slots: Vec::new(),
             is_waked,
             rio_state,
+            registrar: Box::new(veloq_buf::NoopRegistrar),
         })
     }
 

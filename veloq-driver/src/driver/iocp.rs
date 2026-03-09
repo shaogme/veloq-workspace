@@ -15,6 +15,7 @@ use std::task::{Context, Poll};
 use tracing::{debug, trace};
 use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
 
+use inner::WAKEUP_USER_DATA;
 pub use inner::{IocpDriver, IocpOpState, OpLifecycle};
 use op::IocpOp;
 use submit::SubmissionResult;
@@ -24,8 +25,6 @@ impl Driver for IocpDriver {
 
     fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
         // OpRegistry::alloc handles internal vectors and free list management autonomously.
-
-        let old_pages = self.ops.page_count();
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::new())) {
             Ok(handle) => (handle.index, handle.generation),
             Err(_) => {
@@ -36,14 +35,6 @@ impl Driver for IocpDriver {
             }
         };
         trace!(user_data, generation, "Reserved op slot");
-
-        if self.ops.page_count() > old_pages {
-            // New page allocated, register it immediately
-            if let Some(rio) = &mut self.rio_state {
-                let new_page_idx = self.ops.page_count() - 1;
-                rio.ensure_slab_page_registration(new_page_idx, &self.ops);
-            }
-        }
         Ok((user_data, generation))
     }
 
@@ -59,6 +50,15 @@ impl Driver for IocpDriver {
         trace!(user_data, "Submitting op");
 
         let slots_per_page = self.ops.local.len();
+        // On Windows, the slab is currently a single contiguous block (page 0).
+        let (slab_ptr, slab_len) = self.ops.get_page_slice(0).unwrap();
+        let slab_resolver = move |idx| {
+            if idx == 0 {
+                Some((slab_ptr, slab_len))
+            } else {
+                None
+            }
+        };
 
         // Scope for initial submission
         {
@@ -85,8 +85,10 @@ impl Driver for IocpDriver {
                 overlapped: overlapped_ptr,
                 ext: &self.extensions,
                 registered_files: &self.registered_files,
+                registrar: self.registrar.as_ref(),
                 rio: self.rio_state.as_mut(),
                 slots_per_page,
+                slab_resolver: &slab_resolver,
             };
 
             let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
@@ -175,6 +177,16 @@ impl Driver for IocpDriver {
         let (user_data, _) = self.reserve_op()?;
 
         let slots_per_page = self.ops.local.len();
+        // Pre-fetch slab info to avoid borrow conflicts
+        let (slab_ptr, slab_len) = self.ops.get_page_slice(0).unwrap();
+        let slab_resolver = move |idx| {
+            if idx == 0 {
+                Some((slab_ptr, slab_len))
+            } else {
+                None
+            }
+        };
+
         let (slot, op_entry) = match self.ops.get_slot_and_entry_mut(user_data) {
             Some(pair) => pair,
             None => panic!("Op not found after reserve"),
@@ -194,8 +206,10 @@ impl Driver for IocpDriver {
             overlapped: overlapped_ptr,
             ext: &self.extensions,
             registered_files: &self.registered_files,
+            registrar: self.registrar.as_ref(),
             rio: self.rio_state.as_mut(),
             slots_per_page,
+            slab_resolver: &slab_resolver,
         };
 
         let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
@@ -294,7 +308,12 @@ impl Driver for IocpDriver {
     }
 
     fn wake(&mut self) -> io::Result<()> {
-        IocpDriver::wake(self)
+        if !self.is_waked.swap(true, Ordering::AcqRel) {
+            unsafe {
+                PostQueuedCompletionStatus(self.port.handle, 0, WAKEUP_USER_DATA, std::ptr::null());
+            }
+        }
+        Ok(())
     }
 
     fn inner_handle(&self) -> crate::RawHandle {
@@ -304,10 +323,17 @@ impl Driver for IocpDriver {
     }
 
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker> {
-        IocpDriver::create_waker(self)
+        std::sync::Arc::new(crate::driver::iocp::inner::IocpWaker {
+            port: self.port.clone(),
+            is_waked: self.is_waked.clone(),
+        })
     }
 
     fn driver_id(&self) -> usize {
-        0
+        self.port.handle as usize
+    }
+
+    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
+        self.registrar = registrar;
     }
 }

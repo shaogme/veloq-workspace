@@ -76,6 +76,9 @@ pub trait Driver: 'static {
 
     /// Get the unique identifier of the driver.
     fn driver_id(&self) -> usize;
+
+    /// Set the buffer registrar for lazy registration support.
+    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
 }
 
 pub trait RemoteWaker: Send + Sync {

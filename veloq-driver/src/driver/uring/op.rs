@@ -21,11 +21,12 @@ use std::time::Duration;
 // VTable Definition
 // ============================================================================
 
-pub type MakeSqeFn = unsafe fn(op: &mut UringOp, driver: &UringDriver) -> squeue::Entry;
+pub type MakeSqeFn = unsafe fn(op: &mut UringOp, driver: &mut UringDriver) -> squeue::Entry;
 pub type OnCompleteFn = unsafe fn(op: &mut UringOp, result: i32) -> io::Result<usize>;
 pub type DropFn = unsafe fn(op: &mut UringOp);
 pub type GetFdFn = unsafe fn(op: &UringOp) -> Option<IoFd>;
 pub type GetTimeoutFn = unsafe fn(op: &UringOp) -> Option<Duration>;
+pub type ResolveChunksFn = unsafe fn(op: &UringOp, chunks: &mut [u16]) -> usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmissionStrategy {
@@ -44,6 +45,7 @@ pub struct OpVTable {
     pub get_fd: GetFdFn,
     pub strategy: SubmissionStrategy,
     pub get_timeout: GetTimeoutFn,
+    pub resolve_chunks: ResolveChunksFn,
 }
 
 // ============================================================================
@@ -91,6 +93,7 @@ macro_rules! define_uring_ops {
                 get_fd: $get_fd:path,
                 $(strategy: $strategy:expr,)?
                 $(get_timeout: $get_timeout:expr,)?
+                $(resolve_chunks: $resolve_chunks:expr,)?
                 $(construct: $construct:expr,)?
                 $(destruct: $destruct:expr,)?
             }
@@ -114,6 +117,7 @@ macro_rules! define_uring_ops {
                         get_fd: $get_fd,
                         strategy: define_uring_ops!(@strategy $($strategy)?),
                         get_timeout: define_uring_ops!(@get_timeout $($get_timeout)?),
+                        resolve_chunks: define_uring_ops!(@resolve_chunks $($resolve_chunks)?),
                     };
 
                     let payload = define_uring_ops!(@construct self, $($construct)?, $OpType $(, $Payload)?);
@@ -147,6 +151,10 @@ macro_rules! define_uring_ops {
     // Default get_timeout: return None
     (@get_timeout ) => { submit::get_timeout_none };
     (@get_timeout $func:expr) => { $func };
+
+    // Default resolve_chunks: return 0
+    (@resolve_chunks ) => { submit::resolve_chunks_none };
+    (@resolve_chunks $func:expr) => { $func };
 
     // Default construct: return self
     (@construct $self:expr, , $OpType:ty) => { $self };
@@ -208,6 +216,7 @@ define_uring_ops! {
         on_complete: submit::on_complete_read_fixed,
         drop: submit::drop_read_fixed,
         get_fd: submit::get_fd_read_fixed,
+        resolve_chunks: submit::resolve_chunks_read_fixed,
     }, // Kernel 5.1+
     WriteFixed {
         field: write,
@@ -215,6 +224,7 @@ define_uring_ops! {
         on_complete: submit::on_complete_write_fixed,
         drop: submit::drop_write_fixed,
         get_fd: submit::get_fd_write_fixed,
+        resolve_chunks: submit::resolve_chunks_write_fixed,
     }, // Kernel 5.1+
     Recv {
         field: recv,
