@@ -4,9 +4,11 @@ use veloq_buf::nz;
 
 use crate::net::udp::UdpSocket;
 use crate::runtime::Runtime;
+use crate::time::timeout;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 // ============ Helper Functions ============
 
@@ -189,7 +191,17 @@ fn test_udp_multiple_messages() {
                 let h_recv = crate::runtime::context::spawn(async move {
                     for i in 0..NUM_MESSAGES {
                         let buf = crate::runtime::context::alloc(size);
-                        let (result, _buf) = socket1_clone.recv_from(buf).await;
+                        let (result, _buf) = timeout(Duration::from_secs(5), socket1_clone.recv_from(buf))
+                            .await
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "UDP multiple messages timeout: phase=recv_from; expected={}; received_so_far={}; listen_addr={}; timeout_ms={}",
+                                    NUM_MESSAGES,
+                                    i,
+                                    addr1,
+                                    5000
+                                )
+                            });
                         let (bytes, from) = result.expect("recv_from failed");
                         println!("Received message {} ({} bytes) from {}", i, bytes, from);
                     }
@@ -203,7 +215,16 @@ fn test_udp_multiple_messages() {
                     buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
                     buf.set_len(msg.len());
 
-                    let (result, _) = socket2_arc.send_to(buf, addr1).await;
+                    let (result, _) = timeout(Duration::from_secs(5), socket2_arc.send_to(buf, addr1))
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "UDP multiple messages timeout: phase=send_to; sent_so_far={}; target_addr={}; timeout_ms={}",
+                                i,
+                                addr1,
+                                5000
+                            )
+                        });
                     result.expect("send_to failed");
                     println!("Sent message {}", i);
                 }
@@ -529,13 +550,9 @@ fn test_multithread_udp_echo() {
 /// Test concurrent UDP clients from multiple workers to shared server
 #[test]
 fn test_multithread_concurrent_udp_clients() {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
     for size in [nz!(8192), nz!(16384), nz!(65536)] {
         std::thread::spawn(move || {
-            let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
-            let addr_rx = Arc::new(Mutex::new(addr_rx));
+            let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded::<SocketAddr>();
             let message_count = Arc::new(AtomicUsize::new(0));
 
             const NUM_CLIENTS: usize = 3;
@@ -546,29 +563,35 @@ fn test_multithread_concurrent_udp_clients() {
                 .build()
                 .unwrap();
 
-            let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
-
             let message_count_clone = message_count.clone();
             runtime.block_on(async move {
                 // Server worker (0)
                 let addr_tx = addr_tx.clone();
-                crate::runtime::context::spawn_to(0, async move || {
+                let server_handle = crate::runtime::context::spawn_to(0, async move || {
                     let socket =
                         UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
                     let server_addr = socket.local_addr().expect("Failed to get server address");
                     println!("Server listening on {}", server_addr);
 
-                    // Broadcast address to all clients
-                    for _ in 0..NUM_CLIENTS {
-                        addr_tx.send(server_addr).unwrap();
-                    }
+                    // Publish server address once; main task fans out to clients.
+                    addr_tx.send(server_addr).unwrap();
 
                     // let pool = crate::runtime::context::current_pool().unwrap();
 
                     // Receive messages from all clients
                     for i in 0..NUM_CLIENTS {
                         let buf = crate::runtime::context::alloc(size);
-                        let (result, _buf) = socket.recv_from(buf).await;
+                        let (result, _buf) = timeout(Duration::from_secs(5), socket.recv_from(buf))
+                            .await
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "UDP concurrent clients timeout: phase=server_recv; expected_clients={}; received_so_far={}; server_addr={}; timeout_ms={}",
+                                    NUM_CLIENTS,
+                                    i,
+                                    server_addr,
+                                    5000
+                                )
+                            });
                         let (bytes, from) = result.expect("Server recv_from failed");
                         println!(
                             "Server received message {} ({} bytes) from {}",
@@ -578,21 +601,24 @@ fn test_multithread_concurrent_udp_clients() {
                     println!("Server received all {} messages", NUM_CLIENTS);
                 });
 
+                let server_addr = timeout(Duration::from_secs(5), addr_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "UDP concurrent clients timeout: phase=wait_server_addr; timeout_ms={}",
+                            5000
+                        )
+                    })
+                    .expect("Channel closed before server addr published");
+
                 let counter_clone = message_count_clone.clone();
+                let mut client_handles = Vec::with_capacity(NUM_CLIENTS);
                 // Client workers (1..=3)
                 for client_id in 1..=NUM_CLIENTS {
-                    let rx = addr_rx.clone();
                     let counter = counter_clone.clone();
-                    let done_tx = done_tx.clone();
+                    let server_addr = server_addr;
 
-                    crate::runtime::context::spawn_to(client_id, async move || {
-                        let server_addr = {
-                            rx.lock()
-                                .unwrap()
-                                .recv_timeout(Duration::from_secs(5))
-                                .expect("Timeout waiting for server address")
-                        };
-
+                    let handle = crate::runtime::context::spawn_to(client_id, async move || {
                         let client =
                             UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
                         // let pool = crate::runtime::context::current_pool().unwrap();
@@ -602,19 +628,47 @@ fn test_multithread_concurrent_udp_clients() {
                         buf.as_slice_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
                         buf.set_len(msg.len());
 
-                        let (result, _) = client.send_to(buf, server_addr).await;
+                        let (result, _) = timeout(Duration::from_secs(5), client.send_to(buf, server_addr))
+                            .await
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "UDP concurrent clients timeout: phase=client_send; client_id={}; server_addr={}; timeout_ms={}",
+                                    client_id,
+                                    server_addr,
+                                    5000
+                                )
+                            });
                         result.expect("Client send_to failed");
                         println!("Client {} sent message", client_id);
 
                         counter.fetch_add(1, Ordering::SeqCst);
-                        done_tx.send(()).unwrap();
                     });
+                    client_handles.push((client_id, handle));
                 }
 
-                // Wait for clients
-                for _ in 0..NUM_CLIENTS {
-                    done_rx.recv().await.unwrap();
+                for (client_id, handle) in client_handles {
+                    timeout(Duration::from_secs(5), async move { handle.await })
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "UDP concurrent clients timeout: phase=wait_client_join; client_id={}; current_done={}; timeout_ms={}",
+                                client_id,
+                                message_count_clone.load(Ordering::SeqCst),
+                                5000
+                            )
+                        });
                 }
+
+                timeout(Duration::from_secs(5), async move { server_handle.await })
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "UDP concurrent clients timeout: phase=wait_server_join; expected_clients={}; current_done={}; timeout_ms={}",
+                            NUM_CLIENTS,
+                            message_count_clone.load(Ordering::SeqCst),
+                            5000
+                        )
+                    });
             });
 
             assert_eq!(message_count.load(Ordering::SeqCst), NUM_CLIENTS);

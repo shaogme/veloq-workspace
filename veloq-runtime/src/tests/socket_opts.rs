@@ -2,8 +2,10 @@ use veloq_buf::nz;
 
 use crate::net::socket::{TcpSocket, UdpSocketBuilder};
 use crate::runtime::Runtime;
+use crate::time::timeout;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn test_tcp_socket_options() {
@@ -95,7 +97,16 @@ fn test_udp_socket_options() {
         res.expect("Failed to send");
 
         let buf = crate::runtime::context::alloc(nz!(1024));
-        let (res, _) = socket.recv_from(buf).await;
+        let (res, _) = timeout(Duration::from_secs(5), socket.recv_from(buf))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "UDP socket options test timeout: phase=recv_from; bound_addr={}; client_bound_addr={}; timeout_ms={}",
+                    addr,
+                    client.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                    5000
+                )
+            });
         res.expect("Failed to recv");
     });
 }
