@@ -12,20 +12,10 @@ pub mod sync {
 }
 pub mod time;
 
+#[cfg(test)]
+mod tests;
+
 // Re-export key functions for convenient access
 pub use runtime::{JoinHandle, LocalJoinHandle};
 pub use runtime::{LocalExecutor, Runtime}; // Export Runtime for config usage
 pub use runtime::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
-
-#[cfg(test)]
-mod tests {
-    mod basic;
-    mod buffer_test;
-    mod fs;
-    mod select_test;
-    mod socket_opts;
-    mod spawn_to_test;
-    mod tcp;
-    mod time;
-    mod udp;
-}
