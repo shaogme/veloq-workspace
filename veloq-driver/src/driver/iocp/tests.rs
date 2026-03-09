@@ -224,6 +224,10 @@ fn test_iocp_recv_with_buffer_pool() {
             }
             Ok(ids)
         }
+
+        fn resolve_chunk_info(&self, _chunk_id: u16) -> Option<veloq_buf::heap::ChunkInfo> {
+            None
+        }
     }
 
     let registrar = Box::new(LegacyDriverRegistrar {

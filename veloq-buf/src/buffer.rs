@@ -177,6 +177,10 @@ pub trait BufferRegistrar {
     /// Returns a list of handles (tokens) corresponding to the regions.
     /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
     fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>>;
+
+    /// Resolve chunk info for a given chunk_id.
+    /// Used for lazy registration.
+    fn resolve_chunk_info(&self, chunk_id: u16) -> Option<crate::heap::ChunkInfo>;
 }
 
 /// Memory pool implementation providing raw memory allocation.
