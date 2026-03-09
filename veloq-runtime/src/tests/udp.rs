@@ -90,7 +90,7 @@ fn test_udp_send_receive() {
     crate::tests::NetworkTestRunner::new("test_udp_send_receive")
         .worker_threads(1)
         .run(|size| async move {
-            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+            let socket1 = bind_udp_ready("127.0.0.1:0", size, 8).await;
             let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
             let addr1 = socket1.local_addr().expect("Failed to get addr1");
@@ -146,8 +146,8 @@ fn test_udp_echo() {
         .worker_threads(1)
         .run(|size| async move {
             // Create server and client sockets
-            let server = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
-            let client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
+            let server = bind_udp_ready("127.0.0.1:0", size, 8).await;
+            let client = bind_udp_ready("127.0.0.1:0", size, 8).await;
 
             let server_addr = server.local_addr().expect("Failed to get server address");
             let client_addr = client.local_addr().expect("Failed to get client address");
@@ -242,7 +242,7 @@ fn test_udp_multiple_messages() {
     crate::tests::NetworkTestRunner::new("test_udp_multiple_messages")
         .worker_threads(1)
         .run(|size| async move {
-            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+            let socket1 = bind_udp_ready("127.0.0.1:0", size, 8).await;
             let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
             let addr1 = socket1.local_addr().expect("Failed to get addr1");
@@ -313,7 +313,7 @@ fn test_udp_large_data() {
     crate::tests::NetworkTestRunner::new("test_udp_large_data")
         .worker_threads(1)
         .run(|size| async move {
-            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+            let socket1 = bind_udp_ready("127.0.0.1:0", size, 8).await;
             let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
             let addr1 = socket1.local_addr().expect("Failed to get addr1");
@@ -370,7 +370,7 @@ fn test_udp_heap_buffer() {
     crate::tests::NetworkTestRunner::new("test_udp_heap_buffer")
         .worker_threads(1)
         .run(|_| async move {
-            let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+            let socket1 = bind_udp_ready("127.0.0.1:0", veloq_buf::nz!(1024), 8).await;
             let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
             let addr1 = socket1.local_addr().expect("Failed to get addr1");
 
@@ -450,7 +450,7 @@ fn test_multithread_udp_no_echo() {
 
                 let handle = crate::runtime::context::spawn_to(worker_id, async move || {
                     // Each worker creates its own UDP sockets and tests send/recv
-                    let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+                    let socket1 = bind_udp_ready("127.0.0.1:0", size, 8).await;
                     let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
 
                     let addr1 = socket1.local_addr().expect("Failed to get addr1");
@@ -604,8 +604,7 @@ fn test_multithread_udp_echo() {
 
                 println!("Client connecting to {}", server_addr);
 
-                let client =
-                    Arc::new(UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket"));
+                let client = Arc::new(bind_udp_ready("127.0.0.1:0", size, 8).await);
 
                 // Pre-post client recv before sending request to avoid RIO response drop.
                 let (client_ready_tx, mut client_ready_rx) = crate::sync::mpsc::unbounded::<()>();
@@ -717,8 +716,7 @@ fn test_multithread_concurrent_udp_clients() {
                 let counter = counter_clone.clone();
 
                 let handle = crate::runtime::context::spawn_to(client_id, async move || {
-                    let client =
-                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
+                    let client = bind_udp_ready("127.0.0.1:0", size, 8).await;
 
                     let msg = format!("Hello from client {}", client_id);
                     udp_send_to_with_retry(
