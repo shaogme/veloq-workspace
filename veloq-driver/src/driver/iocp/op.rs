@@ -54,7 +54,7 @@ pub struct SubmitContext<'a> {
     pub registrar: &'a dyn veloq_buf::BufferRegistrar,
 
     // RIO Support
-    pub rio: Option<&'a mut RioState>,
+    pub rio: &'a mut RioState,
     pub slots_per_page: usize,
     pub slab_resolver: &'a dyn Fn(usize) -> Option<(*const u8, usize)>,
 }

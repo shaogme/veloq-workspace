@@ -13,8 +13,7 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, WSARecvFrom,
-    WSASendTo, bind, getsockname, setsockopt,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, bind, getsockname, setsockopt,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::CreateIoCompletionPort;
@@ -200,44 +199,14 @@ pub(crate) unsafe fn submit_recv(
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
-    // Try RIO upgrade
-    if let Some(rio) = &mut ctx.rio
-        && let Some(res) = rio.try_submit_recv(
-            val.fd,
-            handle,
-            &mut val.buf,
-            op.header.user_data,
-            ctx.registrar,
-        )?
-    {
-        return Ok(res);
-    }
-
-    // Fallback to normal IOCP
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
-
-    let mut bytes = 0;
-    let ptr = val.buf.as_mut_ptr();
-
-    let ret = unsafe {
-        ReadFile(
-            handle,
-            ptr as _,
-            val.buf.len() as u32,
-            &mut bytes,
-            ctx.overlapped,
-        )
-    };
-
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
+    // RIO path is mandatory for socket recv.
+    return ctx.rio.try_submit_recv(
+        val.fd,
+        handle,
+        &mut val.buf,
+        op.header.user_data,
+        ctx.registrar,
+    );
 }
 impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
 
@@ -253,39 +222,10 @@ pub(crate) unsafe fn submit_send(
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
-    // Try RIO upgrade
-    if let Some(rio) = &mut ctx.rio
-        && let Some(res) =
-            rio.try_submit_send(val.fd, handle, &val.buf, op.header.user_data, ctx.registrar)?
-    {
-        return Ok(res);
-    }
-
-    // Fallback
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
-
-    let mut bytes = 0;
-    let ptr = val.buf.as_slice().as_ptr() as *mut u8;
-
-    let ret = unsafe {
-        WriteFile(
-            handle,
-            ptr as _,
-            val.buf.len() as u32,
-            &mut bytes,
-            ctx.overlapped,
-        )
-    };
-
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
+    // RIO path is mandatory for socket send.
+    return ctx
+        .rio
+        .try_submit_send(val.fd, handle, &val.buf, op.header.user_data, ctx.registrar);
 }
 impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
@@ -519,53 +459,19 @@ pub(crate) unsafe fn submit_send_to(
     let payload = unsafe { &mut *op.payload.send_to };
     let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
 
-    // Try RIO upgrade logic
-    if let Some(rio) = &mut ctx.rio {
-        let page_idx = op.header.user_data / ctx.slots_per_page;
-        if let Some(res) = rio.try_submit_send_to(
-            payload.op.fd,
-            handle,
-            &payload.op.buf,
-            &payload.addr as *const _ as *const std::ffi::c_void,
-            payload.addr_len,
-            op.header.user_data,
-            page_idx,
-            ctx.registrar,
-            ctx.slab_resolver,
-        )? {
-            return Ok(res);
-        }
-    }
-
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
-
-    payload.wsabuf.len = payload.op.buf.len() as u32;
-    payload.wsabuf.buf = payload.op.buf.as_slice().as_ptr() as *mut u8;
-
-    let mut bytes = 0;
-    let ret = unsafe {
-        WSASendTo(
-            handle as SOCKET,
-            &payload.wsabuf,
-            1,
-            &mut bytes,
-            0,
-            &payload.addr as *const _ as *const SOCKADDR,
-            payload.addr_len,
-            ctx.overlapped,
-            None,
-        )
-    };
-
-    if ret == SOCKET_ERROR {
-        let err = unsafe { WSAGetLastError() };
-        if err != ERROR_IO_PENDING as i32 {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
+    // RIO path is mandatory for socket send_to.
+    let page_idx = op.header.user_data / ctx.slots_per_page;
+    return ctx.rio.try_submit_send_to(
+        payload.op.fd,
+        handle,
+        &payload.op.buf,
+        &payload.addr as *const _ as *const std::ffi::c_void,
+        payload.addr_len,
+        op.header.user_data,
+        page_idx,
+        ctx.registrar,
+        ctx.slab_resolver,
+    );
 }
 
 impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
@@ -581,53 +487,19 @@ pub(crate) unsafe fn submit_recv_from(
     let payload = unsafe { &mut *op.payload.recv_from };
     let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
 
-    // Try RIO upgrade
-    if let Some(rio) = &mut ctx.rio {
-        let page_idx = op.header.user_data / ctx.slots_per_page;
-        if let Some(res) = rio.try_submit_recv_from(
-            payload.op.fd,
-            handle,
-            &mut payload.op.buf,
-            &payload.addr as *const _ as *const std::ffi::c_void,
-            &payload.addr_len,
-            op.header.user_data,
-            page_idx,
-            ctx.registrar,
-            ctx.slab_resolver,
-        )? {
-            return Ok(res);
-        }
-    }
-
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
-
-    payload.wsabuf.len = payload.op.buf.capacity() as u32;
-    payload.wsabuf.buf = payload.op.buf.as_mut_ptr();
-
-    let mut bytes = 0;
-    let ret = unsafe {
-        WSARecvFrom(
-            handle as SOCKET,
-            &payload.wsabuf,
-            1,
-            &mut bytes,
-            &mut payload.flags,
-            &mut payload.addr as *mut _ as *mut SOCKADDR,
-            &mut payload.addr_len,
-            ctx.overlapped,
-            None,
-        )
-    };
-
-    if ret == SOCKET_ERROR {
-        let err = unsafe { WSAGetLastError() };
-        if err != ERROR_IO_PENDING as i32 {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
+    // RIO path is mandatory for socket recv_from.
+    let page_idx = op.header.user_data / ctx.slots_per_page;
+    return ctx.rio.try_submit_recv_from(
+        payload.op.fd,
+        handle,
+        &mut payload.op.buf,
+        &payload.addr as *const _ as *const std::ffi::c_void,
+        &payload.addr_len,
+        op.header.user_data,
+        page_idx,
+        ctx.registrar,
+        ctx.slab_resolver,
+    );
 }
 
 impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);

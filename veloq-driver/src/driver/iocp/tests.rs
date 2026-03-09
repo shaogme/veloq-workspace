@@ -53,7 +53,7 @@ fn test_iocp_accept() {
     let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(accept_op));
 
     let (user_data, _) = driver.reserve_op().unwrap();
-    let _ = driver.submit(user_data, &mut iocp_op);
+    let _ = driver.submit(user_data, &mut iocp_op).expect("submit accept failed");
 
     // Connect Client in background
     std::thread::spawn(move || {
@@ -121,7 +121,9 @@ fn test_iocp_connect() {
 
     let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(connect_op));
     let (user_data, _) = driver.reserve_op().unwrap();
-    let _ = driver.submit(user_data, &mut iocp_op);
+    let _ = driver
+        .submit(user_data, &mut iocp_op)
+        .expect("submit connect failed");
 
     // Poll
     let waker = noop_waker();
@@ -156,7 +158,9 @@ fn test_iocp_timeout() {
 
     let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(timeout_op));
     let (user_data, _) = driver.reserve_op().unwrap();
-    let _ = driver.submit(user_data, &mut iocp_op);
+    let _ = driver
+        .submit(user_data, &mut iocp_op)
+        .expect("submit timeout failed");
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -192,13 +196,9 @@ fn test_iocp_timeout() {
 
 #[test]
 fn test_iocp_recv_with_buffer_pool() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use veloq_buf::BufPool;
 
-    let driver = Rc::new(RefCell::new(
-        IocpDriver::new(IocpConfig::default()).unwrap(),
-    ));
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
 
     use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 
@@ -209,74 +209,91 @@ fn test_iocp_recv_with_buffer_pool() {
 
     let global_pool = topology.create_pool(1).expect("Create pool failed");
 
-    // Wrapper to use driver as registrar
-    struct LegacyDriverRegistrar {
-        driver: Rc<RefCell<IocpDriver>>,
-    }
+    // Build pool with noop registrar; chunk registration is explicitly controlled below.
+    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
 
-    impl veloq_buf::BufferRegistrar for LegacyDriverRegistrar {
-        fn register(&self, regions: &[veloq_buf::BufferRegion]) -> std::io::Result<Vec<usize>> {
-            let mut driver = self.driver.borrow_mut();
-            let mut ids = Vec::new();
-            for (i, region) in regions.iter().enumerate() {
-                driver.register_chunk(i as u16, region.as_ptr(), region.len())?;
-                ids.push(i);
-            }
-            Ok(ids)
-        }
-
-        fn resolve_chunk_info(&self, _chunk_id: u16) -> Option<veloq_buf::heap::ChunkInfo> {
-            None
-        }
-    }
-
-    let registrar = Box::new(LegacyDriverRegistrar {
-        driver: driver.clone(),
-    });
-
-    let reg_pool = topology.build(&global_pool, 0, registrar);
-
-    // Setup connection
+    // Setup server listener
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let client_thread = std::thread::spawn(move || {
-        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    // Create RIO-capable client socket and connect via driver op.
+    let client = Socket::new_tcp_v4().expect("client socket create failed");
+    let client_handle = client.into_raw();
+    let (addr_storage, addr_len) = crate::socket_addr_to_storage(addr);
+    let connect_op = Connect {
+        fd: crate::op::IoFd::Raw(client_handle),
+        addr: addr_storage,
+        addr_len: addr_len as u32,
+    };
+    let mut connect_iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(connect_op));
+    let connect_user_data = driver.reserve_op().unwrap().0;
+    let _ = driver
+        .submit(connect_user_data, &mut connect_iocp_op)
+        .expect("submit connect failed");
+
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
         use std::io::Write;
         stream.write_all(b"Hello Buffer").unwrap();
     });
-
-    let (stream, _) = listener.accept().unwrap();
-    let stream_handle = stream.into_raw_socket().into();
 
     // Alloc buffer
     let buf = reg_pool
         .alloc(std::num::NonZeroUsize::new(8192).unwrap())
         .expect("Failed to alloc buffer");
 
+    // Strict RIO path: ensure the exact chunk backing this buffer is registered in the driver.
+    let region = buf.resolve_region_info();
+    let chunk = global_pool
+        .chunk_info(region.id)
+        .expect("Chunk info for buffer not found");
+    driver
+        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .expect("register chunk failed");
+
+    // Poll connect completion before issuing recv.
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let connect_start = std::time::Instant::now();
+    loop {
+        if connect_start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("Connect timed out");
+        }
+        driver.process_completions();
+        let mut op_out = None;
+        match driver.poll_op(connect_user_data, &mut cx, &mut op_out) {
+            Poll::Ready(res) => {
+                assert!(res.is_ok(), "Connect failed: {:?}", res.err());
+                let _ = op_out.unwrap();
+                break;
+            }
+            Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+
     // Create Recv Op
     let recv_op = Recv {
-        fd: crate::op::IoFd::Raw(stream_handle),
+        fd: crate::op::IoFd::Raw(client_handle),
         buf,
     };
 
     let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
-    let (user_data, _) = driver.borrow_mut().reserve_op().unwrap();
-    let _ = driver.borrow_mut().submit(user_data, &mut iocp_op);
+    let (user_data, _) = driver.reserve_op().unwrap();
+    let _ = driver
+        .submit(user_data, &mut iocp_op)
+        .expect("submit recv failed");
 
     // Poll
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
     let start = std::time::Instant::now();
 
     loop {
         if start.elapsed() > std::time::Duration::from_secs(5) {
             panic!("Recv timed out");
         }
-        driver.borrow_mut().process_completions();
+        driver.process_completions();
 
         let mut op_out = None;
-        match driver.borrow_mut().poll_op(user_data, &mut cx, &mut op_out) {
+        match driver.poll_op(user_data, &mut cx, &mut op_out) {
             Poll::Ready(res) => {
                 let iocp_op = op_out.unwrap();
                 assert!(res.is_ok(), "Recv failed: {:?}", res.err());
@@ -288,21 +305,16 @@ fn test_iocp_recv_with_buffer_pool() {
                 op.buf.set_len(bytes_read);
                 assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(stream_handle.into()) };
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
                 break;
             }
             Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
         }
     }
-    client_thread.join().unwrap();
+    server_thread.join().unwrap();
 }
 
 #[test]
 fn test_rio_extensions_load() {
-    let ext = Extensions::new().expect("Extensions failed to load");
-    if ext.rio_table.is_some() {
-        println!("RIO Extensions loaded successfully");
-    } else {
-        eprintln!("RIO Extensions not available (this is expected on Windows 7 or older)");
-    }
+    let _ext = Extensions::new().expect("RIO Extensions should load");
 }

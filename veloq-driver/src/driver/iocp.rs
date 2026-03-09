@@ -86,7 +86,7 @@ impl Driver for IocpDriver {
                 ext: &self.extensions,
                 registered_files: &self.registered_files,
                 registrar: self.registrar.as_ref(),
-                rio: self.rio_state.as_mut(),
+                rio: &mut self.rio_state,
                 slots_per_page,
                 slab_resolver: &slab_resolver,
             };
@@ -207,7 +207,7 @@ impl Driver for IocpDriver {
             ext: &self.extensions,
             registered_files: &self.registered_files,
             registrar: self.registrar.as_ref(),
-            rio: self.rio_state.as_mut(),
+            rio: &mut self.rio_state,
             slots_per_page,
             slab_resolver: &slab_resolver,
         };

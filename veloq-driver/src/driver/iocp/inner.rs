@@ -75,8 +75,8 @@ pub struct IocpDriver {
     pub(crate) free_slots: Vec<usize>,
     pub(crate) is_waked: Arc<AtomicBool>,
 
-    // RIO Support (Decoupled)
-    pub(crate) rio_state: Option<RioState>,
+    // RIO Support (required)
+    pub(crate) rio_state: RioState,
     pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
 }
 
@@ -207,11 +207,7 @@ impl IocpDriver {
         self.process_timer_completions();
 
         let user_data = if completion_key == RIO_EVENT_KEY {
-            if let Some(rio) = &mut self.rio_state {
-                return rio.process_completions(&mut self.ops);
-            } else {
-                return Ok(());
-            }
+            return self.rio_state.process_completions(&mut self.ops);
         } else if !overlapped.is_null() {
             // Since OverlappedEntry is #[repr(C)], and inner is the first field,
             // we can safely cast *mut OVERLAPPED to *const OverlappedEntry to access user_data.
@@ -378,9 +374,7 @@ impl IocpDriver {
     }
 
     pub fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
-        if let Some(rio) = &mut self.rio_state {
-            rio.register_chunk(id, ptr, len)?;
-        }
+        self.rio_state.register_chunk(id, ptr, len)?;
         Ok(())
     }
 
@@ -449,15 +443,12 @@ impl IocpDriver {
         for &handle in files {
             let idx = if let Some(idx) = self.free_slots.pop() {
                 self.registered_files[idx] = Some(handle.handle);
-                if let Some(rio) = &mut self.rio_state {
-                    rio.clear_registered_rq(idx);
-                }
+                self.rio_state.clear_registered_rq(idx);
                 idx
             } else {
                 self.registered_files.push(Some(handle.handle));
-                if let Some(rio) = &mut self.rio_state {
-                    rio.resize_registered_rqs(self.registered_files.len());
-                }
+                self.rio_state
+                    .resize_registered_rqs(self.registered_files.len());
                 self.registered_files.len() - 1
             };
             registered.push(crate::op::IoFd::Fixed(idx as u32));
@@ -471,9 +462,7 @@ impl IocpDriver {
                 let idx = idx as usize;
                 if idx < self.registered_files.len() && self.registered_files[idx].is_some() {
                     self.registered_files[idx] = None;
-                    if let Some(rio) = &mut self.rio_state {
-                        rio.clear_registered_rq(idx);
-                    }
+                    self.rio_state.clear_registered_rq(idx);
                     self.free_slots.push(idx);
                 }
             }

@@ -6,18 +6,19 @@ use crate::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
 use crate::driver::slot::STATE_COMPLETED;
 use crate::op::IoFd;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
 use std::sync::atomic::Ordering;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
-    RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT,
+    RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_IOCP_COMPLETION,
+    RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT, SOCKET_ERROR, WSAGetLastError,
 };
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // Define constants that might be missing or different in windows-sys
 const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0 as RIO_BUFFERID;
-const RIO_NOTIFICATION_COMPLETION_TYPE_IOCP: u32 = 1;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioDispatch {
@@ -33,8 +34,10 @@ pub(crate) struct RioDispatch {
         *const std::ffi::c_void,
     ) -> RIO_RQ,
     pub register_buffer: unsafe extern "system" fn(*const u8, u32) -> RIO_BUFFERID,
+    pub deregister_buffer: unsafe extern "system" fn(RIO_BUFFERID),
     pub dequeue: unsafe extern "system" fn(RIO_CQ, *mut RIORESULT, u32) -> u32,
     pub notify: unsafe extern "system" fn(RIO_CQ) -> i32,
+    pub close_cq: unsafe extern "system" fn(RIO_CQ),
     pub receive:
         unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
     pub send:
@@ -65,6 +68,7 @@ pub(crate) struct RioDispatch {
 
 pub struct RioState {
     pub(crate) cq: RIO_CQ,
+    pub(crate) _notify_overlapped: Box<OVERLAPPED>,
     pub(crate) chunk_registry: Vec<RIO_BUFFERID>,
     // RIO Request Queues per socket (raw handle)
     pub(crate) rio_rqs: FxHashMap<HANDLE, RIO_RQ>,
@@ -73,15 +77,17 @@ pub struct RioState {
     // RIO Registration for Slab Pages (for Address Buffers)
     // Maps PageIndex -> (RIO_BUFFERID, BaseAddress)
     pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize)>>,
+    pub(crate) rq_depth: u32,
     pub(crate) dispatch: RioDispatch,
 }
 
 impl RioState {
-    pub fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Option<Self>> {
-        let table = match &ext.rio_table {
-            Some(t) => t,
-            None => return Ok(None),
-        };
+    fn last_wsa_error() -> io::Error {
+        io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    pub fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
+        let table = &ext.rio_table;
 
         // Construct dispatch table, failing if any required function is missing
         let dispatch = RioDispatch {
@@ -94,12 +100,18 @@ impl RioState {
             register_buffer: table
                 .RIORegisterBuffer
                 .ok_or_else(|| io::Error::other("RIORegisterBuffer missing"))?,
+            deregister_buffer: table
+                .RIODeregisterBuffer
+                .ok_or_else(|| io::Error::other("RIODeregisterBuffer missing"))?,
             dequeue: table
                 .RIODequeueCompletion
                 .ok_or_else(|| io::Error::other("RIODequeueCompletion missing"))?,
             notify: table
                 .RIONotify
                 .ok_or_else(|| io::Error::other("RIONotify missing"))?,
+            close_cq: table
+                .RIOCloseCompletionQueue
+                .ok_or_else(|| io::Error::other("RIOCloseCompletionQueue missing"))?,
             receive: table
                 .RIOReceive
                 .ok_or_else(|| io::Error::other("RIOReceive missing"))?,
@@ -114,40 +126,43 @@ impl RioState {
                 .ok_or_else(|| io::Error::other("RIOReceiveEx missing"))?,
         };
 
-        if let Some(create_fn) = Some(dispatch.create_cq) {
-            // RIO_EVENT_KEY is defined in iocp.rs as usize::MAX - 1
-            const RIO_EVENT_KEY: usize = usize::MAX - 1;
+        // RIO_EVENT_KEY is defined in iocp.rs as usize::MAX - 1
+        const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
-            let notification = RIO_NOTIFICATION_COMPLETION {
-                Type: RIO_NOTIFICATION_COMPLETION_TYPE_IOCP as i32,
-                Anonymous: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0 {
-                    Iocp:
-                        windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
-                            IocpHandle: port,
-                            CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
-                            Overlapped: std::ptr::null_mut(),
-                        },
+        let mut notify_overlapped = Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() });
+        let notification = RIO_NOTIFICATION_COMPLETION {
+            Type: RIO_IOCP_COMPLETION,
+            Anonymous: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0 {
+                Iocp: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
+                    IocpHandle: port,
+                    CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
+                    Overlapped: (&mut *notify_overlapped as *mut OVERLAPPED).cast(),
                 },
-            };
+            },
+        };
 
-            let queue_size = entries.max(1024);
-            let cq = unsafe { create_fn(queue_size, &notification as *const _) };
+        let queue_size = entries.max(128);
+        let cq = unsafe { (dispatch.create_cq)(queue_size, &notification as *const _) };
 
-            if cq == 0 {
-                return Ok(None);
-            }
-
-            Ok(Some(Self {
-                cq,
-                chunk_registry: Vec::new(),
-                rio_rqs: FxHashMap::default(),
-                registered_rio_rqs: Vec::new(),
-                slab_rio_pages: Vec::new(),
-                dispatch,
-            }))
-        } else {
-            Ok(None)
+        if cq == 0 {
+            return Err(Self::last_wsa_error());
         }
+
+        let notify_ret = unsafe { (dispatch.notify)(cq) };
+        if notify_ret == SOCKET_ERROR {
+            return Err(Self::last_wsa_error());
+        }
+
+        Ok(Self {
+            cq,
+            _notify_overlapped: notify_overlapped,
+            chunk_registry: Vec::new(),
+            rio_rqs: FxHashMap::default(),
+            registered_rio_rqs: Vec::new(),
+            slab_rio_pages: Vec::new(),
+            rq_depth: entries.clamp(32, 256),
+            dispatch,
+        })
     }
 
     pub fn resize_registered_rqs(&mut self, size: usize) {
@@ -174,9 +189,15 @@ impl RioState {
         // Note: RIO buffers need to be deregistered? implementation specific.
         // Here we assume new registration.
 
+        if let Some(existing) = self.chunk_registry.get(id_idx).copied()
+            && existing != RIO_INVALID_BUFFERID
+        {
+            unsafe { (self.dispatch.deregister_buffer)(existing) };
+        }
+
         let buf_id = unsafe { reg_fn(ptr, len as u32) };
         if buf_id == RIO_INVALID_BUFFERID {
-            return Err(io::Error::last_os_error());
+            return Err(Self::last_wsa_error());
         }
 
         self.chunk_registry[id_idx] = buf_id;
@@ -251,8 +272,8 @@ impl RioState {
 
         let notify_fn = self.dispatch.notify;
         let ret = unsafe { notify_fn(self.cq) };
-        if ret != 0 {
-            return Err(io::Error::from_raw_os_error(ret));
+        if ret == SOCKET_ERROR {
+            return Err(Self::last_wsa_error());
         }
         Ok(())
     }
@@ -272,7 +293,7 @@ impl RioState {
                 let reg_fn = self.dispatch.register_buffer;
                 let id = unsafe { reg_fn(ptr, len as u32) };
                 if id == RIO_INVALID_BUFFERID {
-                    return Err(io::Error::last_os_error());
+                    return Err(Self::last_wsa_error());
                 }
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize));
             } else {
@@ -301,16 +322,15 @@ impl RioState {
 
         let create_fn = self.dispatch.create_rq;
 
-        // Queue sizes
-        const MAX_OUTSTANDING_RECVS: u32 = 1024;
-        const MAX_OUTSTANDING_SENDS: u32 = 1024;
+        let max_outstanding_recvs = self.rq_depth;
+        let max_outstanding_sends = self.rq_depth;
 
         let rq = unsafe {
             create_fn(
                 handle as usize, // Corrected cast handle: HANDLE (*mut c_void) -> usize
-                MAX_OUTSTANDING_RECVS,
+                max_outstanding_recvs,
                 1,
-                MAX_OUTSTANDING_SENDS,
+                max_outstanding_sends,
                 1,
                 self.cq,
                 self.cq,
@@ -319,7 +339,7 @@ impl RioState {
         };
 
         if rq == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Self::last_wsa_error());
         }
 
         if let IoFd::Fixed(idx) = fd {
@@ -340,7 +360,7 @@ impl RioState {
         buf: &mut FixedBuf,
         user_data: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<Option<SubmissionResult>> {
+    ) -> io::Result<SubmissionResult> {
         let info = buf.resolve_region_info();
         // Check chunk registry
         let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
@@ -357,7 +377,12 @@ impl RioState {
 
         let buffer_id = match buffer_id {
             Some(id) => id,
-            None => return Ok(None),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("RIO chunk {} not registered", info.id),
+                ));
+            }
         };
 
         // Now self.registered_bufs borrow has ended
@@ -375,9 +400,9 @@ impl RioState {
         let ret = unsafe { recv_fn(rq, &rio_buf, 1, 0, request_context) };
 
         if ret == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Self::last_wsa_error());
         }
-        Ok(Some(SubmissionResult::Pending))
+        Ok(SubmissionResult::Pending)
     }
 
     pub fn try_submit_send(
@@ -387,7 +412,7 @@ impl RioState {
         buf: &FixedBuf,
         user_data: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<Option<SubmissionResult>> {
+    ) -> io::Result<SubmissionResult> {
         let info = buf.resolve_region_info();
         // Check chunk registry
         let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
@@ -404,7 +429,12 @@ impl RioState {
 
         let buffer_id = match buffer_id {
             Some(id) => id,
-            None => return Ok(None),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("RIO chunk {} not registered", info.id),
+                ));
+            }
         };
 
         let rq = self.ensure_rq(handle, fd)?;
@@ -421,9 +451,9 @@ impl RioState {
         let ret = unsafe { send_fn(rq, &rio_buf, 1, 0, request_context) };
 
         if ret == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Self::last_wsa_error());
         }
-        Ok(Some(SubmissionResult::Pending))
+        Ok(SubmissionResult::Pending)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -438,7 +468,7 @@ impl RioState {
         page_idx: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-    ) -> io::Result<Option<SubmissionResult>> {
+    ) -> io::Result<SubmissionResult> {
         let info = buf.resolve_region_info();
         // Check chunk registry
         let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
@@ -455,7 +485,12 @@ impl RioState {
 
         let buffer_id = match buffer_id {
             Some(id) => id,
-            None => return Ok(None),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("RIO chunk {} not registered", info.id),
+                ));
+            }
         };
 
         // Lazy register slab page
@@ -497,9 +532,9 @@ impl RioState {
         };
 
         if ret == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Self::last_wsa_error());
         }
-        Ok(Some(SubmissionResult::Pending))
+        Ok(SubmissionResult::Pending)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -514,7 +549,7 @@ impl RioState {
         page_idx: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-    ) -> io::Result<Option<SubmissionResult>> {
+    ) -> io::Result<SubmissionResult> {
         let info = buf.resolve_region_info();
         // Check chunk registry
         let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
@@ -531,7 +566,12 @@ impl RioState {
 
         let buffer_id = match buffer_id {
             Some(id) => id,
-            None => return Ok(None),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("RIO chunk {} not registered", info.id),
+                ));
+            }
         };
 
         // Lazy register slab page
@@ -580,8 +620,28 @@ impl RioState {
         };
 
         if ret == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Self::last_wsa_error());
         }
-        Ok(Some(SubmissionResult::Pending))
+        Ok(SubmissionResult::Pending)
+    }
+}
+
+impl Drop for RioState {
+    fn drop(&mut self) {
+        let mut deregistered = FxHashSet::default();
+        for id in self.chunk_registry.iter().copied() {
+            if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
+                unsafe { (self.dispatch.deregister_buffer)(id) };
+            }
+        }
+        for (id, _) in self.slab_rio_pages.iter().flatten().copied() {
+            if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
+                unsafe { (self.dispatch.deregister_buffer)(id) };
+            }
+        }
+
+        if self.cq != 0 {
+            unsafe { (self.dispatch.close_cq)(self.cq) };
+        }
     }
 }
