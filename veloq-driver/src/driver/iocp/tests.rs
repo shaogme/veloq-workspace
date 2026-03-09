@@ -809,3 +809,138 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
     }
 }
+
+#[test]
+fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
+    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+    let server = Socket::new_udp_v4().expect("server socket create failed");
+    server
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("server bind failed");
+    let server_handle = server.into_raw();
+    let raw_handle = server_handle.handle as windows_sys::Win32::Foundation::HANDLE;
+
+    let mut submitted = Vec::new();
+    const BURST_WAITERS: usize = 12;
+
+    for _ in 0..BURST_WAITERS {
+        let recv_op = RecvFrom {
+            fd: IoFd::Raw(server_handle),
+            buf: veloq_buf::FixedBuf::alloc_heap(std::num::NonZeroUsize::new(1024).unwrap())
+                .expect("alloc recv buf failed"),
+            addr: None,
+        };
+        let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
+        let (ud, _) = driver.reserve_op().expect("reserve recv op failed");
+        let _ = driver
+            .submit(ud, &mut iocp_op)
+            .expect("submit recv_from failed");
+        submitted.push(ud);
+    }
+
+    let stats = driver
+        .rio_state
+        .udp_pool_debug_stats(raw_handle)
+        .expect("udp pool stats missing");
+    assert!(
+        stats.target_credits > 4,
+        "burst waiters should raise target credits, stats={stats:?}"
+    );
+    assert!(
+        stats.target_credits <= stats.max_credits,
+        "target should not exceed max, stats={stats:?}"
+    );
+    assert_eq!(stats.waiters_len, BURST_WAITERS);
+
+    for ud in submitted {
+        driver.cancel_op(ud);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut op_out = None;
+        match driver.poll_op(ud, &mut cx, &mut op_out) {
+            Poll::Ready(res) => {
+                let _ = op_out.expect("cancelled op should be returned");
+                let err = res.expect_err("cancelled recv_from should fail");
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+                );
+            }
+            Poll::Pending => panic!("cancelled waiter should be immediately pollable"),
+        }
+    }
+
+    unsafe {
+        windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
+    }
+}
+
+#[test]
+fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
+    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+    let server = Socket::new_udp_v4().expect("server socket create failed");
+    server
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("server bind failed");
+    let server_handle = server.into_raw();
+    let raw_handle = server_handle.handle as windows_sys::Win32::Foundation::HANDLE;
+
+    let mut submitted = Vec::new();
+    const BURST_WAITERS: usize = 12;
+
+    for _ in 0..BURST_WAITERS {
+        let recv_op = RecvFrom {
+            fd: IoFd::Raw(server_handle),
+            buf: veloq_buf::FixedBuf::alloc_heap(std::num::NonZeroUsize::new(1024).unwrap())
+                .expect("alloc recv buf failed"),
+            addr: None,
+        };
+        let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
+        let (ud, _) = driver.reserve_op().expect("reserve recv op failed");
+        let _ = driver
+            .submit(ud, &mut iocp_op)
+            .expect("submit recv_from failed");
+        submitted.push(ud);
+    }
+
+    for ud in submitted {
+        driver.cancel_op(ud);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut op_out = None;
+        match driver.poll_op(ud, &mut cx, &mut op_out) {
+            Poll::Ready(_) => {}
+            Poll::Pending => panic!("cancelled waiter should be immediately pollable"),
+        }
+    }
+
+    // No waiters/no queue during idle ticks -> target should decay to min.
+    // Decay policy is gradual; tick until reaching min (with an upper bound).
+    const MAX_IDLE_TICKS: usize = 4096;
+    let mut stats = driver
+        .rio_state
+        .udp_pool_debug_stats(raw_handle)
+        .expect("udp pool stats missing");
+    for _ in 0..MAX_IDLE_TICKS {
+        if stats.target_credits == stats.min_credits {
+            break;
+        }
+        driver
+            .rio_state
+            .debug_tick_udp_pool_idle(raw_handle, 1)
+            .expect("idle tick failed");
+        stats = driver
+            .rio_state
+            .udp_pool_debug_stats(raw_handle)
+            .expect("udp pool stats missing");
+    }
+    assert_eq!(
+        stats.target_credits, stats.min_credits,
+        "idle should fall back to min credits, stats={stats:?}"
+    );
+    assert_eq!(stats.waiters_len, 0);
+
+    unsafe {
+        windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
+    }
+}

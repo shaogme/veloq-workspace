@@ -617,28 +617,24 @@ pub(crate) unsafe fn submit_recv_from(
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &mut *op.payload.recv_from };
     let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
-
-    // RIO path is mandatory for socket recv_from.
-    let page_idx = op.header.user_data / ctx.slots_per_page;
     ctx.rio
-        .try_submit_recv_from(
+        .try_submit_recv_from_pooled(
             payload.op.fd,
             handle,
+            op.header.user_data,
+            op.header.generation,
             &mut payload.op.buf,
-            &payload.addr as *const _ as *const std::ffi::c_void,
-            &payload.addr_len,
+            &mut payload.addr,
+            &mut payload.addr_len,
             ctx.overlapped,
-            page_idx,
-            ctx.registrar,
-            ctx.slab_resolver,
         )
         .map_err(|e| {
             io_error(
                 IocpErrorContext::Submission,
                 e,
                 format!(
-                    "RIO recv_from submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
-                    payload.op.fd, op.header.user_data, op.header.generation, page_idx
+                    "RIO recv_from submit failed: fd={:?}, user_data={}, generation={}",
+                    payload.op.fd, op.header.user_data, op.header.generation
                 ),
             )
         })

@@ -50,6 +50,8 @@ pub struct IocpOpState {
     // 1) user has consumed completion; 2) late RIO CQE has been drained.
     pub rio_needs_drain: bool,
     pub rio_drained: bool,
+    // recv_from served by internal RIO UDP pre-post pool; no per-op kernel I/O in flight.
+    pub rio_pool_waiting: bool,
 }
 
 impl Default for IocpOpState {
@@ -62,6 +64,7 @@ impl Default for IocpOpState {
             is_background: false,
             rio_needs_drain: false,
             rio_drained: false,
+            rio_pool_waiting: false,
         }
     }
 }
@@ -369,6 +372,7 @@ impl IocpDriver {
 
         match op.platform_data.lifecycle {
             OpLifecycle::Cancelled | OpLifecycle::InFlight => {
+                op.platform_data.rio_pool_waiting = false;
                 unsafe { *slot.result.get() = Some(io_result) };
 
                 if op.platform_data.is_background {
@@ -467,6 +471,23 @@ impl IocpDriver {
                         && let Some(fd) = res.get_fd()
                         && let Ok(handle) = submit::resolve_fd(fd, &self.registered_files)
                     {
+                        if op.platform_data.rio_pool_waiting {
+                            self.rio_state.cancel_udp_recv_waiter(
+                                handle,
+                                user_data,
+                                op.platform_data.generation,
+                            );
+                            op.platform_data.rio_pool_waiting = false;
+                            unsafe {
+                                *slot.result.get() = Some(Err(io::Error::from_raw_os_error(
+                                    windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+                                )))
+                            };
+                            slot.state.store(STATE_COMPLETED, Ordering::Release);
+                            slot.waker.wake();
+                            return;
+                        }
+
                         if Self::is_rio_op(res) {
                             op.platform_data.rio_needs_drain = true;
                             op.platform_data.rio_drained = false;

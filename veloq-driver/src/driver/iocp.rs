@@ -97,10 +97,15 @@ impl Driver for IocpDriver {
             };
 
             let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
+            let is_rio_recv_from = unsafe {
+                op_ref.vtable.as_ref().submit as *const () as usize
+                    == crate::driver::iocp::submit::submit_recv_from as *const () as usize
+            };
 
             match result {
                 Ok(SubmissionResult::Pending) => {
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                    op_entry.platform_data.rio_pool_waiting = is_rio_recv_from;
                 }
                 Ok(SubmissionResult::PostToQueue) => {
                     let posted = unsafe {
@@ -119,11 +124,13 @@ impl Driver for IocpDriver {
                         submit_error = Some(io::Error::last_os_error());
                     } else {
                         op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                        op_entry.platform_data.rio_pool_waiting = false;
                     }
                 }
                 Ok(SubmissionResult::Offload(task)) => {
                     use veloq_blocking::get_blocking_pool;
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                    op_entry.platform_data.rio_pool_waiting = false;
                     if get_blocking_pool().execute(task).is_err() {
                         op_entry.platform_data.lifecycle =
                             OpLifecycle::Completed(Err(io::Error::other("Thread pool overloaded")));
@@ -140,6 +147,7 @@ impl Driver for IocpDriver {
                     let timeout = self.wheel.insert(user_data, duration);
                     op_entry.platform_data.timer_id = Some(timeout);
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                    op_entry.platform_data.rio_pool_waiting = false;
                 }
                 Err(e) => {
                     *op_in = unsafe { (*slot.op.get()).take() };

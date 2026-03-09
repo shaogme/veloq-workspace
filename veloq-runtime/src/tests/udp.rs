@@ -521,21 +521,53 @@ fn test_multithread_udp_echo() {
                 let addr_tx = addr_tx.clone();
 
                 let server_h = crate::runtime::context::spawn_to(0, async move || {
-                    let socket =
-                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket");
+                    let socket = Arc::new(
+                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server socket"),
+                    );
                     let server_addr = socket.local_addr().expect("Failed to get server address");
                     println!("UDP echo server listening on {}", server_addr);
 
-                    // Send address to client worker
+                    // Pre-post recv before publishing server address to avoid RIO timing window.
+                    let (ready_tx, mut ready_rx) = crate::sync::mpsc::unbounded::<()>();
+                    let socket_for_recv = socket.clone();
+                    let recv_h = crate::runtime::context::spawn(async move {
+                        ready_tx.send(()).unwrap();
+                        let buf = crate::runtime::context::alloc(size);
+                        let (result, buf) = timeout(Duration::from_secs(5), socket_for_recv.recv_from(buf))
+                            .await
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "UDP echo timeout: phase=server_recv; server_addr={}; timeout_ms={}",
+                                    server_addr,
+                                    5000
+                                )
+                            });
+                        let (bytes, from_addr) = result.expect("Server recv_from failed");
+                        (bytes, from_addr, buf)
+                    });
+                    timeout(Duration::from_secs(5), ready_rx.recv())
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "UDP echo timeout: phase=server_recv_ready; server_addr={}; timeout_ms={}",
+                                server_addr,
+                                5000
+                            )
+                        })
+                        .expect("server recv readiness channel closed");
+
+                    // Send address to client worker after recv is posted.
                     addr_tx.send(server_addr).unwrap();
 
-                    // let pool = crate::runtime::context::current_pool().unwrap();
-
-                    // Receive and echo
-                    let buf = crate::runtime::context::alloc(size);
-
-                    let (result, buf) = socket.recv_from(buf).await;
-                    let (bytes, from_addr) = result.expect("Server recv_from failed");
+                    let (bytes, from_addr, buf) = timeout(Duration::from_secs(5), async move { recv_h.await })
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "UDP echo timeout: phase=wait_server_recv_join; server_addr={}; timeout_ms={}",
+                                server_addr,
+                                5000
+                            )
+                        });
                     println!("Server received {} bytes from {}", bytes, from_addr);
 
                     // Echo back
@@ -544,7 +576,16 @@ fn test_multithread_udp_echo() {
                         .copy_from_slice(&buf.as_slice()[..bytes]);
                     echo_buf.set_len(bytes);
 
-                    let (result, _) = socket.send_to(echo_buf, from_addr).await;
+                    let (result, _) = timeout(Duration::from_secs(5), socket.send_to(echo_buf, from_addr))
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "UDP echo timeout: phase=server_send; server_addr={}; peer_addr={}; timeout_ms={}",
+                                server_addr,
+                                from_addr,
+                                5000
+                            )
+                        });
                     result.expect("Server send_to failed");
                     println!("Server echoed response");
                 });
@@ -564,9 +605,38 @@ fn test_multithread_udp_echo() {
 
                     println!("Client connecting to {}", server_addr);
 
-                    let client =
-                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
-                    // let pool = crate::runtime::context::current_pool().unwrap();
+                    let client = Arc::new(
+                        UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket"),
+                    );
+
+                    // Pre-post client recv before sending request to avoid RIO response drop.
+                    let (client_ready_tx, mut client_ready_rx) = crate::sync::mpsc::unbounded::<()>();
+                    let client_for_recv = client.clone();
+                    let recv_h = crate::runtime::context::spawn(async move {
+                        client_ready_tx.send(()).unwrap();
+                        let recv_buf = crate::runtime::context::alloc(size);
+                        let (result, recv_buf) = timeout(Duration::from_secs(5), client_for_recv.recv_from(recv_buf))
+                            .await
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "UDP echo timeout: phase=client_recv; server_addr={}; timeout_ms={}",
+                                    server_addr,
+                                    5000
+                                )
+                            });
+                        let (_received, from) = result.expect("Client recv_from failed");
+                        (from, recv_buf)
+                    });
+                    timeout(Duration::from_secs(5), client_ready_rx.recv())
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "UDP echo timeout: phase=client_recv_ready; server_addr={}; timeout_ms={}",
+                                server_addr,
+                                5000
+                            )
+                        })
+                        .expect("client recv readiness channel closed");
 
                     // Send data
                     let mut send_buf = crate::runtime::context::alloc(size);
@@ -574,14 +644,27 @@ fn test_multithread_udp_echo() {
                     send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
                     send_buf.set_len(data.len());
 
-                    let (result, _) = client.send_to(send_buf, server_addr).await;
+                    let (result, _) = timeout(Duration::from_secs(5), client.send_to(send_buf, server_addr))
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "UDP echo timeout: phase=client_send; server_addr={}; timeout_ms={}",
+                                server_addr,
+                                5000
+                            )
+                        });
                     let sent = result.expect("Client send_to failed");
                     println!("Client sent {} bytes", sent);
 
-                    // Receive echo
-                    let recv_buf = crate::runtime::context::alloc(size);
-                    let (result, recv_buf) = client.recv_from(recv_buf).await;
-                    let (_received, from) = result.expect("Client recv_from failed");
+                    let (from, recv_buf) = timeout(Duration::from_secs(5), async move { recv_h.await })
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "UDP echo timeout: phase=wait_client_recv_join; server_addr={}; timeout_ms={}",
+                                server_addr,
+                                5000
+                            )
+                        });
 
                     assert_eq!(from, server_addr);
                     assert_eq!(&recv_buf.as_slice()[..data.len()], data);

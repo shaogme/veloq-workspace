@@ -1,6 +1,7 @@
 use crate::SockAddrStorage;
 use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::IocpOp;
+use crate::driver::iocp::op::RecvFromPayload;
 use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::submit::SubmissionResult;
 use crate::driver::iocp::{IocpOpState, OpLifecycle};
@@ -10,7 +11,10 @@ use crate::driver::slot::{STATE_COMPLETED, STATE_CONSUMED};
 use crate::op::IoFd;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
+use std::collections::VecDeque;
+use std::thread;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -22,6 +26,53 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // Define constants that might be missing or different in windows-sys
 const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0 as RIO_BUFFERID;
+const UDP_POOL_USER_DATA: usize = usize::MAX - 2;
+const UDP_RECV_POOL_MIN_CREDITS: usize = 2;
+const UDP_RECV_POOL_INITIAL_CREDITS: usize = 4;
+const UDP_RECV_POOL_MAX_CREDITS: usize = 16;
+const UDP_RECV_POOL_BUF_SIZE: usize = 65_536;
+const UDP_RECV_POOL_QUEUE_CAP: usize = 256;
+const UDP_POOL_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+const UDP_POOL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+struct UdpRecvDatagram {
+    data: Vec<u8>,
+    addr: SockAddrStorage,
+    addr_len: i32,
+}
+
+struct UdpRecvPoolSlot {
+    data: Box<[u8]>,
+    addr: Box<SockAddrStorage>,
+    data_buf_id: RIO_BUFFERID,
+    addr_buf_id: RIO_BUFFERID,
+    in_flight: bool,
+}
+
+struct UdpRecvPool {
+    rq: RIO_RQ,
+    slots: Vec<UdpRecvPoolSlot>,
+    queue: VecDeque<UdpRecvDatagram>,
+    waiters: VecDeque<(usize, u32)>,
+    min_credits: usize,
+    max_credits: usize,
+    target_credits: usize,
+    idle_hits: u32,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct UdpRecvPoolDebugStats {
+    pub min_credits: usize,
+    pub max_credits: usize,
+    pub target_credits: usize,
+    pub slots_len: usize,
+    pub in_flight: usize,
+    pub waiters_len: usize,
+    pub queue_len: usize,
+    pub idle_hits: u32,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioDispatch {
@@ -82,20 +133,38 @@ pub struct RioState {
     pub(crate) slab_rio_pages: Vec<Option<(RIO_BUFFERID, usize, usize)>>,
     // Heap-buffer lazy registrations: (ptr, cap) -> RIO_BUFFERID
     pub(crate) heap_rio_bufs: FxHashMap<(usize, usize), RIO_BUFFERID>,
+    udp_recv_pools: FxHashMap<HANDLE, UdpRecvPool>,
+    udp_ctx_map: FxHashMap<u32, (HANDLE, usize)>,
+    udp_next_ctx: u32,
     pub(crate) rq_depth: u32,
     pub(crate) dispatch: RioDispatch,
 }
 
 impl RioState {
+    const POOL_CTX_TAG: usize = 1;
+
     #[inline]
     fn encode_request_context(overlapped: *mut OVERLAPPED) -> *const std::ffi::c_void {
         overlapped as *const std::ffi::c_void
     }
 
     #[inline]
+    fn encode_pool_context(token: u32) -> *const std::ffi::c_void {
+        (((token as usize) << 1) | Self::POOL_CTX_TAG) as *const std::ffi::c_void
+    }
+
+    #[inline]
     fn decode_request_context(ctx: u64) -> Option<(usize, u32)> {
         if ctx == 0 {
             return None;
+        }
+        let raw = ctx as usize;
+        if (raw & Self::POOL_CTX_TAG) == Self::POOL_CTX_TAG {
+            let token = (raw >> 1) as u32;
+            if token == 0 {
+                return None;
+            }
+            return Some((UDP_POOL_USER_DATA, token));
         }
         let entry = ctx as usize as *const OverlappedEntry;
         let user_data = unsafe { (*entry).user_data };
@@ -105,6 +174,32 @@ impl RioState {
 
     fn last_wsa_error() -> io::Error {
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn udp_pool_debug_stats(&self, handle: HANDLE) -> Option<UdpRecvPoolDebugStats> {
+        self.udp_recv_pools.get(&handle).map(|pool| UdpRecvPoolDebugStats {
+            min_credits: pool.min_credits,
+            max_credits: pool.max_credits,
+            target_credits: pool.target_credits,
+            slots_len: pool.slots.len(),
+            in_flight: pool.slots.iter().filter(|s| s.in_flight).count(),
+            waiters_len: pool.waiters.len(),
+            queue_len: pool.queue.len(),
+            idle_hits: pool.idle_hits,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_tick_udp_pool_idle(
+        &mut self,
+        handle: HANDLE,
+        ticks: usize,
+    ) -> io::Result<()> {
+        for _ in 0..ticks {
+            self.rebalance_udp_pool(handle)?;
+        }
+        Ok(())
     }
 
     pub fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
@@ -224,6 +319,9 @@ impl RioState {
             registered_rio_rqs: Vec::new(),
             slab_rio_pages: Vec::new(),
             heap_rio_bufs: FxHashMap::default(),
+            udp_recv_pools: FxHashMap::default(),
+            udp_ctx_map: FxHashMap::default(),
+            udp_next_ctx: 1,
             rq_depth: entries.clamp(32, 256),
             dispatch,
         })
@@ -323,6 +421,410 @@ impl RioState {
         Ok(())
     }
 
+    fn alloc_udp_ctx_token(&mut self, handle: HANDLE, slot_idx: usize) -> u32 {
+        loop {
+            let token = self.udp_next_ctx;
+            self.udp_next_ctx = self.udp_next_ctx.wrapping_add(1);
+            if token == 0 {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Vacant(e) = self.udp_ctx_map.entry(token) {
+                e.insert((handle, slot_idx));
+                return token;
+            }
+        }
+    }
+
+    fn create_udp_pool_slot(&self) -> io::Result<UdpRecvPoolSlot> {
+        let mut data = vec![0u8; UDP_RECV_POOL_BUF_SIZE].into_boxed_slice();
+        let mut addr = Box::new(SockAddrStorage::default());
+
+        let data_buf_id =
+            unsafe { (self.dispatch.register_buffer)(data.as_mut_ptr(), data.len() as u32) };
+        if data_buf_id == RIO_INVALID_BUFFERID {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                "RIORegisterBuffer failed for UDP recv pool data buffer",
+            ));
+        }
+
+        let addr_buf_id = unsafe {
+            (self.dispatch.register_buffer)(
+                (&mut *addr as *mut SockAddrStorage).cast::<u8>(),
+                std::mem::size_of::<SockAddrStorage>() as u32,
+            )
+        };
+        if addr_buf_id == RIO_INVALID_BUFFERID {
+            unsafe { (self.dispatch.deregister_buffer)(data_buf_id) };
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                "RIORegisterBuffer failed for UDP recv pool addr buffer",
+            ));
+        }
+
+        Ok(UdpRecvPoolSlot {
+            data,
+            addr,
+            data_buf_id,
+            addr_buf_id,
+            in_flight: false,
+        })
+    }
+
+    fn deregister_udp_pool_slot(&self, slot: UdpRecvPoolSlot) {
+        if slot.data_buf_id != RIO_INVALID_BUFFERID {
+            unsafe { (self.dispatch.deregister_buffer)(slot.data_buf_id) };
+        }
+        if slot.addr_buf_id != RIO_INVALID_BUFFERID {
+            unsafe { (self.dispatch.deregister_buffer)(slot.addr_buf_id) };
+        }
+    }
+
+    fn submit_udp_pool_slot(&mut self, handle: HANDLE, slot_idx: usize) -> io::Result<()> {
+        let rq = self
+            .udp_recv_pools
+            .get(&handle)
+            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?
+            .rq;
+
+        let token = self.alloc_udp_ctx_token(handle, slot_idx);
+        let pool = self
+            .udp_recv_pools
+            .get_mut(&handle)
+            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
+        let slot = pool
+            .slots
+            .get_mut(slot_idx)
+            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool slot missing"))?;
+        slot.in_flight = true;
+
+        let data_buf = RIO_BUF {
+            BufferId: slot.data_buf_id,
+            Offset: 0,
+            Length: UDP_RECV_POOL_BUF_SIZE as u32,
+        };
+        let addr_buf = RIO_BUF {
+            BufferId: slot.addr_buf_id,
+            Offset: 0,
+            Length: std::mem::size_of::<SockAddrStorage>() as u32,
+        };
+        let recv_ex_fn = self.dispatch.receive_ex;
+        let req_ctx = Self::encode_pool_context(token);
+
+        let ret = unsafe {
+            recv_ex_fn(
+                rq,
+                &data_buf,
+                1,
+                std::ptr::null(),
+                &addr_buf,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                req_ctx,
+            )
+        };
+        if ret == 0 {
+            self.udp_ctx_map.remove(&token);
+            if let Some(pool) = self.udp_recv_pools.get_mut(&handle)
+                && let Some(slot) = pool.slots.get_mut(slot_idx)
+            {
+                slot.in_flight = false;
+            }
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                Self::last_wsa_error(),
+                format!(
+                    "RIOReceiveEx submit failed for UDP recv pool: handle=0x{:x}, slot_idx={}, rq=0x{:x}",
+                    handle as usize, slot_idx, rq as usize
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn grow_udp_pool_to(&mut self, handle: HANDLE, target: usize) -> io::Result<()> {
+        loop {
+            let current = self
+                .udp_recv_pools
+                .get(&handle)
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?
+                .slots
+                .len();
+            if current >= target {
+                return Ok(());
+            }
+
+            let slot = self.create_udp_pool_slot()?;
+            {
+                let pool = self
+                    .udp_recv_pools
+                    .get_mut(&handle)
+                    .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
+                pool.slots.push(slot);
+            }
+            let idx = current;
+            if let Err(e) = self.submit_udp_pool_slot(handle, idx) {
+                let popped = self
+                    .udp_recv_pools
+                    .get_mut(&handle)
+                    .and_then(|pool| pool.slots.pop());
+                if let Some(slot) = popped {
+                    self.deregister_udp_pool_slot(slot);
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    fn trim_udp_pool_tail(&mut self, handle: HANDLE) {
+        loop {
+            let maybe_slot = {
+                let Some(pool) = self.udp_recv_pools.get_mut(&handle) else {
+                    return;
+                };
+                if pool.slots.len() <= pool.target_credits {
+                    return;
+                }
+                if pool.slots.last().is_some_and(|slot| slot.in_flight) {
+                    return;
+                }
+                pool.slots.pop()
+            };
+            if let Some(slot) = maybe_slot {
+                self.deregister_udp_pool_slot(slot);
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn rebalance_udp_pool(&mut self, handle: HANDLE) -> io::Result<()> {
+        let desired = {
+            let pool = self
+                .udp_recv_pools
+                .get_mut(&handle)
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
+
+            if !pool.waiters.is_empty() {
+                let bump = pool.waiters.len().clamp(1, 4);
+                pool.target_credits = (pool.target_credits + bump).min(pool.max_credits);
+                pool.idle_hits = 0;
+            } else if pool.queue.is_empty() {
+                pool.idle_hits = pool.idle_hits.saturating_add(1);
+                if pool.idle_hits >= 64 && pool.target_credits > pool.min_credits {
+                    pool.target_credits -= 1;
+                    pool.idle_hits = 0;
+                }
+            } else {
+                pool.idle_hits = 0;
+            }
+
+            pool.target_credits
+        };
+
+        self.grow_udp_pool_to(handle, desired)?;
+        self.trim_udp_pool_tail(handle);
+        Ok(())
+    }
+
+    fn ensure_udp_recv_pool(&mut self, fd: IoFd, handle: HANDLE) -> io::Result<()> {
+        if self.udp_recv_pools.contains_key(&handle) {
+            return Ok(());
+        }
+        let rq = self.ensure_rq(handle, fd)?;
+        let min = UDP_RECV_POOL_MIN_CREDITS;
+        let max = UDP_RECV_POOL_MAX_CREDITS.max(min);
+        let initial = UDP_RECV_POOL_INITIAL_CREDITS.clamp(min, max);
+
+        self.udp_recv_pools.insert(
+            handle,
+            UdpRecvPool {
+                rq,
+                slots: Vec::with_capacity(max),
+                queue: VecDeque::with_capacity(initial),
+                waiters: VecDeque::new(),
+                min_credits: min,
+                max_credits: max,
+                target_credits: initial,
+                idle_hits: 0,
+            },
+        );
+
+        self.grow_udp_pool_to(handle, initial)?;
+        Ok(())
+    }
+
+    fn deliver_udp_datagram_to_waiter(
+        ops: &mut OpRegistry<IocpOp, IocpOpState>,
+        user_data: usize,
+        expected_generation: u32,
+        datagram: UdpRecvDatagram,
+    ) -> bool {
+        if user_data >= ops.local.len() {
+            return false;
+        }
+        let op = &mut ops.local[user_data];
+        let slot = &ops.shared.slots[user_data];
+        if op.platform_data.generation != expected_generation {
+            return false;
+        }
+        if !matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+            return false;
+        }
+
+        let Some(iocp_op) = (unsafe { &mut *slot.op.get() }).as_mut() else {
+            return false;
+        };
+
+        let payload: &mut RecvFromPayload = unsafe { &mut *iocp_op.payload.recv_from };
+        let copy_len = std::cmp::min(payload.op.buf.capacity(), datagram.data.len());
+        payload.op.buf.as_slice_mut()[..copy_len].copy_from_slice(&datagram.data[..copy_len]);
+        payload.op.buf.set_len(copy_len);
+        payload.addr = datagram.addr;
+        payload.addr_len = datagram.addr_len;
+
+        op.platform_data.rio_pool_waiting = false;
+        op.platform_data.lifecycle = OpLifecycle::Completed(Ok(copy_len));
+        unsafe { *slot.result.get() = Some(Ok(copy_len)) };
+        slot.state.store(STATE_COMPLETED, Ordering::Release);
+        slot.waker.wake();
+        true
+    }
+
+    fn dispatch_udp_waiters_for_handle(
+        &mut self,
+        handle: HANDLE,
+        ops: &mut OpRegistry<IocpOp, IocpOpState>,
+    ) {
+        loop {
+            let (waiter, datagram) = {
+                let Some(pool) = self.udp_recv_pools.get_mut(&handle) else {
+                    return;
+                };
+                let Some(waiter) = pool.waiters.pop_front() else {
+                    return;
+                };
+                let Some(datagram) = pool.queue.pop_front() else {
+                    pool.waiters.push_front(waiter);
+                    return;
+                };
+                (waiter, datagram)
+            };
+
+            let (user_data, generation) = waiter;
+            if !Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram)
+                && let Some(pool) = self.udp_recv_pools.get_mut(&handle)
+            {
+                // stale waiter dropped; continue draining.
+                if pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
+                    let _ = pool.queue.pop_front();
+                }
+            }
+        }
+    }
+
+    pub fn try_submit_recv_from_pooled(
+        &mut self,
+        fd: IoFd,
+        handle: HANDLE,
+        user_data: usize,
+        generation: u32,
+        buf: &mut FixedBuf,
+        addr: &mut SockAddrStorage,
+        addr_len: &mut i32,
+        overlapped: *mut OVERLAPPED,
+    ) -> io::Result<SubmissionResult> {
+        self.ensure_udp_recv_pool(fd, handle)?;
+        {
+            let pool = self
+                .udp_recv_pools
+                .get_mut(&handle)
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
+
+            if let Some(datagram) = pool.queue.pop_front() {
+                let copy_len = std::cmp::min(buf.capacity(), datagram.data.len());
+                buf.as_slice_mut()[..copy_len].copy_from_slice(&datagram.data[..copy_len]);
+                buf.set_len(copy_len);
+                *addr = datagram.addr;
+                *addr_len = datagram.addr_len;
+
+                let entry = overlapped as *mut OverlappedEntry;
+                unsafe {
+                    (*entry).blocking_result = Some(Ok(copy_len));
+                }
+                return Ok(SubmissionResult::PostToQueue);
+            }
+
+            pool.waiters.push_back((user_data, generation));
+        }
+        self.rebalance_udp_pool(handle)?;
+        Ok(SubmissionResult::Pending)
+    }
+
+    pub fn cancel_udp_recv_waiter(&mut self, handle: HANDLE, user_data: usize, generation: u32) {
+        if let Some(pool) = self.udp_recv_pools.get_mut(&handle) {
+            pool.waiters
+                .retain(|&(ud, waiter_generation)| !(ud == user_data && waiter_generation == generation));
+        }
+        let _ = self.rebalance_udp_pool(handle);
+    }
+
+    fn count_udp_pool_in_flight(&self) -> usize {
+        self.udp_recv_pools
+            .values()
+            .map(|pool| pool.slots.iter().filter(|s| s.in_flight).count())
+            .sum()
+    }
+
+    fn ack_udp_pool_completion_for_drop(&mut self, completion_generation: u32) {
+        let Some((handle, slot_idx)) = self.udp_ctx_map.remove(&completion_generation) else {
+            return;
+        };
+        if let Some(pool) = self.udp_recv_pools.get_mut(&handle)
+            && let Some(slot) = pool.slots.get_mut(slot_idx)
+        {
+            slot.in_flight = false;
+        }
+    }
+
+    fn drain_udp_pool_completions_on_drop(&mut self) {
+        if self.udp_recv_pools.is_empty() {
+            return;
+        }
+
+        const MAX_RIO_RESULTS: usize = 128;
+        let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
+        let deadline = Instant::now() + UDP_POOL_DRAIN_TIMEOUT;
+
+        while self.count_udp_pool_in_flight() > 0 && Instant::now() < deadline {
+            let count = unsafe {
+                (self.dispatch.dequeue)(self.cq, results.as_mut_ptr(), MAX_RIO_RESULTS as u32)
+            };
+
+            if count == RIO_CORRUPT_CQ {
+                break;
+            }
+            if count == 0 {
+                thread::sleep(UDP_POOL_DRAIN_POLL_INTERVAL);
+                continue;
+            }
+
+            for res in results.iter().take(count as usize) {
+                let Some((user_data, completion_generation)) =
+                    Self::decode_request_context(res.RequestContext)
+                else {
+                    continue;
+                };
+                if user_data == UDP_POOL_USER_DATA {
+                    self.ack_udp_pool_completion_for_drop(completion_generation);
+                }
+            }
+        }
+    }
+
     pub fn process_completions(
         &mut self,
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
@@ -348,9 +850,6 @@ impl RioState {
                 break;
             }
 
-            let ops_local = &mut ops.local;
-            let ops_shared = &ops.shared;
-
             for res in results.iter().take(count as usize) {
                 let Some((user_data, completion_generation)) =
                     Self::decode_request_context(res.RequestContext)
@@ -358,9 +857,46 @@ impl RioState {
                     continue;
                 };
 
-                if user_data < ops_local.len() {
-                    let op = &mut ops_local[user_data];
-                    let slot = &ops_shared.slots[user_data];
+                if user_data == UDP_POOL_USER_DATA {
+                    let Some((handle, slot_idx)) = self.udp_ctx_map.remove(&completion_generation)
+                    else {
+                        continue;
+                    };
+
+                    let should_resubmit = if let Some(pool) = self.udp_recv_pools.get_mut(&handle)
+                    {
+                        if let Some(slot) = pool.slots.get_mut(slot_idx) {
+                            slot.in_flight = false;
+                            if res.Status == 0 && res.BytesTransferred > 0 {
+                                if pool.queue.len() >= UDP_RECV_POOL_QUEUE_CAP {
+                                    let _ = pool.queue.pop_front();
+                                }
+                                pool.queue.push_back(UdpRecvDatagram {
+                                    data: slot.data[..(res.BytesTransferred as usize)].to_vec(),
+                                    addr: *slot.addr,
+                                    addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
+                                });
+                            }
+                            slot_idx < pool.target_credits
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if should_resubmit {
+                        let _ = self.submit_udp_pool_slot(handle, slot_idx);
+                    }
+                    self.trim_udp_pool_tail(handle);
+                    self.dispatch_udp_waiters_for_handle(handle, ops);
+                    let _ = self.rebalance_udp_pool(handle);
+                    continue;
+                }
+
+                if user_data < ops.local.len() {
+                    let op = &mut ops.local[user_data];
+                    let slot = &ops.shared.slots[user_data];
                     if op.platform_data.generation != completion_generation {
                         // Stale RIO completion for a previously recycled slot.
                         continue;
@@ -800,6 +1336,10 @@ impl RioState {
 
 impl Drop for RioState {
     fn drop(&mut self) {
+        // Explicit drain/ack for UDP pool slots before deregistering their buffers.
+        self.drain_udp_pool_completions_on_drop();
+        self.udp_ctx_map.clear();
+
         let mut deregistered = FxHashSet::default();
         for id in self.chunk_registry.iter().copied() {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
@@ -814,6 +1354,26 @@ impl Drop for RioState {
         for id in self.heap_rio_bufs.values().copied() {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
                 unsafe { (self.dispatch.deregister_buffer)(id) };
+            }
+        }
+        for (_handle, pool) in std::mem::take(&mut self.udp_recv_pools) {
+            for slot in pool.slots {
+                if slot.in_flight {
+                    // Late completion not acknowledged within drain timeout.
+                    // Keep this slot alive to avoid UAF; OS will reclaim at process exit.
+                    std::mem::forget(slot);
+                    continue;
+                }
+                if slot.data_buf_id != RIO_INVALID_BUFFERID
+                    && deregistered.insert(slot.data_buf_id as usize)
+                {
+                    unsafe { (self.dispatch.deregister_buffer)(slot.data_buf_id) };
+                }
+                if slot.addr_buf_id != RIO_INVALID_BUFFERID
+                    && deregistered.insert(slot.addr_buf_id as usize)
+                {
+                    unsafe { (self.dispatch.deregister_buffer)(slot.addr_buf_id) };
+                }
             }
         }
 
