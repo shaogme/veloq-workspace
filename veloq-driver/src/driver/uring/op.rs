@@ -10,7 +10,7 @@ use crate::driver::uring::UringDriver;
 use crate::driver::uring::submit;
 use crate::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
-    RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
+    Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
 };
 use io_uring::squeue;
 use std::io;
@@ -183,8 +183,8 @@ pub struct SendToPayload {
     pub msghdr: libc::msghdr,
 }
 
-pub struct RecvFromPayload {
-    pub op: RecvFrom,
+pub struct UdpRecvStreamPayload {
+    pub op: UdpRecvStream,
     pub msg_name: libc::sockaddr_storage,
     pub msg_namelen: libc::socklen_t,
     pub iovec: [libc::iovec; 1],
@@ -305,22 +305,29 @@ define_uring_ops! {
         },
         destruct: |p: SendToPayload| p.op,
     }, // Kernel 5.1+ (via SendMsg)
-    RecvFrom {
-        field: recv_from,
-        payload: RecvFromPayload,
-        make_sqe: submit::make_sqe_recv_from,
-        on_complete: submit::on_complete_recv_from,
-        drop: submit::drop_recv_from,
-        get_fd: submit::get_fd_recv_from,
-        construct: |op| RecvFromPayload {
+    UdpRecvStream {
+        field: udp_recv_stream,
+        payload: UdpRecvStreamPayload,
+        make_sqe: submit::make_sqe_udp_recv_stream,
+        on_complete: submit::on_complete_udp_recv_stream,
+        drop: submit::drop_udp_recv_stream,
+        get_fd: submit::get_fd_udp_recv_stream,
+        construct: |op| UdpRecvStreamPayload {
             op,
             msg_name: unsafe { std::mem::zeroed() },
             msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
         },
-        destruct: |p: RecvFromPayload| p.op,
+        destruct: |p: UdpRecvStreamPayload| p.op,
     }, // Kernel 5.1+ (via RecvMsg)
+    UdpRefill {
+        field: udp_refill,
+        make_sqe: submit::make_sqe_udp_refill,
+        on_complete: submit::on_complete_udp_refill,
+        drop: submit::drop_udp_refill,
+        get_fd: submit::get_fd_udp_refill,
+    }, // No-op on io_uring, kept for cross-platform API parity
     Open {
         field: open,
         payload: OpenPayload,

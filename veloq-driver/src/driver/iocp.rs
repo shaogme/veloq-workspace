@@ -97,15 +97,15 @@ impl Driver for IocpDriver {
             };
 
             let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
-            let is_rio_recv_from = unsafe {
+            let is_rio_pool_waiting = unsafe {
                 op_ref.vtable.as_ref().submit as *const () as usize
-                    == crate::driver::iocp::submit::submit_recv_from as *const () as usize
+                    == crate::driver::iocp::submit::submit_udp_recv_stream as *const () as usize
             };
 
             match result {
                 Ok(SubmissionResult::Pending) => {
                     op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
-                    op_entry.platform_data.rio_pool_waiting = is_rio_recv_from;
+                    op_entry.platform_data.rio_pool_waiting = is_rio_pool_waiting;
                 }
                 Ok(SubmissionResult::PostToQueue) => {
                     let posted = unsafe {

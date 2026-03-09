@@ -323,18 +323,23 @@ impl_default_completion!(on_complete_send_to);
 impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
 
 // ============================================================================
-// RecvFrom
+// UDP Recv Stream
 // ============================================================================
 
-pub(crate) unsafe fn make_sqe_recv_from(
+pub(crate) unsafe fn make_sqe_udp_recv_stream(
     op: &mut UringOp,
     _driver: &mut UringDriver,
 ) -> squeue::Entry {
-    let payload = unsafe { &mut *op.payload.recv_from };
+    let payload = unsafe { &mut *op.payload.udp_recv_stream };
+    let recv_buf = payload
+        .op
+        .buf
+        .as_mut()
+        .expect("udp_recv_stream requires a buffer on io_uring");
 
     // Initialize internal pointers
-    payload.iovec[0].iov_base = payload.op.buf.as_mut_ptr() as *mut _;
-    payload.iovec[0].iov_len = payload.op.buf.capacity();
+    payload.iovec[0].iov_base = recv_buf.as_mut_ptr() as *mut _;
+    payload.iovec[0].iov_len = recv_buf.capacity();
 
     payload.msghdr.msg_name = &mut payload.msg_name as *mut _ as *mut libc::c_void;
     payload.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
@@ -351,9 +356,12 @@ pub(crate) unsafe fn make_sqe_recv_from(
     }
 }
 
-pub(crate) unsafe fn on_complete_recv_from(op: &mut UringOp, result: i32) -> io::Result<usize> {
+pub(crate) unsafe fn on_complete_udp_recv_stream(
+    op: &mut UringOp,
+    result: i32,
+) -> io::Result<usize> {
     if result >= 0 {
-        let payload = unsafe { &mut *op.payload.recv_from };
+        let payload = unsafe { &mut *op.payload.udp_recv_stream };
         let len = payload.msghdr.msg_namelen as usize;
         let addr_bytes =
             unsafe { std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len) };
@@ -366,7 +374,22 @@ pub(crate) unsafe fn on_complete_recv_from(op: &mut UringOp, result: i32) -> io:
     }
 }
 
-impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
+impl_lifecycle!(
+    drop_udp_recv_stream,
+    get_fd_udp_recv_stream,
+    udp_recv_stream,
+    nested_fd
+);
+
+pub(crate) unsafe fn make_sqe_udp_refill(
+    _op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> squeue::Entry {
+    opcode::Nop::new().build()
+}
+
+impl_default_completion!(on_complete_udp_refill);
+impl_lifecycle!(drop_udp_refill, get_fd_udp_refill, udp_refill, direct_fd);
 
 // ============================================================================
 // Close

@@ -99,17 +99,17 @@ fn test_udp_socket_options() {
         let socket_clone = socket.clone();
         let recv_h = crate::runtime::context::spawn(async move {
             let buf = crate::runtime::context::alloc(nz!(1024));
-            let (res, _) = timeout(Duration::from_secs(5), socket_clone.recv_from(buf))
+            let res = timeout(Duration::from_secs(5), socket_clone.recv_stream(buf))
                 .await
                 .unwrap_or_else(|_| {
                     panic!(
-                        "UDP socket options test timeout: phase=recv_from; bound_addr={}; client_bound_addr={}; timeout_ms={}",
+                        "UDP socket options test timeout: phase=recv_stream; bound_addr={}; client_bound_addr={}; timeout_ms={}",
                         addr,
                         client_addr,
                         5000
                     )
                 });
-            res.expect("Failed to recv");
+            let _ = res.expect("Failed to recv");
         });
 
         crate::runtime::context::yield_now().await;

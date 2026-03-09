@@ -597,25 +597,24 @@ pub(crate) unsafe fn submit_send_to(
 impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
 
 // ============================================================================
-// RecvFrom
+// ============================================================================
+// UDP RIO Pool (Stream)
 // ============================================================================
 
-pub(crate) unsafe fn submit_recv_from(
+pub(crate) unsafe fn submit_udp_recv_stream(
     op: &mut IocpOp,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &mut *op.payload.recv_from };
-    let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
+    let val = unsafe { &mut *op.payload.udp_recv_stream };
+    let handle = resolve_fd(val.fd, ctx.registered_files)?;
     ctx.rio
-        .try_submit_recv_from_pooled(
-            payload.op.fd,
+        .try_submit_udp_recv_stream_pooled(
+            val.fd,
             handle,
+            val,
             op.header.user_data,
             op.header.generation,
             ctx.registrar,
-            &mut payload.op.buf,
-            &mut payload.addr,
-            &mut payload.addr_len,
             ctx.overlapped,
         )
         .map_err(|e| {
@@ -623,14 +622,51 @@ pub(crate) unsafe fn submit_recv_from(
                 IocpErrorContext::Submission,
                 e,
                 format!(
-                    "RIO recv_from submit failed: fd={:?}, user_data={}, generation={}",
-                    payload.op.fd, op.header.user_data, op.header.generation
+                    "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, op.header.user_data, op.header.generation
                 ),
             )
         })
 }
 
-impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
+pub(crate) unsafe fn on_complete_udp_recv_stream(
+    op: &mut IocpOp,
+    result: usize,
+    _ext: &Extensions,
+) -> io::Result<usize> {
+    let val = unsafe { &mut *op.payload.udp_recv_stream };
+    if result == 0
+        && let Some(datagram) = val.result.as_ref()
+    {
+        return Ok(datagram.buf.len());
+    }
+    Ok(result)
+}
+
+impl_lifecycle!(
+    drop_udp_recv_stream,
+    get_fd_udp_recv_stream,
+    udp_recv_stream,
+    direct_fd
+);
+
+pub(crate) unsafe fn submit_udp_refill(
+    op: &mut IocpOp,
+    ctx: &mut SubmitContext,
+) -> io::Result<SubmissionResult> {
+    let val = unsafe { &mut *op.payload.udp_refill };
+    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    if let Some(buf) = val.buf.take() {
+        ctx.rio
+            .try_refill_udp_pool(val.fd, handle, buf, ctx.registrar)?;
+    }
+
+    // Refill is not an async IO op that completes via IOCP,
+    // it just updates the internal pool. We post a completion to notify success.
+    Ok(SubmissionResult::PostToQueue)
+}
+
+impl_lifecycle!(drop_udp_refill, get_fd_udp_refill, udp_refill, direct_fd);
 
 // ============================================================================
 // Open

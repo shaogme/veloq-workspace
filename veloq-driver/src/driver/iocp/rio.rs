@@ -10,6 +10,7 @@ use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED, STATE_CONSUMED};
 use crate::op::IoFd;
 use std::io;
 use std::sync::atomic::Ordering;
+use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CORRUPT_CQ, RIO_CQ, RIO_IOCP_COMPLETION,
@@ -98,6 +99,22 @@ impl RioState {
         let user_data = unsafe { (*entry).user_data };
         let generation = unsafe { (*entry).generation };
         Some((user_data, generation))
+    }
+
+    #[inline]
+    fn decode_pool_context(ctx: u64) -> Option<u32> {
+        if ctx == 0 {
+            return None;
+        }
+        let raw = ctx as usize;
+        if (raw & POOL_CTX_TAG) != POOL_CTX_TAG {
+            return None;
+        }
+        let token = (raw >> 1) as u32;
+        if token == 0 {
+            return None;
+        }
+        Some(token)
     }
 
     fn last_wsa_error() -> io::Error {
@@ -225,8 +242,11 @@ impl RioState {
     }
 
     pub fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
-        self.pool_manager
-            .begin_udp_pool_shutdown_for_handle(handle, &self.dispatch);
+        self.pool_manager.begin_udp_pool_shutdown_for_handle(
+            handle,
+            &mut self.registry,
+            &self.dispatch,
+        );
         // If pool was fully drained, also remove the stale RQ mapping.
         if !self.pool_manager.udp_recv_pools.contains_key(&handle) {
             self.registry.rio_rqs.remove(&handle);
@@ -651,32 +671,28 @@ impl RioState {
         Ok(SubmissionResult::Pending)
     }
 
-    pub fn try_submit_recv_from_pooled(
+    pub fn try_submit_udp_recv_stream_pooled(
         &mut self,
         fd: IoFd,
         handle: HANDLE,
+        stream_op: &mut crate::op::UdpRecvStream,
         user_data: usize,
         generation: u32,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        buf: &mut veloq_buf::FixedBuf,
-        addr: &mut crate::SockAddrStorage,
-        addr_len: &mut i32,
         overlapped: *mut OVERLAPPED,
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
         use crate::driver::iocp::submit::SubmissionResult;
         let rq = self
             .registry
             .ensure_rq(handle, fd, self.cq, &self.dispatch)?;
-        let (res, pool_submissions) = self.pool_manager.try_submit_recv_from_pooled(
+        let (res, pool_submissions) = self.pool_manager.try_submit_udp_recv_stream_pooled(
             handle,
             rq,
+            stream_op,
             user_data,
             generation,
             &mut self.registry,
             registrar,
-            buf,
-            addr,
-            addr_len,
             overlapped,
             &self.dispatch,
         )?;
@@ -685,6 +701,28 @@ impl RioState {
             self.outstanding_count += 1;
         }
         Ok(res)
+    }
+
+    pub fn try_refill_udp_pool(
+        &mut self,
+        fd: IoFd,
+        handle: HANDLE,
+        buf: FixedBuf,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+    ) -> io::Result<()> {
+        let rq = self
+            .registry
+            .ensure_rq(handle, fd, self.cq, &self.dispatch)?;
+        let pool_submissions = self.pool_manager.try_refill_udp_pool(
+            handle,
+            rq,
+            buf,
+            &mut self.registry,
+            registrar,
+            &self.dispatch,
+        )?;
+        self.outstanding_count += pool_submissions;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -743,21 +781,17 @@ impl Drop for RioState {
                 std::thread::yield_now();
             } else {
                 for res in results.iter().take(count as usize) {
-                    if let Some((user_data, completion_generation)) =
-                        Self::decode_request_context(res.RequestContext)
+                    if let Some(completion_generation) =
+                        Self::decode_pool_context(res.RequestContext)
                     {
-                        if user_data == UDP_POOL_USER_DATA {
-                            if let Some((handle, slot_idx)) = self
-                                .pool_manager
-                                .ack_udp_pool_completion(completion_generation)
-                            {
-                                if let Some(pool) =
-                                    self.pool_manager.udp_recv_pools.get_mut(&handle)
-                                {
-                                    if let Some(slot) = pool.slots.get_mut(slot_idx) {
-                                        slot.in_flight = false;
-                                        slot.stop_requested = false;
-                                    }
+                        if let Some((handle, slot_idx)) = self
+                            .pool_manager
+                            .ack_udp_pool_completion(completion_generation)
+                        {
+                            if let Some(pool) = self.pool_manager.udp_recv_pools.get_mut(&handle) {
+                                if let Some(slot) = pool.slots.get_mut(slot_idx) {
+                                    slot.in_flight = false;
+                                    slot.stop_requested = false;
                                 }
                             }
                         }
@@ -769,7 +803,7 @@ impl Drop for RioState {
 
         self.pool_manager.udp_ctx_map.clear();
         self.pool_manager
-            .forget_in_flight_and_deregister_rest(&self.dispatch);
+            .forget_in_flight_and_deregister_rest(&mut self.registry, &self.dispatch);
         self.registry.cleanup_deregister(&self.dispatch);
         if self.cq != 0 {
             unsafe { (self.dispatch.close_cq)(self.cq) };

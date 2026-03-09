@@ -62,9 +62,12 @@ fn test_udp_send_receive() {
                 // Receiver task: socket1 waits for data
                 let handler = crate::runtime::context::spawn(async move {
                     let buf = crate::runtime::context::alloc(size);
-                    // buf.set_len(buf.capacity());
-                    let (result, _buf) = socket1_clone.recv_from(buf).await;
-                    let (bytes_read, from_addr) = result.expect("recv_from failed");
+                    let datagram = socket1_clone
+                        .recv_stream(buf)
+                        .await
+                        .expect("recv_stream failed");
+                    let bytes_read = datagram.buf.len();
+                    let from_addr = datagram.addr;
                     println!("Socket 1 received {} bytes from {}", bytes_read, from_addr);
                     assert_eq!(from_addr, addr2);
                 });
@@ -116,8 +119,13 @@ fn test_udp_echo() {
                 let server_h = crate::runtime::context::spawn(async move {
                     // Receive data
                     let buf = crate::runtime::context::alloc(size);
-                    let (result, buf) = server_clone.recv_from(buf).await;
-                    let (bytes_read, from_addr) = result.expect("Server recv_from failed");
+                    let datagram = server_clone
+                        .recv_stream(buf)
+                        .await
+                        .expect("Server recv_stream failed");
+                    let bytes_read = datagram.buf.len();
+                    let from_addr = datagram.addr;
+                    let buf = datagram.buf;
                     println!("Server received {} bytes from {}", bytes_read, from_addr);
 
                     // Echo back
@@ -143,8 +151,13 @@ fn test_udp_echo() {
 
                 // Receive echo response
                 let recv_buf = crate::runtime::context::alloc(size);
-                let (result, recv_buf) = client_arc.recv_from(recv_buf).await;
-                let (bytes_received, from_addr) = result.expect("Client recv_from failed");
+                let datagram = client_arc
+                    .recv_stream(recv_buf)
+                    .await
+                    .expect("Client recv_stream failed");
+                let bytes_received = datagram.buf.len();
+                let from_addr = datagram.addr;
+                let recv_buf = datagram.buf;
 
                 println!(
                     "Client received {} bytes from {}",
@@ -193,18 +206,20 @@ fn test_udp_multiple_messages() {
                     for i in 0..NUM_MESSAGES {
                         ready_tx.send(i).unwrap();
                         let buf = crate::runtime::context::alloc(size);
-                        let (result, _buf) = timeout(Duration::from_secs(5), socket1_clone.recv_from(buf))
+                        let datagram = timeout(Duration::from_secs(5), socket1_clone.recv_stream(buf))
                             .await
                             .unwrap_or_else(|_| {
                                 panic!(
-                                    "UDP multiple messages timeout: phase=recv_from; expected={}; received_so_far={}; listen_addr={}; timeout_ms={}",
+                                    "UDP multiple messages timeout: phase=recv_stream; expected={}; received_so_far={}; listen_addr={}; timeout_ms={}",
                                     NUM_MESSAGES,
                                     i,
                                     addr1,
                                     5000
                                 )
                             });
-                        let (bytes, from) = result.expect("recv_from failed");
+                        let datagram = datagram.expect("recv_stream failed");
+                        let bytes = datagram.buf.len();
+                        let from = datagram.addr;
                         println!("Received message {} ({} bytes) from {}", i, bytes, from);
                     }
                     println!("Received all {} messages", NUM_MESSAGES);
@@ -290,8 +305,12 @@ fn test_udp_large_data() {
                 // Receiver task
                 let h_recv = crate::runtime::context::spawn(async move {
                     let buf = crate::runtime::context::alloc(size);
-                    let (result, buf) = socket1_clone.recv_from(buf).await;
-                    let (bytes, _from) = result.expect("recv_from failed");
+                    let datagram = socket1_clone
+                        .recv_stream(buf)
+                        .await
+                        .expect("recv_stream failed");
+                    let bytes = datagram.buf.len();
+                    let buf = datagram.buf;
                     println!("Received {} bytes", bytes);
 
                     // Verify data pattern
@@ -336,8 +355,9 @@ fn test_udp_heap_buffer() {
         // Receiver task: Explicitly use heap buffer
         let h_recv = crate::runtime::context::spawn(async move {
             let buf = veloq_buf::FixedBuf::alloc_heap(nz!(1024)).expect("Heap allocation failed");
-            let (result, buf) = socket1.recv_from(buf).await;
-            let (n, _) = result.expect("recv_from failed");
+            let datagram = socket1.recv_stream(buf).await.expect("recv_stream failed");
+            let n = datagram.buf.len();
+            let buf = datagram.buf;
 
             assert_eq!(&buf.as_slice()[..n], b"UDP from heap!");
             println!("UDP server received data in heap buffer correctly");
@@ -422,24 +442,19 @@ fn test_multithread_udp_no_echo() {
                         // Receiver task via crate::context::spawn
                         let h_recv = crate::runtime::context::spawn(async move {
                             let buf = crate::runtime::context::alloc(size);
-                            let (result, buf) = socket1_clone.recv_from(buf).await;
-                            match result {
-                                Ok((_bytes, _from)) => {
-                                    tracing::info!("Worker {} received message", worker_id);
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Worker {} recv_from failed: {:?}",
-                                        worker_id,
-                                        e
-                                    );
-                                    panic!(
-                                        "Worker {} recv_from failed callback: {:?}",
-                                        worker_id, e
-                                    );
-                                }
-                            }
-                            drop(buf);
+                            let datagram = socket1_clone.recv_stream(buf).await.unwrap_or_else(|e| {
+                                tracing::error!(
+                                    "Worker {} recv_stream failed: {:?}",
+                                    worker_id,
+                                    e
+                                );
+                                panic!(
+                                    "Worker {} recv_stream failed callback: {:?}",
+                                    worker_id, e
+                                );
+                            });
+                            tracing::info!("Worker {} received message", worker_id);
+                            drop(datagram.buf);
                         });
 
                         // Sender
@@ -533,7 +548,7 @@ fn test_multithread_udp_echo() {
                     let recv_h = crate::runtime::context::spawn(async move {
                         ready_tx.send(()).unwrap();
                         let buf = crate::runtime::context::alloc(size);
-                        let (result, buf) = timeout(Duration::from_secs(5), socket_for_recv.recv_from(buf))
+                        let datagram = timeout(Duration::from_secs(5), socket_for_recv.recv_stream(buf))
                             .await
                             .unwrap_or_else(|_| {
                                 panic!(
@@ -542,7 +557,10 @@ fn test_multithread_udp_echo() {
                                     5000
                                 )
                             });
-                        let (bytes, from_addr) = result.expect("Server recv_from failed");
+                        let datagram = datagram.expect("Server recv_stream failed");
+                        let bytes = datagram.buf.len();
+                        let from_addr = datagram.addr;
+                        let buf = datagram.buf;
                         (bytes, from_addr, buf)
                     });
                     timeout(Duration::from_secs(5), ready_rx.recv())
@@ -615,7 +633,7 @@ fn test_multithread_udp_echo() {
                     let recv_h = crate::runtime::context::spawn(async move {
                         client_ready_tx.send(()).unwrap();
                         let recv_buf = crate::runtime::context::alloc(size);
-                        let (result, recv_buf) = timeout(Duration::from_secs(5), client_for_recv.recv_from(recv_buf))
+                        let datagram = timeout(Duration::from_secs(5), client_for_recv.recv_stream(recv_buf))
                             .await
                             .unwrap_or_else(|_| {
                                 panic!(
@@ -624,7 +642,9 @@ fn test_multithread_udp_echo() {
                                     5000
                                 )
                             });
-                        let (_received, from) = result.expect("Client recv_from failed");
+                        let datagram = datagram.expect("Client recv_stream failed");
+                        let from = datagram.addr;
+                        let recv_buf = datagram.buf;
                         (from, recv_buf)
                     });
                     timeout(Duration::from_secs(5), client_ready_rx.recv())
@@ -745,7 +765,7 @@ fn test_multithread_concurrent_udp_clients() {
                     // Receive messages from all clients
                     for i in 0..NUM_CLIENTS {
                         let buf = crate::runtime::context::alloc(size);
-                        let (result, _buf) = timeout(Duration::from_secs(5), socket.recv_from(buf))
+                        let datagram = timeout(Duration::from_secs(5), socket.recv_stream(buf))
                             .await
                             .unwrap_or_else(|_| {
                                 panic!(
@@ -756,7 +776,9 @@ fn test_multithread_concurrent_udp_clients() {
                                     5000
                                 )
                             });
-                        let (bytes, from) = result.expect("Server recv_from failed");
+                        let datagram = datagram.expect("Server recv_stream failed");
+                        let bytes = datagram.buf.len();
+                        let from = datagram.addr;
                         let received = server_recv_count_s.fetch_add(1, Ordering::SeqCst) + 1;
                         println!(
                             "Server received message {} ({} bytes) from {}",
@@ -871,7 +893,7 @@ fn test_multithread_concurrent_udp_clients() {
 }
 /// Test UDP recv cancellation
 #[test]
-fn test_udp_cancel_recv_from() {
+fn test_udp_cancel_recv_stream() {
     use crate::select;
     use std::future::Future;
     use std::pin::Pin;
@@ -904,8 +926,8 @@ fn test_udp_cancel_recv_from() {
         let buf = crate::runtime::context::alloc(nz!(1024));
 
         select! {
-            _ = socket.recv_from(buf) => {
-                panic!("RecvFrom should have been cancelled, but it completed (unexpectedly)");
+            _ = socket.recv_stream(buf) => {
+                panic!("RecvStream should have been cancelled, but it completed (unexpectedly)");
             },
             _ = YieldOnce(false) => {
                 println!("UDP recv cancelled successfully");

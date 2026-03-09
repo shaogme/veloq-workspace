@@ -5,7 +5,8 @@ use crate::Socket;
 use crate::config::IocpConfig;
 use crate::driver::Driver;
 use crate::op::{
-    Accept, Connect, IntoPlatformOp, IoFd, OpLifecycle, Recv, RecvFrom, SendTo, Timeout,
+    Accept, Connect, IntoPlatformOp, IoFd, OpLifecycle, Recv, SendTo, Timeout, UdpRecvStream,
+    UdpRefill,
 };
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
@@ -617,10 +618,34 @@ fn test_rio_udp_send_to_recv_from_address_path() {
             .expect("register recv chunk failed");
     }
 
-    let recv_op = RecvFrom {
+    // Provide initial buffer to pool via UdpRefill
+    let refill_op = UdpRefill {
         fd: IoFd::Raw(server_handle),
-        buf: recv_buf,
+        buf: Some(recv_buf),
+    };
+    let mut refill_iocp = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(refill_op));
+    let (refill_ud, _) = driver.reserve_op().expect("reserve refill op failed");
+    let _ = driver
+        .submit(refill_ud, &mut refill_iocp)
+        .expect("submit refill failed");
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // Poll refill completion
+    loop {
+        driver.process_completions();
+        let mut op_out = None;
+        if let Poll::Ready(res) = driver.poll_op(refill_ud, &mut cx, &mut op_out) {
+            res.expect("refill failed");
+            break;
+        }
+    }
+
+    let recv_op = UdpRecvStream {
+        fd: IoFd::Raw(server_handle),
+        buf: None,
         addr: None,
+        result: None,
     };
     let send_op = SendTo {
         fd: IoFd::Raw(client_handle),
@@ -632,7 +657,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     let (recv_ud, _) = driver.reserve_op().expect("reserve recv op failed");
     let _ = driver
         .submit(recv_ud, &mut recv_iocp)
-        .expect("submit recv_from failed");
+        .expect("submit udp_recv_stream failed");
 
     let mut send_iocp = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(send_op));
     let (send_ud, _) = driver.reserve_op().expect("reserve send op failed");
@@ -640,8 +665,6 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         .submit(send_ud, &mut send_iocp)
         .expect("submit send_to failed");
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
     let start = Instant::now();
 
     let mut send_done = false;
@@ -649,7 +672,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
 
     while !(send_done && recv_done) {
         if start.elapsed() > Duration::from_secs(5) {
-            panic!("RIO UDP send_to/recv_from regression test timed out");
+            panic!("RIO UDP send_to/recv_stream regression test timed out");
         }
         driver.process_completions();
 
@@ -666,18 +689,16 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         if !recv_done {
             let mut op_out = None;
             if let Poll::Ready(res) = driver.poll_op(recv_ud, &mut cx, &mut op_out) {
-                let bytes = res.expect("recv_from completion failed");
-                let iocp_op = op_out.expect("recv_from op missing");
-                let mut recv_out =
-                    <RecvFrom as crate::op::IntoPlatformOp<IocpDriver>>::from_platform_op(iocp_op);
-                recv_out.buf.set_len(bytes);
+                let bytes = res.expect("udp_recv_stream completion failed");
+                let iocp_op = op_out.expect("udp_recv_stream op missing");
+                let recv_out =
+                    <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_platform_op(
+                        iocp_op,
+                    );
+                let datagram = recv_out.result.expect("datagram missing in result");
                 assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
-                assert_eq!(&recv_out.buf.as_slice()[..bytes], test_data);
-                assert_eq!(
-                    recv_out.addr,
-                    Some(client_addr),
-                    "recv_from source addr mismatch"
-                );
+                assert_eq!(&datagram.buf.as_slice()[..bytes], test_data);
+                assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
                 recv_done = true;
             }
         }
@@ -762,10 +783,34 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
             .expect("register recv chunk failed");
     }
 
-    let recv_op = RecvFrom {
+    // Provide initial buffer to pool via UdpRefill
+    let refill_op = UdpRefill {
         fd: IoFd::Raw(server_handle),
-        buf: recv_buf,
+        buf: Some(recv_buf),
+    };
+    let mut refill_iocp = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(refill_op));
+    let (refill_ud, _) = driver.reserve_op().expect("reserve refill op failed");
+    let _ = driver
+        .submit(refill_ud, &mut refill_iocp)
+        .expect("submit refill failed");
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // Poll refill completion
+    loop {
+        driver.process_completions();
+        let mut op_out = None;
+        if let Poll::Ready(res) = driver.poll_op(refill_ud, &mut cx, &mut op_out) {
+            res.expect("refill failed");
+            break;
+        }
+    }
+
+    let recv_op = UdpRecvStream {
+        fd: IoFd::Raw(server_handle),
+        buf: None,
         addr: None,
+        result: None,
     };
     let send_op = SendTo {
         fd: IoFd::Raw(client_handle),
@@ -777,7 +822,7 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     let (recv_ud, _) = driver.reserve_op().expect("reserve recv op failed");
     let _ = driver
         .submit(recv_ud, &mut recv_iocp)
-        .expect("submit recv_from failed");
+        .expect("submit udp_recv_stream failed");
 
     let mut send_iocp = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(send_op));
     let (send_ud, _) = driver.reserve_op().expect("reserve send op failed");
@@ -785,8 +830,6 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         .submit(send_ud, &mut send_iocp)
         .expect("submit send_to failed");
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
     let start = Instant::now();
 
     let mut send_done = false;
@@ -794,7 +837,7 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
 
     while !(send_done && recv_done) {
         if start.elapsed() > Duration::from_secs(5) {
-            panic!("RIO UDP IPv6 send_to/recv_from regression test timed out");
+            panic!("RIO UDP IPv6 send_to/recv_stream regression test timed out");
         }
         driver.process_completions();
 
@@ -811,18 +854,16 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         if !recv_done {
             let mut op_out = None;
             if let Poll::Ready(res) = driver.poll_op(recv_ud, &mut cx, &mut op_out) {
-                let bytes = res.expect("recv_from completion failed");
-                let iocp_op = op_out.expect("recv_from op missing");
-                let mut recv_out =
-                    <RecvFrom as crate::op::IntoPlatformOp<IocpDriver>>::from_platform_op(iocp_op);
-                recv_out.buf.set_len(bytes);
+                let bytes = res.expect("udp_recv_stream completion failed");
+                let iocp_op = op_out.expect("udp_recv_stream op missing");
+                let recv_out =
+                    <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_platform_op(
+                        iocp_op,
+                    );
+                let datagram = recv_out.result.expect("datagram missing in result");
                 assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
-                assert_eq!(&recv_out.buf.as_slice()[..bytes], test_data);
-                assert_eq!(
-                    recv_out.addr,
-                    Some(client_addr),
-                    "recv_from source addr mismatch"
-                );
+                assert_eq!(&datagram.buf.as_slice()[..bytes], test_data);
+                assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
                 recv_done = true;
             }
         }
@@ -852,17 +893,17 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
     const BURST_WAITERS: usize = 12;
 
     for _ in 0..BURST_WAITERS {
-        let recv_op = RecvFrom {
+        let recv_op = UdpRecvStream {
             fd: IoFd::Raw(server_handle),
-            buf: veloq_buf::FixedBuf::alloc_heap(std::num::NonZeroUsize::new(1024).unwrap())
-                .expect("alloc recv buf failed"),
+            buf: None,
             addr: None,
+            result: None,
         };
         let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
         let (ud, _) = driver.reserve_op().expect("reserve recv op failed");
         let _ = driver
             .submit(ud, &mut iocp_op)
-            .expect("submit recv_from failed");
+            .expect("submit udp_recv_stream failed");
         submitted.push(ud);
     }
 
@@ -888,7 +929,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
         match driver.poll_op(ud, &mut cx, &mut op_out) {
             Poll::Ready(res) => {
                 let _ = op_out.expect("cancelled op should be returned");
-                let err = res.expect_err("cancelled recv_from should fail");
+                let err = res.expect_err("cancelled udp_recv_stream should fail");
                 assert_eq!(
                     err.raw_os_error(),
                     Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
@@ -917,17 +958,17 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
     const BURST_WAITERS: usize = 12;
 
     for _ in 0..BURST_WAITERS {
-        let recv_op = RecvFrom {
+        let recv_op = UdpRecvStream {
             fd: IoFd::Raw(server_handle),
-            buf: veloq_buf::FixedBuf::alloc_heap(std::num::NonZeroUsize::new(1024).unwrap())
-                .expect("alloc recv buf failed"),
+            buf: None,
             addr: None,
+            result: None,
         };
         let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
         let (ud, _) = driver.reserve_op().expect("reserve recv op failed");
         let _ = driver
             .submit(ud, &mut iocp_op)
-            .expect("submit recv_from failed");
+            .expect("submit udp_recv_stream failed");
         submitted.push(ud);
     }
 

@@ -143,7 +143,9 @@ impl IocpDriver {
         submit_fn == crate::driver::iocp::submit::submit_recv as *const () as usize
             || submit_fn == crate::driver::iocp::submit::submit_send as *const () as usize
             || submit_fn == crate::driver::iocp::submit::submit_send_to as *const () as usize
-            || submit_fn == crate::driver::iocp::submit::submit_recv_from as *const () as usize
+            || submit_fn
+                == crate::driver::iocp::submit::submit_udp_recv_stream as *const () as usize
+            || submit_fn == crate::driver::iocp::submit::submit_udp_refill as *const () as usize
     }
 
     pub fn create_pre_init() -> io::Result<PreInit> {

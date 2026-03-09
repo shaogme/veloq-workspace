@@ -13,7 +13,7 @@ use crate::driver::iocp::rio::RioState;
 use crate::driver::iocp::submit::{self, SubmissionResult};
 use crate::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
-    RecvFrom, Send as OpSend, SendTo, SyncFileRange, Timeout, Wakeup, WriteFixed,
+    Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
 };
 use std::io;
 use std::mem::ManuallyDrop;
@@ -212,14 +212,6 @@ pub struct SendToPayload {
     pub addr_len: i32,
 }
 
-pub struct RecvFromPayload {
-    pub op: RecvFrom,
-    pub wsabuf: WSABUF,
-    pub flags: u32,
-    pub addr: SockAddrStorage,
-    pub addr_len: i32,
-}
-
 pub struct OpenPayload {
     pub op: Open,
 }
@@ -334,35 +326,18 @@ define_iocp_ops! {
         },
         destruct: |p: SendToPayload| p.op,
     },
-    RecvFrom {
-        field: recv_from,
-        payload: RecvFromPayload,
-        submit: submit::submit_recv_from,
-        drop: submit::drop_recv_from,
-        get_fd: submit::get_fd_recv_from,
-        construct: |mut op: RecvFrom| {
-            let wsabuf = WSABUF {
-                len: op.buf.capacity() as u32,
-                buf: op.buf.as_mut_ptr(),
-            };
-            RecvFromPayload {
-                op,
-                wsabuf,
-                flags: 0,
-                addr: SockAddrStorage::default(),
-                addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
-            }
-        },
-        destruct: |p: RecvFromPayload| {
-            let mut val = p.op;
-            let len = p.addr_len as usize;
-            let addr = unsafe {
-                let s = std::slice::from_raw_parts(&p.addr as *const _ as *const u8, len);
-                crate::to_socket_addr(s).ok()
-            };
-            val.addr = addr;
-            val
-        },
+    UdpRecvStream {
+        field: udp_recv_stream,
+        submit: submit::submit_udp_recv_stream,
+        on_complete: submit::on_complete_udp_recv_stream,
+        drop: submit::drop_udp_recv_stream,
+        get_fd: submit::get_fd_udp_recv_stream,
+    },
+    UdpRefill {
+        field: udp_refill,
+        submit: submit::submit_udp_refill,
+        drop: submit::drop_udp_refill,
+        get_fd: submit::get_fd_udp_refill,
     },
     Open {
         field: open,

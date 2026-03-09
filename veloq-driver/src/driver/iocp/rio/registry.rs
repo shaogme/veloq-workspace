@@ -249,6 +249,19 @@ impl RioRegistry {
         Ok(rq)
     }
 
+    pub fn deregister_heap_buffer_for_buf(&mut self, buf: &FixedBuf, dispatch: &RioDispatch) {
+        let info = buf.resolve_region_info();
+        if info.id != u16::MAX {
+            return;
+        }
+        let key = (buf.as_ptr() as usize, buf.capacity(), info.cookie);
+        if let Some(id) = self.heap_rio_bufs.remove(&key)
+            && id != RIO_INVALID_BUFFERID
+        {
+            unsafe { (dispatch.deregister_buffer)(id) };
+        }
+    }
+
     pub fn cleanup_deregister(&mut self, dispatch: &RioDispatch) {
         use std::collections::HashSet;
         let mut deregistered = HashSet::new();

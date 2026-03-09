@@ -480,6 +480,19 @@ impl OpSubmitter for LocalSubmitter {
     }
 }
 
+// ============================================================================
+// DetachedSubmitter
+// ============================================================================
+
+#[derive(Clone, Copy)]
+pub struct DetachedSubmitter;
+
+impl DetachedSubmitter {
+    pub fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+}
+
 impl OpSubmitter for DetachedSubmitter {
     type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> =
         DetachedOp<T, PlatformDriver>;
@@ -493,19 +506,6 @@ impl OpSubmitter for DetachedSubmitter {
 
     fn from_current_context() -> std::io::Result<Self> {
         Self::new()
-    }
-}
-
-// ============================================================================
-// DetachedSubmitter
-// ============================================================================
-
-#[derive(Clone, Copy)]
-pub struct DetachedSubmitter;
-
-impl DetachedSubmitter {
-    pub fn new() -> std::io::Result<Self> {
-        Ok(Self)
     }
 }
 
@@ -607,14 +607,6 @@ pub struct SendTo {
     pub addr: std::net::SocketAddr,
 }
 
-/// Receive data and source address (UDP).
-pub struct RecvFrom {
-    pub fd: IoFd,
-    pub buf: FixedBuf,
-    /// Source address (populated after completion).
-    pub addr: Option<std::net::SocketAddr>,
-}
-
 /// Sync file range.
 pub struct SyncFileRange {
     pub fd: IoFd,
@@ -631,18 +623,27 @@ pub struct Fallocate {
     pub len: u64,
 }
 
-#[cfg(windows)]
-/// Receive data using Windows Registered I/O (RIO).
-pub struct RioRecv {
+/// Receive data as UDP datagram stream.
+pub struct UdpRecvStream {
     pub fd: IoFd,
-    pub buf: FixedBuf,
+    /// Unix io_uring path uses this provided buffer; Windows can leave it as None.
+    pub buf: Option<FixedBuf>,
+    /// Unix io_uring path: source address parsed from recvmsg.
+    pub addr: Option<std::net::SocketAddr>,
+    /// Windows RIO path: resulting datagram, populated on completion.
+    pub result: Option<UdpRecvDatagram>,
 }
 
-#[cfg(windows)]
-/// Send data using Windows Registered I/O (RIO).
-pub struct RioSend {
-    pub fd: IoFd,
+/// A received UDP datagram.
+pub struct UdpRecvDatagram {
     pub buf: FixedBuf,
+    pub addr: std::net::SocketAddr,
+}
+
+/// Provide a buffer to the driver's internal RIO UDP pool.
+pub struct UdpRefill {
+    pub fd: IoFd,
+    pub buf: Option<FixedBuf>,
 }
 
 // ============================================================================
