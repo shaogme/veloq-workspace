@@ -855,14 +855,22 @@ impl Drop for RioState {
                 for res in results.iter().take(count as usize) {
                     if let Some(completion_generation) =
                         Self::decode_pool_context(res.RequestContext)
-                        && let Some((handle, slot_idx)) = self
-                            .pool_manager
-                            .ack_udp_pool_completion(completion_generation)
-                        && let Some(pool) = self.pool_manager.udp_recv_pools.get_mut(&handle)
-                        && let Some(slot) = pool.slots.get_mut(slot_idx)
                     {
-                        slot.in_flight = false;
-                        slot.stop_requested = false;
+                        let env = RioEnv {
+                            registrar: &veloq_buf::NoopRegistrar,
+                            dispatch: &self.dispatch,
+                            cq: self.cq,
+                        };
+                        let mut ctx = RioContext {
+                            registry: &mut self.registry,
+                            env,
+                        };
+                        if let Some(drained_handle) = self
+                            .pool_manager
+                            .handle_completion_drain_only((res, completion_generation), &mut ctx)
+                        {
+                            self.registry.rio_rqs.remove(&drained_handle);
+                        }
                     }
                     self.outstanding_count -= 1;
                 }
