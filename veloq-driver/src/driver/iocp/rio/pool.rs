@@ -17,7 +17,6 @@ use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_RQ, RIORESULT, WSAGetLastError,
 };
 
-pub const UDP_POOL_USER_DATA: usize = usize::MAX - 2;
 const UDP_RECV_POOL_MIN_CREDITS: usize = 2;
 const UDP_RECV_POOL_INITIAL_CREDITS: usize = 4;
 const UDP_RECV_POOL_MAX_CREDITS: usize = 16;

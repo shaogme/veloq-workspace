@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use std::io;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::{RIO_BUFFERID, RIO_RQ, WSAGetLastError};
+use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIO_BUFFERID, RIO_RQ, WSAGetLastError};
 
 pub const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0 as RIO_BUFFERID;
 
@@ -106,6 +106,24 @@ impl RioRegistry {
                 format!("RIO chunk not registered: chunk_id={}", info.id),
             )),
         }
+    }
+
+    pub fn prepare_data_submission(
+        &mut self,
+        target: (IoFd, HANDLE),
+        buf: &FixedBuf,
+        len: u32,
+        env: RioEnv<'_>,
+    ) -> io::Result<(RIO_RQ, RIO_BUF)> {
+        let (fd, handle) = target;
+        let (buffer_id, offset) = self.resolve_buffer_id(buf, env)?;
+        let rq = self.ensure_rq((handle, fd), env)?;
+        let rio_buf = RIO_BUF {
+            BufferId: buffer_id,
+            Offset: offset,
+            Length: len,
+        };
+        Ok((rq, rio_buf))
     }
 
     pub fn resize_registered_rqs(&mut self, size: usize) {

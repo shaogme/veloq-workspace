@@ -18,7 +18,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-use self::pool::{POOL_CTX_TAG, UDP_POOL_USER_DATA, UdpPoolManager};
+use self::pool::{POOL_CTX_TAG, UdpPoolManager};
 use self::registry::RioRegistry;
 
 #[derive(Clone, Copy)]
@@ -31,6 +31,12 @@ pub struct RioEnv<'a> {
 pub struct RioContext<'a> {
     pub registry: &'a mut RioRegistry,
     pub env: RioEnv<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum RioCompletionKind {
+    Pool { generation: u32 },
+    Op { user_data: usize, generation: u32 },
 }
 
 pub struct RioSendToArgs<'a> {
@@ -108,62 +114,21 @@ pub(crate) struct RioDispatch {
 }
 
 pub struct RioState {
-    pub(crate) cq: RIO_CQ,
-    pub(crate) _notify_overlapped: Box<OVERLAPPED>,
+    pub(crate) kernel: RioKernel,
     pub(crate) registry: RioRegistry,
     pub(crate) pool_manager: UdpPoolManager,
-    pub(crate) dispatch: RioDispatch,
     pub(crate) outstanding_count: usize,
 }
 
-impl RioState {
-    #[inline]
-    fn encode_request_context(overlapped: *mut OVERLAPPED) -> *const std::ffi::c_void {
-        overlapped as *const std::ffi::c_void
-    }
+pub(crate) struct RioKernel {
+    cq: RIO_CQ,
+    _notify_overlapped: Box<OVERLAPPED>,
+    dispatch: RioDispatch,
+}
 
-    #[inline]
-    fn decode_request_context(ctx: u64) -> Option<(usize, u32)> {
-        if ctx == 0 {
-            return None;
-        }
-        let raw = ctx as usize;
-        if (raw & POOL_CTX_TAG) == POOL_CTX_TAG {
-            let token = (raw >> 1) as u32;
-            if token == 0 {
-                return None;
-            }
-            return Some((UDP_POOL_USER_DATA, token));
-        }
-        let entry = ctx as usize as *const OverlappedEntry;
-        let user_data = unsafe { (*entry).user_data };
-        let generation = unsafe { (*entry).generation };
-        Some((user_data, generation))
-    }
-
-    #[inline]
-    fn decode_pool_context(ctx: u64) -> Option<u32> {
-        if ctx == 0 {
-            return None;
-        }
-        let raw = ctx as usize;
-        if (raw & POOL_CTX_TAG) != POOL_CTX_TAG {
-            return None;
-        }
-        let token = (raw >> 1) as u32;
-        if token == 0 {
-            return None;
-        }
-        Some(token)
-    }
-
-    fn last_wsa_error() -> io::Error {
-        io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
-    }
-
-    pub fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
+impl RioKernel {
+    fn from_extensions(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
         let table = &ext.rio_table;
-
         let dispatch = RioDispatch {
             create_cq: table.RIOCreateCompletionQueue.ok_or_else(|| {
                 io_msg(
@@ -195,24 +160,24 @@ impl RioState {
                     "RIODequeueCompletion function pointer missing",
                 )
             })?,
-            notify: table.RIONotify.ok_or_else(|| {
-                io_msg(IocpErrorContext::Rio, "RIONotify function pointer missing")
-            })?,
+            notify: table
+                .RIONotify
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIONotify function pointer missing"))?,
             close_cq: table.RIOCloseCompletionQueue.ok_or_else(|| {
                 io_msg(
                     IocpErrorContext::Rio,
                     "RIOCloseCompletionQueue function pointer missing",
                 )
             })?,
-            receive: table.RIOReceive.ok_or_else(|| {
-                io_msg(IocpErrorContext::Rio, "RIOReceive function pointer missing")
-            })?,
+            receive: table
+                .RIOReceive
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOReceive function pointer missing"))?,
             send: table
                 .RIOSend
                 .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSend function pointer missing"))?,
-            send_ex: table.RIOSendEx.ok_or_else(|| {
-                io_msg(IocpErrorContext::Rio, "RIOSendEx function pointer missing")
-            })?,
+            send_ex: table
+                .RIOSendEx
+                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSendEx function pointer missing"))?,
             receive_ex: table.RIOReceiveEx.ok_or_else(|| {
                 io_msg(
                     IocpErrorContext::Rio,
@@ -220,9 +185,11 @@ impl RioState {
                 )
             })?,
         };
+        Self::new(port, entries, dispatch)
+    }
 
+    fn new(port: HANDLE, entries: u32, dispatch: RioDispatch) -> io::Result<Self> {
         const RIO_EVENT_KEY: usize = usize::MAX - 1;
-
         let mut notify_overlapped = Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() });
         let notification = RIO_NOTIFICATION_COMPLETION {
             Type: RIO_IOCP_COMPLETION,
@@ -237,11 +204,10 @@ impl RioState {
 
         let queue_size = entries.max(128);
         let cq = unsafe { (dispatch.create_cq)(queue_size, &notification as *const _) };
-
         if cq == 0 {
             return Err(io_error(
                 IocpErrorContext::Rio,
-                Self::last_wsa_error(),
+                RioState::last_wsa_error(),
                 format!(
                     "RIOCreateCompletionQueue failed: entries={entries}, queue_size={queue_size}"
                 ),
@@ -252,19 +218,280 @@ impl RioState {
         if notify_ret == SOCKET_ERROR {
             return Err(io_error(
                 IocpErrorContext::Rio,
-                Self::last_wsa_error(),
+                RioState::last_wsa_error(),
                 "RIONotify failed after CQ creation",
             ));
         }
 
-        let rq_depth = entries.clamp(32, 256);
-
         Ok(Self {
             cq,
             _notify_overlapped: notify_overlapped,
+            dispatch,
+        })
+    }
+
+    #[inline]
+    fn env<'a>(&'a self, registrar: &'a dyn veloq_buf::BufferRegistrar) -> RioEnv<'a> {
+        RioEnv {
+            registrar,
+            dispatch: &self.dispatch,
+            cq: self.cq,
+        }
+    }
+
+    #[inline]
+    fn dequeue(&self, results: *mut RIORESULT, len: u32) -> u32 {
+        unsafe { (self.dispatch.dequeue)(self.cq, results, len) }
+    }
+
+    #[inline]
+    fn rearm_notify(&self) -> io::Result<()> {
+        let ret = unsafe { (self.dispatch.notify)(self.cq) };
+        if ret == SOCKET_ERROR {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                RioState::last_wsa_error(),
+                "RIONotify failed when rearming CQ",
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn submit_receive(
+        &self,
+        rq: RIO_RQ,
+        buf: &RIO_BUF,
+        request_context: *const std::ffi::c_void,
+    ) -> i32 {
+        unsafe { (self.dispatch.receive)(rq, buf, 1, 0, request_context) }
+    }
+
+    #[inline]
+    fn submit_send(
+        &self,
+        rq: RIO_RQ,
+        buf: &RIO_BUF,
+        request_context: *const std::ffi::c_void,
+    ) -> i32 {
+        unsafe { (self.dispatch.send)(rq, buf, 1, 0, request_context) }
+    }
+
+    #[inline]
+    fn submit_send_ex(
+        &self,
+        rq: RIO_RQ,
+        data_buf: &RIO_BUF,
+        addr_buf: &RIO_BUF,
+        request_context: *const std::ffi::c_void,
+    ) -> i32 {
+        unsafe {
+            (self.dispatch.send_ex)(
+                rq,
+                data_buf,
+                1,
+                std::ptr::null(),
+                addr_buf,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                request_context,
+            )
+        }
+    }
+
+    #[inline]
+    fn submit_receive_ex(
+        &self,
+        rq: RIO_RQ,
+        data_buf: &RIO_BUF,
+        addr_buf: &RIO_BUF,
+        request_context: *const std::ffi::c_void,
+    ) -> i32 {
+        unsafe {
+            (self.dispatch.receive_ex)(
+                rq,
+                data_buf,
+                1,
+                std::ptr::null(),
+                addr_buf,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                request_context,
+            )
+        }
+    }
+
+    #[inline]
+    fn close(&mut self) {
+        if self.cq != 0 {
+            unsafe { (self.dispatch.close_cq)(self.cq) };
+            self.cq = 0;
+        }
+    }
+}
+
+struct RioCompletionRouter<'a> {
+    ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
+    registry: &'a mut RioRegistry,
+    pool_manager: &'a mut UdpPoolManager,
+    env: RioEnv<'a>,
+    outstanding_count: &'a mut usize,
+    completed_count: usize,
+}
+
+impl<'a> RioCompletionRouter<'a> {
+    fn new(
+        ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
+        registry: &'a mut RioRegistry,
+        pool_manager: &'a mut UdpPoolManager,
+        env: RioEnv<'a>,
+        outstanding_count: &'a mut usize,
+    ) -> Self {
+        Self {
+            ops,
+            registry,
+            pool_manager,
+            env,
+            outstanding_count,
+            completed_count: 0,
+        }
+    }
+
+    fn handle_one(&mut self, res: &RIORESULT) {
+        let Some(kind) = RioState::decode_request_context(res.RequestContext) else {
+            return;
+        };
+
+        match kind {
+            RioCompletionKind::Pool { generation } => {
+                let mut ctx = RioContext {
+                    registry: self.registry,
+                    env: self.env,
+                };
+                let (drained_handle, pool_submissions) =
+                    self.pool_manager
+                        .handle_completion(self.ops, (res, generation), &mut ctx);
+                if let Some(h) = drained_handle {
+                    self.registry.rio_rqs.remove(&h);
+                }
+                *self.outstanding_count -= 1;
+                *self.outstanding_count += pool_submissions;
+                self.completed_count += 1;
+            }
+            RioCompletionKind::Op {
+                user_data,
+                generation,
+            } => {
+                if user_data >= self.ops.local.len() {
+                    return;
+                }
+
+                let op = &mut self.ops.local[user_data];
+                let slot = &self.ops.shared.slots[user_data];
+                if op.platform_data.generation != generation {
+                    return;
+                }
+
+                if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                    let result = if res.Status == 0 {
+                        Ok(res.BytesTransferred as usize)
+                    } else {
+                        Err(io::Error::from_raw_os_error(res.Status))
+                    };
+                    op.platform_data.lifecycle = OpLifecycle::Completed(result);
+
+                    let result_for_slot = if res.Status == 0 {
+                        Ok(res.BytesTransferred as usize)
+                    } else {
+                        Err(io::Error::from_raw_os_error(res.Status))
+                    };
+                    unsafe { *slot.result.get() = Some(result_for_slot) };
+                    slot.state.store(STATE_COMPLETED, Ordering::Release);
+                    slot.waker.wake();
+                } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
+                    if op.platform_data.rio_needs_drain {
+                        op.platform_data.rio_drained = true;
+                        if slot.state.load(Ordering::Acquire) == STATE_CONSUMED {
+                            let _ = std::mem::take(&mut op.platform_data);
+                            self.ops.free_indices.push(user_data);
+                        }
+                    } else {
+                        let _ = std::mem::take(&mut op.platform_data);
+                        self.ops.free_indices.push(user_data);
+                    }
+                }
+
+                *self.outstanding_count -= 1;
+                self.completed_count += 1;
+            }
+        }
+    }
+}
+
+impl RioState {
+    #[inline]
+    fn encode_request_context(overlapped: *mut OVERLAPPED) -> *const std::ffi::c_void {
+        overlapped as *const std::ffi::c_void
+    }
+
+    #[inline]
+    fn decode_request_context(ctx: u64) -> Option<RioCompletionKind> {
+        if ctx == 0 {
+            return None;
+        }
+        let raw = ctx as usize;
+        if (raw & POOL_CTX_TAG) == POOL_CTX_TAG {
+            let token = (raw >> 1) as u32;
+            if token == 0 {
+                return None;
+            }
+            return Some(RioCompletionKind::Pool { generation: token });
+        }
+        let entry = ctx as usize as *const OverlappedEntry;
+        let user_data = unsafe { (*entry).user_data };
+        let generation = unsafe { (*entry).generation };
+        Some(RioCompletionKind::Op {
+            user_data,
+            generation,
+        })
+    }
+
+    #[inline]
+    fn decode_pool_context(ctx: u64) -> Option<u32> {
+        if ctx == 0 {
+            return None;
+        }
+        let raw = ctx as usize;
+        if (raw & POOL_CTX_TAG) != POOL_CTX_TAG {
+            return None;
+        }
+        let token = (raw >> 1) as u32;
+        if token == 0 {
+            return None;
+        }
+        Some(token)
+    }
+
+    fn last_wsa_error() -> io::Error {
+        io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    #[inline]
+    fn build_ctx<'a>(registry: &'a mut RioRegistry, env: RioEnv<'a>) -> RioContext<'a> {
+        RioContext { registry, env }
+    }
+
+    pub fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
+        let kernel = RioKernel::from_extensions(port, entries, ext)?;
+
+        let rq_depth = entries.clamp(32, 256);
+
+        Ok(Self {
+            kernel,
             registry: RioRegistry::new(rq_depth),
             pool_manager: UdpPoolManager::new(),
-            dispatch,
             outstanding_count: 0,
         })
     }
@@ -278,24 +505,13 @@ impl RioState {
     }
 
     pub fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
-        let env = RioEnv {
-            registrar: &veloq_buf::NoopRegistrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
+        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
         self.registry.register_chunk(id, (ptr, len), env)
     }
 
     pub fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
-        let env = RioEnv {
-            registrar: &veloq_buf::NoopRegistrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let mut ctx = RioContext {
-            registry: &mut self.registry,
-            env,
-        };
+        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+        let mut ctx = Self::build_ctx(&mut self.registry, env);
         self.pool_manager
             .begin_udp_pool_shutdown_for_handle(handle, &mut ctx);
         // If pool was fully drained, also remove the stale RQ mapping.
@@ -310,15 +526,8 @@ impl RioState {
         uid: (usize, u32),
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) {
-        let env = RioEnv {
-            registrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let mut ctx = RioContext {
-            registry: &mut self.registry,
-            env,
-        };
+        let env = self.kernel.env(registrar);
+        let mut ctx = Self::build_ctx(&mut self.registry, env);
         self.pool_manager
             .cancel_udp_recv_waiter(handle, uid, &mut ctx);
     }
@@ -328,14 +537,21 @@ impl RioState {
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<usize> {
-        let mut completed_count = 0;
-        let dequeue_fn = self.dispatch.dequeue;
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
+        let env = self.kernel.env(registrar);
+        let mut router = RioCompletionRouter::new(
+            ops,
+            &mut self.registry,
+            &mut self.pool_manager,
+            env,
+            &mut self.outstanding_count,
+        );
 
         loop {
-            let count =
-                unsafe { dequeue_fn(self.cq, results.as_mut_ptr(), MAX_RIO_RESULTS as u32) };
+            let count = self
+                .kernel
+                .dequeue(results.as_mut_ptr(), MAX_RIO_RESULTS as u32);
 
             if count == RIO_CORRUPT_CQ {
                 return Err(io_msg(
@@ -348,74 +564,7 @@ impl RioState {
             }
 
             for res in results.iter().take(count as usize) {
-                let Some((user_data, completion_generation)) =
-                    Self::decode_request_context(res.RequestContext)
-                else {
-                    continue;
-                };
-
-                if user_data == UDP_POOL_USER_DATA {
-                    let env = RioEnv {
-                        registrar,
-                        dispatch: &self.dispatch,
-                        cq: self.cq,
-                    };
-                    let mut ctx = RioContext {
-                        registry: &mut self.registry,
-                        env,
-                    };
-                    let (drained_handle, pool_submissions) = self.pool_manager.handle_completion(
-                        ops,
-                        (res, completion_generation),
-                        &mut ctx,
-                    );
-                    if let Some(h) = drained_handle {
-                        self.registry.rio_rqs.remove(&h);
-                    }
-                    self.outstanding_count -= 1;
-                    self.outstanding_count += pool_submissions;
-                    completed_count += 1;
-                    continue;
-                }
-
-                if user_data < ops.local.len() {
-                    let op = &mut ops.local[user_data];
-                    let slot = &ops.shared.slots[user_data];
-                    if op.platform_data.generation != completion_generation {
-                        continue;
-                    }
-
-                    if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                        let result = if res.Status == 0 {
-                            Ok(res.BytesTransferred as usize)
-                        } else {
-                            Err(io::Error::from_raw_os_error(res.Status))
-                        };
-                        op.platform_data.lifecycle = OpLifecycle::Completed(result);
-
-                        let result_for_slot = if res.Status == 0 {
-                            Ok(res.BytesTransferred as usize)
-                        } else {
-                            Err(io::Error::from_raw_os_error(res.Status))
-                        };
-                        unsafe { *slot.result.get() = Some(result_for_slot) };
-                        slot.state.store(STATE_COMPLETED, Ordering::Release);
-                        slot.waker.wake();
-                    } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
-                        if op.platform_data.rio_needs_drain {
-                            op.platform_data.rio_drained = true;
-                            if slot.state.load(Ordering::Acquire) == STATE_CONSUMED {
-                                let _ = std::mem::take(&mut op.platform_data);
-                                ops.free_indices.push(user_data);
-                            }
-                        } else {
-                            let _ = std::mem::take(&mut op.platform_data);
-                            ops.free_indices.push(user_data);
-                        }
-                    }
-                    self.outstanding_count -= 1;
-                    completed_count += 1;
-                }
+                router.handle_one(res);
             }
 
             if count < MAX_RIO_RESULTS as u32 {
@@ -423,16 +572,8 @@ impl RioState {
             }
         }
 
-        let notify_fn = self.dispatch.notify;
-        let ret = unsafe { notify_fn(self.cq) };
-        if ret == SOCKET_ERROR {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                "RIONotify failed when rearming CQ",
-            ));
-        }
-        Ok(completed_count)
+        self.kernel.rearm_notify()?;
+        Ok(router.completed_count)
     }
 
     pub fn try_submit_recv(
@@ -443,21 +584,12 @@ impl RioState {
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
         use crate::driver::iocp::submit::SubmissionResult;
         let (fd, handle, overlapped) = target;
-        let env = RioEnv {
-            registrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let (buffer_id, offset) = self.registry.resolve_buffer_id(buf, env)?;
-        let rq = self.registry.ensure_rq((handle, fd), env)?;
-
-        let rio_buf = RIO_BUF {
-            BufferId: buffer_id,
-            Offset: offset,
-            Length: buf.capacity() as u32,
-        };
+        let env = self.kernel.env(registrar);
+        let (rq, rio_buf) =
+            self.registry
+                .prepare_data_submission((fd, handle), buf, buf.capacity() as u32, env)?;
         let request_context = Self::encode_request_context(overlapped);
-        let ret = unsafe { (self.dispatch.receive)(rq, &rio_buf, 1, 0, request_context) };
+        let ret = self.kernel.submit_receive(rq, &rio_buf, request_context);
         if ret == 0 {
             return Err(io_error(
                 IocpErrorContext::Rio,
@@ -477,21 +609,12 @@ impl RioState {
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
         use crate::driver::iocp::submit::SubmissionResult;
         let (fd, handle, overlapped) = target;
-        let env = RioEnv {
-            registrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let (buffer_id, offset) = self.registry.resolve_buffer_id(buf, env)?;
-        let rq = self.registry.ensure_rq((handle, fd), env)?;
-
-        let rio_buf = RIO_BUF {
-            BufferId: buffer_id,
-            Offset: offset,
-            Length: buf.len() as u32,
-        };
+        let env = self.kernel.env(registrar);
+        let (rq, rio_buf) =
+            self.registry
+                .prepare_data_submission((fd, handle), buf, buf.len() as u32, env)?;
         let request_context = Self::encode_request_context(overlapped);
-        let ret = unsafe { (self.dispatch.send)(rq, &rio_buf, 1, 0, request_context) };
+        let ret = self.kernel.submit_send(rq, &rio_buf, request_context);
         if ret == 0 {
             return Err(io_error(
                 IocpErrorContext::Rio,
@@ -523,22 +646,12 @@ impl RioState {
             page_idx,
         } = args;
 
-        let env = RioEnv {
-            registrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let (buffer_id, data_offset) = self.registry.resolve_buffer_id(buf, env)?;
-        self.registry
-            .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
+        let env = self.kernel.env(registrar);
+        let (rq, data_buf) =
+            self.registry
+                .prepare_data_submission((fd, handle), buf, buf.len() as u32, env)?;
+        self.registry.ensure_slab_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
-        let rq = self.registry.ensure_rq((handle, fd), env)?;
-
-        let data_buf = RIO_BUF {
-            BufferId: buffer_id,
-            Offset: data_offset,
-            Length: buf.len() as u32,
-        };
 
         if addr_ptr.is_null() {
             return Err(io_msg(
@@ -598,19 +711,9 @@ impl RioState {
         };
         let request_context = Self::encode_request_context(overlapped);
 
-        let ret = unsafe {
-            (self.dispatch.send_ex)(
-                rq,
-                &data_buf,
-                1,
-                std::ptr::null(),
-                &addr_buf,
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                request_context,
-            )
-        };
+        let ret = self
+            .kernel
+            .submit_send_ex(rq, &data_buf, &addr_buf, request_context);
         if ret == 0 {
             return Err(io_error(
                 IocpErrorContext::Rio,
@@ -651,22 +754,13 @@ impl RioState {
             overlapped,
             page_idx,
         } = args;
-        let env = RioEnv {
-            registrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let (buffer_id, data_offset) = self.registry.resolve_buffer_id(buf, env)?;
+        let env = self.kernel.env(registrar);
+        let (rq, data_buf) =
+            self.registry
+                .prepare_data_submission((fd, handle), buf, buf.capacity() as u32, env)?;
         self.registry
             .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
-        let rq = self.registry.ensure_rq((handle, fd), env)?;
-
-        let data_buf = RIO_BUF {
-            BufferId: buffer_id,
-            Offset: data_offset,
-            Length: buf.capacity() as u32,
-        };
 
         let addr_addr = addr_ptr as usize;
         let slab_end = base_addr.saturating_add(slab_len);
@@ -699,19 +793,9 @@ impl RioState {
         };
         let request_context = Self::encode_request_context(overlapped);
 
-        let ret = unsafe {
-            (self.dispatch.receive_ex)(
-                rq,
-                &data_buf,
-                1,
-                std::ptr::null(),
-                &addr_buf,
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                request_context,
-            )
-        };
+        let ret = self
+            .kernel
+            .submit_receive_ex(rq, &data_buf, &addr_buf, request_context);
         if ret == 0 {
             return Err(io_error(
                 IocpErrorContext::Rio,
@@ -749,15 +833,8 @@ impl RioState {
             user_data,
             generation,
         } = args;
-        let env = RioEnv {
-            registrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let mut ctx = RioContext {
-            registry: &mut self.registry,
-            env,
-        };
+        let env = self.kernel.env(registrar);
+        let mut ctx = Self::build_ctx(&mut self.registry, env);
         let (res, pool_submissions) = self.pool_manager.try_submit_udp_recv_stream_pooled(
             (fd, handle),
             stream_op,
@@ -777,15 +854,8 @@ impl RioState {
         buf: FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
-        let env = RioEnv {
-            registrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let mut ctx = RioContext {
-            registry: &mut self.registry,
-            env,
-        };
+        let env = self.kernel.env(registrar);
+        let mut ctx = Self::build_ctx(&mut self.registry, env);
         let pool_submissions = self
             .pool_manager
             .try_refill_udp_pool(target, buf, &mut ctx)?;
@@ -808,15 +878,8 @@ impl RioState {
         ticks: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
-        let env = RioEnv {
-            registrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let mut ctx = RioContext {
-            registry: &mut self.registry,
-            env,
-        };
+        let env = self.kernel.env(registrar);
+        let mut ctx = Self::build_ctx(&mut self.registry, env);
         for _ in 0..ticks {
             self.pool_manager.rebalance_udp_pool(handle, &mut ctx)?;
         }
@@ -845,9 +908,9 @@ impl Drop for RioState {
 
             const MAX_RESULTS: usize = 128;
             let mut results: [RIORESULT; MAX_RESULTS] = unsafe { std::mem::zeroed() };
-            let count = unsafe {
-                (self.dispatch.dequeue)(self.cq, results.as_mut_ptr(), MAX_RESULTS as u32)
-            };
+            let count = self
+                .kernel
+                .dequeue(results.as_mut_ptr(), MAX_RESULTS as u32);
 
             if count == RIO_CORRUPT_CQ || count == 0 {
                 std::thread::yield_now();
@@ -856,15 +919,8 @@ impl Drop for RioState {
                     if let Some(completion_generation) =
                         Self::decode_pool_context(res.RequestContext)
                     {
-                        let env = RioEnv {
-                            registrar: &veloq_buf::NoopRegistrar,
-                            dispatch: &self.dispatch,
-                            cq: self.cq,
-                        };
-                        let mut ctx = RioContext {
-                            registry: &mut self.registry,
-                            env,
-                        };
+                        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+                        let mut ctx = Self::build_ctx(&mut self.registry, env);
                         if let Some(drained_handle) = self
                             .pool_manager
                             .handle_completion_drain_only((res, completion_generation), &mut ctx)
@@ -878,20 +934,13 @@ impl Drop for RioState {
         }
 
         self.pool_manager.udp_ctx_map.clear();
-        let env = RioEnv {
-            registrar: &veloq_buf::NoopRegistrar,
-            dispatch: &self.dispatch,
-            cq: self.cq,
-        };
-        let mut ctx = RioContext {
-            registry: &mut self.registry,
-            env,
-        };
+        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+        let mut ctx = Self::build_ctx(&mut self.registry, env);
         self.pool_manager
             .forget_in_flight_and_deregister_rest(&mut ctx);
+        let _ = ctx;
+        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
         self.registry.cleanup_deregister(env);
-        if self.cq != 0 {
-            unsafe { (self.dispatch.close_cq)(self.cq) };
-        }
+        self.kernel.close();
     }
 }
