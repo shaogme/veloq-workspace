@@ -485,8 +485,7 @@ impl IocpDriver {
                         if op.platform_data.rio_pool_waiting {
                             self.rio_state.cancel_udp_recv_waiter(
                                 handle,
-                                user_data,
-                                op.platform_data.generation,
+                                (user_data, op.platform_data.generation),
                                 &*self.registrar,
                             );
                             op.platform_data.rio_pool_waiting = false;

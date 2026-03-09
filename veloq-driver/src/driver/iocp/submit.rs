@@ -251,7 +251,11 @@ pub(crate) unsafe fn submit_recv(
 
     // RIO path is mandatory for socket recv.
     ctx.rio
-        .try_submit_recv(val.fd, handle, &mut val.buf, ctx.overlapped, ctx.registrar)
+        .try_submit_recv(
+            (val.fd, handle, ctx.overlapped),
+            &mut val.buf,
+            ctx.registrar,
+        )
         .map_err(|e| {
             io_error(
                 IocpErrorContext::Submission,
@@ -279,7 +283,7 @@ pub(crate) unsafe fn submit_send(
 
     // RIO path is mandatory for socket send.
     ctx.rio
-        .try_submit_send(val.fd, handle, &val.buf, ctx.overlapped, ctx.registrar)
+        .try_submit_send((val.fd, handle, ctx.overlapped), &val.buf, ctx.registrar)
         .map_err(|e| {
             io_error(
                 IocpErrorContext::Submission,
@@ -570,18 +574,17 @@ pub(crate) unsafe fn submit_send_to(
 
     // RIO path is mandatory for socket send_to.
     let page_idx = op.header.user_data / ctx.slots_per_page;
+    let args = crate::driver::iocp::rio::RioSendToArgs {
+        fd: payload.op.fd,
+        handle,
+        buf: &payload.op.buf,
+        addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
+        addr_len: payload.addr_len,
+        overlapped: ctx.overlapped,
+        page_idx,
+    };
     ctx.rio
-        .try_submit_send_to(
-            payload.op.fd,
-            handle,
-            &payload.op.buf,
-            &payload.addr as *const _ as *const std::ffi::c_void,
-            payload.addr_len,
-            ctx.overlapped,
-            page_idx,
-            ctx.registrar,
-            ctx.slab_resolver,
-        )
+        .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
         .map_err(|e| {
             io_error(
                 IocpErrorContext::Submission,
@@ -607,16 +610,15 @@ pub(crate) unsafe fn submit_udp_recv_stream(
 ) -> io::Result<SubmissionResult> {
     let val = unsafe { &mut *op.payload.udp_recv_stream };
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let args = crate::driver::iocp::rio::RioUdpStreamArgs {
+        fd: val.fd,
+        handle,
+        stream_op: val,
+        user_data: op.header.user_data,
+        generation: op.header.generation,
+    };
     ctx.rio
-        .try_submit_udp_recv_stream_pooled(
-            val.fd,
-            handle,
-            val,
-            op.header.user_data,
-            op.header.generation,
-            ctx.registrar,
-            ctx.overlapped,
-        )
+        .try_submit_udp_recv_stream_pooled(args, ctx.registrar)
         .map_err(|e| {
             io_error(
                 IocpErrorContext::Submission,
@@ -658,7 +660,7 @@ pub(crate) unsafe fn submit_udp_refill(
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
     if let Some(buf) = val.buf.take() {
         ctx.rio
-            .try_refill_udp_pool(val.fd, handle, buf, ctx.registrar)?;
+            .try_refill_udp_pool((val.fd, handle), buf, ctx.registrar)?;
     }
 
     // Refill is not an async IO op that completes via IOCP,

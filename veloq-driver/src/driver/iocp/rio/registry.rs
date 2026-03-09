@@ -94,8 +94,7 @@ impl RioRegistry {
         {
             self.register_chunk(
                 info.id,
-                chunk_info.ptr.as_ptr(),
-                chunk_info.len.get(),
+                (chunk_info.ptr.as_ptr(), chunk_info.len.get()),
                 dispatch,
             )?;
             buffer_id = Some(self.chunk_registry[info.id as usize]);
@@ -125,10 +124,10 @@ impl RioRegistry {
     pub fn register_chunk(
         &mut self,
         id: u16,
-        ptr: *const u8,
-        len: usize,
+        mem: (*const u8, usize),
         dispatch: &RioDispatch,
     ) -> io::Result<()> {
+        let (ptr, len) = mem;
         let reg_fn = dispatch.register_buffer;
         let id_idx = id as usize;
 
@@ -191,11 +190,11 @@ impl RioRegistry {
 
     pub fn ensure_rq(
         &mut self,
-        handle: HANDLE,
-        fd: IoFd,
+        target: (HANDLE, IoFd),
         cq: RIO_CQ,
         dispatch: &RioDispatch,
     ) -> io::Result<RIO_RQ> {
+        let (handle, fd) = target;
         // fast path for registered files
         if let IoFd::Fixed(idx) = fd {
             let idx = idx as usize;

@@ -98,8 +98,7 @@ impl Driver for IocpDriver {
 
             let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
             let is_rio_pool_waiting = unsafe {
-                op_ref.vtable.as_ref().submit as *const () as usize
-                    == crate::driver::iocp::submit::submit_udp_recv_stream as *const () as usize
+                std::ptr::eq(op_ref.vtable.as_ref().submit as *const (), crate::driver::iocp::submit::submit_udp_recv_stream as *const ())
             };
 
             match result {
