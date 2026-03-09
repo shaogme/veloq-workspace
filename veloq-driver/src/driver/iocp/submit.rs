@@ -143,7 +143,20 @@ macro_rules! submit_io_op {
             let handle = resolve_fd(val.fd, ctx.registered_files)?;
             let port = unsafe { CreateIoCompletionPort(handle, ctx.port, 0, 0) };
             if port.is_null() {
-                return Err(io::Error::last_os_error());
+                return Err(io_error(
+                    IocpErrorContext::Submission,
+                    io::Error::last_os_error(),
+                    format!(
+                        "{}: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
+                        stringify!($fn_name),
+                        val.fd,
+                        handle,
+                        op.header.user_data,
+                        op.header.generation,
+                        val.offset,
+                        val.buf.len()
+                    ),
+                ));
             }
 
             let mut bytes = 0;
@@ -164,7 +177,20 @@ macro_rules! submit_io_op {
             if ret == 0 {
                 let err = unsafe { GetLastError() };
                 if err != ERROR_IO_PENDING {
-                    return Err(io::Error::from_raw_os_error(err as i32));
+                    return Err(io_error(
+                        IocpErrorContext::Submission,
+                        io::Error::from_raw_os_error(err as i32),
+                        format!(
+                            "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
+                            stringify!($fn_name),
+                            val.fd,
+                            handle,
+                            op.header.user_data,
+                            op.header.generation,
+                            val.offset,
+                            val.buf.len()
+                        ),
+                    ));
                 }
             }
             Ok(SubmissionResult::Pending)

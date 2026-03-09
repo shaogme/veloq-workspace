@@ -18,6 +18,7 @@ pub struct CompletionInfo {
 pub struct OverlappedEntry {
     pub inner: OVERLAPPED,
     pub user_data: usize,
+    pub generation: u32,
     pub blocking_result: Option<io::Result<usize>>,
 }
 
