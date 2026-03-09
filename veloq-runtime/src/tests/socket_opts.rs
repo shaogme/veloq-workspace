@@ -82,7 +82,7 @@ fn test_udp_socket_options() {
             .set_reuse_address(true)
             .expect("Failed to set reuseaddr");
 
-        let socket = builder.bind("127.0.0.1:0").expect("Failed to bind UDP");
+        let socket = Arc::new(builder.bind("127.0.0.1:0").expect("Failed to bind UDP"));
         let addr = socket.local_addr().expect("Failed to get local addr");
         println!("UDP bound to: {}", addr);
 
@@ -91,22 +91,33 @@ fn test_udp_socket_options() {
         let client = builder2
             .bind("127.0.0.1:0")
             .expect("Failed to bind UDP client");
+        let client_addr = client
+            .local_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+
+        // RIO UDP requires recv to be posted before send to avoid packet drop.
+        let socket_clone = socket.clone();
+        let recv_h = crate::runtime::context::spawn(async move {
+            let buf = crate::runtime::context::alloc(nz!(1024));
+            let (res, _) = timeout(Duration::from_secs(5), socket_clone.recv_from(buf))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "UDP socket options test timeout: phase=recv_from; bound_addr={}; client_bound_addr={}; timeout_ms={}",
+                        addr,
+                        client_addr,
+                        5000
+                    )
+                });
+            res.expect("Failed to recv");
+        });
+
+        crate::runtime::context::yield_now().await;
 
         let buf = crate::runtime::context::alloc(nz!(1024));
         let (res, _) = client.send_to(buf, addr).await;
         res.expect("Failed to send");
 
-        let buf = crate::runtime::context::alloc(nz!(1024));
-        let (res, _) = timeout(Duration::from_secs(5), socket.recv_from(buf))
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "UDP socket options test timeout: phase=recv_from; bound_addr={}; client_bound_addr={}; timeout_ms={}",
-                    addr,
-                    client.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
-                    5000
-                )
-            });
-        res.expect("Failed to recv");
+        recv_h.await;
     });
 }

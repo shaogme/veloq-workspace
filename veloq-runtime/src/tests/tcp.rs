@@ -4,9 +4,11 @@ use veloq_buf::nz;
 
 use crate::net::tcp::{TcpListener, TcpStream};
 use crate::runtime::Runtime;
+use crate::time::timeout;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 // ============ Helper Functions ============
 
@@ -438,17 +440,15 @@ fn test_multithread_tcp_connections() {
         .build()
         .unwrap();
 
-    let (tx, mut rx) = crate::sync::mpsc::unbounded();
-
     let connection_count_for_block = connection_count.clone();
 
     runtime.block_on(async move {
+        let mut worker_handles = Vec::with_capacity(NUM_WORKERS);
         // We will spawn a task for each worker pinned to that worker
         for worker_id in 0..NUM_WORKERS {
             let counter = connection_count_for_block.clone();
-            let tx_done = tx.clone();
 
-            crate::runtime::context::spawn(async move {
+            let handle = crate::runtime::context::spawn(async move {
                 let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
                 let listen_addr = listener.local_addr().expect("Failed to get local address");
                 println!("Worker {} listening on {}", worker_id, listen_addr);
@@ -473,13 +473,21 @@ fn test_multithread_tcp_connections() {
                 drop(stream);
 
                 counter.fetch_add(1, Ordering::SeqCst);
-                tx_done.send(()).unwrap();
             });
+            worker_handles.push((worker_id, handle));
         }
 
-        // Wait for all 3
-        for _ in 0..NUM_WORKERS {
-            rx.recv().await.unwrap();
+        for (worker_id, handle) in worker_handles {
+            timeout(Duration::from_secs(5), async move { handle.await })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "TCP multithread connections timeout: phase=wait_worker_join; worker_id={}; current_done={}; timeout_ms={}",
+                        worker_id,
+                        connection_count_for_block.load(Ordering::SeqCst),
+                        5000
+                    )
+                });
         }
     });
 
@@ -499,13 +507,11 @@ fn test_multithread_tcp_echo() {
                 .build()
                 .unwrap();
 
-            let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
-
             runtime.block_on(async move {
                 let addr_tx = addr_tx.clone(); // Move into task
 
                 // Worker 0: Echo server
-                crate::runtime::context::spawn_to(0, async move || {
+                let server_h = crate::runtime::context::spawn_to(0, async move || {
                     let listener =
                         TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
                     let listen_addr = listener.local_addr().expect("Failed to get local address");
@@ -531,10 +537,17 @@ fn test_multithread_tcp_echo() {
                 });
 
                 // Worker 1: Client
-                let done_tx = done_tx.clone();
-                crate::runtime::context::spawn_to(1, async move || {
+                let client_h = crate::runtime::context::spawn_to(1, async move || {
                     // Wait for server address
-                    let listen_addr = addr_rx.recv().await.expect("Channel closed");
+                    let listen_addr = timeout(Duration::from_secs(5), addr_rx.recv())
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "TCP echo timeout: phase=wait_server_addr; timeout_ms={}",
+                                5000
+                            )
+                        })
+                        .expect("Channel closed");
 
                     let stream = TcpStream::connect(listen_addr)
                         .await
@@ -555,12 +568,18 @@ fn test_multithread_tcp_echo() {
 
                     assert_eq!(&recv_buf.as_slice()[..data.len()], data);
                     println!("Client received correct echo");
-
-                    done_tx.send(()).unwrap();
                 });
 
-                // Wait for client to finish
-                done_rx.recv().await.unwrap();
+                timeout(Duration::from_secs(5), async move { client_h.await })
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("TCP echo timeout: phase=wait_client_join; timeout_ms={}", 5000)
+                    });
+                timeout(Duration::from_secs(5), async move { server_h.await })
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("TCP echo timeout: phase=wait_server_join; timeout_ms={}", 5000)
+                    });
             });
 
             println!("Multi-thread echo test completed");
@@ -574,7 +593,6 @@ fn test_multithread_tcp_echo() {
 #[test]
 fn test_multithread_concurrent_clients() {
     use std::sync::mpsc;
-    use std::time::Duration;
 
     let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
     let addr_rx = Arc::new(Mutex::new(addr_rx));
@@ -588,13 +606,11 @@ fn test_multithread_concurrent_clients() {
         .build()
         .unwrap();
 
-    let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
-
     let connection_count_clone = connection_count.clone();
     runtime.block_on(async move {
         // Server worker (0)
         let addr_tx = addr_tx.clone();
-        crate::runtime::context::spawn_to(0, async move || {
+        let server_h = crate::runtime::context::spawn_to(0, async move || {
             let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
             let listen_addr = listener.local_addr().expect("Failed to get local address");
 
@@ -615,12 +631,12 @@ fn test_multithread_concurrent_clients() {
 
         // Client workers (1..=3)
         let connection_count_clone = connection_count_clone.clone();
+        let mut client_handles = Vec::with_capacity(NUM_CLIENTS);
         for client_id in 1..=NUM_CLIENTS {
             let rx = addr_rx.clone();
             let counter = connection_count_clone.clone();
-            let done_tx = done_tx.clone();
 
-            crate::runtime::context::spawn_to(client_id, async move || {
+            let handle = crate::runtime::context::spawn_to(client_id, async move || {
                 let listen_addr = {
                     rx.lock()
                         .unwrap()
@@ -636,14 +652,33 @@ fn test_multithread_concurrent_clients() {
                 drop(stream);
 
                 counter.fetch_add(1, Ordering::SeqCst);
-                done_tx.send(()).unwrap();
             });
+            client_handles.push((client_id, handle));
         }
 
-        // Wait for all clients
-        for _ in 0..NUM_CLIENTS {
-            done_rx.recv().await.unwrap();
+        for (client_id, handle) in client_handles {
+            timeout(Duration::from_secs(5), async move { handle.await })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "TCP concurrent clients timeout: phase=wait_client_join; client_id={}; current_done={}; timeout_ms={}",
+                        client_id,
+                        connection_count_clone.load(Ordering::SeqCst),
+                        5000
+                    )
+                });
         }
+
+        timeout(Duration::from_secs(5), async move { server_h.await })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "TCP concurrent clients timeout: phase=wait_server_join; expected_clients={}; current_done={}; timeout_ms={}",
+                    NUM_CLIENTS,
+                    connection_count_clone.load(Ordering::SeqCst),
+                    5000
+                )
+            });
     });
 
     assert_eq!(connection_count.load(Ordering::SeqCst), NUM_CLIENTS);
