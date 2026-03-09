@@ -274,8 +274,15 @@ fn test_listener_local_addr() {
 fn test_tcp_connect_refused() {
     crate::tests::NetworkTestRunner::new("test_tcp_connect_refused")
         .worker_threads(1)
+        .buffer_sizes(vec![veloq_buf::nz!(8192)])
         .run(|_| async move {
-            let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
+            // Reserve an ephemeral local port then close it immediately.
+            // Connecting to this now-closed port should fail fast with connection refused.
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let addr = listener
+                .local_addr()
+                .expect("Failed to get listener address");
+            drop(listener);
 
             let result = TcpStream::connect(addr).await;
 
