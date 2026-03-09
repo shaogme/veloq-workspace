@@ -6,7 +6,7 @@ use crate::driver::iocp::submit::SubmissionResult;
 use crate::driver::iocp::{IocpOp, IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
 use crate::driver::slot::STATE_COMPLETED;
-use crate::op::UdpRecvStream;
+use crate::op::{IoFd, UdpRecvStream};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::io;
@@ -363,13 +363,14 @@ impl UdpPoolManager {
 
     pub fn ensure_udp_recv_pool(
         &mut self,
-        target: (HANDLE, RIO_RQ),
+        target: (IoFd, HANDLE),
         ctx: &mut RioContext,
     ) -> io::Result<usize> {
-        let (handle, rq) = target;
+        let (fd, handle) = target;
         if self.udp_recv_pools.contains_key(&handle) {
             return Ok(0);
         }
+        let rq = ctx.registry.ensure_rq((handle, fd), ctx.env)?;
         let min = UDP_RECV_POOL_MIN_CREDITS;
         let max = UDP_RECV_POOL_MAX_CREDITS.max(min);
         let initial = UDP_RECV_POOL_INITIAL_CREDITS.clamp(min, max);
@@ -487,14 +488,14 @@ impl UdpPoolManager {
     #[allow(clippy::too_many_arguments)]
     pub fn try_submit_udp_recv_stream_pooled(
         &mut self,
-        target: (HANDLE, RIO_RQ),
+        target: (IoFd, HANDLE),
         stream_op: &mut crate::op::UdpRecvStream,
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> io::Result<(SubmissionResult, usize)> {
-        let (handle, rq) = target;
+        let (fd, handle) = target;
         let (user_data, generation) = uid;
-        let mut total_submissions = self.ensure_udp_recv_pool((handle, rq), ctx)?;
+        let mut total_submissions = self.ensure_udp_recv_pool((fd, handle), ctx)?;
         {
             let pool = self
                 .udp_recv_pools
@@ -519,12 +520,12 @@ impl UdpPoolManager {
 
     pub fn try_refill_udp_pool(
         &mut self,
-        target: (HANDLE, RIO_RQ),
+        target: (IoFd, HANDLE),
         buf: FixedBuf,
         ctx: &mut RioContext,
     ) -> io::Result<usize> {
-        let (handle, rq) = target;
-        let mut total_submissions = self.ensure_udp_recv_pool((handle, rq), ctx)?;
+        let (fd, handle) = target;
+        let mut total_submissions = self.ensure_udp_recv_pool((fd, handle), ctx)?;
         let pool = self.udp_recv_pools.get_mut(&handle).unwrap();
 
         pool.spare_bufs.push_back(buf);

@@ -25,6 +25,7 @@ use self::registry::RioRegistry;
 pub struct RioEnv<'a> {
     pub registrar: &'a dyn veloq_buf::BufferRegistrar,
     pub dispatch: &'a RioDispatch,
+    pub cq: RIO_CQ,
 }
 
 pub struct RioContext<'a> {
@@ -280,6 +281,7 @@ impl RioState {
         let env = RioEnv {
             registrar: &veloq_buf::NoopRegistrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
         self.registry.register_chunk(id, (ptr, len), env)
     }
@@ -288,6 +290,7 @@ impl RioState {
         let env = RioEnv {
             registrar: &veloq_buf::NoopRegistrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
         let mut ctx = RioContext {
             registry: &mut self.registry,
@@ -310,6 +313,7 @@ impl RioState {
         let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
         let mut ctx = RioContext {
             registry: &mut self.registry,
@@ -354,6 +358,7 @@ impl RioState {
                     let env = RioEnv {
                         registrar,
                         dispatch: &self.dispatch,
+                        cq: self.cq,
                     };
                     let mut ctx = RioContext {
                         registry: &mut self.registry,
@@ -441,9 +446,10 @@ impl RioState {
         let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
         let (buffer_id, offset) = self.registry.resolve_buffer_id(buf, env)?;
-        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
+        let rq = self.registry.ensure_rq((handle, fd), env)?;
 
         let rio_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -474,9 +480,10 @@ impl RioState {
         let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
         let (buffer_id, offset) = self.registry.resolve_buffer_id(buf, env)?;
-        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
+        let rq = self.registry.ensure_rq((handle, fd), env)?;
 
         let rio_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -519,12 +526,13 @@ impl RioState {
         let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
         let (buffer_id, data_offset) = self.registry.resolve_buffer_id(buf, env)?;
         self.registry
             .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
-        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
+        let rq = self.registry.ensure_rq((handle, fd), env)?;
 
         let data_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -646,12 +654,13 @@ impl RioState {
         let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
         let (buffer_id, data_offset) = self.registry.resolve_buffer_id(buf, env)?;
         self.registry
             .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
-        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
+        let rq = self.registry.ensure_rq((handle, fd), env)?;
 
         let data_buf = RIO_BUF {
             BufferId: buffer_id,
@@ -743,14 +752,14 @@ impl RioState {
         let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
-        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
         let mut ctx = RioContext {
             registry: &mut self.registry,
             env,
         };
         let (res, pool_submissions) = self.pool_manager.try_submit_udp_recv_stream_pooled(
-            (handle, rq),
+            (fd, handle),
             stream_op,
             (user_data, generation),
             &mut ctx,
@@ -768,19 +777,18 @@ impl RioState {
         buf: FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
-        let (fd, handle) = target;
         let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
-        let rq = self.registry.ensure_rq((handle, fd), self.cq, env)?;
         let mut ctx = RioContext {
             registry: &mut self.registry,
             env,
         };
-        let pool_submissions =
-            self.pool_manager
-                .try_refill_udp_pool((handle, rq), buf, &mut ctx)?;
+        let pool_submissions = self
+            .pool_manager
+            .try_refill_udp_pool(target, buf, &mut ctx)?;
         self.outstanding_count += pool_submissions;
         Ok(())
     }
@@ -803,6 +811,7 @@ impl RioState {
         let env = RioEnv {
             registrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
         let mut ctx = RioContext {
             registry: &mut self.registry,
@@ -864,6 +873,7 @@ impl Drop for RioState {
         let env = RioEnv {
             registrar: &veloq_buf::NoopRegistrar,
             dispatch: &self.dispatch,
+            cq: self.cq,
         };
         let mut ctx = RioContext {
             registry: &mut self.registry,

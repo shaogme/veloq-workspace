@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use std::io;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::{RIO_BUFFERID, RIO_CQ, RIO_RQ, WSAGetLastError};
+use windows_sys::Win32::Networking::WinSock::{RIO_BUFFERID, RIO_RQ, WSAGetLastError};
 
 pub const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0 as RIO_BUFFERID;
 
@@ -187,12 +187,7 @@ impl RioRegistry {
         Ok(())
     }
 
-    pub fn ensure_rq(
-        &mut self,
-        target: (HANDLE, IoFd),
-        cq: RIO_CQ,
-        env: RioEnv<'_>,
-    ) -> io::Result<RIO_RQ> {
+    pub fn ensure_rq(&mut self, target: (HANDLE, IoFd), env: RioEnv<'_>) -> io::Result<RIO_RQ> {
         let (handle, fd) = target;
         // fast path for registered files
         if let IoFd::Fixed(idx) = fd {
@@ -219,8 +214,8 @@ impl RioRegistry {
                 1,
                 max_outstanding_sends,
                 1,
-                cq,
-                cq,
+                env.cq,
+                env.cq,
                 std::ptr::null_mut(),
             )
         };
