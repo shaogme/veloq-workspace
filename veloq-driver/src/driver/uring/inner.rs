@@ -196,8 +196,7 @@ impl UringDriver {
                             // --- Lazy Registration ---
                             let mut chunks = [0u16; 4];
                             let count = (vtable.resolve_chunks)(res, &mut chunks);
-                            for i in 0..count {
-                                let chunk_id = chunks[i];
+                            for &chunk_id in chunks.iter().take(count) {
                                 let index = chunk_id as usize;
                                 // Explicitly handle bitset error
                                 let is_registered =
@@ -208,15 +207,14 @@ impl UringDriver {
                                         ))
                                     })?;
 
-                                if !is_registered {
-                                    if let Some(info) = self.registrar.resolve_chunk_info(chunk_id)
-                                    {
-                                        self.register_chunk(
-                                            info.id,
-                                            info.ptr.as_ptr(),
-                                            info.len.get(),
-                                        )?;
-                                    }
+                                if !is_registered
+                                    && let Some(info) = self.registrar.resolve_chunk_info(chunk_id)
+                                {
+                                    self.register_chunk(
+                                        info.id,
+                                        info.ptr.as_ptr(),
+                                        info.len.get(),
+                                    )?;
                                 }
                             }
                             // -------------------------

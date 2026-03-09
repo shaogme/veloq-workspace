@@ -317,9 +317,7 @@ impl UdpPoolManager {
                         if s.addr_buf_id != RIO_INVALID_BUFFERID {
                             unsafe { (ctx.env.dispatch.deregister_buffer)(s.addr_buf_id) };
                         }
-                        if is_running
-                            && let Some(pool) = self.pool.as_mut()
-                        {
+                        if is_running && let Some(pool) = self.pool.as_mut() {
                             pool.spare_bufs.push_front(buf);
                         }
                     }
@@ -335,7 +333,9 @@ impl UdpPoolManager {
                 let Some(pool) = self.pool.as_mut() else {
                     return;
                 };
-                if matches!(pool.state, UdpPoolState::Running) && pool.slots.len() <= pool.target_credits {
+                if matches!(pool.state, UdpPoolState::Running)
+                    && pool.slots.len() <= pool.target_credits
+                {
                     return;
                 }
                 if pool.slots.last().is_some_and(|slot| slot.in_flight) {
@@ -393,7 +393,12 @@ impl UdpPoolManager {
         Ok(submissions)
     }
 
-    fn ensure_udp_recv_pool(&mut self, rq: RIO_RQ, actor_id: u32, ctx: &mut RioContext) -> io::Result<usize> {
+    fn ensure_udp_recv_pool(
+        &mut self,
+        rq: RIO_RQ,
+        actor_id: u32,
+        ctx: &mut RioContext,
+    ) -> io::Result<usize> {
         if self.pool.is_some() {
             return Ok(0);
         }
@@ -478,10 +483,7 @@ impl UdpPoolManager {
         }
     }
 
-    fn dispatch_udp_waiters(
-        &mut self,
-        ops: &mut OpRegistry<IocpOp, IocpOpState>,
-    ) {
+    fn dispatch_udp_waiters(&mut self, ops: &mut OpRegistry<IocpOp, IocpOpState>) {
         loop {
             let (waiter, datagram) = {
                 let Some(pool) = self.pool.as_mut() else {
@@ -721,17 +723,15 @@ impl UdpPoolManager {
 
     #[cfg(test)]
     pub fn udp_pool_debug_stats(&self) -> Option<UdpRecvPoolDebugStats> {
-        self.pool
-            .as_ref()
-            .map(|pool| UdpRecvPoolDebugStats {
-                min_credits: pool.min_credits,
-                max_credits: pool.max_credits,
-                target_credits: pool.target_credits,
-                slots_len: pool.slots.len(),
-                in_flight: pool.slots.iter().filter(|s| s.in_flight).count(),
-                waiters_len: pool.waiters.len(),
-                queue_len: pool.queue.len(),
-                idle_hits: pool.idle_hits,
-            })
+        self.pool.as_ref().map(|pool| UdpRecvPoolDebugStats {
+            min_credits: pool.min_credits,
+            max_credits: pool.max_credits,
+            target_credits: pool.target_credits,
+            slots_len: pool.slots.len(),
+            in_flight: pool.slots.iter().filter(|s| s.in_flight).count(),
+            waiters_len: pool.waiters.len(),
+            queue_len: pool.queue.len(),
+            idle_hits: pool.idle_hits,
+        })
     }
 }

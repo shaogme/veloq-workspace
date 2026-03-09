@@ -179,24 +179,24 @@ impl RioKernel {
                     "RIODequeueCompletion function pointer missing",
                 )
             })?,
-            notify: table
-                .RIONotify
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIONotify function pointer missing"))?,
+            notify: table.RIONotify.ok_or_else(|| {
+                io_msg(IocpErrorContext::Rio, "RIONotify function pointer missing")
+            })?,
             close_cq: table.RIOCloseCompletionQueue.ok_or_else(|| {
                 io_msg(
                     IocpErrorContext::Rio,
                     "RIOCloseCompletionQueue function pointer missing",
                 )
             })?,
-            receive: table
-                .RIOReceive
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOReceive function pointer missing"))?,
+            receive: table.RIOReceive.ok_or_else(|| {
+                io_msg(IocpErrorContext::Rio, "RIOReceive function pointer missing")
+            })?,
             send: table
                 .RIOSend
                 .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSend function pointer missing"))?,
-            send_ex: table
-                .RIOSendEx
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSendEx function pointer missing"))?,
+            send_ex: table.RIOSendEx.ok_or_else(|| {
+                io_msg(IocpErrorContext::Rio, "RIOSendEx function pointer missing")
+            })?,
             receive_ex: table.RIOReceiveEx.ok_or_else(|| {
                 io_msg(
                     IocpErrorContext::Rio,
@@ -414,7 +414,9 @@ impl<'a> RioCompletionRouter<'a> {
                         res,
                         &mut ctx,
                     );
-                    let remove = actor.pool_manager.cleanup_shutdown_udp_pool_if_drained(&mut ctx);
+                    let remove = actor
+                        .pool_manager
+                        .cleanup_shutdown_udp_pool_if_drained(&mut ctx);
                     (submissions, remove)
                 };
                 if remove_actor {
@@ -556,7 +558,8 @@ impl RioState {
             let rq = self.registry.create_rq((handle, fd), env)?;
             let actor_id = self.alloc_actor_id();
             self.actor_routes.insert(actor_id, handle);
-            self.actors.insert(handle, RioSocketActor::new(actor_id, rq));
+            self.actors
+                .insert(handle, RioSocketActor::new(actor_id, rq));
         }
         Ok(self.actors.get_mut(&handle).expect("actor inserted"))
     }
@@ -595,7 +598,10 @@ impl RioState {
         let mut remove_actor = None;
         if let Some(actor) = self.actors.get_mut(&handle) {
             actor.pool_manager.begin_udp_pool_shutdown();
-            if actor.pool_manager.cleanup_shutdown_udp_pool_if_drained(&mut ctx) {
+            if actor
+                .pool_manager
+                .cleanup_shutdown_udp_pool_if_drained(&mut ctx)
+            {
                 remove_actor = Some(actor.actor_id);
             }
         }
@@ -757,7 +763,8 @@ impl RioState {
         let data_buf =
             self.registry
                 .prepare_data_submission((fd, handle), buf, buf.len() as u32, env)?;
-        self.registry.ensure_slab_page_registration(page_idx, slab_resolver, env)?;
+        self.registry
+            .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
 
         if addr_ptr.is_null() {
@@ -1058,20 +1065,21 @@ impl Drop for RioState {
                 for res in results.iter().take(count as usize) {
                     if let Some((actor_id, completion_generation)) =
                         Self::decode_pool_context(res.RequestContext)
+                        && let Some(handle) = self.actor_routes.get(&actor_id).copied()
+                        && let Some(actor) = self.actors.get_mut(&handle)
                     {
-                        if let Some(handle) = self.actor_routes.get(&actor_id).copied()
-                            && let Some(actor) = self.actors.get_mut(&handle)
+                        let _ = actor
+                            .pool_manager
+                            .ack_udp_pool_completion(completion_generation);
+                        actor.pool_manager.handle_completion_drain_only();
+                        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+                        let mut ctx = Self::build_ctx(&mut self.registry, env);
+                        if actor
+                            .pool_manager
+                            .cleanup_shutdown_udp_pool_if_drained(&mut ctx)
                         {
-                            let _ = actor
-                                .pool_manager
-                                .ack_udp_pool_completion(completion_generation);
-                            actor.pool_manager.handle_completion_drain_only();
-                            let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-                            let mut ctx = Self::build_ctx(&mut self.registry, env);
-                            if actor.pool_manager.cleanup_shutdown_udp_pool_if_drained(&mut ctx) {
-                                self.actor_routes.remove(&actor_id);
-                                self.actors.remove(&handle);
-                            }
+                            self.actor_routes.remove(&actor_id);
+                            self.actors.remove(&handle);
                         }
                     }
                     self.outstanding_count -= 1;
