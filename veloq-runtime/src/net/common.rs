@@ -13,6 +13,14 @@ pub struct InnerSocket(pub(crate) RawHandle);
 
 impl Drop for InnerSocket {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            if let Some(ctx) = crate::runtime::context::try_current()
+                && let Some(driver) = ctx.driver().upgrade()
+            {
+                driver.borrow_mut().shutdown_udp_pool_for_handle(self.0);
+            }
+        }
         let _ = unsafe { Socket::from_raw(self.0) };
     }
 }

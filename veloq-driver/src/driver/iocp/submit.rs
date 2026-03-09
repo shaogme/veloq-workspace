@@ -3,6 +3,7 @@
 //! This module implements the logic for submitting operations, handling completions,
 //! and accessing FDs, exposed as static functions for VTable construction.
 
+use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::op::{IocpOp, SubmitContext};
 use crate::op::IoFd;
@@ -10,11 +11,13 @@ use std::io;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, GetLastError, HANDLE,
+};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, WSARecvFrom,
-    WSASendTo, bind, getsockname, setsockopt,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, bind,
+    getsockname, setsockopt,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::CreateIoCompletionPort;
@@ -113,13 +116,35 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
             if let Some(Some(h)) = registered_files.get(idx as usize) {
                 Ok(*h)
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Invalid registered file descriptor",
+                Err(io_msg(
+                    IocpErrorContext::ResolveFd,
+                    format!("invalid registered file descriptor: fd={fd:?}, idx={idx}"),
                 ))
             }
         }
     }
+}
+
+fn ensure_iocp_association(
+    handle: HANDLE,
+    port: HANDLE,
+    detail: impl Into<String>,
+) -> io::Result<()> {
+    let assoc = unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
+    if assoc.is_null() {
+        let err = unsafe { GetLastError() } as i32;
+        // Windows returns ERROR_INVALID_PARAMETER when trying to re-associate
+        // a handle that is already bound to an IOCP.
+        if err == ERROR_INVALID_PARAMETER as i32 {
+            return Ok(());
+        }
+        return Err(io_error(
+            IocpErrorContext::Submission,
+            io::Error::from_raw_os_error(err),
+            detail,
+        ));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -140,9 +165,20 @@ macro_rules! submit_io_op {
             overlapped.Anonymous.Anonymous.OffsetHigh = (val.offset >> 32) as u32;
 
             let handle = resolve_fd(val.fd, ctx.registered_files)?;
-            unsafe {
-                CreateIoCompletionPort(handle, ctx.port, 0, 0);
-            }
+            ensure_iocp_association(
+                handle,
+                ctx.port,
+                format!(
+                    "{}: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
+                    stringify!($fn_name),
+                    val.fd,
+                    handle,
+                    op.header.user_data,
+                    op.header.generation,
+                    val.offset,
+                    val.buf.len()
+                ),
+            )?;
 
             let mut bytes = 0;
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
@@ -162,7 +198,20 @@ macro_rules! submit_io_op {
             if ret == 0 {
                 let err = unsafe { GetLastError() };
                 if err != ERROR_IO_PENDING {
-                    return Err(io::Error::from_raw_os_error(err as i32));
+                    return Err(io_error(
+                        IocpErrorContext::Submission,
+                        io::Error::from_raw_os_error(err as i32),
+                        format!(
+                            "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
+                            stringify!($fn_name),
+                            val.fd,
+                            handle,
+                            op.header.user_data,
+                            op.header.generation,
+                            val.offset,
+                            val.buf.len()
+                        ),
+                    ));
                 }
             }
             Ok(SubmissionResult::Pending)
@@ -200,38 +249,23 @@ pub(crate) unsafe fn submit_recv(
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
-    // Try RIO upgrade
-    if let Some(rio) = &mut ctx.rio
-        && let Some(res) = rio.try_submit_recv(val.fd, handle, &mut val.buf, op.header.user_data)?
-    {
-        return Ok(res);
-    }
-
-    // Fallback to normal IOCP
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
-
-    let mut bytes = 0;
-    let ptr = val.buf.as_mut_ptr();
-
-    let ret = unsafe {
-        ReadFile(
-            handle,
-            ptr as _,
-            val.buf.len() as u32,
-            &mut bytes,
-            ctx.overlapped,
+    // RIO path is mandatory for socket recv.
+    ctx.rio
+        .try_submit_recv(
+            (val.fd, handle, ctx.overlapped),
+            &mut val.buf,
+            ctx.registrar,
         )
-    };
-
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, op.header.user_data, op.header.generation
+                ),
+            )
+        })
 }
 impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
 
@@ -247,38 +281,19 @@ pub(crate) unsafe fn submit_send(
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
-    // Try RIO upgrade
-    if let Some(rio) = &mut ctx.rio
-        && let Some(res) = rio.try_submit_send(val.fd, handle, &val.buf, op.header.user_data)?
-    {
-        return Ok(res);
-    }
-
-    // Fallback
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
-
-    let mut bytes = 0;
-    let ptr = val.buf.as_slice().as_ptr() as *mut u8;
-
-    let ret = unsafe {
-        WriteFile(
-            handle,
-            ptr as _,
-            val.buf.len() as u32,
-            &mut bytes,
-            ctx.overlapped,
-        )
-    };
-
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
+    // RIO path is mandatory for socket send.
+    ctx.rio
+        .try_submit_send((val.fd, handle, ctx.overlapped), &val.buf, ctx.registrar)
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO send submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, op.header.user_data, op.header.generation
+                ),
+            )
+        })
 }
 impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
 
@@ -292,9 +307,14 @@ pub(crate) unsafe fn submit_connect(
 ) -> io::Result<SubmissionResult> {
     let connect_op = unsafe { &mut *op.payload.connect };
     let handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
+    ensure_iocp_association(
+        handle,
+        ctx.port,
+        format!(
+            "submit_connect: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+            connect_op.fd, handle, op.header.user_data, op.header.generation
+        ),
+    )?;
 
     let mut need_bind = true;
     let mut name: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
@@ -341,8 +361,9 @@ pub(crate) unsafe fn submit_connect(
                 std::mem::size_of::<SOCKADDR_IN6>() as i32,
             )
         };
-        unsafe {
-            bind(handle as SOCKET, ptr, len);
+        let bind_ret = unsafe { bind(handle as SOCKET, ptr, len) };
+        if bind_ret == SOCKET_ERROR {
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
         }
     }
 
@@ -404,10 +425,26 @@ pub(crate) unsafe fn submit_accept(
     let payload = unsafe { &mut *op.payload.accept };
     let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
     let accept_socket = payload.op.accept_socket;
+    let accept_socket_raw = accept_socket.handle as SOCKET;
 
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
+    ensure_iocp_association(
+        handle,
+        ctx.port,
+        format!(
+            "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
+            handle as usize, op.header.user_data, op.header.generation
+        ),
+    )?;
+
+    // Ensure the pre-allocated accept socket is also associated with the same IOCP.
+    ensure_iocp_association(
+        accept_socket_raw as HANDLE,
+        ctx.port,
+        format!(
+            "submit_accept: associate accept socket failed: accept=0x{:x}, listen=0x{:x}, user_data={}, generation={}",
+            accept_socket_raw, handle as usize, op.header.user_data, op.header.generation
+        ),
+    )?;
 
     const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
     let split = MIN_ADDR_LEN;
@@ -416,7 +453,7 @@ pub(crate) unsafe fn submit_accept(
     let ret = unsafe {
         (ctx.ext.accept_ex)(
             handle as SOCKET,
-            accept_socket.into(),
+            accept_socket_raw,
             payload.accept_buffer.as_mut_ptr() as *mut _,
             0,
             split as u32,
@@ -429,7 +466,19 @@ pub(crate) unsafe fn submit_accept(
     if ret == 0 {
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
+            return Err(io_error(
+                IocpErrorContext::Submission,
+                io::Error::from_raw_os_error(err as i32),
+                format!(
+                    "submit_accept: AcceptEx immediate failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
+                    handle as usize,
+                    accept_socket_raw,
+                    split,
+                    split,
+                    op.header.user_data,
+                    op.header.generation
+                ),
+            ));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -443,18 +492,29 @@ pub(crate) unsafe fn on_complete_accept(
     let payload = unsafe { &mut *op.payload.accept };
     let accept_socket = payload.op.accept_socket;
     let listen_handle = payload.op.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
+    let listen_socket = listen_handle.handle as SOCKET;
+    let accept_socket_raw = accept_socket.handle as SOCKET;
 
     let ret = unsafe {
         setsockopt(
-            accept_socket.into(),
+            accept_socket_raw,
             SOL_SOCKET,
             SO_UPDATE_ACCEPT_CONTEXT,
-            &listen_handle as *const _ as *const _,
-            std::mem::size_of_val(&listen_handle) as i32,
+            &listen_socket as *const _ as *const _,
+            std::mem::size_of::<SOCKET>() as i32,
         )
     };
     if ret != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io_error(
+            IocpErrorContext::Submission,
+            io::Error::last_os_error(),
+            format!(
+                "on_complete_accept: setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed: accept_socket=0x{:x}, listen_socket=0x{:x}, optlen={}",
+                accept_socket_raw,
+                listen_socket,
+                std::mem::size_of::<SOCKET>()
+            ),
+        ));
     }
 
     const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
@@ -512,114 +572,103 @@ pub(crate) unsafe fn submit_send_to(
     let payload = unsafe { &mut *op.payload.send_to };
     let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
 
-    // Try RIO upgrade logic
-    if let Some(rio) = &mut ctx.rio {
-        let page_idx = op.header.user_data / ctx.slots_per_page;
-        if let Some(res) = rio.try_submit_send_to(
-            payload.op.fd,
-            handle,
-            &payload.op.buf,
-            &payload.addr as *const _ as *const std::ffi::c_void,
-            payload.addr_len,
-            op.header.user_data,
-            page_idx,
-        )? {
-            return Ok(res);
-        }
-    }
-
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
-
-    payload.wsabuf.len = payload.op.buf.len() as u32;
-    payload.wsabuf.buf = payload.op.buf.as_slice().as_ptr() as *mut u8;
-
-    let mut bytes = 0;
-    let ret = unsafe {
-        WSASendTo(
-            handle as SOCKET,
-            &payload.wsabuf,
-            1,
-            &mut bytes,
-            0,
-            &payload.addr as *const _ as *const SOCKADDR,
-            payload.addr_len,
-            ctx.overlapped,
-            None,
-        )
+    // RIO path is mandatory for socket send_to.
+    let page_idx = op.header.user_data / ctx.slots_per_page;
+    let args = crate::driver::iocp::rio::RioSendToArgs {
+        fd: payload.op.fd,
+        handle,
+        buf: &payload.op.buf,
+        addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
+        addr_len: payload.addr_len,
+        overlapped: ctx.overlapped,
+        page_idx,
     };
-
-    if ret == SOCKET_ERROR {
-        let err = unsafe { WSAGetLastError() };
-        if err != ERROR_IO_PENDING as i32 {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
+    ctx.rio
+        .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
+                    payload.op.fd, op.header.user_data, op.header.generation, page_idx
+                ),
+            )
+        })
 }
 
 impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
 
 // ============================================================================
-// RecvFrom
+// ============================================================================
+// UDP RIO Pool (Stream)
 // ============================================================================
 
-pub(crate) unsafe fn submit_recv_from(
+pub(crate) unsafe fn submit_udp_recv_stream(
     op: &mut IocpOp,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &mut *op.payload.recv_from };
-    let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
-
-    // Try RIO upgrade
-    if let Some(rio) = &mut ctx.rio {
-        let page_idx = op.header.user_data / ctx.slots_per_page;
-        if let Some(res) = rio.try_submit_recv_from(
-            payload.op.fd,
-            handle,
-            &mut payload.op.buf,
-            &payload.addr as *const _ as *const std::ffi::c_void,
-            &payload.addr_len,
-            op.header.user_data,
-            page_idx,
-        )? {
-            return Ok(res);
-        }
-    }
-
-    unsafe {
-        CreateIoCompletionPort(handle, ctx.port, 0, 0);
-    }
-
-    payload.wsabuf.len = payload.op.buf.capacity() as u32;
-    payload.wsabuf.buf = payload.op.buf.as_mut_ptr();
-
-    let mut bytes = 0;
-    let ret = unsafe {
-        WSARecvFrom(
-            handle as SOCKET,
-            &payload.wsabuf,
-            1,
-            &mut bytes,
-            &mut payload.flags,
-            &mut payload.addr as *mut _ as *mut SOCKADDR,
-            &mut payload.addr_len,
-            ctx.overlapped,
-            None,
-        )
+    let val = unsafe { &mut *op.payload.udp_recv_stream };
+    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let args = crate::driver::iocp::rio::RioUdpStreamArgs {
+        fd: val.fd,
+        handle,
+        stream_op: val,
+        user_data: op.header.user_data,
+        generation: op.header.generation,
     };
-
-    if ret == SOCKET_ERROR {
-        let err = unsafe { WSAGetLastError() };
-        if err != ERROR_IO_PENDING as i32 {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
-    }
-    Ok(SubmissionResult::Pending)
+    ctx.rio
+        .try_submit_udp_recv_stream_pooled(args, ctx.registrar)
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, op.header.user_data, op.header.generation
+                ),
+            )
+        })
 }
 
-impl_lifecycle!(drop_recv_from, get_fd_recv_from, recv_from, nested_fd);
+pub(crate) unsafe fn on_complete_udp_recv_stream(
+    op: &mut IocpOp,
+    result: usize,
+    _ext: &Extensions,
+) -> io::Result<usize> {
+    let val = unsafe { &mut *op.payload.udp_recv_stream };
+    if result == 0
+        && let Some(datagram) = val.result.as_ref()
+    {
+        return Ok(datagram.buf.len());
+    }
+    Ok(result)
+}
+
+impl_lifecycle!(
+    drop_udp_recv_stream,
+    get_fd_udp_recv_stream,
+    udp_recv_stream,
+    direct_fd
+);
+
+pub(crate) unsafe fn submit_udp_refill(
+    op: &mut IocpOp,
+    ctx: &mut SubmitContext,
+) -> io::Result<SubmissionResult> {
+    let val = unsafe { &mut *op.payload.udp_refill };
+    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    if let Some(buf) = val.buf.take() {
+        ctx.rio
+            .try_refill_udp_pool((val.fd, handle), buf, ctx.registrar)?;
+    }
+
+    // Refill is not an async IO op that completes via IOCP,
+    // it just updates the internal pool. We post a completion to notify success.
+    Ok(SubmissionResult::PostToQueue)
+}
+
+impl_lifecycle!(drop_udp_refill, get_fd_udp_refill, udp_refill, direct_fd);
 
 // ============================================================================
 // Open

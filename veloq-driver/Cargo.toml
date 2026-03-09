@@ -21,6 +21,7 @@ veloq-bitset.workspace = true
 
 crossbeam-utils.workspace = true
 tracing.workspace = true
+error-stack = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"

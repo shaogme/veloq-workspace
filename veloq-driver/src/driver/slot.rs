@@ -18,6 +18,7 @@ pub const STATE_CONSUMED: u8 = 3; // Future consumed result, waiting for recycle
 pub struct OverlappedEntry {
     pub inner: OVERLAPPED,
     pub user_data: usize,
+    pub generation: u32,
     pub blocking_result: Option<std::io::Result<usize>>,
 }
 
@@ -27,6 +28,7 @@ impl Default for OverlappedEntry {
         Self {
             inner: unsafe { std::mem::zeroed() },
             user_data: 0,
+            generation: 0,
             blocking_result: None,
         }
     }
@@ -83,6 +85,7 @@ impl<Op> Slot<Op> {
             overlapped: UnsafeCell::new(OverlappedEntry {
                 inner: unsafe { std::mem::zeroed() },
                 user_data: index,
+                generation: 0,
                 blocking_result: None,
             }),
         }
@@ -97,6 +100,7 @@ impl<Op> Slot<Op> {
         unsafe {
             let entry = OverlappedEntry {
                 user_data: self.index,
+                generation,
                 ..Default::default()
             };
             *self.overlapped.get() = entry;

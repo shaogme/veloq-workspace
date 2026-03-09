@@ -6,8 +6,8 @@ use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
-    Accept, Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter,
-    ReadFixed, WriteFixed,
+    Accept, Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter, Recv,
+    Send as OpSend,
 };
 
 // ============================================================================
@@ -127,10 +127,9 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
     }
 
     pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = ReadFixed {
+        let op = Recv {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
-            offset: 0,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let buf = op_back
@@ -140,10 +139,9 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
     }
 
     pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
-        let op = WriteFixed {
+        let op = OpSend {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
-            offset: 0,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let buf = op_back
