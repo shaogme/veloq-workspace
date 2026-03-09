@@ -340,6 +340,49 @@ fn test_tcp_recv_zero_bytes() {
     }
 }
 
+/// Test TCP using heap-allocated FixedBuf (fallback mechanism)
+#[test]
+fn test_tcp_heap_buffer() {
+    let runtime = Runtime::builder()
+        .config(crate::config::Config::default().worker_threads(1))
+        .build()
+        .unwrap();
+
+    runtime.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+        let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+        // Server task: Use heap-allocated buffer for receive
+        let server_h = crate::runtime::context::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("Accept failed");
+
+            // Explicitly allocate from heap
+            let buf = veloq_buf::FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
+            let (result, buf) = stream.recv(buf).await;
+            let n = result.expect("Server recv failed");
+
+            assert_eq!(&buf.as_slice()[..n], b"Hello from heap!");
+            println!("Server received data in heap buffer correctly");
+        });
+
+        // Client: Use heap-allocated buffer for send
+        let stream = TcpStream::connect(listen_addr)
+            .await
+            .expect("Failed to connect");
+
+        let mut buf = veloq_buf::FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
+        let data = b"Hello from heap!";
+        buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+        buf.set_len(data.len());
+
+        let (result, _) = stream.send(buf).await;
+        result.expect("Client send failed");
+        println!("Client sent data from heap buffer correctly");
+
+        server_h.await;
+    });
+}
+
 /// Test IPv6 connection
 #[test]
 fn test_tcp_ipv6() {

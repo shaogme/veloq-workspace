@@ -273,6 +273,43 @@ fn test_udp_large_data() {
     }
 }
 
+/// Test UDP using heap-allocated FixedBuf
+#[test]
+fn test_udp_heap_buffer() {
+    let runtime = Runtime::builder()
+        .config(crate::config::Config::default().worker_threads(1))
+        .build()
+        .unwrap();
+
+    runtime.block_on(async move {
+        let socket1 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 1");
+        let socket2 = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket 2");
+        let addr1 = socket1.local_addr().expect("Failed to get addr1");
+
+        // Receiver task: Explicitly use heap buffer
+        let h_recv = crate::runtime::context::spawn(async move {
+            let buf = veloq_buf::FixedBuf::alloc_heap(nz!(1024)).expect("Heap allocation failed");
+            let (result, buf) = socket1.recv_from(buf).await;
+            let (n, _) = result.expect("recv_from failed");
+
+            assert_eq!(&buf.as_slice()[..n], b"UDP from heap!");
+            println!("UDP server received data in heap buffer correctly");
+        });
+
+        // Sender: Explicitly use heap buffer
+        let mut buf = veloq_buf::FixedBuf::alloc_heap(nz!(1024)).expect("Heap allocation failed");
+        let data = b"UDP from heap!";
+        buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+        buf.set_len(data.len());
+
+        let (result, _) = socket2.send_to(buf, addr1).await;
+        result.expect("send_to failed");
+        println!("UDP client sent data from heap buffer correctly");
+
+        h_recv.await;
+    });
+}
+
 /// Test IPv6 UDP
 #[test]
 fn test_udp_ipv6() {

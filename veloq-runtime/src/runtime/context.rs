@@ -88,8 +88,8 @@ where
     submitter.submit(op, driver)
 }
 
-/// Try to allocate a buffer from the current runtime context.
-pub fn try_alloc(size: NonZeroUsize) -> Option<FixedBuf> {
+/// Try to allocate a buffer from the current runtime context pool.
+pub fn try_alloc_from_pool(size: NonZeroUsize) -> Option<FixedBuf> {
     CONTEXT.with(|ctx| {
         ctx.borrow()
             .as_ref()
@@ -99,12 +99,19 @@ pub fn try_alloc(size: NonZeroUsize) -> Option<FixedBuf> {
     })
 }
 
+/// Try to allocate a buffer from the current runtime context pool.
+pub fn try_alloc(size: NonZeroUsize) -> Result<FixedBuf, veloq_buf::AllocError> {
+    try_alloc_from_pool(size).map_or_else(|| FixedBuf::alloc_heap(size), Ok)
+}
+
 /// Allocate a buffer from the current runtime context.
 ///
+/// If the pool is full, it fallbacks to system heap allocation.
+///
 /// # Panics
-/// Panics when called outside a runtime context or when the buffer pool is full.
+/// Panics when called outside a runtime context or when both pool and heap are exhausted.
 pub fn alloc(size: NonZeroUsize) -> FixedBuf {
-    try_alloc(size).expect("Buffer pool is full")
+    try_alloc(size).unwrap()
 }
 
 /// Context passed to runtime tasks.

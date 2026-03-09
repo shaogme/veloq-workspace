@@ -411,6 +411,34 @@ impl FixedBuf {
         assert!(len <= self.cap.get());
         self.len = len;
     }
+
+    /// Allocate a buffer from the system heap (not from a pool).
+    ///
+    /// This is used as a fallback when the pool is full.
+    /// Note: Heap-allocated buffers may not be registered with the I/O driver
+    /// and thus may incur overhead for direct I/O operations.
+    pub fn alloc_heap(len: NonZeroUsize) -> Result<Self, AllocError> {
+        // Use 4KB alignment for general compatibility
+        let layout =
+            std::alloc::Layout::from_size_align(len.get(), 4096).map_err(AllocError::Layout)?;
+
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            return Err(AllocError::Oom);
+        }
+
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+
+        Ok(unsafe {
+            Self::new(
+                ptr,
+                len,
+                NonNull::dangling(), // No pool context for heap buffers
+                &HEAP_POOL_VTABLE,
+                0,
+            )
+        })
+    }
 }
 
 impl Drop for FixedBuf {
@@ -445,6 +473,19 @@ impl std::fmt::Display for AllocError {
 }
 
 impl std::error::Error for AllocError {}
+
+impl From<AllocError> for std::io::Error {
+    fn from(err: AllocError) -> Self {
+        match err {
+            AllocError::Layout(_) => {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Layout error")
+            }
+            AllocError::Oom => {
+                std::io::Error::new(std::io::ErrorKind::OutOfMemory, "Out of memory")
+            }
+        }
+    }
+}
 
 // ============================================================================
 // Type-Erased Box<dyn BufPool> Replacement (Thread-Local Friendly)
@@ -758,6 +799,27 @@ static SLOT_BASED_POOL_VTABLE: PoolVTable = PoolVTable {
     dealloc: slot_based_dealloc_shim,
     resolve_region_info: slot_based_resolve_region_info_shim,
 };
+
+// VTable for Heap-allocated buffers
+static HEAP_POOL_VTABLE: PoolVTable = PoolVTable {
+    dealloc: heap_dealloc_shim,
+    resolve_region_info: heap_resolve_region_info_shim,
+};
+
+unsafe fn heap_dealloc_shim(_pool_data: NonNull<()>, params: DeallocParams) {
+    let layout = std::alloc::Layout::from_size_align(params.cap.get(), 4096).unwrap();
+    unsafe {
+        std::alloc::dealloc(params.ptr.as_ptr(), layout);
+    }
+}
+
+unsafe fn heap_resolve_region_info_shim(
+    _pool_data: NonNull<()>,
+    _buf: &FixedBuf,
+) -> (usize, usize) {
+    // Return NO_REGISTRATION_INDEX to indicate this buffer is not registered
+    (NO_REGISTRATION_INDEX as usize, 0)
+}
 
 unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
     let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;

@@ -159,9 +159,7 @@ impl OpenOptions {
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
 
-        let mut buf = crate::runtime::context::try_alloc(len_nz).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "buf pool exhausted")
-        })?;
+        let mut buf = crate::runtime::context::try_alloc(len_nz)?;
 
         // Write path + null
         let slice = buf.as_slice_mut();
@@ -240,9 +238,7 @@ impl OpenOptions {
             .collect();
         let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
 
-        let mut buf = crate::runtime::context::try_alloc(len_bytes).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "buf pool exhausted")
-        })?;
+        let mut buf = crate::runtime::context::try_alloc(len_bytes)?;
 
         let slice = buf.as_slice_mut();
         if slice.len() < len_bytes.get() {
