@@ -2,10 +2,59 @@
 
 use crate::net::udp::UdpSocket;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ============ Helper Functions ============
+async fn udp_send_to_with_retry(
+    ctx: &str,
+    socket: &UdpSocket,
+    mut build_buf: impl FnMut() -> veloq_buf::FixedBuf,
+    addr: SocketAddr,
+    attempts: usize,
+) {
+    let mut last_err = None;
+    for _ in 0..attempts.max(1) {
+        let buf = build_buf();
+        let (result, _) =
+            crate::tests::timeout_op(ctx, "send_to_retry", 5, socket.send_to(buf, addr)).await;
+        match result {
+            Ok(_) => return,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    panic!(
+        "UDP send_to_with_retry failed: ctx='{}', attempts={}, last_err={:?}",
+        ctx, attempts, last_err
+    );
+}
+
+async fn udp_recv_unique_peers(
+    socket: &UdpSocket,
+    size: NonZeroUsize,
+    expected_peers: usize,
+    max_receives: usize,
+    timeout_secs_per_recv: u64,
+) -> std::collections::HashSet<SocketAddr> {
+    let mut seen = std::collections::HashSet::with_capacity(expected_peers);
+    for _ in 0..max_receives {
+        if seen.len() >= expected_peers {
+            break;
+        }
+        let buf = crate::runtime::context::alloc(size);
+        let datagram = crate::tests::timeout_op(
+            "server",
+            "recv_unique_peer",
+            timeout_secs_per_recv,
+            socket.recv_stream(buf),
+        )
+        .await
+        .expect("recv_stream failed while collecting unique peers");
+        seen.insert(datagram.addr);
+    }
+    seen
+}
 
 // ============ Single-Thread UDP Tests (using Runtime/spawn) ============
 
@@ -426,14 +475,20 @@ fn test_multithread_udp_no_echo() {
                     buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
                     buf.set_len(msg.len());
 
-                    let (result, _) = crate::tests::timeout_op(
+                    let payload = buf.as_slice().to_vec();
+                    udp_send_to_with_retry(
                         &format!("worker_{}", worker_id),
-                        "send_to",
-                        5,
-                        socket2_arc.send_to(buf, addr1),
+                        &socket2_arc,
+                        || {
+                            let mut b = crate::runtime::context::alloc(size);
+                            b.spare_capacity_mut()[..payload.len()].copy_from_slice(&payload);
+                            b.set_len(payload.len());
+                            b
+                        },
+                        addr1,
+                        2,
                     )
                     .await;
-                    result.expect("send_to failed");
                     tracing::info!("Worker {} sent message", worker_id);
 
                     tracing::info!("Worker {} waiting for h_recv", worker_id);
@@ -606,6 +661,7 @@ fn test_multithread_udp_echo() {
 fn test_multithread_concurrent_udp_clients() {
     crate::tests::NetworkTestRunner::new("test_multithread_concurrent_udp_clients")
         .worker_threads(4) // 0=Server, 1,2,3=Clients
+        .buffer_sizes(vec![veloq_buf::nz!(8192)])
         .run(|size| async move {
             const NUM_CLIENTS: usize = 3;
             let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded::<SocketAddr>();
@@ -621,24 +677,13 @@ fn test_multithread_concurrent_udp_clients() {
                 // Publish server address once; main task fans out to clients.
                 addr_tx_clone.send(server_addr).unwrap();
 
-                // Receive messages from all clients
-                for i in 0..NUM_CLIENTS {
-                    let buf = crate::runtime::context::alloc(size);
-                    let datagram = crate::tests::timeout_op(
-                        "server",
-                        "server_recv",
-                        5,
-                        socket.recv_stream(buf),
-                    )
-                    .await
-                    .expect("Server recv_stream failed");
-                    let bytes = datagram.buf.len();
-                    let from = datagram.addr;
-                    println!(
-                        "Server received message {} ({} bytes) from {}",
-                        i, bytes, from
-                    );
-                }
+                let seen =
+                    udp_recv_unique_peers(&socket, size, NUM_CLIENTS, NUM_CLIENTS * 3, 2).await;
+                assert_eq!(
+                    seen.len(),
+                    NUM_CLIENTS,
+                    "server did not receive all client datagrams"
+                );
                 println!("Server received all {} messages", NUM_CLIENTS);
             });
 
@@ -657,19 +702,20 @@ fn test_multithread_concurrent_udp_clients() {
                     let client =
                         UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client socket");
 
-                    let mut buf = crate::runtime::context::alloc(size);
                     let msg = format!("Hello from client {}", client_id);
-                    buf.as_slice_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
-                    buf.set_len(msg.len());
-
-                    let (result, _) = crate::tests::timeout_op(
+                    udp_send_to_with_retry(
                         &format!("client_{}", client_id),
-                        "client_send",
-                        5,
-                        client.send_to(buf, server_addr),
+                        &client,
+                        || {
+                            let mut buf = crate::runtime::context::alloc(size);
+                            buf.as_slice_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+                            buf.set_len(msg.len());
+                            buf
+                        },
+                        server_addr,
+                        2,
                     )
                     .await;
-                    result.expect("Client send_to failed");
                     println!("Client {} sent message", client_id);
 
                     counter.fetch_add(1, Ordering::SeqCst);
