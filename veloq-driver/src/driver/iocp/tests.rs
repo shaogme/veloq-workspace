@@ -945,6 +945,59 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
 }
 
 #[test]
+fn test_rio_udp_recv_waiter_does_not_increment_outstanding_count() {
+    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+    let server = Socket::new_udp_v4().expect("server socket create failed");
+    server
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("server bind failed");
+    let server_handle = server.into_raw();
+    let raw_handle = server_handle.handle as windows_sys::Win32::Foundation::HANDLE;
+
+    let recv_op = UdpRecvStream {
+        fd: IoFd::Raw(server_handle),
+        buf: None,
+        addr: None,
+        result: None,
+    };
+    let mut iocp_op = Some(IntoPlatformOp::<IocpDriver>::into_platform_op(recv_op));
+    let (ud, _) = driver.reserve_op().expect("reserve recv op failed");
+    let _ = driver
+        .submit(ud, &mut iocp_op)
+        .expect("submit udp_recv_stream failed");
+
+    let stats = driver
+        .rio_state
+        .udp_pool_debug_stats(raw_handle)
+        .expect("udp pool stats missing");
+
+    assert_eq!(
+        driver.rio_state.outstanding_count, stats.in_flight,
+        "only real in-flight RIO receives should contribute to outstanding_count; stats={stats:?}"
+    );
+
+    driver.cancel_op(ud);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut op_out = None;
+    match driver.poll_op(ud, &mut cx, &mut op_out) {
+        Poll::Ready(res) => {
+            let _ = op_out.expect("cancelled op should be returned");
+            let err = res.expect_err("cancelled udp_recv_stream should fail");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+            );
+        }
+        Poll::Pending => panic!("cancelled waiter should be immediately pollable"),
+    }
+
+    unsafe {
+        windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
+    }
+}
+
+#[test]
 fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
     let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
     let server = Socket::new_udp_v4().expect("server socket create failed");

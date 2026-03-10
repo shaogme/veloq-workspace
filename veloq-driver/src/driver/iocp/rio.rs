@@ -1215,9 +1215,6 @@ impl RioState {
             &mut ctx,
         )?;
         self.outstanding_count += pool_submissions;
-        if matches!(res, SubmissionResult::Pending) {
-            self.outstanding_count += 1;
-        }
         Ok(res)
     }
 
