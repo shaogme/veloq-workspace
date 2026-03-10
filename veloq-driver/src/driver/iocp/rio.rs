@@ -4,6 +4,7 @@ pub mod registry;
 use crate::driver::iocp::IocpOp;
 use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::ext::Extensions;
+use crate::driver::iocp::submit::SubmissionResult;
 use crate::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
 use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED, STATE_CONSUMED};
