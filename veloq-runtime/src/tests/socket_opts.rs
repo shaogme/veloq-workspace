@@ -98,18 +98,32 @@ fn test_udp_socket_options() {
             .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
 
         let socket_clone = socket.clone();
+        let (tx, rx) = veloq_sync::oneshot::channel::<()>();
         let recv_h = crate::runtime::context::spawn(async move {
             let buf = crate::runtime::context::alloc(nz!(1024));
             let res = socket_clone.recv_stream(buf).await;
             let _ = res.expect("Failed to recv");
+            let _ = tx.send(());
         });
 
-        crate::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Send packets in a loop in case of UDP drop
+        let send_h = crate::runtime::context::spawn(async move {
+            let mut rx = rx;
+            loop {
+                let buf = crate::runtime::context::alloc(nz!(1024));
+                let (res, _) = client.send_to(buf, addr).await;
+                res.expect("Failed to send");
 
-        let buf = crate::runtime::context::alloc(nz!(1024));
-        let (res, _) = client.send_to(buf, addr).await;
-        res.expect("Failed to send");
+                let sleep = crate::time::sleep(std::time::Duration::from_millis(50));
+
+                crate::select! {
+                    _ = &mut rx => break,
+                    _ = sleep => continue,
+                }
+            }
+        });
 
         recv_h.await;
+        send_h.await;
     });
 }
