@@ -507,6 +507,7 @@ fn test_multithread_tcp_echo() {
         .run(|size| async move {
             let (addr_tx, mut addr_rx) = crate::sync::mpsc::unbounded();
             let addr_tx = addr_tx.clone(); // Move into task
+            let (done_tx, mut done_rx) = crate::sync::mpsc::unbounded();
 
             // Worker 0: Echo server
             let server_h = crate::runtime::context::spawn_to(0, async move || {
@@ -536,14 +537,26 @@ fn test_multithread_tcp_echo() {
                 }
                 assert_eq!(received.as_slice(), expect);
 
-                // Echo back
-                let mut echo_buf = crate::runtime::context::alloc(size);
-                echo_buf.as_slice_mut()[..expect.len()].copy_from_slice(expect);
+                // Echo back (handle potential partial sends)
+                let mut sent = 0usize;
+                while sent < expect.len() {
+                    let remain = &expect[sent..];
+                    let mut echo_buf = crate::runtime::context::alloc(size);
+                    let chunk = remain.len().min(echo_buf.capacity());
+                    echo_buf.spare_capacity_mut()[..chunk].copy_from_slice(&remain[..chunk]);
+                    echo_buf.set_len(chunk);
 
-                let (result, _) =
-                    crate::tests::timeout_op("server", "send", 5, stream.send(echo_buf)).await;
-                result.expect("Send failed");
+                    let (result, _) =
+                        crate::tests::timeout_op("server", "send", 5, stream.send(echo_buf)).await;
+                    let n = result.expect("Send failed");
+                    assert!(n > 0, "Send returned 0 before echo completed");
+                    sent += n;
+                }
                 println!("Echo server sent response");
+
+                crate::tests::timeout_op("server", "wait_client_done", 5, done_rx.recv())
+                    .await
+                    .expect("Client done channel closed");
             });
 
             // Worker 1: Client
@@ -564,13 +577,21 @@ fn test_multithread_tcp_echo() {
                 .expect("Failed to connect");
 
                 // Send data
-                let mut send_buf = crate::runtime::context::alloc(size);
                 let data = b"Hello from worker 1!";
-                send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
+                let mut sent = 0usize;
+                while sent < data.len() {
+                    let remain = &data[sent..];
+                    let mut send_buf = crate::runtime::context::alloc(size);
+                    let chunk = remain.len().min(send_buf.capacity());
+                    send_buf.spare_capacity_mut()[..chunk].copy_from_slice(&remain[..chunk]);
+                    send_buf.set_len(chunk);
 
-                let (result, _) =
-                    crate::tests::timeout_op("client", "send", 5, stream.send(send_buf)).await;
-                let _sent = result.expect("Send failed");
+                    let (result, _) =
+                        crate::tests::timeout_op("client", "send", 5, stream.send(send_buf)).await;
+                    let n = result.expect("Send failed");
+                    assert!(n > 0, "Send returned 0 before request completed");
+                    sent += n;
+                }
 
                 // Receive echo
                 let mut recv_buf = crate::runtime::context::alloc(size);
@@ -587,6 +608,8 @@ fn test_multithread_tcp_echo() {
 
                 assert_eq!(echoed.as_slice(), data);
                 println!("Client received correct echo");
+
+                done_tx.send(()).unwrap();
             });
 
             crate::tests::timeout_op("main", "wait_client_join", 5, client_h).await;
