@@ -6,7 +6,6 @@ use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::OverlappedEntry;
 use crate::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
@@ -49,8 +48,15 @@ pub(crate) struct RioCompletionContext<'a> {
 
 #[derive(Clone, Copy)]
 enum RioCompletionKind {
-    Pool { actor_id: u32, generation: u32 },
-    Op { user_data: usize, generation: u32 },
+    Pool {
+        actor_id: u32,
+        generation: u32,
+    },
+    Op {
+        user_data: usize,
+        generation: u32,
+        ctx_ptr: *mut RioOpRequestContext,
+    },
 }
 
 struct RioSocketActor {
@@ -69,13 +75,31 @@ impl RioSocketActor {
     }
 }
 
+#[repr(C)]
+struct RioOpRequestContext {
+    user_data: usize,
+    generation: u32,
+}
+
+struct RioOpCtxGuard(*mut RioOpRequestContext);
+
+impl Drop for RioOpCtxGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { drop(Box::from_raw(self.0)) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
 pub(crate) struct RioSendToArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: HANDLE,
     pub(crate) buf: &'a veloq_buf::FixedBuf,
     pub(crate) addr_ptr: *const std::ffi::c_void,
     pub(crate) addr_len: i32,
-    pub(crate) overlapped: *mut OVERLAPPED,
+    pub(crate) user_data: usize,
+    pub(crate) generation: u32,
     pub(crate) page_idx: usize,
 }
 
@@ -545,50 +569,52 @@ impl<'a> RioCompletionRouter<'a> {
             RioCompletionKind::Op {
                 user_data,
                 generation,
+                ctx_ptr,
             } => {
+                let _ctx_guard = RioOpCtxGuard(ctx_ptr);
                 let ops = &mut self.comp.ops;
-                if user_data >= ops.local.len() {
-                    return;
+
+                if user_data < ops.local.len() {
+                    let op = &mut ops.local[user_data];
+                    let slot = &ops.shared.slots[user_data];
+
+                    if op.platform_data.generation == generation {
+                        if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                            op.platform_data.lifecycle = OpLifecycle::Completed;
+
+                            let result_for_slot = if res.Status == 0 {
+                                Ok(res.BytesTransferred as usize)
+                            } else {
+                                Err(io::Error::from_raw_os_error(res.Status))
+                            };
+                            let res_code = rio_result_to_event_res(&result_for_slot);
+                            let event = CompletionEvent {
+                                user_data: encode_completion_token(user_data, generation),
+                                res: res_code,
+                                flags: 0,
+                            };
+                            let payload = unsafe { (*slot.payload.get()).take() };
+                            let detail = unsafe { (*slot.result.get()).take() };
+                            self.comp
+                                .table
+                                .record_completion_with_data(event, payload, detail);
+                            self.comp.events.push(event);
+                            let _ = unsafe { (*slot.op.get()).take() };
+                            let _ = std::mem::take(&mut op.platform_data);
+                            self.comp.ops.shared.push_free(user_data);
+                        } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
+                            let _ = unsafe { (*slot.op.get()).take() };
+                            let _ = unsafe { (*slot.payload.get()).take() };
+                            let _ = unsafe { (*slot.result.get()).take() };
+                            let _ = std::mem::take(&mut op.platform_data);
+                            self.comp.ops.shared.push_free(user_data);
+                        }
+                    }
                 }
 
-                let op = &mut ops.local[user_data];
-                let slot = &ops.shared.slots[user_data];
-                if op.platform_data.generation != generation {
-                    return;
+                if *self.outstanding_count > 0 {
+                    *self.outstanding_count -= 1;
                 }
-
-                if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                    op.platform_data.lifecycle = OpLifecycle::Completed;
-
-                    let result_for_slot = if res.Status == 0 {
-                        Ok(res.BytesTransferred as usize)
-                    } else {
-                        Err(io::Error::from_raw_os_error(res.Status))
-                    };
-                    let res_code = rio_result_to_event_res(&result_for_slot);
-                    let event = CompletionEvent {
-                        user_data: encode_completion_token(user_data, generation),
-                        res: res_code,
-                        flags: 0,
-                    };
-                    let payload = unsafe { (*slot.payload.get()).take() };
-                    let detail = unsafe { (*slot.result.get()).take() };
-                    self.comp
-                        .table
-                        .record_completion_with_data(event, payload, detail);
-                    self.comp.events.push(event);
-                    let _ = unsafe { (*slot.op.get()).take() };
-                    let _ = std::mem::take(&mut op.platform_data);
-                    self.comp.ops.shared.push_free(user_data);
-                } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
-                    let _ = unsafe { (*slot.op.get()).take() };
-                    let _ = unsafe { (*slot.payload.get()).take() };
-                    let _ = unsafe { (*slot.result.get()).take() };
-                    let _ = std::mem::take(&mut op.platform_data);
-                    self.comp.ops.shared.push_free(user_data);
-                }
-
-                *self.outstanding_count -= 1;
                 self.completed_count += 1;
             }
         }
@@ -605,8 +631,14 @@ fn rio_result_to_event_res(res: &io::Result<usize>) -> i32 {
 
 impl RioState {
     #[inline]
-    fn encode_request_context(overlapped: *mut OVERLAPPED) -> *const std::ffi::c_void {
-        overlapped as *const std::ffi::c_void
+    fn encode_request_context(user_data: usize, generation: u32) -> *const std::ffi::c_void {
+        let ctx = Box::new(RioOpRequestContext {
+            user_data,
+            generation,
+        });
+        let raw = Box::into_raw(ctx);
+        debug_assert_eq!((raw as usize) & POOL_CTX_TAG, 0);
+        raw.cast::<std::ffi::c_void>()
     }
 
     #[inline]
@@ -626,13 +658,31 @@ impl RioState {
                 generation: token,
             });
         }
-        let entry = ctx as usize as *const OverlappedEntry;
-        let user_data = unsafe { (*entry).user_data };
-        let generation = unsafe { (*entry).generation };
+        let ctx_ptr = raw as *mut RioOpRequestContext;
+        if ctx_ptr.is_null() {
+            return None;
+        }
+        let op_ctx = unsafe { &*ctx_ptr };
         Some(RioCompletionKind::Op {
-            user_data,
-            generation,
+            user_data: op_ctx.user_data,
+            generation: op_ctx.generation,
+            ctx_ptr,
         })
+    }
+
+    #[inline]
+    fn free_op_request_context(ctx: u64) {
+        if ctx == 0 {
+            return;
+        }
+        let raw = ctx as usize;
+        if (raw & POOL_CTX_TAG) == POOL_CTX_TAG {
+            return;
+        }
+        let ptr = raw as *mut RioOpRequestContext;
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr)) };
+        }
     }
 
     #[inline]
@@ -803,8 +853,12 @@ impl RioState {
                         self.actor_routes.remove(&actor_id);
                         self.actors.remove(&handle);
                     }
+                } else {
+                    Self::free_op_request_context(res.RequestContext);
                 }
-                self.outstanding_count -= 1;
+                if self.outstanding_count > 0 {
+                    self.outstanding_count -= 1;
+                }
             }
         }
 
@@ -908,12 +962,12 @@ impl RioState {
 
     pub(crate) fn try_submit_recv(
         &mut self,
-        target: (IoFd, HANDLE, *mut OVERLAPPED),
+        target: (IoFd, HANDLE, usize, u32),
         buf: &mut veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
         use crate::driver::iocp::submit::SubmissionResult;
-        let (fd, handle, overlapped) = target;
+        let (fd, handle, user_data, generation) = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {
             registrar,
@@ -924,9 +978,10 @@ impl RioState {
         let rio_buf = self
             .registry
             .prepare_data_submission(buf, buf.capacity() as u32, env)?;
-        let request_context = Self::encode_request_context(overlapped);
+        let request_context = Self::encode_request_context(user_data, generation);
         let ret = self.kernel.submit_receive(rq, &rio_buf, request_context);
         if ret == 0 {
+            Self::free_op_request_context(request_context as u64);
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
@@ -939,12 +994,12 @@ impl RioState {
 
     pub(crate) fn try_submit_send(
         &mut self,
-        target: (IoFd, HANDLE, *mut OVERLAPPED),
+        target: (IoFd, HANDLE, usize, u32),
         buf: &veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
         use crate::driver::iocp::submit::SubmissionResult;
-        let (fd, handle, overlapped) = target;
+        let (fd, handle, user_data, generation) = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {
             registrar,
@@ -955,9 +1010,10 @@ impl RioState {
         let rio_buf = self
             .registry
             .prepare_data_submission(buf, buf.len() as u32, env)?;
-        let request_context = Self::encode_request_context(overlapped);
+        let request_context = Self::encode_request_context(user_data, generation);
         let ret = self.kernel.submit_send(rq, &rio_buf, request_context);
         if ret == 0 {
+            Self::free_op_request_context(request_context as u64);
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
@@ -984,7 +1040,8 @@ impl RioState {
             buf,
             addr_ptr,
             addr_len,
-            overlapped,
+            user_data,
+            generation,
             page_idx,
         } = args;
 
@@ -1058,12 +1115,13 @@ impl RioState {
             Offset: addr_offset,
             Length: rio_addr_len as u32,
         };
-        let request_context = Self::encode_request_context(overlapped);
+        let request_context = Self::encode_request_context(user_data, generation);
 
         let ret = self
             .kernel
             .submit_send_ex(rq, &data_buf, &addr_buf, request_context);
         if ret == 0 {
+            Self::free_op_request_context(request_context as u64);
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),

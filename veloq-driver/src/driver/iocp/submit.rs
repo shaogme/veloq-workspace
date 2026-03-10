@@ -259,7 +259,7 @@ pub(crate) unsafe fn submit_recv(
     // RIO path is mandatory for socket recv.
     ctx.rio
         .try_submit_recv(
-            (val.fd, handle, ctx.overlapped),
+            (val.fd, handle, op.header.user_data, op.header.generation),
             &mut val.buf,
             ctx.registrar,
         )
@@ -291,7 +291,11 @@ pub(crate) unsafe fn submit_send(
 
     // RIO path is mandatory for socket send.
     ctx.rio
-        .try_submit_send((val.fd, handle, ctx.overlapped), &val.buf, ctx.registrar)
+        .try_submit_send(
+            (val.fd, handle, op.header.user_data, op.header.generation),
+            &val.buf,
+            ctx.registrar,
+        )
         .map_err(|e| {
             io_error(
                 IocpErrorContext::Submission,
@@ -593,7 +597,8 @@ pub(crate) unsafe fn submit_send_to(
         buf: &user.buf,
         addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
         addr_len: payload.addr_len,
-        overlapped: ctx.overlapped,
+        user_data: op.header.user_data,
+        generation: op.header.generation,
         page_idx,
     };
     ctx.rio
