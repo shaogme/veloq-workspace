@@ -21,3 +21,6 @@ optional = true
 [features]
 loom = ["dep:loom"]
 alloc = []
+
+[lints]
+workspace = true

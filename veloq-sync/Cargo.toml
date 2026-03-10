@@ -29,6 +29,9 @@ workspace = true
 features = ["futures"]
 optional = true
 
+[lints]
+workspace = true
+
 [features]
 default = ["veloq-shim/alloc"]
 loom = ["dep:loom", "veloq-atomic-waker/loom", "veloq-intrusive-linklist/loom", "veloq-shim/loom", "veloq-shim/alloc"]

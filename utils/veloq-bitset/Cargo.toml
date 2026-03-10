@@ -12,3 +12,6 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
+
+[lints]
+workspace = true

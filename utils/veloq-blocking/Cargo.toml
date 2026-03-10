@@ -17,3 +17,6 @@ crossbeam-queue.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys.workspace = true
+
+[lints]
+workspace = true

@@ -60,3 +60,9 @@ parking_lot = "0.12"
 
 loom = "0.7.0"
 criterion = { version = "0.8", features = ["async_tokio"] }
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+cognitive_complexity = { level = "deny", priority = 1 }
