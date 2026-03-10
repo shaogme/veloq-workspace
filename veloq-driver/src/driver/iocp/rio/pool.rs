@@ -427,21 +427,21 @@ impl UdpPoolManager {
         user_data: usize,
         expected_generation: u32,
         datagram: UdpRecvDatagram,
-    ) -> bool {
+    ) -> Result<(), UdpRecvDatagram> {
         if user_data >= ops.local.len() {
-            return false;
+            return Err(datagram);
         }
         let op = &mut ops.local[user_data];
         let slot = &ops.shared.slots[user_data];
         if op.platform_data.generation != expected_generation {
-            return false;
+            return Err(datagram);
         }
         if !matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-            return false;
+            return Err(datagram);
         }
 
         let Some(iocp_op) = (unsafe { &mut *slot.op.get() }).as_mut() else {
-            return false;
+            return Err(datagram);
         };
 
         let stream_op: &mut UdpRecvStream = unsafe { &mut iocp_op.payload.udp_recv_stream };
@@ -465,7 +465,7 @@ impl UdpPoolManager {
         unsafe { *slot.result.get() = Some(Ok(datagram_len)) };
         slot.state.store(STATE_COMPLETED, Ordering::Release);
         slot.waker.wake();
-        true
+        Ok(())
     }
 
     fn into_op_udp_datagram(datagram: UdpRecvDatagram) -> crate::op::UdpRecvDatagram {
@@ -500,11 +500,11 @@ impl UdpPoolManager {
             };
 
             let (user_data, generation) = waiter;
-            if !Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram) {
+            if let Err(returned_datagram) = Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram) {
                 if let Some(pool) = self.pool.as_mut() {
-                    pool.queue.push_back(datagram);
+                    pool.queue.push_front(returned_datagram);
                     if pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
-                        let _ = pool.queue.pop_front();
+                        let _ = pool.queue.pop_back();
                     }
                 }
             }
