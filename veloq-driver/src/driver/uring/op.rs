@@ -8,7 +8,7 @@
 use crate::driver::PlatformOp;
 use crate::driver::uring::{UringDriver, submit};
 use crate::op::{
-    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, OpKind, Open, ReadFixed, Recv,
+    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, OpKind, Open, ReadFixed, Recv,
     Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
 };
 use io_uring::squeue;
@@ -20,15 +20,15 @@ use std::time::Duration;
 // VTable Definition
 // ============================================================================
 
-pub type MakeSqeFn = unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> squeue::Entry;
-pub type OnCompleteFn = unsafe fn(op: &mut UringKernelOp, result: i32) -> io::Result<usize>;
-pub type DropFn = unsafe fn(op: &mut UringKernelOp);
-pub type GetFdFn = unsafe fn(op: &UringKernelOp) -> Option<IoFd>;
-pub type GetTimeoutFn = unsafe fn(op: &UringKernelOp) -> Option<Duration>;
-pub type ResolveChunksFn = unsafe fn(op: &UringKernelOp, chunks: &mut [u16]) -> usize;
+pub(crate) type MakeSqeFn =
+    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> squeue::Entry;
+pub(crate) type OnCompleteFn = unsafe fn(op: &mut UringKernelOp, result: i32) -> io::Result<usize>;
+pub(crate) type DropFn = unsafe fn(op: &mut UringKernelOp);
+pub(crate) type GetTimeoutFn = unsafe fn(op: &UringKernelOp) -> Option<Duration>;
+pub(crate) type ResolveChunksFn = unsafe fn(op: &UringKernelOp, chunks: &mut [u16]) -> usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubmissionStrategy {
+pub(crate) enum SubmissionStrategy {
     /// Submit a Standard SQE to the ring
     SubmitSqe,
     /// Handled by software timer wheel (no SQE submitted)
@@ -37,14 +37,13 @@ pub enum SubmissionStrategy {
     BackgroundOnly,
 }
 
-pub struct OpVTable {
-    pub make_sqe: MakeSqeFn,
-    pub on_complete: OnCompleteFn,
-    pub drop: DropFn,
-    pub get_fd: GetFdFn,
-    pub strategy: SubmissionStrategy,
-    pub get_timeout: GetTimeoutFn,
-    pub resolve_chunks: ResolveChunksFn,
+pub(crate) struct OpVTable {
+    pub(crate) make_sqe: MakeSqeFn,
+    pub(crate) on_complete: OnCompleteFn,
+    pub(crate) drop: DropFn,
+    pub(crate) strategy: SubmissionStrategy,
+    pub(crate) get_timeout: GetTimeoutFn,
+    pub(crate) resolve_chunks: ResolveChunksFn,
 }
 
 // ============================================================================
@@ -56,19 +55,13 @@ use std::ptr::NonNull;
 #[repr(C)]
 pub struct UringKernelOp {
     /// Virtual Table for dynamic dispatch
-    pub vtable: NonNull<OpVTable>,
+    pub(crate) vtable: NonNull<OpVTable>,
 
     /// Type-erased payload
-    pub payload: UringOpPayload,
+    pub(crate) payload: UringOpPayload,
 }
 
 impl PlatformOp for UringKernelOp {}
-
-impl UringKernelOp {
-    pub fn get_fd(&self) -> Option<IoFd> {
-        unsafe { (self.vtable.as_ref().get_fd)(self) }
-    }
-}
 
 impl Drop for UringKernelOp {
     fn drop(&mut self) {
@@ -90,7 +83,6 @@ macro_rules! define_uring_ops {
                 make_sqe: $make_sqe:path,
                 on_complete: $complete:path,
                 drop: $drop:path,
-                get_fd: $get_fd:path,
                 $(strategy: $strategy:expr,)?
                 $(get_timeout: $get_timeout:expr,)?
                 $(resolve_chunks: $resolve_chunks:expr,)?
@@ -101,9 +93,9 @@ macro_rules! define_uring_ops {
     ) => {
         // Ensure proper alignment
         #[repr(C)]
-        pub union UringOpPayload {
+        pub(crate) union UringOpPayload {
             $(
-                pub $field: ManuallyDrop< define_uring_ops!(@payload_type $OpType $(, $Payload)?) >,
+                pub(crate) $field: ManuallyDrop< define_uring_ops!(@payload_type $OpType $(, $Payload)?) >,
             )+
         }
 
@@ -117,7 +109,6 @@ macro_rules! define_uring_ops {
                         make_sqe: $make_sqe,
                         on_complete: $complete,
                         drop: $drop,
-                        get_fd: $get_fd,
                         strategy: define_uring_ops!(@strategy $($strategy)?),
                         get_timeout: define_uring_ops!(@get_timeout $($get_timeout)?),
                         resolve_chunks: define_uring_ops!(@resolve_chunks $($resolve_chunks)?),
@@ -192,45 +183,44 @@ macro_rules! define_uring_ops {
 // Payload Structures for Complex Ops
 // ============================================================================
 
-pub struct KernelRef<T> {
-    pub user: NonNull<T>,
+pub(crate) struct KernelRef<T> {
+    pub(crate) user: NonNull<T>,
 }
 
-pub struct AcceptPayload {
-    pub user: NonNull<Accept>,
+pub(crate) struct AcceptPayload {
+    pub(crate) user: NonNull<Accept>,
 }
 
-pub struct SendToPayload {
-    pub user: NonNull<SendTo>,
-    pub msg_name: libc::sockaddr_storage,
-    pub msg_namelen: libc::socklen_t,
-    pub iovec: [libc::iovec; 1],
-    pub msghdr: libc::msghdr,
+pub(crate) struct SendToPayload {
+    pub(crate) user: NonNull<SendTo>,
+    pub(crate) msg_name: libc::sockaddr_storage,
+    pub(crate) msg_namelen: libc::socklen_t,
+    pub(crate) iovec: [libc::iovec; 1],
+    pub(crate) msghdr: libc::msghdr,
 }
 
-pub struct UdpRecvStreamPayload {
-    pub user: NonNull<UdpRecvStream>,
-    pub msg_name: libc::sockaddr_storage,
-    pub msg_namelen: libc::socklen_t,
-    pub iovec: [libc::iovec; 1],
-    pub msghdr: libc::msghdr,
+pub(crate) struct UdpRecvStreamPayload {
+    pub(crate) user: NonNull<UdpRecvStream>,
+    pub(crate) msg_name: libc::sockaddr_storage,
+    pub(crate) iovec: [libc::iovec; 1],
+    pub(crate) msghdr: libc::msghdr,
 }
 
-pub struct OpenPayload {
-    pub user: NonNull<Open>,
+pub(crate) struct OpenPayload {
+    pub(crate) user: NonNull<Open>,
 }
 
-pub struct WakeupPayload {
-    pub user: NonNull<Wakeup>,
-    pub buf: [u8; 8],
+pub(crate) struct WakeupPayload {
+    pub(crate) user: NonNull<Wakeup>,
+    pub(crate) buf: [u8; 8],
 }
 
-pub struct TimeoutPayload {
-    pub user: NonNull<Timeout>,
-    pub ts: [i64; 2],
+pub(crate) struct TimeoutPayload {
+    pub(crate) user: NonNull<Timeout>,
+    pub(crate) ts: [i64; 2],
 }
 
-pub type UringOp = UringKernelOp;
+pub(crate) type UringOp = UringKernelOp;
 
 // ============================================================================
 // Op Definitions
@@ -243,7 +233,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_read_fixed,
         on_complete: submit::on_complete_read_fixed,
         drop: submit::drop_read_fixed,
-        get_fd: submit::get_fd_read_fixed,
         resolve_chunks: submit::resolve_chunks_read_fixed,
     }, // Kernel 5.1+
     WriteFixed {
@@ -252,7 +241,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_write_fixed,
         on_complete: submit::on_complete_write_fixed,
         drop: submit::drop_write_fixed,
-        get_fd: submit::get_fd_write_fixed,
         resolve_chunks: submit::resolve_chunks_write_fixed,
     }, // Kernel 5.1+
     Recv {
@@ -261,7 +249,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_recv,
         on_complete: submit::on_complete_recv,
         drop: submit::drop_recv,
-        get_fd: submit::get_fd_recv,
     }, // Kernel 5.6+
     OpSend {
         field: send,
@@ -269,7 +256,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_send,
         on_complete: submit::on_complete_send,
         drop: submit::drop_send,
-        get_fd: submit::get_fd_send,
     }, // Kernel 5.6+
     Connect {
         field: connect,
@@ -277,7 +263,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_connect,
         on_complete: submit::on_complete_connect,
         drop: submit::drop_connect,
-        get_fd: submit::get_fd_connect,
     }, // Kernel 5.5+
     Close {
         field: close,
@@ -285,7 +270,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_close,
         on_complete: submit::on_complete_close,
         drop: submit::drop_close,
-        get_fd: submit::get_fd_close,
         strategy: SubmissionStrategy::BackgroundOnly,
     }, // Kernel 5.6+
     Fsync {
@@ -294,7 +278,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_fsync,
         on_complete: submit::on_complete_fsync,
         drop: submit::drop_fsync,
-        get_fd: submit::get_fd_fsync,
     }, // Kernel 5.1+
     SyncFileRange {
         field: sync_range,
@@ -302,7 +285,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_sync_range,
         on_complete: submit::on_complete_sync_range,
         drop: submit::drop_sync_range,
-        get_fd: submit::get_fd_sync_range,
     }, // Kernel 5.2+
     Fallocate {
         field: fallocate,
@@ -310,7 +292,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_fallocate,
         on_complete: submit::on_complete_fallocate,
         drop: submit::drop_fallocate,
-        get_fd: submit::get_fd_fallocate,
     }, // Kernel 5.6+
     Accept {
         field: accept,
@@ -319,7 +300,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_accept,
         on_complete: submit::on_complete_accept,
         drop: submit::drop_accept,
-        get_fd: submit::get_fd_accept,
         construct: |user| AcceptPayload { user },
         destruct: |user: Box<Accept>| *user,
     }, // Kernel 5.5+
@@ -330,7 +310,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_send_to,
         on_complete: submit::on_complete_send_to,
         drop: submit::drop_send_to,
-        get_fd: submit::get_fd_send_to,
         construct: |user: std::ptr::NonNull<SendTo>| {
             let op = unsafe { user.as_ref() };
             let (msg_name, msg_namelen) = crate::socket_addr_to_storage(op.addr);
@@ -351,11 +330,9 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_udp_recv_stream,
         on_complete: submit::on_complete_udp_recv_stream,
         drop: submit::drop_udp_recv_stream,
-        get_fd: submit::get_fd_udp_recv_stream,
         construct: |user| UdpRecvStreamPayload {
             user,
             msg_name: unsafe { std::mem::zeroed() },
-            msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
         },
@@ -367,7 +344,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_udp_refill,
         on_complete: submit::on_complete_udp_refill,
         drop: submit::drop_udp_refill,
-        get_fd: submit::get_fd_udp_refill,
     }, // No-op on io_uring, kept for cross-platform API parity
     Open {
         field: open,
@@ -376,7 +352,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_open,
         on_complete: submit::on_complete_open,
         drop: submit::drop_open,
-        get_fd: submit::get_fd_open,
         construct: |user| OpenPayload { user },
         destruct: |user: Box<Open>| *user,
     }, // Kernel 5.6+ (via OpenAt)
@@ -387,7 +362,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_wakeup,
         on_complete: submit::on_complete_wakeup,
         drop: submit::drop_wakeup,
-        get_fd: submit::get_fd_wakeup,
         construct: |user| WakeupPayload { user, buf: [0; 8] },
         destruct: |user: Box<Wakeup>| *user,
     }, // Kernel 5.6+ (via Read)
@@ -398,7 +372,6 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_timeout,
         on_complete: submit::on_complete_timeout,
         drop: submit::drop_timeout,
-        get_fd: submit::get_fd_timeout,
         strategy: SubmissionStrategy::SoftwareTimer,
         get_timeout: submit::get_timeout_timeout,
         construct: |user| TimeoutPayload { user, ts: [0; 2] },

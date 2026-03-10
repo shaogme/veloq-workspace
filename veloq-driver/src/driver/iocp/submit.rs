@@ -103,7 +103,7 @@ macro_rules! impl_blocking_offload {
 // Submission Result
 // ============================================================================
 
-pub enum SubmissionResult {
+pub(crate) enum SubmissionResult {
     Pending,
     PostToQueue,
     Offload(BlockingTask),

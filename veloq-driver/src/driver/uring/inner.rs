@@ -9,7 +9,6 @@ use tracing::{debug, trace};
 
 use crate::config::{IoMode, UringConfig};
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::STATE_SUBMITTED;
 use crate::driver::uring::op::UringOp;
 use crate::driver::{
     CompletionEvent, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
@@ -18,7 +17,7 @@ use crate::driver::{
 use crate::op::IntoPlatformOp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OpLifecycle {
+pub(crate) enum OpLifecycle {
     /// Created, waiting to be submitted
     Pending,
     /// Submitted to ring or timer wheel
@@ -32,9 +31,9 @@ pub enum OpLifecycle {
 
 #[derive(Clone)]
 pub struct UringOpState {
-    pub lifecycle: OpLifecycle,
-    pub next: Option<usize>,
-    pub timer_id: Option<veloq_wheel::TaskId>,
+    pub(crate) lifecycle: OpLifecycle,
+    pub(crate) next: Option<usize>,
+    pub(crate) timer_id: Option<veloq_wheel::TaskId>,
 }
 
 impl Default for UringOpState {
@@ -48,13 +47,13 @@ impl Default for UringOpState {
 }
 
 impl UringOpState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 }
 
 pub(crate) struct EventFd {
-    pub fd: RawFd,
+    pub(crate) fd: RawFd,
 }
 
 impl Drop for EventFd {
@@ -252,8 +251,6 @@ impl UringDriver {
                         if let Some(entry) = self.ops.get_mut(user_data) {
                             entry.platform_data.lifecycle = OpLifecycle::InFlight;
                         }
-                        let slot = &self.ops.shared.slots[user_data];
-                        slot.state.store(STATE_SUBMITTED, Ordering::Release);
                         trace!(user_data, "Submitted to SQ");
                         Ok(true)
                     } else {
@@ -271,8 +268,6 @@ impl UringDriver {
                         entry.platform_data.lifecycle = OpLifecycle::InFlight;
                         entry.platform_data.timer_id = Some(task_id);
                     }
-                    let slot = &self.ops.shared.slots[user_data];
-                    slot.state.store(STATE_SUBMITTED, Ordering::Release);
                     trace!(user_data, ?duration, "Registered software timer");
                     Ok(true)
                 } else {
@@ -336,9 +331,6 @@ impl UringDriver {
                 if let Some(entry) = self.ops.get_mut(user_data) {
                     entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
-                // Update slot state
-                let slot = &self.ops.shared.slots[user_data];
-                slot.state.store(STATE_SUBMITTED, Ordering::Release);
             } else {
                 self.push_backlog(user_data);
             }
@@ -348,7 +340,7 @@ impl UringDriver {
         }
     }
 
-    pub fn submit_to_kernel(&mut self) -> io::Result<()> {
+    pub(crate) fn submit_to_kernel(&mut self) -> io::Result<()> {
         trace!("submit_to_kernel entered");
         if self.ring.params().is_setup_sqpoll() {
             if self.ring.submission().need_wakeup() {
@@ -361,7 +353,7 @@ impl UringDriver {
         Ok(())
     }
 
-    pub fn wait(&mut self) -> io::Result<()> {
+    pub(crate) fn wait(&mut self) -> io::Result<()> {
         self.flush_cancellations();
         self.flush_backlog();
 

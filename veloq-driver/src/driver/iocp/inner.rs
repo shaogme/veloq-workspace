@@ -35,7 +35,7 @@ pub enum OpLifecycle {
     /// Submitted to true OS operations (IOCP/RIO)
     InFlight,
     /// Completion received or Timer fired
-    Completed(io::Result<usize>), // Stores the result here!
+    Completed,
     /// Cancelled by user
     Cancelled,
     /// Detached completion notifier path.
@@ -43,18 +43,18 @@ pub enum OpLifecycle {
 }
 
 pub struct IocpOpState {
-    pub generation: u32,
-    pub lifecycle: OpLifecycle,
-    pub detached_notifier: Option<Box<dyn crate::driver::DetachedCompleter>>,
-    pub timer_id: Option<TaskId>,
-    pub timer_deadline: Option<Instant>,
-    pub is_background: bool,
+    pub(crate) generation: u32,
+    pub(crate) lifecycle: OpLifecycle,
+    pub(crate) detached_notifier: Option<Box<dyn crate::driver::DetachedCompleter>>,
+    pub(crate) timer_id: Option<TaskId>,
+    pub(crate) timer_deadline: Option<Instant>,
+    pub(crate) is_background: bool,
     // For RIO cancel path: the slot can be recycled only after both:
     // 1) user has consumed completion; 2) late RIO CQE has been drained.
-    pub rio_needs_drain: bool,
-    pub rio_drained: bool,
+    pub(crate) rio_needs_drain: bool,
+    pub(crate) rio_drained: bool,
     // recv_from served by internal RIO UDP pre-post pool; no per-op kernel I/O in flight.
-    pub rio_pool_waiting: bool,
+    pub(crate) rio_pool_waiting: bool,
 }
 
 impl Default for IocpOpState {
@@ -74,12 +74,12 @@ impl Default for IocpOpState {
 }
 
 impl IocpOpState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 }
 
-pub type PreInit = usize;
+pub(crate) type PreInit = usize;
 
 #[derive(Clone, Copy, Debug)]
 pub enum CloseMode {
@@ -106,8 +106,8 @@ pub struct IocpDriver {
     pub(crate) closed: bool,
 }
 
-pub(crate) struct CompletionPort {
-    pub handle: HANDLE,
+pub struct CompletionPort {
+    pub(crate) handle: HANDLE,
 }
 
 impl Drop for CompletionPort {
@@ -159,7 +159,7 @@ impl IocpDriver {
             || submit_fn == crate::driver::iocp::submit::submit_udp_refill as *const () as usize
     }
 
-    pub fn create_pre_init() -> io::Result<PreInit> {
+    pub(crate) fn create_pre_init() -> io::Result<PreInit> {
         // Create a new completion port.
         let port =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
@@ -171,16 +171,12 @@ impl IocpDriver {
         }
     }
 
-    pub fn pre_init_handle(pre: &PreInit) -> crate::RawHandle {
-        crate::RawHandle { handle: *pre as _ }
-    }
-
     pub fn new(config: impl AsRef<IocpConfig>) -> io::Result<Self> {
         let pre = Self::create_pre_init()?;
         Self::new_from_pre_init(config.as_ref().entries.get(), pre)
     }
 
-    pub fn new_from_pre_init(entries: u32, port_val: PreInit) -> io::Result<Self> {
+    pub(crate) fn new_from_pre_init(entries: u32, port_val: PreInit) -> io::Result<Self> {
         let port = port_val as HANDLE;
         debug!(port = ?port, "Initializing IocpDriver");
         // Load extensions
@@ -228,7 +224,7 @@ impl IocpDriver {
 
     /// Retrieve completion events from the port.
     /// timeout_ms: 0 for poll, u32::MAX for wait.
-    pub fn get_completion(&mut self, timeout_ms: u32) -> io::Result<()> {
+    pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> io::Result<()> {
         let mut bytes_transferred = 0;
         let mut completion_key = 0;
         let mut overlapped = std::ptr::null_mut();
@@ -374,7 +370,7 @@ impl IocpDriver {
                         continue;
                     }
 
-                    op.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
+                    op.platform_data.lifecycle = OpLifecycle::Completed;
 
                     let slot = &ops_shared.slots[user_data];
                     let generation = slot.generation.load(Ordering::Acquire);
@@ -400,14 +396,7 @@ impl IocpDriver {
             push_completion_event_shared(
                 &self.completion_events,
                 &self.completion_table,
-                completion_record(
-                    completion.user_data,
-                    completion.generation,
-                    completion.res,
-                    completion.flags,
-                    completion.payload,
-                    completion.detail,
-                ),
+                completion_record(completion),
             );
         }
         timer_buffer.clear();
@@ -488,18 +477,17 @@ impl IocpDriver {
                     push_completion_event_shared(
                         &completion_events,
                         &completion_table,
-                        completion_record(
+                        completion_record(CompletionSidecar {
                             user_data,
-                            slot_generation,
-                            completion_res,
-                            0,
+                            generation: slot_generation,
+                            res: completion_res,
+                            flags: 0,
                             payload,
                             detail,
-                        ),
+                        }),
                     );
                 } else {
-                    op.platform_data.lifecycle =
-                        OpLifecycle::Completed(clone_io_result(&io_result));
+                    op.platform_data.lifecycle = OpLifecycle::Completed;
 
                     let should_emit = !(was_cancelled && op.platform_data.rio_needs_drain);
                     if should_emit {
@@ -508,14 +496,14 @@ impl IocpDriver {
                         push_completion_event_shared(
                             &completion_events,
                             &completion_table,
-                            completion_record(
+                            completion_record(CompletionSidecar {
                                 user_data,
-                                slot_generation,
-                                completion_res,
-                                0,
+                                generation: slot_generation,
+                                res: completion_res,
+                                flags: 0,
                                 payload,
                                 detail,
-                            ),
+                            }),
                         );
                     }
 
@@ -532,7 +520,7 @@ impl IocpDriver {
         }
     }
 
-    pub fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
+    pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
         self.rio_state.register_chunk(id, ptr, len)?;
         Ok(())
     }
@@ -542,7 +530,7 @@ impl IocpDriver {
             .begin_udp_pool_shutdown_for_handle(handle.handle);
     }
 
-    pub fn cancel_op_internal(&mut self, user_data: usize) {
+    pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
         let completion_events = self.completion_events.clone();
         let completion_table = self.completion_table.clone();
         let ops_local = &mut self.ops.local;
@@ -556,23 +544,20 @@ impl IocpDriver {
                 self.wheel.cancel(tid);
                 op.platform_data.timer_id = None;
                 op.platform_data.timer_deadline = None;
-                let err = io::Error::from_raw_os_error(
-                    windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
-                );
-                op.platform_data.lifecycle = OpLifecycle::Completed(Err(err));
+                op.platform_data.lifecycle = OpLifecycle::Completed;
                 let generation = slot.generation.load(Ordering::Acquire);
 
                 push_completion_event_shared(
                     &completion_events,
                     &completion_table,
-                    completion_record(
+                    completion_record(CompletionSidecar {
                         user_data,
                         generation,
-                        -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                        0,
-                        unsafe { (*slot.payload.get()).take() },
-                        unsafe { (*slot.result.get()).take() },
-                    ),
+                        res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                        flags: 0,
+                        payload: unsafe { (*slot.payload.get()).take() },
+                        detail: unsafe { (*slot.result.get()).take() },
+                    }),
                 );
                 let _ = unsafe { (*slot.op.get()).take() };
                 let _data = std::mem::take(&mut op.platform_data);
@@ -587,14 +572,14 @@ impl IocpDriver {
                     push_completion_event_shared(
                         &completion_events,
                         &completion_table,
-                        completion_record(
+                        completion_record(CompletionSidecar {
                             user_data,
                             generation,
-                            -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                            0,
-                            unsafe { (*slot.payload.get()).take() },
-                            unsafe { (*slot.result.get()).take() },
-                        ),
+                            res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                            flags: 0,
+                            payload: unsafe { (*slot.payload.get()).take() },
+                            detail: unsafe { (*slot.result.get()).take() },
+                        }),
                     );
                     let _ = unsafe { (*slot.op.get()).take() };
                     let _data = std::mem::take(&mut op.platform_data);
@@ -618,15 +603,15 @@ impl IocpDriver {
                             push_completion_event_shared(
                                 &completion_events,
                                 &completion_table,
-                                completion_record(
+                                completion_record(CompletionSidecar {
                                     user_data,
                                     generation,
-                                    -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED
+                                    res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED
                                         as i32),
-                                    0,
-                                    unsafe { (*slot.payload.get()).take() },
-                                    unsafe { (*slot.result.get()).take() },
-                                ),
+                                    flags: 0,
+                                    payload: unsafe { (*slot.payload.get()).take() },
+                                    detail: unsafe { (*slot.result.get()).take() },
+                                }),
                             );
                             let _ = unsafe { (*slot.op.get()).take() };
                             let _data = std::mem::take(&mut op.platform_data);
@@ -639,15 +624,15 @@ impl IocpDriver {
                             push_completion_event_shared(
                                 &completion_events,
                                 &completion_table,
-                                completion_record(
+                                completion_record(CompletionSidecar {
                                     user_data,
                                     generation,
-                                    -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED
+                                    res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED
                                         as i32),
-                                    0,
-                                    unsafe { (*slot.payload.get()).take() },
-                                    unsafe { (*slot.result.get()).take() },
-                                ),
+                                    flags: 0,
+                                    payload: unsafe { (*slot.payload.get()).take() },
+                                    detail: unsafe { (*slot.result.get()).take() },
+                                }),
                             );
                             let _ = unsafe { (*slot.op.get()).take() };
                             let _data = std::mem::take(&mut op.platform_data);
@@ -668,7 +653,7 @@ impl IocpDriver {
         }
     }
 
-    pub fn register_files(
+    pub(crate) fn register_files(
         &mut self,
         files: &[crate::RawHandle],
     ) -> io::Result<Vec<crate::op::IoFd>> {
@@ -689,7 +674,7 @@ impl IocpDriver {
         Ok(registered)
     }
 
-    pub fn unregister_files(&mut self, files: Vec<crate::op::IoFd>) -> io::Result<()> {
+    pub(crate) fn unregister_files(&mut self, files: Vec<crate::op::IoFd>) -> io::Result<()> {
         for fd in files {
             if let crate::op::IoFd::Fixed(idx) = fd {
                 let idx = idx as usize;
@@ -703,7 +688,7 @@ impl IocpDriver {
         Ok(())
     }
 
-    pub fn wake(&self) -> io::Result<()> {
+    pub(crate) fn wake(&self) -> io::Result<()> {
         let res = unsafe {
             PostQueuedCompletionStatus(self.port.handle, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
         };
@@ -714,7 +699,7 @@ impl IocpDriver {
         Ok(())
     }
 
-    pub fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker> {
+    pub(crate) fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker> {
         std::sync::Arc::new(IocpWaker {
             port: self.port.clone(),
             is_waked: self.is_waked.clone(),
@@ -722,19 +707,11 @@ impl IocpDriver {
     }
 
     #[inline]
-    pub(crate) fn push_completion_event(
-        &self,
-        user_data: usize,
-        generation: u32,
-        res: i32,
-        flags: u32,
-        payload: Option<crate::driver::slot::ErasedPayload>,
-        detail: Option<io::Result<usize>>,
-    ) {
+    pub(crate) fn push_completion_event(&self, sidecar: CompletionSidecar) {
         push_completion_event_shared(
             &self.completion_events,
             &self.completion_table,
-            completion_record(user_data, generation, res, flags, payload, detail),
+            completion_record(sidecar),
         );
     }
 
@@ -865,15 +842,6 @@ impl IocpDriver {
         self.closed = true;
         Ok(())
     }
-
-    pub fn shutdown(&mut self) -> io::Result<()> {
-        let _ = self.shutdown_inflight_ops();
-        Ok(())
-    }
-
-    pub fn close_with_mode(mut self, mode: CloseMode) -> io::Result<()> {
-        self.close_impl(mode)
-    }
 }
 
 #[inline]
@@ -885,22 +853,15 @@ fn io_result_to_event_res(res: &io::Result<usize>) -> i32 {
 }
 
 #[inline]
-fn completion_record(
-    user_data: usize,
-    generation: u32,
-    res: i32,
-    flags: u32,
-    payload: Option<crate::driver::slot::ErasedPayload>,
-    detail: Option<io::Result<usize>>,
-) -> CompletionRecord {
+fn completion_record(sidecar: CompletionSidecar) -> CompletionRecord {
     CompletionRecord {
         event: CompletionEvent {
-            user_data: encode_completion_token(user_data, generation),
-            res,
-            flags,
+            user_data: encode_completion_token(sidecar.user_data, sidecar.generation),
+            res: sidecar.res,
+            flags: sidecar.flags,
         },
-        payload,
-        detail,
+        payload: sidecar.payload,
+        detail: sidecar.detail,
     }
 }
 

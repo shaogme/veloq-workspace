@@ -17,7 +17,7 @@ use crate::op::{
 use std::io;
 use std::mem::ManuallyDrop;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, WSABUF};
+use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // ============================================================================
@@ -25,15 +25,15 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 // ============================================================================
 
 #[repr(C)]
-pub struct OverlappedEntry {
-    pub inner: OVERLAPPED,
-    pub user_data: usize,
-    pub generation: u32,
-    pub blocking_result: Option<io::Result<usize>>,
+pub(crate) struct OverlappedEntry {
+    pub(crate) inner: OVERLAPPED,
+    pub(crate) user_data: usize,
+    pub(crate) generation: u32,
+    pub(crate) blocking_result: Option<io::Result<usize>>,
 }
 
 impl OverlappedEntry {
-    pub fn new(user_data: usize) -> Self {
+    pub(crate) fn new(user_data: usize) -> Self {
         Self {
             inner: unsafe { std::mem::zeroed() },
             user_data,
@@ -47,38 +47,38 @@ impl OverlappedEntry {
 // SubmitContext Definition
 // ============================================================================
 
-pub struct SubmitContext<'a> {
-    pub port: HANDLE,
-    pub overlapped: *mut OVERLAPPED,
-    pub ext: &'a Extensions,
-    pub registered_files: &'a [Option<HANDLE>],
-    pub registrar: &'a dyn veloq_buf::BufferRegistrar,
+pub(crate) struct SubmitContext<'a> {
+    pub(crate) port: HANDLE,
+    pub(crate) overlapped: *mut OVERLAPPED,
+    pub(crate) ext: &'a Extensions,
+    pub(crate) registered_files: &'a [Option<HANDLE>],
+    pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
 
     // RIO Support
-    pub rio: &'a mut RioState,
-    pub slots_per_page: usize,
-    pub slab_resolver: &'a dyn Fn(usize) -> Option<(*const u8, usize)>,
+    pub(crate) rio: &'a mut RioState,
+    pub(crate) slots_per_page: usize,
+    pub(crate) slab_resolver: &'a dyn Fn(usize) -> Option<(*const u8, usize)>,
 }
 
 // ============================================================================
 // VTable Definition
 // ============================================================================
 
-pub type SubmitFn =
+pub(crate) type SubmitFn =
     unsafe fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> io::Result<SubmissionResult>;
 
-pub type OnCompleteFn =
+pub(crate) type OnCompleteFn =
     unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> io::Result<usize>;
 
-pub type DropFn = unsafe fn(op: &mut IocpKernelOp);
+pub(crate) type DropFn = unsafe fn(op: &mut IocpKernelOp);
 
-pub type GetFdFn = unsafe fn(op: &IocpKernelOp) -> Option<IoFd>;
+pub(crate) type GetFdFn = unsafe fn(op: &IocpKernelOp) -> Option<IoFd>;
 
-pub struct OpVTable {
-    pub submit: SubmitFn,
-    pub on_complete: Option<OnCompleteFn>,
-    pub drop: DropFn,
-    pub get_fd: GetFdFn,
+pub(crate) struct OpVTable {
+    pub(crate) submit: SubmitFn,
+    pub(crate) on_complete: Option<OnCompleteFn>,
+    pub(crate) drop: DropFn,
+    pub(crate) get_fd: GetFdFn,
 }
 
 // ============================================================================
@@ -90,25 +90,19 @@ use std::ptr::NonNull;
 #[repr(C)]
 pub struct IocpKernelOp {
     /// Virtual Table for dynamic dispatch
-    pub vtable: NonNull<OpVTable>,
+    pub(crate) vtable: NonNull<OpVTable>,
 
     /// Public header accessible directly by Driver
-    pub header: OverlappedEntry,
+    pub(crate) header: OverlappedEntry,
 
     /// Type-erased payload
-    pub payload: IocpOpPayload,
+    pub(crate) payload: IocpOpPayload,
 }
 
 impl PlatformOp for IocpKernelOp {}
 
 impl IocpKernelOp {
-    /// Helper to access the OverlappedEntry (header).
-    /// Kept for compatibility with existing Driver code.
-    pub fn entry_mut(&mut self) -> Option<&mut OverlappedEntry> {
-        Some(&mut self.header)
-    }
-
-    pub fn get_fd(&self) -> Option<IoFd> {
+    pub(crate) fn get_fd(&self) -> Option<IoFd> {
         unsafe { (self.vtable.as_ref().get_fd)(self) }
     }
 }
@@ -141,9 +135,9 @@ macro_rules! define_iocp_ops {
     ) => {
         // Ensure proper alignment
         #[repr(C)]
-        pub union IocpOpPayload {
+        pub(crate) union IocpOpPayload {
             $(
-                pub $field: ManuallyDrop< define_iocp_ops!(@payload_type $OpType $(, $Payload)?) >,
+                pub(crate) $field: ManuallyDrop< define_iocp_ops!(@payload_type $OpType $(, $Payload)?) >,
             )+
         }
 
@@ -221,28 +215,23 @@ macro_rules! define_iocp_ops {
 // Payload Structures for Complex Ops
 // ============================================================================
 
-pub struct KernelRef<T> {
-    pub user: NonNull<T>,
+pub(crate) struct KernelRef<T> {
+    pub(crate) user: NonNull<T>,
 }
 
-pub struct AcceptPayload {
-    pub user: NonNull<Accept>,
-    pub accept_buffer: [u8; 288],
+pub(crate) struct AcceptPayload {
+    pub(crate) user: NonNull<Accept>,
+    pub(crate) accept_buffer: [u8; 288],
 }
 
-pub struct SendToPayload {
-    pub user: NonNull<SendTo>,
-    pub wsabuf: WSABUF,
-    pub addr: SockAddrStorage,
-    pub addr_len: i32,
+pub(crate) struct SendToPayload {
+    pub(crate) user: NonNull<SendTo>,
+    pub(crate) addr: SockAddrStorage,
+    pub(crate) addr_len: i32,
 }
 
-pub struct OpenPayload {
-    pub user: NonNull<Open>,
-}
-
-pub struct WakeupPayload {
-    pub user: NonNull<Wakeup>,
+pub(crate) struct OpenPayload {
+    pub(crate) user: NonNull<Open>,
 }
 
 pub type IocpOp = IocpKernelOp;
@@ -353,13 +342,8 @@ define_iocp_ops! {
                 std::mem::size_of::<SOCKADDR_IN6>() as i32
             };
             debug_assert_eq!(raw_addr_len, addr_len);
-            let wsabuf = WSABUF {
-                len: op.buf.len() as u32,
-                buf: op.buf.as_slice().as_ptr() as *mut u8,
-            };
             SendToPayload {
                 user,
-                wsabuf,
                 addr,
                 addr_len,
             }
@@ -393,12 +377,10 @@ define_iocp_ops! {
     },
     Wakeup {
         field: wakeup,
-        payload: WakeupPayload,
         kind: OpKind::Wakeup,
         submit: submit::submit_wakeup,
         drop: submit::drop_wakeup,
         get_fd: submit::get_fd_wakeup,
-        construct: |user| WakeupPayload { user },
         destruct: |user: Box<Wakeup>| *user,
     },
 }

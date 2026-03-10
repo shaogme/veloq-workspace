@@ -3,32 +3,32 @@ use crate::driver::slot::{SlotEntry, SlotTable};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
-pub struct OpEntry<P> {
-    pub platform_data: P,
+pub(crate) struct OpEntry<P> {
+    pub(crate) platform_data: P,
 }
 
 impl<P> OpEntry<P> {
-    pub fn new(platform_data: P) -> Self {
+    pub(crate) fn new(platform_data: P) -> Self {
         Self { platform_data }
     }
 }
 
-pub struct OpRegistry<Op: PlatformOp, P> {
-    pub shared: Arc<SlotTable<Op>>,
+pub(crate) struct OpRegistry<Op: PlatformOp, P> {
+    pub(crate) shared: Arc<SlotTable<Op>>,
     // Local state storage, indexed by slot index
-    pub local: Box<[OpEntry<P>]>,
+    pub(crate) local: Box<[OpEntry<P>]>,
     // Locally claimed free-chain head. Additional free nodes are fetched from shared stack.
     local_free_head: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OpHandle {
-    pub index: usize,
-    pub generation: u32,
+pub(crate) struct OpHandle {
+    pub(crate) index: usize,
+    pub(crate) generation: u32,
 }
 
-pub struct AllocResult {
-    pub handle: OpHandle,
+pub(crate) struct AllocResult {
+    pub(crate) handle: OpHandle,
 }
 
 impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
@@ -52,7 +52,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    pub fn alloc(&mut self, data: P) -> Result<AllocResult, P> {
+    pub(crate) fn alloc(&mut self, data: P) -> Result<AllocResult, P> {
         if self.local_free_head == SlotTable::<Op>::NULL_INDEX {
             self.local_free_head = self.shared.pop_all();
         }
@@ -88,7 +88,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
     /// Insert equivalent (for compatibility with previous interface)
     /// Note: This consumes entry but we only need platform_data.
     /// The actual resource Op should be placed into slot by caller.
-    pub fn insert(&mut self, entry: OpEntry<P>) -> Result<OpHandle, OpEntry<P>> {
+    pub(crate) fn insert(&mut self, entry: OpEntry<P>) -> Result<OpHandle, OpEntry<P>> {
         match self.alloc(entry.platform_data) {
             Ok(res) => Ok(res.handle),
             Err(data) => Err(OpEntry {
@@ -97,16 +97,18 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    pub fn get(&self, user_data: usize) -> Option<&OpEntry<P>> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn get(&self, user_data: usize) -> Option<&OpEntry<P>> {
         self.local.get(user_data)
     }
 
-    pub fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<P>> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<P>> {
         self.local.get_mut(user_data)
     }
 
     #[allow(dead_code)]
-    pub fn get_slot_and_entry_mut(
+    pub(crate) fn get_slot_and_entry_mut(
         &mut self,
         user_data: usize,
     ) -> Option<(&SlotEntry<Op>, &mut OpEntry<P>)> {
@@ -117,11 +119,11 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    pub fn contains(&self, user_data: usize) -> bool {
+    pub(crate) fn contains(&self, user_data: usize) -> bool {
         user_data < self.local.len()
     }
 
-    pub fn remove(&mut self, user_data: usize) -> OpEntry<P> {
+    pub(crate) fn remove(&mut self, user_data: usize) -> OpEntry<P> {
         // In this fixed-size registry, remove doesn't actually remove memory.
         // It just marks index as free.
         // We return the data by replacing it with default.
@@ -137,14 +139,8 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    // Windows compatibility helpers
     #[cfg(target_os = "windows")]
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut OpEntry<P>)> {
-        self.local.iter_mut().enumerate()
-    }
-
-    #[cfg(target_os = "windows")]
-    pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
+    pub(crate) fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
         // Expose the slot memory. Since it's a single contiguous block,
         // page 0 is the whole thing.
         if page_idx == 0 {
@@ -154,11 +150,6 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         } else {
             None
         }
-    }
-
-    #[cfg(target_os = "windows")]
-    pub fn page_count(&self) -> usize {
-        1
     }
 }
 
