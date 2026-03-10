@@ -524,20 +524,28 @@ impl<'a> RioCompletionRouter<'a> {
             return;
         };
 
+        let mut consume_outstanding = || {
+            *self.outstanding_count = self.outstanding_count.saturating_sub(1);
+            self.completed_count += 1;
+        };
+
         match kind {
             RioCompletionKind::Pool {
                 actor_id,
                 generation,
             } => {
                 let Some(&handle) = self.actor_routes.get(&actor_id) else {
+                    consume_outstanding();
                     return;
                 };
                 let (pool_submissions, remove_actor) = {
                     let Some(actor) = self.actors.get_mut(&handle) else {
+                        consume_outstanding();
                         return;
                     };
                     let Some(slot_idx) = actor.pool_manager.ack_udp_pool_completion(generation)
                     else {
+                        consume_outstanding();
                         return;
                     };
                     let mut ctx = RioContext {
@@ -561,21 +569,22 @@ impl<'a> RioCompletionRouter<'a> {
                     self.actors.remove(&handle);
                     self.actor_routes.remove(&actor_id);
                 }
-                *self.outstanding_count -= 1;
+                consume_outstanding();
                 *self.outstanding_count += pool_submissions;
-                self.completed_count += 1;
             }
             RioCompletionKind::Op {
                 user_data,
                 generation,
             } => {
                 if user_data >= self.ops.local.len() {
+                    consume_outstanding();
                     return;
                 }
 
                 let op = &mut self.ops.local[user_data];
                 let slot = &self.ops.shared.slots[user_data];
                 if op.platform_data.generation != generation {
+                    consume_outstanding();
                     return;
                 }
 
@@ -608,8 +617,7 @@ impl<'a> RioCompletionRouter<'a> {
                     }
                 }
 
-                *self.outstanding_count -= 1;
-                self.completed_count += 1;
+                consume_outstanding();
             }
         }
     }
@@ -806,7 +814,7 @@ impl RioState {
                         self.actors.remove(&handle);
                     }
                 }
-                self.outstanding_count -= 1;
+                self.outstanding_count = self.outstanding_count.saturating_sub(1);
             }
         }
 
