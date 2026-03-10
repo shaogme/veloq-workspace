@@ -3,10 +3,8 @@
 pub(crate) mod op_registry;
 pub(crate) mod slot;
 use crossbeam_queue::SegQueue;
-use std::any::Any;
 use std::io;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::task::Poll;
 use std::task::Waker;
@@ -28,70 +26,6 @@ pub struct CompletionEvent {
 
 pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
 pub type SharedCompletionTable = Arc<CompletionTable>;
-pub type SharedDetachedPayloadTable = Arc<DetachedPayloadTable>;
-
-pub struct DetachedPayloadCell {
-    generation: AtomicU32,
-    value: Mutex<Option<Box<dyn Any + Send>>>,
-}
-
-impl DetachedPayloadCell {
-    fn new() -> Self {
-        Self {
-            generation: AtomicU32::new(0),
-            value: Mutex::new(None),
-        }
-    }
-}
-
-pub struct DetachedPayloadTable {
-    cells: Box<[DetachedPayloadCell]>,
-}
-
-impl DetachedPayloadTable {
-    pub fn new(capacity: usize) -> Self {
-        let mut cells = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            cells.push(DetachedPayloadCell::new());
-        }
-        Self {
-            cells: cells.into_boxed_slice(),
-        }
-    }
-
-    #[inline]
-    pub fn store(&self, token: u64, payload: Box<dyn Any + Send>) {
-        let (idx, generation) = decode_completion_token(token);
-        if idx >= self.cells.len() {
-            return;
-        }
-        let cell = &self.cells[idx];
-        let mut guard = cell
-            .value
-            .lock()
-            .expect("DetachedPayloadTable mutex poisoned while storing payload");
-        *guard = Some(payload);
-        cell.generation.store(generation, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn try_take(&self, token: u64) -> Option<Box<dyn Any + Send>> {
-        let (idx, generation) = decode_completion_token(token);
-        if idx >= self.cells.len() {
-            return None;
-        }
-        let cell = &self.cells[idx];
-        if cell.generation.load(Ordering::Acquire) != generation {
-            return None;
-        }
-        let mut guard = cell
-            .value
-            .lock()
-            .expect("DetachedPayloadTable mutex poisoned while taking payload");
-        guard.take()
-    }
-}
-
 pub struct CompletionCell {
     expected_generation: AtomicU32,
     ready_generation: AtomicU32,
@@ -244,9 +178,6 @@ pub trait Driver: 'static {
     /// Shared completion table for token-targeted consumption.
     fn completion_table(&self) -> SharedCompletionTable;
 
-    /// Shared detached payload table keyed by completion token.
-    fn detached_payload_table(&self) -> SharedDetachedPayloadTable;
-
     /// Pop one completion event if available.
     fn try_pop_completion(&mut self) -> Option<CompletionEvent> {
         self.completion_queue().pop()
@@ -277,6 +208,33 @@ pub trait Driver: 'static {
     /// Register/replace a waiter for token.
     fn register_completion_waker(&mut self, token: u64, waker: &Waker) {
         self.completion_table().register_waker(token, waker);
+    }
+
+    /// Store detached payload inside driver slot state.
+    fn store_detached_payload(
+        &mut self,
+        user_data: usize,
+        generation: u32,
+        payload: Box<dyn std::any::Any + Send>,
+    ) {
+        let slots = self.slot_table();
+        let slot = &slots.slots[user_data];
+        if slot.generation.load(Ordering::Acquire) == generation {
+            unsafe {
+                *slot.detached_payload.get() = Some(payload);
+            }
+        }
+    }
+
+    /// Take detached payload from driver slot state by token.
+    fn take_detached_payload(&mut self, token: u64) -> Option<Box<dyn std::any::Any + Send>> {
+        let (user_data, generation) = decode_completion_token(token);
+        let slots = self.slot_table();
+        let slot = &slots.slots[user_data];
+        if slot.generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        unsafe { (*slot.detached_payload.get()).take() }
     }
 
     /// Cancel an operation.

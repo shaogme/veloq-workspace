@@ -11,8 +11,7 @@ pub mod submit;
 pub use inner::{UringDriver, UringOpState};
 
 use crate::driver::{
-    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
-    SharedDetachedPayloadTable, SubmitBinder,
+    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
 };
 use inner::UringWaker;
 use op::UringOp;
@@ -106,6 +105,9 @@ impl Driver for UringDriver {
                 index: id,
                 generation,
             }) => {
+                if let Some(entry) = self.ops.get_mut(id) {
+                    entry.platform_data.generation = generation;
+                }
                 trace!(id, generation, "Reserved op slot");
                 Ok((id, generation))
             }
@@ -187,10 +189,6 @@ impl Driver for UringDriver {
 
     fn completion_table(&self) -> SharedCompletionTable {
         self.completion_table.clone()
-    }
-
-    fn detached_payload_table(&self) -> SharedDetachedPayloadTable {
-        self.detached_payloads.clone()
     }
 
     fn wait_and_drain_completions(

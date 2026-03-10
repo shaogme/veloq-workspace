@@ -13,7 +13,7 @@ use crate::driver::slot::STATE_SUBMITTED;
 use crate::driver::uring::op::UringOp;
 use crate::driver::{
     CompletionEvent, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
-    SharedDetachedPayloadTable, encode_completion_token,
+    encode_completion_token,
 };
 use crate::op::IntoPlatformOp;
 
@@ -30,8 +30,8 @@ pub enum OpLifecycle {
     Cancelled,
 }
 
-#[derive(Clone)]
 pub struct UringOpState {
+    pub generation: u32,
     pub lifecycle: OpLifecycle,
     pub next: Option<usize>,
     pub timer_id: Option<veloq_wheel::TaskId>,
@@ -40,6 +40,7 @@ pub struct UringOpState {
 impl Default for UringOpState {
     fn default() -> Self {
         Self {
+            generation: 0,
             lifecycle: OpLifecycle::Completed,
             next: None,
             timer_id: None,
@@ -102,7 +103,6 @@ pub struct UringDriver {
     pub(crate) pending_cancellations: VecDeque<usize>,
     pub(crate) completion_events: SharedCompletionQueue,
     pub(crate) completion_table: SharedCompletionTable,
-    pub(crate) detached_payloads: SharedDetachedPayloadTable,
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_token: Option<usize>,
@@ -157,9 +157,6 @@ impl UringDriver {
             pending_cancellations: VecDeque::new(),
             completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
             completion_table: std::sync::Arc::new(crate::driver::CompletionTable::new(
-                entries as usize,
-            )),
-            detached_payloads: std::sync::Arc::new(crate::driver::DetachedPayloadTable::new(
                 entries as usize,
             )),
             waker_fd: Arc::new(EventFd { fd: waker_fd }),
@@ -303,6 +300,7 @@ impl UringDriver {
             <crate::op::Wakeup as IntoPlatformOp<UringDriver>>::into_kernel_and_payload(op);
 
         let state = UringOpState {
+            generation: 0,
             lifecycle: OpLifecycle::Pending, // Will change to InFlight below
             next: None,
             timer_id: None,
@@ -313,10 +311,14 @@ impl UringDriver {
         if let Ok(crate::driver::op_registry::AllocResult {
             handle:
                 crate::driver::op_registry::OpHandle {
-                    index: user_data, ..
+                    index: user_data,
+                    generation,
                 },
         }) = result
         {
+            if let Some(entry) = self.ops.get_mut(user_data) {
+                entry.platform_data.generation = generation;
+            }
             self.waker_token = Some(user_data);
             self.waker_payload = Some(payload);
             let slot = &self.ops.shared.slots[user_data];

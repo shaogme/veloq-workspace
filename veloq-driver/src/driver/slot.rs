@@ -45,6 +45,7 @@ pub struct Slot<Op> {
     // - SUBMITTED: Driver reads Op pointer to pass to kernel
     // - COMPLETED: Future takes Op
     pub op: UnsafeCell<Option<Op>>,
+    pub detached_payload: UnsafeCell<Option<Box<dyn std::any::Any + Send>>>,
 
     // Windows IOCP specific field (Embedded Overlapped)
     // Enabled only on Windows for pointer reconstruction (Container_of pattern)
@@ -69,6 +70,7 @@ impl<Op> Slot<Op> {
             state: AtomicU8::new(STATE_EMPTY),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             op: UnsafeCell::new(None),
+            detached_payload: UnsafeCell::new(None),
             #[cfg(windows)]
             overlapped: UnsafeCell::new(OverlappedEntry {
                 inner: unsafe { std::mem::zeroed() },
@@ -82,6 +84,9 @@ impl<Op> Slot<Op> {
     pub fn reset(&self, generation: u32) {
         self.state.store(STATE_EMPTY, Ordering::Release);
         self.generation.store(generation, Ordering::Release);
+        unsafe {
+            *self.detached_payload.get() = None;
+        }
         #[cfg(windows)]
         unsafe {
             let entry = OverlappedEntry {

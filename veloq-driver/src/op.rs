@@ -21,8 +21,8 @@ use veloq_buf::FixedBuf;
 use crate::RawHandle;
 use crate::SockAddrStorage;
 use crate::driver::{
-    Driver, PlatformDriver, SharedCompletionTable, SharedDetachedPayloadTable, SubmitBinder,
-    decode_completion_token, encode_completion_token, event_res_to_io,
+    Driver, PlatformDriver, SharedCompletionTable, SubmitBinder, decode_completion_token,
+    encode_completion_token, event_res_to_io,
 };
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
@@ -191,8 +191,8 @@ impl<T> Op<T> {
                 let mut op_platform = Some(kernel_op);
                 let token = encode_completion_token(user_data, generation);
                 let completion_table = driver.completion_table();
-                let detached_payloads = driver.detached_payload_table();
-                detached_payloads.store(token, Box::new(payload));
+                let slot_table = driver.slot_table();
+                driver.store_detached_payload(user_data, generation, Box::new(payload));
 
                 if let Err(e) = driver
                     .submit(user_data, &mut op_platform, SubmitBinder::new())
@@ -203,32 +203,38 @@ impl<T> Op<T> {
                     // If the platform op is returned, propagate immediate failure with payload.
                     // Otherwise, fall back to slot-monitoring path and let generation check resolve.
                     if let Some(op) = op_platform.take() {
-                        let payload = detached_payloads
-                            .try_take(token)
+                        let payload = driver
+                            .take_detached_payload(token)
                             .and_then(|boxed| boxed.downcast::<T::UserPayload>().ok())
                             .map(|boxed| *boxed)
                             .expect("Detached payload missing while recovering submit failure");
                         drop(op);
+                        let slot_table_ptr = &*slot_table as *const _;
                         DetachedOp {
                             completion_table: None,
-                            detached_payloads: None,
+                            slot_table_ptr,
+                            _slot_table_owner: Box::new(slot_table),
                             token: 0,
                             immediate_failure: Some((e, T::from_user_payload(payload))),
                             _phantom: std::marker::PhantomData,
                         }
                     } else {
+                        let slot_table_ptr = &*slot_table as *const _;
                         DetachedOp {
                             completion_table: Some(completion_table),
-                            detached_payloads: Some(detached_payloads),
+                            slot_table_ptr,
+                            _slot_table_owner: Box::new(slot_table),
                             token,
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
                         }
                     }
                 } else {
+                    let slot_table_ptr = &*slot_table as *const _;
                     DetachedOp {
                         completion_table: Some(completion_table),
-                        detached_payloads: Some(detached_payloads),
+                        slot_table_ptr,
+                        _slot_table_owner: Box::new(slot_table),
                         token,
                         immediate_failure: None,
                         _phantom: std::marker::PhantomData,
@@ -238,9 +244,12 @@ impl<T> Op<T> {
             Err(e) => {
                 // Reservation failed (e.g. full).
                 // Return DetachedOp with immediate failure.
+                let slot_table = driver.slot_table();
+                let slot_table_ptr = &*slot_table as *const _;
                 DetachedOp {
                     completion_table: None,
-                    detached_payloads: None,
+                    slot_table_ptr,
+                    _slot_table_owner: Box::new(slot_table),
                     token: 0,
                     immediate_failure: Some((e, data)),
                     _phantom: std::marker::PhantomData,
@@ -271,20 +280,11 @@ where
     T: IntoPlatformOp<D>,
 {
     completion_table: Option<SharedCompletionTable>,
-    detached_payloads: Option<SharedDetachedPayloadTable>,
+    slot_table_ptr: *const crate::driver::slot::SlotTable<D::Op>,
+    _slot_table_owner: Box<dyn std::any::Any>,
     token: u64,
     immediate_failure: Option<(std::io::Error, T)>,
     _phantom: std::marker::PhantomData<(T, D)>,
-}
-
-// DetachedOp is Send/Sync if the Op data is Send and the Driver Op is Send (implied by SlotTable<Op> bound).
-unsafe impl<T: IntoPlatformOp<D> + std::marker::Send, D: Driver> std::marker::Send
-    for DetachedOp<T, D>
-{
-}
-unsafe impl<T: IntoPlatformOp<D> + std::marker::Send, D: Driver> std::marker::Sync
-    for DetachedOp<T, D>
-{
 }
 
 impl<T, D> Future for DetachedOp<T, D>
@@ -306,18 +306,21 @@ where
             .as_ref()
             .expect("DetachedOp missing completion_table but no immediate_failure");
         if let Some(event) = table.try_take(this.token) {
-            let payload_table = this
-                .detached_payloads
-                .as_ref()
-                .expect("DetachedOp missing detached payload table on completion");
-            let payload = match payload_table
-                .try_take(this.token)
+            let (idx, generation) = decode_completion_token(this.token);
+            let slot_table = unsafe { &*this.slot_table_ptr };
+            let slot = &slot_table.slots[idx];
+            let payload =
+                if slot.generation.load(std::sync::atomic::Ordering::Acquire) == generation {
+                    unsafe { (*slot.detached_payload.get()).take() }
+                } else {
+                    None
+                };
+            let payload = match payload
                 .and_then(|boxed| boxed.downcast::<T::UserPayload>().ok())
                 .map(|boxed| *boxed)
             {
                 Some(payload) => payload,
                 None => {
-                    let (idx, generation) = decode_completion_token(this.token);
                     let err = std::io::Error::other(format!(
                         "Detached payload lost for idx={idx}, generation={generation}"
                     ));
