@@ -422,42 +422,43 @@ impl UdpPoolManager {
         self.grow_udp_pool_to(initial, rq, actor_id, ctx)
     }
 
-    #[allow(clippy::result_large_err)]
     fn deliver_udp_datagram_to_waiter(
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
         user_data: usize,
         expected_generation: u32,
-        datagram: UdpRecvDatagram,
-    ) -> Result<(), UdpRecvDatagram> {
+        datagram: &mut Option<UdpRecvDatagram>,
+    ) -> bool {
         if user_data >= ops.local.len() {
-            return Err(datagram);
+            return false;
         }
         let op = &mut ops.local[user_data];
         let slot = &ops.shared.slots[user_data];
         if op.platform_data.generation != expected_generation {
-            return Err(datagram);
+            return false;
         }
         if !matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-            return Err(datagram);
+            return false;
         }
 
         let Some(iocp_op) = (unsafe { &mut *slot.op.get() }).as_mut() else {
-            return Err(datagram);
+            return false;
         };
 
         let stream_op: &mut UdpRecvStream = unsafe { &mut iocp_op.payload.udp_recv_stream };
-        let datagram_len = datagram.buf.len();
+
+        let owned_datagram = datagram.take().unwrap();
+        let datagram_len = owned_datagram.buf.len();
 
         let addr = unsafe {
             let s = std::slice::from_raw_parts(
-                &datagram.addr as *const _ as *const u8,
-                datagram.addr_len as usize,
+                &owned_datagram.addr as *const _ as *const u8,
+                owned_datagram.addr_len as usize,
             );
             crate::to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
         };
 
         stream_op.result = Some(crate::op::UdpRecvDatagram {
-            buf: datagram.buf,
+            buf: owned_datagram.buf,
             addr,
         });
 
@@ -466,7 +467,7 @@ impl UdpPoolManager {
         unsafe { *slot.result.get() = Some(Ok(datagram_len)) };
         slot.state.store(STATE_COMPLETED, Ordering::Release);
         slot.waker.wake();
-        Ok(())
+        true
     }
 
     fn into_op_udp_datagram(datagram: UdpRecvDatagram) -> crate::op::UdpRecvDatagram {
@@ -486,7 +487,7 @@ impl UdpPoolManager {
 
     fn dispatch_udp_waiters(&mut self, ops: &mut OpRegistry<IocpOp, IocpOpState>) {
         loop {
-            let (waiter, datagram) = {
+            let (waiter, mut datagram) = {
                 let Some(pool) = self.pool.as_mut() else {
                     return;
                 };
@@ -497,13 +498,13 @@ impl UdpPoolManager {
                     pool.waiters.push_front(waiter);
                     return;
                 };
-                (waiter, datagram)
+                (waiter, Some(datagram))
             };
 
             let (user_data, generation) = waiter;
-            if let Err(returned_datagram) =
-                Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram)
+            if !Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, &mut datagram)
                 && let Some(pool) = self.pool.as_mut()
+                && let Some(returned_datagram) = datagram
             {
                 pool.queue.push_front(returned_datagram);
                 if pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP {

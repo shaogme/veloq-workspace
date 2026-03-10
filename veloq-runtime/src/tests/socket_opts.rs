@@ -74,7 +74,7 @@ fn test_udp_socket_options() {
             .set_broadcast(true)
             .expect("Failed to set broadcast");
         builder
-            .set_recv_buffer_size(65536)
+            .set_recv_buffer_size(4096)
             .expect("Failed to set rcvbuf");
         builder
             .set_reuse_address(true)
