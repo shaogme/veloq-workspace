@@ -928,7 +928,6 @@ impl RioState {
         buf: &mut veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
         let (fd, handle, overlapped) = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {
@@ -959,7 +958,6 @@ impl RioState {
         buf: &veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
         let (fd, handle, overlapped) = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {
@@ -990,7 +988,6 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
         use windows_sys::Win32::Networking::WinSock::{
             AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
         };
@@ -1109,7 +1106,6 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
         let RioRecvFromArgs {
             fd,
             handle,
@@ -1196,7 +1192,6 @@ impl RioState {
         args: RioUdpStreamArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
         let RioUdpStreamArgs {
             fd,
             handle,
