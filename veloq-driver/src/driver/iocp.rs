@@ -21,6 +21,16 @@ use submit::SubmissionResult;
 use tracing::{debug, trace};
 use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
 
+#[cfg(feature = "test-hooks")]
+impl crate::driver::test_hooks::DriverTestHooks for IocpDriver {
+    fn debug_chunk_register_attempts(&self) -> u64 {
+        self.rio_state
+            .registry
+            .registration_stats
+            .chunk_register_attempts
+    }
+}
+
 impl Driver for IocpDriver {
     type Op = IocpOp;
 
