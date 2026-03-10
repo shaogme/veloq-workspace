@@ -10,7 +10,8 @@ use crate::driver::uring::UringDriver;
 use crate::driver::uring::submit;
 use crate::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
-    Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
+    Send as OpSend, SendTo, SharedUserPayload, SyncFileRange, Timeout, UdpRecvStream, UdpRefill,
+    Wakeup, WriteFixed,
 };
 use io_uring::squeue;
 use std::io;
@@ -109,7 +110,7 @@ macro_rules! define_uring_ops {
 
         $(
             impl IntoPlatformOp<UringDriver> for $OpType {
-                type UserPayload = Box<$OpType>;
+                type UserPayload = SharedUserPayload<$OpType>;
 
                 fn into_kernel_and_payload(self) -> (UringKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
@@ -122,8 +123,8 @@ macro_rules! define_uring_ops {
                         resolve_chunks: define_uring_ops!(@resolve_chunks $($resolve_chunks)?),
                     };
 
-                    let mut user = Box::new(self);
-                    let user_ptr = std::ptr::NonNull::from(user.as_mut());
+                    let user = SharedUserPayload::new(self);
+                    let user_ptr = user.user_ptr();
                     let payload = define_uring_ops!(@construct user_ptr, $($construct)?, $OpType $(, $Payload)?);
 
                     let op = UringKernelOp {
@@ -163,7 +164,7 @@ macro_rules! define_uring_ops {
     (@construct $user_ptr:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user_ptr) };
 
     // Default destruct: return user payload
-    (@destruct $user_payload:expr, ) => { *$user_payload };
+    (@destruct $user_payload:expr, ) => { $user_payload.into_inner() };
     // Custom destruct
     (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
 }
@@ -291,7 +292,7 @@ define_uring_ops! {
         drop: submit::drop_accept,
         get_fd: submit::get_fd_accept,
         construct: |user| AcceptPayload { user },
-        destruct: |user: Box<Accept>| *user,
+        destruct: |user: SharedUserPayload<Accept>| user.into_inner(),
     }, // Kernel 5.5+
     SendTo {
         field: send_to,
@@ -311,7 +312,7 @@ define_uring_ops! {
                 msghdr: unsafe { std::mem::zeroed() },
             }
         },
-        destruct: |user: Box<SendTo>| *user,
+        destruct: |user: SharedUserPayload<SendTo>| user.into_inner(),
     }, // Kernel 5.1+ (via SendMsg)
     UdpRecvStream {
         field: udp_recv_stream,
@@ -327,7 +328,7 @@ define_uring_ops! {
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
         },
-        destruct: |user: Box<UdpRecvStream>| *user,
+        destruct: |user: SharedUserPayload<UdpRecvStream>| user.into_inner(),
     }, // Kernel 5.1+ (via RecvMsg)
     UdpRefill {
         field: udp_refill,
@@ -344,7 +345,7 @@ define_uring_ops! {
         drop: submit::drop_open,
         get_fd: submit::get_fd_open,
         construct: |user| OpenPayload { user },
-        destruct: |user: Box<Open>| *user,
+        destruct: |user: SharedUserPayload<Open>| user.into_inner(),
     }, // Kernel 5.6+ (via OpenAt)
     Wakeup {
         field: wakeup,
@@ -354,7 +355,7 @@ define_uring_ops! {
         drop: submit::drop_wakeup,
         get_fd: submit::get_fd_wakeup,
         construct: |user| WakeupPayload { user, buf: [0; 8] },
-        destruct: |user: Box<Wakeup>| *user,
+        destruct: |user: SharedUserPayload<Wakeup>| user.into_inner(),
     }, // Kernel 5.6+ (via Read)
     Timeout {
         field: timeout,
@@ -366,6 +367,6 @@ define_uring_ops! {
         strategy: SubmissionStrategy::SoftwareTimer,
         get_timeout: submit::get_timeout_timeout,
         construct: |user| TimeoutPayload { user, ts: [0; 2] },
-        destruct: |user: Box<Timeout>| *user,
+        destruct: |user: SharedUserPayload<Timeout>| user.into_inner(),
     }, // Kernel 5.4+
 }

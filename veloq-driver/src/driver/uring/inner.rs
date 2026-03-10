@@ -105,7 +105,7 @@ pub struct UringDriver {
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_token: Option<usize>,
-    pub(crate) waker_payload: Option<Box<crate::op::Wakeup>>,
+    pub(crate) waker_payload: Option<crate::op::SharedUserPayload<crate::op::Wakeup>>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 

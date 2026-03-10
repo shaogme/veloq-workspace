@@ -15,6 +15,7 @@ use std::{
 };
 
 use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 use tracing::trace;
 use veloq_buf::FixedBuf;
 
@@ -152,6 +153,49 @@ pub trait IntoPlatformOp<D: Driver>: Sized + std::marker::Send {
     {
         drop(op);
         Self::from_user_payload(Default::default())
+    }
+}
+
+/// Shared storage for detached operation user payload.
+///
+/// This keeps the user payload alive independently from the detached future,
+/// while allowing platform ops to hold a stable raw pointer into the same object.
+pub struct SharedUserPayload<T> {
+    inner: Arc<Mutex<Option<T>>>,
+}
+
+impl<T> SharedUserPayload<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some(value))),
+        }
+    }
+
+    pub fn user_ptr(&self) -> std::ptr::NonNull<T> {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("SharedUserPayload mutex poisoned while building kernel op");
+        let value = guard
+            .as_mut()
+            .expect("SharedUserPayload missing value while building kernel op");
+        std::ptr::NonNull::from(value)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner
+            .lock()
+            .expect("SharedUserPayload mutex poisoned while extracting result")
+            .take()
+            .expect("SharedUserPayload already consumed")
+    }
+}
+
+impl<T> Clone for SharedUserPayload<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
