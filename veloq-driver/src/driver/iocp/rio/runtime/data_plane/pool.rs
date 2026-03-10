@@ -1,8 +1,19 @@
-use super::registry::RIO_INVALID_BUFFERID;
-use super::{RioCompletionContext, RioContext, RioDispatch};
+//! UDP receive-pool datapath implementation for RIO.
+//!
+//! The pool amortizes submission overhead by keeping a bounded set of in-flight
+//! receive buffers and dispatching completed datagrams to waiting operations.
+//! It also encodes/decodes pool-specific completion tags and maintains adaptive
+//! credit behavior under idle/load transitions.
+//!
+//! This file represents datapath state machines only; lifecycle teardown is
+//! handled by dedicated shutdown logic in the lifecycle layer.
+
 use crate::SockAddrStorage;
 use crate::driver::iocp::OpLifecycle;
 use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
+use crate::driver::iocp::rio::core::registry::RIO_INVALID_BUFFERID;
+use crate::driver::iocp::rio::core::submit_ops::RioDispatch;
+use crate::driver::iocp::rio::{RioCompletionContext, RioContext};
 use crate::driver::iocp::submit::SubmissionResult;
 use crate::driver::{CompletionEvent, encode_completion_token};
 use crate::op::UdpRecvStream;

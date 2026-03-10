@@ -1,5 +1,16 @@
-use super::RioEnv;
+//! Buffer and request-queue registration state for the RIO backend.
+//!
+//! `RioRegistry` owns all registration metadata required to submit operations:
+//! - chunk registrations for pre-registered slab regions,
+//! - lazy heap-buffer registrations with bounded cache behavior,
+//! - slab-page registrations for address buffers used by `RIOSendEx`,
+//! - deferred deregistration queues for safe teardown sequencing.
+//!
+//! This module is focused on resource identity and lifetime bookkeeping; it
+//! intentionally avoids actor scheduling or completion routing policy.
+
 use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
+use crate::driver::iocp::rio::RioEnv;
 use crate::op::IoFd;
 use rustc_hash::FxHashMap;
 use std::io;
