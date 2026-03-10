@@ -500,11 +500,13 @@ impl UdpPoolManager {
             };
 
             let (user_data, generation) = waiter;
-            if !Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram)
-                && let Some(pool) = self.pool.as_mut()
-                && pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP
-            {
-                let _ = pool.queue.pop_front();
+            if !Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram) {
+                if let Some(pool) = self.pool.as_mut() {
+                    pool.queue.push_back(datagram);
+                    if pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
+                        let _ = pool.queue.pop_front();
+                    }
+                }
             }
         }
     }
