@@ -405,25 +405,12 @@ impl LocalExecutor {
 
     fn sync_memory_chunks(&self, target_epoch: usize) {
         if let Some(registry) = &self.registry {
-            let chunks_guard = registry.memory_chunks.read();
-            let current_len = chunks_guard.len();
+            let current_len = registry.memory_chunks.read().len();
             let processed = self.processed_chunk_count.get();
 
             if processed < current_len {
-                let mut driver = self.driver.borrow_mut();
-                for chunk in chunks_guard.iter().skip(processed) {
-                    if let Err(e) =
-                        driver.register_chunk(chunk.id, chunk.ptr as *const u8, chunk.len)
-                    {
-                        tracing::error!(
-                            ?e,
-                            chunk_id = chunk.id,
-                            "Failed to register new memory chunk"
-                        );
-                    } else {
-                        // tracing::info!(chunk_id = chunk.id, "Registered new memory chunk");
-                    }
-                }
+                // Runtime now only syncs metadata visibility.
+                // Kernel registration is owned by the driver submission path (lazy registration).
                 self.processed_chunk_count.set(current_len);
             }
 
