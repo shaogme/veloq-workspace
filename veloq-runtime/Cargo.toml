@@ -52,3 +52,6 @@ harness = false
 [[bench]]
 name = "sync_alloc_bench"
 harness = false
+
+[lints]
+workspace = true

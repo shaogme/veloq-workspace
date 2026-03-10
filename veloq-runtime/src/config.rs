@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use veloq_buf::nz;
 
 pub use veloq_blocking::BlockingPoolConfig;
-pub use veloq_driver::config::{IocpConfig, UringConfig};
+pub use veloq_driver::config::{BufferRegistrationMode, IocpConfig, UringConfig};
 
 #[derive(Debug, Clone)]
 pub struct Config {

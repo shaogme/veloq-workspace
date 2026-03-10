@@ -41,7 +41,7 @@ pub(crate) type LpfnGetAcceptExSockaddrs = unsafe extern "system" fn(
 );
 
 #[derive(Clone, Copy)]
-pub struct Extensions {
+pub(crate) struct Extensions {
     pub(crate) accept_ex: LpfnAcceptEx,
     pub(crate) connect_ex: LpfnConnectEx,
     pub(crate) get_accept_ex_sockaddrs: LpfnGetAcceptExSockaddrs,

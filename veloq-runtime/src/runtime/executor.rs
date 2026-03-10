@@ -9,8 +9,9 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use crossbeam_deque::Worker;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use veloq_buf::BufferRegistrar;
+use veloq_driver::config::BufferRegistrationMode;
 use veloq_driver::driver::{Driver, PlatformDriver, RemoteWaker};
 
 use crate::runtime::context::RuntimeContext;
@@ -151,6 +152,15 @@ impl LocalExecutorBuilder {
         // Bind the driver's waker to the shared state (Late Binding)
         shared.waker.set(waker);
 
+        // Construct registrar for driver lazy registration path.
+        {
+            let mut driver_ref = driver.borrow_mut();
+            driver_ref.set_registrar(Box::new(ExecutorRegistrar {
+                driver: Rc::downgrade(&driver),
+                registry: self.registry.clone(),
+            }));
+        }
+
         // Construct Registrar and Pool
         let registrar = Box::new(ExecutorRegistrar {
             driver: Rc::downgrade(&driver),
@@ -158,6 +168,11 @@ impl LocalExecutorBuilder {
         });
 
         let buf_pool = pool_constructor(registrar);
+
+        #[cfg(target_os = "linux")]
+        let registration_mode = self.config.uring.registration_mode;
+        #[cfg(target_os = "windows")]
+        let registration_mode = self.config.iocp.registration_mode;
 
         LocalExecutor {
             driver,
@@ -171,6 +186,7 @@ impl LocalExecutorBuilder {
             buf_pool,
             last_seen_epoch: Cell::new(0),
             processed_chunk_count: Cell::new(0),
+            registration_mode,
         }
     }
     pub fn build_with_uniform_pool(self, memory_multiplier: usize) -> LocalExecutor {
@@ -225,6 +241,7 @@ pub struct LocalExecutor {
     // Pull Model State
     last_seen_epoch: Cell<usize>,
     processed_chunk_count: Cell<usize>,
+    registration_mode: BufferRegistrationMode,
 }
 
 impl LocalExecutor {
@@ -405,25 +422,35 @@ impl LocalExecutor {
 
     fn sync_memory_chunks(&self, target_epoch: usize) {
         if let Some(registry) = &self.registry {
-            let chunks_guard = registry.memory_chunks.read();
-            let current_len = chunks_guard.len();
+            let (current_len, new_chunks) = {
+                let chunks = registry.memory_chunks.read();
+                let current_len = chunks.len();
+                let processed = self.processed_chunk_count.get();
+                let new_chunks = chunks.iter().skip(processed).copied().collect::<Vec<_>>();
+                (current_len, new_chunks)
+            };
             let processed = self.processed_chunk_count.get();
 
             if processed < current_len {
-                let mut driver = self.driver.borrow_mut();
-                for chunk in chunks_guard.iter().skip(processed) {
-                    if let Err(e) =
-                        driver.register_chunk(chunk.id, chunk.ptr as *const u8, chunk.len)
-                    {
-                        tracing::error!(
-                            ?e,
-                            chunk_id = chunk.id,
-                            "Failed to register new memory chunk"
-                        );
-                    } else {
-                        // tracing::info!(chunk_id = chunk.id, "Registered new memory chunk");
+                if matches!(self.registration_mode, BufferRegistrationMode::Compatible) {
+                    // Compatibility fallback: best-effort eager registration for newly visible chunks.
+                    let mut driver = self.driver.borrow_mut();
+                    for chunk in &new_chunks {
+                        if let Err(e) =
+                            driver.register_chunk(chunk.id, chunk.ptr as *const u8, chunk.len)
+                        {
+                            warn!(
+                                ?e,
+                                chunk_id = chunk.id,
+                                ptr = chunk.ptr,
+                                len = chunk.len,
+                                "Compatible registration fallback failed"
+                            );
+                        }
                     }
                 }
+
+                // Strict mode stays metadata-only; lazy kernel registration is owned by driver submit path.
                 self.processed_chunk_count.set(current_len);
             }
 

@@ -1,13 +1,15 @@
 use io_uring::{IoUring, opcode, squeue};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
 
-use crate::config::{IoMode, UringConfig};
+use crate::config::{BufferRegistrationMode, IoMode, UringConfig};
 use crate::driver::op_registry::OpRegistry;
 use crate::driver::uring::op::UringOp;
 use crate::driver::{
@@ -92,6 +94,16 @@ impl RemoteWaker for UringWaker {
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 pub(crate) const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
 pub(crate) const MAX_CHUNKS: usize = 1024;
+const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct UringRegistrationStats {
+    pub(crate) chunk_register_attempts: u64,
+    pub(crate) chunk_register_success: u64,
+    pub(crate) chunk_register_failures: u64,
+    pub(crate) chunk_register_skipped_recent_failure: u64,
+    pub(crate) submission_missing_chunk_info: u64,
+}
 
 pub struct UringDriver {
     pub(crate) ring: IoUring,
@@ -111,6 +123,9 @@ pub struct UringDriver {
     pub(crate) wheel: veloq_wheel::Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
     pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
+    pub(crate) registration_stats: UringRegistrationStats,
+    pub(crate) registration_mode: BufferRegistrationMode,
+    chunk_register_failures_recent: HashMap<u16, Instant>,
 }
 
 impl UringDriver {
@@ -166,6 +181,9 @@ impl UringDriver {
             wheel: veloq_wheel::Wheel::new(veloq_wheel::WheelConfig::default()),
             timer_buffer: Vec::new(),
             registrar: Box::new(veloq_buf::NoopRegistrar),
+            registration_stats: UringRegistrationStats::default(),
+            registration_mode: config.registration_mode,
+            chunk_register_failures_recent: HashMap::new(),
         };
 
         driver.submit_waker();
@@ -220,11 +238,33 @@ impl UringDriver {
                                 if !is_registered
                                     && let Some(info) = self.registrar.resolve_chunk_info(chunk_id)
                                 {
-                                    self.register_chunk(
+                                    if let Err(e) = self.register_chunk(
                                         info.id,
                                         info.ptr.as_ptr(),
                                         info.len.get(),
-                                    )?;
+                                    ) {
+                                        if self.registration_mode.is_strict() {
+                                            panic!(
+                                                "strict registration mode: io_uring lazy register failed: chunk_id={}, user_data={}, error={}",
+                                                chunk_id, user_data, e
+                                            );
+                                        }
+                                        return Err(e);
+                                    }
+                                } else if !is_registered {
+                                    self.registration_stats.submission_missing_chunk_info = self
+                                        .registration_stats
+                                        .submission_missing_chunk_info
+                                        .saturating_add(1);
+                                    if self.registration_mode.is_strict() {
+                                        panic!(
+                                            "strict registration mode: io_uring missing chunk info for lazy registration: chunk_id={}, user_data={}",
+                                            chunk_id, user_data
+                                        );
+                                    }
+                                    return Err(io::Error::other(format!(
+                                        "Missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
+                                    )));
                                 }
                             }
                             // -------------------------
@@ -672,6 +712,19 @@ impl UringDriver {
     }
 
     pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
+        if let Some(last_fail) = self.chunk_register_failures_recent.get(&id)
+            && last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN
+        {
+            self.registration_stats
+                .chunk_register_skipped_recent_failure = self
+                .registration_stats
+                .chunk_register_skipped_recent_failure
+                .saturating_add(1);
+            return Err(io::Error::other(format!(
+                "io_uring register_chunk skipped due to recent failure: chunk_id={id}"
+            )));
+        }
+
         let index = id as usize;
         if index >= MAX_CHUNKS {
             return Err(io::Error::new(
@@ -687,14 +740,32 @@ impl UringDriver {
 
         // Use register_buffers_update
         // offset = index
-        unsafe {
+        self.registration_stats.chunk_register_attempts = self
+            .registration_stats
+            .chunk_register_attempts
+            .saturating_add(1);
+        let register_result = unsafe {
             self.ring
                 .submitter()
-                .register_buffers_update(index as u32, &iovecs, None)?;
+                .register_buffers_update(index as u32, &iovecs, None)
+        };
+        if let Err(e) = register_result {
+            self.registration_stats.chunk_register_failures = self
+                .registration_stats
+                .chunk_register_failures
+                .saturating_add(1);
+            self.chunk_register_failures_recent
+                .insert(id, Instant::now());
+            return Err(e);
         }
 
         // Mark as registered in local bitset
         let _ = self.registered_chunks.set(index); // ignore out of bounds error as we checked
+        self.chunk_register_failures_recent.remove(&id);
+        self.registration_stats.chunk_register_success = self
+            .registration_stats
+            .chunk_register_success
+            .saturating_add(1);
 
         Ok(())
     }
