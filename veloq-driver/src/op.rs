@@ -192,7 +192,7 @@ impl<T> Op<T> {
                 let token = encode_completion_token(user_data, generation);
                 let completion_table = driver.completion_table();
                 let slot_table = driver.slot_table();
-                driver.store_detached_payload(user_data, generation, Box::new(payload));
+                driver.store_detached_payload(user_data, generation, payload);
 
                 if let Err(e) = driver
                     .submit(user_data, &mut op_platform, SubmitBinder::new())
@@ -204,37 +204,29 @@ impl<T> Op<T> {
                     // Otherwise, fall back to slot-monitoring path and let generation check resolve.
                     if let Some(op) = op_platform.take() {
                         let payload = driver
-                            .take_detached_payload(token)
-                            .and_then(|boxed| boxed.downcast::<T::UserPayload>().ok())
-                            .map(|boxed| *boxed)
+                            .take_detached_payload::<T::UserPayload>(token)
                             .expect("Detached payload missing while recovering submit failure");
                         drop(op);
-                        let slot_table_ptr = &*slot_table as *const _;
                         DetachedOp {
                             completion_table: None,
-                            slot_table_ptr,
-                            _slot_table_owner: Box::new(slot_table),
+                            slot_table,
                             token: 0,
                             immediate_failure: Some((e, T::from_user_payload(payload))),
                             _phantom: std::marker::PhantomData,
                         }
                     } else {
-                        let slot_table_ptr = &*slot_table as *const _;
                         DetachedOp {
                             completion_table: Some(completion_table),
-                            slot_table_ptr,
-                            _slot_table_owner: Box::new(slot_table),
+                            slot_table,
                             token,
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
                         }
                     }
                 } else {
-                    let slot_table_ptr = &*slot_table as *const _;
                     DetachedOp {
                         completion_table: Some(completion_table),
-                        slot_table_ptr,
-                        _slot_table_owner: Box::new(slot_table),
+                        slot_table,
                         token,
                         immediate_failure: None,
                         _phantom: std::marker::PhantomData,
@@ -245,11 +237,9 @@ impl<T> Op<T> {
                 // Reservation failed (e.g. full).
                 // Return DetachedOp with immediate failure.
                 let slot_table = driver.slot_table();
-                let slot_table_ptr = &*slot_table as *const _;
                 DetachedOp {
                     completion_table: None,
-                    slot_table_ptr,
-                    _slot_table_owner: Box::new(slot_table),
+                    slot_table,
                     token: 0,
                     immediate_failure: Some((e, data)),
                     _phantom: std::marker::PhantomData,
@@ -280,8 +270,7 @@ where
     T: IntoPlatformOp<D>,
 {
     completion_table: Option<SharedCompletionTable>,
-    slot_table_ptr: *const crate::driver::slot::SlotTable<D::Op>,
-    _slot_table_owner: Box<dyn std::any::Any>,
+    slot_table: std::sync::Arc<crate::driver::slot::SlotTable<D::Op>>,
     token: u64,
     immediate_failure: Option<(std::io::Error, T)>,
     _phantom: std::marker::PhantomData<(T, D)>,
@@ -307,18 +296,15 @@ where
             .expect("DetachedOp missing completion_table but no immediate_failure");
         if let Some(event) = table.try_take(this.token) {
             let (idx, generation) = decode_completion_token(this.token);
-            let slot_table = unsafe { &*this.slot_table_ptr };
-            let slot = &slot_table.slots[idx];
+            let slot = &this.slot_table.slots[idx];
             let payload =
-                if slot.generation.load(std::sync::atomic::Ordering::Acquire) == generation {
-                    unsafe { (*slot.detached_payload.get()).take() }
-                } else {
+                if slot.generation.load(std::sync::atomic::Ordering::Acquire) != generation {
                     None
+                } else {
+                    unsafe { (*slot.detached_payload.get()).take() }
+                        .and_then(|payload| payload.try_take::<T::UserPayload>().ok())
                 };
-            let payload = match payload
-                .and_then(|boxed| boxed.downcast::<T::UserPayload>().ok())
-                .map(|boxed| *boxed)
-            {
+            let payload = match payload {
                 Some(payload) => payload,
                 None => {
                     let err = std::io::Error::other(format!(

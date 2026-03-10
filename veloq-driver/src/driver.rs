@@ -211,32 +211,41 @@ pub trait Driver: 'static {
     }
 
     /// Store detached payload inside driver slot state.
-    fn store_detached_payload(
+    fn store_detached_payload<T: Send + 'static>(
         &mut self,
         user_data: usize,
         generation: u32,
-        payload: Box<dyn std::any::Any + Send>,
+        payload: T,
     ) {
         let slots = self.slot_table();
         let slot = &slots.slots[user_data];
         if slot.generation.load(Ordering::Acquire) == generation {
             unsafe {
-                *slot.detached_payload.get() = Some(payload);
+                *slot.detached_payload.get() = Some(slot::DetachedPayload::new(payload));
             }
         }
     }
 
     /// Take detached payload from driver slot state by token.
-    fn take_detached_payload(&mut self, token: u64) -> Option<Box<dyn std::any::Any + Send>> {
+    fn take_detached_payload<T: Send + 'static>(&mut self, token: u64) -> Option<T> {
         let (user_data, generation) = decode_completion_token(token);
+        self.take_detached_payload_from_slot::<T>(user_data, generation)
+    }
+
+    /// Take detached payload from a slot if generation/type match.
+    fn take_detached_payload_from_slot<T: Send + 'static>(
+        &mut self,
+        user_data: usize,
+        generation: u32,
+    ) -> Option<T> {
         let slots = self.slot_table();
         let slot = &slots.slots[user_data];
         if slot.generation.load(Ordering::Acquire) != generation {
             return None;
         }
-        unsafe { (*slot.detached_payload.get()).take() }
+        let payload = unsafe { (*slot.detached_payload.get()).take() }?;
+        payload.try_take::<T>().ok()
     }
-
     /// Cancel an operation.
     fn cancel_op(&mut self, user_data: usize);
 

@@ -1,4 +1,5 @@
 use crossbeam_utils::CachePadded;
+use std::any::TypeId;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
@@ -8,6 +9,51 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 // State definitions
 pub const STATE_EMPTY: u8 = 0;
 pub const STATE_SUBMITTED: u8 = 1; // Submitted to kernel (Driver owns Op)
+
+#[derive(Debug)]
+pub struct DetachedPayload {
+    ptr: *mut (),
+    type_id: TypeId,
+    drop_fn: unsafe fn(*mut ()),
+}
+
+impl DetachedPayload {
+    #[inline]
+    pub fn new<T: Send + 'static>(payload: T) -> Self {
+        unsafe fn drop_impl<T>(ptr: *mut ()) {
+            unsafe {
+                drop(Box::from_raw(ptr as *mut T));
+            }
+        }
+
+        Self {
+            ptr: Box::into_raw(Box::new(payload)) as *mut (),
+            type_id: TypeId::of::<T>(),
+            drop_fn: drop_impl::<T>,
+        }
+    }
+
+    #[inline]
+    pub fn type_matches<T: 'static>(&self) -> bool {
+        self.type_id == TypeId::of::<T>()
+    }
+
+    #[inline]
+    pub fn try_take<T: Send + 'static>(self) -> Result<T, Self> {
+        if !self.type_matches::<T>() {
+            return Err(self);
+        }
+        let value = unsafe { *Box::from_raw(self.ptr as *mut T) };
+        std::mem::forget(self);
+        Ok(value)
+    }
+}
+
+impl Drop for DetachedPayload {
+    fn drop(&mut self) {
+        unsafe { (self.drop_fn)(self.ptr) };
+    }
+}
 
 #[repr(C)]
 #[cfg(windows)]
@@ -45,7 +91,7 @@ pub struct Slot<Op> {
     // - SUBMITTED: Driver reads Op pointer to pass to kernel
     // - COMPLETED: Future takes Op
     pub op: UnsafeCell<Option<Op>>,
-    pub detached_payload: UnsafeCell<Option<Box<dyn std::any::Any + Send>>>,
+    pub detached_payload: UnsafeCell<Option<DetachedPayload>>,
 
     // Windows IOCP specific field (Embedded Overlapped)
     // Enabled only on Windows for pointer reconstruction (Container_of pattern)
