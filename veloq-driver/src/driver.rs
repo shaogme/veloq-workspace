@@ -14,21 +14,30 @@ use veloq_atomic_waker::AtomicWaker;
 /// Platform-specific operation trait
 pub trait PlatformOp: 'static {}
 
+pub(crate) struct CompletionSidecar {
+    user_data: usize,
+    generation: u32,
+    res: i32,
+    flags: u32,
+    payload: Option<crate::driver::slot::ErasedPayload>,
+    detail: Option<io::Result<usize>>,
+}
+
 /// Unified completion event produced by platform drivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompletionEvent {
     /// Encoded completion token (generation + slot index).
-    pub user_data: u64,
+    pub(crate) user_data: u64,
     /// Completion result code. Non-negative for success, negative for error.
-    pub res: i32,
+    pub(crate) res: i32,
     /// Platform-specific completion flags.
-    pub flags: u32,
+    pub(crate) flags: u32,
 }
 
 pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
 pub type SharedCompletionTable = Arc<CompletionTable>;
 
-pub struct CompletionCell {
+pub(crate) struct CompletionCell {
     expected_generation: AtomicU32,
     ready_generation: AtomicU32,
     ready: AtomicBool,
@@ -59,9 +68,9 @@ impl CompletionCell {
 }
 
 pub struct CompletionRecord {
-    pub event: CompletionEvent,
-    pub payload: Option<slot::ErasedPayload>,
-    pub detail: Option<io::Result<usize>>,
+    pub(crate) event: CompletionEvent,
+    pub(crate) payload: Option<slot::ErasedPayload>,
+    pub(crate) detail: Option<io::Result<usize>>,
 }
 
 pub struct CompletionTable {
@@ -69,7 +78,7 @@ pub struct CompletionTable {
 }
 
 impl CompletionTable {
-    pub fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         let mut cells = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             cells.push(CompletionCell::new());
@@ -80,12 +89,7 @@ impl CompletionTable {
     }
 
     #[inline]
-    pub fn record_completion(&self, event: CompletionEvent) {
-        self.record_completion_with_data(event, None, None);
-    }
-
-    #[inline]
-    pub fn record_completion_with_data(
+    pub(crate) fn record_completion_with_data(
         &self,
         event: CompletionEvent,
         payload: Option<slot::ErasedPayload>,
@@ -117,12 +121,12 @@ impl CompletionTable {
     }
 
     #[inline]
-    pub fn try_take(&self, token: u64) -> Option<CompletionEvent> {
+    pub(crate) fn try_take(&self, token: u64) -> Option<CompletionEvent> {
         self.try_take_record(token).map(|record| record.event)
     }
 
     #[inline]
-    pub fn try_take_record(&self, token: u64) -> Option<CompletionRecord> {
+    pub(crate) fn try_take_record(&self, token: u64) -> Option<CompletionRecord> {
         let (idx, generation) = decode_completion_token(token);
         if idx >= self.cells.len() {
             return None;
@@ -155,7 +159,7 @@ impl CompletionTable {
     }
 
     #[inline]
-    pub fn register_waker(&self, token: u64, waker: &Waker) {
+    pub(crate) fn register_waker(&self, token: u64, waker: &Waker) {
         let (idx, generation) = decode_completion_token(token);
         if idx >= self.cells.len() {
             return;
@@ -170,33 +174,22 @@ impl CompletionTable {
             waker.wake_by_ref();
         }
     }
-
-    #[inline]
-    pub fn is_ready(&self, token: u64) -> bool {
-        let (idx, generation) = decode_completion_token(token);
-        if idx >= self.cells.len() {
-            return false;
-        }
-        let cell = &self.cells[idx];
-        cell.ready.load(Ordering::Acquire)
-            && cell.ready_generation.load(Ordering::Acquire) == generation
-    }
 }
 
 #[inline]
-pub fn encode_completion_token(index: usize, generation: u32) -> u64 {
+pub(crate) fn encode_completion_token(index: usize, generation: u32) -> u64 {
     ((generation as u64) << 32) | (index as u32 as u64)
 }
 
 #[inline]
-pub fn decode_completion_token(token: u64) -> (usize, u32) {
+pub(crate) fn decode_completion_token(token: u64) -> (usize, u32) {
     let index = (token & 0xffff_ffff) as usize;
     let generation = (token >> 32) as u32;
     (index, generation)
 }
 
 #[inline]
-pub fn event_res_to_io(res: i32) -> io::Result<usize> {
+pub(crate) fn event_res_to_io(res: i32) -> io::Result<usize> {
     if res >= 0 {
         Ok(res as usize)
     } else {
@@ -315,11 +308,6 @@ pub trait RemoteWaker: Send + Sync {
     fn wake(&self) -> io::Result<()>;
 }
 
-/// A trait for processing detached completion logic.
-pub trait DetachedCompleter: Send {
-    fn complete(self: Box<Self>, res: io::Result<usize>);
-}
-
 // Platform-specific driver implementations
 
 /// A wrapper for driver method return values that enforces resource state management.
@@ -328,7 +316,7 @@ pub struct Outcome<T>(T);
 
 impl<T> Outcome<T> {
     #[inline]
-    pub fn into_inner(self) -> T {
+    pub(crate) fn into_inner(self) -> T {
         self.0
     }
 }
@@ -339,19 +327,19 @@ pub struct SubmitBinder;
 
 impl SubmitBinder {
     #[inline]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self
     }
 
     /// Finish submission with success. The Op is assumed to be held by the driver.
     #[inline]
-    pub fn ok(self, poll: Poll<()>) -> Outcome<io::Result<Poll<()>>> {
+    pub(crate) fn ok(self, poll: Poll<()>) -> Outcome<io::Result<Poll<()>>> {
         Outcome(Ok(poll))
     }
 
     /// Finish submission with failure.
     #[inline]
-    pub fn err(self, err: io::Error) -> Outcome<io::Result<Poll<()>>> {
+    pub(crate) fn err(self, err: io::Error) -> Outcome<io::Result<Poll<()>>> {
         Outcome(Err(err))
     }
 }

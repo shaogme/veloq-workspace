@@ -11,7 +11,7 @@ use crate::config::{IoMode, UringConfig};
 use crate::driver::op_registry::OpRegistry;
 use crate::driver::uring::op::UringOp;
 use crate::driver::{
-    CompletionEvent, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    CompletionEvent, CompletionSidecar, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
     encode_completion_token,
 };
 use crate::op::IntoPlatformOp;
@@ -402,7 +402,14 @@ impl UringDriver {
                     let slot = &self.ops.shared.slots[user_data];
                     let payload = unsafe { (*slot.payload.get()).take() };
                     let detail = unsafe { (*slot.result.get()).take() };
-                    self.push_completion_event(user_data, generation, 0, 0, payload, detail);
+                    self.push_completion_event(CompletionSidecar {
+                        user_data,
+                        generation,
+                        res: 0,
+                        flags: 0,
+                        payload,
+                        detail,
+                    });
                     self.ops.remove(user_data);
                 }
             }
@@ -426,14 +433,7 @@ impl UringDriver {
     pub(crate) fn process_completions_internal(&mut self) {
         let mut needs_waker_resubmit = false;
 
-        let mut pending_events: Vec<(
-            usize,
-            u32,
-            i32,
-            u32,
-            Option<crate::driver::slot::ErasedPayload>,
-            Option<io::Result<usize>>,
-        )> = Vec::new();
+        let mut pending_events: Vec<CompletionSidecar> = Vec::new();
         {
             let mut cqe_kicker = self.ring.completion();
             cqe_kicker.sync();
@@ -464,14 +464,14 @@ impl UringDriver {
                         let generation = slot.generation.load(Ordering::Acquire);
                         let payload = unsafe { (*slot.payload.get()).take() };
                         let detail = unsafe { (*slot.result.get()).take() };
-                        pending_events.push((
+                        pending_events.push(CompletionSidecar {
                             user_data,
                             generation,
-                            cqe.result(),
-                            cqe.flags(),
+                            res: cqe.result(),
+                            flags: cqe.flags(),
                             payload,
                             detail,
-                        ));
+                        });
                         unsafe {
                             *slot.op.get() = None;
                         }
@@ -501,22 +501,22 @@ impl UringDriver {
                             detail = clone_result_if_non_os_error(&final_res);
                         }
                         let payload = unsafe { (*slot.payload.get()).take() };
-                        pending_events.push((
+                        pending_events.push(CompletionSidecar {
                             user_data,
                             generation,
-                            res_code,
-                            cqe.flags(),
+                            res: res_code,
+                            flags: cqe.flags(),
                             payload,
                             detail,
-                        ));
+                        });
                         let _ = unsafe { (*slot.op.get()).take() };
                         self.ops.remove(user_data);
                     }
                 }
             }
         }
-        for (user_data, generation, res_code, flags, payload, detail) in pending_events {
-            self.push_completion_event(user_data, generation, res_code, flags, payload, detail);
+        for sidecar in pending_events {
+            self.push_completion_event(sidecar);
         }
 
         if needs_waker_resubmit {
@@ -725,14 +725,14 @@ impl UringDriver {
                     let slot = &self.ops.shared.slots[user_data];
                     let payload = unsafe { (*slot.payload.get()).take() };
                     let detail = unsafe { (*slot.result.get()).take() };
-                    self.push_completion_event(
+                    self.push_completion_event(CompletionSidecar {
                         user_data,
                         generation,
-                        -libc::ECANCELED,
-                        0,
+                        res: -libc::ECANCELED,
+                        flags: 0,
                         payload,
                         detail,
-                    );
+                    });
                     self.ops.remove(user_data);
                 }
             }
@@ -753,14 +753,14 @@ impl UringDriver {
                         let slot = &self.ops.shared.slots[user_data];
                         let payload = unsafe { (*slot.payload.get()).take() };
                         let detail = unsafe { (*slot.result.get()).take() };
-                        self.push_completion_event(
+                        self.push_completion_event(CompletionSidecar {
                             user_data,
                             generation,
-                            -libc::ECANCELED,
-                            0,
+                            res: -libc::ECANCELED,
+                            flags: 0,
                             payload,
                             detail,
-                        );
+                        });
                         self.ops.remove(user_data);
                     }
                     return;
@@ -790,23 +790,15 @@ fn io_result_to_event_res(res: &io::Result<usize>) -> i32 {
 
 impl UringDriver {
     #[inline]
-    pub(crate) fn push_completion_event(
-        &mut self,
-        user_data: usize,
-        generation: u32,
-        res: i32,
-        flags: u32,
-        payload: Option<crate::driver::slot::ErasedPayload>,
-        detail: Option<io::Result<usize>>,
-    ) {
-        let token = encode_completion_token(user_data, generation);
+    pub(crate) fn push_completion_event(&mut self, sidecar: CompletionSidecar) {
+        let token = encode_completion_token(sidecar.user_data, sidecar.generation);
         let event = CompletionEvent {
             user_data: token,
-            res,
-            flags,
+            res: sidecar.res,
+            flags: sidecar.flags,
         };
         self.completion_table
-            .record_completion_with_data(event, payload, detail);
+            .record_completion_with_data(event, sidecar.payload, sidecar.detail);
         self.completion_events.push(event);
     }
 }

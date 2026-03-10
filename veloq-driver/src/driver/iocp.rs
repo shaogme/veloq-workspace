@@ -9,7 +9,8 @@ mod tests;
 
 use crate::driver::op_registry::OpEntry;
 use crate::driver::{
-    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+    CompletionSidecar, Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    SubmitBinder,
 };
 pub use inner::{CloseMode, IocpDriver, IocpOpState, OpLifecycle};
 use op::IocpOp;
@@ -19,15 +20,6 @@ use std::task::Poll;
 use submit::SubmissionResult;
 use tracing::{debug, trace};
 use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
-
-pub(crate) struct CompletionSidecar {
-    user_data: usize,
-    generation: u32,
-    res: i32,
-    flags: u32,
-    payload: Option<crate::driver::slot::ErasedPayload>,
-    detail: Option<io::Result<usize>>,
-}
 
 impl Driver for IocpDriver {
     type Op = IocpOp;

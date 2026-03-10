@@ -38,14 +38,11 @@ pub enum OpLifecycle {
     Completed,
     /// Cancelled by user
     Cancelled,
-    /// Detached completion notifier path.
-    Detached,
 }
 
 pub struct IocpOpState {
     pub(crate) generation: u32,
     pub(crate) lifecycle: OpLifecycle,
-    pub(crate) detached_notifier: Option<Box<dyn crate::driver::DetachedCompleter>>,
     pub(crate) timer_id: Option<TaskId>,
     pub(crate) timer_deadline: Option<Instant>,
     pub(crate) is_background: bool,
@@ -62,7 +59,6 @@ impl Default for IocpOpState {
         Self {
             generation: 0,
             lifecycle: OpLifecycle::Pending,
-            detached_notifier: None,
             timer_id: None,
             timer_deadline: None,
             is_background: false,
@@ -315,52 +311,7 @@ impl IocpDriver {
         let now = Instant::now();
 
         for &user_data in &timer_buffer {
-            let is_detached = if let Some(op) = ops_local.get_mut(user_data) {
-                op.platform_data.detached_notifier.is_some()
-            } else {
-                continue;
-            };
-
-            if is_detached {
-                let slot = &ops_shared.slots[user_data];
-
-                if let Some(op) = ops_local.get_mut(user_data)
-                    && matches!(op.platform_data.lifecycle, OpLifecycle::InFlight)
-                    && let Some(completer) = op.platform_data.detached_notifier.take()
-                {
-                    if let Some(deadline) = op.platform_data.timer_deadline
-                        && now < deadline
-                    {
-                        let remain = deadline.saturating_duration_since(now);
-                        op.platform_data.timer_id = Some(self.wheel.insert(user_data, remain));
-                        continue;
-                    }
-
-                    op.platform_data.lifecycle = OpLifecycle::Detached;
-                    op.platform_data.timer_id = None;
-                    op.platform_data.timer_deadline = None;
-                    let generation = slot.generation.load(Ordering::Acquire);
-
-                    let resources = unsafe { (*slot.op.get()).take() };
-
-                    if let Some(res) = resources {
-                        drop(res);
-                        completer.complete(Ok(0));
-                    }
-                    let payload = unsafe { (*slot.payload.get()).take() };
-                    let detail = unsafe { (*slot.result.get()).take() };
-                    pending_events.push(CompletionSidecar {
-                        user_data,
-                        generation,
-                        res: 0,
-                        flags: 0,
-                        payload,
-                        detail,
-                    });
-                    let _ = std::mem::take(&mut op.platform_data);
-                    ops_shared.push_free(user_data);
-                }
-            } else if let Some(op) = ops_local.get_mut(user_data) {
+            if let Some(op) = ops_local.get_mut(user_data) {
                 if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
                     if let Some(deadline) = op.platform_data.timer_deadline
                         && now < deadline
@@ -463,29 +414,6 @@ impl IocpDriver {
                     let _ = unsafe { (*slot.result.get()).take() };
                     let _data = std::mem::take(&mut op.platform_data);
                     self.ops.shared.push_free(user_data);
-                } else if let Some(completer) = op.platform_data.detached_notifier.take() {
-                    op.platform_data.lifecycle = OpLifecycle::Detached;
-                    let resource = unsafe { (*slot.op.get()).take() };
-                    if let Some(iocp_op) = resource {
-                        drop(iocp_op);
-                        completer.complete(clone_io_result(&io_result));
-                    }
-                    let payload = unsafe { (*slot.payload.get()).take() };
-                    let detail = unsafe { (*slot.result.get()).take() };
-                    let _data = std::mem::take(&mut op.platform_data);
-                    self.ops.shared.push_free(user_data);
-                    push_completion_event_shared(
-                        &completion_events,
-                        &completion_table,
-                        completion_record(CompletionSidecar {
-                            user_data,
-                            generation: slot_generation,
-                            res: completion_res,
-                            flags: 0,
-                            payload,
-                            detail,
-                        }),
-                    );
                 } else {
                     op.platform_data.lifecycle = OpLifecycle::Completed;
 
@@ -814,18 +742,6 @@ impl IocpDriver {
         Ok(())
     }
 
-    fn cleanup_detached_notifiers(&mut self) {
-        for (user_data, op_entry) in self.ops.local.iter_mut().enumerate() {
-            let slot = &self.ops.shared.slots[user_data];
-            if let Some(completer) = op_entry.platform_data.detached_notifier.take()
-                && let Some(op) = unsafe { (*slot.op.get()).take() }
-            {
-                drop(op);
-                completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)));
-            }
-        }
-    }
-
     fn close_impl(&mut self, mode: CloseMode) -> io::Result<()> {
         if self.closed {
             return Ok(());
@@ -838,7 +754,6 @@ impl IocpDriver {
             self.rio_state.drain_outstanding_for(timeout)?;
         }
 
-        self.cleanup_detached_notifiers();
         self.closed = true;
         Ok(())
     }
@@ -873,20 +788,6 @@ fn push_completion_event_shared(
 ) {
     table.record_completion_with_data(record.event, record.payload, record.detail);
     queue.push(record.event);
-}
-
-#[inline]
-fn clone_io_result(res: &io::Result<usize>) -> io::Result<usize> {
-    match res {
-        Ok(v) => Ok(*v),
-        Err(e) => {
-            if let Some(code) = e.raw_os_error() {
-                Err(io::Error::from_raw_os_error(code))
-            } else {
-                Err(io::Error::new(e.kind(), e.to_string()))
-            }
-        }
-    }
 }
 
 impl Drop for IocpDriver {
