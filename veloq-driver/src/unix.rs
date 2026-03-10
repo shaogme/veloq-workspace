@@ -1,6 +1,7 @@
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::RawFd;
+use veloq_driver_core::{RawHandle, SockAddrStorage};
 
 pub struct Socket {
     fd: RawFd,
@@ -139,46 +140,6 @@ impl Drop for Socket {
     }
 }
 
-pub use libc::sockaddr_storage as SockAddrStorage;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RawHandle {
-    // i32 (4 bytes)
-    pub fd: std::os::fd::RawFd,
-}
-
-impl std::ops::Deref for RawHandle {
-    type Target = std::os::fd::RawFd;
-
-    fn deref(&self) -> &Self::Target {
-        &self.fd
-    }
-}
-
-impl From<RawHandle> for std::os::fd::RawFd {
-    fn from(handle: RawHandle) -> Self {
-        handle.fd
-    }
-}
-
-impl From<i32> for RawHandle {
-    fn from(fd: i32) -> Self {
-        RawHandle { fd }
-    }
-}
-
-impl From<usize> for RawHandle {
-    fn from(handle: usize) -> Self {
-        RawHandle { fd: handle as i32 }
-    }
-}
-
-impl From<RawHandle> for usize {
-    fn from(handle: RawHandle) -> Self {
-        handle.fd as usize
-    }
-}
-
 pub fn to_socket_addr(buf: &[u8]) -> std::io::Result<SocketAddr> {
     if buf.len() < std::mem::size_of::<libc::sa_family_t>() {
         return Err(std::io::Error::new(
@@ -255,8 +216,8 @@ pub fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, socklen_t) {
     }
 }
 
-pub fn socket_addr_to_storage(addr: SocketAddr) -> (libc::sockaddr_storage, socklen_t) {
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) {
+    let mut storage: SockAddrStorage = unsafe { std::mem::zeroed() };
     let len = match addr {
         SocketAddr::V4(a) => {
             let sin_ptr = &mut storage as *mut _ as *mut sockaddr_in;

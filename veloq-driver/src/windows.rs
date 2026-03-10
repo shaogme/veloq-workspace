@@ -1,5 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::raw::c_void;
+use veloq_driver_core::{RawHandle, SockAddrStorage};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_STREAM, SOCKADDR,
     SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSADATA, WSASocketW,
@@ -281,10 +281,8 @@ pub fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, i32) {
     }
 }
 
-pub use windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE;
-
-pub fn socket_addr_to_storage(addr: SocketAddr) -> (SOCKADDR_STORAGE, i32) {
-    let mut storage: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
+pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, i32) {
+    let mut storage: SockAddrStorage = unsafe { std::mem::zeroed() };
     let len = match addr {
         SocketAddr::V4(a) => {
             let sin_ptr = &mut storage as *mut _ as *mut SOCKADDR_IN;
@@ -311,64 +309,4 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SOCKADDR_STORAGE, i32) {
         }
     };
     (storage, len)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RawHandle {
-    // usually isize/ptr (8 bytes)
-    pub handle: windows_sys::Win32::Foundation::HANDLE,
-}
-
-impl From<*mut c_void> for RawHandle {
-    fn from(handle: *mut c_void) -> Self {
-        RawHandle {
-            handle: handle as _,
-        }
-    }
-}
-
-impl From<usize> for RawHandle {
-    fn from(handle: usize) -> Self {
-        RawHandle {
-            handle: handle as _,
-        }
-    }
-}
-
-#[cfg(target_pointer_width = "64")]
-impl From<u64> for RawHandle {
-    fn from(handle: u64) -> Self {
-        RawHandle {
-            handle: handle as _,
-        }
-    }
-}
-
-#[cfg(target_pointer_width = "32")]
-impl From<u32> for RawHandle {
-    fn from(handle: u32) -> Self {
-        RawHandle {
-            handle: handle as _,
-        }
-    }
-}
-
-impl std::ops::Deref for RawHandle {
-    type Target = windows_sys::Win32::Foundation::HANDLE;
-
-    fn deref(&self) -> &Self::Target {
-        &self.handle
-    }
-}
-
-impl From<RawHandle> for windows_sys::Win32::Foundation::HANDLE {
-    fn from(handle: RawHandle) -> Self {
-        handle.handle
-    }
-}
-
-impl From<RawHandle> for usize {
-    fn from(handle: RawHandle) -> Self {
-        handle.handle as usize
-    }
 }

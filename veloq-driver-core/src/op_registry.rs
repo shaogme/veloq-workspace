@@ -1,34 +1,32 @@
 use crate::driver::PlatformOp;
-use crate::driver::slot::{SlotEntry, SlotTable};
+use crate::slot::{SlotEntry, SlotTable};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
-pub(crate) struct OpEntry<P> {
-    pub(crate) platform_data: P,
+pub struct OpEntry<P> {
+    pub platform_data: P,
 }
 
 impl<P> OpEntry<P> {
-    pub(crate) fn new(platform_data: P) -> Self {
+    pub fn new(platform_data: P) -> Self {
         Self { platform_data }
     }
 }
 
-pub(crate) struct OpRegistry<Op: PlatformOp, P> {
-    pub(crate) shared: Arc<SlotTable<Op>>,
-    // Local state storage, indexed by slot index
-    pub(crate) local: Box<[OpEntry<P>]>,
-    // Locally claimed free-chain head. Additional free nodes are fetched from shared stack.
+pub struct OpRegistry<Op: PlatformOp, P> {
+    pub shared: Arc<SlotTable<Op>>,
+    pub local: Box<[OpEntry<P>]>,
     local_free_head: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OpHandle {
-    pub(crate) index: usize,
-    pub(crate) generation: u32,
+pub struct OpHandle {
+    pub index: usize,
+    pub generation: u32,
 }
 
-pub(crate) struct AllocResult {
-    pub(crate) handle: OpHandle,
+pub struct AllocResult {
+    pub handle: OpHandle,
 }
 
 impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
@@ -52,7 +50,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    pub(crate) fn alloc(&mut self, data: P) -> Result<AllocResult, P> {
+    pub fn alloc(&mut self, data: P) -> Result<AllocResult, P> {
         if self.local_free_head == SlotTable::<Op>::NULL_INDEX {
             self.local_free_head = self.shared.pop_all();
         }
@@ -63,7 +61,6 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
                 .next_free
                 .load(std::sync::atomic::Ordering::Relaxed);
 
-            // Reset slot generation
             let slot = &self.shared.slots[idx];
             let new_gen = slot
                 .generation
@@ -71,7 +68,6 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
                 .wrapping_add(1);
             slot.reset(new_gen);
 
-            // Initialize local data
             self.local[idx].platform_data = data;
 
             Ok(AllocResult {
@@ -85,10 +81,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    /// Insert equivalent (for compatibility with previous interface)
-    /// Note: This consumes entry but we only need platform_data.
-    /// The actual resource Op should be placed into slot by caller.
-    pub(crate) fn insert(&mut self, entry: OpEntry<P>) -> Result<OpHandle, OpEntry<P>> {
+    pub fn insert(&mut self, entry: OpEntry<P>) -> Result<OpHandle, OpEntry<P>> {
         match self.alloc(entry.platform_data) {
             Ok(res) => Ok(res.handle),
             Err(data) => Err(OpEntry {
@@ -98,17 +91,16 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn get(&self, user_data: usize) -> Option<&OpEntry<P>> {
+    pub fn get(&self, user_data: usize) -> Option<&OpEntry<P>> {
         self.local.get(user_data)
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<P>> {
+    pub fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<P>> {
         self.local.get_mut(user_data)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn get_slot_and_entry_mut(
+    pub fn get_slot_and_entry_mut(
         &mut self,
         user_data: usize,
     ) -> Option<(&SlotEntry<Op>, &mut OpEntry<P>)> {
@@ -119,14 +111,11 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    pub(crate) fn contains(&self, user_data: usize) -> bool {
+    pub fn contains(&self, user_data: usize) -> bool {
         user_data < self.local.len()
     }
 
-    pub(crate) fn remove(&mut self, user_data: usize) -> OpEntry<P> {
-        // In this fixed-size registry, remove doesn't actually remove memory.
-        // It just marks index as free.
-        // We return the data by replacing it with default.
+    pub fn remove(&mut self, user_data: usize) -> OpEntry<P> {
         if user_data >= self.local.len() {
             panic!("Invalid user_data for remove");
         }
@@ -140,9 +129,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
     }
 
     #[cfg(target_os = "windows")]
-    pub(crate) fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
-        // Expose the slot memory. Since it's a single contiguous block,
-        // page 0 is the whole thing.
+    pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
         if page_idx == 0 {
             let ptr = self.shared.slots.as_ptr() as *const u8;
             let len = std::mem::size_of_val(&*self.shared.slots);

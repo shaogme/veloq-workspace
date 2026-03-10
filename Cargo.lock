@@ -1262,7 +1262,20 @@ dependencies = [
  "veloq-bitset",
  "veloq-blocking",
  "veloq-buf",
+ "veloq-driver-core",
  "veloq-wheel",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "veloq-driver-core"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "libc",
+ "veloq-atomic-waker",
+ "veloq-buf",
  "windows-sys 0.61.2",
 ]
 

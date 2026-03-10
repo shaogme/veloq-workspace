@@ -8,16 +8,16 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 /// Manual payload container: raw pointer + static kind + drop fn.
 pub struct ErasedPayload {
-    pub(crate) ptr: *mut (),
-    pub(crate) kind: u16,
-    pub(crate) drop_fn: unsafe fn(*mut ()),
+    pub ptr: *mut (),
+    pub kind: u16,
+    pub drop_fn: unsafe fn(*mut ()),
 }
 
 unsafe impl Send for ErasedPayload {}
 
 impl ErasedPayload {
     #[inline]
-    pub(crate) fn leak_ptr(self) -> *mut () {
+    pub fn leak_ptr(self) -> *mut () {
         let this = ManuallyDrop::new(self);
         this.ptr
     }
@@ -34,11 +34,11 @@ impl Drop for ErasedPayload {
 
 #[repr(C)]
 #[cfg(windows)]
-pub(crate) struct OverlappedEntry {
-    pub(crate) inner: OVERLAPPED,
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
-    pub(crate) blocking_result: Option<std::io::Result<usize>>,
+pub struct OverlappedEntry {
+    pub inner: OVERLAPPED,
+    pub user_data: usize,
+    pub generation: u32,
+    pub blocking_result: Option<std::io::Result<usize>>,
 }
 
 #[cfg(windows)]
@@ -55,41 +55,25 @@ impl Default for OverlappedEntry {
 
 #[derive(Debug)]
 #[cfg_attr(windows, repr(C))]
-pub(crate) struct Slot<Op> {
-    // Basic metadata
+pub struct Slot<Op> {
     #[cfg(windows)]
-    index: usize, // Self-reference index
-    pub(crate) generation: AtomicU32, // Generation to prevent ABA
-
-    // Intrusive free list pointer (replaces remote_free_queue)
-    pub(crate) next_free: AtomicUsize,
-
-    // Resource storage
-    // - SUBMITTED: Driver reads Op pointer to pass to kernel
-    // - COMPLETED: Future takes Op
-    pub(crate) op: UnsafeCell<Option<Op>>,
-    /// Detailed completion result for cases not representable by raw errno/event res.
-    pub(crate) result: UnsafeCell<Option<std::io::Result<usize>>>,
-    /// Type-erased user payload owned by the slot while op is in-flight.
-    pub(crate) payload: UnsafeCell<Option<ErasedPayload>>,
-
-    // Windows IOCP specific field (Embedded Overlapped)
-    // Enabled only on Windows for pointer reconstruction (Container_of pattern)
-    // Only enabled on Windows, used for pointer back-tracing (Container_of pattern)
+    index: usize,
+    pub generation: AtomicU32,
+    pub next_free: AtomicUsize,
+    pub op: UnsafeCell<Option<Op>>,
+    pub result: UnsafeCell<Option<std::io::Result<usize>>>,
+    pub payload: UnsafeCell<Option<ErasedPayload>>,
     #[cfg(windows)]
-    pub(crate) overlapped: UnsafeCell<OverlappedEntry>,
+    pub overlapped: UnsafeCell<OverlappedEntry>,
 }
 
-// Slot must be Sync as it is referenced by multiple threads
-// Safety relies on atomic state transitions
 unsafe impl<Op: Send> Sync for Slot<Op> {}
 
 impl<Op> Slot<Op> {
-    // Should be consistent with SlotTable::NULL_INDEX, but we can't easily reference it here without generic.
-    // We use usize::MAX as sentinel.
     const NULL_INDEX: usize = usize::MAX;
 
-    pub(crate) fn new(#[cfg(windows)] index: usize) -> Self {
+    #[cfg_attr(not(windows), allow(clippy::new_without_default))]
+    pub fn new(#[cfg(windows)] index: usize) -> Self {
         Self {
             #[cfg(windows)]
             index,
@@ -108,9 +92,8 @@ impl<Op> Slot<Op> {
         }
     }
 
-    pub(crate) fn reset(&self, generation: u32) {
+    pub fn reset(&self, generation: u32) {
         unsafe {
-            // Ensure stale resources from previous generation are dropped before reuse.
             *self.op.get() = None;
             *self.result.get() = None;
             *self.payload.get() = None;
@@ -128,27 +111,25 @@ impl<Op> Slot<Op> {
     }
 
     #[cfg(windows)]
-    pub(crate) fn overlapped_ptr(&self) -> *mut OVERLAPPED {
+    pub fn overlapped_ptr(&self) -> *mut OVERLAPPED {
         unsafe { &mut (*self.overlapped.get()).inner }
     }
 }
 
-// Note: Use CachePadded<Slot> in Slab/Table to avoid false sharing
-pub(crate) type SlotEntry<Op> = CachePadded<Slot<Op>>;
+pub type SlotEntry<Op> = CachePadded<Slot<Op>>;
 
 pub struct SlotTable<Op> {
-    pub(crate) slots: Box<[SlotEntry<Op>]>,
-    // Intrusive Treiber stack head
-    pub(crate) remote_free_head: AtomicUsize,
+    pub slots: Box<[SlotEntry<Op>]>,
+    pub remote_free_head: AtomicUsize,
 }
 
 unsafe impl<Op: Send> Sync for SlotTable<Op> {}
 unsafe impl<Op: Send> Send for SlotTable<Op> {}
 
 impl<Op> SlotTable<Op> {
-    pub(crate) const NULL_INDEX: usize = usize::MAX;
+    pub const NULL_INDEX: usize = usize::MAX;
 
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         let mut slots = Vec::with_capacity(capacity);
         for _i in 0..capacity {
             slots.push(CachePadded::new(Slot::new(
@@ -162,15 +143,11 @@ impl<Op> SlotTable<Op> {
         }
     }
 
-    /// Pushes an index onto the remote free stack.
-    /// This is lock-free and can be called from multiple threads.
-    pub(crate) fn push_free(&self, idx: usize) {
+    pub fn push_free(&self, idx: usize) {
         let slot = &self.slots[idx];
         let mut head = self.remote_free_head.load(Ordering::Relaxed);
         loop {
-            // Point the new node to the current head
             slot.next_free.store(head, Ordering::Relaxed);
-            // Try to swap the head
             match self.remote_free_head.compare_exchange_weak(
                 head,
                 idx,
@@ -183,10 +160,7 @@ impl<Op> SlotTable<Op> {
         }
     }
 
-    /// Pops all items from the remote free stack.
-    /// Returns the head of the linked list.
-    /// This is used by the driver to bulk-reclaim slots.
-    pub(crate) fn pop_all(&self) -> usize {
+    pub fn pop_all(&self) -> usize {
         self.remote_free_head
             .swap(Self::NULL_INDEX, Ordering::Acquire)
     }

@@ -24,31 +24,7 @@ use crate::driver::{
     CompletionRecord, Driver, PlatformDriver, PlatformOp, SharedCompletionTable, SubmitBinder,
     encode_completion_token, event_res_to_io,
 };
-
-/// Represents the source of an IO operation: either a raw handle or a registered index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoFd {
-    /// A raw system handle (fd on Unix, HANDLE on Windows).
-    Raw(RawHandle),
-    /// A registered index for pre-registered file descriptors.
-    Fixed(u32),
-}
-
-impl IoFd {
-    /// Returns the raw handle if this is a Raw variant.
-    pub fn raw(&self) -> Option<RawHandle> {
-        match self {
-            Self::Raw(fd) => Some(*fd),
-            Self::Fixed(_) => None,
-        }
-    }
-}
-
-impl From<RawHandle> for IoFd {
-    fn from(handle: RawHandle) -> Self {
-        Self::Raw(handle)
-    }
-}
+pub use veloq_driver_core::IoFd;
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

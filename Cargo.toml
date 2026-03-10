@@ -1,16 +1,17 @@
 [workspace]
 members = [
+    "veloq-driver-core",
     "veloq-runtime",
     "veloq-examples/disk-bench",
     "veloq-sync",
     "veloq-buf", 
+    "veloq-driver",
     "utils/veloq-shim",
     "utils/veloq-atomic-waker", 
     "utils/veloq-intrusive-linklist", 
     "utils/veloq-bitset",
     "utils/veloq-wheel", 
     "utils/veloq-blocking",
-    "veloq-driver", 
 ]
 resolver = "3"
 
@@ -34,6 +35,7 @@ veloq-runtime = { path = "veloq-runtime", version = "0.1.0" }
 veloq-sync = { path = "veloq-sync", version = "0.1.0" }
 veloq-local = { path = "veloq-local", version = "0.1.0" }
 veloq-buf = { path = "veloq-buf", version = "0.1.0" }
+veloq-driver-core = { path = "veloq-driver-core", version = "0.1.0" }
 veloq-driver = { path = "veloq-driver", version = "0.1.0" }
 
 veloq-shim = { path = "utils/veloq-shim", version = "0.1.0" }
