@@ -364,7 +364,7 @@ impl UringDriver {
         self.flush_cancellations();
         self.flush_backlog();
 
-        if self.ops.is_empty() {
+        if !self.has_active_ops() {
             return Ok(());
         }
 
@@ -404,10 +404,10 @@ impl UringDriver {
                         let slot = &self.ops.shared.slots[user_data];
                         let generation = slot.generation.load(Ordering::Acquire);
                         let _ = unsafe { (*slot.op.get()).take() };
+                        promote_slot_completion(slot, generation);
                         generation
                     };
-                    self.push_completion_event(user_data, generation, 0, 0);
-                    self.ops.remove(user_data);
+                    self.push_completion_event(user_data, generation, 0, 0, None);
                 }
             }
         }
@@ -416,6 +416,15 @@ impl UringDriver {
         self.flush_cancellations();
         self.flush_backlog();
         Ok(())
+    }
+
+    fn has_active_ops(&self) -> bool {
+        self.ops.local.iter().any(|entry| {
+            matches!(
+                entry.platform_data.lifecycle,
+                OpLifecycle::Pending | OpLifecycle::InFlight | OpLifecycle::Cancelled
+            )
+        })
     }
 
     pub(crate) fn process_completions_internal(&mut self) {
@@ -450,6 +459,7 @@ impl UringDriver {
                     // Don't touch op if Cancelled
                     if matches!(op_state.lifecycle, OpLifecycle::Cancelled) {
                         let generation = slot.generation.load(Ordering::Acquire);
+                        promote_slot_completion(slot, generation);
                         pending_events.push((user_data, generation, cqe.result(), cqe.flags()));
                         unsafe {
                             *slot.op.get() = None;
@@ -475,15 +485,21 @@ impl UringDriver {
                         op_state.lifecycle = OpLifecycle::Completed;
                         let generation = slot.generation.load(Ordering::Acquire);
                         let res_code = io_result_to_event_res(&final_res);
+                        let detail = clone_result_if_non_os_error(&final_res);
+                        if let Some(detail_res) = detail {
+                            unsafe {
+                                *slot.result.get() = Some(detail_res);
+                            }
+                        }
                         pending_events.push((user_data, generation, res_code, cqe.flags()));
                         let _ = unsafe { (*slot.op.get()).take() };
-                        self.ops.remove(user_data);
+                        promote_slot_completion(slot, generation);
                     }
                 }
             }
         }
         for (user_data, generation, res_code, flags) in pending_events {
-            self.push_completion_event(user_data, generation, res_code, flags);
+            self.push_completion_event(user_data, generation, res_code, flags, None);
         }
 
         if needs_waker_resubmit {
@@ -689,7 +705,7 @@ impl UringDriver {
                         let _ = unsafe { (*slot.op.get()).take() };
                         generation
                     };
-                    self.push_completion_event(user_data, generation, -libc::ECANCELED, 0);
+                    self.push_completion_event(user_data, generation, -libc::ECANCELED, 0, None);
                     self.ops.remove(user_data);
                 }
             }
@@ -707,7 +723,13 @@ impl UringDriver {
                             let _ = unsafe { (*slot.op.get()).take() };
                             generation
                         };
-                        self.push_completion_event(user_data, generation, -libc::ECANCELED, 0);
+                        self.push_completion_event(
+                            user_data,
+                            generation,
+                            -libc::ECANCELED,
+                            0,
+                            None,
+                        );
                         self.ops.remove(user_data);
                     }
                     return;
@@ -735,6 +757,22 @@ fn io_result_to_event_res(res: &io::Result<usize>) -> i32 {
     }
 }
 
+#[inline]
+fn promote_slot_completion(slot: &crate::driver::slot::SlotEntry<UringOp>, generation: u32) {
+    let payload = unsafe { (*slot.payload.get()).take() };
+    if let Some(payload) = payload {
+        unsafe {
+            *slot.completed_payload.get() = Some((generation, payload));
+        }
+    }
+    let result = unsafe { (*slot.result.get()).take() };
+    if let Some(result) = result {
+        unsafe {
+            *slot.completed_result.get() = Some((generation, result));
+        }
+    }
+}
+
 impl UringDriver {
     #[inline]
     pub(crate) fn push_completion_event(
@@ -743,7 +781,14 @@ impl UringDriver {
         generation: u32,
         res: i32,
         flags: u32,
+        detail: Option<io::Result<usize>>,
     ) {
+        if let Some(detail_res) = detail {
+            let slot = &self.ops.shared.slots[user_data];
+            unsafe {
+                *slot.result.get() = Some(detail_res);
+            }
+        }
         let token = encode_completion_token(user_data, generation);
         let event = CompletionEvent {
             user_data: token,
@@ -752,6 +797,20 @@ impl UringDriver {
         };
         self.completion_table.record_completion(event);
         self.completion_events.push(event);
+    }
+}
+
+#[inline]
+fn clone_result_if_non_os_error(res: &io::Result<usize>) -> Option<io::Result<usize>> {
+    match res {
+        Ok(_) => None,
+        Err(e) => {
+            if e.raw_os_error().is_some() {
+                None
+            } else {
+                Some(Err(io::Error::new(e.kind(), e.to_string())))
+            }
+        }
     }
 }
 

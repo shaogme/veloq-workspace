@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::{
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -21,8 +22,8 @@ use veloq_buf::FixedBuf;
 use crate::RawHandle;
 use crate::SockAddrStorage;
 use crate::driver::{
-    Driver, PlatformDriver, SharedCompletionTable, SubmitBinder, encode_completion_token,
-    event_res_to_io,
+    Driver, PlatformDriver, SharedCompletionTable, SubmitBinder, decode_completion_token,
+    encode_completion_token, event_res_to_io,
 };
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
@@ -48,6 +49,27 @@ impl From<RawHandle> for IoFd {
     fn from(handle: RawHandle) -> Self {
         Self::Raw(handle)
     }
+}
+
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    ReadFixed = 1,
+    WriteFixed = 2,
+    Recv = 3,
+    Send = 4,
+    Connect = 5,
+    Close = 6,
+    Fsync = 7,
+    SyncFileRange = 8,
+    Fallocate = 9,
+    Accept = 10,
+    SendTo = 11,
+    UdpRecvStream = 12,
+    UdpRefill = 13,
+    Open = 14,
+    Wakeup = 15,
+    Timeout = 16,
 }
 
 // ============================================================================
@@ -121,12 +143,22 @@ pub trait OpLifecycle: Sized {
 pub trait IntoPlatformOp<D: Driver>: Sized + std::marker::Send {
     /// User payload detached from kernel op.
     type UserPayload: std::marker::Send + 'static;
+    const PAYLOAD_KIND: OpKind;
 
     /// Split into kernel-facing op and user payload.
     fn into_kernel_and_payload(self) -> (D::Op, Self::UserPayload);
 
     /// Rebuild the user operation from payload.
     fn from_user_payload(payload: Self::UserPayload) -> Self;
+
+    fn payload_into_erased(payload: Self::UserPayload) -> crate::driver::slot::ErasedPayload;
+
+    /// Rebuilds payload from a raw pointer previously produced by `payload_into_erased`.
+    ///
+    /// # Safety
+    /// `ptr` must originate from the matching `Self::payload_into_erased` implementation
+    /// of the same concrete operation type and must not have been consumed before.
+    unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload;
 
     /// Compatibility helper for transitional callsites.
     #[inline]
@@ -188,10 +220,14 @@ impl<T> Op<T> {
         match driver.reserve_op() {
             Ok((user_data, generation)) => {
                 let (kernel_op, payload) = data.into_kernel_and_payload();
-                let mut payload = Some(payload);
                 let mut op_platform = Some(kernel_op);
                 let token = encode_completion_token(user_data, generation);
                 let completion_table = driver.completion_table();
+                let slot_table = driver.slot_table();
+                let slot = &slot_table.slots[user_data];
+                unsafe {
+                    *slot.payload.get() = Some(T::payload_into_erased(payload));
+                }
 
                 if let Err(e) = driver
                     .submit(user_data, &mut op_platform, SubmitBinder::new())
@@ -202,22 +238,25 @@ impl<T> Op<T> {
                     // If the platform op is returned, propagate immediate failure with payload.
                     // Otherwise, fall back to slot-monitoring path and let generation check resolve.
                     if let Some(op) = op_platform.take() {
-                        let payload = payload
-                            .take()
+                        let payload_any = unsafe { (*slot.payload.get()).take() }
                             .expect("Payload missing while recovering submit failure");
+                        if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                            panic!("DetachedOp payload kind mismatch on submit recovery");
+                        }
+                        let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                         drop(op);
                         DetachedOp {
                             completion_table: None,
+                            slot_table: None,
                             token: 0,
-                            payload: None,
                             immediate_failure: Some((e, T::from_user_payload(payload))),
                             _phantom: std::marker::PhantomData,
                         }
                     } else {
                         DetachedOp {
                             completion_table: Some(completion_table),
+                            slot_table: Some(slot_table),
                             token,
-                            payload,
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
                         }
@@ -225,8 +264,8 @@ impl<T> Op<T> {
                 } else {
                     DetachedOp {
                         completion_table: Some(completion_table),
+                        slot_table: Some(slot_table),
                         token,
-                        payload,
                         immediate_failure: None,
                         _phantom: std::marker::PhantomData,
                     }
@@ -237,8 +276,8 @@ impl<T> Op<T> {
                 // Return DetachedOp with immediate failure.
                 DetachedOp {
                     completion_table: None,
+                    slot_table: None,
                     token: 0,
-                    payload: None,
                     immediate_failure: Some((e, data)),
                     _phantom: std::marker::PhantomData,
                 }
@@ -268,8 +307,8 @@ where
     T: IntoPlatformOp<D>,
 {
     completion_table: Option<SharedCompletionTable>,
+    slot_table: Option<Arc<crate::driver::slot::SlotTable<D::Op>>>,
     token: u64,
-    payload: Option<T::UserPayload>,
     immediate_failure: Option<(std::io::Error, T)>,
     _phantom: std::marker::PhantomData<T>,
 }
@@ -302,13 +341,40 @@ where
             .completion_table
             .as_ref()
             .expect("DetachedOp missing completion_table but no immediate_failure");
+        let slot_table = this
+            .slot_table
+            .as_ref()
+            .expect("DetachedOp missing slot_table but no immediate_failure");
         if let Some(event) = table.try_take(this.token) {
-            let payload = this
-                .payload
-                .take()
-                .expect("DetachedOp payload missing on completion");
+            let (user_data, generation) = decode_completion_token(this.token);
+            let slot = &slot_table.slots[user_data];
+            let slot_generation = slot.generation.load(std::sync::atomic::Ordering::Acquire);
+            let payload_any = if slot_generation == generation {
+                let inflight = unsafe { (*slot.payload.get()).take() };
+                if inflight.is_some() {
+                    inflight
+                } else {
+                    take_completed_payload(slot, generation)
+                }
+            } else {
+                take_completed_payload(slot, generation)
+            };
+            let Some(payload_any) = payload_any else {
+                return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                    "operation payload lost: slot generation mismatch",
+                )));
+            };
+            if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                    "operation payload lost: kind mismatch",
+                )));
+            }
+            let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
             let data = T::from_user_payload(payload);
-            return Poll::Ready(OpResult::Completed(event_res_to_io(event.res), data));
+            let res = take_result_for_generation(slot, generation)
+                .unwrap_or_else(|| event_res_to_io(event.res));
+            slot_table.push_free(user_data);
+            return Poll::Ready(OpResult::Completed(res, data));
         }
 
         if let Some(table) = this.completion_table.as_ref() {
@@ -316,6 +382,46 @@ where
         }
 
         Poll::Pending
+    }
+}
+
+#[inline]
+fn take_completed_payload<Op>(
+    slot: &crate::driver::slot::SlotEntry<Op>,
+    generation: u32,
+) -> Option<crate::driver::slot::ErasedPayload> {
+    let completed = unsafe { (*slot.completed_payload.get()).take() };
+    match completed {
+        Some((g, payload)) if g == generation => Some(payload),
+        Some(other) => {
+            unsafe {
+                *slot.completed_payload.get() = Some(other);
+            }
+            None
+        }
+        None => None,
+    }
+}
+
+#[inline]
+fn take_result_for_generation<Op>(
+    slot: &crate::driver::slot::SlotEntry<Op>,
+    generation: u32,
+) -> Option<std::io::Result<usize>> {
+    let inflight = unsafe { (*slot.result.get()).take() };
+    if inflight.is_some() {
+        return inflight;
+    }
+    let completed = unsafe { (*slot.completed_result.get()).take() };
+    match completed {
+        Some((g, res)) if g == generation => Some(res),
+        Some(other) => {
+            unsafe {
+                *slot.completed_result.get() = Some(other);
+            }
+            None
+        }
+        None => None,
     }
 }
 
@@ -333,7 +439,6 @@ enum State {
 pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
-    payload: Option<T::UserPayload>,
     driver: Rc<RefCell<PlatformDriver>>,
     user_data: usize,
     token: u64,
@@ -345,7 +450,6 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
         Self {
             state: State::Defined,
             data: Some(data),
-            payload: None,
             driver,
             user_data: 0,
             token: 0,
@@ -365,7 +469,6 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
             // Submit to driver
             let data = op.data.take().expect("Op started without data");
             let (driver_op, payload) = data.into_kernel_and_payload();
-            op.payload = Some(payload);
 
             // reserve_op now returns generation, but we ignore it for LocalOp
             // because LocalOp lifetime is tied to the driver via Rc/RefCell.
@@ -373,16 +476,17 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
                 Ok(v) => v,
                 Err(e) => {
                     // Failed to reserve
-                    let payload = op
-                        .payload
-                        .take()
-                        .expect("Payload missing on reserve failure");
                     drop(driver_op);
                     return Poll::Ready(OpResult::Completed(Err(e), T::from_user_payload(payload)));
                 }
             };
             op.user_data = user_data;
             op.token = encode_completion_token(user_data, generation);
+            let slot_table = driver.slot_table();
+            let slot = &slot_table.slots[user_data];
+            unsafe {
+                *slot.payload.get() = Some(T::payload_into_erased(payload));
+            }
 
             // Submit to driver.
             let mut driver_op_opt = Some(driver_op);
@@ -393,10 +497,12 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
                 if let Some(val) = driver_op_opt.take() {
                     drop(val);
                 }
-                let payload = op
-                    .payload
-                    .take()
+                let payload_any = unsafe { (*slot.payload.get()).take() }
                     .expect("Payload missing while recovering submit failure");
+                if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                    panic!("LocalOp payload kind mismatch on submit recovery");
+                }
+                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                 let data = T::from_user_payload(payload);
                 return Poll::Ready(OpResult::Completed(Err(e), data));
             }
@@ -408,9 +514,36 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
             let mut driver = op.driver.borrow_mut();
             if let Some(event) = driver.try_take_completion(op.token) {
                 op.state = State::Completed;
-                let payload = op.payload.take().expect("Payload missing on completion");
+                let slot_table = driver.slot_table();
+                let slot = &slot_table.slots[op.user_data];
+                let (_, generation) = decode_completion_token(op.token);
+                let slot_generation = slot.generation.load(std::sync::atomic::Ordering::Acquire);
+                let payload_any = if slot_generation == generation {
+                    let inflight = unsafe { (*slot.payload.get()).take() };
+                    if inflight.is_some() {
+                        inflight
+                    } else {
+                        take_completed_payload(slot, generation)
+                    }
+                } else {
+                    take_completed_payload(slot, generation)
+                };
+                let Some(payload_any) = payload_any else {
+                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                        "operation payload lost: slot generation mismatch",
+                    )));
+                };
+                if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                        "operation payload lost: kind mismatch",
+                    )));
+                }
+                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                 let data = T::from_user_payload(payload);
-                Poll::Ready(OpResult::Completed(event_res_to_io(event.res), data))
+                let res = take_result_for_generation(slot, generation)
+                    .unwrap_or_else(|| event_res_to_io(event.res));
+                slot_table.push_free(op.user_data);
+                Poll::Ready(OpResult::Completed(res, data))
             } else {
                 driver.register_completion_waker(op.token, cx.waker());
                 Poll::Pending

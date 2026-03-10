@@ -611,16 +611,25 @@ impl<'a> RioCompletionRouter<'a> {
                     self.comp.table.record_completion(event);
                     self.comp.events.push(event);
                     let _ = unsafe { (*slot.op.get()).take() };
-                    let _ = std::mem::take(&mut op.platform_data);
-                    self.comp.ops.free_indices.push(user_data);
+                    promote_slot_completion(slot, generation);
                 } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
                     if op.platform_data.rio_needs_drain {
                         op.platform_data.rio_drained = true;
-                        let _ = std::mem::take(&mut op.platform_data);
-                        self.comp.ops.free_indices.push(user_data);
+                        let _ = unsafe { (*slot.op.get()).take() };
+                        promote_slot_completion(slot, generation);
+                        let token = encode_completion_token(user_data, generation);
+                        if !self.comp.table.is_ready(token) {
+                            let _ = std::mem::take(&mut op.platform_data);
+                            self.comp.ops.free_indices.push(user_data);
+                        }
                     } else {
-                        let _ = std::mem::take(&mut op.platform_data);
-                        self.comp.ops.free_indices.push(user_data);
+                        let _ = unsafe { (*slot.op.get()).take() };
+                        promote_slot_completion(slot, generation);
+                        let token = encode_completion_token(user_data, generation);
+                        if !self.comp.table.is_ready(token) {
+                            let _ = std::mem::take(&mut op.platform_data);
+                            self.comp.ops.free_indices.push(user_data);
+                        }
                     }
                 }
 
@@ -636,6 +645,22 @@ fn rio_result_to_event_res(res: &io::Result<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
         Err(e) => -e.raw_os_error().unwrap_or(1).abs(),
+    }
+}
+
+#[inline]
+fn promote_slot_completion(slot: &crate::driver::slot::SlotEntry<IocpOp>, generation: u32) {
+    let payload = unsafe { (*slot.payload.get()).take() };
+    if let Some(payload) = payload {
+        unsafe {
+            *slot.completed_payload.get() = Some((generation, payload));
+        }
+    }
+    let result = unsafe { (*slot.result.get()).take() };
+    if let Some(result) = result {
+        unsafe {
+            *slot.completed_result.get() = Some((generation, result));
+        }
     }
 }
 

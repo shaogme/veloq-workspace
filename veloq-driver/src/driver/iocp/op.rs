@@ -12,7 +12,7 @@ use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::rio::RioState;
 use crate::driver::iocp::submit::{self, SubmissionResult};
 use crate::op::{
-    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
+    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, OpKind, Open, ReadFixed, Recv,
     Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
 };
 use std::io;
@@ -130,6 +130,7 @@ macro_rules! define_iocp_ops {
             $OpType:ident {
                 field: $field:ident,
                 $(payload: $Payload:ty,)?
+                kind: $kind:expr,
                 submit: $submit:path,
                 $(on_complete: $complete:path,)?
                 drop: $drop:path,
@@ -150,6 +151,7 @@ macro_rules! define_iocp_ops {
         $(
             impl IntoPlatformOp<IocpDriver> for $OpType {
                 type UserPayload = Box<$OpType>;
+                const PAYLOAD_KIND: OpKind = $kind;
 
                 fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
@@ -176,6 +178,18 @@ macro_rules! define_iocp_ops {
                 fn from_user_payload(payload: Self::UserPayload) -> Self {
                     define_iocp_ops!(@destruct payload, $($destruct)?)
                 }
+
+                fn payload_into_erased(payload: Self::UserPayload) -> crate::driver::slot::ErasedPayload {
+                    crate::driver::slot::ErasedPayload {
+                        ptr: Box::into_raw(payload) as *mut (),
+                        kind: Self::PAYLOAD_KIND as u16,
+                        drop_fn: define_iocp_ops!(@drop_raw_fn $OpType),
+                    }
+                }
+
+                unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
+                    unsafe { Box::from_raw(ptr as *mut $OpType) }
+                }
             }
         )+
     };
@@ -195,6 +209,13 @@ macro_rules! define_iocp_ops {
     (@destruct $user_payload:expr, ) => { *$user_payload };
     // Custom destruct
     (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
+
+    (@drop_raw_fn $OpType:ty) => {{
+        unsafe fn drop_raw(ptr: *mut ()) {
+            unsafe { drop(Box::from_raw(ptr as *mut $OpType)) };
+        }
+        drop_raw
+    }};
 }
 
 // ============================================================================
@@ -234,60 +255,70 @@ pub type IocpOp = IocpKernelOp;
 define_iocp_ops! {
     ReadFixed {
         field: read,
+        kind: OpKind::ReadFixed,
         submit: submit::submit_read_fixed,
         drop: submit::drop_read_fixed,
         get_fd: submit::get_fd_read_fixed,
     },
     WriteFixed {
         field: write,
+        kind: OpKind::WriteFixed,
         submit: submit::submit_write_fixed,
         drop: submit::drop_write_fixed,
         get_fd: submit::get_fd_write_fixed,
     },
     Recv {
         field: recv,
+        kind: OpKind::Recv,
         submit: submit::submit_recv,
         drop: submit::drop_recv,
         get_fd: submit::get_fd_recv,
     },
     OpSend {
         field: send,
+        kind: OpKind::Send,
         submit: submit::submit_send,
         drop: submit::drop_send,
         get_fd: submit::get_fd_send,
     },
     Close {
         field: close,
+        kind: OpKind::Close,
         submit: submit::submit_close,
         drop: submit::drop_close,
         get_fd: submit::get_fd_close,
     },
     Fsync {
         field: fsync,
+        kind: OpKind::Fsync,
         submit: submit::submit_fsync,
         drop: submit::drop_fsync,
         get_fd: submit::get_fd_fsync,
     },
     SyncFileRange {
         field: sync_range,
+        kind: OpKind::SyncFileRange,
         submit: submit::submit_sync_range,
         drop: submit::drop_sync_range,
         get_fd: submit::get_fd_sync_range,
     },
     Fallocate {
         field: fallocate,
+        kind: OpKind::Fallocate,
         submit: submit::submit_fallocate,
         drop: submit::drop_fallocate,
         get_fd: submit::get_fd_fallocate,
     },
     Timeout {
         field: timeout,
+        kind: OpKind::Timeout,
         submit: submit::submit_timeout,
         drop: submit::drop_timeout,
         get_fd: submit::get_fd_timeout,
     },
     Connect {
         field: connect,
+        kind: OpKind::Connect,
         submit: submit::submit_connect,
         on_complete: submit::on_complete_connect,
         drop: submit::drop_connect,
@@ -296,6 +327,7 @@ define_iocp_ops! {
     Accept {
         field: accept,
         payload: AcceptPayload,
+        kind: OpKind::Accept,
         submit: submit::submit_accept,
         on_complete: submit::on_complete_accept,
         drop: submit::drop_accept,
@@ -309,6 +341,7 @@ define_iocp_ops! {
     SendTo {
         field: send_to,
         payload: SendToPayload,
+        kind: OpKind::SendTo,
         submit: submit::submit_send_to,
         drop: submit::drop_send_to,
         get_fd: submit::get_fd_send_to,
@@ -336,6 +369,7 @@ define_iocp_ops! {
     },
     UdpRecvStream {
         field: udp_recv_stream,
+        kind: OpKind::UdpRecvStream,
         submit: submit::submit_udp_recv_stream,
         on_complete: submit::on_complete_udp_recv_stream,
         drop: submit::drop_udp_recv_stream,
@@ -343,6 +377,7 @@ define_iocp_ops! {
     },
     UdpRefill {
         field: udp_refill,
+        kind: OpKind::UdpRefill,
         submit: submit::submit_udp_refill,
         drop: submit::drop_udp_refill,
         get_fd: submit::get_fd_udp_refill,
@@ -350,6 +385,7 @@ define_iocp_ops! {
     Open {
         field: open,
         payload: OpenPayload,
+        kind: OpKind::Open,
         submit: submit::submit_open,
         drop: submit::drop_open,
         get_fd: submit::get_fd_open,
@@ -359,6 +395,7 @@ define_iocp_ops! {
     Wakeup {
         field: wakeup,
         payload: WakeupPayload,
+        kind: OpKind::Wakeup,
         submit: submit::submit_wakeup,
         drop: submit::drop_wakeup,
         get_fd: submit::get_fd_wakeup,

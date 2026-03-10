@@ -145,11 +145,6 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn is_empty(&self) -> bool {
-        self.free_indices.len() == self.local.len()
-    }
-
     // Windows compatibility helpers
     #[cfg(target_os = "windows")]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut OpEntry<P>)> {

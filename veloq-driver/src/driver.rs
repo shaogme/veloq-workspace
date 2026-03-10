@@ -123,6 +123,17 @@ impl CompletionTable {
             waker.wake_by_ref();
         }
     }
+
+    #[inline]
+    pub fn is_ready(&self, token: u64) -> bool {
+        let (idx, generation) = decode_completion_token(token);
+        if idx >= self.cells.len() {
+            return false;
+        }
+        let cell = &self.cells[idx];
+        cell.ready.load(Ordering::Acquire)
+            && cell.ready_generation.load(Ordering::Acquire) == generation
+    }
 }
 
 #[inline]

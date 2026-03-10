@@ -20,6 +20,7 @@ use crate::runtime::join::{JoinHandle, LocalJoinHandle};
 use crate::runtime::task::{SpawnedTask, Task};
 
 thread_local! {
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), allow(clippy::missing_const_for_thread_local))]
     static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
 }
 

@@ -9,7 +9,7 @@ use crate::driver::PlatformOp;
 use crate::driver::uring::UringDriver;
 use crate::driver::uring::submit;
 use crate::op::{
-    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
+    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, OpKind, Open, ReadFixed, Recv,
     Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
 };
 use io_uring::squeue;
@@ -87,6 +87,7 @@ macro_rules! define_uring_ops {
             $OpType:ident {
                 field: $field:ident,
                 $(payload: $Payload:ty,)?
+                kind: $kind:expr,
                 make_sqe: $make_sqe:path,
                 on_complete: $complete:path,
                 drop: $drop:path,
@@ -110,6 +111,7 @@ macro_rules! define_uring_ops {
         $(
             impl IntoPlatformOp<UringDriver> for $OpType {
                 type UserPayload = Box<$OpType>;
+                const PAYLOAD_KIND: OpKind = $kind;
 
                 fn into_kernel_and_payload(self) -> (UringKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
@@ -137,6 +139,18 @@ macro_rules! define_uring_ops {
 
                 fn from_user_payload(payload: Self::UserPayload) -> Self {
                     define_uring_ops!(@destruct payload, $($destruct)?)
+                }
+
+                fn payload_into_erased(payload: Self::UserPayload) -> crate::driver::slot::ErasedPayload {
+                    crate::driver::slot::ErasedPayload {
+                        ptr: Box::into_raw(payload) as *mut (),
+                        kind: Self::PAYLOAD_KIND as u16,
+                        drop_fn: define_uring_ops!(@drop_raw_fn $OpType),
+                    }
+                }
+
+                unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
+                    unsafe { Box::from_raw(ptr as *mut $OpType) }
                 }
             }
         )+
@@ -166,6 +180,13 @@ macro_rules! define_uring_ops {
     (@destruct $user_payload:expr, ) => { *$user_payload };
     // Custom destruct
     (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
+
+    (@drop_raw_fn $OpType:ty) => {{
+        unsafe fn drop_raw(ptr: *mut ()) {
+            unsafe { drop(Box::from_raw(ptr as *mut $OpType)) };
+        }
+        drop_raw
+    }};
 }
 
 // ============================================================================
@@ -219,6 +240,7 @@ pub type UringOp = UringKernelOp;
 define_uring_ops! {
     ReadFixed {
         field: read,
+        kind: OpKind::ReadFixed,
         make_sqe: submit::make_sqe_read_fixed,
         on_complete: submit::on_complete_read_fixed,
         drop: submit::drop_read_fixed,
@@ -227,6 +249,7 @@ define_uring_ops! {
     }, // Kernel 5.1+
     WriteFixed {
         field: write,
+        kind: OpKind::WriteFixed,
         make_sqe: submit::make_sqe_write_fixed,
         on_complete: submit::on_complete_write_fixed,
         drop: submit::drop_write_fixed,
@@ -235,6 +258,7 @@ define_uring_ops! {
     }, // Kernel 5.1+
     Recv {
         field: recv,
+        kind: OpKind::Recv,
         make_sqe: submit::make_sqe_recv,
         on_complete: submit::on_complete_recv,
         drop: submit::drop_recv,
@@ -242,6 +266,7 @@ define_uring_ops! {
     }, // Kernel 5.6+
     OpSend {
         field: send,
+        kind: OpKind::Send,
         make_sqe: submit::make_sqe_send,
         on_complete: submit::on_complete_send,
         drop: submit::drop_send,
@@ -249,6 +274,7 @@ define_uring_ops! {
     }, // Kernel 5.6+
     Connect {
         field: connect,
+        kind: OpKind::Connect,
         make_sqe: submit::make_sqe_connect,
         on_complete: submit::on_complete_connect,
         drop: submit::drop_connect,
@@ -256,6 +282,7 @@ define_uring_ops! {
     }, // Kernel 5.5+
     Close {
         field: close,
+        kind: OpKind::Close,
         make_sqe: submit::make_sqe_close,
         on_complete: submit::on_complete_close,
         drop: submit::drop_close,
@@ -264,6 +291,7 @@ define_uring_ops! {
     }, // Kernel 5.6+
     Fsync {
         field: fsync,
+        kind: OpKind::Fsync,
         make_sqe: submit::make_sqe_fsync,
         on_complete: submit::on_complete_fsync,
         drop: submit::drop_fsync,
@@ -271,6 +299,7 @@ define_uring_ops! {
     }, // Kernel 5.1+
     SyncFileRange {
         field: sync_range,
+        kind: OpKind::SyncFileRange,
         make_sqe: submit::make_sqe_sync_range,
         on_complete: submit::on_complete_sync_range,
         drop: submit::drop_sync_range,
@@ -278,6 +307,7 @@ define_uring_ops! {
     }, // Kernel 5.2+
     Fallocate {
         field: fallocate,
+        kind: OpKind::Fallocate,
         make_sqe: submit::make_sqe_fallocate,
         on_complete: submit::on_complete_fallocate,
         drop: submit::drop_fallocate,
@@ -286,6 +316,7 @@ define_uring_ops! {
     Accept {
         field: accept,
         payload: AcceptPayload,
+        kind: OpKind::Accept,
         make_sqe: submit::make_sqe_accept,
         on_complete: submit::on_complete_accept,
         drop: submit::drop_accept,
@@ -296,6 +327,7 @@ define_uring_ops! {
     SendTo {
         field: send_to,
         payload: SendToPayload,
+        kind: OpKind::SendTo,
         make_sqe: submit::make_sqe_send_to,
         on_complete: submit::on_complete_send_to,
         drop: submit::drop_send_to,
@@ -316,6 +348,7 @@ define_uring_ops! {
     UdpRecvStream {
         field: udp_recv_stream,
         payload: UdpRecvStreamPayload,
+        kind: OpKind::UdpRecvStream,
         make_sqe: submit::make_sqe_udp_recv_stream,
         on_complete: submit::on_complete_udp_recv_stream,
         drop: submit::drop_udp_recv_stream,
@@ -331,6 +364,7 @@ define_uring_ops! {
     }, // Kernel 5.1+ (via RecvMsg)
     UdpRefill {
         field: udp_refill,
+        kind: OpKind::UdpRefill,
         make_sqe: submit::make_sqe_udp_refill,
         on_complete: submit::on_complete_udp_refill,
         drop: submit::drop_udp_refill,
@@ -339,6 +373,7 @@ define_uring_ops! {
     Open {
         field: open,
         payload: OpenPayload,
+        kind: OpKind::Open,
         make_sqe: submit::make_sqe_open,
         on_complete: submit::on_complete_open,
         drop: submit::drop_open,
@@ -349,6 +384,7 @@ define_uring_ops! {
     Wakeup {
         field: wakeup,
         payload: WakeupPayload,
+        kind: OpKind::Wakeup,
         make_sqe: submit::make_sqe_wakeup,
         on_complete: submit::on_complete_wakeup,
         drop: submit::drop_wakeup,
@@ -359,6 +395,7 @@ define_uring_ops! {
     Timeout {
         field: timeout,
         payload: TimeoutPayload,
+        kind: OpKind::Timeout,
         make_sqe: submit::make_sqe_timeout,
         on_complete: submit::on_complete_timeout,
         drop: submit::drop_timeout,

@@ -144,6 +144,10 @@ impl Driver for IocpDriver {
                     op_entry.platform_data.rio_pool_waiting = false;
                     if get_blocking_pool().execute(task).is_err() {
                         let err = io::Error::other("Thread pool overloaded");
+                        unsafe {
+                            *slot.result.get() =
+                                Some(Err(io::Error::new(err.kind(), err.to_string())));
+                        }
                         op_entry.platform_data.lifecycle = OpLifecycle::Completed(Err(
                             io::Error::new(err.kind(), err.to_string()),
                         ));
@@ -155,8 +159,6 @@ impl Driver for IocpDriver {
                             -err.raw_os_error().unwrap_or(1).abs(),
                             0,
                         ));
-                        let _ = std::mem::take(&mut op_entry.platform_data);
-                        self.ops.free_indices.push(user_data);
                     }
                 }
                 Ok(SubmissionResult::Timer(duration)) => {

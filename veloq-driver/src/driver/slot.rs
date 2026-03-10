@@ -1,5 +1,6 @@
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 #[cfg(windows)]
@@ -8,6 +9,32 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 // State definitions
 pub const STATE_EMPTY: u8 = 0;
 pub const STATE_SUBMITTED: u8 = 1; // Submitted to kernel (Driver owns Op)
+
+/// Manual payload container: raw pointer + static kind + drop fn.
+pub struct ErasedPayload {
+    pub ptr: *mut (),
+    pub kind: u16,
+    pub drop_fn: unsafe fn(*mut ()),
+}
+
+unsafe impl Send for ErasedPayload {}
+
+impl ErasedPayload {
+    #[inline]
+    pub fn leak_ptr(self) -> *mut () {
+        let this = ManuallyDrop::new(self);
+        this.ptr
+    }
+}
+
+impl Drop for ErasedPayload {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { (self.drop_fn)(self.ptr) };
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
 
 #[repr(C)]
 #[cfg(windows)]
@@ -45,6 +72,15 @@ pub struct Slot<Op> {
     // - SUBMITTED: Driver reads Op pointer to pass to kernel
     // - COMPLETED: Future takes Op
     pub op: UnsafeCell<Option<Op>>,
+    /// Detailed completion result for cases not representable by raw errno/event res.
+    pub result: UnsafeCell<Option<std::io::Result<usize>>>,
+    /// Type-erased user payload owned by the slot while op is in-flight.
+    pub payload: UnsafeCell<Option<ErasedPayload>>,
+    /// Last completed payload keyed by generation, used by detached/local futures
+    /// to recover data even if the slot has already been reused.
+    pub completed_payload: UnsafeCell<Option<(u32, ErasedPayload)>>,
+    /// Last completed detailed result keyed by generation.
+    pub completed_result: UnsafeCell<Option<(u32, std::io::Result<usize>)>>,
 
     // Windows IOCP specific field (Embedded Overlapped)
     // Enabled only on Windows for pointer reconstruction (Container_of pattern)
@@ -69,6 +105,10 @@ impl<Op> Slot<Op> {
             state: AtomicU8::new(STATE_EMPTY),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             op: UnsafeCell::new(None),
+            result: UnsafeCell::new(None),
+            payload: UnsafeCell::new(None),
+            completed_payload: UnsafeCell::new(None),
+            completed_result: UnsafeCell::new(None),
             #[cfg(windows)]
             overlapped: UnsafeCell::new(OverlappedEntry {
                 inner: unsafe { std::mem::zeroed() },
@@ -80,6 +120,14 @@ impl<Op> Slot<Op> {
     }
 
     pub fn reset(&self, generation: u32) {
+        unsafe {
+            // Ensure stale resources from previous generation are dropped before reuse.
+            *self.op.get() = None;
+            *self.result.get() = None;
+            *self.payload.get() = None;
+            *self.completed_payload.get() = None;
+            *self.completed_result.get() = None;
+        }
         self.state.store(STATE_EMPTY, Ordering::Release);
         self.generation.store(generation, Ordering::Release);
         #[cfg(windows)]

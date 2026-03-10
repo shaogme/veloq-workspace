@@ -454,8 +454,7 @@ impl UdpPoolManager {
         comp.table.record_completion(event);
         comp.events.push(event);
         let _ = unsafe { (*slot.op.get()).take() };
-        let _ = std::mem::take(&mut op.platform_data);
-        ops.free_indices.push(user_data);
+        promote_slot_completion(slot, expected_generation);
         true
     }
 
@@ -713,5 +712,24 @@ impl UdpPoolManager {
             queue_len: pool.queue.len(),
             idle_hits: pool.idle_hits,
         })
+    }
+}
+
+#[inline]
+fn promote_slot_completion(
+    slot: &crate::driver::slot::SlotEntry<crate::driver::iocp::IocpOp>,
+    generation: u32,
+) {
+    let payload = unsafe { (*slot.payload.get()).take() };
+    if let Some(payload) = payload {
+        unsafe {
+            *slot.completed_payload.get() = Some((generation, payload));
+        }
+    }
+    let result = unsafe { (*slot.result.get()).take() };
+    if let Some(result) = result {
+        unsafe {
+            *slot.completed_result.get() = Some((generation, result));
+        }
     }
 }

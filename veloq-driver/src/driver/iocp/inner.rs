@@ -373,8 +373,7 @@ impl IocpDriver {
                     let generation = slot.generation.load(Ordering::Acquire);
                     pending_events.push((user_data, generation, 0, 0));
                     let _ = unsafe { (*slot.op.get()).take() };
-                    let _ = std::mem::take(&mut op.platform_data);
-                    self.ops.free_indices.push(user_data);
+                    promote_slot_completion(slot, generation);
                 }
                 op.platform_data.timer_id = None;
                 op.platform_data.timer_deadline = None;
@@ -427,6 +426,13 @@ impl IocpDriver {
                 io_result = unsafe { (on_comp)(iocp_op, val, &self.extensions) };
             }
         }
+        if let Err(e) = &io_result
+            && e.raw_os_error().is_none()
+        {
+            unsafe {
+                *slot.result.get() = Some(Err(io::Error::new(e.kind(), e.to_string())));
+            }
+        }
 
         match op.platform_data.lifecycle {
             OpLifecycle::Cancelled | OpLifecycle::InFlight => {
@@ -473,8 +479,7 @@ impl IocpDriver {
 
                     if !op.platform_data.rio_needs_drain || op.platform_data.rio_drained {
                         let _ = unsafe { (*slot.op.get()).take() };
-                        let _ = std::mem::take(&mut op.platform_data);
-                        self.ops.free_indices.push(user_data);
+                        promote_slot_completion(slot, slot_generation);
                     }
                 }
             }
@@ -523,8 +528,7 @@ impl IocpDriver {
                     0,
                 );
                 let _ = unsafe { (*slot.op.get()).take() };
-                let _ = std::mem::take(&mut op.platform_data);
-                self.ops.free_indices.push(user_data);
+                promote_slot_completion(slot, generation);
                 return;
             }
 
@@ -541,8 +545,7 @@ impl IocpDriver {
                         0,
                     );
                     let _ = unsafe { (*slot.op.get()).take() };
-                    let _ = std::mem::take(&mut op.platform_data);
-                    self.ops.free_indices.push(user_data);
+                    promote_slot_completion(slot, generation);
                 }
                 OpLifecycle::InFlight => {
                     op.platform_data.lifecycle = OpLifecycle::Cancelled;
@@ -568,8 +571,7 @@ impl IocpDriver {
                                 0,
                             );
                             let _ = unsafe { (*slot.op.get()).take() };
-                            let _ = std::mem::take(&mut op.platform_data);
-                            self.ops.free_indices.push(user_data);
+                            promote_slot_completion(slot, generation);
                             return;
                         }
 
@@ -814,6 +816,22 @@ fn io_result_to_event_res(res: &io::Result<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
         Err(e) => -e.raw_os_error().unwrap_or(1).abs(),
+    }
+}
+
+#[inline]
+fn promote_slot_completion(slot: &crate::driver::slot::SlotEntry<IocpOp>, generation: u32) {
+    let payload = unsafe { (*slot.payload.get()).take() };
+    if let Some(payload) = payload {
+        unsafe {
+            *slot.completed_payload.get() = Some((generation, payload));
+        }
+    }
+    let result = unsafe { (*slot.result.get()).take() };
+    if let Some(result) = result {
+        unsafe {
+            *slot.completed_result.get() = Some((generation, result));
+        }
     }
 }
 
