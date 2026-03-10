@@ -16,6 +16,13 @@ use crate::driver::{
 use inner::UringWaker;
 use op::UringOp;
 
+#[cfg(feature = "test-hooks")]
+impl crate::driver::test_hooks::DriverTestHooks for UringDriver {
+    fn debug_chunk_register_attempts(&self) -> u64 {
+        self.registration_stats.chunk_register_attempts
+    }
+}
+
 impl UringDriver {
     fn submit_sqe(
         &mut self,

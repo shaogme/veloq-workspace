@@ -12,6 +12,10 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+test-hooks = []
+
 [dependencies]
 veloq-atomic-waker.workspace = true
 veloq-buf.workspace = true

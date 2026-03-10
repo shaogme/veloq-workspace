@@ -357,3 +357,12 @@ pub(crate) mod iocp;
 pub use iocp::CloseMode;
 #[cfg(target_os = "windows")]
 pub use iocp::IocpDriver as PlatformDriver;
+
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    /// Optional test-only hooks implemented by platform drivers.
+    pub trait DriverTestHooks {
+        /// Returns how many chunk registration attempts have been issued by this driver.
+        fn debug_chunk_register_attempts(&self) -> u64;
+    }
+}

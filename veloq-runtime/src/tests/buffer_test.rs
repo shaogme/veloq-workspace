@@ -1,159 +1,197 @@
+use crate::config::{BufferRegistrationMode, Config, IocpConfig, UringConfig};
 use crate::runtime::Runtime;
 use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq_driver::driver::test_hooks::DriverTestHooks;
 
-// Test automatic memory expansion and registration
-#[test]
-fn test_memory_expansion_and_registration() {
-    // 1. Configure Runtime with very small memory to trigger expansion easily.
-    // Multiplier 1 means 2MB * 2 * 1 worker = 4MB total initial memory.
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(1))
+fn build_runtime(worker_threads: usize, mode: BufferRegistrationMode) -> Runtime<UniformSlot> {
+    let config = Config::default()
+        .worker_threads(worker_threads)
+        .uring(UringConfig::default().registration_mode(mode))
+        .iocp(IocpConfig::default().registration_mode(mode));
+
+    Runtime::builder()
+        .config(config)
         .with_topology(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
         .build()
-        .unwrap();
+        .expect("failed to build runtime")
+}
 
+fn current_chunk_register_attempts() -> u64 {
+    let weak = crate::runtime::context::current().driver();
+    let driver = weak.upgrade().expect("driver dropped unexpectedly");
+    driver.borrow().debug_chunk_register_attempts()
+}
+
+fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
+    let runtime = build_runtime(1, mode);
     runtime.block_on(async move {
-        // Use current_pool() and unwrap it
-        let pool = crate::runtime::context::current_pool().expect("Buffer pool not found");
-
-        println!("Initial pool allocation...");
-
-        // 2. Allocate enough buffers to exhaust the initial memory.
-        let mut bufs = Vec::new();
-        // 1MB allocations
+        let pool = crate::runtime::context::current_pool().expect("buffer pool not found");
         let alloc_size = nz!(1024 * 1024);
 
-        // Allocate 4x 1MB -> Should fill the pool (4MB)
-        for i in 0..4 {
-            if let Some(buf) = pool.alloc(alloc_size) {
-                println!("Allocated buffer {}", i);
-                bufs.push(buf);
-            } else {
-                panic!("Failed to allocate initial buffer {}", i);
+        let mut bufs = Vec::new();
+        let mut expanded_chunk_id = None;
+        for i in 0..16 {
+            let buf = pool
+                .alloc(alloc_size)
+                .unwrap_or_else(|| panic!("allocation failed before expansion validation, i={i}"));
+            let info = buf.resolve_region_info();
+            assert_ne!(
+                info.id,
+                u16::MAX,
+                "auto expansion should not fallback to heap buffer"
+            );
+            if info.id != 0 {
+                expanded_chunk_id = Some(info.id);
             }
-        }
-
-        println!("Allocated {} buffers (Initial 4MB)", bufs.len());
-
-        // 3. Allocate more to trigger expansion
-        // This should trigger expansion by 64MB (default EXPANSION_SIZE in GlobalSlotPool)
-        println!("Triggering expansion...");
-
-        if let Some(mut buf) = pool.alloc(alloc_size) {
-            println!("Allocated extra buffer (Expansion triggered)");
-
-            // 4. Verify the new buffer works
-            {
-                let slice = buf.as_slice_mut();
-                slice[0] = 42;
-                slice[slice.len() - 1] = 100;
-
-                assert_eq!(slice[0], 42);
-                assert_eq!(slice[slice.len() - 1], 100);
-            }
-
             bufs.push(buf);
-        } else {
-            panic!("Unified allocation failed - expansion didn't work?");
-        }
-
-        // 5. Verify registration happened (implicitly) and we can continue allocating
-        // Allocate 10 more to ensure the new chunk is actually usable and big enough
-        for i in 0..10 {
-            if let Some(buf) = pool.alloc(alloc_size) {
-                bufs.push(buf);
-            } else {
-                panic!("Failed to allocate post-expansion buffer {}", i);
+            if expanded_chunk_id.is_some() {
+                break;
             }
         }
 
-        println!("Total allocated buffers: {}", bufs.len());
-        assert!(
-            bufs.len() >= 15,
-            "Should have allocated significantly more than initial capacity"
-        );
+        let expanded_id = expanded_chunk_id.expect("auto expansion did not produce a new chunk");
 
-        // Optional: Yield to allow any async registration tasks to proceed (though registration is usually synchronous in notification)
-        crate::runtime::context::yield_now().await;
+        // Ensure expanded chunk is actually usable.
+        let mut post_expansion_count = 0usize;
+        for _ in 0..8 {
+            if let Some(buf) = pool.alloc(alloc_size)
+                && buf.resolve_region_info().id == expanded_id
+            {
+                post_expansion_count += 1;
+                bufs.push(buf);
+            }
+        }
+        assert!(
+            post_expansion_count > 0,
+            "expanded chunk should be reusable for subsequent allocations"
+        );
     });
 }
 
-#[test]
-fn test_multithreaded_expansion() {
-    // Test Cross-Thread Registration:
-    // Worker 0 triggers expansion.
-    // Worker 1 must see the new chunk and register it to its own driver to use it.
-
-    // Config: 2 Workers
-    // Size: Multiplier 1 ==> 2MB * 2 * 2 workers = 8MB Total Initial.
-    let runtime = Runtime::builder()
-        .config(crate::config::Config::default().worker_threads(2))
-        .with_topology(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
-        .build()
-        .unwrap();
-
+fn run_expansion_immediate_registration_check(
+    mode: BufferRegistrationMode,
+    should_immediate: bool,
+) {
+    let runtime = build_runtime(1, mode);
     runtime.block_on(async move {
-        let pool = crate::runtime::context::current_pool().expect("No pool");
+        let pool = crate::runtime::context::current_pool().expect("buffer pool not found");
+        let alloc_size = nz!(1024 * 1024);
+        let before = current_chunk_register_attempts();
 
-        // 1. Worker 0 fills the pool (8MB)
-        let mut holding = Vec::new();
-        let chunk_size = nz!(1024 * 1024); // 1MB
-
-        println!("Worker 0: Filling pool...");
-        // Alloc 8MB (should succeed mostly)
-        for i in 0..8 {
-            if let Some(buf) = pool.alloc(chunk_size) {
-                holding.push(buf);
-            } else {
-                println!("Worker 0 warning: Early alloc failure at {}", i);
+        let mut bufs = Vec::new();
+        let mut expanded = false;
+        for i in 0..16 {
+            let buf = pool
+                .alloc(alloc_size)
+                .unwrap_or_else(|| panic!("allocation failed while triggering expansion, i={i}"));
+            let info = buf.resolve_region_info();
+            assert_ne!(info.id, u16::MAX, "expansion should not fallback to heap");
+            if info.id != 0 {
+                expanded = true;
+            }
+            bufs.push(buf);
+            if expanded {
+                break;
             }
         }
+        assert!(expanded, "failed to trigger expansion");
 
-        // 2. Trigger Expansion (Alloc 1 more)
-        println!("Worker 0: Triggering expansion...");
-        if let Some(buf) = pool.alloc(chunk_size) {
-            // Verify it is from a new chunk (Chunk 0 has max 8MB, we just took 9th)
-            let info = buf.resolve_region_info();
-            assert_ne!(info.id, 0, "Should be new chunk");
-            println!("Worker 0: Expansion successful (Chunk {})", info.id);
-            holding.push(buf);
-        } else {
-            panic!("Worker 0 failed to trigger expansion");
+        // Cross at least one executor budget boundary so check_for_memory_updates runs again.
+        for _ in 0..128 {
+            crate::runtime::context::yield_now().await;
         }
 
-        // 3. Spawn task on (hopefully) another worker to verify visibility
-        // We spawn multiple to ensure at least one hits Worker 1
+        let after = current_chunk_register_attempts();
+        if should_immediate {
+            assert!(
+                after > before,
+                "compatible mode should eagerly register new chunk after expansion: before={before}, after={after}"
+            );
+        } else {
+            assert_eq!(
+                after, before,
+                "strict mode should not eagerly register after expansion without I/O submit: before={before}, after={after}"
+            );
+        }
+    });
+}
+
+fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
+    let runtime = build_runtime(2, mode);
+    runtime.block_on(async move {
+        let pool = crate::runtime::context::current_pool().expect("no pool");
+        let alloc_size = nz!(1024 * 1024);
+
+        let mut holding = Vec::new();
+        let mut expanded_chunk_id = None;
+        for i in 0..16 {
+            let buf = pool
+                .alloc(alloc_size)
+                .unwrap_or_else(|| panic!("worker0 allocation failed, i={i}"));
+            let info = buf.resolve_region_info();
+            assert_ne!(
+                info.id,
+                u16::MAX,
+                "expansion path should not fallback to heap"
+            );
+            if info.id != 0 {
+                expanded_chunk_id = Some(info.id);
+                holding.push(buf);
+                break;
+            }
+            holding.push(buf);
+        }
+        let expanded_id = expanded_chunk_id.expect("worker0 did not trigger pool auto expansion");
+
         let handles: Vec<_> = (0..4)
-            .map(|_i| {
+            .map(|_| {
                 crate::runtime::context::spawn(async move {
-                    let chunk_size = nz!(1024 * 1024);
-
-                    // Allow some time for epoch synch
                     crate::runtime::context::yield_now().await;
-
-                    let pool = crate::runtime::context::current_pool().unwrap();
-
-                    // Try alloc. Since Main Thread holds ~9MB, and initial was ~8MB,
-                    // any new alloc MUST come from the new 64MB chunk.
-                    if let Some(buf) = pool.alloc(chunk_size) {
-                        let info = buf.resolve_region_info();
-                        // Just return the chunk ID
-                        Some(info.id)
-                    } else {
-                        None
-                    }
+                    let pool = crate::runtime::context::current_pool().expect("pool missing");
+                    let buf = pool.alloc(alloc_size).expect("worker allocation failed");
+                    buf.resolve_region_info().id
                 })
             })
             .collect();
 
         for h in handles {
-            let res = h.await;
-            if let Some(chunk_id) = res {
-                assert_eq!(chunk_id, 1, "Other workers should see Chunk 1");
-            }
-            // Some allocs might fail if we raced too fast? Unlikely with 64MB expansion.
+            let chunk_id = h.await;
+            assert_ne!(chunk_id, u16::MAX, "worker should not fallback to heap");
+            assert_ne!(chunk_id, 0, "worker should see expanded chunk");
+            assert!(
+                chunk_id >= expanded_id,
+                "worker chunk_id should be on or after expanded chunk"
+            );
         }
-
-        println!("Cross-thread expansion test passed");
     });
+}
+
+#[test]
+fn test_memory_auto_expansion_strict_mode() {
+    run_auto_expansion_single_worker(BufferRegistrationMode::Strict);
+}
+
+#[test]
+fn test_memory_auto_expansion_compatible_mode() {
+    run_auto_expansion_single_worker(BufferRegistrationMode::Compatible);
+}
+
+#[test]
+fn test_expansion_does_not_immediately_register_in_strict_mode() {
+    run_expansion_immediate_registration_check(BufferRegistrationMode::Strict, false);
+}
+
+#[test]
+fn test_expansion_immediately_registers_in_compatible_mode() {
+    run_expansion_immediate_registration_check(BufferRegistrationMode::Compatible, true);
+}
+
+#[test]
+fn test_multithreaded_auto_expansion_strict_mode() {
+    run_auto_expansion_multithread(BufferRegistrationMode::Strict);
+}
+
+#[test]
+fn test_multithreaded_auto_expansion_compatible_mode() {
+    run_auto_expansion_multithread(BufferRegistrationMode::Compatible);
 }

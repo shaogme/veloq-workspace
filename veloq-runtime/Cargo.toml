@@ -44,6 +44,7 @@ rustc-hash = "2.1.1"
 [dev-dependencies]
 criterion.workspace = true
 tracing-subscriber = "0.3.22"
+veloq-driver = { workspace = true, features = ["test-hooks"] }
 
 [[bench]]
 name = "fs_benchmark"
