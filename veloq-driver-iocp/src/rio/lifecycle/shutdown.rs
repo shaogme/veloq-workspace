@@ -8,11 +8,11 @@
 //! When immediate teardown cannot complete in `Drop`, ownership is moved to a
 //! background reaper thread to avoid blocking critical threads indefinitely.
 
-use crate::driver::iocp::error::{IocpErrorContext, io_msg};
-use crate::driver::iocp::rio::RioState;
-use crate::driver::iocp::rio::core::registry::RioRegistry;
-use crate::driver::iocp::rio::core::submit_ops::RioKernel;
-use crate::driver::iocp::rio::runtime::control_flow::actor::RioSocketActor;
+use crate::error::{IocpErrorContext, io_msg};
+use crate::rio::RioState;
+use crate::rio::core::registry::RioRegistry;
+use crate::rio::core::submit_ops::RioKernel;
+use crate::rio::runtime::control_flow::actor::RioSocketActor;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::sync::OnceLock;
@@ -24,7 +24,7 @@ const RIO_REAPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 struct DeferredRioCleanup {
     kernel: RioKernel,
     registry: RioRegistry,
-    registration_mode: crate::config::BufferRegistrationMode,
+    registration_mode: crate::BufferRegistrationMode,
     actors: FxHashMap<HANDLE, RioSocketActor>,
     actor_routes: FxHashMap<u32, HANDLE>,
     outstanding_count: usize,

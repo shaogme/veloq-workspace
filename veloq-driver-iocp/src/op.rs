@@ -6,18 +6,25 @@
 //! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
 use crate::SockAddrStorage;
-use crate::driver::PlatformOp;
-use crate::driver::iocp::ext::Extensions;
-use crate::driver::iocp::rio::RioState;
-use crate::driver::iocp::submit::{self, SubmissionResult};
-use crate::op::{
-    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, OpKind, Open, ReadFixed, Recv,
-    Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
-};
+use crate::ext::Extensions;
+use crate::rio::RioState;
+use crate::submit::{self, SubmissionResult};
+use crate::{IoFd, RawHandle};
 use std::io;
 use std::mem::ManuallyDrop;
+use veloq_driver_core::driver::PlatformOp;
+use veloq_driver_core::op::{
+    Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
+    Fsync as FsyncBase, IntoPlatformOp, OpKind, Open, ReadFixed as ReadFixedBase, Recv as RecvBase,
+    Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase, Timeout,
+    UdpRecvStream as UdpRecvStreamBase, UdpRefill as UdpRefillBase, Wakeup as WakeupBase,
+    WriteFixed as WriteFixedBase,
+};
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6};
+use windows_sys::Win32::Networking::WinSock::{
+    INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED,
+    WSA_FLAG_REGISTERED_IO, WSASocketW,
+};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // ============================================================================
@@ -25,7 +32,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 // ============================================================================
 
 #[repr(C)]
-pub(crate) struct OverlappedEntry {
+pub struct OverlappedEntry {
     pub(crate) inner: OVERLAPPED,
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
@@ -42,6 +49,29 @@ impl OverlappedEntry {
         }
     }
 }
+
+impl Default for OverlappedEntry {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+unsafe impl Send for OverlappedEntry {}
+
+type ReadFixed = ReadFixedBase<RawHandle>;
+type WriteFixed = WriteFixedBase<RawHandle>;
+type Recv = RecvBase<RawHandle>;
+type OpSend = OpSendBase<RawHandle>;
+type Close = CloseBase<RawHandle>;
+type Fsync = FsyncBase<RawHandle>;
+type Connect = ConnectBase<RawHandle, SockAddrStorage>;
+type Accept = AcceptBase<RawHandle, SockAddrStorage>;
+type SendTo = SendToBase<RawHandle>;
+type SyncFileRange = SyncFileRangeBase<RawHandle>;
+type Fallocate = FallocateBase<RawHandle>;
+type UdpRecvStream = UdpRecvStreamBase<RawHandle>;
+type UdpRefill = UdpRefillBase<RawHandle>;
+type Wakeup = WakeupBase<RawHandle>;
 
 // ============================================================================
 // SubmitContext Definition
@@ -172,8 +202,8 @@ macro_rules! define_iocp_ops {
                     define_iocp_ops!(@destruct payload, $($destruct)?)
                 }
 
-                fn payload_into_erased(payload: Self::UserPayload) -> crate::driver::slot::ErasedPayload {
-                    crate::driver::slot::ErasedPayload {
+                fn payload_into_erased(payload: Self::UserPayload) -> veloq_driver_core::slot::ErasedPayload {
+                    veloq_driver_core::slot::ErasedPayload {
                         ptr: Box::into_raw(payload) as *mut (),
                         kind: Self::PAYLOAD_KIND as u16,
                         drop_fn: define_iocp_ops!(@drop_raw_fn $OpType),
@@ -222,6 +252,7 @@ pub(crate) struct KernelRef<T> {
 pub(crate) struct AcceptPayload {
     pub(crate) user: NonNull<Accept>,
     pub(crate) accept_buffer: [u8; 288],
+    pub(crate) accept_socket: RawHandle,
 }
 
 pub(crate) struct SendToPayload {
@@ -320,9 +351,33 @@ define_iocp_ops! {
         on_complete: submit::on_complete_accept,
         drop: submit::drop_accept,
         get_fd: submit::get_fd_accept,
-        construct: |user| AcceptPayload {
-            user,
-            accept_buffer: [0; 288],
+        construct: |user: std::ptr::NonNull<Accept>| {
+            let op = unsafe { user.as_ref() };
+            let family = op.addr.0.ss_family;
+            let socket = unsafe {
+                WSASocketW(
+                    family as i32,
+                    SOCK_STREAM,
+                    IPPROTO_TCP,
+                    std::ptr::null(),
+                    0,
+                    WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
+                )
+            };
+            let accept_socket = if socket == INVALID_SOCKET {
+                RawHandle {
+                    handle: std::ptr::null_mut(),
+                }
+            } else {
+                RawHandle {
+                    handle: socket as HANDLE,
+                }
+            };
+            AcceptPayload {
+                user,
+                accept_buffer: [0; 288],
+                accept_socket,
+            }
         },
         destruct: |user: Box<Accept>| *user,
     },

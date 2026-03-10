@@ -1,7 +1,7 @@
+use crate::{RawHandle, SockAddrStorage};
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::RawFd;
-use veloq_driver_core::{RawHandle, SockAddrStorage};
 
 pub struct Socket {
     fd: RawFd,
@@ -217,10 +217,10 @@ pub fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, socklen_t) {
 }
 
 pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) {
-    let mut storage: SockAddrStorage = unsafe { std::mem::zeroed() };
+    let mut storage = SockAddrStorage::default();
     let len = match addr {
         SocketAddr::V4(a) => {
-            let sin_ptr = &mut storage as *mut _ as *mut sockaddr_in;
+            let sin_ptr = &mut storage.0 as *mut _ as *mut sockaddr_in;
             unsafe {
                 (*sin_ptr).sin_family = libc::AF_INET as _;
                 (*sin_ptr).sin_port = a.port().to_be();
@@ -229,7 +229,7 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) 
             }
         }
         SocketAddr::V6(a) => {
-            let sin6_ptr = &mut storage as *mut _ as *mut sockaddr_in6;
+            let sin6_ptr = &mut storage.0 as *mut _ as *mut sockaddr_in6;
             unsafe {
                 (*sin6_ptr).sin6_family = libc::AF_INET6 as _;
                 (*sin6_ptr).sin6_port = a.port().to_be();

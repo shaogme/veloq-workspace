@@ -2,7 +2,11 @@ pub mod config;
 pub mod driver;
 pub mod op;
 
-pub use veloq_driver_core::{RawHandle, SockAddrStorage};
+#[cfg(unix)]
+pub use veloq_driver_uring::{RawHandle, SockAddrStorage};
+
+#[cfg(windows)]
+pub use veloq_driver_iocp::{RawHandle, SockAddrStorage};
 
 #[cfg(unix)]
 mod unix;

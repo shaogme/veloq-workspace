@@ -3,10 +3,10 @@
 //! This module implements the logic for submitting operations, handling completions,
 //! and accessing FDs, exposed as static functions for VTable construction.
 
-use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
-use crate::driver::iocp::ext::Extensions;
-use crate::driver::iocp::op::{IocpOp, SubmitContext};
-use crate::op::IoFd;
+use crate::IoFd;
+use crate::error::{IocpErrorContext, io_error, io_msg};
+use crate::ext::Extensions;
+use crate::op::{IocpOp, SubmitContext};
 use std::io;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -116,7 +116,7 @@ pub(crate) enum SubmissionResult {
 
 pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::Result<HANDLE> {
     match fd {
-        IoFd::Raw(h) => Ok(h.into()),
+        IoFd::Raw(h) => Ok(h.handle as HANDLE),
         IoFd::Fixed(idx) => {
             if let Some(Some(h)) = registered_files.get(idx as usize) {
                 Ok(*h)
@@ -357,7 +357,7 @@ pub(crate) unsafe fn submit_connect(
     }
 
     if need_bind {
-        let family = connect_op.addr.ss_family;
+        let family = connect_op.addr.0.ss_family;
         let mut bind_addr: SOCKADDR_IN = unsafe { std::mem::zeroed() };
         bind_addr.sin_family = AF_INET;
         let mut bind_addr6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
@@ -412,7 +412,7 @@ pub(crate) unsafe fn on_complete_connect(
     if let Some(fd) = connect_op.fd.raw() {
         let ret = unsafe {
             setsockopt(
-                fd.into(),
+                fd.handle as SOCKET,
                 SOL_SOCKET,
                 SO_UPDATE_CONNECT_CONTEXT,
                 std::ptr::null(),
@@ -439,7 +439,7 @@ pub(crate) unsafe fn submit_accept(
     let payload = unsafe { &mut *op.payload.accept };
     let user = unsafe { payload.user.as_mut() };
     let handle = resolve_fd(user.fd, ctx.registered_files)?;
-    let accept_socket = user.accept_socket;
+    let accept_socket = payload.accept_socket;
     let accept_socket_raw = accept_socket.handle as SOCKET;
 
     ensure_iocp_association(
@@ -501,12 +501,12 @@ pub(crate) unsafe fn submit_accept(
 
 pub(crate) unsafe fn on_complete_accept(
     op: &mut IocpOp,
-    result: usize,
+    _result: usize,
     ext: &Extensions,
 ) -> io::Result<usize> {
     let payload = unsafe { &mut *op.payload.accept };
     let user = unsafe { payload.user.as_mut() };
-    let accept_socket = user.accept_socket;
+    let accept_socket = payload.accept_socket;
     let listen_handle = user.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
     let listen_socket = listen_handle.handle as SOCKET;
     let accept_socket_raw = accept_socket.handle as SOCKET;
@@ -572,7 +572,7 @@ pub(crate) unsafe fn on_complete_accept(
             )));
         }
     }
-    Ok(result)
+    Ok(accept_socket_raw as usize)
 }
 
 impl_lifecycle!(drop_accept, get_fd_accept, accept, nested_fd);
@@ -591,7 +591,7 @@ pub(crate) unsafe fn submit_send_to(
 
     // RIO path is mandatory for socket send_to.
     let page_idx = op.header.user_data / ctx.slots_per_page;
-    let args = crate::driver::iocp::rio::RioSendToArgs {
+    let args = crate::rio::RioSendToArgs {
         fd: user.fd,
         handle,
         buf: &user.buf,
@@ -629,7 +629,7 @@ pub(crate) unsafe fn submit_udp_recv_stream(
     let kernel = unsafe { &mut *op.payload.udp_recv_stream };
     let val = unsafe { kernel.user.as_mut() };
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
-    let args = crate::driver::iocp::rio::RioUdpStreamArgs {
+    let args = crate::rio::RioUdpStreamArgs {
         fd: val.fd,
         handle,
         stream_op: val,

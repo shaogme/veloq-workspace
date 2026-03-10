@@ -3,12 +3,12 @@
 //! This module implements the logic for submitting operations and handling completions,
 //! exposed as static functions for VTable construction.
 
+use crate::IoFd;
 use crate::UringDriver;
 use crate::op::UringOp;
 use io_uring::{opcode, squeue, types};
 use std::io;
 use std::mem::ManuallyDrop;
-use veloq_driver_core::IoFd;
 
 // ============================================================================
 // Macros
@@ -228,13 +228,13 @@ pub(crate) unsafe fn make_sqe_connect(
     match val.fd {
         IoFd::Raw(fd) => opcode::Connect::new(
             types::Fd(fd.fd),
-            &val.addr as *const _ as *const _,
+            &val.addr.0 as *const _ as *const _,
             val.addr_len,
         )
         .build(),
         IoFd::Fixed(idx) => opcode::Connect::new(
             types::Fixed(idx),
-            &val.addr as *const _ as *const _,
+            &val.addr.0 as *const _ as *const _,
             val.addr_len,
         )
         .build(),
@@ -249,13 +249,13 @@ pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp, _driver: &mut UringDriver
     match val.fd {
         IoFd::Raw(fd) => opcode::Accept::new(
             types::Fd(fd.fd),
-            &mut val.addr as *mut _ as *mut _,
+            &mut val.addr.0 as *mut _ as *mut _,
             &mut val.addr_len as *mut _,
         )
         .build(),
         IoFd::Fixed(idx) => opcode::Accept::new(
             types::Fixed(idx),
-            &mut val.addr as *mut _ as *mut _,
+            &mut val.addr.0 as *mut _ as *mut _,
             &mut val.addr_len as *mut _,
         )
         .build(),
@@ -269,7 +269,7 @@ pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Re
         // Try fallback parsing to populate remote_addr early
         let addr_bytes = unsafe {
             std::slice::from_raw_parts(
-                &accept_op.addr as *const _ as *const u8,
+                &accept_op.addr.0 as *const _ as *const u8,
                 accept_op.addr_len as usize,
             )
         };

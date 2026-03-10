@@ -36,12 +36,12 @@ mod lifecycle {
     pub(crate) mod shutdown;
 }
 
-use crate::config::BufferRegistrationMode;
-use crate::driver::iocp::IocpOp;
-use crate::driver::iocp::IocpOpState;
-use crate::driver::op_registry::OpRegistry;
-use crate::driver::{SharedCompletionQueue, SharedCompletionTable};
+use crate::BufferRegistrationMode;
+use crate::IocpOpState;
+use crate::op::IocpOp;
 use rustc_hash::FxHashMap;
+use veloq_driver_core::driver::{SharedCompletionQueue, SharedCompletionTable};
+use veloq_driver_core::op_registry::OpRegistry;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{RIO_CQ, RIO_RQ};
 
@@ -67,7 +67,7 @@ pub(crate) struct RioContext<'a> {
 }
 
 pub(crate) struct RioCompletionContext<'a> {
-    pub(crate) ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
+    pub(crate) ops: &'a mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
     pub(crate) events: &'a SharedCompletionQueue,
     pub(crate) table: &'a SharedCompletionTable,
 }

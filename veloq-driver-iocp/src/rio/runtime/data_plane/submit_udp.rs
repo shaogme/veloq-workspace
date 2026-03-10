@@ -8,9 +8,9 @@
 //! All methods are implemented as `RioState` extensions but remain datapath
 //! focused: they prepare buffers, submit requests, and update outstanding counts.
 
-use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
-use crate::driver::iocp::rio::{RioEnv, RioState};
-use crate::op::IoFd;
+use crate::IoFd;
+use crate::error::{IocpErrorContext, io_error, io_msg};
+use crate::rio::{RioEnv, RioState};
 use std::io;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -30,7 +30,7 @@ pub(crate) struct RioSendToArgs<'a> {
 pub(crate) struct RioUdpStreamArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: HANDLE,
-    pub(crate) stream_op: &'a mut crate::op::UdpRecvStream,
+    pub(crate) stream_op: &'a mut veloq_driver_core::op::UdpRecvStream<crate::RawHandle>,
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
 }
@@ -41,8 +41,8 @@ impl RioState {
         args: RioSendToArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
+    ) -> io::Result<crate::submit::SubmissionResult> {
+        use crate::submit::SubmissionResult;
         use windows_sys::Win32::Networking::WinSock::{
             AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
         };
@@ -163,8 +163,8 @@ impl RioState {
         &mut self,
         args: RioUdpStreamArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
+    ) -> io::Result<crate::submit::SubmissionResult> {
+        use crate::submit::SubmissionResult;
 
         let RioUdpStreamArgs {
             fd,

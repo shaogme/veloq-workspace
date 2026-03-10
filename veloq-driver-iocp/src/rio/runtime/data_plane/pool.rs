@@ -8,19 +8,19 @@
 //! This file represents datapath state machines only; lifecycle teardown is
 //! handled by dedicated shutdown logic in the lifecycle layer.
 
+use crate::OpLifecycle;
 use crate::SockAddrStorage;
-use crate::driver::iocp::OpLifecycle;
-use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
-use crate::driver::iocp::rio::core::registry::RIO_INVALID_BUFFERID;
-use crate::driver::iocp::rio::core::submit_ops::RioDispatch;
-use crate::driver::iocp::rio::{RioCompletionContext, RioContext};
-use crate::driver::iocp::submit::SubmissionResult;
-use crate::driver::{CompletionEvent, encode_completion_token};
-use crate::op::UdpRecvStream;
+use crate::error::{IocpErrorContext, io_error, io_msg};
+use crate::rio::core::registry::RIO_INVALID_BUFFERID;
+use crate::rio::core::submit_ops::RioDispatch;
+use crate::rio::{RioCompletionContext, RioContext};
+use crate::submit::SubmissionResult;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::io;
 use veloq_buf::FixedBuf;
+use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
+use veloq_driver_core::op::UdpRecvStream;
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIO_BUFFERID, RIORESULT, WSAGetLastError};
 
@@ -437,7 +437,7 @@ impl UdpPoolManager {
         };
 
         let kernel = unsafe { &mut *iocp_op.payload.udp_recv_stream };
-        let stream_op: &mut UdpRecvStream = unsafe { kernel.user.as_mut() };
+        let stream_op: &mut UdpRecvStream<crate::RawHandle> = unsafe { kernel.user.as_mut() };
 
         let owned_datagram = datagram.take().unwrap();
         let datagram_len = owned_datagram.buf.len();
@@ -450,7 +450,7 @@ impl UdpPoolManager {
             crate::to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
         };
 
-        stream_op.result = Some(crate::op::UdpRecvDatagram {
+        stream_op.result = Some(veloq_driver_core::op::UdpRecvDatagram {
             buf: owned_datagram.buf,
             addr,
         });
@@ -473,7 +473,7 @@ impl UdpPoolManager {
         true
     }
 
-    fn into_op_udp_datagram(datagram: UdpRecvDatagram) -> crate::op::UdpRecvDatagram {
+    fn into_op_udp_datagram(datagram: UdpRecvDatagram) -> veloq_driver_core::op::UdpRecvDatagram {
         let addr = unsafe {
             let s = std::slice::from_raw_parts(
                 &datagram.addr as *const _ as *const u8,
@@ -482,7 +482,7 @@ impl UdpPoolManager {
             crate::to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
         };
 
-        crate::op::UdpRecvDatagram {
+        veloq_driver_core::op::UdpRecvDatagram {
             buf: datagram.buf,
             addr,
         }
@@ -518,7 +518,7 @@ impl UdpPoolManager {
 
     pub(crate) fn try_submit_udp_recv_stream_pooled(
         &mut self,
-        stream_op: &mut crate::op::UdpRecvStream,
+        stream_op: &mut veloq_driver_core::op::UdpRecvStream<crate::RawHandle>,
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> io::Result<(SubmissionResult, usize)> {

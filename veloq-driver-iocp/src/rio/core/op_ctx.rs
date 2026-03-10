@@ -9,8 +9,8 @@
 //! The code here is intentionally low-level and allocation-aware because it is
 //! called on hot completion paths and during shutdown draining.
 
-use crate::driver::iocp::rio::RioState;
-use crate::driver::iocp::rio::runtime::data_plane::pool::POOL_CTX_TAG;
+use crate::rio::RioState;
+use crate::rio::runtime::data_plane::pool::POOL_CTX_TAG;
 use std::io;
 
 #[derive(Clone, Copy)]

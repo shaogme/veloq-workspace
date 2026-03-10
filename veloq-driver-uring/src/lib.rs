@@ -12,31 +12,40 @@ mod op;
 mod submit;
 
 pub use inner::{UringDriver, UringOpState};
-pub use veloq_driver_core::{RawHandle, SockAddrStorage};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct RawHandle {
+    pub fd: i32,
+}
 
-pub mod driver {
-    pub mod op_registry {
-        pub use veloq_driver_core::op_registry::*;
-    }
-
-    pub mod slot {
-        pub use veloq_driver_core::slot::*;
-    }
-
-    pub use veloq_driver_core::driver::{
-        CompletionEvent, CompletionRecord, CompletionSidecar, CompletionTable, Driver, Outcome,
-        PlatformOp, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
-        decode_completion_token, encode_completion_token, event_res_to_io,
-    };
-
-    pub mod uring {
-        pub use crate::{UringDriver, UringOpState};
-
-        pub mod op {
-            pub use crate::op::*;
-        }
+impl From<i32> for RawHandle {
+    fn from(fd: i32) -> Self {
+        Self { fd }
     }
 }
+
+impl From<usize> for RawHandle {
+    fn from(fd: usize) -> Self {
+        Self { fd: fd as i32 }
+    }
+}
+
+impl From<RawHandle> for usize {
+    fn from(handle: RawHandle) -> Self {
+        handle.fd as usize
+    }
+}
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct SockAddrStorage(pub libc::sockaddr_storage);
+
+impl Default for SockAddrStorage {
+    fn default() -> Self {
+        Self(unsafe { std::mem::zeroed() })
+    }
+}
+
+pub type IoFd = veloq_driver_core::IoFd<RawHandle>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BufferRegistrationMode {
@@ -162,10 +171,10 @@ pub fn to_socket_addr(buf: &[u8]) -> std::io::Result<SocketAddr> {
 }
 
 pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) {
-    let mut storage: SockAddrStorage = unsafe { std::mem::zeroed() };
+    let mut storage = SockAddrStorage::default();
     let len = match addr {
         SocketAddr::V4(a) => {
-            let sin_ptr = &mut storage as *mut _ as *mut sockaddr_in;
+            let sin_ptr = &mut storage.0 as *mut _ as *mut sockaddr_in;
             unsafe {
                 (*sin_ptr).sin_family = libc::AF_INET as _;
                 (*sin_ptr).sin_port = a.port().to_be();
@@ -174,7 +183,7 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) 
             }
         }
         SocketAddr::V6(a) => {
-            let sin6_ptr = &mut storage as *mut _ as *mut sockaddr_in6;
+            let sin6_ptr = &mut storage.0 as *mut _ as *mut sockaddr_in6;
             unsafe {
                 (*sin6_ptr).sin6_family = libc::AF_INET6 as _;
                 (*sin6_ptr).sin6_port = a.port().to_be();
@@ -188,13 +197,12 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) 
     (storage, len)
 }
 
-use driver::op_registry::OpEntry;
-use driver::{
-    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
-};
 use inner::UringWaker;
 use op::UringOp;
-use veloq_driver_core::IoFd;
+use veloq_driver_core::driver::{
+    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+};
+use veloq_driver_core::op_registry::{OpEntry, OpHandle};
 
 impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver {
     fn debug_chunk_register_attempts(&self) -> u64 {
@@ -275,10 +283,12 @@ impl UringDriver {
 
 impl Driver for UringDriver {
     type Op = UringOp;
+    type Handle = RawHandle;
+    type Sidecar = ();
 
     fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
         match self.ops.insert(OpEntry::new(UringOpState::new())) {
-            Ok(driver::op_registry::OpHandle {
+            Ok(OpHandle {
                 index: id,
                 generation,
             }) => {
@@ -292,7 +302,9 @@ impl Driver for UringDriver {
         }
     }
 
-    fn slot_table(&self) -> std::sync::Arc<driver::slot::SlotTable<Self::Op>> {
+    fn slot_table(
+        &self,
+    ) -> std::sync::Arc<veloq_driver_core::slot::SlotTable<Self::Op, Self::Sidecar>> {
         self.ops.shared.clone()
     }
 
@@ -367,7 +379,7 @@ impl Driver for UringDriver {
 
     fn wait_and_drain_completions(
         &mut self,
-        out: &mut Vec<driver::CompletionEvent>,
+        out: &mut Vec<veloq_driver_core::driver::CompletionEvent>,
     ) -> io::Result<usize> {
         UringDriver::wait(self)?;
         Ok(self.drain_completions(out))

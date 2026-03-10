@@ -1,4 +1,4 @@
-use crate::handle::{IoFd, RawHandle};
+use crate::{Handle, IoFd, SlotSidecar};
 use crate::slot;
 use crossbeam_queue::SegQueue;
 use std::cell::UnsafeCell;
@@ -194,10 +194,12 @@ pub fn event_res_to_io(res: i32) -> io::Result<usize> {
 
 pub trait Driver: 'static {
     type Op: PlatformOp;
+    type Handle: Handle;
+    type Sidecar: SlotSidecar;
 
     fn reserve_op(&mut self) -> io::Result<(usize, u32)>;
 
-    fn slot_table(&self) -> std::sync::Arc<slot::SlotTable<Self::Op>>;
+    fn slot_table(&self) -> std::sync::Arc<slot::SlotTable<Self::Op, Self::Sidecar>>;
 
     fn submit(
         &mut self,
@@ -251,15 +253,15 @@ pub trait Driver: 'static {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()>;
 
-    fn register_files(&mut self, files: &[RawHandle]) -> io::Result<Vec<IoFd>>;
+    fn register_files(&mut self, files: &[Self::Handle]) -> io::Result<Vec<IoFd<Self::Handle>>>;
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()>;
+    fn unregister_files(&mut self, files: Vec<IoFd<Self::Handle>>) -> io::Result<()>;
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()>;
 
     fn wake(&mut self) -> io::Result<()>;
 
-    fn inner_handle(&self) -> RawHandle;
+    fn inner_handle(&self) -> Self::Handle;
 
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
 

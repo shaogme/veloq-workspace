@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
 
-use crate::driver::op_registry::OpRegistry;
-use crate::driver::uring::op::UringOp;
-use crate::driver::{
-    CompletionEvent, CompletionSidecar, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
-    encode_completion_token,
+use crate::op::{SubmissionStrategy, UringOp};
+use crate::{BufferRegistrationMode, IoFd, IoMode, RawHandle, UringConfig};
+use veloq_driver_core::driver::{
+    CompletionEvent, CompletionSidecar, CompletionTable, RemoteWaker, SharedCompletionQueue,
+    SharedCompletionTable, encode_completion_token,
 };
-use crate::{BufferRegistrationMode, IoMode, UringConfig};
-use veloq_driver_core::op::{IntoPlatformOp, IoFd, Wakeup};
+use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
+use veloq_driver_core::op_registry::{AllocResult, OpHandle, OpRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum OpLifecycle {
@@ -107,7 +107,7 @@ pub(crate) struct UringRegistrationStats {
 
 pub struct UringDriver {
     pub(crate) ring: IoUring,
-    pub(crate) ops: OpRegistry<UringOp, UringOpState>,
+    pub(crate) ops: OpRegistry<UringOp, UringOpState, ()>,
     pub(crate) backlog_head: Option<usize>,
     pub(crate) backlog_tail: Option<usize>,
     pub(crate) pending_cancellations: VecDeque<usize>,
@@ -116,7 +116,7 @@ pub struct UringDriver {
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_token: Option<usize>,
-    pub(crate) waker_payload: Option<Box<Wakeup>>,
+    pub(crate) waker_payload: Option<Box<Wakeup<RawHandle>>>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
@@ -169,9 +169,7 @@ impl UringDriver {
             backlog_tail: None,
             pending_cancellations: VecDeque::new(),
             completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
-            completion_table: std::sync::Arc::new(crate::driver::CompletionTable::new(
-                entries as usize,
-            )),
+            completion_table: std::sync::Arc::new(CompletionTable::new(entries as usize)),
             waker_fd: Arc::new(EventFd { fd: waker_fd }),
             waker_token: None,
             waker_payload: None,
@@ -220,7 +218,7 @@ impl UringDriver {
                     let strategy = vtable.strategy;
 
                     match strategy {
-                        crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
+                        SubmissionStrategy::SubmitSqe => {
                             // --- Lazy Registration ---
                             let mut chunks = [0u16; 4];
                             let count = (vtable.resolve_chunks)(res, &mut chunks);
@@ -272,7 +270,7 @@ impl UringDriver {
                             let s = (vtable.make_sqe)(res, self).user_data(user_data as u64);
                             (Some(s), strategy, None)
                         }
-                        crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
+                        SubmissionStrategy::SoftwareTimer => {
                             let d = (vtable.get_timeout)(res);
                             (None, strategy, d)
                         }
@@ -285,7 +283,7 @@ impl UringDriver {
         };
 
         match strategy {
-            crate::driver::uring::op::SubmissionStrategy::SubmitSqe => {
+            SubmissionStrategy::SubmitSqe => {
                 if let Some(sqe) = sqe_opt {
                     if self.push_entry(sqe) {
                         if let Some(entry) = self.ops.get_mut(user_data) {
@@ -301,7 +299,7 @@ impl UringDriver {
                     Err(io::Error::other("SQE generation failed"))
                 }
             }
-            crate::driver::uring::op::SubmissionStrategy::SoftwareTimer => {
+            SubmissionStrategy::SoftwareTimer => {
                 if let Some(duration) = duration_opt {
                     let task_id = self.wheel.insert(user_data, duration);
                     if let Some(entry) = self.ops.get_mut(user_data) {
@@ -328,12 +326,10 @@ impl UringDriver {
 
         let fd = self.waker_fd.fd;
         let op = Wakeup {
-            fd: IoFd::Raw(crate::RawHandle { fd }),
+            fd: IoFd::Raw(RawHandle { fd }),
         };
         let (uring_op, payload) =
-            <Wakeup as IntoPlatformOp<crate::driver::uring::op::UringOp>>::into_kernel_and_payload(
-                op,
-            );
+            <Wakeup<RawHandle> as IntoPlatformOp<UringOp>>::into_kernel_and_payload(op);
 
         let state = UringOpState {
             lifecycle: OpLifecycle::Pending, // Will change to InFlight below
@@ -343,11 +339,10 @@ impl UringDriver {
 
         let result = self.ops.alloc(state);
 
-        if let Ok(crate::driver::op_registry::AllocResult {
-            handle:
-                crate::driver::op_registry::OpHandle {
-                    index: user_data, ..
-                },
+        if let Ok(AllocResult {
+            handle: OpHandle {
+                index: user_data, ..
+            },
         }) = result
         {
             self.waker_token = Some(user_data);

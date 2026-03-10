@@ -16,11 +16,8 @@ pub use veloq_driver_core::driver::{
 pub use veloq_driver_uring::UringDriver as PlatformDriver;
 
 #[cfg(target_os = "windows")]
-pub(crate) mod iocp;
-
+pub use veloq_driver_iocp::CloseMode;
 #[cfg(target_os = "windows")]
-pub use iocp::CloseMode;
-#[cfg(target_os = "windows")]
-pub use iocp::IocpDriver as PlatformDriver;
+pub use veloq_driver_iocp::IocpDriver as PlatformDriver;
 
 pub use veloq_driver_core::driver::test_hooks;

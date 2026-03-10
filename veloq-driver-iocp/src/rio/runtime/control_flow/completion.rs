@@ -8,19 +8,17 @@
 //! completion queue/table records.
 
 use super::actor::RioSocketActor;
-use crate::driver::iocp::error::{IocpErrorContext, io_msg};
-use crate::driver::iocp::rio::core::op_ctx::{
-    RioCompletionKind, RioOpCtxGuard, rio_result_to_event_res,
-};
-use crate::driver::iocp::rio::core::registry::RioRegistry;
-use crate::driver::iocp::rio::{RioCompletionContext, RioContext, RioEnv, RioState};
-use crate::driver::iocp::{IocpOp, IocpOpState, OpLifecycle};
-use crate::driver::op_registry::OpRegistry;
-use crate::driver::{
-    CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
-};
+use crate::error::{IocpErrorContext, io_msg};
+use crate::rio::core::op_ctx::{RioCompletionKind, RioOpCtxGuard, rio_result_to_event_res};
+use crate::rio::core::registry::RioRegistry;
+use crate::rio::{RioCompletionContext, RioContext, RioEnv, RioState};
+use crate::{IocpOp, IocpOpState, OpLifecycle};
 use rustc_hash::FxHashMap;
 use std::io;
+use veloq_driver_core::driver::{
+    CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
+};
+use veloq_driver_core::op_registry::OpRegistry;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
@@ -157,7 +155,7 @@ impl<'a> RioCompletionRouter<'a> {
 impl RioState {
     pub(crate) fn process_completions(
         &mut self,
-        ops: &mut OpRegistry<IocpOp, IocpOpState>,
+        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable,

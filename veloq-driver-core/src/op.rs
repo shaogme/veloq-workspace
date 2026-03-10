@@ -18,13 +18,11 @@ use std::cell::RefCell;
 use tracing::trace;
 use veloq_buf::FixedBuf;
 
-pub use crate::IoFd;
-use crate::RawHandle;
-use crate::SockAddrStorage;
 use crate::driver::{
     CompletionRecord, Driver, PlatformOp, SharedCompletionTable, SubmitBinder,
     encode_completion_token, event_res_to_io,
 };
+use crate::{Handle, IoFd, SockAddr};
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,18 +95,20 @@ pub trait OpLifecycle: Sized {
     type PreAlloc;
     /// The final output type after the operation completes.
     type Output;
+    /// Driver-defined raw handle token type.
+    type Handle: Handle;
 
     /// Pre-allocate any resources needed (e.g., accept socket on Windows).
-    fn pre_alloc(fd: RawHandle) -> std::io::Result<Self::PreAlloc>;
+    fn pre_alloc(fd: Self::Handle) -> std::io::Result<Self::PreAlloc>;
 
     /// Construct the operation from a raw handle and pre-allocated resources.
-    fn into_op(fd: RawHandle, pre: Self::PreAlloc) -> Self;
+    fn into_op(fd: Self::Handle, pre: Self::PreAlloc) -> Self;
 
     /// Convert the completed operation result to the final output type.
     fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output>;
 
     /// Helper: Pre-allocate and construct the operation in one step.
-    fn prepare_op(fd: RawHandle) -> std::io::Result<Self> {
+    fn prepare_op(fd: Self::Handle) -> std::io::Result<Self> {
         let pre = Self::pre_alloc(fd)?;
         Ok(Self::into_op(fd, pre))
     }
@@ -553,36 +553,36 @@ impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
 // ============================================================================
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
-pub struct ReadFixed {
-    pub fd: IoFd,
+pub struct ReadFixed<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub offset: u64,
 }
 
 /// Write to a file descriptor at a specific offset using a fixed buffer.
-pub struct WriteFixed {
-    pub fd: IoFd,
+pub struct WriteFixed<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub offset: u64,
 }
 
 /// Receive data from a socket into a fixed buffer.
-pub struct Recv {
-    pub fd: IoFd,
+pub struct Recv<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
 }
 
 /// Send data from a fixed buffer to a socket.
-pub struct Send {
-    pub fd: IoFd,
+pub struct Send<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
 }
 
 /// Connect a socket to a remote address.
-pub struct Connect {
-    pub fd: IoFd,
+pub struct Connect<H: Handle, A: SockAddr> {
+    pub fd: IoFd<H>,
     /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
-    pub addr: SockAddrStorage,
+    pub addr: A,
     pub addr_len: u32,
 }
 
@@ -599,13 +599,13 @@ pub struct Open {
 }
 
 /// Close a file descriptor or handle.
-pub struct Close {
-    pub fd: IoFd,
+pub struct Close<H: Handle> {
+    pub fd: IoFd<H>,
 }
 
 /// Flush file buffers to disk.
-pub struct Fsync {
-    pub fd: IoFd,
+pub struct Fsync<H: Handle> {
+    pub fd: IoFd<H>,
     /// If true, only sync data (not metadata).
     pub datasync: bool,
 }
@@ -616,17 +616,17 @@ pub struct Timeout {
 }
 
 /// Wake up the event loop.
-pub struct Wakeup {
-    pub fd: IoFd,
+pub struct Wakeup<H: Handle> {
+    pub fd: IoFd<H>,
 }
 
 /// Accept a new connection on a listening socket.
 /// Result includes the new socket handle and remote address.
-pub struct Accept {
-    pub fd: IoFd,
+pub struct Accept<H: Handle, A: SockAddr> {
+    pub fd: IoFd<H>,
     /// Buffer for storing the remote address.
     /// On Windows, we parse the result from the AcceptEx output buffer, so we don't need this storage.
-    pub addr: SockAddrStorage,
+    pub addr: A,
     /// Length of the address buffer.
     pub addr_len: u32,
     /// Parsed remote address (populated after completion).
@@ -634,32 +634,32 @@ pub struct Accept {
 }
 
 /// Send data to a specific address (UDP).
-pub struct SendTo {
-    pub fd: IoFd,
+pub struct SendTo<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: FixedBuf,
     /// Target address.
     pub addr: std::net::SocketAddr,
 }
 
 /// Sync file range.
-pub struct SyncFileRange {
-    pub fd: IoFd,
+pub struct SyncFileRange<H: Handle> {
+    pub fd: IoFd<H>,
     pub offset: u64,
     pub nbytes: u64,
     pub flags: u32,
 }
 
 /// Pre-allocate file space.
-pub struct Fallocate {
-    pub fd: IoFd,
+pub struct Fallocate<H: Handle> {
+    pub fd: IoFd<H>,
     pub mode: i32,
     pub offset: u64,
     pub len: u64,
 }
 
 /// Receive data as UDP datagram stream.
-pub struct UdpRecvStream {
-    pub fd: IoFd,
+pub struct UdpRecvStream<H: Handle> {
+    pub fd: IoFd<H>,
     /// Unix io_uring path uses this provided buffer; Windows can leave it as None.
     pub buf: Option<FixedBuf>,
     /// Unix io_uring path: source address parsed from recvmsg.
@@ -675,8 +675,8 @@ pub struct UdpRecvDatagram {
 }
 
 /// Provide a buffer to the driver's internal RIO UDP pool.
-pub struct UdpRefill {
-    pub fd: IoFd,
+pub struct UdpRefill<H: Handle> {
+    pub fd: IoFd<H>,
     pub buf: Option<FixedBuf>,
 }
 
@@ -684,21 +684,22 @@ pub struct UdpRefill {
 // OpLifecycle Implementations
 // ============================================================================
 
-impl OpLifecycle for Accept {
+impl<H: Handle + From<usize>, A: SockAddr> OpLifecycle for Accept<H, A> {
     type PreAlloc = ();
-    type Output = (RawHandle, std::net::SocketAddr);
+    type Output = (H, std::net::SocketAddr);
+    type Handle = H;
 
-    fn pre_alloc(_fd: RawHandle) -> std::io::Result<Self::PreAlloc> {
+    fn pre_alloc(_fd: H) -> std::io::Result<Self::PreAlloc> {
         Ok(())
     }
 
-    fn into_op(fd: RawHandle, _pre: Self::PreAlloc) -> Self {
+    fn into_op(fd: H, _pre: Self::PreAlloc) -> Self {
         // Use stack/inline storage
-        let addr_len = std::mem::size_of::<SockAddrStorage>() as u32;
+        let addr_len = std::mem::size_of::<A>() as u32;
 
         Self {
             fd: IoFd::Raw(fd),
-            addr: unsafe { std::mem::zeroed() },
+            addr: A::default(),
             addr_len,
             remote_addr: None,
         }
@@ -706,18 +707,12 @@ impl OpLifecycle for Accept {
 
     fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output> {
         let fd = res?.into();
-        use crate::to_socket_addr;
-        let addr = if let Some(a) = self.remote_addr {
-            a
-        } else {
-            unsafe {
-                let s = std::slice::from_raw_parts(
-                    &self.addr as *const _ as *const u8,
-                    self.addr_len as usize,
-                );
-                to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
-            }
-        };
+        let addr = self.remote_addr.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "driver must populate Accept::remote_addr before completion",
+            )
+        })?;
         Ok((fd, addr))
     }
 }

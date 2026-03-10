@@ -1,5 +1,5 @@
+use crate::{RawHandle, SockAddrStorage};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use veloq_driver_core::{RawHandle, SockAddrStorage};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_STREAM, SOCKADDR,
     SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSADATA, WSASocketW,

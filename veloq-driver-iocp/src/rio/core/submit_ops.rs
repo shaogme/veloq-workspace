@@ -9,11 +9,11 @@
 //! It forms the low-level boundary between high-level runtime orchestration and
 //! Windows RIO APIs, keeping unsafe calls and pointer setup in one place.
 
-use crate::config::BufferRegistrationMode;
-use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
-use crate::driver::iocp::ext::Extensions;
-use crate::driver::iocp::rio::{RioEnv, RioState};
-use crate::op::IoFd;
+use crate::BufferRegistrationMode;
+use crate::IoFd;
+use crate::error::{IocpErrorContext, io_error, io_msg};
+use crate::ext::Extensions;
+use crate::rio::{RioEnv, RioState};
 use std::io;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -382,7 +382,7 @@ impl RioState {
 
         Ok(Self {
             kernel,
-            registry: crate::driver::iocp::rio::core::registry::RioRegistry::new(rq_depth),
+            registry: crate::rio::core::registry::RioRegistry::new(rq_depth),
             registration_mode,
             actors: rustc_hash::FxHashMap::default(),
             actor_routes: rustc_hash::FxHashMap::default(),
@@ -411,8 +411,8 @@ impl RioState {
         target: (IoFd, HANDLE, usize, u32),
         buf: &mut veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
+    ) -> io::Result<crate::submit::SubmissionResult> {
+        use crate::submit::SubmissionResult;
         let (fd, handle, user_data, generation) = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {
@@ -444,8 +444,8 @@ impl RioState {
         target: (IoFd, HANDLE, usize, u32),
         buf: &veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
+    ) -> io::Result<crate::submit::SubmissionResult> {
+        use crate::submit::SubmissionResult;
         let (fd, handle, user_data, generation) = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {

@@ -1,20 +1,30 @@
 use super::ext::Extensions;
 use super::*;
 
+use crate::IocpConfig;
 use crate::Socket;
-use crate::config::IocpConfig;
-use crate::driver::{Driver, SubmitBinder, encode_completion_token, event_res_to_io};
-use crate::op::{
-    Accept, Connect, IntoPlatformOp, IoFd, OpLifecycle, Recv, SendTo, Timeout, UdpRecvStream,
-    UdpRefill,
-};
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::sync::atomic::Ordering;
+use veloq_driver_core::driver::{Driver, SubmitBinder, encode_completion_token, event_res_to_io};
+use veloq_driver_core::op::{
+    Accept as AcceptBase, Connect as ConnectBase, IntoPlatformOp, OpLifecycle, Recv as RecvBase,
+    SendTo as SendToBase, Timeout, UdpRecvStream as UdpRecvStreamBase, UdpRefill as UdpRefillBase,
+};
+
+type Accept = AcceptBase<crate::RawHandle, crate::SockAddrStorage>;
+type Connect = ConnectBase<crate::RawHandle, crate::SockAddrStorage>;
+type Recv = RecvBase<crate::RawHandle>;
+type SendTo = SendToBase<crate::RawHandle>;
+type UdpRecvStream = UdpRecvStreamBase<crate::RawHandle>;
+type UdpRefill = UdpRefillBase<crate::RawHandle>;
+type IoFd = crate::IoFd;
 
 fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);
-    while cur != crate::driver::slot::SlotTable::<crate::driver::iocp::op::IocpOp>::NULL_INDEX {
+    while cur
+        != veloq_driver_core::slot::SlotTable::<crate::op::IocpOp, crate::op::OverlappedEntry>::NULL_INDEX
+    {
         if cur == needle {
             return true;
         }
@@ -70,16 +80,11 @@ fn test_iocp_accept() {
     let addr = std_listener.local_addr().unwrap();
     let listener_handle = std_listener.into_raw_socket();
 
-    // Acceptor - pre-create the socket for AcceptEx
-    let acceptor = Socket::new_tcp_v4().expect("Acceptor socket creation failed");
-    let acceptor_handle = acceptor.into_raw();
-
     // Prepare Accept Op using OpLifecycle
-    let mut accept_op = Accept::into_op(listener_handle.into(), acceptor_handle);
-    accept_op.accept_socket = acceptor_handle;
+    let accept_op = Accept::into_op((listener_handle as usize).into(), ());
 
     let (iocp_kernel, accept_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(accept_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(accept_op);
     let mut accept_payload = Some(accept_payload);
     let mut iocp_op = Some(iocp_kernel);
 
@@ -103,7 +108,7 @@ fn test_iocp_accept() {
     );
     assert!(res.is_ok(), "Accept failed: {:?}", res.err());
     let op =
-        <Accept as crate::op::IntoPlatformOp<crate::driver::iocp::op::IocpOp>>::from_user_payload(
+        <Accept as veloq_driver_core::op::IntoPlatformOp<crate::op::IocpOp>>::from_user_payload(
             accept_payload
                 .take()
                 .expect("accept payload missing on completion"),
@@ -111,10 +116,8 @@ fn test_iocp_accept() {
     assert!(op.remote_addr.is_some(), "Remote addr should be populated");
     unsafe {
         if let Some(fd) = op.fd.raw() {
-            windows_sys::Win32::Foundation::CloseHandle(fd.into());
+            windows_sys::Win32::Networking::WinSock::closesocket(fd.handle as usize);
         }
-        let s = op.accept_socket;
-        windows_sys::Win32::Foundation::CloseHandle(s.into());
     }
 }
 
@@ -135,13 +138,13 @@ fn test_iocp_connect() {
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
 
     let connect_op = Connect {
-        fd: crate::op::IoFd::Raw(client_handle),
+        fd: IoFd::Raw(client_handle),
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
 
     let (iocp_kernel, _connect_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(connect_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(connect_op);
     let mut iocp_op = Some(iocp_kernel);
     let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
@@ -156,7 +159,7 @@ fn test_iocp_connect() {
         std::time::Duration::from_secs(5),
     );
     assert!(res.is_ok(), "Connect failed: {:?}", res.err());
-    unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
+    unsafe { windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize) };
 }
 
 #[test]
@@ -168,7 +171,7 @@ fn test_iocp_timeout() {
     };
 
     let (iocp_kernel, _timeout_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(timeout_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(timeout_op);
     let mut iocp_op = Some(iocp_kernel);
     let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
@@ -219,12 +222,12 @@ fn test_iocp_recv_with_buffer_pool() {
     let client_handle = client.into_raw();
     let (addr_storage, addr_len) = crate::socket_addr_to_storage(addr);
     let connect_op = Connect {
-        fd: crate::op::IoFd::Raw(client_handle),
+        fd: IoFd::Raw(client_handle),
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
     let (connect_kernel, _connect_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(connect_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(connect_op);
     let mut connect_iocp_op = Some(connect_kernel);
     let connect_user_data = driver.reserve_op().unwrap().0;
     let _ = driver
@@ -268,12 +271,12 @@ fn test_iocp_recv_with_buffer_pool() {
 
     // Create Recv Op
     let recv_op = Recv {
-        fd: crate::op::IoFd::Raw(client_handle),
+        fd: IoFd::Raw(client_handle),
         buf,
     };
 
     let (iocp_kernel, recv_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(recv_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(recv_op);
     let mut recv_payload = Some(recv_payload);
     let mut iocp_op = Some(iocp_kernel);
     let (user_data, generation) = driver.reserve_op().unwrap();
@@ -293,7 +296,7 @@ fn test_iocp_recv_with_buffer_pool() {
     assert_eq!(bytes_read, 12);
 
     let mut op =
-        <Recv as crate::op::IntoPlatformOp<crate::driver::iocp::op::IocpOp>>::from_user_payload(
+        <Recv as veloq_driver_core::op::IntoPlatformOp<crate::op::IocpOp>>::from_user_payload(
             recv_payload
                 .take()
                 .expect("recv payload missing on completion"),
@@ -301,7 +304,7 @@ fn test_iocp_recv_with_buffer_pool() {
     op.buf.set_len(bytes_read);
     assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
-    unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
+    unsafe { windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize) };
     server_thread.join().unwrap();
 }
 
@@ -334,12 +337,12 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let client_handle = client.into_raw();
     let (addr_storage, addr_len) = crate::socket_addr_to_storage(addr);
     let connect_op = Connect {
-        fd: crate::op::IoFd::Raw(client_handle),
+        fd: IoFd::Raw(client_handle),
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
     let (connect_kernel, _connect_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(connect_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(connect_op);
     let mut connect_iocp_op = Some(connect_kernel);
     let (connect_user_data, connect_generation) = driver.reserve_op().unwrap();
     let _ = driver
@@ -371,11 +374,11 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         .expect("register chunk failed");
 
     let recv_op = Recv {
-        fd: crate::op::IoFd::Raw(client_handle),
+        fd: IoFd::Raw(client_handle),
         buf,
     };
     let (iocp_kernel, _recv_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(recv_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(recv_op);
     let mut iocp_op = Some(iocp_kernel);
     let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
@@ -394,7 +397,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 
     let _ = tx_send.send(());
     server_thread.join().unwrap();
-    unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
+    unsafe { windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize) };
 }
 
 #[test]
@@ -426,12 +429,12 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let client_handle = client.into_raw();
     let (addr_storage, addr_len) = crate::socket_addr_to_storage(addr);
     let connect_op = Connect {
-        fd: crate::op::IoFd::Raw(client_handle),
+        fd: IoFd::Raw(client_handle),
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
     let (connect_kernel, _connect_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(connect_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(connect_op);
     let mut connect_iocp_op = Some(connect_kernel);
     let (connect_user_data, connect_generation) = driver.reserve_op().unwrap();
     let _ = driver
@@ -463,11 +466,11 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         .expect("register chunk failed");
 
     let recv_op = Recv {
-        fd: crate::op::IoFd::Raw(client_handle),
+        fd: IoFd::Raw(client_handle),
         buf,
     };
     let (iocp_kernel, _recv_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(recv_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(recv_op);
     let mut iocp_op = Some(iocp_kernel);
     let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
@@ -505,7 +508,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     );
 
     server_thread.join().unwrap();
-    unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
+    unsafe { windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize) };
 }
 
 #[test]
@@ -586,7 +589,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         buf: Some(recv_buf),
     };
     let (refill_kernel, _refill_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(refill_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(refill_op);
     let mut refill_iocp = Some(refill_kernel);
     let (refill_ud, refill_gen) = driver.reserve_op().expect("reserve refill op failed");
     let _ = driver
@@ -610,7 +613,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     };
 
     let (recv_kernel, recv_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(recv_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(recv_op);
     let mut recv_payload = Some(recv_payload);
     let mut recv_iocp = Some(recv_kernel);
     let (recv_ud, recv_gen) = driver.reserve_op().expect("reserve recv op failed");
@@ -620,7 +623,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         .expect("submit udp_recv_stream failed");
 
     let (send_kernel, _send_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(send_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(send_op);
     let mut send_iocp = Some(send_kernel);
     let (send_ud, send_gen) = driver.reserve_op().expect("reserve send op failed");
     let _ = driver
@@ -633,7 +636,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
     let bytes = wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
         .expect("udp_recv_stream completion failed");
-    let recv_out = <UdpRecvStream as crate::op::IntoPlatformOp<crate::driver::iocp::op::IocpOp>>::from_user_payload(
+    let recv_out = <UdpRecvStream as veloq_driver_core::op::IntoPlatformOp<crate::op::IocpOp>>::from_user_payload(
         recv_payload
             .take()
             .expect("udp_recv_stream payload missing on completion"),
@@ -724,7 +727,7 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         buf: Some(recv_buf),
     };
     let (refill_kernel, _refill_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(refill_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(refill_op);
     let mut refill_iocp = Some(refill_kernel);
     let (refill_ud, refill_gen) = driver.reserve_op().expect("reserve refill op failed");
     let _ = driver
@@ -748,7 +751,7 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     };
 
     let (recv_kernel, recv_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(recv_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(recv_op);
     let mut recv_payload = Some(recv_payload);
     let mut recv_iocp = Some(recv_kernel);
     let (recv_ud, recv_gen) = driver.reserve_op().expect("reserve recv op failed");
@@ -758,7 +761,7 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         .expect("submit udp_recv_stream failed");
 
     let (send_kernel, _send_payload) =
-        IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(send_op);
+        IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(send_op);
     let mut send_iocp = Some(send_kernel);
     let (send_ud, send_gen) = driver.reserve_op().expect("reserve send op failed");
     let _ = driver
@@ -771,7 +774,7 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
     let bytes = wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
         .expect("udp_recv_stream completion failed");
-    let recv_out = <UdpRecvStream as crate::op::IntoPlatformOp<crate::driver::iocp::op::IocpOp>>::from_user_payload(
+    let recv_out = <UdpRecvStream as veloq_driver_core::op::IntoPlatformOp<crate::op::IocpOp>>::from_user_payload(
         recv_payload
             .take()
             .expect("udp_recv_stream payload missing on completion"),
@@ -808,7 +811,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
             result: None,
         };
         let (iocp_kernel, recv_payload) =
-            IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(recv_op);
+            IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(recv_op);
         let mut iocp_op = Some(iocp_kernel);
         let (ud, generation) = driver.reserve_op().expect("reserve recv op failed");
         let _ = driver
@@ -834,7 +837,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
 
     for (ud, generation, recv_payload) in submitted {
         driver.cancel_op(ud);
-        let _ = <UdpRecvStream as crate::op::IntoPlatformOp<crate::driver::iocp::op::IocpOp>>::from_user_payload(
+        let _ = <UdpRecvStream as veloq_driver_core::op::IntoPlatformOp<crate::op::IocpOp>>::from_user_payload(
             recv_payload,
         );
         let res = wait_completion(
@@ -876,7 +879,7 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
             result: None,
         };
         let (iocp_kernel, recv_payload) =
-            IntoPlatformOp::<crate::driver::iocp::op::IocpOp>::into_kernel_and_payload(recv_op);
+            IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(recv_op);
         let mut iocp_op = Some(iocp_kernel);
         let (ud, generation) = driver.reserve_op().expect("reserve recv op failed");
         let _ = driver
@@ -888,7 +891,7 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
 
     for (ud, generation, recv_payload) in submitted {
         driver.cancel_op(ud);
-        let _ = <UdpRecvStream as crate::op::IntoPlatformOp<crate::driver::iocp::op::IocpOp>>::from_user_payload(
+        let _ = <UdpRecvStream as veloq_driver_core::op::IntoPlatformOp<crate::op::IocpOp>>::from_user_payload(
             recv_payload,
         );
         let _ = wait_completion(

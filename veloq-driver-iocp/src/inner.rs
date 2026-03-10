@@ -3,14 +3,15 @@ use super::error::{IocpErrorContext, io_error, io_msg};
 use super::ext::Extensions;
 use super::rio::RioState;
 use super::submit;
-use crate::config::IocpConfig;
-use crate::driver::iocp::op::IocpOp;
-use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::OverlappedEntry;
-use crate::driver::{
+use crate::IoFd;
+use crate::IocpConfig;
+use crate::op::IocpOp;
+use crate::op::OverlappedEntry;
+use veloq_driver_core::driver::{
     CompletionEvent, CompletionRecord, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
     encode_completion_token,
 };
+use veloq_driver_core::op_registry::OpRegistry;
 
 use std::io;
 use std::sync::Arc;
@@ -85,7 +86,7 @@ pub enum CloseMode {
 
 pub struct IocpDriver {
     pub(crate) port: Arc<CompletionPort>,
-    pub(crate) ops: OpRegistry<IocpOp, IocpOpState>,
+    pub(crate) ops: OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
     pub(crate) extensions: Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
@@ -147,12 +148,11 @@ impl RemoteWaker for IocpWaker {
 impl IocpDriver {
     fn is_rio_op(op: &IocpOp) -> bool {
         let submit_fn = unsafe { op.vtable.as_ref().submit as *const () as usize };
-        submit_fn == crate::driver::iocp::submit::submit_recv as *const () as usize
-            || submit_fn == crate::driver::iocp::submit::submit_send as *const () as usize
-            || submit_fn == crate::driver::iocp::submit::submit_send_to as *const () as usize
-            || submit_fn
-                == crate::driver::iocp::submit::submit_udp_recv_stream as *const () as usize
-            || submit_fn == crate::driver::iocp::submit::submit_udp_refill as *const () as usize
+        submit_fn == crate::submit::submit_recv as *const () as usize
+            || submit_fn == crate::submit::submit_send as *const () as usize
+            || submit_fn == crate::submit::submit_send_to as *const () as usize
+            || submit_fn == crate::submit::submit_udp_recv_stream as *const () as usize
+            || submit_fn == crate::submit::submit_udp_refill as *const () as usize
     }
 
     pub(crate) fn create_pre_init() -> io::Result<PreInit> {
@@ -176,7 +176,7 @@ impl IocpDriver {
     pub(crate) fn new_from_pre_init(
         entries: u32,
         port_val: PreInit,
-        registration_mode: crate::config::BufferRegistrationMode,
+        registration_mode: crate::BufferRegistrationMode,
     ) -> io::Result<Self> {
         let port = port_val as HANDLE;
         debug!(port = ?port, "Initializing IocpDriver");
@@ -214,7 +214,7 @@ impl IocpDriver {
             free_slots: Vec::new(),
             is_waked,
             completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
-            completion_table: std::sync::Arc::new(crate::driver::CompletionTable::new(
+            completion_table: std::sync::Arc::new(veloq_driver_core::driver::CompletionTable::new(
                 entries as usize,
             )),
             rio_state,
@@ -390,7 +390,7 @@ impl IocpDriver {
         };
 
         if let Some(iocp_op) = unsafe { &mut *slot.op.get() } {
-            let slot_overlapped = unsafe { &mut *slot.overlapped.get() };
+            let slot_overlapped = unsafe { &mut *slot.sidecar.get() };
             if let Some(blocking_res) = slot_overlapped.blocking_result.take() {
                 io_result = blocking_res;
             } else if io_result.is_ok()
@@ -575,7 +575,7 @@ impl IocpDriver {
                         }
 
                         // Safe usage of overlapped ptr
-                        let overlapped_ptr = slot.overlapped_ptr();
+                        let overlapped_ptr = unsafe { &mut (*slot.sidecar.get()).inner as *mut _ };
                         unsafe {
                             use windows_sys::Win32::System::IO::CancelIoEx;
                             let _ = CancelIoEx(handle, overlapped_ptr);
@@ -587,10 +587,7 @@ impl IocpDriver {
         }
     }
 
-    pub(crate) fn register_files(
-        &mut self,
-        files: &[crate::RawHandle],
-    ) -> io::Result<Vec<crate::op::IoFd>> {
+    pub(crate) fn register_files(&mut self, files: &[crate::RawHandle]) -> io::Result<Vec<IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for &handle in files {
             let idx = if let Some(idx) = self.free_slots.pop() {
@@ -603,14 +600,14 @@ impl IocpDriver {
                     .resize_registered_rqs(self.registered_files.len());
                 self.registered_files.len() - 1
             };
-            registered.push(crate::op::IoFd::Fixed(idx as u32));
+            registered.push(IoFd::Fixed(idx as u32));
         }
         Ok(registered)
     }
 
-    pub(crate) fn unregister_files(&mut self, files: Vec<crate::op::IoFd>) -> io::Result<()> {
+    pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()> {
         for fd in files {
-            if let crate::op::IoFd::Fixed(idx) = fd {
+            if let IoFd::Fixed(idx) = fd {
                 let idx = idx as usize;
                 if idx < self.registered_files.len() && self.registered_files[idx].is_some() {
                     self.registered_files[idx] = None;

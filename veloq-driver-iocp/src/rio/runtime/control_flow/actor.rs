@@ -7,12 +7,12 @@
 //! It intentionally avoids direct CQ decoding logic, which lives in the
 //! completion module of the same control-flow layer.
 
-use crate::driver::iocp::rio::RioContext;
-use crate::driver::iocp::rio::RioEnv;
-use crate::driver::iocp::rio::RioState;
-use crate::driver::iocp::rio::core::registry::RioRegistry;
-use crate::driver::iocp::rio::runtime::data_plane::pool::UdpPoolManager;
-use crate::op::IoFd;
+use crate::IoFd;
+use crate::rio::RioContext;
+use crate::rio::RioEnv;
+use crate::rio::RioState;
+use crate::rio::core::registry::RioRegistry;
+use crate::rio::runtime::data_plane::pool::UdpPoolManager;
 use std::io;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::RIO_RQ;
@@ -122,7 +122,7 @@ impl RioState {
     pub(crate) fn udp_pool_debug_stats(
         &self,
         handle: HANDLE,
-    ) -> Option<crate::driver::iocp::rio::runtime::data_plane::pool::UdpRecvPoolDebugStats> {
+    ) -> Option<crate::rio::runtime::data_plane::pool::UdpRecvPoolDebugStats> {
         self.actors
             .get(&handle)
             .and_then(|actor| actor.pool_manager.udp_pool_debug_stats())

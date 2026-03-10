@@ -7,22 +7,216 @@ mod submit;
 #[cfg(test)]
 mod tests;
 
-use crate::driver::op_registry::OpEntry;
-use crate::driver::{
-    CompletionSidecar, Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
-    SubmitBinder,
-};
 pub use inner::{CloseMode, IocpDriver, IocpOpState, OpLifecycle};
 use op::IocpOp;
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::num::NonZeroU32;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
 use submit::SubmissionResult;
 use tracing::{debug, trace};
+use veloq_driver_core::driver::{
+    CompletionSidecar, Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    SubmitBinder,
+};
+use veloq_driver_core::op_registry::OpEntry;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, AF_INET6, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_STREAM, SOCKADDR,
+    SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSADATA, WSASocketW,
+    WSAStartup, bind, closesocket, getsockname, listen,
+};
 use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BufferRegistrationMode {
+    #[default]
+    Strict,
+    Compatible,
+}
+
+impl BufferRegistrationMode {
+    #[inline]
+    pub const fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IocpConfig {
+    pub entries: NonZeroU32,
+    pub registration_mode: BufferRegistrationMode,
+}
+
+impl AsRef<IocpConfig> for IocpConfig {
+    fn as_ref(&self) -> &IocpConfig {
+        self
+    }
+}
+
+impl Default for IocpConfig {
+    fn default() -> Self {
+        Self {
+            entries: NonZeroU32::new(1024).unwrap(),
+            registration_mode: BufferRegistrationMode::Strict,
+        }
+    }
+}
+
+impl IocpConfig {
+    pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
+        self.registration_mode = mode;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct RawHandle {
+    pub handle: HANDLE,
+}
+
+unsafe impl Send for RawHandle {}
+unsafe impl Sync for RawHandle {}
+
+impl From<usize> for RawHandle {
+    fn from(handle: usize) -> Self {
+        Self {
+            handle: handle as HANDLE,
+        }
+    }
+}
+
+impl From<RawHandle> for usize {
+    fn from(handle: RawHandle) -> Self {
+        handle.handle as usize
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct SockAddrStorage(pub windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE);
+
+impl Default for SockAddrStorage {
+    fn default() -> Self {
+        Self(unsafe { std::mem::zeroed() })
+    }
+}
+
+pub type IoFd = veloq_driver_core::IoFd<RawHandle>;
+
+pub struct Socket {
+    handle: RawHandle,
+}
+
+impl Socket {
+    fn new(af: u16, ty: i32, protocol: i32) -> std::io::Result<Self> {
+        let s = unsafe {
+            WSASocketW(
+                af as i32,
+                ty,
+                protocol,
+                std::ptr::null(),
+                0,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
+            )
+        };
+        if s == INVALID_SOCKET {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { handle: s.into() })
+    }
+
+    pub fn new_tcp_v4() -> std::io::Result<Self> {
+        Self::new(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    }
+
+    pub fn new_tcp_v6() -> std::io::Result<Self> {
+        Self::new(AF_INET6, SOCK_STREAM, IPPROTO_TCP)
+    }
+
+    pub fn new_udp_v4() -> std::io::Result<Self> {
+        Self::new(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    }
+
+    pub fn new_udp_v6() -> std::io::Result<Self> {
+        Self::new(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+    }
+
+    pub fn bind(&self, addr: SocketAddr) -> std::io::Result<()> {
+        let (raw_addr, raw_addr_len) = socket_addr_trans(addr);
+        let ret = unsafe {
+            bind(
+                self.handle.into(),
+                raw_addr.as_ptr() as *const SOCKADDR,
+                raw_addr_len,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn listen(&self, backlog: i32) -> std::io::Result<()> {
+        let ret = unsafe { listen(self.handle.into(), backlog) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn into_raw(self) -> RawHandle {
+        let h = self.handle;
+        std::mem::forget(self);
+        h
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        let mut buf = [0u8; 128];
+        let mut len = 128_i32;
+        let ret = unsafe {
+            getsockname(
+                self.handle.into(),
+                buf.as_mut_ptr() as *mut SOCKADDR,
+                &mut len,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        to_socket_addr(&buf[..len as usize])
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        unsafe { closesocket(self.handle.into()) };
+    }
+}
+
+#[used]
+#[unsafe(link_section = ".CRT$XCU")]
+static INIT_WINSOCK: unsafe extern "C" fn() = {
+    unsafe extern "C" fn init() {
+        unsafe {
+            let mut data: WSADATA = std::mem::zeroed();
+            let _ = WSAStartup(0x0202, &mut data);
+        }
+    }
+    init
+};
+
+#[inline]
+fn slot_overlapped_ptr(
+    slot: &veloq_driver_core::slot::SlotEntry<IocpOp, op::OverlappedEntry>,
+) -> *mut windows_sys::Win32::System::IO::OVERLAPPED {
+    unsafe { &mut (*slot.sidecar.get()).inner as *mut _ }
+}
+
 #[cfg(feature = "test-hooks")]
-impl crate::driver::test_hooks::DriverTestHooks for IocpDriver {
+impl veloq_driver_core::driver::test_hooks::DriverTestHooks for IocpDriver {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.rio_state
             .registry
@@ -33,6 +227,8 @@ impl crate::driver::test_hooks::DriverTestHooks for IocpDriver {
 
 impl Driver for IocpDriver {
     type Op = IocpOp;
+    type Handle = RawHandle;
+    type Sidecar = op::OverlappedEntry;
 
     fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
         // OpRegistry::alloc handles internal vectors and free list management autonomously.
@@ -49,7 +245,9 @@ impl Driver for IocpDriver {
         Ok((user_data, generation))
     }
 
-    fn slot_table(&self) -> std::sync::Arc<crate::driver::slot::SlotTable<Self::Op>> {
+    fn slot_table(
+        &self,
+    ) -> std::sync::Arc<veloq_driver_core::slot::SlotTable<Self::Op, Self::Sidecar>> {
         self.ops.shared.clone()
     }
 
@@ -98,9 +296,15 @@ impl Driver for IocpDriver {
             // This is safe because:
             // 1. The Slot is pinned in memory (part of Arc<SlotTable>).
             // 2. OverlappedEntry is #[repr(C)], so we can recover the user_data from the pointer.
-            let overlapped_ptr = slot.overlapped_ptr();
+            unsafe {
+                let sidecar = &mut *slot.sidecar.get();
+                sidecar.user_data = user_data;
+                sidecar.generation = generation;
+                sidecar.blocking_result = None;
+            }
+            let overlapped_ptr = slot_overlapped_ptr(slot);
 
-            let mut ctx = crate::driver::iocp::op::SubmitContext {
+            let mut ctx = crate::op::SubmitContext {
                 port: self.port.handle,
                 overlapped: overlapped_ptr,
                 ext: &self.extensions,
@@ -115,7 +319,7 @@ impl Driver for IocpDriver {
             let is_rio_pool_waiting = unsafe {
                 std::ptr::eq(
                     op_ref.vtable.as_ref().submit as *const (),
-                    crate::driver::iocp::submit::submit_udp_recv_stream as *const (),
+                    crate::submit::submit_udp_recv_stream as *const (),
                 )
             };
 
@@ -227,9 +431,15 @@ impl Driver for IocpDriver {
         op_entry.platform_data.generation = generation;
 
         op_entry.platform_data.is_background = true;
-        let overlapped_ptr = slot.overlapped_ptr();
+        unsafe {
+            let sidecar = &mut *slot.sidecar.get();
+            sidecar.user_data = user_data;
+            sidecar.generation = generation;
+            sidecar.blocking_result = None;
+        }
+        let overlapped_ptr = slot_overlapped_ptr(slot);
 
-        let mut ctx = crate::driver::iocp::op::SubmitContext {
+        let mut ctx = crate::op::SubmitContext {
             port: self.port.handle,
             overlapped: overlapped_ptr,
             ext: &self.extensions,
@@ -291,7 +501,7 @@ impl Driver for IocpDriver {
 
     fn wait_and_drain_completions(
         &mut self,
-        out: &mut Vec<crate::driver::CompletionEvent>,
+        out: &mut Vec<veloq_driver_core::driver::CompletionEvent>,
     ) -> io::Result<usize> {
         self.get_completion(u32::MAX)?;
         Ok(self.drain_completions(out))
@@ -305,11 +515,11 @@ impl Driver for IocpDriver {
         IocpDriver::register_chunk(self, id, ptr, len)
     }
 
-    fn register_files(&mut self, files: &[crate::RawHandle]) -> io::Result<Vec<crate::op::IoFd>> {
+    fn register_files(&mut self, files: &[RawHandle]) -> io::Result<Vec<IoFd>> {
         IocpDriver::register_files(self, files)
     }
 
-    fn unregister_files(&mut self, files: Vec<crate::op::IoFd>) -> io::Result<()> {
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()> {
         IocpDriver::unregister_files(self, files)
     }
 
@@ -317,8 +527,8 @@ impl Driver for IocpDriver {
         IocpDriver::wake(self)
     }
 
-    fn inner_handle(&self) -> crate::RawHandle {
-        crate::RawHandle {
+    fn inner_handle(&self) -> RawHandle {
+        RawHandle {
             handle: self.port.handle as _,
         }
     }
@@ -333,5 +543,116 @@ impl Driver for IocpDriver {
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
         self.registrar = registrar;
+    }
+}
+
+pub fn to_socket_addr(buf: &[u8]) -> std::io::Result<SocketAddr> {
+    if buf.len() < 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid address length",
+        ));
+    }
+    let family = unsafe { *(buf.as_ptr() as *const u16) };
+    match family {
+        AF_INET => {
+            if buf.len() < std::mem::size_of::<SOCKADDR_IN>() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid address length",
+                ));
+            }
+            let sin = unsafe { &*(buf.as_ptr() as *const SOCKADDR_IN) };
+            let s_addr = unsafe { sin.sin_addr.S_un.S_addr };
+            let ip = Ipv4Addr::from(u32::from_be(s_addr));
+            let port = u16::from_be(sin.sin_port);
+            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        }
+        AF_INET6 => {
+            if buf.len() < std::mem::size_of::<SOCKADDR_IN6>() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid address length",
+                ));
+            }
+            let sin6 = unsafe { &*(buf.as_ptr() as *const SOCKADDR_IN6) };
+            let addr_bytes = unsafe { sin6.sin6_addr.u.Byte };
+            let ip = Ipv6Addr::from(addr_bytes);
+            let port = u16::from_be(sin6.sin6_port);
+            let flowinfo = sin6.sin6_flowinfo;
+            let scope_id = unsafe { sin6.Anonymous.sin6_scope_id };
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                ip, port, flowinfo, scope_id,
+            )))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Unsupported address family",
+        )),
+    }
+}
+
+pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, i32) {
+    let mut storage = SockAddrStorage::default();
+    let len = match addr {
+        SocketAddr::V4(a) => {
+            let sin_ptr = &mut storage.0 as *mut _ as *mut SOCKADDR_IN;
+            unsafe {
+                (*sin_ptr).sin_family = AF_INET;
+                (*sin_ptr).sin_port = a.port().to_be();
+                (*sin_ptr).sin_addr.S_un.S_addr = u32::from_ne_bytes(a.ip().octets());
+                std::mem::size_of::<SOCKADDR_IN>() as i32
+            }
+        }
+        SocketAddr::V6(a) => {
+            let sin6_ptr = &mut storage.0 as *mut _ as *mut SOCKADDR_IN6;
+            unsafe {
+                (*sin6_ptr).sin6_family = AF_INET6;
+                (*sin6_ptr).sin6_port = a.port().to_be();
+                (*sin6_ptr).sin6_addr = std::mem::transmute::<
+                    [u8; 16],
+                    windows_sys::Win32::Networking::WinSock::IN6_ADDR,
+                >(a.ip().octets());
+                (*sin6_ptr).sin6_flowinfo = a.flowinfo();
+                (*sin6_ptr).Anonymous.sin6_scope_id = a.scope_id();
+                std::mem::size_of::<SOCKADDR_IN6>() as i32
+            }
+        }
+    };
+    (storage, len)
+}
+
+fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, i32) {
+    match addr {
+        SocketAddr::V4(a) => {
+            let mut sin: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+            sin.sin_family = AF_INET;
+            sin.sin_port = a.port().to_be();
+            sin.sin_addr.S_un.S_addr = u32::from_ne_bytes(a.ip().octets());
+
+            let ptr = &sin as *const _ as *const u8;
+            let buf =
+                unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<SOCKADDR_IN>()) }
+                    .to_vec();
+            (buf, std::mem::size_of::<SOCKADDR_IN>() as i32)
+        }
+        SocketAddr::V6(a) => {
+            let mut sin6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
+            sin6.sin6_family = AF_INET6;
+            sin6.sin6_port = a.port().to_be();
+            sin6.sin6_addr = unsafe {
+                std::mem::transmute::<[u8; 16], windows_sys::Win32::Networking::WinSock::IN6_ADDR>(
+                    a.ip().octets(),
+                )
+            };
+            sin6.sin6_flowinfo = a.flowinfo();
+            sin6.Anonymous.sin6_scope_id = a.scope_id();
+
+            let ptr = &sin6 as *const _ as *const u8;
+            let buf =
+                unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<SOCKADDR_IN6>()) }
+                    .to_vec();
+            (buf, std::mem::size_of::<SOCKADDR_IN6>() as i32)
+        }
     }
 }

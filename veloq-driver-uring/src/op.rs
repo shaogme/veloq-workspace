@@ -12,9 +12,27 @@ use std::mem::ManuallyDrop;
 use std::time::Duration;
 use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{
-    Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, OpKind, Open, ReadFixed, Recv,
-    Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
+    Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
+    Fsync as CoreFsync, IntoPlatformOp, OpKind, Open, ReadFixed as CoreReadFixed, Recv as CoreRecv,
+    Send as CoreSend, SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange, Timeout,
+    UdpRecvStream as CoreUdpRecvStream, UdpRefill as CoreUdpRefill, Wakeup as CoreWakeup,
+    WriteFixed as CoreWriteFixed,
 };
+
+type ReadFixed = CoreReadFixed<crate::RawHandle>;
+type WriteFixed = CoreWriteFixed<crate::RawHandle>;
+type Recv = CoreRecv<crate::RawHandle>;
+type OpSend = CoreSend<crate::RawHandle>;
+type Connect = CoreConnect<crate::RawHandle, crate::SockAddrStorage>;
+type Close = CoreClose<crate::RawHandle>;
+type Fsync = CoreFsync<crate::RawHandle>;
+type SyncFileRange = CoreSyncFileRange<crate::RawHandle>;
+type Fallocate = CoreFallocate<crate::RawHandle>;
+type Accept = CoreAccept<crate::RawHandle, crate::SockAddrStorage>;
+type SendTo = CoreSendTo<crate::RawHandle>;
+type UdpRecvStream = CoreUdpRecvStream<crate::RawHandle>;
+type UdpRefill = CoreUdpRefill<crate::RawHandle>;
+type Wakeup = CoreWakeup<crate::RawHandle>;
 
 // ============================================================================
 // VTable Definition
@@ -131,8 +149,8 @@ macro_rules! define_uring_ops {
                     define_uring_ops!(@destruct payload, $($destruct)?)
                 }
 
-                fn payload_into_erased(payload: Self::UserPayload) -> crate::driver::slot::ErasedPayload {
-                    crate::driver::slot::ErasedPayload {
+                fn payload_into_erased(payload: Self::UserPayload) -> veloq_driver_core::slot::ErasedPayload {
+                    veloq_driver_core::slot::ErasedPayload {
                         ptr: Box::into_raw(payload) as *mut (),
                         kind: <$OpType as IntoPlatformOp<UringOp>>::PAYLOAD_KIND as u16,
                         drop_fn: define_uring_ops!(@drop_raw_fn $OpType),
@@ -315,7 +333,7 @@ define_uring_ops! {
             let (msg_name, msg_namelen) = crate::socket_addr_to_storage(op.addr);
             SendToPayload {
                 user,
-                msg_name,
+                msg_name: msg_name.0,
                 msg_namelen: msg_namelen as libc::socklen_t,
                 iovec: [unsafe { std::mem::zeroed() }],
                 msghdr: unsafe { std::mem::zeroed() },
