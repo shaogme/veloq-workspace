@@ -1,8 +1,7 @@
 use crate::driver::op_registry::OpEntry;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use tracing::{debug, trace};
 
 mod inner;
@@ -11,8 +10,9 @@ pub mod submit;
 
 pub use inner::{UringDriver, UringOpState};
 
-use crate::driver::slot::STATE_COMPLETED;
-use crate::driver::{Driver, Outcome, PollBinder, RemoteWaker, SubmitBinder};
+use crate::driver::{
+    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+};
 use inner::UringWaker;
 use op::UringOp;
 
@@ -163,59 +163,6 @@ impl Driver for UringDriver {
         }
     }
 
-    fn poll_op(
-        &mut self,
-        user_data: usize,
-        cx: &mut Context<'_>,
-        binder: PollBinder,
-    ) -> Outcome<Poll<io::Result<usize>>> {
-        // 1. Check if we need to flush pending op
-        let is_pending = if let Some(entry) = self.ops.get(user_data) {
-            matches!(entry.platform_data.lifecycle, inner::OpLifecycle::Pending)
-        } else {
-            // If op missing, it might be already removed? Or invalid.
-            panic!("Op not found in registry during poll");
-        };
-
-        if is_pending {
-            self.flush_backlog();
-            self.flush_cancellations();
-        }
-
-        // Block to limit slot borrow
-        let state = {
-            let slot = &self.ops.shared.slots[user_data];
-            // 2. Register Waker
-            slot.waker.register(cx.waker());
-            // 3. Check for completion state
-            slot.state.load(Ordering::Acquire)
-        };
-
-        if state == STATE_COMPLETED {
-            // Completed. Extract result and drop kernel op.
-            let res = {
-                let slot = &self.ops.shared.slots[user_data];
-                let res = unsafe {
-                    (*slot.result.get())
-                        .take()
-                        .expect("Result missing in COMPLETED slot")
-                };
-                let _ = unsafe { (*slot.op.get()).take() };
-                // Mark slot as consumed?
-                use crate::driver::slot::STATE_CONSUMED;
-                slot.state.store(STATE_CONSUMED, Ordering::Release);
-                res
-            };
-
-            // Cleanup registry
-            self.ops.remove(user_data);
-
-            binder.ready(res)
-        } else {
-            binder.pending()
-        }
-    }
-
     fn submit_queue(&mut self) -> io::Result<()> {
         self.flush_cancellations();
         self.flush_backlog();
@@ -231,6 +178,22 @@ impl Driver for UringDriver {
         self.process_completions_internal();
         self.flush_cancellations();
         self.flush_backlog();
+    }
+
+    fn completion_queue(&self) -> SharedCompletionQueue {
+        self.completion_events.clone()
+    }
+
+    fn completion_table(&self) -> SharedCompletionTable {
+        self.completion_table.clone()
+    }
+
+    fn wait_and_drain_completions(
+        &mut self,
+        out: &mut Vec<crate::driver::CompletionEvent>,
+    ) -> io::Result<usize> {
+        UringDriver::wait(self)?;
+        Ok(self.drain_completions(out))
     }
 
     fn cancel_op(&mut self, user_data: usize) {

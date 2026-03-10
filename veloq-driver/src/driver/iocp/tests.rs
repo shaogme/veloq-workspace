@@ -3,24 +3,35 @@ use super::*;
 
 use crate::Socket;
 use crate::config::IocpConfig;
-use crate::driver::{Driver, PollBinder, SubmitBinder};
+use crate::driver::{Driver, SubmitBinder, encode_completion_token, event_res_to_io};
 use crate::op::{
     Accept, Connect, IntoPlatformOp, IoFd, OpLifecycle, Recv, SendTo, Timeout, UdpRecvStream,
     UdpRefill,
 };
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-fn noop_waker() -> Waker {
-    unsafe fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
+fn wait_completion(
+    driver: &mut IocpDriver,
+    user_data: usize,
+    generation: u32,
+    timeout: std::time::Duration,
+) -> io::Result<usize> {
+    let start = std::time::Instant::now();
+    let token = encode_completion_token(user_data, generation);
+    loop {
+        if start.elapsed() > timeout {
+            panic!(
+                "wait completion timed out: user_data={}, generation={}",
+                user_data, generation
+            );
+        }
+        driver.process_completions();
+        if let Some(ev) = driver.try_take_completion(token) {
+            return event_res_to_io(ev.res);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    unsafe fn wake(_: *const ()) {}
-    unsafe fn wake_by_ref(_: *const ()) {}
-    unsafe fn drop(_: *const ()) {}
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
 #[test]
@@ -58,7 +69,7 @@ fn test_iocp_accept() {
     let mut accept_payload = Some(accept_payload);
     let mut iocp_op = Some(iocp_kernel);
 
-    let (user_data, _) = driver.reserve_op().unwrap();
+    let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
         .submit(user_data, &mut iocp_op, SubmitBinder::new())
         .into_inner()
@@ -70,43 +81,25 @@ fn test_iocp_accept() {
         std::net::TcpStream::connect(addr).expect("Client connect failed");
     });
 
-    // Poll
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let start = std::time::Instant::now();
-
-    loop {
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!("Test timed out");
+    let res = wait_completion(
+        &mut driver,
+        user_data,
+        generation,
+        std::time::Duration::from_secs(5),
+    );
+    assert!(res.is_ok(), "Accept failed: {:?}", res.err());
+    let op = <Accept as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
+        accept_payload
+            .take()
+            .expect("accept payload missing on completion"),
+    );
+    assert!(op.remote_addr.is_some(), "Remote addr should be populated");
+    unsafe {
+        if let Some(fd) = op.fd.raw() {
+            windows_sys::Win32::Foundation::CloseHandle(fd.into());
         }
-
-        driver.process_completions();
-
-        match driver
-            .poll_op(user_data, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => {
-                assert!(res.is_ok(), "Accept failed: {:?}", res.err());
-                let op = <Accept as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
-                    accept_payload
-                        .take()
-                        .expect("accept payload missing on completion"),
-                );
-                assert!(op.remote_addr.is_some(), "Remote addr should be populated");
-                unsafe {
-                    if let Some(fd) = op.fd.raw() {
-                        windows_sys::Win32::Foundation::CloseHandle(fd.into());
-                    }
-                    let s = op.accept_socket;
-                    windows_sys::Win32::Foundation::CloseHandle(s.into());
-                }
-                break;
-            }
-            Poll::Pending => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
+        let s = op.accept_socket;
+        windows_sys::Win32::Foundation::CloseHandle(s.into());
     }
 }
 
@@ -135,34 +128,20 @@ fn test_iocp_connect() {
     let (iocp_kernel, _connect_payload) =
         IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(connect_op);
     let mut iocp_op = Some(iocp_kernel);
-    let (user_data, _) = driver.reserve_op().unwrap();
+    let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
         .submit(user_data, &mut iocp_op, SubmitBinder::new())
         .into_inner()
         .expect("submit connect failed");
 
-    // Poll
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let start = std::time::Instant::now();
-
-    loop {
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!("Connect Timed out");
-        }
-        driver.process_completions();
-        match driver
-            .poll_op(user_data, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => {
-                assert!(res.is_ok(), "Connect failed: {:?}", res.err());
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
-                break;
-            }
-            Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    }
+    let res = wait_completion(
+        &mut driver,
+        user_data,
+        generation,
+        std::time::Duration::from_secs(5),
+    );
+    assert!(res.is_ok(), "Connect failed: {:?}", res.err());
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
 }
 
 #[test]
@@ -176,43 +155,26 @@ fn test_iocp_timeout() {
     let (iocp_kernel, _timeout_payload) =
         IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(timeout_op);
     let mut iocp_op = Some(iocp_kernel);
-    let (user_data, _) = driver.reserve_op().unwrap();
+    let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
         .submit(user_data, &mut iocp_op, SubmitBinder::new())
         .into_inner()
         .expect("submit timeout failed");
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
     let start = std::time::Instant::now();
-
-    loop {
-        // Safety timeout
-        if start.elapsed() > std::time::Duration::from_secs(1) {
-            panic!("Timeout Op didn't complete in time");
-        }
-
-        driver.process_completions();
-
-        match driver
-            .poll_op(user_data, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => {
-                assert!(res.is_ok(), "Timeout should succeed");
-                let elapsed = start.elapsed();
-                assert!(
-                    elapsed >= std::time::Duration::from_millis(50),
-                    "Should wait at least ~100ms, got {:?}",
-                    elapsed
-                );
-                break;
-            }
-            Poll::Pending => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-    }
+    let res = wait_completion(
+        &mut driver,
+        user_data,
+        generation,
+        std::time::Duration::from_secs(1),
+    );
+    assert!(res.is_ok(), "Timeout should succeed");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(50),
+        "Should wait at least ~100ms, got {:?}",
+        elapsed
+    );
 }
 
 #[test]
@@ -276,25 +238,18 @@ fn test_iocp_recv_with_buffer_pool() {
         .expect("register chunk failed");
 
     // Poll connect completion before issuing recv.
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let connect_start = std::time::Instant::now();
-    loop {
-        if connect_start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!("Connect timed out");
-        }
-        driver.process_completions();
-        match driver
-            .poll_op(connect_user_data, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => {
-                assert!(res.is_ok(), "Connect failed: {:?}", res.err());
-                break;
-            }
-            Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    }
+    let connect_gen = driver.ops.local[connect_user_data].platform_data.generation;
+    let connect_res = wait_completion(
+        &mut driver,
+        connect_user_data,
+        connect_gen,
+        std::time::Duration::from_secs(5),
+    );
+    assert!(
+        connect_res.is_ok(),
+        "Connect failed: {:?}",
+        connect_res.err()
+    );
 
     // Create Recv Op
     let recv_op = Recv {
@@ -302,47 +257,35 @@ fn test_iocp_recv_with_buffer_pool() {
         buf,
     };
 
-    let (iocp_kernel, recv_payload) = IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
+    let (iocp_kernel, recv_payload) =
+        IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
     let mut recv_payload = Some(recv_payload);
     let mut iocp_op = Some(iocp_kernel);
-    let (user_data, _) = driver.reserve_op().unwrap();
+    let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
         .submit(user_data, &mut iocp_op, SubmitBinder::new())
         .into_inner()
         .expect("submit recv failed");
 
-    // Poll
-    let start = std::time::Instant::now();
+    let res = wait_completion(
+        &mut driver,
+        user_data,
+        generation,
+        std::time::Duration::from_secs(5),
+    );
+    assert!(res.is_ok(), "Recv failed: {:?}", res.err());
+    let bytes_read = res.unwrap();
+    assert_eq!(bytes_read, 12);
 
-    loop {
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!("Recv timed out");
-        }
-        driver.process_completions();
+    let mut op = <Recv as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
+        recv_payload
+            .take()
+            .expect("recv payload missing on completion"),
+    );
+    op.buf.set_len(bytes_read);
+    assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
-        match driver
-            .poll_op(user_data, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => {
-                assert!(res.is_ok(), "Recv failed: {:?}", res.err());
-                let bytes_read = res.unwrap();
-                assert_eq!(bytes_read, 12);
-
-                let mut op = <Recv as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
-                    recv_payload
-                        .take()
-                        .expect("recv payload missing on completion"),
-                );
-                op.buf.set_len(bytes_read);
-                assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
-
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
-                break;
-            }
-            Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    }
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(client_handle.into()) };
     server_thread.join().unwrap();
 }
 
@@ -350,7 +293,7 @@ fn test_iocp_recv_with_buffer_pool() {
 fn test_rio_cancel_poll_returns_aborted_without_hang() {
     use std::io::Write;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use veloq_buf::BufPool;
     use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 
@@ -382,31 +325,23 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let (connect_kernel, _connect_payload) =
         IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(connect_op);
     let mut connect_iocp_op = Some(connect_kernel);
-    let connect_user_data = driver.reserve_op().unwrap().0;
+    let (connect_user_data, connect_generation) = driver.reserve_op().unwrap();
     let _ = driver
         .submit(connect_user_data, &mut connect_iocp_op, SubmitBinder::new())
         .into_inner()
         .expect("submit connect failed");
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let connect_start = Instant::now();
-    loop {
-        if connect_start.elapsed() > Duration::from_secs(5) {
-            panic!("Connect timed out");
-        }
-        driver.process_completions();
-        match driver
-            .poll_op(connect_user_data, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => {
-                assert!(res.is_ok(), "Connect failed: {:?}", res.err());
-                break;
-            }
-            Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
+    let connect_res = wait_completion(
+        &mut driver,
+        connect_user_data,
+        connect_generation,
+        Duration::from_secs(5),
+    );
+    assert!(
+        connect_res.is_ok(),
+        "Connect failed: {:?}",
+        connect_res.err()
+    );
 
     let buf = reg_pool
         .alloc(std::num::NonZeroUsize::new(8192).unwrap())
@@ -423,9 +358,10 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         fd: crate::op::IoFd::Raw(client_handle),
         buf,
     };
-    let (iocp_kernel, _recv_payload) = IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
+    let (iocp_kernel, _recv_payload) =
+        IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
     let mut iocp_op = Some(iocp_kernel);
-    let (user_data, _) = driver.reserve_op().unwrap();
+    let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
         .submit(user_data, &mut iocp_op, SubmitBinder::new())
         .into_inner()
@@ -433,27 +369,12 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 
     driver.cancel_op(user_data);
 
-    let poll_start = Instant::now();
-    let mut polled = false;
-    while poll_start.elapsed() < Duration::from_secs(1) {
-        driver.process_completions();
-        match driver
-            .poll_op(user_data, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => {
-                let err = res.expect_err("cancelled op should return aborted");
-                assert_eq!(
-                    err.raw_os_error(),
-                    Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
-                );
-                polled = true;
-                break;
-            }
-            Poll::Pending => std::thread::sleep(Duration::from_millis(5)),
-        }
-    }
-    assert!(polled, "cancel后 poll 不应卡住");
+    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(1));
+    let err = res.expect_err("cancelled op should return aborted");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+    );
 
     let _ = tx_send.send(());
     server_thread.join().unwrap();
@@ -464,7 +385,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     use std::io::Write;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use veloq_buf::BufPool;
     use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 
@@ -496,31 +417,23 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let (connect_kernel, _connect_payload) =
         IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(connect_op);
     let mut connect_iocp_op = Some(connect_kernel);
-    let connect_user_data = driver.reserve_op().unwrap().0;
+    let (connect_user_data, connect_generation) = driver.reserve_op().unwrap();
     let _ = driver
         .submit(connect_user_data, &mut connect_iocp_op, SubmitBinder::new())
         .into_inner()
         .expect("submit connect failed");
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let connect_start = Instant::now();
-    loop {
-        if connect_start.elapsed() > Duration::from_secs(5) {
-            panic!("Connect timed out");
-        }
-        driver.process_completions();
-        match driver
-            .poll_op(connect_user_data, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => {
-                assert!(res.is_ok(), "Connect failed: {:?}", res.err());
-                break;
-            }
-            Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
-        }
-    }
+    let connect_res = wait_completion(
+        &mut driver,
+        connect_user_data,
+        connect_generation,
+        Duration::from_secs(5),
+    );
+    assert!(
+        connect_res.is_ok(),
+        "Connect failed: {:?}",
+        connect_res.err()
+    );
 
     let buf = reg_pool
         .alloc(std::num::NonZeroUsize::new(8192).unwrap())
@@ -537,9 +450,10 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         fd: crate::op::IoFd::Raw(client_handle),
         buf,
     };
-    let (iocp_kernel, _recv_payload) = IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
+    let (iocp_kernel, _recv_payload) =
+        IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
     let mut iocp_op = Some(iocp_kernel);
-    let (user_data, _) = driver.reserve_op().unwrap();
+    let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
         .submit(user_data, &mut iocp_op, SubmitBinder::new())
         .into_inner()
@@ -547,16 +461,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
 
     driver.cancel_op(user_data);
 
-    let res = loop {
-        driver.process_completions();
-        match driver
-            .poll_op(user_data, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => break res,
-            Poll::Pending => std::thread::sleep(Duration::from_millis(5)),
-        }
-    };
+    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(1));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
         err.raw_os_error(),
@@ -569,7 +474,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     );
 
     let _ = tx_send.send(());
-    let drain_start = Instant::now();
+    let drain_start = std::time::Instant::now();
     while drain_start.elapsed() < Duration::from_secs(2) {
         driver.process_completions();
         if driver.ops.free_indices.contains(&user_data) {
@@ -594,7 +499,7 @@ fn test_rio_extensions_load() {
 
 #[test]
 fn test_rio_udp_send_to_recv_from_address_path() {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use veloq_buf::BufPool;
     use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 
@@ -667,25 +572,14 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     let (refill_kernel, _refill_payload) =
         IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(refill_op);
     let mut refill_iocp = Some(refill_kernel);
-    let (refill_ud, _) = driver.reserve_op().expect("reserve refill op failed");
+    let (refill_ud, refill_gen) = driver.reserve_op().expect("reserve refill op failed");
     let _ = driver
         .submit(refill_ud, &mut refill_iocp, SubmitBinder::new())
         .into_inner()
         .expect("submit refill failed");
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    // Poll refill completion
-    loop {
-        driver.process_completions();
-        if let Poll::Ready(res) = driver
-            .poll_op(refill_ud, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            res.expect("refill failed");
-            break;
-        }
-    }
+    wait_completion(&mut driver, refill_ud, refill_gen, Duration::from_secs(5))
+        .expect("refill failed");
 
     let recv_op = UdpRecvStream {
         fd: IoFd::Raw(server_handle),
@@ -699,68 +593,39 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         addr: server_addr,
     };
 
-    let (recv_kernel, recv_payload) = IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
+    let (recv_kernel, recv_payload) =
+        IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
     let mut recv_payload = Some(recv_payload);
     let mut recv_iocp = Some(recv_kernel);
-    let (recv_ud, _) = driver.reserve_op().expect("reserve recv op failed");
+    let (recv_ud, recv_gen) = driver.reserve_op().expect("reserve recv op failed");
     let _ = driver
         .submit(recv_ud, &mut recv_iocp, SubmitBinder::new())
         .into_inner()
         .expect("submit udp_recv_stream failed");
 
-    let (send_kernel, _send_payload) = IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(send_op);
+    let (send_kernel, _send_payload) =
+        IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(send_op);
     let mut send_iocp = Some(send_kernel);
-    let (send_ud, _) = driver.reserve_op().expect("reserve send op failed");
+    let (send_ud, send_gen) = driver.reserve_op().expect("reserve send op failed");
     let _ = driver
         .submit(send_ud, &mut send_iocp, SubmitBinder::new())
         .into_inner()
         .expect("submit send_to failed");
 
-    let start = Instant::now();
-
-    let mut send_done = false;
-    let mut recv_done = false;
-
-    while !(send_done && recv_done) {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("RIO UDP send_to/recv_stream regression test timed out");
-        }
-        driver.process_completions();
-
-        if !send_done {
-            if let Poll::Ready(res) = driver
-                .poll_op(send_ud, &mut cx, PollBinder::new())
-                .into_inner()
-            {
-                let sent = res.expect("send_to completion failed");
-                assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
-                send_done = true;
-            }
-        }
-
-        if !recv_done {
-            if let Poll::Ready(res) = driver
-                .poll_op(recv_ud, &mut cx, PollBinder::new())
-                .into_inner()
-            {
-                let bytes = res.expect("udp_recv_stream completion failed");
-                let recv_out = <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
-                    recv_payload
-                        .take()
-                        .expect("udp_recv_stream payload missing on completion"),
-                );
-                let datagram = recv_out.result.expect("datagram missing in result");
-                assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
-                assert_eq!(&datagram.buf.as_slice()[..bytes], test_data);
-                assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
-                recv_done = true;
-            }
-        }
-
-        if !(send_done && recv_done) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
+    let sent = wait_completion(&mut driver, send_ud, send_gen, Duration::from_secs(5))
+        .expect("send_to completion failed");
+    assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
+    let bytes = wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
+        .expect("udp_recv_stream completion failed");
+    let recv_out = <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
+        recv_payload
+            .take()
+            .expect("udp_recv_stream payload missing on completion"),
+    );
+    let datagram = recv_out.result.expect("datagram missing in result");
+    assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
+    assert_eq!(&datagram.buf.as_slice()[..bytes], test_data);
+    assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
 
     unsafe {
         windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize);
@@ -770,7 +635,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
 
 #[test]
 fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use veloq_buf::BufPool;
     use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 
@@ -845,25 +710,14 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     let (refill_kernel, _refill_payload) =
         IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(refill_op);
     let mut refill_iocp = Some(refill_kernel);
-    let (refill_ud, _) = driver.reserve_op().expect("reserve refill op failed");
+    let (refill_ud, refill_gen) = driver.reserve_op().expect("reserve refill op failed");
     let _ = driver
         .submit(refill_ud, &mut refill_iocp, SubmitBinder::new())
         .into_inner()
         .expect("submit refill failed");
 
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    // Poll refill completion
-    loop {
-        driver.process_completions();
-        if let Poll::Ready(res) = driver
-            .poll_op(refill_ud, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            res.expect("refill failed");
-            break;
-        }
-    }
+    wait_completion(&mut driver, refill_ud, refill_gen, Duration::from_secs(5))
+        .expect("refill failed");
 
     let recv_op = UdpRecvStream {
         fd: IoFd::Raw(server_handle),
@@ -877,68 +731,39 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         addr: server_addr,
     };
 
-    let (recv_kernel, recv_payload) = IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
+    let (recv_kernel, recv_payload) =
+        IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
     let mut recv_payload = Some(recv_payload);
     let mut recv_iocp = Some(recv_kernel);
-    let (recv_ud, _) = driver.reserve_op().expect("reserve recv op failed");
+    let (recv_ud, recv_gen) = driver.reserve_op().expect("reserve recv op failed");
     let _ = driver
         .submit(recv_ud, &mut recv_iocp, SubmitBinder::new())
         .into_inner()
         .expect("submit udp_recv_stream failed");
 
-    let (send_kernel, _send_payload) = IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(send_op);
+    let (send_kernel, _send_payload) =
+        IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(send_op);
     let mut send_iocp = Some(send_kernel);
-    let (send_ud, _) = driver.reserve_op().expect("reserve send op failed");
+    let (send_ud, send_gen) = driver.reserve_op().expect("reserve send op failed");
     let _ = driver
         .submit(send_ud, &mut send_iocp, SubmitBinder::new())
         .into_inner()
         .expect("submit send_to failed");
 
-    let start = Instant::now();
-
-    let mut send_done = false;
-    let mut recv_done = false;
-
-    while !(send_done && recv_done) {
-        if start.elapsed() > Duration::from_secs(5) {
-            panic!("RIO UDP IPv6 send_to/recv_stream regression test timed out");
-        }
-        driver.process_completions();
-
-        if !send_done {
-            if let Poll::Ready(res) = driver
-                .poll_op(send_ud, &mut cx, PollBinder::new())
-                .into_inner()
-            {
-                let sent = res.expect("send_to completion failed");
-                assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
-                send_done = true;
-            }
-        }
-
-        if !recv_done {
-            if let Poll::Ready(res) = driver
-                .poll_op(recv_ud, &mut cx, PollBinder::new())
-                .into_inner()
-            {
-                let bytes = res.expect("udp_recv_stream completion failed");
-                let recv_out = <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
-                    recv_payload
-                        .take()
-                        .expect("udp_recv_stream payload missing on completion"),
-                );
-                let datagram = recv_out.result.expect("datagram missing in result");
-                assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
-                assert_eq!(&datagram.buf.as_slice()[..bytes], test_data);
-                assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
-                recv_done = true;
-            }
-        }
-
-        if !(send_done && recv_done) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
+    let sent = wait_completion(&mut driver, send_ud, send_gen, Duration::from_secs(5))
+        .expect("send_to completion failed");
+    assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
+    let bytes = wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
+        .expect("udp_recv_stream completion failed");
+    let recv_out = <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
+        recv_payload
+            .take()
+            .expect("udp_recv_stream payload missing on completion"),
+    );
+    let datagram = recv_out.result.expect("datagram missing in result");
+    assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
+    assert_eq!(&datagram.buf.as_slice()[..bytes], test_data);
+    assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
 
     unsafe {
         windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize);
@@ -969,12 +794,12 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
         let (iocp_kernel, recv_payload) =
             IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
         let mut iocp_op = Some(iocp_kernel);
-        let (ud, _) = driver.reserve_op().expect("reserve recv op failed");
+        let (ud, generation) = driver.reserve_op().expect("reserve recv op failed");
         let _ = driver
             .submit(ud, &mut iocp_op, SubmitBinder::new())
             .into_inner()
             .expect("submit udp_recv_stream failed");
-        submitted.push((ud, recv_payload));
+        submitted.push((ud, generation, recv_payload));
     }
 
     let stats = driver
@@ -991,24 +816,22 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
     );
     assert_eq!(stats.waiters_len, BURST_WAITERS);
 
-    for (ud, recv_payload) in submitted {
+    for (ud, generation, recv_payload) in submitted {
         driver.cancel_op(ud);
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        match driver
-            .poll_op(ud, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(res) => {
-                let _ = <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(recv_payload);
-                let err = res.expect_err("cancelled udp_recv_stream should fail");
-                assert_eq!(
-                    err.raw_os_error(),
-                    Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
-                );
-            }
-            Poll::Pending => panic!("cancelled waiter should be immediately pollable"),
-        }
+        let _ = <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
+            recv_payload,
+        );
+        let res = wait_completion(
+            &mut driver,
+            ud,
+            generation,
+            std::time::Duration::from_secs(1),
+        );
+        let err = res.expect_err("cancelled udp_recv_stream should fail");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+        );
     }
 
     unsafe {
@@ -1039,27 +862,25 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
         let (iocp_kernel, recv_payload) =
             IntoPlatformOp::<IocpDriver>::into_kernel_and_payload(recv_op);
         let mut iocp_op = Some(iocp_kernel);
-        let (ud, _) = driver.reserve_op().expect("reserve recv op failed");
+        let (ud, generation) = driver.reserve_op().expect("reserve recv op failed");
         let _ = driver
             .submit(ud, &mut iocp_op, SubmitBinder::new())
             .into_inner()
             .expect("submit udp_recv_stream failed");
-        submitted.push((ud, recv_payload));
+        submitted.push((ud, generation, recv_payload));
     }
 
-    for (ud, recv_payload) in submitted {
+    for (ud, generation, recv_payload) in submitted {
         driver.cancel_op(ud);
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        match driver
-            .poll_op(ud, &mut cx, PollBinder::new())
-            .into_inner()
-        {
-            Poll::Ready(_) => {
-                let _ = <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(recv_payload);
-            }
-            Poll::Pending => panic!("cancelled waiter should be immediately pollable"),
-        }
+        let _ = <UdpRecvStream as crate::op::IntoPlatformOp<IocpDriver>>::from_user_payload(
+            recv_payload,
+        );
+        let _ = wait_completion(
+            &mut driver,
+            ud,
+            generation,
+            std::time::Duration::from_secs(1),
+        );
     }
 
     // No waiters/no queue during idle ticks -> target should decay to min.

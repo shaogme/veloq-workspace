@@ -20,6 +20,7 @@ veloq-blocking.workspace = true
 veloq-bitset.workspace = true
 
 crossbeam-utils.workspace = true
+crossbeam-queue.workspace = true
 tracing.workspace = true
 error-stack = "0.6"
 

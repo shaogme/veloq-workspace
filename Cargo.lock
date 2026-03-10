@@ -1251,6 +1251,7 @@ dependencies = [
 name = "veloq-driver"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "crossbeam-utils",
  "error-stack",
  "io-uring",
