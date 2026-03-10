@@ -24,6 +24,7 @@ const RIO_REAPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 struct DeferredRioCleanup {
     kernel: RioKernel,
     registry: RioRegistry,
+    registration_mode: crate::config::BufferRegistrationMode,
     actors: FxHashMap<HANDLE, RioSocketActor>,
     actor_routes: FxHashMap<u32, HANDLE>,
     outstanding_count: usize,
@@ -37,6 +38,7 @@ impl DeferredRioCleanup {
         let mut state = RioState {
             kernel: self.kernel,
             registry: self.registry,
+            registration_mode: self.registration_mode,
             actors: self.actors,
             actor_routes: self.actor_routes,
             next_actor_id: 1,
@@ -126,7 +128,9 @@ impl RioState {
     fn finalize_shutdown_cleanup(&mut self) {
         self.forget_all_udp_pool_contexts();
         self.shutdown_all_actors_with_registry_cleanup(&veloq_buf::NoopRegistrar);
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+        let env = self
+            .kernel
+            .env(&veloq_buf::NoopRegistrar, self.registration_mode);
         self.registry.cleanup_deregister(env);
         self.kernel.close();
     }
@@ -140,6 +144,7 @@ impl RioState {
         Some(DeferredRioCleanup {
             kernel,
             registry,
+            registration_mode: self.registration_mode,
             actors: std::mem::take(&mut self.actors),
             actor_routes: std::mem::take(&mut self.actor_routes),
             outstanding_count: std::mem::take(&mut self.outstanding_count),

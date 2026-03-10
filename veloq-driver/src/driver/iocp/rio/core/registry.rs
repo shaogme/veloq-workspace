@@ -120,14 +120,21 @@ impl RioRegistry {
                     .saturating_add(1);
                 self.heap_register_failures_recent
                     .insert(key, Instant::now());
-                return Err(io_error(
+                let err = io_error(
                     IocpErrorContext::Rio,
                     Self::last_wsa_error(),
                     format!(
                         "RIORegisterBuffer failed for heap buffer: ptr=0x{:x}, cap={}, cookie={}",
                         key.0, key.1, key.2
                     ),
-                ));
+                );
+                if env.registration_mode.is_strict() {
+                    panic!(
+                        "strict registration mode: RIO heap registration failed: ptr=0x{:x}, cap={}, cookie={}, error={}",
+                        key.0, key.1, key.2, err
+                    );
+                }
+                return Err(err);
             }
 
             self.heap_rio_bufs.insert(key, id);
@@ -147,20 +154,36 @@ impl RioRegistry {
         if buffer_id.is_none()
             && let Some(chunk_info) = env.registrar.resolve_chunk_info(info.id)
         {
-            self.register_chunk(
+            if let Err(e) = self.register_chunk(
                 info.id,
                 (chunk_info.ptr.as_ptr(), chunk_info.len.get()),
                 env,
-            )?;
+            ) {
+                if env.registration_mode.is_strict() {
+                    panic!(
+                        "strict registration mode: RIO lazy chunk registration failed: chunk_id={}, error={}",
+                        info.id, e
+                    );
+                }
+                return Err(e);
+            }
             buffer_id = Some(self.chunk_registry[info.id as usize]);
         }
 
         match buffer_id {
             Some(id) => Ok((id, info.offset as u32)),
-            None => Err(io_msg(
-                IocpErrorContext::Rio,
-                format!("RIO chunk not registered: chunk_id={}", info.id),
-            )),
+            None => {
+                if env.registration_mode.is_strict() {
+                    panic!(
+                        "strict registration mode: RIO chunk not registered and chunk info unavailable: chunk_id={}",
+                        info.id
+                    );
+                }
+                Err(io_msg(
+                    IocpErrorContext::Rio,
+                    format!("RIO chunk not registered: chunk_id={}", info.id),
+                ))
+            }
         }
     }
 
@@ -229,11 +252,18 @@ impl RioRegistry {
                 .saturating_add(1);
             self.chunk_register_failures_recent
                 .insert(id, Instant::now());
-            return Err(io_error(
+            let err = io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
                 format!("RIORegisterBuffer failed: chunk_id={id}, len={len}"),
-            ));
+            );
+            if env.registration_mode.is_strict() {
+                panic!(
+                    "strict registration mode: RIO chunk register syscall failed: chunk_id={}, len={}, error={}",
+                    id, len, err
+                );
+            }
+            return Err(err);
         }
 
         self.chunk_registry[id_idx] = buf_id;

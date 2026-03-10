@@ -79,7 +79,9 @@ impl RioState {
     }
 
     pub(crate) fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+        let env = self
+            .kernel
+            .env(&veloq_buf::NoopRegistrar, self.registration_mode);
         let mut remove_actor = None;
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
@@ -109,7 +111,7 @@ impl RioState {
         uid: (usize, u32),
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) {
-        let env = self.kernel.env(registrar);
+        let env = self.kernel.env(registrar, self.registration_mode);
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             actor.pool_manager.cancel_udp_recv_waiter(uid, &mut ctx);
@@ -133,7 +135,7 @@ impl RioState {
         ticks: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
-        let env = self.kernel.env(registrar);
+        let env = self.kernel.env(registrar, self.registration_mode);
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             for _ in 0..ticks {
@@ -153,7 +155,7 @@ impl RioState {
         &mut self,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) {
-        let env = self.kernel.env(registrar);
+        let env = self.kernel.env(registrar, self.registration_mode);
         for actor in self.actors.values_mut() {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             actor
@@ -179,7 +181,9 @@ impl RioState {
             .pool_manager
             .ack_udp_pool_completion(completion_generation);
         actor.pool_manager.handle_completion_drain_only();
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+        let env = self
+            .kernel
+            .env(&veloq_buf::NoopRegistrar, self.registration_mode);
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor_id, actor.rq));
         if actor
             .pool_manager

@@ -9,6 +9,7 @@
 //! It forms the low-level boundary between high-level runtime orchestration and
 //! Windows RIO APIs, keeping unsafe calls and pointer setup in one place.
 
+use crate::config::BufferRegistrationMode;
 use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::rio::{RioEnv, RioState};
@@ -285,11 +286,16 @@ impl RioKernel {
     }
 
     #[inline]
-    pub(crate) fn env<'a>(&'a self, registrar: &'a dyn veloq_buf::BufferRegistrar) -> RioEnv<'a> {
+    pub(crate) fn env<'a>(
+        &'a self,
+        registrar: &'a dyn veloq_buf::BufferRegistrar,
+        registration_mode: BufferRegistrationMode,
+    ) -> RioEnv<'a> {
         RioEnv {
             registrar,
             dispatch: &self.dispatch,
             cq: self.cq,
+            registration_mode,
         }
     }
 
@@ -364,7 +370,12 @@ impl RioKernel {
 }
 
 impl RioState {
-    pub(crate) fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
+    pub(crate) fn new(
+        port: HANDLE,
+        entries: u32,
+        ext: &Extensions,
+        registration_mode: BufferRegistrationMode,
+    ) -> io::Result<Self> {
         let kernel = RioKernel::from_extensions(port, entries, ext)?;
 
         let rq_depth = entries.clamp(32, 256);
@@ -372,6 +383,7 @@ impl RioState {
         Ok(Self {
             kernel,
             registry: crate::driver::iocp::rio::core::registry::RioRegistry::new(rq_depth),
+            registration_mode,
             actors: rustc_hash::FxHashMap::default(),
             actor_routes: rustc_hash::FxHashMap::default(),
             next_actor_id: 1,
@@ -388,7 +400,9 @@ impl RioState {
     }
 
     pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
-        let env = self.kernel.env(&veloq_buf::NoopRegistrar);
+        let env = self
+            .kernel
+            .env(&veloq_buf::NoopRegistrar, self.registration_mode);
         self.registry.register_chunk(id, (ptr, len), env)
     }
 
@@ -405,6 +419,7 @@ impl RioState {
             registrar,
             dispatch: &dispatch,
             cq: self.kernel.cq,
+            registration_mode: self.registration_mode,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
         let rio_buf = self
@@ -437,6 +452,7 @@ impl RioState {
             registrar,
             dispatch: &dispatch,
             cq: self.kernel.cq,
+            registration_mode: self.registration_mode,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
         let rio_buf = self

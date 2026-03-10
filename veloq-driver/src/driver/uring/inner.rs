@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
 
-use crate::config::{IoMode, UringConfig};
+use crate::config::{BufferRegistrationMode, IoMode, UringConfig};
 use crate::driver::op_registry::OpRegistry;
 use crate::driver::uring::op::UringOp;
 use crate::driver::{
@@ -124,6 +124,7 @@ pub struct UringDriver {
     pub(crate) timer_buffer: Vec<usize>,
     pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
     pub(crate) registration_stats: UringRegistrationStats,
+    pub(crate) registration_mode: BufferRegistrationMode,
     chunk_register_failures_recent: HashMap<u16, Instant>,
 }
 
@@ -181,6 +182,7 @@ impl UringDriver {
             timer_buffer: Vec::new(),
             registrar: Box::new(veloq_buf::NoopRegistrar),
             registration_stats: UringRegistrationStats::default(),
+            registration_mode: config.registration_mode,
             chunk_register_failures_recent: HashMap::new(),
         };
 
@@ -236,16 +238,30 @@ impl UringDriver {
                                 if !is_registered
                                     && let Some(info) = self.registrar.resolve_chunk_info(chunk_id)
                                 {
-                                    self.register_chunk(
+                                    if let Err(e) = self.register_chunk(
                                         info.id,
                                         info.ptr.as_ptr(),
                                         info.len.get(),
-                                    )?;
+                                    ) {
+                                        if self.registration_mode.is_strict() {
+                                            panic!(
+                                                "strict registration mode: io_uring lazy register failed: chunk_id={}, user_data={}, error={}",
+                                                chunk_id, user_data, e
+                                            );
+                                        }
+                                        return Err(e);
+                                    }
                                 } else if !is_registered {
                                     self.registration_stats.submission_missing_chunk_info = self
                                         .registration_stats
                                         .submission_missing_chunk_info
                                         .saturating_add(1);
+                                    if self.registration_mode.is_strict() {
+                                        panic!(
+                                            "strict registration mode: io_uring missing chunk info for lazy registration: chunk_id={}, user_data={}",
+                                            chunk_id, user_data
+                                        );
+                                    }
                                     return Err(io::Error::other(format!(
                                         "Missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
                                     )));

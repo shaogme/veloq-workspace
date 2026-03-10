@@ -164,7 +164,7 @@ impl RioState {
     ) -> io::Result<usize> {
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
-        let env = self.kernel.env(registrar);
+        let env = self.kernel.env(registrar, self.registration_mode);
         let mut router = RioCompletionRouter::new(
             &mut self.actors,
             (&mut self.actor_routes, &mut self.outstanding_count),

@@ -168,11 +168,16 @@ impl IocpDriver {
     }
 
     pub fn new(config: impl AsRef<IocpConfig>) -> io::Result<Self> {
+        let cfg = config.as_ref();
         let pre = Self::create_pre_init()?;
-        Self::new_from_pre_init(config.as_ref().entries.get(), pre)
+        Self::new_from_pre_init(cfg.entries.get(), pre, cfg.registration_mode)
     }
 
-    pub(crate) fn new_from_pre_init(entries: u32, port_val: PreInit) -> io::Result<Self> {
+    pub(crate) fn new_from_pre_init(
+        entries: u32,
+        port_val: PreInit,
+        registration_mode: crate::config::BufferRegistrationMode,
+    ) -> io::Result<Self> {
         let port = port_val as HANDLE;
         debug!(port = ?port, "Initializing IocpDriver");
         // Load extensions
@@ -185,13 +190,14 @@ impl IocpDriver {
         })?;
 
         // Initialize RIO State
-        let rio_state = RioState::new(port, entries, &extensions).map_err(|e| {
-            io_error(
-                IocpErrorContext::DriverInit,
-                e,
-                format!("failed to initialize RIO state, entries={entries}, port={port:?}"),
-            )
-        })?;
+        let rio_state =
+            RioState::new(port, entries, &extensions, registration_mode).map_err(|e| {
+                io_error(
+                    IocpErrorContext::DriverInit,
+                    e,
+                    format!("failed to initialize RIO state, entries={entries}, port={port:?}"),
+                )
+            })?;
 
         // Changed from with_capacity to new
         let ops = OpRegistry::new(entries as usize);

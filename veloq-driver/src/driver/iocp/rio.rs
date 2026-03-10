@@ -36,6 +36,7 @@ mod lifecycle {
     pub(crate) mod shutdown;
 }
 
+use crate::config::BufferRegistrationMode;
 use crate::driver::iocp::IocpOp;
 use crate::driver::iocp::IocpOpState;
 use crate::driver::op_registry::OpRegistry;
@@ -55,6 +56,7 @@ pub(crate) struct RioEnv<'a> {
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
     pub(crate) dispatch: &'a RioDispatch,
     pub(crate) cq: RIO_CQ,
+    pub(crate) registration_mode: BufferRegistrationMode,
 }
 
 pub(crate) struct RioContext<'a> {
@@ -73,6 +75,7 @@ pub(crate) struct RioCompletionContext<'a> {
 pub(crate) struct RioState {
     pub(crate) kernel: RioKernel,
     pub(crate) registry: RioRegistry,
+    pub(crate) registration_mode: BufferRegistrationMode,
     actors: FxHashMap<HANDLE, RioSocketActor>,
     actor_routes: FxHashMap<u32, HANDLE>,
     next_actor_id: u32,

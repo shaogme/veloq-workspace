@@ -63,6 +63,7 @@ impl RioState {
             registrar,
             dispatch: &dispatch,
             cq: self.kernel.cq,
+            registration_mode: self.registration_mode,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
         let data_buf = self
@@ -177,6 +178,7 @@ impl RioState {
             registrar,
             dispatch: &dispatch,
             cq: self.kernel.cq,
+            registration_mode: self.registration_mode,
         };
         let _ = self.ensure_actor((fd, handle), env)?;
         let (registry, actors) = (&mut self.registry, &mut self.actors);
@@ -205,6 +207,7 @@ impl RioState {
             registrar,
             dispatch: &dispatch,
             cq: self.kernel.cq,
+            registration_mode: self.registration_mode,
         };
         let (fd, handle) = target;
         let _ = self.ensure_actor((fd, handle), env)?;
