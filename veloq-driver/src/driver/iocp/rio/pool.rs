@@ -422,6 +422,7 @@ impl UdpPoolManager {
         self.grow_udp_pool_to(initial, rq, actor_id, ctx)
     }
 
+    #[allow(clippy::result_large_err)]
     fn deliver_udp_datagram_to_waiter(
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
         user_data: usize,
@@ -500,12 +501,13 @@ impl UdpPoolManager {
             };
 
             let (user_data, generation) = waiter;
-            if let Err(returned_datagram) = Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram) {
-                if let Some(pool) = self.pool.as_mut() {
-                    pool.queue.push_front(returned_datagram);
-                    if pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
-                        let _ = pool.queue.pop_back();
-                    }
+            if let Err(returned_datagram) =
+                Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram)
+                && let Some(pool) = self.pool.as_mut()
+            {
+                pool.queue.push_front(returned_datagram);
+                if pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
+                    let _ = pool.queue.pop_back();
                 }
             }
         }

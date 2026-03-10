@@ -74,7 +74,7 @@ fn test_udp_socket_options() {
             .set_broadcast(true)
             .expect("Failed to set broadcast");
         builder
-            .set_recv_buffer_size(4096)
+            .set_recv_buffer_size(65536)
             .expect("Failed to set rcvbuf");
         builder
             .set_reuse_address(true)
@@ -103,6 +103,8 @@ fn test_udp_socket_options() {
             let res = socket_clone.recv_stream(buf).await;
             let _ = res.expect("Failed to recv");
         });
+
+        crate::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let buf = crate::runtime::context::alloc(nz!(1024));
         let (res, _) = client.send_to(buf, addr).await;
