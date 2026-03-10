@@ -426,7 +426,7 @@ impl UdpPoolManager {
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
         user_data: usize,
         expected_generation: u32,
-        datagram: UdpRecvDatagram,
+        datagram: &mut Option<UdpRecvDatagram>,
     ) -> bool {
         if user_data >= ops.local.len() {
             return false;
@@ -445,18 +445,20 @@ impl UdpPoolManager {
         };
 
         let stream_op: &mut UdpRecvStream = unsafe { &mut iocp_op.payload.udp_recv_stream };
-        let datagram_len = datagram.buf.len();
+
+        let owned_datagram = datagram.take().unwrap();
+        let datagram_len = owned_datagram.buf.len();
 
         let addr = unsafe {
             let s = std::slice::from_raw_parts(
-                &datagram.addr as *const _ as *const u8,
-                datagram.addr_len as usize,
+                &owned_datagram.addr as *const _ as *const u8,
+                owned_datagram.addr_len as usize,
             );
             crate::to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
         };
 
         stream_op.result = Some(crate::op::UdpRecvDatagram {
-            buf: datagram.buf,
+            buf: owned_datagram.buf,
             addr,
         });
 
@@ -485,7 +487,7 @@ impl UdpPoolManager {
 
     fn dispatch_udp_waiters(&mut self, ops: &mut OpRegistry<IocpOp, IocpOpState>) {
         loop {
-            let (waiter, datagram) = {
+            let (waiter, mut datagram) = {
                 let Some(pool) = self.pool.as_mut() else {
                     return;
                 };
@@ -496,15 +498,18 @@ impl UdpPoolManager {
                     pool.waiters.push_front(waiter);
                     return;
                 };
-                (waiter, datagram)
+                (waiter, Some(datagram))
             };
 
             let (user_data, generation) = waiter;
-            if !Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, datagram)
+            if !Self::deliver_udp_datagram_to_waiter(ops, user_data, generation, &mut datagram)
                 && let Some(pool) = self.pool.as_mut()
-                && pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP
+                && let Some(returned_datagram) = datagram
             {
-                let _ = pool.queue.pop_front();
+                pool.queue.push_front(returned_datagram);
+                if pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
+                    let _ = pool.queue.pop_back();
+                }
             }
         }
     }
