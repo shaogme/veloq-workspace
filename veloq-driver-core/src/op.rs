@@ -1,0 +1,723 @@
+//! # IO Operation Abstraction Layer
+//!
+//! This module defines platform-agnostic operation structures and traits.
+//! All types here are completely cross-platform with no conditional compilation.
+//!
+//! Platform-specific implementations reside in:
+//! - `io/driver/uring/op.rs` for Linux io_uring
+//! - `io/driver/iocp/op.rs` for Windows IOCP
+
+use std::rc::Rc;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use std::cell::RefCell;
+use tracing::trace;
+use veloq_buf::FixedBuf;
+
+pub use crate::IoFd;
+use crate::RawHandle;
+use crate::SockAddrStorage;
+use crate::driver::{
+    CompletionRecord, Driver, PlatformOp, SharedCompletionTable, SubmitBinder,
+    encode_completion_token, event_res_to_io,
+};
+
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    ReadFixed = 1,
+    WriteFixed = 2,
+    Recv = 3,
+    Send = 4,
+    Connect = 5,
+    Close = 6,
+    Fsync = 7,
+    SyncFileRange = 8,
+    Fallocate = 9,
+    Accept = 10,
+    SendTo = 11,
+    UdpRecvStream = 12,
+    UdpRefill = 13,
+    Open = 14,
+    Wakeup = 15,
+    Timeout = 16,
+}
+
+// ============================================================================
+// OpResult
+// ============================================================================
+
+/// The result of an IO operation.
+///
+/// Since operations execute asynchronously and are detached from the submitter's lifetime,
+/// it is possible (though rare) for the operation slot to be recycled if the `Future`
+/// is polled after the driver has reclaimed the slot (Generation Mismatch).
+/// In such cases, the ownership of the resource `T` is lost.
+#[derive(Debug)]
+pub enum OpResult<T> {
+    /// Operation completed (successfully or with IO error).
+    /// Returns the result of the operation and the original resource.
+    Completed(std::io::Result<usize>, T),
+    /// Operation failed because the submitter/driver slot was recycled (Generation Mismatch).
+    /// The resource `T` is lost (polled too late, driver reset slot).
+    Lost(std::io::Error),
+}
+
+impl<T> OpResult<T> {
+    /// Unwraps the result, assuming the operation completed (panics if Lost).
+    pub fn unwrap(self) -> (usize, T) {
+        match self {
+            OpResult::Completed(Ok(res), data) => (res, data),
+            OpResult::Completed(Err(e), _) => panic!("OpResult::Completed(Err({}))", e),
+            OpResult::Lost(e) => panic!("OpResult::Lost({})", e),
+        }
+    }
+
+    /// Returns the result and the resource implementation (if available).
+    pub fn into_inner(self) -> (std::io::Result<usize>, Option<T>) {
+        match self {
+            OpResult::Completed(res, data) => (res, Some(data)),
+            OpResult::Lost(err) => (Err(err), None),
+        }
+    }
+}
+
+// ============================================================================
+// Core Traits
+// ============================================================================
+
+/// Trait for managing the lifecycle of an operation.
+/// Handles pre-allocation, construction, and output conversion.
+pub trait OpLifecycle: Sized {
+    /// Type for any pre-allocated resources needed before creating the op.
+    type PreAlloc;
+    /// The final output type after the operation completes.
+    type Output;
+
+    /// Pre-allocate any resources needed (e.g., accept socket on Windows).
+    fn pre_alloc(fd: RawHandle) -> std::io::Result<Self::PreAlloc>;
+
+    /// Construct the operation from a raw handle and pre-allocated resources.
+    fn into_op(fd: RawHandle, pre: Self::PreAlloc) -> Self;
+
+    /// Convert the completed operation result to the final output type.
+    fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output>;
+
+    /// Helper: Pre-allocate and construct the operation in one step.
+    fn prepare_op(fd: RawHandle) -> std::io::Result<Self> {
+        let pre = Self::pre_alloc(fd)?;
+        Ok(Self::into_op(fd, pre))
+    }
+}
+
+/// Trait to convert a user-facing operation to a platform-specific driver operation.
+pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
+    /// User payload detached from kernel op.
+    type UserPayload: std::marker::Send + 'static;
+    const PAYLOAD_KIND: OpKind;
+
+    /// Split into kernel-facing op and user payload.
+    fn into_kernel_and_payload(self) -> (O, Self::UserPayload);
+
+    /// Rebuild the user operation from payload.
+    fn from_user_payload(payload: Self::UserPayload) -> Self;
+
+    fn payload_into_erased(payload: Self::UserPayload) -> crate::slot::ErasedPayload;
+
+    /// Rebuilds payload from a raw pointer previously produced by `payload_into_erased`.
+    ///
+    /// # Safety
+    /// `ptr` must originate from the matching `Self::payload_into_erased` implementation
+    /// of the same concrete operation type and must not have been consumed before.
+    unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload;
+
+    /// Compatibility helper for transitional callsites.
+    #[inline]
+    fn from_kernel_and_payload(op: O, payload: Self::UserPayload) -> Self {
+        drop(op);
+        Self::from_user_payload(payload)
+    }
+
+    /// Compatibility helper for legacy callsites.
+    #[inline]
+    fn into_platform_op(self) -> O
+    where
+        Self::UserPayload: Default,
+    {
+        self.into_kernel_and_payload().0
+    }
+
+    /// Compatibility helper for legacy callsites.
+    #[inline]
+    fn from_platform_op(op: O) -> Self
+    where
+        Self::UserPayload: Default,
+    {
+        drop(op);
+        Self::from_user_payload(Default::default())
+    }
+}
+
+// ============================================================================
+// Op (Generic Data Carrier)
+// ============================================================================
+
+/// A generic wrapper for IO operation data.
+///
+/// This struct represents the "intent" of an operation, holding only the data
+/// required to perform the IO (e.g., buffers, file descriptors, flags).
+/// It is decoupled from the execution backend (Driver).
+pub struct Op<T> {
+    pub data: T,
+}
+
+impl<T> Op<T> {
+    /// Create a new operation intent with the given data.
+    pub fn new(data: T) -> Self {
+        Self { data }
+    }
+
+    /// Submit this operation manually to a specific driver instance.
+    /// The operation is submitted synchronously, but completion is awaited asynchronously via the returned future.
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op>
+    where
+        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
+        D: Driver,
+    {
+        let data = self.data;
+        trace!("Submitting detached op");
+
+        // Try reserve first
+        match driver.reserve_op() {
+            Ok((user_data, generation)) => {
+                let (kernel_op, payload) = data.into_kernel_and_payload();
+                let mut op_platform = Some(kernel_op);
+                let token = encode_completion_token(user_data, generation);
+                let completion_table = driver.completion_table();
+                let slot_table = driver.slot_table();
+                let slot = &slot_table.slots[user_data];
+                unsafe {
+                    *slot.payload.get() = Some(T::payload_into_erased(payload));
+                }
+
+                if let Err(e) = driver
+                    .submit(user_data, &mut op_platform, SubmitBinder::new())
+                    .into_inner()
+                {
+                    trace!("Submit failed: {}", e);
+                    // Submit failed synchronously.
+                    // If the platform op is returned, propagate immediate failure with payload.
+                    // Otherwise, fall back to slot-monitoring path and let generation check resolve.
+                    if let Some(op) = op_platform.take() {
+                        let payload_any = unsafe { (*slot.payload.get()).take() }
+                            .expect("Payload missing while recovering submit failure");
+                        if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                            panic!("DetachedOp payload kind mismatch on submit recovery");
+                        }
+                        let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                        drop(op);
+                        DetachedOp {
+                            completion_table: None,
+                            token: 0,
+                            immediate_failure: Some((e, T::from_user_payload(payload))),
+                            _phantom: std::marker::PhantomData,
+                        }
+                    } else {
+                        DetachedOp {
+                            completion_table: Some(completion_table),
+                            token,
+                            immediate_failure: None,
+                            _phantom: std::marker::PhantomData,
+                        }
+                    }
+                } else {
+                    DetachedOp {
+                        completion_table: Some(completion_table),
+                        token,
+                        immediate_failure: None,
+                        _phantom: std::marker::PhantomData,
+                    }
+                }
+            }
+            Err(e) => {
+                // Reservation failed (e.g. full).
+                // Return DetachedOp with immediate failure.
+                DetachedOp {
+                    completion_table: None,
+                    token: 0,
+                    immediate_failure: Some((e, data)),
+                    _phantom: std::marker::PhantomData,
+                }
+            }
+        }
+    }
+
+    /// Submit this operation to a local IO driver.
+    /// Returns a `LocalOp` future that resolves when the operation completes.
+    pub fn submit_local<D>(self, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
+    where
+        T: IntoPlatformOp<D::Op> + 'static,
+        D: Driver,
+    {
+        LocalOp::new(self.data, driver)
+    }
+}
+
+// ============================================================================
+// DetachedOp (Future Implementation for Shared/Send Ops)
+// ============================================================================
+
+/// A Future representing a detached operation.
+/// It polls a shared completion event queue by token.
+pub struct DetachedOp<T, O>
+where
+    O: PlatformOp,
+    T: IntoPlatformOp<O>,
+{
+    completion_table: Option<SharedCompletionTable>,
+    token: u64,
+    immediate_failure: Option<(std::io::Error, T)>,
+    _phantom: std::marker::PhantomData<(T, fn() -> O)>,
+}
+
+// DetachedOp is Send/Sync if the Op data is Send and the Driver Op is Send (implied by SlotTable<Op> bound).
+unsafe impl<T: IntoPlatformOp<O> + std::marker::Send, O: PlatformOp> std::marker::Send
+    for DetachedOp<T, O>
+{
+}
+
+impl<T, O> Future for DetachedOp<T, O>
+where
+    O: PlatformOp,
+    T: IntoPlatformOp<O>,
+{
+    type Output = OpResult<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if let Some((e, data)) = this.immediate_failure.take() {
+            return Poll::Ready(OpResult::Completed(Err(e), data));
+        }
+
+        let table = this
+            .completion_table
+            .as_ref()
+            .expect("DetachedOp missing completion_table but no immediate_failure");
+        if let Some(record) = table.try_take_record(this.token) {
+            let CompletionRecord {
+                event,
+                payload: payload_any,
+                detail,
+            } = record;
+            let Some(payload_any) = payload_any else {
+                return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                    "operation payload lost: completion sidecar missing",
+                )));
+            };
+            if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                    "operation payload lost: kind mismatch",
+                )));
+            }
+            let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+            let data = T::from_user_payload(payload);
+            let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
+            return Poll::Ready(OpResult::Completed(res, data));
+        }
+
+        if let Some(table) = this.completion_table.as_ref() {
+            table.register_waker(this.token, cx.waker());
+        }
+
+        Poll::Pending
+    }
+}
+
+// ============================================================================
+// LocalOp (Future Implementation)
+// ============================================================================
+
+enum State {
+    Defined,
+    Submitted,
+    Completed,
+}
+
+/// A Future wrapper for asynchronous IO operations executed locally.
+pub struct LocalOp<T, D>
+where
+    D: Driver,
+    T: IntoPlatformOp<D::Op> + 'static,
+{
+    state: State,
+    data: Option<T>,
+    driver: Rc<RefCell<D>>,
+    user_data: usize,
+    token: u64,
+}
+
+impl<T, D> LocalOp<T, D>
+where
+    D: Driver,
+    T: IntoPlatformOp<D::Op> + 'static,
+{
+    /// Create a new local operation future.
+    pub fn new(data: T, driver: Rc<RefCell<D>>) -> Self {
+        Self {
+            state: State::Defined,
+            data: Some(data),
+            driver,
+            user_data: 0,
+            token: 0,
+        }
+    }
+}
+
+impl<T, D> Future for LocalOp<T, D>
+where
+    D: Driver,
+    T: IntoPlatformOp<D::Op> + 'static,
+{
+    type Output = OpResult<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let op = unsafe { self.get_unchecked_mut() };
+
+        if let State::Defined = op.state {
+            let mut driver = op.driver.borrow_mut();
+
+            // Submit to driver
+            let data = op.data.take().expect("Op started without data");
+            let (driver_op, payload) = data.into_kernel_and_payload();
+
+            // reserve_op now returns generation, but we ignore it for LocalOp
+            // because LocalOp lifetime is tied to the driver via Rc/RefCell.
+            let (user_data, generation) = match driver.reserve_op() {
+                Ok(v) => v,
+                Err(e) => {
+                    // Failed to reserve
+                    drop(driver_op);
+                    return Poll::Ready(OpResult::Completed(Err(e), T::from_user_payload(payload)));
+                }
+            };
+            op.user_data = user_data;
+            op.token = encode_completion_token(user_data, generation);
+            let slot_table = driver.slot_table();
+            let slot = &slot_table.slots[user_data];
+            unsafe {
+                *slot.payload.get() = Some(T::payload_into_erased(payload));
+            }
+
+            // Submit to driver.
+            let mut driver_op_opt = Some(driver_op);
+            if let Err(e) = driver
+                .submit(user_data, &mut driver_op_opt, SubmitBinder::new())
+                .into_inner()
+            {
+                if let Some(val) = driver_op_opt.take() {
+                    drop(val);
+                }
+                let payload_any = unsafe { (*slot.payload.get()).take() }
+                    .expect("Payload missing while recovering submit failure");
+                if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                    panic!("LocalOp payload kind mismatch on submit recovery");
+                }
+                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                let data = T::from_user_payload(payload);
+                return Poll::Ready(OpResult::Completed(Err(e), data));
+            }
+
+            op.state = State::Submitted;
+        }
+
+        if let State::Submitted = op.state {
+            let mut driver = op.driver.borrow_mut();
+            if let Some(record) = driver.try_take_completion_record(op.token) {
+                op.state = State::Completed;
+                let CompletionRecord {
+                    event,
+                    payload: payload_any,
+                    detail,
+                } = record;
+                let Some(payload_any) = payload_any else {
+                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                        "operation payload lost: completion sidecar missing",
+                    )));
+                };
+                if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                        "operation payload lost: kind mismatch",
+                    )));
+                }
+                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                let data = T::from_user_payload(payload);
+                let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
+                Poll::Ready(OpResult::Completed(res, data))
+            } else {
+                driver.register_completion_waker(op.token, cx.waker());
+                Poll::Pending
+            }
+        } else {
+            panic!("Polled after completion");
+        }
+    }
+}
+
+impl<T, D> Drop for LocalOp<T, D>
+where
+    D: Driver,
+    T: IntoPlatformOp<D::Op> + 'static,
+{
+    fn drop(&mut self) {
+        if let State::Submitted = self.state {
+            // LocalOp being dropped while submitted means we must cancel it.
+            self.driver.borrow_mut().cancel_op(self.user_data);
+        }
+    }
+}
+
+// ============================================================================
+// OpSubmitter Trait
+// ============================================================================
+
+pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
+    type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static>: Future<
+        Output = OpResult<T>,
+    >;
+
+    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
+    where
+        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static;
+
+    fn from_current_context() -> std::io::Result<Self>;
+}
+
+// ============================================================================
+// LocalSubmitter
+// ============================================================================
+
+#[derive(Clone, Copy)]
+pub struct LocalSubmitter;
+
+impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
+    type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static> = LocalOp<T, D>;
+
+    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
+    where
+        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
+    {
+        trace!("Submitting local op");
+        op.submit_local(driver)
+    }
+
+    fn from_current_context() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+// ============================================================================
+// DetachedSubmitter
+// ============================================================================
+
+#[derive(Clone, Copy)]
+pub struct DetachedSubmitter;
+
+impl DetachedSubmitter {
+    pub fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
+    type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static> = DetachedOp<T, D::Op>;
+
+    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
+    where
+        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
+    {
+        op.submit_detached(&mut *driver.borrow_mut())
+    }
+
+    fn from_current_context() -> std::io::Result<Self> {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Cross-Platform Operation Structures
+// ============================================================================
+
+/// Read from a file descriptor at a specific offset using a fixed buffer.
+pub struct ReadFixed {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+    pub offset: u64,
+}
+
+/// Write to a file descriptor at a specific offset using a fixed buffer.
+pub struct WriteFixed {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+    pub offset: u64,
+}
+
+/// Receive data from a socket into a fixed buffer.
+pub struct Recv {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+}
+
+/// Send data from a fixed buffer to a socket.
+pub struct Send {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+}
+
+/// Connect a socket to a remote address.
+pub struct Connect {
+    pub fd: IoFd,
+    /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
+    pub addr: SockAddrStorage,
+    pub addr_len: u32,
+}
+
+/// Open a file.
+/// Path representation is platform-agnostic (raw bytes).
+#[derive(Debug)]
+pub struct Open {
+    /// Path stored in a fixed buffer.
+    /// - Unix: UTF-8 encoded, null-terminated.
+    /// - Windows: UTF-16 encoded, null-terminated (stored as bytes).
+    pub path: FixedBuf,
+    pub flags: i32,
+    pub mode: u32,
+}
+
+/// Close a file descriptor or handle.
+pub struct Close {
+    pub fd: IoFd,
+}
+
+/// Flush file buffers to disk.
+pub struct Fsync {
+    pub fd: IoFd,
+    /// If true, only sync data (not metadata).
+    pub datasync: bool,
+}
+
+/// Timeout operation (platform-specific timing).
+pub struct Timeout {
+    pub duration: std::time::Duration,
+}
+
+/// Wake up the event loop.
+pub struct Wakeup {
+    pub fd: IoFd,
+}
+
+/// Accept a new connection on a listening socket.
+/// Result includes the new socket handle and remote address.
+pub struct Accept {
+    pub fd: IoFd,
+    /// Buffer for storing the remote address.
+    /// On Windows, we parse the result from the AcceptEx output buffer, so we don't need this storage.
+    pub addr: SockAddrStorage,
+    /// Length of the address buffer.
+    pub addr_len: u32,
+    /// Parsed remote address (populated after completion).
+    pub remote_addr: Option<std::net::SocketAddr>,
+}
+
+/// Send data to a specific address (UDP).
+pub struct SendTo {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+    /// Target address.
+    pub addr: std::net::SocketAddr,
+}
+
+/// Sync file range.
+pub struct SyncFileRange {
+    pub fd: IoFd,
+    pub offset: u64,
+    pub nbytes: u64,
+    pub flags: u32,
+}
+
+/// Pre-allocate file space.
+pub struct Fallocate {
+    pub fd: IoFd,
+    pub mode: i32,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Receive data as UDP datagram stream.
+pub struct UdpRecvStream {
+    pub fd: IoFd,
+    /// Unix io_uring path uses this provided buffer; Windows can leave it as None.
+    pub buf: Option<FixedBuf>,
+    /// Unix io_uring path: source address parsed from recvmsg.
+    pub addr: Option<std::net::SocketAddr>,
+    /// Windows RIO path: resulting datagram, populated on completion.
+    pub result: Option<UdpRecvDatagram>,
+}
+
+/// A received UDP datagram.
+pub struct UdpRecvDatagram {
+    pub buf: FixedBuf,
+    pub addr: std::net::SocketAddr,
+}
+
+/// Provide a buffer to the driver's internal RIO UDP pool.
+pub struct UdpRefill {
+    pub fd: IoFd,
+    pub buf: Option<FixedBuf>,
+}
+
+// ============================================================================
+// OpLifecycle Implementations
+// ============================================================================
+
+impl OpLifecycle for Accept {
+    type PreAlloc = ();
+    type Output = (RawHandle, std::net::SocketAddr);
+
+    fn pre_alloc(_fd: RawHandle) -> std::io::Result<Self::PreAlloc> {
+        Ok(())
+    }
+
+    fn into_op(fd: RawHandle, _pre: Self::PreAlloc) -> Self {
+        // Use stack/inline storage
+        let addr_len = std::mem::size_of::<SockAddrStorage>() as u32;
+
+        Self {
+            fd: IoFd::Raw(fd),
+            addr: unsafe { std::mem::zeroed() },
+            addr_len,
+            remote_addr: None,
+        }
+    }
+
+    fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output> {
+        let fd = res?.into();
+        use crate::to_socket_addr;
+        let addr = if let Some(a) = self.remote_addr {
+            a
+        } else {
+            unsafe {
+                let s = std::slice::from_raw_parts(
+                    &self.addr as *const _ as *const u8,
+                    self.addr_len as usize,
+                );
+                to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+            }
+        };
+        Ok((fd, addr))
+    }
+}

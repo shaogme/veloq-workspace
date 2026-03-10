@@ -1,5 +1,5 @@
 [package]
-name = "veloq-driver-core"
+name = "veloq-driver-uring"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,23 +12,16 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[features]
-default = []
-test-hooks = []
-
 [dependencies]
-veloq-atomic-waker.workspace = true
+veloq-driver-core.workspace = true
 veloq-buf.workspace = true
+veloq-wheel.workspace = true
+veloq-bitset.workspace = true
 
-crossbeam-utils.workspace = true
 crossbeam-queue.workspace = true
 tracing.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.11"
 libc.workspace = true
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys.workspace = true
 
 [lints]
 workspace = true

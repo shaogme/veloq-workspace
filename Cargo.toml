@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "veloq-driver-core",
+    "veloq-driver-uring",
     "veloq-runtime",
     "veloq-examples/disk-bench",
     "veloq-sync",
@@ -36,6 +37,7 @@ veloq-sync = { path = "veloq-sync", version = "0.1.0" }
 veloq-local = { path = "veloq-local", version = "0.1.0" }
 veloq-buf = { path = "veloq-buf", version = "0.1.0" }
 veloq-driver-core = { path = "veloq-driver-core", version = "0.1.0" }
+veloq-driver-uring = { path = "veloq-driver-uring", version = "0.1.0" }
 veloq-driver = { path = "veloq-driver", version = "0.1.0" }
 
 veloq-shim = { path = "utils/veloq-shim", version = "0.1.0" }
