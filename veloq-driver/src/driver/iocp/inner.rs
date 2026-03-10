@@ -3,11 +3,13 @@ use super::ext::Extensions;
 use super::rio::RioState;
 use super::submit;
 use crate::config::IocpConfig;
-use crate::driver::RemoteWaker;
-use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED}; // Removed DetachedCompleter if unused, or keep if used in public API
-// Removed STATE_SUBMITTED if unused here.
 use crate::driver::iocp::op::IocpOp;
+use crate::driver::op_registry::OpRegistry;
+use crate::driver::slot::OverlappedEntry;
+use crate::driver::{
+    CompletionEvent, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    encode_completion_token,
+};
 
 use std::io;
 use std::sync::Arc;
@@ -35,16 +37,16 @@ pub enum OpLifecycle {
     Completed(io::Result<usize>), // Stores the result here!
     /// Cancelled by user
     Cancelled,
-    /// Detached completer running or done (Legacy, keeping for compatibility if generic DetachedCompleter logic is used)
+    /// Detached completion notifier path.
     Detached,
 }
 
 pub struct IocpOpState {
     pub generation: u32,
     pub lifecycle: OpLifecycle,
-    pub detached_completer:
-        Option<Box<dyn crate::driver::DetachedCompleter<crate::driver::iocp::op::IocpOp>>>,
+    pub detached_notifier: Option<Box<dyn crate::driver::DetachedCompleter>>,
     pub timer_id: Option<TaskId>,
+    pub timer_deadline: Option<Instant>,
     pub is_background: bool,
     // For RIO cancel path: the slot can be recycled only after both:
     // 1) user has consumed completion; 2) late RIO CQE has been drained.
@@ -59,8 +61,9 @@ impl Default for IocpOpState {
         Self {
             generation: 0,
             lifecycle: OpLifecycle::Pending,
-            detached_completer: None,
+            detached_notifier: None,
             timer_id: None,
+            timer_deadline: None,
             is_background: false,
             rio_needs_drain: false,
             rio_drained: false,
@@ -92,6 +95,8 @@ pub struct IocpDriver {
     pub(crate) registered_files: Vec<Option<HANDLE>>,
     pub(crate) free_slots: Vec<usize>,
     pub(crate) is_waked: Arc<AtomicBool>,
+    pub(crate) completion_events: SharedCompletionQueue,
+    pub(crate) completion_table: SharedCompletionTable,
 
     // RIO Support (required)
     pub(crate) rio_state: RioState,
@@ -212,6 +217,10 @@ impl IocpDriver {
             registered_files: Vec::new(),
             free_slots: Vec::new(),
             is_waked,
+            completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
+            completion_table: std::sync::Arc::new(crate::driver::CompletionTable::new(
+                entries as usize,
+            )),
             rio_state,
             registrar: Box::new(veloq_buf::NoopRegistrar),
             shutting_down: false,
@@ -251,8 +260,12 @@ impl IocpDriver {
         self.process_timer_completions();
 
         if completion_key == RIO_EVENT_KEY {
-            self.rio_state
-                .process_completions(&mut self.ops, &*self.registrar)?;
+            self.rio_state.process_completions(
+                &mut self.ops,
+                &*self.registrar,
+                &self.completion_events,
+                &self.completion_table,
+            )?;
             return Ok(());
         }
 
@@ -304,10 +317,12 @@ impl IocpDriver {
         let mut timer_buffer = std::mem::take(&mut self.timer_buffer);
         let ops_local = &mut self.ops.local;
         let ops_shared = &self.ops.shared;
+        let mut pending_events: Vec<(usize, u32, i32, u32)> = Vec::new();
+        let now = Instant::now();
 
         for &user_data in &timer_buffer {
             let is_detached = if let Some(op) = ops_local.get_mut(user_data) {
-                op.platform_data.detached_completer.is_some()
+                op.platform_data.detached_notifier.is_some()
             } else {
                 continue;
             };
@@ -317,31 +332,56 @@ impl IocpDriver {
 
                 if let Some(op) = ops_local.get_mut(user_data)
                     && matches!(op.platform_data.lifecycle, OpLifecycle::InFlight)
-                    && let Some(completer) = op.platform_data.detached_completer.take()
+                    && let Some(completer) = op.platform_data.detached_notifier.take()
                 {
+                    if let Some(deadline) = op.platform_data.timer_deadline
+                        && now < deadline
+                    {
+                        let remain = deadline.saturating_duration_since(now);
+                        op.platform_data.timer_id = Some(self.wheel.insert(user_data, remain));
+                        continue;
+                    }
+
                     op.platform_data.lifecycle = OpLifecycle::Detached;
                     op.platform_data.timer_id = None;
+                    op.platform_data.timer_deadline = None;
+                    let generation = slot.generation.load(Ordering::Acquire);
 
                     let resources = unsafe { (*slot.op.get()).take() };
 
                     if let Some(res) = resources {
-                        completer.complete(Ok(0), res);
+                        drop(res);
+                        completer.complete(Ok(0));
                     }
-                    unsafe { *slot.result.get() = Some(Ok(0)) };
-                    slot.state.store(STATE_COMPLETED, Ordering::Release);
-                    slot.waker.wake();
+                    pending_events.push((user_data, generation, 0, 0));
+                    let _ = std::mem::take(&mut op.platform_data);
+                    self.ops.free_indices.push(user_data);
                 }
             } else if let Some(op) = ops_local.get_mut(user_data) {
                 if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                    if let Some(deadline) = op.platform_data.timer_deadline
+                        && now < deadline
+                    {
+                        let remain = deadline.saturating_duration_since(now);
+                        op.platform_data.timer_id = Some(self.wheel.insert(user_data, remain));
+                        continue;
+                    }
+
                     op.platform_data.lifecycle = OpLifecycle::Completed(Ok(0));
 
                     let slot = &ops_shared.slots[user_data];
-                    unsafe { *slot.result.get() = Some(Ok(0)) };
-                    slot.state.store(STATE_COMPLETED, Ordering::Release);
-                    slot.waker.wake();
+                    let generation = slot.generation.load(Ordering::Acquire);
+                    pending_events.push((user_data, generation, 0, 0));
+                    let _ = unsafe { (*slot.op.get()).take() };
+                    let _ = std::mem::take(&mut op.platform_data);
+                    self.ops.free_indices.push(user_data);
                 }
                 op.platform_data.timer_id = None;
+                op.platform_data.timer_deadline = None;
             }
+        }
+        for (user_data, generation, res, flags) in pending_events {
+            self.push_completion_event(user_data, generation, res, flags);
         }
         timer_buffer.clear();
         self.timer_buffer = timer_buffer;
@@ -352,6 +392,8 @@ impl IocpDriver {
             return;
         }
 
+        let completion_events = self.completion_events.clone();
+        let completion_table = self.completion_table.clone();
         let ops_local = &mut self.ops.local;
         let ops_shared = &self.ops.shared;
 
@@ -388,48 +430,52 @@ impl IocpDriver {
 
         match op.platform_data.lifecycle {
             OpLifecycle::Cancelled | OpLifecycle::InFlight => {
+                let was_cancelled = matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
+                let completion_res = io_result_to_event_res(&io_result);
                 op.platform_data.rio_pool_waiting = false;
-                unsafe { *slot.result.get() = Some(io_result) };
 
                 if op.platform_data.is_background {
-                    // Drop resource
-                    let _op = unsafe { (*slot.op.get()).take() };
-                    // We need to mark slot as free in registry.
-                    // Can't use self.ops.remove here because borrowing split.
-                    // Manually implement remove logic on local
+                    let _ = unsafe { (*slot.op.get()).take() };
                     let _data = std::mem::take(&mut op.platform_data);
                     self.ops.free_indices.push(user_data);
-                } else if let Some(completer) = op.platform_data.detached_completer.take() {
+                } else if let Some(completer) = op.platform_data.detached_notifier.take() {
                     op.platform_data.lifecycle = OpLifecycle::Detached;
                     let resource = unsafe { (*slot.op.get()).take() };
                     if let Some(iocp_op) = resource {
-                        let res = unsafe { (*slot.result.get()).take().unwrap() };
-                        completer.complete(res, iocp_op);
+                        drop(iocp_op);
+                        completer.complete(clone_io_result(&io_result));
                     }
-                    // Remove from registry
-                    // self.ops.remove(user_data);
                     let _data = std::mem::take(&mut op.platform_data);
                     self.ops.free_indices.push(user_data);
+                    push_completion_event_shared(
+                        &completion_events,
+                        &completion_table,
+                        user_data,
+                        slot_generation,
+                        completion_res,
+                        0,
+                    );
                 } else {
-                    // Normal completion
-                    let res_clone = unsafe {
-                        (*slot.result.get())
-                            .as_ref()
-                            .unwrap()
-                            .as_ref()
-                            .map(|x| *x)
-                            .map_err(|e| {
-                                if let Some(code) = e.raw_os_error() {
-                                    io::Error::from_raw_os_error(code)
-                                } else {
-                                    io::Error::new(e.kind(), e.to_string())
-                                }
-                            })
-                    };
-                    op.platform_data.lifecycle = OpLifecycle::Completed(res_clone);
+                    op.platform_data.lifecycle =
+                        OpLifecycle::Completed(clone_io_result(&io_result));
 
-                    slot.state.store(STATE_COMPLETED, Ordering::Release);
-                    slot.waker.wake();
+                    let should_emit = !(was_cancelled && op.platform_data.rio_needs_drain);
+                    if should_emit {
+                        push_completion_event_shared(
+                            &completion_events,
+                            &completion_table,
+                            user_data,
+                            slot_generation,
+                            completion_res,
+                            0,
+                        );
+                    }
+
+                    if !op.platform_data.rio_needs_drain || op.platform_data.rio_drained {
+                        let _ = unsafe { (*slot.op.get()).take() };
+                        let _ = std::mem::take(&mut op.platform_data);
+                        self.ops.free_indices.push(user_data);
+                    }
                 }
             }
             _ => {
@@ -449,6 +495,8 @@ impl IocpDriver {
     }
 
     pub fn cancel_op_internal(&mut self, user_data: usize) {
+        let completion_events = self.completion_events.clone();
+        let completion_table = self.completion_table.clone();
         let ops_local = &mut self.ops.local;
         let ops_shared = &self.ops.shared;
 
@@ -459,31 +507,42 @@ impl IocpDriver {
             if let Some(tid) = op.platform_data.timer_id {
                 self.wheel.cancel(tid);
                 op.platform_data.timer_id = None;
+                op.platform_data.timer_deadline = None;
                 let err = io::Error::from_raw_os_error(
                     windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
                 );
                 op.platform_data.lifecycle = OpLifecycle::Completed(Err(err));
+                let generation = slot.generation.load(Ordering::Acquire);
 
-                unsafe {
-                    *slot.result.get() = Some(Err(io::Error::from_raw_os_error(
-                        windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
-                    )))
-                };
-                slot.state.store(STATE_COMPLETED, Ordering::Release);
-                slot.waker.wake();
+                push_completion_event_shared(
+                    &completion_events,
+                    &completion_table,
+                    user_data,
+                    generation,
+                    -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                    0,
+                );
+                let _ = unsafe { (*slot.op.get()).take() };
+                let _ = std::mem::take(&mut op.platform_data);
+                self.ops.free_indices.push(user_data);
                 return;
             }
 
             match op.platform_data.lifecycle {
                 OpLifecycle::Pending => {
                     op.platform_data.lifecycle = OpLifecycle::Cancelled;
-                    slot.state.store(STATE_COMPLETED, Ordering::Release);
-                    unsafe {
-                        *slot.result.get() = Some(Err(io::Error::from_raw_os_error(
-                            windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
-                        )))
-                    };
-                    slot.waker.wake();
+                    let generation = slot.generation.load(Ordering::Acquire);
+                    push_completion_event_shared(
+                        &completion_events,
+                        &completion_table,
+                        user_data,
+                        generation,
+                        -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                        0,
+                    );
+                    let _ = unsafe { (*slot.op.get()).take() };
+                    let _ = std::mem::take(&mut op.platform_data);
+                    self.ops.free_indices.push(user_data);
                 }
                 OpLifecycle::InFlight => {
                     op.platform_data.lifecycle = OpLifecycle::Cancelled;
@@ -499,26 +558,33 @@ impl IocpDriver {
                                 &*self.registrar,
                             );
                             op.platform_data.rio_pool_waiting = false;
-                            unsafe {
-                                *slot.result.get() = Some(Err(io::Error::from_raw_os_error(
-                                    windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
-                                )))
-                            };
-                            slot.state.store(STATE_COMPLETED, Ordering::Release);
-                            slot.waker.wake();
+                            let generation = slot.generation.load(Ordering::Acquire);
+                            push_completion_event_shared(
+                                &completion_events,
+                                &completion_table,
+                                user_data,
+                                generation,
+                                -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                                0,
+                            );
+                            let _ = unsafe { (*slot.op.get()).take() };
+                            let _ = std::mem::take(&mut op.platform_data);
+                            self.ops.free_indices.push(user_data);
                             return;
                         }
 
                         if Self::is_rio_op(res) {
                             op.platform_data.rio_needs_drain = true;
                             op.platform_data.rio_drained = false;
-                            unsafe {
-                                *slot.result.get() = Some(Err(io::Error::from_raw_os_error(
-                                    windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
-                                )))
-                            };
-                            slot.state.store(STATE_COMPLETED, Ordering::Release);
-                            slot.waker.wake();
+                            let generation = slot.generation.load(Ordering::Acquire);
+                            push_completion_event_shared(
+                                &completion_events,
+                                &completion_table,
+                                user_data,
+                                generation,
+                                -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                                0,
+                            );
                         }
 
                         // Safe usage of overlapped ptr
@@ -587,6 +653,24 @@ impl IocpDriver {
         })
     }
 
+    #[inline]
+    pub(crate) fn push_completion_event(
+        &self,
+        user_data: usize,
+        generation: u32,
+        res: i32,
+        flags: u32,
+    ) {
+        push_completion_event_shared(
+            &self.completion_events,
+            &self.completion_table,
+            user_data,
+            generation,
+            res,
+            flags,
+        );
+    }
+
     fn shutdown_inflight_ops(&mut self) -> usize {
         if self.shutting_down {
             return 0;
@@ -652,10 +736,12 @@ impl IocpDriver {
             };
 
             if key == RIO_EVENT_KEY {
-                if let Ok(count) = self
-                    .rio_state
-                    .process_completions(&mut self.ops, &*self.registrar)
-                {
+                if let Ok(count) = self.rio_state.process_completions(
+                    &mut self.ops,
+                    &*self.registrar,
+                    &self.completion_events,
+                    &self.completion_table,
+                ) {
                     ops_drained += count;
                 }
                 continue;
@@ -684,13 +770,14 @@ impl IocpDriver {
         Ok(())
     }
 
-    fn cleanup_detached_completers(&mut self) {
+    fn cleanup_detached_notifiers(&mut self) {
         for (user_data, op_entry) in self.ops.local.iter_mut().enumerate() {
             let slot = &self.ops.shared.slots[user_data];
-            if let Some(completer) = op_entry.platform_data.detached_completer.take()
+            if let Some(completer) = op_entry.platform_data.detached_notifier.take()
                 && let Some(op) = unsafe { (*slot.op.get()).take() }
             {
-                completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
+                drop(op);
+                completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)));
             }
         }
     }
@@ -707,7 +794,7 @@ impl IocpDriver {
             self.rio_state.drain_outstanding_for(timeout)?;
         }
 
-        self.cleanup_detached_completers();
+        self.cleanup_detached_notifiers();
         self.closed = true;
         Ok(())
     }
@@ -719,6 +806,46 @@ impl IocpDriver {
 
     pub fn close_with_mode(mut self, mode: CloseMode) -> io::Result<()> {
         self.close_impl(mode)
+    }
+}
+
+#[inline]
+fn io_result_to_event_res(res: &io::Result<usize>) -> i32 {
+    match res {
+        Ok(v) => (*v).min(i32::MAX as usize) as i32,
+        Err(e) => -e.raw_os_error().unwrap_or(1).abs(),
+    }
+}
+
+#[inline]
+fn push_completion_event_shared(
+    queue: &SharedCompletionQueue,
+    table: &SharedCompletionTable,
+    user_data: usize,
+    generation: u32,
+    res: i32,
+    flags: u32,
+) {
+    let event = CompletionEvent {
+        user_data: encode_completion_token(user_data, generation),
+        res,
+        flags,
+    };
+    table.record_completion(event);
+    queue.push(event);
+}
+
+#[inline]
+fn clone_io_result(res: &io::Result<usize>) -> io::Result<usize> {
+    match res {
+        Ok(v) => Ok(*v),
+        Err(e) => {
+            if let Some(code) = e.raw_os_error() {
+                Err(io::Error::from_raw_os_error(code))
+            } else {
+                Err(io::Error::new(e.kind(), e.to_string()))
+            }
+        }
     }
 }
 

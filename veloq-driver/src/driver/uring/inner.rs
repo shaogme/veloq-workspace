@@ -8,10 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, trace};
 
 use crate::config::{IoMode, UringConfig};
-use crate::driver::RemoteWaker;
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::{STATE_COMPLETED, STATE_SUBMITTED};
+use crate::driver::slot::STATE_SUBMITTED;
 use crate::driver::uring::op::UringOp;
+use crate::driver::{
+    CompletionEvent, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    encode_completion_token,
+};
 use crate::op::IntoPlatformOp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,9 +100,12 @@ pub struct UringDriver {
     pub(crate) backlog_head: Option<usize>,
     pub(crate) backlog_tail: Option<usize>,
     pub(crate) pending_cancellations: VecDeque<usize>,
+    pub(crate) completion_events: SharedCompletionQueue,
+    pub(crate) completion_table: SharedCompletionTable,
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_token: Option<usize>,
+    pub(crate) waker_payload: Option<Box<crate::op::Wakeup>>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
@@ -148,8 +154,13 @@ impl UringDriver {
             backlog_head: None,
             backlog_tail: None,
             pending_cancellations: VecDeque::new(),
+            completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
+            completion_table: std::sync::Arc::new(crate::driver::CompletionTable::new(
+                entries as usize,
+            )),
             waker_fd: Arc::new(EventFd { fd: waker_fd }),
             waker_token: None,
+            waker_payload: None,
             registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
             is_waked,
 
@@ -284,7 +295,8 @@ impl UringDriver {
         let op = crate::op::Wakeup {
             fd: crate::op::IoFd::Raw(crate::RawHandle { fd }),
         };
-        let uring_op = <crate::op::Wakeup as IntoPlatformOp<UringDriver>>::into_platform_op(op);
+        let (uring_op, payload) =
+            <crate::op::Wakeup as IntoPlatformOp<UringDriver>>::into_kernel_and_payload(op);
 
         let state = UringOpState {
             lifecycle: OpLifecycle::Pending, // Will change to InFlight below
@@ -302,6 +314,7 @@ impl UringDriver {
         }) = result
         {
             self.waker_token = Some(user_data);
+            self.waker_payload = Some(payload);
             let slot = &self.ops.shared.slots[user_data];
 
             // Put op into slot
@@ -379,22 +392,24 @@ impl UringDriver {
             let elapsed = start.elapsed();
             self.wheel.advance(elapsed, &mut self.timer_buffer);
 
-            for &user_data in &self.timer_buffer {
+            let timer_buffer = std::mem::take(&mut self.timer_buffer);
+            for user_data in timer_buffer {
                 if let Some(entry) = self.ops.get_mut(user_data)
                     && matches!(entry.platform_data.lifecycle, OpLifecycle::InFlight)
                 {
                     entry.platform_data.lifecycle = OpLifecycle::Completed;
                     entry.platform_data.timer_id = None;
 
-                    let slot = &self.ops.shared.slots[user_data];
-                    unsafe {
-                        *slot.result.get() = Some(Ok(0));
-                    }
-                    slot.state.store(STATE_COMPLETED, Ordering::Release);
-                    slot.waker.wake();
+                    let generation = {
+                        let slot = &self.ops.shared.slots[user_data];
+                        let generation = slot.generation.load(Ordering::Acquire);
+                        let _ = unsafe { (*slot.op.get()).take() };
+                        generation
+                    };
+                    self.push_completion_event(user_data, generation, 0, 0);
+                    self.ops.remove(user_data);
                 }
             }
-            self.timer_buffer.clear();
         }
 
         self.process_completions_internal();
@@ -406,6 +421,7 @@ impl UringDriver {
     pub(crate) fn process_completions_internal(&mut self) {
         let mut needs_waker_resubmit = false;
 
+        let mut pending_events: Vec<(usize, u32, i32, u32)> = Vec::new();
         {
             let mut cqe_kicker = self.ring.completion();
             cqe_kicker.sync();
@@ -433,12 +449,12 @@ impl UringDriver {
 
                     // Don't touch op if Cancelled
                     if matches!(op_state.lifecycle, OpLifecycle::Cancelled) {
-                        // Driver owns Op, must drop it.
-                        // Future has already dropped interest.
+                        let generation = slot.generation.load(Ordering::Acquire);
+                        pending_events.push((user_data, generation, cqe.result(), cqe.flags()));
                         unsafe {
-                            *slot.op.get() = None; // Drop op
+                            *slot.op.get() = None;
                         }
-                        self.ops.remove(user_data); // Free index
+                        self.ops.remove(user_data);
                     } else {
                         // Standard completion
                         let res_val = cqe.result();
@@ -457,17 +473,17 @@ impl UringDriver {
                         };
 
                         op_state.lifecycle = OpLifecycle::Completed;
-
-                        unsafe {
-                            *slot.result.get() = Some(final_res);
-                        }
-                        slot.state.store(STATE_COMPLETED, Ordering::Release);
-                        slot.waker.wake();
-
-                        // NOTE: We DO NOT remove op here. Future will do it.
+                        let generation = slot.generation.load(Ordering::Acquire);
+                        let res_code = io_result_to_event_res(&final_res);
+                        pending_events.push((user_data, generation, res_code, cqe.flags()));
+                        let _ = unsafe { (*slot.op.get()).take() };
+                        self.ops.remove(user_data);
                     }
                 }
             }
+        }
+        for (user_data, generation, res_code, flags) in pending_events {
+            self.push_completion_event(user_data, generation, res_code, flags);
         }
 
         if needs_waker_resubmit {
@@ -476,6 +492,7 @@ impl UringDriver {
                 // Remove existing waker op/slot
                 self.ops.remove(token);
             }
+            self.waker_payload = None;
             self.submit_waker();
             self.flush_backlog();
         }
@@ -666,15 +683,14 @@ impl UringDriver {
             Some(OpLifecycle::Pending) => {
                 if let Some(op) = self.ops.get_mut(user_data) {
                     op.platform_data.lifecycle = OpLifecycle::Cancelled;
-                    // Direct completion with error? Or just drop?
-                    // Usually we should wake the future.
-                    let slot = &self.ops.shared.slots[user_data];
-                    unsafe {
-                        *slot.result.get() =
-                            Some(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-                    }
-                    slot.state.store(STATE_COMPLETED, Ordering::Release);
-                    slot.waker.wake();
+                    let generation = {
+                        let slot = &self.ops.shared.slots[user_data];
+                        let generation = slot.generation.load(Ordering::Acquire);
+                        let _ = unsafe { (*slot.op.get()).take() };
+                        generation
+                    };
+                    self.push_completion_event(user_data, generation, -libc::ECANCELED, 0);
+                    self.ops.remove(user_data);
                 }
             }
             Some(OpLifecycle::InFlight) => {
@@ -685,13 +701,14 @@ impl UringDriver {
                 if let Some(tid) = timer_id {
                     self.wheel.cancel(tid);
                     if self.ops.get_mut(user_data).is_some() {
-                        let slot = &self.ops.shared.slots[user_data];
-                        unsafe {
-                            *slot.result.get() =
-                                Some(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-                        }
-                        slot.state.store(STATE_COMPLETED, Ordering::Release);
-                        slot.waker.wake();
+                        let generation = {
+                            let slot = &self.ops.shared.slots[user_data];
+                            let generation = slot.generation.load(Ordering::Acquire);
+                            let _ = unsafe { (*slot.op.get()).take() };
+                            generation
+                        };
+                        self.push_completion_event(user_data, generation, -libc::ECANCELED, 0);
+                        self.ops.remove(user_data);
                     }
                     return;
                 }
@@ -707,6 +724,34 @@ impl UringDriver {
                 // Cancellation is async, we wait for CQE to clean up.
             }
         }
+    }
+}
+
+#[inline]
+fn io_result_to_event_res(res: &io::Result<usize>) -> i32 {
+    match res {
+        Ok(v) => (*v).min(i32::MAX as usize) as i32,
+        Err(e) => -e.raw_os_error().unwrap_or(1).abs(),
+    }
+}
+
+impl UringDriver {
+    #[inline]
+    pub(crate) fn push_completion_event(
+        &mut self,
+        user_data: usize,
+        generation: u32,
+        res: i32,
+        flags: u32,
+    ) {
+        let token = encode_completion_token(user_data, generation);
+        let event = CompletionEvent {
+            user_data: token,
+            res,
+            flags,
+        };
+        self.completion_table.record_completion(event);
+        self.completion_events.push(event);
     }
 }
 

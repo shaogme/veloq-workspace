@@ -8,8 +8,6 @@
 //! - `io/driver/iocp/op.rs` for Windows IOCP
 
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::{
     future::Future,
     pin::Pin,
@@ -22,8 +20,10 @@ use veloq_buf::FixedBuf;
 
 use crate::RawHandle;
 use crate::SockAddrStorage;
-use crate::driver::slot::{STATE_COMPLETED, STATE_CONSUMED, SlotTable};
-use crate::driver::{Driver, PlatformDriver};
+use crate::driver::{
+    Driver, PlatformDriver, SharedCompletionTable, SubmitBinder, encode_completion_token,
+    event_res_to_io,
+};
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,11 +119,40 @@ pub trait OpLifecycle: Sized {
 
 /// Trait to convert a user-facing operation to a platform-specific driver operation.
 pub trait IntoPlatformOp<D: Driver>: Sized + std::marker::Send {
-    /// Convert this operation into the platform driver's operation type.
-    fn into_platform_op(self) -> D::Op;
+    /// User payload detached from kernel op.
+    type UserPayload: std::marker::Send + 'static;
 
-    /// Convert from the platform driver's operation type back to this type.
-    fn from_platform_op(op: D::Op) -> Self;
+    /// Split into kernel-facing op and user payload.
+    fn into_kernel_and_payload(self) -> (D::Op, Self::UserPayload);
+
+    /// Rebuild the user operation from payload.
+    fn from_user_payload(payload: Self::UserPayload) -> Self;
+
+    /// Compatibility helper for transitional callsites.
+    #[inline]
+    fn from_kernel_and_payload(op: D::Op, payload: Self::UserPayload) -> Self {
+        drop(op);
+        Self::from_user_payload(payload)
+    }
+
+    /// Compatibility helper for legacy callsites.
+    #[inline]
+    fn into_platform_op(self) -> D::Op
+    where
+        Self::UserPayload: Default,
+    {
+        self.into_kernel_and_payload().0
+    }
+
+    /// Compatibility helper for legacy callsites.
+    #[inline]
+    fn from_platform_op(op: D::Op) -> Self
+    where
+        Self::UserPayload: Default,
+    {
+        drop(op);
+        Self::from_user_payload(Default::default())
+    }
 }
 
 // ============================================================================
@@ -158,36 +187,46 @@ impl<T> Op<T> {
         // Try reserve first
         match driver.reserve_op() {
             Ok((user_data, generation)) => {
-                let mut op_platform = Some(data.into_platform_op());
-                let table = driver.slot_table();
+                let (kernel_op, payload) = data.into_kernel_and_payload();
+                let mut payload = Some(payload);
+                let mut op_platform = Some(kernel_op);
+                let token = encode_completion_token(user_data, generation);
+                let completion_table = driver.completion_table();
 
-                if let Err(e) = driver.submit(user_data, &mut op_platform) {
+                if let Err(e) = driver
+                    .submit(user_data, &mut op_platform, SubmitBinder::new())
+                    .into_inner()
+                {
                     trace!("Submit failed: {}", e);
                     // Submit failed synchronously.
                     // If the platform op is returned, propagate immediate failure with payload.
                     // Otherwise, fall back to slot-monitoring path and let generation check resolve.
                     if let Some(op) = op_platform.take() {
+                        let payload = payload
+                            .take()
+                            .expect("Payload missing while recovering submit failure");
+                        drop(op);
                         DetachedOp {
-                            table: None,
-                            index: 0,
-                            expected_gen: 0,
-                            immediate_failure: Some((e, T::from_platform_op(op))),
+                            completion_table: None,
+                            token: 0,
+                            payload: None,
+                            immediate_failure: Some((e, T::from_user_payload(payload))),
                             _phantom: std::marker::PhantomData,
                         }
                     } else {
                         DetachedOp {
-                            table: Some(table),
-                            index: user_data,
-                            expected_gen: generation,
+                            completion_table: Some(completion_table),
+                            token,
+                            payload,
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
                         }
                     }
                 } else {
                     DetachedOp {
-                        table: Some(table),
-                        index: user_data,
-                        expected_gen: generation,
+                        completion_table: Some(completion_table),
+                        token,
+                        payload,
                         immediate_failure: None,
                         _phantom: std::marker::PhantomData,
                     }
@@ -197,9 +236,9 @@ impl<T> Op<T> {
                 // Reservation failed (e.g. full).
                 // Return DetachedOp with immediate failure.
                 DetachedOp {
-                    table: None, // No table needed
-                    index: 0,    // Dummy
-                    expected_gen: 0,
+                    completion_table: None,
+                    token: 0,
+                    payload: None,
                     immediate_failure: Some((e, data)),
                     _phantom: std::marker::PhantomData,
                 }
@@ -222,15 +261,15 @@ impl<T> Op<T> {
 // ============================================================================
 
 /// A Future representing a detached operation.
-/// It holds a reference to the Shared Slot Table and polls the slot directly.
+/// It polls a shared completion event queue by token.
 pub struct DetachedOp<T, D>
 where
     D: Driver,
     T: IntoPlatformOp<D>,
 {
-    table: Option<Arc<SlotTable<D::Op>>>,
-    index: usize,
-    expected_gen: u32,
+    completion_table: Option<SharedCompletionTable>,
+    token: u64,
+    payload: Option<T::UserPayload>,
     immediate_failure: Option<(std::io::Error, T)>,
     _phantom: std::marker::PhantomData<T>,
 }
@@ -260,71 +299,23 @@ where
         }
 
         let table = this
-            .table
+            .completion_table
             .as_ref()
-            .expect("DetachedOp missing table but no immediate_failure");
-        let slot = &table.slots[this.index];
-
-        // 1. Generation check: Ensure slot hasn't been recycled for a new operation.
-        let generation = slot.generation.load(Ordering::Acquire);
-        if generation != this.expected_gen {
-            return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                "Op slot recycled (generation mismatch)",
-            )));
+            .expect("DetachedOp missing completion_table but no immediate_failure");
+        if let Some(event) = table.try_take(this.token) {
+            let payload = this
+                .payload
+                .take()
+                .expect("DetachedOp payload missing on completion");
+            let data = T::from_user_payload(payload);
+            return Poll::Ready(OpResult::Completed(event_res_to_io(event.res), data));
         }
 
-        // 2. Check for completion state
-        let state = slot.state.load(Ordering::Acquire);
-        if state == STATE_COMPLETED {
-            // Completed. Extract result and op.
-            let res = unsafe { (*slot.result.get()).take() };
-            let op_platform = unsafe { (*slot.op.get()).take() };
-            let (res, op_platform) = match (res, op_platform) {
-                (Some(res), Some(op_platform)) => (res, op_platform),
-                _ => {
-                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                        "Detached slot completed with missing payload",
-                    )));
-                }
-            };
-
-            // Convert platform op back to user op
-            let data = T::from_platform_op(op_platform);
-
-            // Mark slot as CONSUMED so it can be reclaimed
-            slot.state.store(STATE_CONSUMED, Ordering::Release);
-
-            // NOTE: The Slot index remains "occupied" in the Registry until someone frees it.
-            // In the detached model, we need a mechanism to recycle the index.
-            // We push the index to the "remote free queue" which sits in the SlotTable.
-            table.push_free(this.index);
-
-            Poll::Ready(OpResult::Completed(res, data))
-        } else {
-            // 3. Register Waker
-            slot.waker.register(cx.waker());
-
-            // Double check state
-            let state = slot.state.load(Ordering::Acquire);
-            if state == STATE_COMPLETED {
-                let res = unsafe { (*slot.result.get()).take() };
-                let op_platform = unsafe { (*slot.op.get()).take() };
-                let (res, op_platform) = match (res, op_platform) {
-                    (Some(res), Some(op_platform)) => (res, op_platform),
-                    _ => {
-                        return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                            "Detached slot completed with missing payload",
-                        )));
-                    }
-                };
-                let data = T::from_platform_op(op_platform);
-                slot.state.store(STATE_CONSUMED, Ordering::Release);
-                table.push_free(this.index);
-                Poll::Ready(OpResult::Completed(res, data))
-            } else {
-                Poll::Pending
-            }
+        if let Some(table) = this.completion_table.as_ref() {
+            table.register_waker(this.token, cx.waker());
         }
+
+        Poll::Pending
     }
 }
 
@@ -342,10 +333,10 @@ enum State {
 pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     state: State,
     data: Option<T>,
+    payload: Option<T::UserPayload>,
     driver: Rc<RefCell<PlatformDriver>>,
-    table: Option<Arc<SlotTable<<PlatformDriver as Driver>::Op>>>,
     user_data: usize,
-    expected_gen: u32,
+    token: u64,
 }
 
 impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
@@ -354,10 +345,10 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
         Self {
             state: State::Defined,
             data: Some(data),
+            payload: None,
             driver,
-            table: None,
             user_data: 0,
-            expected_gen: 0,
+            token: 0,
         }
     }
 }
@@ -373,7 +364,8 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
 
             // Submit to driver
             let data = op.data.take().expect("Op started without data");
-            let driver_op = data.into_platform_op();
+            let (driver_op, payload) = data.into_kernel_and_payload();
+            op.payload = Some(payload);
 
             // reserve_op now returns generation, but we ignore it for LocalOp
             // because LocalOp lifetime is tied to the driver via Rc/RefCell.
@@ -381,21 +373,31 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
                 Ok(v) => v,
                 Err(e) => {
                     // Failed to reserve
-                    return Poll::Ready(OpResult::Completed(
-                        Err(e),
-                        T::from_platform_op(driver_op),
-                    ));
+                    let payload = op
+                        .payload
+                        .take()
+                        .expect("Payload missing on reserve failure");
+                    drop(driver_op);
+                    return Poll::Ready(OpResult::Completed(Err(e), T::from_user_payload(payload)));
                 }
             };
             op.user_data = user_data;
-            op.expected_gen = generation;
-            op.table = Some(driver.slot_table());
+            op.token = encode_completion_token(user_data, generation);
 
             // Submit to driver.
             let mut driver_op_opt = Some(driver_op);
-            if let Err(e) = driver.submit(user_data, &mut driver_op_opt) {
-                let val = driver_op_opt.unwrap();
-                let data = T::from_platform_op(val);
+            if let Err(e) = driver
+                .submit(user_data, &mut driver_op_opt, SubmitBinder::new())
+                .into_inner()
+            {
+                if let Some(val) = driver_op_opt.take() {
+                    drop(val);
+                }
+                let payload = op
+                    .payload
+                    .take()
+                    .expect("Payload missing while recovering submit failure");
+                let data = T::from_user_payload(payload);
                 return Poll::Ready(OpResult::Completed(Err(e), data));
             }
 
@@ -403,28 +405,15 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
         }
 
         if let State::Submitted = op.state {
-            if let Some(table) = op.table.as_ref() {
-                let slot = &table.slots[op.user_data];
-                let generation = slot.generation.load(Ordering::Acquire);
-                if generation != op.expected_gen {
-                    op.state = State::Completed;
-                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                        "Op slot recycled (generation mismatch)",
-                    )));
-                }
-            }
-
             let mut driver = op.driver.borrow_mut();
-
-            let mut op_out = None;
-            match driver.poll_op(op.user_data, cx, &mut op_out) {
-                Poll::Ready(res) => {
-                    op.state = State::Completed;
-                    let driver_op = op_out.expect("Op missing on complete");
-                    let data = T::from_platform_op(driver_op);
-                    Poll::Ready(OpResult::Completed(res, data))
-                }
-                Poll::Pending => Poll::Pending,
+            if let Some(event) = driver.try_take_completion(op.token) {
+                op.state = State::Completed;
+                let payload = op.payload.take().expect("Payload missing on completion");
+                let data = T::from_user_payload(payload);
+                Poll::Ready(OpResult::Completed(event_res_to_io(event.res), data))
+            } else {
+                driver.register_completion_waker(op.token, cx.waker());
+                Poll::Pending
             }
         } else {
             panic!("Polled after completion");

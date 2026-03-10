@@ -1,9 +1,9 @@
 //! io_uring Platform-Specific Operation Definitions
 //!
 //! This module defines:
-//! - `UringOp`: The Type-Erased operation struct using Unions and VTables
+//! - `UringKernelOp`: The Type-Erased kernel operation struct using Unions and VTables
 //! - `OpVTable`: The virtual table for dynamic dispatch without enums
-//! - `IntoPlatformOp` implementations using blind casting
+//! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
 use crate::driver::PlatformOp;
 use crate::driver::uring::UringDriver;
@@ -21,12 +21,12 @@ use std::time::Duration;
 // VTable Definition
 // ============================================================================
 
-pub type MakeSqeFn = unsafe fn(op: &mut UringOp, driver: &mut UringDriver) -> squeue::Entry;
-pub type OnCompleteFn = unsafe fn(op: &mut UringOp, result: i32) -> io::Result<usize>;
-pub type DropFn = unsafe fn(op: &mut UringOp);
-pub type GetFdFn = unsafe fn(op: &UringOp) -> Option<IoFd>;
-pub type GetTimeoutFn = unsafe fn(op: &UringOp) -> Option<Duration>;
-pub type ResolveChunksFn = unsafe fn(op: &UringOp, chunks: &mut [u16]) -> usize;
+pub type MakeSqeFn = unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> squeue::Entry;
+pub type OnCompleteFn = unsafe fn(op: &mut UringKernelOp, result: i32) -> io::Result<usize>;
+pub type DropFn = unsafe fn(op: &mut UringKernelOp);
+pub type GetFdFn = unsafe fn(op: &UringKernelOp) -> Option<IoFd>;
+pub type GetTimeoutFn = unsafe fn(op: &UringKernelOp) -> Option<Duration>;
+pub type ResolveChunksFn = unsafe fn(op: &UringKernelOp, chunks: &mut [u16]) -> usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmissionStrategy {
@@ -49,13 +49,13 @@ pub struct OpVTable {
 }
 
 // ============================================================================
-// UringOp Struct & Union (Type-Erased)
+// UringKernelOp Struct & Union (Type-Erased)
 // ============================================================================
 
 use std::ptr::NonNull;
 
 #[repr(C)]
-pub struct UringOp {
+pub struct UringKernelOp {
     /// Virtual Table for dynamic dispatch
     pub vtable: NonNull<OpVTable>,
 
@@ -63,15 +63,15 @@ pub struct UringOp {
     pub payload: UringOpPayload,
 }
 
-impl PlatformOp for UringOp {}
+impl PlatformOp for UringKernelOp {}
 
-impl UringOp {
+impl UringKernelOp {
     pub fn get_fd(&self) -> Option<IoFd> {
         unsafe { (self.vtable.as_ref().get_fd)(self) }
     }
 }
 
-impl Drop for UringOp {
+impl Drop for UringKernelOp {
     fn drop(&mut self) {
         unsafe { (self.vtable.as_ref().drop)(self) };
     }
@@ -109,7 +109,9 @@ macro_rules! define_uring_ops {
 
         $(
             impl IntoPlatformOp<UringDriver> for $OpType {
-                fn into_platform_op(self) -> UringOp {
+                type UserPayload = Box<$OpType>;
+
+                fn into_kernel_and_payload(self) -> (UringKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
                         make_sqe: $make_sqe,
                         on_complete: $complete,
@@ -120,28 +122,27 @@ macro_rules! define_uring_ops {
                         resolve_chunks: define_uring_ops!(@resolve_chunks $($resolve_chunks)?),
                     };
 
-                    let payload = define_uring_ops!(@construct self, $($construct)?, $OpType $(, $Payload)?);
+                    let mut user = Box::new(self);
+                    let user_ptr = std::ptr::NonNull::from(user.as_mut());
+                    let payload = define_uring_ops!(@construct user_ptr, $($construct)?, $OpType $(, $Payload)?);
 
-                    UringOp {
+                    let op = UringKernelOp {
                         vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
                         payload: UringOpPayload {
                             $field: ManuallyDrop::new(payload),
                         },
-                    }
+                    };
+                    (op, user)
                 }
 
-                fn from_platform_op(op: UringOp) -> Self {
-                    let op = ManuallyDrop::new(op);
-                    let payload = unsafe {
-                        ManuallyDrop::into_inner(std::ptr::read(&op.payload.$field))
-                    };
+                fn from_user_payload(payload: Self::UserPayload) -> Self {
                     define_uring_ops!(@destruct payload, $($destruct)?)
                 }
             }
         )+
     };
 
-    (@payload_type $OpType:ty) => { $OpType };
+    (@payload_type $OpType:ty) => { KernelRef<$OpType> };
     (@payload_type $OpType:ty, $Payload:ty) => { $Payload };
 
     // Default strategy: SubmitSqe
@@ -156,27 +157,31 @@ macro_rules! define_uring_ops {
     (@resolve_chunks ) => { submit::resolve_chunks_none };
     (@resolve_chunks $func:expr) => { $func };
 
-    // Default construct: return self
-    (@construct $self:expr, , $OpType:ty) => { $self };
+    // Default construct: keep only a pointer to user payload
+    (@construct $user_ptr:expr, , $OpType:ty) => { KernelRef { user: $user_ptr } };
     // Custom construct
-    (@construct $self:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($self) };
+    (@construct $user_ptr:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user_ptr) };
 
-    // Default destruct: return payload (assumes payload is OpType)
-    (@destruct $payload:expr, ) => { $payload };
+    // Default destruct: return user payload
+    (@destruct $user_payload:expr, ) => { *$user_payload };
     // Custom destruct
-    (@destruct $payload:expr, $destruct:expr) => { ($destruct)($payload) };
+    (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
 }
 
 // ============================================================================
 // Payload Structures for Complex Ops
 // ============================================================================
 
+pub struct KernelRef<T> {
+    pub user: NonNull<T>,
+}
+
 pub struct AcceptPayload {
-    pub op: Accept,
+    pub user: NonNull<Accept>,
 }
 
 pub struct SendToPayload {
-    pub op: SendTo,
+    pub user: NonNull<SendTo>,
     pub msg_name: libc::sockaddr_storage,
     pub msg_namelen: libc::socklen_t,
     pub iovec: [libc::iovec; 1],
@@ -184,7 +189,7 @@ pub struct SendToPayload {
 }
 
 pub struct UdpRecvStreamPayload {
-    pub op: UdpRecvStream,
+    pub user: NonNull<UdpRecvStream>,
     pub msg_name: libc::sockaddr_storage,
     pub msg_namelen: libc::socklen_t,
     pub iovec: [libc::iovec; 1],
@@ -192,18 +197,20 @@ pub struct UdpRecvStreamPayload {
 }
 
 pub struct OpenPayload {
-    pub op: Open,
+    pub user: NonNull<Open>,
 }
 
 pub struct WakeupPayload {
-    pub op: Wakeup,
+    pub user: NonNull<Wakeup>,
     pub buf: [u8; 8],
 }
 
 pub struct TimeoutPayload {
-    pub op: Timeout,
+    pub user: NonNull<Timeout>,
     pub ts: [i64; 2],
 }
+
+pub type UringOp = UringKernelOp;
 
 // ============================================================================
 // Op Definitions
@@ -283,8 +290,8 @@ define_uring_ops! {
         on_complete: submit::on_complete_accept,
         drop: submit::drop_accept,
         get_fd: submit::get_fd_accept,
-        construct: |op| AcceptPayload { op },
-        destruct: |p: AcceptPayload| p.op,
+        construct: |user| AcceptPayload { user },
+        destruct: |user: Box<Accept>| *user,
     }, // Kernel 5.5+
     SendTo {
         field: send_to,
@@ -293,17 +300,18 @@ define_uring_ops! {
         on_complete: submit::on_complete_send_to,
         drop: submit::drop_send_to,
         get_fd: submit::get_fd_send_to,
-        construct: |op: SendTo| {
+        construct: |user: std::ptr::NonNull<SendTo>| {
+            let op = unsafe { user.as_ref() };
             let (msg_name, msg_namelen) = crate::socket_addr_to_storage(op.addr);
             SendToPayload {
-                op,
+                user,
                 msg_name,
                 msg_namelen: msg_namelen as libc::socklen_t,
                 iovec: [unsafe { std::mem::zeroed() }],
                 msghdr: unsafe { std::mem::zeroed() },
             }
         },
-        destruct: |p: SendToPayload| p.op,
+        destruct: |user: Box<SendTo>| *user,
     }, // Kernel 5.1+ (via SendMsg)
     UdpRecvStream {
         field: udp_recv_stream,
@@ -312,14 +320,14 @@ define_uring_ops! {
         on_complete: submit::on_complete_udp_recv_stream,
         drop: submit::drop_udp_recv_stream,
         get_fd: submit::get_fd_udp_recv_stream,
-        construct: |op| UdpRecvStreamPayload {
-            op,
+        construct: |user| UdpRecvStreamPayload {
+            user,
             msg_name: unsafe { std::mem::zeroed() },
             msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
         },
-        destruct: |p: UdpRecvStreamPayload| p.op,
+        destruct: |user: Box<UdpRecvStream>| *user,
     }, // Kernel 5.1+ (via RecvMsg)
     UdpRefill {
         field: udp_refill,
@@ -335,8 +343,8 @@ define_uring_ops! {
         on_complete: submit::on_complete_open,
         drop: submit::drop_open,
         get_fd: submit::get_fd_open,
-        construct: |op| OpenPayload { op },
-        destruct: |p: OpenPayload| p.op,
+        construct: |user| OpenPayload { user },
+        destruct: |user: Box<Open>| *user,
     }, // Kernel 5.6+ (via OpenAt)
     Wakeup {
         field: wakeup,
@@ -345,8 +353,8 @@ define_uring_ops! {
         on_complete: submit::on_complete_wakeup,
         drop: submit::drop_wakeup,
         get_fd: submit::get_fd_wakeup,
-        construct: |op| WakeupPayload { op, buf: [0; 8] },
-        destruct: |p: WakeupPayload| p.op,
+        construct: |user| WakeupPayload { user, buf: [0; 8] },
+        destruct: |user: Box<Wakeup>| *user,
     }, // Kernel 5.6+ (via Read)
     Timeout {
         field: timeout,
@@ -357,7 +365,7 @@ define_uring_ops! {
         get_fd: submit::get_fd_timeout,
         strategy: SubmissionStrategy::SoftwareTimer,
         get_timeout: submit::get_timeout_timeout,
-        construct: |op| TimeoutPayload { op, ts: [0; 2] },
-        destruct: |p: TimeoutPayload| p.op,
+        construct: |user| TimeoutPayload { user, ts: [0; 2] },
+        destruct: |user: Box<Timeout>| *user,
     }, // Kernel 5.4+
 }

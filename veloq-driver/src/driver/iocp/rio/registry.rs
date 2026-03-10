@@ -104,7 +104,6 @@ impl RioRegistry {
 
     pub fn prepare_data_submission(
         &mut self,
-        _target: (IoFd, HANDLE),
         buf: &FixedBuf,
         len: u32,
         env: RioEnv<'_>,

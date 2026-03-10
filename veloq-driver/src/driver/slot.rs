@@ -1,7 +1,6 @@
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
-use veloq_atomic_waker::AtomicWaker;
 
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -9,9 +8,6 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 // State definitions
 pub const STATE_EMPTY: u8 = 0;
 pub const STATE_SUBMITTED: u8 = 1; // Submitted to kernel (Driver owns Op)
-pub const STATE_COMPLETED: u8 = 2; // Kernel completed, result written (Future owns Op)
-pub const STATE_CONSUMED: u8 = 3; // Future consumed result, waiting for recycle
-// pub const STATE_CANCELLED: u8 = 4; // Future dropped, requesting cancellation
 
 #[repr(C)]
 #[cfg(windows)]
@@ -45,12 +41,6 @@ pub struct Slot<Op> {
     // Intrusive free list pointer (replaces remote_free_queue)
     pub next_free: AtomicUsize,
 
-    // Synchronization primitive
-    pub waker: AtomicWaker, // Consumer waker
-
-    // Result storage (UnsafeCell safe to access only in COMPLETED/CONSUMED state)
-    pub result: UnsafeCell<Option<std::io::Result<usize>>>,
-
     // Resource storage
     // - SUBMITTED: Driver reads Op pointer to pass to kernel
     // - COMPLETED: Future takes Op
@@ -78,8 +68,6 @@ impl<Op> Slot<Op> {
             generation: AtomicU32::new(0),
             state: AtomicU8::new(STATE_EMPTY),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
-            waker: AtomicWaker::new(),
-            result: UnsafeCell::new(None),
             op: UnsafeCell::new(None),
             #[cfg(windows)]
             overlapped: UnsafeCell::new(OverlappedEntry {
@@ -94,8 +82,6 @@ impl<Op> Slot<Op> {
     pub fn reset(&self, generation: u32) {
         self.state.store(STATE_EMPTY, Ordering::Release);
         self.generation.store(generation, Ordering::Release);
-        // Waker resets itself on register
-        // Result and Op are logically empty/invalid
         #[cfg(windows)]
         unsafe {
             let entry = OverlappedEntry {

@@ -39,7 +39,9 @@ macro_rules! impl_lifecycle {
         }
 
         pub(crate) unsafe fn $get_fd_fn(op: &IocpOp) -> Option<IoFd> {
-            unsafe { Some(op.payload.$variant.fd) }
+            let k = unsafe { &*op.payload.$variant };
+            let u = unsafe { k.user.as_ref() };
+            Some(u.fd)
         }
     };
     ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, nested_fd) => {
@@ -50,7 +52,9 @@ macro_rules! impl_lifecycle {
         }
 
         pub(crate) unsafe fn $get_fd_fn(op: &IocpOp) -> Option<IoFd> {
-            unsafe { Some(op.payload.$variant.op.fd) }
+            let k = unsafe { &*op.payload.$variant };
+            let u = unsafe { k.user.as_ref() };
+            Some(u.fd)
         }
     };
     ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, no_fd) => {
@@ -72,7 +76,8 @@ macro_rules! impl_blocking_offload {
             op: &mut IocpOp,
             ctx: &mut SubmitContext,
         ) -> io::Result<SubmissionResult> {
-            let payload = unsafe { &*op.payload.$variant };
+            let kernel = unsafe { &*op.payload.$variant };
+            let payload = unsafe { kernel.user.as_ref() };
             let handle = resolve_fd(payload.fd, ctx.registered_files)?;
 
             let entry = &op.header;
@@ -157,7 +162,8 @@ macro_rules! submit_io_op {
             op: &mut IocpOp,
             ctx: &mut SubmitContext,
         ) -> io::Result<SubmissionResult> {
-            let val = unsafe { &mut *op.payload.$field };
+            let kernel = unsafe { &mut *op.payload.$field };
+            let val = unsafe { kernel.user.as_mut() };
             // Using ctx.overlapped (Slot Overlapped)
             let overlapped = unsafe { &mut *ctx.overlapped };
 
@@ -241,7 +247,8 @@ pub(crate) unsafe fn submit_recv(
     op: &mut IocpOp,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let val = unsafe { &mut *op.payload.recv };
+    let kernel = unsafe { &mut *op.payload.recv };
+    let val = unsafe { kernel.user.as_mut() };
 
     let overlapped = unsafe { &mut *ctx.overlapped };
     overlapped.Anonymous.Anonymous.Offset = 0;
@@ -273,7 +280,8 @@ pub(crate) unsafe fn submit_send(
     op: &mut IocpOp,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let val = unsafe { &mut *op.payload.send };
+    let kernel = unsafe { &mut *op.payload.send };
+    let val = unsafe { kernel.user.as_mut() };
 
     let overlapped = unsafe { &mut *ctx.overlapped };
     overlapped.Anonymous.Anonymous.Offset = 0;
@@ -305,7 +313,8 @@ pub(crate) unsafe fn submit_connect(
     op: &mut IocpOp,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let connect_op = unsafe { &mut *op.payload.connect };
+    let kernel = unsafe { &mut *op.payload.connect };
+    let connect_op = unsafe { kernel.user.as_mut() };
     let handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
     ensure_iocp_association(
         handle,
@@ -394,7 +403,8 @@ pub(crate) unsafe fn on_complete_connect(
     result: usize,
     _ext: &Extensions,
 ) -> io::Result<usize> {
-    let connect_op = unsafe { &*op.payload.connect };
+    let kernel = unsafe { &*op.payload.connect };
+    let connect_op = unsafe { kernel.user.as_ref() };
     if let Some(fd) = connect_op.fd.raw() {
         let ret = unsafe {
             setsockopt(
@@ -423,8 +433,9 @@ pub(crate) unsafe fn submit_accept(
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &mut *op.payload.accept };
-    let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
-    let accept_socket = payload.op.accept_socket;
+    let user = unsafe { payload.user.as_mut() };
+    let handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let accept_socket = user.accept_socket;
     let accept_socket_raw = accept_socket.handle as SOCKET;
 
     ensure_iocp_association(
@@ -490,8 +501,9 @@ pub(crate) unsafe fn on_complete_accept(
     ext: &Extensions,
 ) -> io::Result<usize> {
     let payload = unsafe { &mut *op.payload.accept };
-    let accept_socket = payload.op.accept_socket;
-    let listen_handle = payload.op.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
+    let user = unsafe { payload.user.as_mut() };
+    let accept_socket = user.accept_socket;
+    let listen_handle = user.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
     let listen_socket = listen_handle.handle as SOCKET;
     let accept_socket_raw = accept_socket.handle as SOCKET;
 
@@ -544,14 +556,14 @@ pub(crate) unsafe fn on_complete_accept(
             let addr_in = unsafe { &*(remote_sockaddr as *const SOCKADDR_IN) };
             let ip = Ipv4Addr::from(unsafe { addr_in.sin_addr.S_un.S_addr.to_ne_bytes() });
             let port = u16::from_be(addr_in.sin_port);
-            payload.op.remote_addr = Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+            user.remote_addr = Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
         } else if family == AF_INET6 {
             let addr_in6 = unsafe { &*(remote_sockaddr as *const SOCKADDR_IN6) };
             let ip = Ipv6Addr::from(unsafe { addr_in6.sin6_addr.u.Byte });
             let port = u16::from_be(addr_in6.sin6_port);
             let flowinfo = addr_in6.sin6_flowinfo;
             let scope_id = unsafe { addr_in6.Anonymous.sin6_scope_id };
-            payload.op.remote_addr = Some(SocketAddr::V6(SocketAddrV6::new(
+            user.remote_addr = Some(SocketAddr::V6(SocketAddrV6::new(
                 ip, port, flowinfo, scope_id,
             )));
         }
@@ -570,14 +582,15 @@ pub(crate) unsafe fn submit_send_to(
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &mut *op.payload.send_to };
-    let handle = resolve_fd(payload.op.fd, ctx.registered_files)?;
+    let user = unsafe { payload.user.as_ref() };
+    let handle = resolve_fd(user.fd, ctx.registered_files)?;
 
     // RIO path is mandatory for socket send_to.
     let page_idx = op.header.user_data / ctx.slots_per_page;
     let args = crate::driver::iocp::rio::RioSendToArgs {
-        fd: payload.op.fd,
+        fd: user.fd,
         handle,
-        buf: &payload.op.buf,
+        buf: &user.buf,
         addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
         addr_len: payload.addr_len,
         overlapped: ctx.overlapped,
@@ -591,7 +604,7 @@ pub(crate) unsafe fn submit_send_to(
                 e,
                 format!(
                     "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
-                    payload.op.fd, op.header.user_data, op.header.generation, page_idx
+                    user.fd, op.header.user_data, op.header.generation, page_idx
                 ),
             )
         })
@@ -608,7 +621,8 @@ pub(crate) unsafe fn submit_udp_recv_stream(
     op: &mut IocpOp,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let val = unsafe { &mut *op.payload.udp_recv_stream };
+    let kernel = unsafe { &mut *op.payload.udp_recv_stream };
+    let val = unsafe { kernel.user.as_mut() };
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
     let args = crate::driver::iocp::rio::RioUdpStreamArgs {
         fd: val.fd,
@@ -636,7 +650,8 @@ pub(crate) unsafe fn on_complete_udp_recv_stream(
     result: usize,
     _ext: &Extensions,
 ) -> io::Result<usize> {
-    let val = unsafe { &mut *op.payload.udp_recv_stream };
+    let kernel = unsafe { &mut *op.payload.udp_recv_stream };
+    let val = unsafe { kernel.user.as_mut() };
     if result == 0
         && let Some(datagram) = val.result.as_ref()
     {
@@ -656,7 +671,8 @@ pub(crate) unsafe fn submit_udp_refill(
     op: &mut IocpOp,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let val = unsafe { &mut *op.payload.udp_refill };
+    let kernel = unsafe { &mut *op.payload.udp_refill };
+    let val = unsafe { kernel.user.as_mut() };
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
     if let Some(buf) = val.buf.take() {
         ctx.rio
@@ -679,7 +695,8 @@ pub(crate) unsafe fn submit_open(
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     let payload = unsafe { &*op.payload.open };
-    let path_ptr = payload.op.path.as_slice().as_ptr() as usize;
+    let user = unsafe { payload.user.as_ref() };
+    let path_ptr = user.path.as_slice().as_ptr() as usize;
 
     let entry = &op.header;
     let user_data = entry.user_data;
@@ -692,8 +709,8 @@ pub(crate) unsafe fn submit_open(
 
     let op = BlockingOps::Open {
         path_ptr,
-        flags: payload.op.flags,
-        mode: payload.op.mode,
+        flags: user.flags,
+        mode: user.mode,
         completion,
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
@@ -730,7 +747,8 @@ pub(crate) unsafe fn submit_fallocate(
     op: &mut IocpOp,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &*op.payload.fallocate };
+    let kernel = unsafe { &*op.payload.fallocate };
+    let payload = unsafe { kernel.user.as_ref() };
     let handle = resolve_fd(payload.fd, ctx.registered_files)?;
 
     let entry = &op.header;
@@ -774,7 +792,8 @@ pub(crate) unsafe fn submit_timeout(
     op: &mut IocpOp,
     _ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let duration = unsafe { op.payload.timeout.duration };
+    let kernel = unsafe { &op.payload.timeout };
+    let duration = unsafe { kernel.user.as_ref().duration };
     Ok(SubmissionResult::Timer(duration))
 }
 

@@ -6,12 +6,14 @@ use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
 use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::{IocpOpState, OpLifecycle};
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED, STATE_CONSUMED};
+use crate::driver::slot::OverlappedEntry;
+use crate::driver::{
+    CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
+};
 use crate::op::IoFd;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::sync::OnceLock;
-use std::sync::atomic::Ordering;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -35,6 +37,14 @@ pub struct RioEnv<'a> {
 pub struct RioContext<'a> {
     pub registry: &'a mut RioRegistry,
     pub env: RioEnv<'a>,
+    pub actor_id: u32,
+    pub rq: RIO_RQ,
+}
+
+pub struct RioCompletionContext<'a> {
+    pub ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
+    pub events: &'a SharedCompletionQueue,
+    pub table: &'a SharedCompletionTable,
 }
 
 #[derive(Clone, Copy)]
@@ -490,31 +500,31 @@ impl RioKernel {
 }
 
 struct RioCompletionRouter<'a> {
-    ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
-    registry: &'a mut RioRegistry,
     actors: &'a mut FxHashMap<HANDLE, RioSocketActor>,
     actor_routes: &'a mut FxHashMap<u32, HANDLE>,
-    env: RioEnv<'a>,
     outstanding_count: &'a mut usize,
+    comp: RioCompletionContext<'a>,
+    registry: &'a mut RioRegistry,
+    env: RioEnv<'a>,
     completed_count: usize,
 }
 
 impl<'a> RioCompletionRouter<'a> {
     fn new(
-        ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
-        registry: &'a mut RioRegistry,
         actors: &'a mut FxHashMap<HANDLE, RioSocketActor>,
-        actor_routes: &'a mut FxHashMap<u32, HANDLE>,
-        env: RioEnv<'a>,
-        outstanding_count: &'a mut usize,
+        router_ctx: (&'a mut FxHashMap<u32, HANDLE>, &'a mut usize),
+        comp: RioCompletionContext<'a>,
+        env: (&'a mut RioRegistry, RioEnv<'a>),
     ) -> Self {
+        let (actor_routes, outstanding_count) = router_ctx;
+        let (registry, env) = env;
         Self {
-            ops,
-            registry,
             actors,
             actor_routes,
-            env,
             outstanding_count,
+            comp,
+            registry,
+            env,
             completed_count: 0,
         }
     }
@@ -543,13 +553,12 @@ impl<'a> RioCompletionRouter<'a> {
                     let mut ctx = RioContext {
                         registry: self.registry,
                         env: self.env,
+                        actor_id: actor.actor_id,
+                        rq: actor.rq,
                     };
                     let submissions = actor.pool_manager.handle_completion(
-                        self.ops,
-                        actor.rq,
-                        actor.actor_id,
-                        slot_idx,
-                        res,
+                        (slot_idx, res),
+                        &mut self.comp,
                         &mut ctx,
                     );
                     let remove = actor
@@ -569,12 +578,13 @@ impl<'a> RioCompletionRouter<'a> {
                 user_data,
                 generation,
             } => {
-                if user_data >= self.ops.local.len() {
+                let ops = &mut self.comp.ops;
+                if user_data >= ops.local.len() {
                     return;
                 }
 
-                let op = &mut self.ops.local[user_data];
-                let slot = &self.ops.shared.slots[user_data];
+                let op = &mut ops.local[user_data];
+                let slot = &ops.shared.slots[user_data];
                 if op.platform_data.generation != generation {
                     return;
                 }
@@ -592,19 +602,25 @@ impl<'a> RioCompletionRouter<'a> {
                     } else {
                         Err(io::Error::from_raw_os_error(res.Status))
                     };
-                    unsafe { *slot.result.get() = Some(result_for_slot) };
-                    slot.state.store(STATE_COMPLETED, Ordering::Release);
-                    slot.waker.wake();
+                    let res_code = rio_result_to_event_res(&result_for_slot);
+                    let event = CompletionEvent {
+                        user_data: encode_completion_token(user_data, generation),
+                        res: res_code,
+                        flags: 0,
+                    };
+                    self.comp.table.record_completion(event);
+                    self.comp.events.push(event);
+                    let _ = unsafe { (*slot.op.get()).take() };
+                    let _ = std::mem::take(&mut op.platform_data);
+                    self.comp.ops.free_indices.push(user_data);
                 } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
                     if op.platform_data.rio_needs_drain {
                         op.platform_data.rio_drained = true;
-                        if slot.state.load(Ordering::Acquire) == STATE_CONSUMED {
-                            let _ = std::mem::take(&mut op.platform_data);
-                            self.ops.free_indices.push(user_data);
-                        }
+                        let _ = std::mem::take(&mut op.platform_data);
+                        self.comp.ops.free_indices.push(user_data);
                     } else {
                         let _ = std::mem::take(&mut op.platform_data);
-                        self.ops.free_indices.push(user_data);
+                        self.comp.ops.free_indices.push(user_data);
                     }
                 }
 
@@ -612,6 +628,14 @@ impl<'a> RioCompletionRouter<'a> {
                 self.completed_count += 1;
             }
         }
+    }
+}
+
+#[inline]
+fn rio_result_to_event_res(res: &io::Result<usize>) -> i32 {
+    match res {
+        Ok(v) => (*v).min(i32::MAX as usize) as i32,
+        Err(e) => -e.raw_os_error().unwrap_or(1).abs(),
     }
 }
 
@@ -669,8 +693,18 @@ impl RioState {
     }
 
     #[inline]
-    fn build_ctx<'a>(registry: &'a mut RioRegistry, env: RioEnv<'a>) -> RioContext<'a> {
-        RioContext { registry, env }
+    fn build_ctx<'a>(
+        registry: &'a mut RioRegistry,
+        env: RioEnv<'a>,
+        actor: (u32, RIO_RQ),
+    ) -> RioContext<'a> {
+        let (actor_id, rq) = actor;
+        RioContext {
+            registry,
+            env,
+            actor_id,
+            rq,
+        }
     }
 
     fn alloc_actor_id(&mut self) -> u32 {
@@ -732,9 +766,9 @@ impl RioState {
 
     pub fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
         let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
         let mut remove_actor = None;
         if let Some(actor) = self.actors.get_mut(&handle) {
+            let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             actor.pool_manager.begin_udp_pool_shutdown();
             if actor
                 .pool_manager
@@ -797,7 +831,7 @@ impl RioState {
                         .ack_udp_pool_completion(completion_generation);
                     actor.pool_manager.handle_completion_drain_only();
                     let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-                    let mut ctx = Self::build_ctx(&mut self.registry, env);
+                    let mut ctx = Self::build_ctx(&mut self.registry, env, (actor_id, actor.rq));
                     if actor
                         .pool_manager
                         .cleanup_shutdown_udp_pool_if_drained(&mut ctx)
@@ -818,15 +852,14 @@ impl RioState {
             actor.pool_manager.udp_ctx_map.clear();
         }
         let env = self.kernel.env(&veloq_buf::NoopRegistrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
         for actor in self.actors.values_mut() {
+            let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             actor
                 .pool_manager
                 .forget_in_flight_and_deregister_rest(&mut ctx);
         }
         self.actors.clear();
         self.actor_routes.clear();
-        let _ = ctx;
         let env = self.kernel.env(&veloq_buf::NoopRegistrar);
         self.registry.cleanup_deregister(env);
         self.kernel.close();
@@ -854,11 +887,9 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) {
         let env = self.kernel.env(registrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
         if let Some(actor) = self.actors.get_mut(&handle) {
-            actor
-                .pool_manager
-                .cancel_udp_recv_waiter(uid, actor.rq, actor.actor_id, &mut ctx);
+            let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
+            actor.pool_manager.cancel_udp_recv_waiter(uid, &mut ctx);
         }
     }
 
@@ -866,17 +897,21 @@ impl RioState {
         &mut self,
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
         registrar: &dyn veloq_buf::BufferRegistrar,
+        completion_events: &SharedCompletionQueue,
+        completion_table: &SharedCompletionTable,
     ) -> io::Result<usize> {
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
         let env = self.kernel.env(registrar);
         let mut router = RioCompletionRouter::new(
-            ops,
-            &mut self.registry,
             &mut self.actors,
-            &mut self.actor_routes,
-            env,
-            &mut self.outstanding_count,
+            (&mut self.actor_routes, &mut self.outstanding_count),
+            RioCompletionContext {
+                ops,
+                events: completion_events,
+                table: completion_table,
+            },
+            (&mut self.registry, env),
         );
 
         loop {
@@ -922,9 +957,9 @@ impl RioState {
             cq: self.kernel.cq,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let rio_buf =
-            self.registry
-                .prepare_data_submission((fd, handle), buf, buf.capacity() as u32, env)?;
+        let rio_buf = self
+            .registry
+            .prepare_data_submission(buf, buf.capacity() as u32, env)?;
         let request_context = Self::encode_request_context(overlapped);
         let ret = self.kernel.submit_receive(rq, &rio_buf, request_context);
         if ret == 0 {
@@ -953,9 +988,9 @@ impl RioState {
             cq: self.kernel.cq,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let rio_buf =
-            self.registry
-                .prepare_data_submission((fd, handle), buf, buf.len() as u32, env)?;
+        let rio_buf = self
+            .registry
+            .prepare_data_submission(buf, buf.len() as u32, env)?;
         let request_context = Self::encode_request_context(overlapped);
         let ret = self.kernel.submit_send(rq, &rio_buf, request_context);
         if ret == 0 {
@@ -996,9 +1031,9 @@ impl RioState {
             cq: self.kernel.cq,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let data_buf =
-            self.registry
-                .prepare_data_submission((fd, handle), buf, buf.len() as u32, env)?;
+        let data_buf = self
+            .registry
+            .prepare_data_submission(buf, buf.len() as u32, env)?;
         self.registry
             .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
@@ -1111,9 +1146,9 @@ impl RioState {
             cq: self.kernel.cq,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let data_buf =
-            self.registry
-                .prepare_data_submission((fd, handle), buf, buf.capacity() as u32, env)?;
+        let data_buf = self
+            .registry
+            .prepare_data_submission(buf, buf.capacity() as u32, env)?;
         self.registry
             .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
@@ -1198,10 +1233,8 @@ impl RioState {
         let _ = self.ensure_actor((fd, handle), env)?;
         let (registry, actors) = (&mut self.registry, &mut self.actors);
         let actor = actors.get_mut(&handle).expect("actor exists");
-        let mut ctx = Self::build_ctx(registry, env);
+        let mut ctx = Self::build_ctx(registry, env, (actor.actor_id, actor.rq));
         let (res, pool_submissions) = actor.pool_manager.try_submit_udp_recv_stream_pooled(
-            actor.rq,
-            actor.actor_id,
             stream_op,
             (user_data, generation),
             &mut ctx,
@@ -1229,11 +1262,8 @@ impl RioState {
         let _ = self.ensure_actor((fd, handle), env)?;
         let (registry, actors) = (&mut self.registry, &mut self.actors);
         let actor = actors.get_mut(&handle).expect("actor exists");
-        let mut ctx = Self::build_ctx(registry, env);
-        let pool_submissions =
-            actor
-                .pool_manager
-                .try_refill_udp_pool(actor.rq, actor.actor_id, buf, &mut ctx)?;
+        let mut ctx = Self::build_ctx(registry, env, (actor.actor_id, actor.rq));
+        let pool_submissions = actor.pool_manager.try_refill_udp_pool(buf, &mut ctx)?;
         self.outstanding_count += pool_submissions;
         Ok(())
     }
@@ -1256,12 +1286,10 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
         let env = self.kernel.env(registrar);
-        let mut ctx = Self::build_ctx(&mut self.registry, env);
         if let Some(actor) = self.actors.get_mut(&handle) {
+            let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             for _ in 0..ticks {
-                actor
-                    .pool_manager
-                    .rebalance_udp_pool(actor.rq, actor.actor_id, &mut ctx)?;
+                actor.pool_manager.rebalance_udp_pool(&mut ctx)?;
             }
         }
         Ok(())
