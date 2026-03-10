@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use veloq_driver::driver::PlatformDriver;
+use veloq_driver::driver::{Driver, PlatformDriver};
 use veloq_driver::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
 
 // ============================================================================
@@ -30,7 +30,7 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 
 pub struct Sleep {
     deadline: Instant,
-    inner: Option<DetachedOp<OpTimeout, PlatformDriver>>,
+    inner: Option<DetachedOp<OpTimeout, <PlatformDriver as Driver>::Op>>,
 }
 
 impl Sleep {

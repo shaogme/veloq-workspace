@@ -1,5 +1,5 @@
-pub mod pool;
-pub mod registry;
+pub(crate) mod pool;
+pub(crate) mod registry;
 
 use crate::driver::iocp::IocpOp;
 use crate::driver::iocp::error::{IocpErrorContext, io_error, io_msg};
@@ -28,23 +28,23 @@ use self::registry::RioRegistry;
 const RIO_REAPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
-pub struct RioEnv<'a> {
-    pub registrar: &'a dyn veloq_buf::BufferRegistrar,
-    pub dispatch: &'a RioDispatch,
-    pub cq: RIO_CQ,
+pub(crate) struct RioEnv<'a> {
+    pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
+    pub(crate) dispatch: &'a RioDispatch,
+    pub(crate) cq: RIO_CQ,
 }
 
-pub struct RioContext<'a> {
-    pub registry: &'a mut RioRegistry,
-    pub env: RioEnv<'a>,
-    pub actor_id: u32,
-    pub rq: RIO_RQ,
+pub(crate) struct RioContext<'a> {
+    pub(crate) registry: &'a mut RioRegistry,
+    pub(crate) env: RioEnv<'a>,
+    pub(crate) actor_id: u32,
+    pub(crate) rq: RIO_RQ,
 }
 
-pub struct RioCompletionContext<'a> {
-    pub ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
-    pub events: &'a SharedCompletionQueue,
-    pub table: &'a SharedCompletionTable,
+pub(crate) struct RioCompletionContext<'a> {
+    pub(crate) ops: &'a mut OpRegistry<IocpOp, IocpOpState>,
+    pub(crate) events: &'a SharedCompletionQueue,
+    pub(crate) table: &'a SharedCompletionTable,
 }
 
 #[derive(Clone, Copy)]
@@ -69,38 +69,29 @@ impl RioSocketActor {
     }
 }
 
-pub struct RioSendToArgs<'a> {
-    pub fd: IoFd,
-    pub handle: HANDLE,
-    pub buf: &'a veloq_buf::FixedBuf,
-    pub addr_ptr: *const std::ffi::c_void,
-    pub addr_len: i32,
-    pub overlapped: *mut OVERLAPPED,
-    pub page_idx: usize,
+pub(crate) struct RioSendToArgs<'a> {
+    pub(crate) fd: IoFd,
+    pub(crate) handle: HANDLE,
+    pub(crate) buf: &'a veloq_buf::FixedBuf,
+    pub(crate) addr_ptr: *const std::ffi::c_void,
+    pub(crate) addr_len: i32,
+    pub(crate) overlapped: *mut OVERLAPPED,
+    pub(crate) page_idx: usize,
 }
 
-pub struct RioRecvFromArgs<'a> {
-    pub fd: IoFd,
-    pub handle: HANDLE,
-    pub buf: &'a mut veloq_buf::FixedBuf,
-    pub addr_ptr: *const std::ffi::c_void,
-    pub len_ptr: *const i32,
-    pub overlapped: *mut OVERLAPPED,
-    pub page_idx: usize,
-}
-
-pub struct RioUdpStreamArgs<'a> {
-    pub fd: IoFd,
-    pub handle: HANDLE,
-    pub stream_op: &'a mut crate::op::UdpRecvStream,
-    pub user_data: usize,
-    pub generation: u32,
+pub(crate) struct RioUdpStreamArgs<'a> {
+    pub(crate) fd: IoFd,
+    pub(crate) handle: HANDLE,
+    pub(crate) stream_op: &'a mut crate::op::UdpRecvStream,
+    pub(crate) user_data: usize,
+    pub(crate) generation: u32,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioDispatch {
-    pub create_cq: unsafe extern "system" fn(u32, *const RIO_NOTIFICATION_COMPLETION) -> RIO_CQ,
-    pub create_rq: unsafe extern "system" fn(
+    pub(crate) create_cq:
+        unsafe extern "system" fn(u32, *const RIO_NOTIFICATION_COMPLETION) -> RIO_CQ,
+    pub(crate) create_rq: unsafe extern "system" fn(
         usize,
         u32,
         u32,
@@ -110,16 +101,16 @@ pub(crate) struct RioDispatch {
         RIO_CQ,
         *const std::ffi::c_void,
     ) -> RIO_RQ,
-    pub register_buffer: unsafe extern "system" fn(*const u8, u32) -> RIO_BUFFERID,
-    pub deregister_buffer: unsafe extern "system" fn(RIO_BUFFERID),
-    pub dequeue: unsafe extern "system" fn(RIO_CQ, *mut RIORESULT, u32) -> u32,
-    pub notify: unsafe extern "system" fn(RIO_CQ) -> i32,
-    pub close_cq: unsafe extern "system" fn(RIO_CQ),
-    pub receive:
+    pub(crate) register_buffer: unsafe extern "system" fn(*const u8, u32) -> RIO_BUFFERID,
+    pub(crate) deregister_buffer: unsafe extern "system" fn(RIO_BUFFERID),
+    pub(crate) dequeue: unsafe extern "system" fn(RIO_CQ, *mut RIORESULT, u32) -> u32,
+    pub(crate) notify: unsafe extern "system" fn(RIO_CQ) -> i32,
+    pub(crate) close_cq: unsafe extern "system" fn(RIO_CQ),
+    pub(crate) receive:
         unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
-    pub send:
+    pub(crate) send:
         unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
-    pub send_ex: unsafe extern "system" fn(
+    pub(crate) send_ex: unsafe extern "system" fn(
         RIO_RQ,
         *const RIO_BUF,
         u32,
@@ -130,7 +121,7 @@ pub(crate) struct RioDispatch {
         u32,
         *const std::ffi::c_void,
     ) -> i32,
-    pub receive_ex: unsafe extern "system" fn(
+    pub(crate) receive_ex: unsafe extern "system" fn(
         RIO_RQ,
         *const RIO_BUF,
         u32,
@@ -143,7 +134,7 @@ pub(crate) struct RioDispatch {
     ) -> i32,
 }
 
-pub struct RioState {
+pub(crate) struct RioState {
     pub(crate) kernel: RioKernel,
     pub(crate) registry: RioRegistry,
     actors: FxHashMap<HANDLE, RioSocketActor>,
@@ -468,29 +459,6 @@ impl RioKernel {
     }
 
     #[inline]
-    fn submit_receive_ex(
-        &self,
-        rq: RIO_RQ,
-        data_buf: &RIO_BUF,
-        addr_buf: &RIO_BUF,
-        request_context: *const std::ffi::c_void,
-    ) -> i32 {
-        unsafe {
-            (self.dispatch.receive_ex)(
-                rq,
-                data_buf,
-                1,
-                std::ptr::null(),
-                addr_buf,
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                request_context,
-            )
-        }
-    }
-
-    #[inline]
     fn close(&mut self) {
         if self.cq != 0 {
             unsafe { (self.dispatch.close_cq)(self.cq) };
@@ -590,12 +558,7 @@ impl<'a> RioCompletionRouter<'a> {
                 }
 
                 if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                    let result = if res.Status == 0 {
-                        Ok(res.BytesTransferred as usize)
-                    } else {
-                        Err(io::Error::from_raw_os_error(res.Status))
-                    };
-                    op.platform_data.lifecycle = OpLifecycle::Completed(result);
+                    op.platform_data.lifecycle = OpLifecycle::Completed;
 
                     let result_for_slot = if res.Status == 0 {
                         Ok(res.BytesTransferred as usize)
@@ -608,20 +571,21 @@ impl<'a> RioCompletionRouter<'a> {
                         res: res_code,
                         flags: 0,
                     };
-                    self.comp.table.record_completion(event);
+                    let payload = unsafe { (*slot.payload.get()).take() };
+                    let detail = unsafe { (*slot.result.get()).take() };
+                    self.comp
+                        .table
+                        .record_completion_with_data(event, payload, detail);
                     self.comp.events.push(event);
                     let _ = unsafe { (*slot.op.get()).take() };
                     let _ = std::mem::take(&mut op.platform_data);
-                    self.comp.ops.free_indices.push(user_data);
+                    self.comp.ops.shared.push_free(user_data);
                 } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
-                    if op.platform_data.rio_needs_drain {
-                        op.platform_data.rio_drained = true;
-                        let _ = std::mem::take(&mut op.platform_data);
-                        self.comp.ops.free_indices.push(user_data);
-                    } else {
-                        let _ = std::mem::take(&mut op.platform_data);
-                        self.comp.ops.free_indices.push(user_data);
-                    }
+                    let _ = unsafe { (*slot.op.get()).take() };
+                    let _ = unsafe { (*slot.payload.get()).take() };
+                    let _ = unsafe { (*slot.result.get()).take() };
+                    let _ = std::mem::take(&mut op.platform_data);
+                    self.comp.ops.shared.push_free(user_data);
                 }
 
                 *self.outstanding_count -= 1;
@@ -736,7 +700,7 @@ impl RioState {
         Ok(self.actors.get_mut(&handle).expect("actor inserted"))
     }
 
-    pub fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
+    pub(crate) fn new(port: HANDLE, entries: u32, ext: &Extensions) -> io::Result<Self> {
         let kernel = RioKernel::from_extensions(port, entries, ext)?;
 
         let rq_depth = entries.clamp(32, 256);
@@ -751,20 +715,20 @@ impl RioState {
         })
     }
 
-    pub fn resize_registered_rqs(&mut self, size: usize) {
+    pub(crate) fn resize_registered_rqs(&mut self, size: usize) {
         self.registry.resize_registered_rqs(size);
     }
 
-    pub fn clear_registered_rq(&mut self, idx: usize) {
+    pub(crate) fn clear_registered_rq(&mut self, idx: usize) {
         self.registry.clear_registered_rq(idx);
     }
 
-    pub fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
+    pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
         let env = self.kernel.env(&veloq_buf::NoopRegistrar);
         self.registry.register_chunk(id, (ptr, len), env)
     }
 
-    pub fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
+    pub(crate) fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
         let env = self.kernel.env(&veloq_buf::NoopRegistrar);
         let mut remove_actor = None;
         if let Some(actor) = self.actors.get_mut(&handle) {
@@ -783,13 +747,13 @@ impl RioState {
         }
     }
 
-    pub fn begin_shutdown(&mut self) {
+    pub(crate) fn begin_shutdown(&mut self) {
         for actor in self.actors.values_mut() {
             actor.pool_manager.begin_udp_pool_shutdown();
         }
     }
 
-    pub fn drain_outstanding_for(&mut self, timeout: std::time::Duration) -> io::Result<()> {
+    pub(crate) fn drain_outstanding_for(&mut self, timeout: std::time::Duration) -> io::Result<()> {
         let start = std::time::Instant::now();
         while self.outstanding_count > 0 {
             if start.elapsed() >= timeout {
@@ -880,7 +844,7 @@ impl RioState {
         })
     }
 
-    pub fn cancel_udp_recv_waiter(
+    pub(crate) fn cancel_udp_recv_waiter(
         &mut self,
         handle: HANDLE,
         uid: (usize, u32),
@@ -893,7 +857,7 @@ impl RioState {
         }
     }
 
-    pub fn process_completions(
+    pub(crate) fn process_completions(
         &mut self,
         ops: &mut OpRegistry<IocpOp, IocpOpState>,
         registrar: &dyn veloq_buf::BufferRegistrar,
@@ -942,7 +906,7 @@ impl RioState {
         Ok(router.completed_count)
     }
 
-    pub fn try_submit_recv(
+    pub(crate) fn try_submit_recv(
         &mut self,
         target: (IoFd, HANDLE, *mut OVERLAPPED),
         buf: &mut veloq_buf::FixedBuf,
@@ -973,7 +937,7 @@ impl RioState {
         Ok(SubmissionResult::Pending)
     }
 
-    pub fn try_submit_send(
+    pub(crate) fn try_submit_send(
         &mut self,
         target: (IoFd, HANDLE, *mut OVERLAPPED),
         buf: &veloq_buf::FixedBuf,
@@ -1004,7 +968,7 @@ impl RioState {
         Ok(SubmissionResult::Pending)
     }
 
-    pub fn try_submit_send_to(
+    pub(crate) fn try_submit_send_to(
         &mut self,
         args: RioSendToArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
@@ -1123,95 +1087,7 @@ impl RioState {
         Ok(SubmissionResult::Pending)
     }
 
-    pub fn try_submit_recv_from(
-        &mut self,
-        args: RioRecvFromArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-    ) -> io::Result<crate::driver::iocp::submit::SubmissionResult> {
-        use crate::driver::iocp::submit::SubmissionResult;
-        let RioRecvFromArgs {
-            fd,
-            handle,
-            buf,
-            addr_ptr,
-            len_ptr: _len_ptr,
-            overlapped,
-            page_idx,
-        } = args;
-        let dispatch = self.kernel.dispatch;
-        let env = RioEnv {
-            registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
-        };
-        let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let data_buf = self
-            .registry
-            .prepare_data_submission(buf, buf.capacity() as u32, env)?;
-        self.registry
-            .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
-        let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
-
-        let addr_addr = addr_ptr as usize;
-        let slab_end = base_addr.saturating_add(slab_len);
-        let addr_len = std::mem::size_of::<crate::SockAddrStorage>();
-        if addr_addr < base_addr || addr_addr >= slab_end {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!(
-                    "RIO recv_from address pointer is outside registered slab: page_idx={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}, slab_end=0x{:x}",
-                    page_idx, addr_addr, base_addr, slab_len, slab_end
-                ),
-            ));
-        }
-        let addr_end = addr_addr.saturating_add(addr_len);
-        if addr_end > slab_end {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!(
-                    "RIO recv_from address range exceeds registered slab: page_idx={}, addr_ptr=0x{:x}, addr_len={}, addr_end=0x{:x}, slab_end=0x{:x}",
-                    page_idx, addr_addr, addr_len, addr_end, slab_end
-                ),
-            ));
-        }
-
-        let addr_offset = (addr_addr - base_addr) as u32;
-        let addr_buf = RIO_BUF {
-            BufferId: addr_buf_id,
-            Offset: addr_offset,
-            Length: addr_len as u32,
-        };
-        let request_context = Self::encode_request_context(overlapped);
-
-        let ret = self
-            .kernel
-            .submit_receive_ex(rq, &data_buf, &addr_buf, request_context);
-        if ret == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!(
-                    "RIOReceiveEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={}, rq=0x{:x}, data_buf_id=0x{:x}, data_off={}, data_len={}, addr_buf_id=0x{:x}, addr_off={}, addr_len={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}",
-                    page_idx,
-                    rq as usize,
-                    data_buf.BufferId as usize,
-                    data_buf.Offset,
-                    data_buf.Length,
-                    addr_buf.BufferId as usize,
-                    addr_buf.Offset,
-                    addr_buf.Length,
-                    addr_addr,
-                    base_addr,
-                    slab_len
-                ),
-            ));
-        }
-        self.outstanding_count += 1;
-        Ok(SubmissionResult::Pending)
-    }
-
-    pub fn try_submit_udp_recv_stream_pooled(
+    pub(crate) fn try_submit_udp_recv_stream_pooled(
         &mut self,
         args: RioUdpStreamArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
@@ -1246,7 +1122,7 @@ impl RioState {
         Ok(res)
     }
 
-    pub fn try_refill_udp_pool(
+    pub(crate) fn try_refill_udp_pool(
         &mut self,
         target: (IoFd, HANDLE),
         buf: FixedBuf,

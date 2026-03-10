@@ -9,16 +9,15 @@ use tracing::{debug, trace};
 
 use crate::config::{IoMode, UringConfig};
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::STATE_SUBMITTED;
 use crate::driver::uring::op::UringOp;
 use crate::driver::{
-    CompletionEvent, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    CompletionEvent, CompletionSidecar, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
     encode_completion_token,
 };
 use crate::op::IntoPlatformOp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OpLifecycle {
+pub(crate) enum OpLifecycle {
     /// Created, waiting to be submitted
     Pending,
     /// Submitted to ring or timer wheel
@@ -32,9 +31,9 @@ pub enum OpLifecycle {
 
 #[derive(Clone)]
 pub struct UringOpState {
-    pub lifecycle: OpLifecycle,
-    pub next: Option<usize>,
-    pub timer_id: Option<veloq_wheel::TaskId>,
+    pub(crate) lifecycle: OpLifecycle,
+    pub(crate) next: Option<usize>,
+    pub(crate) timer_id: Option<veloq_wheel::TaskId>,
 }
 
 impl Default for UringOpState {
@@ -48,13 +47,13 @@ impl Default for UringOpState {
 }
 
 impl UringOpState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 }
 
 pub(crate) struct EventFd {
-    pub fd: RawFd,
+    pub(crate) fd: RawFd,
 }
 
 impl Drop for EventFd {
@@ -252,8 +251,6 @@ impl UringDriver {
                         if let Some(entry) = self.ops.get_mut(user_data) {
                             entry.platform_data.lifecycle = OpLifecycle::InFlight;
                         }
-                        let slot = &self.ops.shared.slots[user_data];
-                        slot.state.store(STATE_SUBMITTED, Ordering::Release);
                         trace!(user_data, "Submitted to SQ");
                         Ok(true)
                     } else {
@@ -271,8 +268,6 @@ impl UringDriver {
                         entry.platform_data.lifecycle = OpLifecycle::InFlight;
                         entry.platform_data.timer_id = Some(task_id);
                     }
-                    let slot = &self.ops.shared.slots[user_data];
-                    slot.state.store(STATE_SUBMITTED, Ordering::Release);
                     trace!(user_data, ?duration, "Registered software timer");
                     Ok(true)
                 } else {
@@ -295,8 +290,9 @@ impl UringDriver {
         let op = crate::op::Wakeup {
             fd: crate::op::IoFd::Raw(crate::RawHandle { fd }),
         };
-        let (uring_op, payload) =
-            <crate::op::Wakeup as IntoPlatformOp<UringDriver>>::into_kernel_and_payload(op);
+        let (uring_op, payload) = <crate::op::Wakeup as IntoPlatformOp<
+            crate::driver::uring::op::UringOp,
+        >>::into_kernel_and_payload(op);
 
         let state = UringOpState {
             lifecycle: OpLifecycle::Pending, // Will change to InFlight below
@@ -335,9 +331,6 @@ impl UringDriver {
                 if let Some(entry) = self.ops.get_mut(user_data) {
                     entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 }
-                // Update slot state
-                let slot = &self.ops.shared.slots[user_data];
-                slot.state.store(STATE_SUBMITTED, Ordering::Release);
             } else {
                 self.push_backlog(user_data);
             }
@@ -347,7 +340,7 @@ impl UringDriver {
         }
     }
 
-    pub fn submit_to_kernel(&mut self) -> io::Result<()> {
+    pub(crate) fn submit_to_kernel(&mut self) -> io::Result<()> {
         trace!("submit_to_kernel entered");
         if self.ring.params().is_setup_sqpoll() {
             if self.ring.submission().need_wakeup() {
@@ -360,11 +353,11 @@ impl UringDriver {
         Ok(())
     }
 
-    pub fn wait(&mut self) -> io::Result<()> {
+    pub(crate) fn wait(&mut self) -> io::Result<()> {
         self.flush_cancellations();
         self.flush_backlog();
 
-        if self.ops.is_empty() {
+        if !self.has_active_ops() {
             return Ok(());
         }
 
@@ -406,7 +399,17 @@ impl UringDriver {
                         let _ = unsafe { (*slot.op.get()).take() };
                         generation
                     };
-                    self.push_completion_event(user_data, generation, 0, 0);
+                    let slot = &self.ops.shared.slots[user_data];
+                    let payload = unsafe { (*slot.payload.get()).take() };
+                    let detail = unsafe { (*slot.result.get()).take() };
+                    self.push_completion_event(CompletionSidecar {
+                        user_data,
+                        generation,
+                        res: 0,
+                        flags: 0,
+                        payload,
+                        detail,
+                    });
                     self.ops.remove(user_data);
                 }
             }
@@ -418,10 +421,19 @@ impl UringDriver {
         Ok(())
     }
 
+    fn has_active_ops(&self) -> bool {
+        self.ops.local.iter().any(|entry| {
+            matches!(
+                entry.platform_data.lifecycle,
+                OpLifecycle::Pending | OpLifecycle::InFlight | OpLifecycle::Cancelled
+            )
+        })
+    }
+
     pub(crate) fn process_completions_internal(&mut self) {
         let mut needs_waker_resubmit = false;
 
-        let mut pending_events: Vec<(usize, u32, i32, u32)> = Vec::new();
+        let mut pending_events: Vec<CompletionSidecar> = Vec::new();
         {
             let mut cqe_kicker = self.ring.completion();
             cqe_kicker.sync();
@@ -450,7 +462,16 @@ impl UringDriver {
                     // Don't touch op if Cancelled
                     if matches!(op_state.lifecycle, OpLifecycle::Cancelled) {
                         let generation = slot.generation.load(Ordering::Acquire);
-                        pending_events.push((user_data, generation, cqe.result(), cqe.flags()));
+                        let payload = unsafe { (*slot.payload.get()).take() };
+                        let detail = unsafe { (*slot.result.get()).take() };
+                        pending_events.push(CompletionSidecar {
+                            user_data,
+                            generation,
+                            res: cqe.result(),
+                            flags: cqe.flags(),
+                            payload,
+                            detail,
+                        });
                         unsafe {
                             *slot.op.get() = None;
                         }
@@ -475,15 +496,27 @@ impl UringDriver {
                         op_state.lifecycle = OpLifecycle::Completed;
                         let generation = slot.generation.load(Ordering::Acquire);
                         let res_code = io_result_to_event_res(&final_res);
-                        pending_events.push((user_data, generation, res_code, cqe.flags()));
+                        let mut detail = unsafe { (*slot.result.get()).take() };
+                        if detail.is_none() {
+                            detail = clone_result_if_non_os_error(&final_res);
+                        }
+                        let payload = unsafe { (*slot.payload.get()).take() };
+                        pending_events.push(CompletionSidecar {
+                            user_data,
+                            generation,
+                            res: res_code,
+                            flags: cqe.flags(),
+                            payload,
+                            detail,
+                        });
                         let _ = unsafe { (*slot.op.get()).take() };
                         self.ops.remove(user_data);
                     }
                 }
             }
         }
-        for (user_data, generation, res_code, flags) in pending_events {
-            self.push_completion_event(user_data, generation, res_code, flags);
+        for sidecar in pending_events {
+            self.push_completion_event(sidecar);
         }
 
         if needs_waker_resubmit {
@@ -689,7 +722,17 @@ impl UringDriver {
                         let _ = unsafe { (*slot.op.get()).take() };
                         generation
                     };
-                    self.push_completion_event(user_data, generation, -libc::ECANCELED, 0);
+                    let slot = &self.ops.shared.slots[user_data];
+                    let payload = unsafe { (*slot.payload.get()).take() };
+                    let detail = unsafe { (*slot.result.get()).take() };
+                    self.push_completion_event(CompletionSidecar {
+                        user_data,
+                        generation,
+                        res: -libc::ECANCELED,
+                        flags: 0,
+                        payload,
+                        detail,
+                    });
                     self.ops.remove(user_data);
                 }
             }
@@ -707,7 +750,17 @@ impl UringDriver {
                             let _ = unsafe { (*slot.op.get()).take() };
                             generation
                         };
-                        self.push_completion_event(user_data, generation, -libc::ECANCELED, 0);
+                        let slot = &self.ops.shared.slots[user_data];
+                        let payload = unsafe { (*slot.payload.get()).take() };
+                        let detail = unsafe { (*slot.result.get()).take() };
+                        self.push_completion_event(CompletionSidecar {
+                            user_data,
+                            generation,
+                            res: -libc::ECANCELED,
+                            flags: 0,
+                            payload,
+                            detail,
+                        });
                         self.ops.remove(user_data);
                     }
                     return;
@@ -737,21 +790,30 @@ fn io_result_to_event_res(res: &io::Result<usize>) -> i32 {
 
 impl UringDriver {
     #[inline]
-    pub(crate) fn push_completion_event(
-        &mut self,
-        user_data: usize,
-        generation: u32,
-        res: i32,
-        flags: u32,
-    ) {
-        let token = encode_completion_token(user_data, generation);
+    pub(crate) fn push_completion_event(&mut self, sidecar: CompletionSidecar) {
+        let token = encode_completion_token(sidecar.user_data, sidecar.generation);
         let event = CompletionEvent {
             user_data: token,
-            res,
-            flags,
+            res: sidecar.res,
+            flags: sidecar.flags,
         };
-        self.completion_table.record_completion(event);
+        self.completion_table
+            .record_completion_with_data(event, sidecar.payload, sidecar.detail);
         self.completion_events.push(event);
+    }
+}
+
+#[inline]
+fn clone_result_if_non_os_error(res: &io::Result<usize>) -> Option<io::Result<usize>> {
+    match res {
+        Ok(_) => None,
+        Err(e) => {
+            if e.raw_os_error().is_some() {
+                None
+            } else {
+                Some(Err(io::Error::new(e.kind(), e.to_string())))
+            }
+        }
     }
 }
 

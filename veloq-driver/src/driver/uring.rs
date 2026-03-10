@@ -5,8 +5,8 @@ use std::task::Poll;
 use tracing::{debug, trace};
 
 mod inner;
-pub mod op;
-pub mod submit;
+mod op;
+mod submit;
 
 pub use inner::{UringDriver, UringOpState};
 

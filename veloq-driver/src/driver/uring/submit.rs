@@ -15,41 +15,25 @@ use std::mem::ManuallyDrop;
 // ============================================================================
 
 macro_rules! impl_lifecycle {
-    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, direct_fd) => {
+    ($drop_fn:ident, $variant:ident, direct_fd) => {
         pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
             unsafe {
                 ManuallyDrop::drop(&mut op.payload.$variant);
             }
-        }
-
-        pub(crate) unsafe fn $get_fd_fn(op: &UringOp) -> Option<IoFd> {
-            let k = unsafe { &*op.payload.$variant };
-            let u = unsafe { k.user.as_ref() };
-            Some(u.fd)
         }
     };
-    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, nested_fd) => {
+    ($drop_fn:ident, $variant:ident, nested_fd) => {
         pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
             unsafe {
                 ManuallyDrop::drop(&mut op.payload.$variant);
             }
-        }
-
-        pub(crate) unsafe fn $get_fd_fn(op: &UringOp) -> Option<IoFd> {
-            let k = unsafe { &*op.payload.$variant };
-            let u = unsafe { k.user.as_ref() };
-            Some(u.fd)
         }
     };
-    ($drop_fn:ident, $get_fd_fn:ident, $variant:ident, no_fd) => {
+    ($drop_fn:ident, $variant:ident, no_fd) => {
         pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
             unsafe {
                 ManuallyDrop::drop(&mut op.payload.$variant);
             }
-        }
-
-        pub(crate) unsafe fn $get_fd_fn(_op: &UringOp) -> Option<IoFd> {
-            None
         }
     };
 }
@@ -169,10 +153,10 @@ make_rw_fixed!(
 );
 
 impl_default_completion!(on_complete_read_fixed);
-impl_lifecycle!(drop_read_fixed, get_fd_read_fixed, read, direct_fd);
+impl_lifecycle!(drop_read_fixed, read, direct_fd);
 
 impl_default_completion!(on_complete_write_fixed);
-impl_lifecycle!(drop_write_fixed, get_fd_write_fixed, write, direct_fd);
+impl_lifecycle!(drop_write_fixed, write, direct_fd);
 
 // ============================================================================
 // Recv / Send / Connect / Accept
@@ -229,11 +213,11 @@ macro_rules! make_buf_op {
 
 make_buf_op!(make_sqe_recv, recv, opcode::Recv::new, recv_args);
 impl_default_completion!(on_complete_recv);
-impl_lifecycle!(drop_recv, get_fd_recv, recv, direct_fd);
+impl_lifecycle!(drop_recv, recv, direct_fd);
 
 make_buf_op!(make_sqe_send, send, opcode::Send::new, send_args);
 impl_default_completion!(on_complete_send);
-impl_lifecycle!(drop_send, get_fd_send, send, direct_fd);
+impl_lifecycle!(drop_send, send, direct_fd);
 
 pub(crate) unsafe fn make_sqe_connect(
     op: &mut UringOp,
@@ -257,7 +241,7 @@ pub(crate) unsafe fn make_sqe_connect(
     }
 }
 impl_default_completion!(on_complete_connect);
-impl_lifecycle!(drop_connect, get_fd_connect, connect, direct_fd);
+impl_lifecycle!(drop_connect, connect, direct_fd);
 
 pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.accept };
@@ -298,7 +282,7 @@ pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Re
     }
 }
 
-impl_lifecycle!(drop_accept, get_fd_accept, accept, nested_fd);
+impl_lifecycle!(drop_accept, accept, nested_fd);
 
 // ============================================================================
 // SendTo
@@ -332,7 +316,7 @@ pub(crate) unsafe fn make_sqe_send_to(
 }
 
 impl_default_completion!(on_complete_send_to);
-impl_lifecycle!(drop_send_to, get_fd_send_to, send_to, nested_fd);
+impl_lifecycle!(drop_send_to, send_to, nested_fd);
 
 // ============================================================================
 // UDP Recv Stream
@@ -388,12 +372,7 @@ pub(crate) unsafe fn on_complete_udp_recv_stream(
     }
 }
 
-impl_lifecycle!(
-    drop_udp_recv_stream,
-    get_fd_udp_recv_stream,
-    udp_recv_stream,
-    direct_fd
-);
+impl_lifecycle!(drop_udp_recv_stream, udp_recv_stream, direct_fd);
 
 pub(crate) unsafe fn make_sqe_udp_refill(
     _op: &mut UringOp,
@@ -403,7 +382,7 @@ pub(crate) unsafe fn make_sqe_udp_refill(
 }
 
 impl_default_completion!(on_complete_udp_refill);
-impl_lifecycle!(drop_udp_refill, get_fd_udp_refill, udp_refill, direct_fd);
+impl_lifecycle!(drop_udp_refill, udp_refill, direct_fd);
 
 // ============================================================================
 // Close
@@ -419,7 +398,7 @@ pub(crate) unsafe fn make_sqe_close(op: &mut UringOp, _driver: &mut UringDriver)
 }
 
 impl_default_completion!(on_complete_close);
-impl_lifecycle!(drop_close, get_fd_close, close, direct_fd);
+impl_lifecycle!(drop_close, close, direct_fd);
 
 // ============================================================================
 // Fsync
@@ -441,7 +420,7 @@ pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp, _driver: &mut UringDriver)
 }
 
 impl_default_completion!(on_complete_fsync);
-impl_lifecycle!(drop_fsync, get_fd_fsync, fsync, direct_fd);
+impl_lifecycle!(drop_fsync, fsync, direct_fd);
 
 // ============================================================================
 // SyncFileRange
@@ -466,7 +445,7 @@ pub(crate) unsafe fn make_sqe_sync_range(
 }
 
 impl_default_completion!(on_complete_sync_range);
-impl_lifecycle!(drop_sync_range, get_fd_sync_range, sync_range, direct_fd);
+impl_lifecycle!(drop_sync_range, sync_range, direct_fd);
 
 // ============================================================================
 // Fallocate
@@ -491,7 +470,7 @@ pub(crate) unsafe fn make_sqe_fallocate(
 }
 
 impl_default_completion!(on_complete_fallocate);
-impl_lifecycle!(drop_fallocate, get_fd_fallocate, fallocate, direct_fd);
+impl_lifecycle!(drop_fallocate, fallocate, direct_fd);
 
 // ============================================================================
 // Open
@@ -508,7 +487,7 @@ pub(crate) unsafe fn make_sqe_open(op: &mut UringOp, _driver: &mut UringDriver) 
 }
 
 impl_default_completion!(on_complete_open);
-impl_lifecycle!(drop_open, get_fd_open, open, no_fd);
+impl_lifecycle!(drop_open, open, no_fd);
 
 // ============================================================================
 // Timeout
@@ -529,7 +508,7 @@ pub(crate) unsafe fn make_sqe_timeout(
 }
 
 impl_default_completion!(on_complete_timeout);
-impl_lifecycle!(drop_timeout, get_fd_timeout, timeout, no_fd);
+impl_lifecycle!(drop_timeout, timeout, no_fd);
 
 // ============================================================================
 // Wakeup
@@ -545,7 +524,7 @@ pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp, _driver: &mut UringDriver
 }
 
 impl_default_completion!(on_complete_wakeup);
-impl_lifecycle!(drop_wakeup, get_fd_wakeup, wakeup, no_fd);
+impl_lifecycle!(drop_wakeup, wakeup, no_fd);
 
 // ============================================================================
 // VTable Helpers

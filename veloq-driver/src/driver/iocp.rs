@@ -1,27 +1,25 @@
 mod error;
 mod ext;
 mod inner;
-pub mod op;
-pub mod rio;
+mod op;
+mod rio;
 mod submit;
 #[cfg(test)]
 mod tests;
 
 use crate::driver::op_registry::OpEntry;
-use crate::driver::slot::STATE_SUBMITTED;
 use crate::driver::{
-    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+    CompletionSidecar, Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    SubmitBinder,
 };
+pub use inner::{CloseMode, IocpDriver, IocpOpState, OpLifecycle};
+use op::IocpOp;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
+use submit::SubmissionResult;
 use tracing::{debug, trace};
 use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
-
-use inner::WAKEUP_USER_DATA;
-pub use inner::{CloseMode, IocpDriver, IocpOpState, OpLifecycle};
-use op::IocpOp;
-use submit::SubmissionResult;
 
 impl Driver for IocpDriver {
     type Op = IocpOp;
@@ -68,7 +66,7 @@ impl Driver for IocpDriver {
                 None
             }
         };
-        let mut deferred_event: Option<(usize, u32, i32, u32)> = None;
+        let mut deferred_event: Option<CompletionSidecar> = None;
 
         // Scope for initial submission
         {
@@ -79,7 +77,6 @@ impl Driver for IocpDriver {
 
             let op = op_in.take().expect("submit called with empty Option");
             unsafe { *slot.op.get() = Some(op) };
-            slot.state.store(STATE_SUBMITTED, Ordering::Release);
 
             let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
             op_ref.header.user_data = user_data;
@@ -129,8 +126,6 @@ impl Driver for IocpDriver {
                     if posted == 0 {
                         let op = unsafe { (*slot.op.get()).take().unwrap() };
                         *op_in = Some(op);
-                        slot.state
-                            .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
                         self.ops.remove(user_data);
                         return binder.err(io::Error::last_os_error());
                     } else {
@@ -144,19 +139,23 @@ impl Driver for IocpDriver {
                     op_entry.platform_data.rio_pool_waiting = false;
                     if get_blocking_pool().execute(task).is_err() {
                         let err = io::Error::other("Thread pool overloaded");
-                        op_entry.platform_data.lifecycle = OpLifecycle::Completed(Err(
-                            io::Error::new(err.kind(), err.to_string()),
-                        ));
+                        unsafe {
+                            *slot.result.get() =
+                                Some(Err(io::Error::new(err.kind(), err.to_string())));
+                        }
+                        op_entry.platform_data.lifecycle = OpLifecycle::Completed;
                         let generation = slot.generation.load(Ordering::Acquire);
                         let _ = unsafe { (*slot.op.get()).take() };
-                        deferred_event = Some((
+                        let payload = unsafe { (*slot.payload.get()).take() };
+                        let detail = unsafe { (*slot.result.get()).take() };
+                        deferred_event = Some(CompletionSidecar {
                             user_data,
                             generation,
-                            -err.raw_os_error().unwrap_or(1).abs(),
-                            0,
-                        ));
-                        let _ = std::mem::take(&mut op_entry.platform_data);
-                        self.ops.free_indices.push(user_data);
+                            res: -err.raw_os_error().unwrap_or(1).abs(),
+                            flags: 0,
+                            payload,
+                            detail,
+                        });
                     }
                 }
                 Ok(SubmissionResult::Timer(duration)) => {
@@ -170,16 +169,16 @@ impl Driver for IocpDriver {
                 Err(e) => {
                     let op = unsafe { (*slot.op.get()).take().unwrap() };
                     *op_in = Some(op);
-                    slot.state
-                        .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
                     self.ops.remove(user_data);
                     return binder.err(e);
                 }
             }
         } // End of submission scope
 
-        if let Some((ud, generation, res, flags)) = deferred_event {
-            self.push_completion_event(ud, generation, res, flags);
+        if let Some(deferred) = deferred_event {
+            let user_data = deferred.user_data;
+            self.push_completion_event(deferred);
+            self.ops.remove(user_data);
         }
         binder.ok(Poll::Ready(()))
     }
@@ -210,7 +209,6 @@ impl Driver for IocpDriver {
         };
 
         unsafe { *slot.op.get() = Some(op) };
-        slot.state.store(STATE_SUBMITTED, Ordering::Release);
 
         let op_ref = unsafe { (*slot.op.get()).as_mut().unwrap() };
         op_ref.header.user_data = user_data;
@@ -240,7 +238,7 @@ impl Driver for IocpDriver {
                 use veloq_blocking::get_blocking_pool;
                 if get_blocking_pool().execute(task).is_err() {
                     let _ = std::mem::take(&mut op_entry.platform_data);
-                    self.ops.free_indices.push(user_data);
+                    self.ops.shared.push_free(user_data);
                     return Err(io::Error::other("Thread pool overloaded"));
                 }
             }
@@ -250,8 +248,6 @@ impl Driver for IocpDriver {
             Err(e) => {
                 debug!(error = ?e, user_data, "Background submit failed");
                 let _ = unsafe { (*slot.op.get()).take() };
-                slot.state
-                    .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
                 submit_error = Some(e);
             }
         }
@@ -308,16 +304,7 @@ impl Driver for IocpDriver {
     }
 
     fn wake(&mut self) -> io::Result<()> {
-        if !self.is_waked.swap(true, Ordering::AcqRel) {
-            let posted = unsafe {
-                PostQueuedCompletionStatus(self.port.handle, 0, WAKEUP_USER_DATA, std::ptr::null())
-            };
-            if posted == 0 {
-                self.is_waked.store(false, Ordering::Release);
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(())
+        IocpDriver::wake(self)
     }
 
     fn inner_handle(&self) -> crate::RawHandle {
@@ -327,10 +314,7 @@ impl Driver for IocpDriver {
     }
 
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker> {
-        std::sync::Arc::new(crate::driver::iocp::inner::IocpWaker {
-            port: self.port.clone(),
-            is_waked: self.is_waked.clone(),
-        })
+        IocpDriver::create_waker(self)
     }
 
     fn driver_id(&self) -> usize {

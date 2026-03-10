@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 
 #[derive(Debug, Clone, Copy)]
-pub enum IocpErrorContext {
+pub(crate) enum IocpErrorContext {
     DriverInit,
     CompletionWait,
     Submission,

@@ -712,11 +712,21 @@ struct PoolCacheInner {
 
 struct ThreadLocalPoolCache(Cell<PoolCacheInner>);
 
+impl ThreadLocalPoolCache {
+    /// 构造一个新的空缓存。由于字段是简单的原始类型和指针，此构造函数是 const 的。
+    const fn new() -> Self {
+        Self(Cell::new(PoolCacheInner {
+            ptr: std::ptr::null(),
+            balance: 0,
+        }))
+    }
+}
+
 impl Drop for ThreadLocalPoolCache {
     fn drop(&mut self) {
         let inner = self.0.get();
         if inner.balance > 0 && !inner.ptr.is_null() {
-            // Flush remaining credits on thread exit
+            // 线程退出时刷新剩余的引用计数
             for _ in 0..inner.balance {
                 unsafe {
                     Arc::decrement_strong_count(inner.ptr);
@@ -727,12 +737,17 @@ impl Drop for ThreadLocalPoolCache {
 }
 
 thread_local! {
-    static POOL_CACHE: ThreadLocalPoolCache = const {
-        ThreadLocalPoolCache(Cell::new(PoolCacheInner {
-            ptr: std::ptr::null(),
-            balance: 0,
-        }))
-    };
+    /// 缓存当前线程使用的全局池引用计数。
+    ///
+    /// 在 Windows GNU 平台上，Clippy 可能会对常量初始化产生误报，
+    /// 这里通过重构为直接存储并使用 const 块来优化。
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), allow(clippy::missing_const_for_thread_local))]
+    static POOL_CACHE: ThreadLocalPoolCache = const { ThreadLocalPoolCache::new() };
+}
+
+#[inline]
+fn with_pool_cache<R>(f: impl FnOnce(&ThreadLocalPoolCache) -> R) -> R {
+    POOL_CACHE.with(f)
 }
 
 impl BackingPool for SlotBasedPool {
@@ -775,7 +790,7 @@ impl BackingPool for SlotBasedPool {
     fn pool_data(&self) -> NonNull<()> {
         let current_ptr = Arc::as_ptr(&self.pool);
 
-        POOL_CACHE.with(|cache| {
+        with_pool_cache(|cache| {
             let mut inner = cache.0.get();
 
             if inner.ptr == current_ptr {
@@ -863,7 +878,7 @@ unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams)
     let slot_idx = crate::heap::slot::SlotIndex(slot_idx_val);
 
     // Try recycle
-    let recycled = POOL_CACHE.with(|cache| {
+    let recycled = with_pool_cache(|cache| {
         let mut inner = cache.0.get();
         if inner.ptr == raw_ptr && inner.balance < ARC_CACHE_LIMIT as u32 {
             inner.balance += 1;

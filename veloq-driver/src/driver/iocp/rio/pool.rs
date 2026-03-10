@@ -16,38 +16,38 @@ use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIO_BUFFERID, RIORESULT, 
 const UDP_RECV_POOL_MIN_CREDITS: usize = 2;
 const UDP_RECV_POOL_INITIAL_CREDITS: usize = 4;
 const UDP_RECV_POOL_MAX_CREDITS: usize = 16;
-pub const UDP_RECV_POOL_QUEUE_CAP: usize = 256;
+pub(crate) const UDP_RECV_POOL_QUEUE_CAP: usize = 256;
 
-pub const POOL_CTX_TAG: usize = 1;
+pub(crate) const POOL_CTX_TAG: usize = 1;
 
-pub struct UdpRecvDatagram {
-    pub buf: FixedBuf,
-    pub addr: SockAddrStorage,
-    pub addr_len: i32,
+pub(crate) struct UdpRecvDatagram {
+    pub(crate) buf: FixedBuf,
+    pub(crate) addr: SockAddrStorage,
+    pub(crate) addr_len: i32,
 }
 
-pub struct UdpRecvPoolSlot {
-    pub buf: FixedBuf,
-    pub addr: Box<SockAddrStorage>,
-    pub addr_buf_id: RIO_BUFFERID,
-    pub in_flight: bool,
-    pub stop_requested: bool,
+pub(crate) struct UdpRecvPoolSlot {
+    pub(crate) buf: FixedBuf,
+    pub(crate) addr: Box<SockAddrStorage>,
+    pub(crate) addr_buf_id: RIO_BUFFERID,
+    pub(crate) in_flight: bool,
+    pub(crate) stop_requested: bool,
 }
 
-pub struct UdpRecvPool {
-    pub slots: Vec<UdpRecvPoolSlot>,
-    pub queue: VecDeque<UdpRecvDatagram>,
-    pub waiters: VecDeque<(usize, u32)>,
-    pub spare_bufs: VecDeque<FixedBuf>,
-    pub min_credits: usize,
-    pub max_credits: usize,
-    pub target_credits: usize,
-    pub idle_hits: u32,
-    pub state: UdpPoolState,
+pub(crate) struct UdpRecvPool {
+    pub(crate) slots: Vec<UdpRecvPoolSlot>,
+    pub(crate) queue: VecDeque<UdpRecvDatagram>,
+    pub(crate) waiters: VecDeque<(usize, u32)>,
+    pub(crate) spare_bufs: VecDeque<FixedBuf>,
+    pub(crate) min_credits: usize,
+    pub(crate) max_credits: usize,
+    pub(crate) target_credits: usize,
+    pub(crate) idle_hits: u32,
+    pub(crate) state: UdpPoolState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UdpPoolState {
+pub(crate) enum UdpPoolState {
     Running,
     Draining,
     Closed,
@@ -72,25 +72,25 @@ struct CompletionActions {
 #[cfg(test)]
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-pub struct UdpRecvPoolDebugStats {
-    pub min_credits: usize,
-    pub max_credits: usize,
-    pub target_credits: usize,
-    pub slots_len: usize,
-    pub in_flight: usize,
-    pub waiters_len: usize,
-    pub queue_len: usize,
-    pub idle_hits: u32,
+pub(crate) struct UdpRecvPoolDebugStats {
+    pub(crate) min_credits: usize,
+    pub(crate) max_credits: usize,
+    pub(crate) target_credits: usize,
+    pub(crate) slots_len: usize,
+    pub(crate) in_flight: usize,
+    pub(crate) waiters_len: usize,
+    pub(crate) queue_len: usize,
+    pub(crate) idle_hits: u32,
 }
 
-pub struct UdpPoolManager {
+pub(crate) struct UdpPoolManager {
     pub(crate) pool: Option<UdpRecvPool>,
     pub(crate) udp_ctx_map: FxHashMap<u32, usize>,
     pub(crate) udp_next_ctx: u32,
 }
 
 impl UdpPoolManager {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pool: None,
             udp_ctx_map: FxHashMap::default(),
@@ -103,7 +103,7 @@ impl UdpPoolManager {
     }
 
     #[inline]
-    pub fn encode_pool_context(actor_id: u32, token: u32) -> *const std::ffi::c_void {
+    pub(crate) fn encode_pool_context(actor_id: u32, token: u32) -> *const std::ffi::c_void {
         (((actor_id as usize) << 33) | ((token as usize) << 1) | POOL_CTX_TAG)
             as *const std::ffi::c_void
     }
@@ -341,7 +341,7 @@ impl UdpPoolManager {
         }
     }
 
-    pub fn rebalance_udp_pool(&mut self, ctx: &mut RioContext) -> io::Result<usize> {
+    pub(crate) fn rebalance_udp_pool(&mut self, ctx: &mut RioContext) -> io::Result<usize> {
         let (desired, state) = {
             let pool = self
                 .pool
@@ -445,17 +445,20 @@ impl UdpPoolManager {
         });
 
         op.platform_data.rio_pool_waiting = false;
-        op.platform_data.lifecycle = OpLifecycle::Completed(Ok(datagram_len));
+        op.platform_data.lifecycle = OpLifecycle::Completed;
         let event = CompletionEvent {
             user_data: encode_completion_token(user_data, expected_generation),
             res: datagram_len.min(i32::MAX as usize) as i32,
             flags: 0,
         };
-        comp.table.record_completion(event);
+        let payload = unsafe { (*slot.payload.get()).take() };
+        let detail = unsafe { (*slot.result.get()).take() };
+        comp.table
+            .record_completion_with_data(event, payload, detail);
         comp.events.push(event);
         let _ = unsafe { (*slot.op.get()).take() };
         let _ = std::mem::take(&mut op.platform_data);
-        ops.free_indices.push(user_data);
+        comp.ops.shared.push_free(user_data);
         true
     }
 
@@ -502,7 +505,7 @@ impl UdpPoolManager {
         }
     }
 
-    pub fn try_submit_udp_recv_stream_pooled(
+    pub(crate) fn try_submit_udp_recv_stream_pooled(
         &mut self,
         stream_op: &mut crate::op::UdpRecvStream,
         uid: (usize, u32),
@@ -531,7 +534,7 @@ impl UdpPoolManager {
         Ok((SubmissionResult::Pending, total_submissions))
     }
 
-    pub fn try_refill_udp_pool(
+    pub(crate) fn try_refill_udp_pool(
         &mut self,
         buf: FixedBuf,
         ctx: &mut RioContext,
@@ -544,7 +547,7 @@ impl UdpPoolManager {
         Ok(total_submissions)
     }
 
-    pub fn cancel_udp_recv_waiter(&mut self, uid: (usize, u32), ctx: &mut RioContext) {
+    pub(crate) fn cancel_udp_recv_waiter(&mut self, uid: (usize, u32), ctx: &mut RioContext) {
         let (user_data, generation) = uid;
         if let Some(pool) = self.pool.as_mut() {
             pool.waiters.retain(|&(ud, waiter_generation)| {
@@ -554,7 +557,7 @@ impl UdpPoolManager {
         let _ = self.rebalance_udp_pool(ctx);
     }
 
-    pub fn ack_udp_pool_completion(&mut self, completion_generation: u32) -> Option<usize> {
+    pub(crate) fn ack_udp_pool_completion(&mut self, completion_generation: u32) -> Option<usize> {
         self.udp_ctx_map.remove(&completion_generation)
     }
 
@@ -624,7 +627,7 @@ impl UdpPoolManager {
         }
     }
 
-    pub fn handle_completion(
+    pub(crate) fn handle_completion(
         &mut self,
         completion: (usize, &RIORESULT),
         comp: &mut RioCompletionContext<'_>,
@@ -657,17 +660,17 @@ impl UdpPoolManager {
         submissions
     }
 
-    pub fn handle_completion_drain_only(&mut self) {
+    pub(crate) fn handle_completion_drain_only(&mut self) {
         let _ = self.pool.as_mut().map(|_| PoolCompletionEvent::PoolMissing);
     }
 
-    pub fn begin_udp_pool_shutdown(&mut self) {
+    pub(crate) fn begin_udp_pool_shutdown(&mut self) {
         if let Some(pool) = self.pool.as_mut() {
             Self::begin_draining(pool);
         }
     }
 
-    pub fn cleanup_shutdown_udp_pool_if_drained(&mut self, ctx: &mut RioContext) -> bool {
+    pub(crate) fn cleanup_shutdown_udp_pool_if_drained(&mut self, ctx: &mut RioContext) -> bool {
         let drained = self.pool.as_ref().is_some_and(|pool| {
             !matches!(pool.state, UdpPoolState::Running)
                 && pool.slots.iter().all(|slot| !slot.in_flight)
@@ -688,7 +691,7 @@ impl UdpPoolManager {
         true
     }
 
-    pub fn forget_in_flight_and_deregister_rest(&mut self, ctx: &mut RioContext) {
+    pub(crate) fn forget_in_flight_and_deregister_rest(&mut self, ctx: &mut RioContext) {
         if let Some(pool) = self.pool.take() {
             for slot in pool.slots {
                 if slot.in_flight {
@@ -702,7 +705,7 @@ impl UdpPoolManager {
     }
 
     #[cfg(test)]
-    pub fn udp_pool_debug_stats(&self) -> Option<UdpRecvPoolDebugStats> {
+    pub(crate) fn udp_pool_debug_stats(&self) -> Option<UdpRecvPoolDebugStats> {
         self.pool.as_ref().map(|pool| UdpRecvPoolDebugStats {
             min_credits: pool.min_credits,
             max_credits: pool.max_credits,

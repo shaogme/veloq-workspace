@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 use std::rc::Weak;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_driver::driver::PlatformDriver;
+use veloq_driver::driver::{Driver, PlatformDriver};
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 use crate::runtime::executor::ExecutorHandle;
@@ -20,6 +20,7 @@ use crate::runtime::join::{JoinHandle, LocalJoinHandle};
 use crate::runtime::task::{SpawnedTask, Task};
 
 thread_local! {
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), allow(clippy::missing_const_for_thread_local))]
     static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
 }
 
@@ -70,7 +71,7 @@ pub fn try_current() -> Option<RuntimeContext> {
 pub fn submit<T, S>(submitter: &S, op: Op<T>) -> S::Future<T>
 where
     S: OpSubmitter,
-    T: IntoPlatformOp<PlatformDriver> + 'static,
+    T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + 'static,
 {
     let driver = CONTEXT
         .with(|ctx| {

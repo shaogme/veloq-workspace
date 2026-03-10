@@ -7,9 +7,9 @@ use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIO_BUFFERID, RIO_RQ, WSAGetLastError};
 
-pub const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0 as RIO_BUFFERID;
+pub(crate) const RIO_INVALID_BUFFERID: RIO_BUFFERID = 0 as RIO_BUFFERID;
 
-pub struct RioRegistry {
+pub(crate) struct RioRegistry {
     pub(crate) chunk_registry: Vec<RIO_BUFFERID>,
     /// RIO Registration for Slab Pages (for Address Buffers)
     /// Maps PageIndex -> (RIO_BUFFERID, BaseAddress, Length)
@@ -21,7 +21,7 @@ pub struct RioRegistry {
 }
 
 impl RioRegistry {
-    pub fn new(rq_depth: u32) -> Self {
+    pub(crate) fn new(rq_depth: u32) -> Self {
         Self {
             chunk_registry: Vec::new(),
             slab_rio_pages: Vec::new(),
@@ -35,7 +35,7 @@ impl RioRegistry {
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
 
-    pub fn resolve_buffer_id(
+    pub(crate) fn resolve_buffer_id(
         &mut self,
         buf: &FixedBuf,
         env: RioEnv<'_>,
@@ -102,7 +102,7 @@ impl RioRegistry {
         }
     }
 
-    pub fn prepare_data_submission(
+    pub(crate) fn prepare_data_submission(
         &mut self,
         buf: &FixedBuf,
         len: u32,
@@ -117,11 +117,11 @@ impl RioRegistry {
         Ok(rio_buf)
     }
 
-    pub fn resize_registered_rqs(&mut self, _size: usize) {}
+    pub(crate) fn resize_registered_rqs(&mut self, _size: usize) {}
 
-    pub fn clear_registered_rq(&mut self, _idx: usize) {}
+    pub(crate) fn clear_registered_rq(&mut self, _idx: usize) {}
 
-    pub fn register_chunk(
+    pub(crate) fn register_chunk(
         &mut self,
         id: u16,
         mem: (*const u8, usize),
@@ -154,7 +154,7 @@ impl RioRegistry {
         Ok(())
     }
 
-    pub fn ensure_slab_page_registration(
+    pub(crate) fn ensure_slab_page_registration(
         &mut self,
         page_idx: usize,
         resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
@@ -188,7 +188,11 @@ impl RioRegistry {
         Ok(())
     }
 
-    pub fn create_rq(&mut self, target: (HANDLE, IoFd), env: RioEnv<'_>) -> io::Result<RIO_RQ> {
+    pub(crate) fn create_rq(
+        &mut self,
+        target: (HANDLE, IoFd),
+        env: RioEnv<'_>,
+    ) -> io::Result<RIO_RQ> {
         let (handle, fd) = target;
         let create_fn = env.dispatch.create_rq;
 
@@ -221,7 +225,7 @@ impl RioRegistry {
         Ok(rq)
     }
 
-    pub fn deregister_heap_buffer_for_buf(&mut self, buf: &FixedBuf, env: RioEnv<'_>) {
+    pub(crate) fn deregister_heap_buffer_for_buf(&mut self, buf: &FixedBuf, env: RioEnv<'_>) {
         let info = buf.resolve_region_info();
         if info.id != u16::MAX {
             return;
@@ -234,7 +238,7 @@ impl RioRegistry {
         }
     }
 
-    pub fn cleanup_deregister(&mut self, env: RioEnv<'_>) {
+    pub(crate) fn cleanup_deregister(&mut self, env: RioEnv<'_>) {
         use std::collections::HashSet;
         let mut deregistered = HashSet::new();
 
