@@ -522,15 +522,23 @@ fn test_multithread_tcp_echo() {
                     crate::tests::timeout_op("server", "accept", 5, Arc::new(listener).accept())
                         .await
                         .expect("Accept failed");
-                let buf = crate::runtime::context::alloc(size);
-
-                let (result, buf) =
-                    crate::tests::timeout_op("server", "recv", 5, stream.recv(buf)).await;
-                let bytes = result.expect("Recv failed");
+                let expect = b"Hello from worker 1!";
+                let mut recv_buf = crate::runtime::context::alloc(size);
+                let mut received = Vec::with_capacity(expect.len());
+                while received.len() < expect.len() {
+                    let (result, buf) =
+                        crate::tests::timeout_op("server", "recv", 5, stream.recv(recv_buf)).await;
+                    recv_buf = buf;
+                    let n = result.expect("Recv failed");
+                    assert!(n > 0, "Peer closed before sending full request");
+                    let remain = expect.len() - received.len();
+                    received.extend_from_slice(&recv_buf.as_slice()[..n.min(remain)]);
+                }
+                assert_eq!(received.as_slice(), expect);
 
                 // Echo back
                 let mut echo_buf = crate::runtime::context::alloc(size);
-                echo_buf.as_slice_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
+                echo_buf.as_slice_mut()[..expect.len()].copy_from_slice(expect);
 
                 let (result, _) =
                     crate::tests::timeout_op("server", "send", 5, stream.send(echo_buf)).await;
@@ -565,12 +573,19 @@ fn test_multithread_tcp_echo() {
                 let _sent = result.expect("Send failed");
 
                 // Receive echo
-                let recv_buf = crate::runtime::context::alloc(size);
-                let (result, recv_buf) =
-                    crate::tests::timeout_op("client", "recv", 5, stream.recv(recv_buf)).await;
-                let _received = result.expect("Recv failed");
+                let mut recv_buf = crate::runtime::context::alloc(size);
+                let mut echoed = Vec::with_capacity(data.len());
+                while echoed.len() < data.len() {
+                    let (result, buf) =
+                        crate::tests::timeout_op("client", "recv", 5, stream.recv(recv_buf)).await;
+                    recv_buf = buf;
+                    let n = result.expect("Recv failed");
+                    assert!(n > 0, "Peer closed before echo completed");
+                    let remain = data.len() - echoed.len();
+                    echoed.extend_from_slice(&recv_buf.as_slice()[..n.min(remain)]);
+                }
 
-                assert_eq!(&recv_buf.as_slice()[..data.len()], data);
+                assert_eq!(echoed.as_slice(), data);
                 println!("Client received correct echo");
             });
 
