@@ -524,9 +524,13 @@ impl<'a> RioCompletionRouter<'a> {
             return;
         };
 
-        let mut consume_outstanding = || {
+        // completed_count is consumed by strict-close IOCP drain as op progress,
+        // so only count completions that actually advance an op lifecycle.
+        let mut consume_outstanding = |count_progress: bool| {
             *self.outstanding_count = self.outstanding_count.saturating_sub(1);
-            self.completed_count += 1;
+            if count_progress {
+                self.completed_count += 1;
+            }
         };
 
         match kind {
@@ -535,17 +539,17 @@ impl<'a> RioCompletionRouter<'a> {
                 generation,
             } => {
                 let Some(&handle) = self.actor_routes.get(&actor_id) else {
-                    consume_outstanding();
+                    consume_outstanding(false);
                     return;
                 };
                 let (pool_submissions, remove_actor) = {
                     let Some(actor) = self.actors.get_mut(&handle) else {
-                        consume_outstanding();
+                        consume_outstanding(false);
                         return;
                     };
                     let Some(slot_idx) = actor.pool_manager.ack_udp_pool_completion(generation)
                     else {
-                        consume_outstanding();
+                        consume_outstanding(false);
                         return;
                     };
                     let mut ctx = RioContext {
@@ -569,7 +573,7 @@ impl<'a> RioCompletionRouter<'a> {
                     self.actors.remove(&handle);
                     self.actor_routes.remove(&actor_id);
                 }
-                consume_outstanding();
+                consume_outstanding(false);
                 *self.outstanding_count += pool_submissions;
             }
             RioCompletionKind::Op {
@@ -577,17 +581,18 @@ impl<'a> RioCompletionRouter<'a> {
                 generation,
             } => {
                 if user_data >= self.ops.local.len() {
-                    consume_outstanding();
+                    consume_outstanding(false);
                     return;
                 }
 
                 let op = &mut self.ops.local[user_data];
                 let slot = &self.ops.shared.slots[user_data];
                 if op.platform_data.generation != generation {
-                    consume_outstanding();
+                    consume_outstanding(false);
                     return;
                 }
 
+                let mut made_progress = false;
                 if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
                     let result = if res.Status == 0 {
                         Ok(res.BytesTransferred as usize)
@@ -604,6 +609,7 @@ impl<'a> RioCompletionRouter<'a> {
                     unsafe { *slot.result.get() = Some(result_for_slot) };
                     slot.state.store(STATE_COMPLETED, Ordering::Release);
                     slot.waker.wake();
+                    made_progress = true;
                 } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
                     if op.platform_data.rio_needs_drain {
                         op.platform_data.rio_drained = true;
@@ -615,9 +621,10 @@ impl<'a> RioCompletionRouter<'a> {
                         let _ = std::mem::take(&mut op.platform_data);
                         self.ops.free_indices.push(user_data);
                     }
+                    made_progress = true;
                 }
 
-                consume_outstanding();
+                consume_outstanding(made_progress);
             }
         }
     }
