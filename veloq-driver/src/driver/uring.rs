@@ -11,7 +11,8 @@ pub mod submit;
 pub use inner::{UringDriver, UringOpState};
 
 use crate::driver::{
-    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    SharedDetachedPayloadTable, SubmitBinder,
 };
 use inner::UringWaker;
 use op::UringOp;
@@ -186,6 +187,10 @@ impl Driver for UringDriver {
 
     fn completion_table(&self) -> SharedCompletionTable {
         self.completion_table.clone()
+    }
+
+    fn detached_payload_table(&self) -> SharedDetachedPayloadTable {
+        self.detached_payloads.clone()
     }
 
     fn wait_and_drain_completions(

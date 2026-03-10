@@ -15,15 +15,14 @@ use std::{
 };
 
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
 use tracing::trace;
 use veloq_buf::FixedBuf;
 
 use crate::RawHandle;
 use crate::SockAddrStorage;
 use crate::driver::{
-    Driver, PlatformDriver, SharedCompletionTable, SubmitBinder, encode_completion_token,
-    event_res_to_io,
+    Driver, PlatformDriver, SharedCompletionTable, SharedDetachedPayloadTable, SubmitBinder,
+    decode_completion_token, encode_completion_token, event_res_to_io,
 };
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
@@ -156,49 +155,6 @@ pub trait IntoPlatformOp<D: Driver>: Sized + std::marker::Send {
     }
 }
 
-/// Shared storage for detached operation user payload.
-///
-/// This keeps the user payload alive independently from the detached future,
-/// while allowing platform ops to hold a stable raw pointer into the same object.
-pub struct SharedUserPayload<T> {
-    inner: Arc<Mutex<Option<T>>>,
-}
-
-impl<T> SharedUserPayload<T> {
-    pub fn new(value: T) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Some(value))),
-        }
-    }
-
-    pub fn user_ptr(&self) -> std::ptr::NonNull<T> {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("SharedUserPayload mutex poisoned while building kernel op");
-        let value = guard
-            .as_mut()
-            .expect("SharedUserPayload missing value while building kernel op");
-        std::ptr::NonNull::from(value)
-    }
-
-    pub fn into_inner(self) -> T {
-        self.inner
-            .lock()
-            .expect("SharedUserPayload mutex poisoned while extracting result")
-            .take()
-            .expect("SharedUserPayload already consumed")
-    }
-}
-
-impl<T> Clone for SharedUserPayload<T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
 // ============================================================================
 // Op (Generic Data Carrier)
 // ============================================================================
@@ -232,10 +188,11 @@ impl<T> Op<T> {
         match driver.reserve_op() {
             Ok((user_data, generation)) => {
                 let (kernel_op, payload) = data.into_kernel_and_payload();
-                let mut payload = Some(payload);
                 let mut op_platform = Some(kernel_op);
                 let token = encode_completion_token(user_data, generation);
                 let completion_table = driver.completion_table();
+                let detached_payloads = driver.detached_payload_table();
+                detached_payloads.store(token, Box::new(payload));
 
                 if let Err(e) = driver
                     .submit(user_data, &mut op_platform, SubmitBinder::new())
@@ -246,22 +203,24 @@ impl<T> Op<T> {
                     // If the platform op is returned, propagate immediate failure with payload.
                     // Otherwise, fall back to slot-monitoring path and let generation check resolve.
                     if let Some(op) = op_platform.take() {
-                        let payload = payload
-                            .take()
-                            .expect("Payload missing while recovering submit failure");
+                        let payload = detached_payloads
+                            .try_take(token)
+                            .and_then(|boxed| boxed.downcast::<T::UserPayload>().ok())
+                            .map(|boxed| *boxed)
+                            .expect("Detached payload missing while recovering submit failure");
                         drop(op);
                         DetachedOp {
                             completion_table: None,
+                            detached_payloads: None,
                             token: 0,
-                            payload: None,
                             immediate_failure: Some((e, T::from_user_payload(payload))),
                             _phantom: std::marker::PhantomData,
                         }
                     } else {
                         DetachedOp {
                             completion_table: Some(completion_table),
+                            detached_payloads: Some(detached_payloads),
                             token,
-                            payload,
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
                         }
@@ -269,8 +228,8 @@ impl<T> Op<T> {
                 } else {
                     DetachedOp {
                         completion_table: Some(completion_table),
+                        detached_payloads: Some(detached_payloads),
                         token,
-                        payload,
                         immediate_failure: None,
                         _phantom: std::marker::PhantomData,
                     }
@@ -281,8 +240,8 @@ impl<T> Op<T> {
                 // Return DetachedOp with immediate failure.
                 DetachedOp {
                     completion_table: None,
+                    detached_payloads: None,
                     token: 0,
-                    payload: None,
                     immediate_failure: Some((e, data)),
                     _phantom: std::marker::PhantomData,
                 }
@@ -312,10 +271,10 @@ where
     T: IntoPlatformOp<D>,
 {
     completion_table: Option<SharedCompletionTable>,
+    detached_payloads: Option<SharedDetachedPayloadTable>,
     token: u64,
-    payload: Option<T::UserPayload>,
     immediate_failure: Option<(std::io::Error, T)>,
-    _phantom: std::marker::PhantomData<T>,
+    _phantom: std::marker::PhantomData<(T, D)>,
 }
 
 // DetachedOp is Send/Sync if the Op data is Send and the Driver Op is Send (implied by SlotTable<Op> bound).
@@ -347,10 +306,24 @@ where
             .as_ref()
             .expect("DetachedOp missing completion_table but no immediate_failure");
         if let Some(event) = table.try_take(this.token) {
-            let payload = this
-                .payload
-                .take()
-                .expect("DetachedOp payload missing on completion");
+            let payload_table = this
+                .detached_payloads
+                .as_ref()
+                .expect("DetachedOp missing detached payload table on completion");
+            let payload = match payload_table
+                .try_take(this.token)
+                .and_then(|boxed| boxed.downcast::<T::UserPayload>().ok())
+                .map(|boxed| *boxed)
+            {
+                Some(payload) => payload,
+                None => {
+                    let (idx, generation) = decode_completion_token(this.token);
+                    let err = std::io::Error::other(format!(
+                        "Detached payload lost for idx={idx}, generation={generation}"
+                    ));
+                    return Poll::Ready(OpResult::Lost(err));
+                }
+            };
             let data = T::from_user_payload(payload);
             return Poll::Ready(OpResult::Completed(event_res_to_io(event.res), data));
         }

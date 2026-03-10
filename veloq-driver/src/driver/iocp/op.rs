@@ -13,8 +13,7 @@ use crate::driver::iocp::rio::RioState;
 use crate::driver::iocp::submit::{self, SubmissionResult};
 use crate::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, Open, ReadFixed, Recv,
-    Send as OpSend, SendTo, SharedUserPayload, SyncFileRange, Timeout, UdpRecvStream, UdpRefill,
-    Wakeup, WriteFixed,
+    Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
 };
 use std::io;
 use std::mem::ManuallyDrop;
@@ -150,7 +149,7 @@ macro_rules! define_iocp_ops {
 
         $(
             impl IntoPlatformOp<IocpDriver> for $OpType {
-                type UserPayload = SharedUserPayload<$OpType>;
+                type UserPayload = Box<$OpType>;
 
                 fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
@@ -160,8 +159,8 @@ macro_rules! define_iocp_ops {
                         get_fd: $get_fd,
                     };
 
-                    let user = SharedUserPayload::new(self);
-                    let user_ptr = user.user_ptr();
+                    let mut user = Box::new(self);
+                    let user_ptr = std::ptr::NonNull::from(user.as_mut());
                     let payload = define_iocp_ops!(@construct user_ptr, $($construct)?, $OpType $(, $Payload)?);
 
                     let op = IocpKernelOp {
@@ -193,7 +192,7 @@ macro_rules! define_iocp_ops {
     (@construct $user_ptr:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user_ptr) };
 
     // Default destruct: return user payload
-    (@destruct $user_payload:expr, ) => { $user_payload.into_inner() };
+    (@destruct $user_payload:expr, ) => { *$user_payload };
     // Custom destruct
     (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
 }
@@ -305,7 +304,7 @@ define_iocp_ops! {
             user,
             accept_buffer: [0; 288],
         },
-        destruct: |user: SharedUserPayload<Accept>| user.into_inner(),
+        destruct: |user: Box<Accept>| *user,
     },
     SendTo {
         field: send_to,
@@ -333,7 +332,7 @@ define_iocp_ops! {
                 addr_len,
             }
         },
-        destruct: |user: SharedUserPayload<SendTo>| user.into_inner(),
+        destruct: |user: Box<SendTo>| *user,
     },
     UdpRecvStream {
         field: udp_recv_stream,
@@ -355,7 +354,7 @@ define_iocp_ops! {
         drop: submit::drop_open,
         get_fd: submit::get_fd_open,
         construct: |user| OpenPayload { user },
-        destruct: |user: SharedUserPayload<Open>| user.into_inner(),
+        destruct: |user: Box<Open>| *user,
     },
     Wakeup {
         field: wakeup,
@@ -364,6 +363,6 @@ define_iocp_ops! {
         drop: submit::drop_wakeup,
         get_fd: submit::get_fd_wakeup,
         construct: |user| WakeupPayload { user },
-        destruct: |user: SharedUserPayload<Wakeup>| user.into_inner(),
+        destruct: |user: Box<Wakeup>| *user,
     },
 }

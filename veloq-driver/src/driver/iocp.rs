@@ -10,7 +10,8 @@ mod tests;
 use crate::driver::op_registry::OpEntry;
 use crate::driver::slot::STATE_SUBMITTED;
 use crate::driver::{
-    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+    Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    SharedDetachedPayloadTable, SubmitBinder,
 };
 use std::io;
 use std::sync::atomic::Ordering;
@@ -281,6 +282,10 @@ impl Driver for IocpDriver {
 
     fn completion_table(&self) -> SharedCompletionTable {
         self.completion_table.clone()
+    }
+
+    fn detached_payload_table(&self) -> SharedDetachedPayloadTable {
+        self.detached_payloads.clone()
     }
 
     fn wait_and_drain_completions(

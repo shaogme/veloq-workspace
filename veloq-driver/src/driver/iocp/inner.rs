@@ -8,7 +8,7 @@ use crate::driver::op_registry::OpRegistry;
 use crate::driver::slot::OverlappedEntry;
 use crate::driver::{
     CompletionEvent, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
-    encode_completion_token,
+    SharedDetachedPayloadTable, encode_completion_token,
 };
 
 use std::io;
@@ -97,6 +97,7 @@ pub struct IocpDriver {
     pub(crate) is_waked: Arc<AtomicBool>,
     pub(crate) completion_events: SharedCompletionQueue,
     pub(crate) completion_table: SharedCompletionTable,
+    pub(crate) detached_payloads: SharedDetachedPayloadTable,
 
     // RIO Support (required)
     pub(crate) rio_state: RioState,
@@ -219,6 +220,9 @@ impl IocpDriver {
             is_waked,
             completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
             completion_table: std::sync::Arc::new(crate::driver::CompletionTable::new(
+                entries as usize,
+            )),
+            detached_payloads: std::sync::Arc::new(crate::driver::DetachedPayloadTable::new(
                 entries as usize,
             )),
             rio_state,

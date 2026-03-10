@@ -13,7 +13,7 @@ use crate::driver::slot::STATE_SUBMITTED;
 use crate::driver::uring::op::UringOp;
 use crate::driver::{
     CompletionEvent, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
-    encode_completion_token,
+    SharedDetachedPayloadTable, encode_completion_token,
 };
 use crate::op::IntoPlatformOp;
 
@@ -102,10 +102,11 @@ pub struct UringDriver {
     pub(crate) pending_cancellations: VecDeque<usize>,
     pub(crate) completion_events: SharedCompletionQueue,
     pub(crate) completion_table: SharedCompletionTable,
+    pub(crate) detached_payloads: SharedDetachedPayloadTable,
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_token: Option<usize>,
-    pub(crate) waker_payload: Option<crate::op::SharedUserPayload<crate::op::Wakeup>>,
+    pub(crate) waker_payload: Option<Box<crate::op::Wakeup>>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
@@ -156,6 +157,9 @@ impl UringDriver {
             pending_cancellations: VecDeque::new(),
             completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
             completion_table: std::sync::Arc::new(crate::driver::CompletionTable::new(
+                entries as usize,
+            )),
+            detached_payloads: std::sync::Arc::new(crate::driver::DetachedPayloadTable::new(
                 entries as usize,
             )),
             waker_fd: Arc::new(EventFd { fd: waker_fd }),
