@@ -5,8 +5,7 @@ use super::submit;
 use crate::config::IocpConfig;
 use crate::driver::RemoteWaker;
 use crate::driver::op_registry::OpRegistry;
-use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED}; // Removed DetachedCompleter if unused, or keep if used in public API
-// Removed STATE_SUBMITTED if unused here.
+use crate::driver::slot::{OverlappedEntry, STATE_COMPLETED};
 use crate::driver::iocp::op::IocpOp;
 
 use std::io;
@@ -35,15 +34,14 @@ pub enum OpLifecycle {
     Completed(io::Result<usize>), // Stores the result here!
     /// Cancelled by user
     Cancelled,
-    /// Detached completer running or done (Legacy, keeping for compatibility if generic DetachedCompleter logic is used)
+    /// Detached completion notifier path.
     Detached,
 }
 
 pub struct IocpOpState {
     pub generation: u32,
     pub lifecycle: OpLifecycle,
-    pub detached_completer:
-        Option<Box<dyn crate::driver::DetachedCompleter<crate::driver::iocp::op::IocpOp>>>,
+    pub detached_notifier: Option<Box<dyn crate::driver::DetachedCompleter>>,
     pub timer_id: Option<TaskId>,
     pub is_background: bool,
     // For RIO cancel path: the slot can be recycled only after both:
@@ -59,7 +57,7 @@ impl Default for IocpOpState {
         Self {
             generation: 0,
             lifecycle: OpLifecycle::Pending,
-            detached_completer: None,
+            detached_notifier: None,
             timer_id: None,
             is_background: false,
             rio_needs_drain: false,
@@ -307,7 +305,7 @@ impl IocpDriver {
 
         for &user_data in &timer_buffer {
             let is_detached = if let Some(op) = ops_local.get_mut(user_data) {
-                op.platform_data.detached_completer.is_some()
+                op.platform_data.detached_notifier.is_some()
             } else {
                 continue;
             };
@@ -317,7 +315,7 @@ impl IocpDriver {
 
                 if let Some(op) = ops_local.get_mut(user_data)
                     && matches!(op.platform_data.lifecycle, OpLifecycle::InFlight)
-                    && let Some(completer) = op.platform_data.detached_completer.take()
+                    && let Some(completer) = op.platform_data.detached_notifier.take()
                 {
                     op.platform_data.lifecycle = OpLifecycle::Detached;
                     op.platform_data.timer_id = None;
@@ -325,7 +323,8 @@ impl IocpDriver {
                     let resources = unsafe { (*slot.op.get()).take() };
 
                     if let Some(res) = resources {
-                        completer.complete(Ok(0), res);
+                        drop(res);
+                        completer.complete(Ok(0));
                     }
                     unsafe { *slot.result.get() = Some(Ok(0)) };
                     slot.state.store(STATE_COMPLETED, Ordering::Release);
@@ -399,12 +398,13 @@ impl IocpDriver {
                     // Manually implement remove logic on local
                     let _data = std::mem::take(&mut op.platform_data);
                     self.ops.free_indices.push(user_data);
-                } else if let Some(completer) = op.platform_data.detached_completer.take() {
+                } else if let Some(completer) = op.platform_data.detached_notifier.take() {
                     op.platform_data.lifecycle = OpLifecycle::Detached;
                     let resource = unsafe { (*slot.op.get()).take() };
                     if let Some(iocp_op) = resource {
                         let res = unsafe { (*slot.result.get()).take().unwrap() };
-                        completer.complete(res, iocp_op);
+                        drop(iocp_op);
+                        completer.complete(res);
                     }
                     // Remove from registry
                     // self.ops.remove(user_data);
@@ -684,13 +684,14 @@ impl IocpDriver {
         Ok(())
     }
 
-    fn cleanup_detached_completers(&mut self) {
+    fn cleanup_detached_notifiers(&mut self) {
         for (user_data, op_entry) in self.ops.local.iter_mut().enumerate() {
             let slot = &self.ops.shared.slots[user_data];
-            if let Some(completer) = op_entry.platform_data.detached_completer.take()
+            if let Some(completer) = op_entry.platform_data.detached_notifier.take()
                 && let Some(op) = unsafe { (*slot.op.get()).take() }
             {
-                completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)), op);
+                drop(op);
+                completer.complete(Err(io::Error::from(io::ErrorKind::Interrupted)));
             }
         }
     }
@@ -707,7 +708,7 @@ impl IocpDriver {
             self.rio_state.drain_outstanding_for(timeout)?;
         }
 
-        self.cleanup_detached_completers();
+        self.cleanup_detached_notifiers();
         self.closed = true;
         Ok(())
     }

@@ -18,22 +18,21 @@ pub trait Driver: 'static {
     /// Get the shared slot table if available.
     fn slot_table(&self) -> std::sync::Arc<slot::SlotTable<Self::Op>>;
 
-    /// Submit an operation with its resources directly.
-    /// Returns `Ok(Poll::...)` on success (Ready or Pending/Queued).
-    /// Returns `Err((Error, Op))` if submission failed and the Op was NOT consumed/stored.
+    /// Submit an operation to the driver.
     fn submit(
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,
-    ) -> Result<Poll<()>, io::Error>;
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>>;
 
-    /// Poll operation status.
+    /// Poll for operation completion.
     fn poll_op(
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-        op_out: &mut Option<Self::Op>,
-    ) -> Poll<io::Result<usize>>;
+        binder: PollBinder,
+    ) -> Outcome<Poll<io::Result<usize>>>;
 
     /// Submit queued operations to the kernel.
     fn submit_queue(&mut self) -> io::Result<()>;
@@ -86,12 +85,66 @@ pub trait RemoteWaker: Send + Sync {
 }
 
 /// A trait for processing detached completion logic.
-/// This allows the driver to pass ownership of the platform specific op back to the submitter.
-pub trait DetachedCompleter<Op>: Send {
-    fn complete(self: Box<Self>, res: io::Result<usize>, op: Op);
+pub trait DetachedCompleter: Send {
+    fn complete(self: Box<Self>, res: io::Result<usize>);
 }
 
 // Platform-specific driver implementations
+
+/// A wrapper for driver method return values that enforces resource state management.
+#[must_use]
+pub struct Outcome<T>(T);
+
+impl<T> Outcome<T> {
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+/// Binder for `submit` operation.
+pub struct SubmitBinder;
+
+impl SubmitBinder {
+    #[inline]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Finish submission with success. The Op is assumed to be held by the driver.
+    #[inline]
+    pub fn ok(self, poll: Poll<()>) -> Outcome<io::Result<Poll<()>>> {
+        Outcome(Ok(poll))
+    }
+
+    /// Finish submission with failure.
+    #[inline]
+    pub fn err(self, err: io::Error) -> Outcome<io::Result<Poll<()>>> {
+        Outcome(Err(err))
+    }
+}
+
+/// Binder for `poll_op` operation.
+pub struct PollBinder;
+
+impl PollBinder {
+    #[inline]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Op is ready.
+    #[inline]
+    pub fn ready(self, res: io::Result<usize>) -> Outcome<Poll<io::Result<usize>>> {
+        Outcome(Poll::Ready(res))
+    }
+
+    /// Op is still pending, it remains owned by the driver.
+    #[inline]
+    pub fn pending(self) -> Outcome<Poll<io::Result<usize>>> {
+        Outcome(Poll::Pending)
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) mod uring;

@@ -444,7 +444,8 @@ impl UdpPoolManager {
             return false;
         };
 
-        let stream_op: &mut UdpRecvStream = unsafe { &mut iocp_op.payload.udp_recv_stream };
+        let kernel = unsafe { &mut *iocp_op.payload.udp_recv_stream };
+        let stream_op: &mut UdpRecvStream = unsafe { kernel.user.as_mut() };
 
         let owned_datagram = datagram.take().unwrap();
         let datagram_len = owned_datagram.buf.len();

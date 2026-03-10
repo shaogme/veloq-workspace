@@ -9,7 +9,7 @@ mod tests;
 
 use crate::driver::op_registry::OpEntry;
 use crate::driver::slot::{STATE_COMPLETED, STATE_CONSUMED, STATE_SUBMITTED};
-use crate::driver::{Driver, RemoteWaker};
+use crate::driver::{Driver, Outcome, PollBinder, RemoteWaker, SubmitBinder};
 use std::io;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
@@ -47,14 +47,14 @@ impl Driver for IocpDriver {
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,
-    ) -> Result<Poll<()>, io::Error> {
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>> {
         if self.shutting_down {
-            return Err(io::Error::from_raw_os_error(
+            return binder.err(io::Error::from_raw_os_error(
                 windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
             ));
         }
         trace!(user_data, "Submitting op");
-        let mut submit_error: Option<io::Error> = None;
 
         let slots_per_page = self.ops.local.len();
         // On Windows, the slab is currently a single contiguous block (page 0).
@@ -74,7 +74,7 @@ impl Driver for IocpDriver {
                 None => panic!("Op not found"),
             };
 
-            let op = op_in.take().unwrap();
+            let op = op_in.take().expect("submit called with empty Option");
             unsafe { *slot.op.get() = Some(op) };
             slot.state.store(STATE_SUBMITTED, Ordering::Release);
 
@@ -124,11 +124,13 @@ impl Driver for IocpDriver {
                         )
                     };
                     if posted == 0 {
-                        *op_in = unsafe { (*slot.op.get()).take() };
+                        let op = unsafe { (*slot.op.get()).take().unwrap() };
+                        *op_in = Some(op);
                         unsafe { *slot.result.get() = None };
                         slot.state
                             .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
-                        submit_error = Some(io::Error::last_os_error());
+                        self.ops.remove(user_data);
+                        return binder.err(io::Error::last_os_error());
                     } else {
                         op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                         op_entry.platform_data.rio_pool_waiting = false;
@@ -157,31 +159,27 @@ impl Driver for IocpDriver {
                     op_entry.platform_data.rio_pool_waiting = false;
                 }
                 Err(e) => {
-                    *op_in = unsafe { (*slot.op.get()).take() };
+                    let op = unsafe { (*slot.op.get()).take().unwrap() };
+                    *op_in = Some(op);
                     unsafe { *slot.result.get() = None };
                     slot.state
                         .store(crate::driver::slot::STATE_EMPTY, Ordering::Release);
-                    submit_error = Some(e);
+                    self.ops.remove(user_data);
+                    return binder.err(e);
                 }
             }
         } // End of submission scope
 
-        if let Some(e) = submit_error {
-            // Reclaim reserved registry slot on submit failure.
-            self.ops.remove(user_data);
-            return Err(e);
-        }
-
         // Logic for detached completer
         // Access self.ops directly
-        let should_complete_detached = if let Some(op) = self.ops.get(user_data) {
+        let should_notify_detached = if let Some(op) = self.ops.get(user_data) {
             matches!(op.platform_data.lifecycle, OpLifecycle::Completed(_))
-                && op.platform_data.detached_completer.is_some()
+                && op.platform_data.detached_notifier.is_some()
         } else {
             false
         };
 
-        if should_complete_detached
+        if should_notify_detached
             && let Some((slot, entry)) = self.ops.get_slot_and_entry_mut(user_data)
         {
             if let OpLifecycle::Completed(result) = &entry.platform_data.lifecycle {
@@ -193,17 +191,18 @@ impl Driver for IocpDriver {
                     }
                 });
 
-                if let Some(completer) = entry.platform_data.detached_completer.take()
+                if let Some(completer) = entry.platform_data.detached_notifier.take()
                     && let Some(iocp_op) = unsafe { (*slot.op.get()).take() }
                 {
-                    completer.complete(res_copy, iocp_op);
+                    drop(iocp_op);
+                    completer.complete(res_copy);
                 }
             }
             let _ = std::mem::take(&mut entry.platform_data);
             self.ops.free_indices.push(user_data);
         }
 
-        Ok(Poll::Ready(()))
+        binder.ok(Poll::Ready(()))
     }
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()> {
@@ -290,8 +289,8 @@ impl Driver for IocpDriver {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-        op_out: &mut Option<Self::Op>,
-    ) -> Poll<io::Result<usize>> {
+        binder: PollBinder,
+    ) -> Outcome<Poll<io::Result<usize>>> {
         trace!(user_data, "IocpDriver::poll_op");
         // Check Slot Logic first
         let slot = &self.ops.shared.slots[user_data];
@@ -303,8 +302,7 @@ impl Driver for IocpDriver {
 
         if state == STATE_COMPLETED {
             let res = unsafe { (*slot.result.get()).take().expect("Result missing") };
-            *op_out = Some(unsafe { (*slot.op.get()).take().expect("Op missing") });
-
+            let _ = unsafe { (*slot.op.get()).take() };
             slot.state.store(STATE_CONSUMED, Ordering::Release);
             let entry = &self.ops.local[user_data];
             let can_recycle_now =
@@ -314,7 +312,7 @@ impl Driver for IocpDriver {
                 self.ops.remove(user_data);
             }
 
-            return Poll::Ready(res);
+            return binder.ready(res);
         }
 
         // Register waker if Pending
@@ -324,7 +322,7 @@ impl Driver for IocpDriver {
         let state = slot.state.load(Ordering::Acquire);
         if state == STATE_COMPLETED {
             let res = unsafe { (*slot.result.get()).take().expect("Result missing") };
-            *op_out = Some(unsafe { (*slot.op.get()).take().expect("Op missing") });
+            let _ = unsafe { (*slot.op.get()).take() };
             slot.state.store(STATE_CONSUMED, Ordering::Release);
             let entry = &self.ops.local[user_data];
             let can_recycle_now =
@@ -332,10 +330,10 @@ impl Driver for IocpDriver {
             if can_recycle_now {
                 self.ops.remove(user_data);
             }
-            return Poll::Ready(res);
+            return binder.ready(res);
         }
 
-        Poll::Pending
+        binder.pending()
     }
 
     fn submit_queue(&mut self) -> io::Result<()> {

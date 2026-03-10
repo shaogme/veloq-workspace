@@ -1,9 +1,9 @@
 //! IOCP Platform-Specific Operation Definitions
 //!
 //! This module defines:
-//! - `IocpOp`: The Type-Erased operation struct using Unions and VTables
+//! - `IocpKernelOp`: The Type-Erased kernel operation struct using Unions and VTables
 //! - `OpVTable`: The virtual table for dynamic dispatch without enums
-//! - `IntoPlatformOp` implementations using blind casting
+//! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
 use crate::SockAddrStorage;
 use crate::driver::PlatformOp;
@@ -66,14 +66,14 @@ pub struct SubmitContext<'a> {
 // ============================================================================
 
 pub type SubmitFn =
-    unsafe fn(op: &mut IocpOp, ctx: &mut SubmitContext) -> io::Result<SubmissionResult>;
+    unsafe fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> io::Result<SubmissionResult>;
 
 pub type OnCompleteFn =
-    unsafe fn(op: &mut IocpOp, result: usize, ext: &Extensions) -> io::Result<usize>;
+    unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> io::Result<usize>;
 
-pub type DropFn = unsafe fn(op: &mut IocpOp);
+pub type DropFn = unsafe fn(op: &mut IocpKernelOp);
 
-pub type GetFdFn = unsafe fn(op: &IocpOp) -> Option<IoFd>;
+pub type GetFdFn = unsafe fn(op: &IocpKernelOp) -> Option<IoFd>;
 
 pub struct OpVTable {
     pub submit: SubmitFn,
@@ -83,13 +83,13 @@ pub struct OpVTable {
 }
 
 // ============================================================================
-// IocpOp Struct & Union (Type-Erased)
+// IocpKernelOp Struct & Union (Type-Erased)
 // ============================================================================
 
 use std::ptr::NonNull;
 
 #[repr(C)]
-pub struct IocpOp {
+pub struct IocpKernelOp {
     /// Virtual Table for dynamic dispatch
     pub vtable: NonNull<OpVTable>,
 
@@ -100,9 +100,9 @@ pub struct IocpOp {
     pub payload: IocpOpPayload,
 }
 
-impl PlatformOp for IocpOp {}
+impl PlatformOp for IocpKernelOp {}
 
-impl IocpOp {
+impl IocpKernelOp {
     /// Helper to access the OverlappedEntry (header).
     /// Kept for compatibility with existing Driver code.
     pub fn entry_mut(&mut self) -> Option<&mut OverlappedEntry> {
@@ -114,7 +114,7 @@ impl IocpOp {
     }
 }
 
-impl Drop for IocpOp {
+impl Drop for IocpKernelOp {
     fn drop(&mut self) {
         unsafe { (self.vtable.as_ref().drop)(self) };
     }
@@ -149,7 +149,9 @@ macro_rules! define_iocp_ops {
 
         $(
             impl IntoPlatformOp<IocpDriver> for $OpType {
-                fn into_platform_op(self) -> IocpOp {
+                type UserPayload = Box<$OpType>;
+
+                fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
                         submit: $submit,
                         on_complete: define_iocp_ops!(@optional_complete $($complete)?),
@@ -157,68 +159,73 @@ macro_rules! define_iocp_ops {
                         get_fd: $get_fd,
                     };
 
-                    let payload = define_iocp_ops!(@construct self, $($construct)?, $OpType $(, $Payload)?);
+                    let mut user = Box::new(self);
+                    let user_ptr = std::ptr::NonNull::from(user.as_mut());
+                    let payload = define_iocp_ops!(@construct user_ptr, $($construct)?, $OpType $(, $Payload)?);
 
-                    IocpOp {
+                    let op = IocpKernelOp {
                         vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
                         header: OverlappedEntry::new(0),
                         payload: IocpOpPayload {
                             $field: ManuallyDrop::new(payload),
                         },
-                    }
+                    };
+                    (op, user)
                 }
 
-                fn from_platform_op(op: IocpOp) -> Self {
-                    let op = ManuallyDrop::new(op);
-                    let payload = unsafe {
-                        ManuallyDrop::into_inner(std::ptr::read(&op.payload.$field))
-                    };
+                fn from_user_payload(payload: Self::UserPayload) -> Self {
                     define_iocp_ops!(@destruct payload, $($destruct)?)
                 }
             }
         )+
     };
 
-    (@payload_type $OpType:ty) => { $OpType };
+    (@payload_type $OpType:ty) => { KernelRef<$OpType> };
     (@payload_type $OpType:ty, $Payload:ty) => { $Payload };
 
     (@optional_complete) => { None };
     (@optional_complete $fn:path) => { Some($fn) };
 
-    // Default construct: return self
-    (@construct $self:expr, , $OpType:ty) => { $self };
+    // Default construct: keep only a pointer to user payload
+    (@construct $user_ptr:expr, , $OpType:ty) => { KernelRef { user: $user_ptr } };
     // Custom construct
-    (@construct $self:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($self) };
+    (@construct $user_ptr:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user_ptr) };
 
-    // Default destruct: return payload (assumes payload is OpType)
-    (@destruct $payload:expr, ) => { $payload };
+    // Default destruct: return user payload
+    (@destruct $user_payload:expr, ) => { *$user_payload };
     // Custom destruct
-    (@destruct $payload:expr, $destruct:expr) => { ($destruct)($payload) };
+    (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
 }
 
 // ============================================================================
 // Payload Structures for Complex Ops
 // ============================================================================
 
+pub struct KernelRef<T> {
+    pub user: NonNull<T>,
+}
+
 pub struct AcceptPayload {
-    pub op: Accept,
+    pub user: NonNull<Accept>,
     pub accept_buffer: [u8; 288],
 }
 
 pub struct SendToPayload {
-    pub op: SendTo,
+    pub user: NonNull<SendTo>,
     pub wsabuf: WSABUF,
     pub addr: SockAddrStorage,
     pub addr_len: i32,
 }
 
 pub struct OpenPayload {
-    pub op: Open,
+    pub user: NonNull<Open>,
 }
 
 pub struct WakeupPayload {
-    pub op: Wakeup,
+    pub user: NonNull<Wakeup>,
 }
+
+pub type IocpOp = IocpKernelOp;
 
 // ============================================================================
 // Op Definitions
@@ -293,11 +300,11 @@ define_iocp_ops! {
         on_complete: submit::on_complete_accept,
         drop: submit::drop_accept,
         get_fd: submit::get_fd_accept,
-        construct: |op| AcceptPayload {
-            op,
+        construct: |user| AcceptPayload {
+            user,
             accept_buffer: [0; 288],
         },
-        destruct: |p: AcceptPayload| p.op,
+        destruct: |user: Box<Accept>| *user,
     },
     SendTo {
         field: send_to,
@@ -305,7 +312,8 @@ define_iocp_ops! {
         submit: submit::submit_send_to,
         drop: submit::drop_send_to,
         get_fd: submit::get_fd_send_to,
-        construct: |op: SendTo| {
+        construct: |user: std::ptr::NonNull<SendTo>| {
+            let op = unsafe { user.as_ref() };
             let (addr, raw_addr_len) = crate::socket_addr_to_storage(op.addr);
             let addr_len = if op.addr.is_ipv4() {
                 std::mem::size_of::<SOCKADDR_IN>() as i32
@@ -318,13 +326,13 @@ define_iocp_ops! {
                 buf: op.buf.as_slice().as_ptr() as *mut u8,
             };
             SendToPayload {
-                op,
+                user,
                 wsabuf,
                 addr,
                 addr_len,
             }
         },
-        destruct: |p: SendToPayload| p.op,
+        destruct: |user: Box<SendTo>| *user,
     },
     UdpRecvStream {
         field: udp_recv_stream,
@@ -345,8 +353,8 @@ define_iocp_ops! {
         submit: submit::submit_open,
         drop: submit::drop_open,
         get_fd: submit::get_fd_open,
-        construct: |op| OpenPayload { op },
-        destruct: |p: OpenPayload| p.op,
+        construct: |user| OpenPayload { user },
+        destruct: |user: Box<Open>| *user,
     },
     Wakeup {
         field: wakeup,
@@ -354,7 +362,7 @@ define_iocp_ops! {
         submit: submit::submit_wakeup,
         drop: submit::drop_wakeup,
         get_fd: submit::get_fd_wakeup,
-        construct: |op| WakeupPayload { op },
-        destruct: |p: WakeupPayload| p.op,
+        construct: |user| WakeupPayload { user },
+        destruct: |user: Box<Wakeup>| *user,
     },
 }

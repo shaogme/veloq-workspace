@@ -12,7 +12,7 @@ pub mod submit;
 pub use inner::{UringDriver, UringOpState};
 
 use crate::driver::slot::STATE_COMPLETED;
-use crate::driver::{Driver, RemoteWaker};
+use crate::driver::{Driver, Outcome, PollBinder, RemoteWaker, SubmitBinder};
 use inner::UringWaker;
 use op::UringOp;
 
@@ -20,10 +20,11 @@ impl UringDriver {
     fn submit_sqe(
         &mut self,
         user_data: usize,
+        op: <Self as Driver>::Op,
         op_in: &mut Option<<Self as Driver>::Op>,
-    ) -> Result<Poll<()>, io::Error> {
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>> {
         // 1. Store resources FIRST in the Slot
-        let op = op_in.take().unwrap();
         {
             let slot = &self.ops.shared.slots[user_data];
             unsafe {
@@ -33,7 +34,7 @@ impl UringDriver {
 
         // 2. Try submit using centralized logic
         match self.submit_from_slot(user_data) {
-            Ok(true) => Ok(Poll::Ready(())),
+            Ok(true) => binder.ok(Poll::Ready(())),
             Ok(false) => {
                 debug!(user_data, "SQ full, pushing to backlog");
                 if let Some(entry) = self.ops.get_mut(user_data) {
@@ -41,13 +42,14 @@ impl UringDriver {
                 }
                 // Op remains in Slot, waiting for flush_backlog to pick it up
                 self.push_backlog(user_data);
-                Ok(Poll::Pending)
+                binder.ok(Poll::Pending)
             }
             Err(e) => {
                 // Recover op
                 let slot = &self.ops.shared.slots[user_data];
-                *op_in = unsafe { (*slot.op.get()).take() };
-                Err(e)
+                let op = unsafe { (*slot.op.get()).take().unwrap() };
+                *op_in = Some(op);
+                binder.err(e)
             }
         }
     }
@@ -55,10 +57,11 @@ impl UringDriver {
     fn submit_timer(
         &mut self,
         user_data: usize,
+        op: <Self as Driver>::Op,
         op_in: &mut Option<<Self as Driver>::Op>,
-    ) -> Result<Poll<()>, io::Error> {
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>> {
         // 1. Store resources FIRST
-        let op = op_in.take().unwrap();
         {
             let slot = &self.ops.shared.slots[user_data];
             unsafe {
@@ -68,7 +71,7 @@ impl UringDriver {
 
         // 2. Try submit
         match self.submit_from_slot(user_data) {
-            Ok(true) => Ok(Poll::Ready(())),
+            Ok(true) => binder.ok(Poll::Ready(())),
             Ok(false) => {
                 // Should technically not happen for SoftwareTimer unless we change logic later
                 debug!(
@@ -79,13 +82,14 @@ impl UringDriver {
                     entry.platform_data.lifecycle = inner::OpLifecycle::Pending;
                 }
                 self.push_backlog(user_data);
-                Ok(Poll::Pending)
+                binder.ok(Poll::Pending)
             }
             Err(e) => {
                 // Recover op
                 let slot = &self.ops.shared.slots[user_data];
-                *op_in = unsafe { (*slot.op.get()).take() };
-                Err(e)
+                let op = unsafe { (*slot.op.get()).take().unwrap() };
+                *op_in = Some(op);
+                binder.err(e)
             }
         }
     }
@@ -119,16 +123,24 @@ impl Driver for UringDriver {
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,
-    ) -> Result<Poll<()>, io::Error> {
-        let op = op_in.as_mut().unwrap();
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>> {
+        let op = op_in.take().expect("submit called with empty Option");
         let strategy = unsafe { op.vtable.as_ref().strategy };
-        match strategy {
-            op::SubmissionStrategy::BackgroundOnly => Err(io::Error::new(
+        if strategy == op::SubmissionStrategy::BackgroundOnly {
+            *op_in = Some(op);
+            return binder.err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "background op cannot be submitted normally",
-            )),
-            op::SubmissionStrategy::SubmitSqe => self.submit_sqe(user_data, op_in),
-            op::SubmissionStrategy::SoftwareTimer => self.submit_timer(user_data, op_in),
+            ));
+        }
+
+        match strategy {
+            op::SubmissionStrategy::BackgroundOnly => unreachable!(),
+            op::SubmissionStrategy::SubmitSqe => self.submit_sqe(user_data, op, op_in, binder),
+            op::SubmissionStrategy::SoftwareTimer => {
+                self.submit_timer(user_data, op, op_in, binder)
+            }
         }
     }
 
@@ -155,8 +167,8 @@ impl Driver for UringDriver {
         &mut self,
         user_data: usize,
         cx: &mut Context<'_>,
-        op_out: &mut Option<Self::Op>,
-    ) -> Poll<io::Result<usize>> {
+        binder: PollBinder,
+    ) -> Outcome<Poll<io::Result<usize>>> {
         // 1. Check if we need to flush pending op
         let is_pending = if let Some(entry) = self.ops.get(user_data) {
             matches!(entry.platform_data.lifecycle, inner::OpLifecycle::Pending)
@@ -180,7 +192,7 @@ impl Driver for UringDriver {
         };
 
         if state == STATE_COMPLETED {
-            // Completed. Extract result and op.
+            // Completed. Extract result and drop kernel op.
             let res = {
                 let slot = &self.ops.shared.slots[user_data];
                 let res = unsafe {
@@ -188,11 +200,7 @@ impl Driver for UringDriver {
                         .take()
                         .expect("Result missing in COMPLETED slot")
                 };
-                *op_out = Some(unsafe {
-                    (*slot.op.get())
-                        .take()
-                        .expect("Op missing in COMPLETED slot")
-                });
+                let _ = unsafe { (*slot.op.get()).take() };
                 // Mark slot as consumed?
                 use crate::driver::slot::STATE_CONSUMED;
                 slot.state.store(STATE_CONSUMED, Ordering::Release);
@@ -202,9 +210,9 @@ impl Driver for UringDriver {
             // Cleanup registry
             self.ops.remove(user_data);
 
-            Poll::Ready(res)
+            binder.ready(res)
         } else {
-            Poll::Pending
+            binder.pending()
         }
     }
 

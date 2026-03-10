@@ -100,6 +100,7 @@ pub struct UringDriver {
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_token: Option<usize>,
+    pub(crate) waker_payload: Option<Box<crate::op::Wakeup>>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
@@ -150,6 +151,7 @@ impl UringDriver {
             pending_cancellations: VecDeque::new(),
             waker_fd: Arc::new(EventFd { fd: waker_fd }),
             waker_token: None,
+            waker_payload: None,
             registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
             is_waked,
 
@@ -284,7 +286,8 @@ impl UringDriver {
         let op = crate::op::Wakeup {
             fd: crate::op::IoFd::Raw(crate::RawHandle { fd }),
         };
-        let uring_op = <crate::op::Wakeup as IntoPlatformOp<UringDriver>>::into_platform_op(op);
+        let (uring_op, payload) =
+            <crate::op::Wakeup as IntoPlatformOp<UringDriver>>::into_kernel_and_payload(op);
 
         let state = UringOpState {
             lifecycle: OpLifecycle::Pending, // Will change to InFlight below
@@ -302,6 +305,7 @@ impl UringDriver {
         }) = result
         {
             self.waker_token = Some(user_data);
+            self.waker_payload = Some(payload);
             let slot = &self.ops.shared.slots[user_data];
 
             // Put op into slot
@@ -476,6 +480,7 @@ impl UringDriver {
                 // Remove existing waker op/slot
                 self.ops.remove(token);
             }
+            self.waker_payload = None;
             self.submit_waker();
             self.flush_backlog();
         }
