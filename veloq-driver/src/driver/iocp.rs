@@ -23,6 +23,15 @@ pub use inner::{CloseMode, IocpDriver, IocpOpState, OpLifecycle};
 use op::IocpOp;
 use submit::SubmissionResult;
 
+pub(super) struct CompletionSidecar {
+    user_data: usize,
+    generation: u32,
+    res: i32,
+    flags: u32,
+    payload: Option<crate::driver::slot::ErasedPayload>,
+    detail: Option<io::Result<usize>>,
+}
+
 impl Driver for IocpDriver {
     type Op = IocpOp;
 
@@ -68,7 +77,7 @@ impl Driver for IocpDriver {
                 None
             }
         };
-        let mut deferred_event: Option<(usize, u32, i32, u32)> = None;
+        let mut deferred_event: Option<CompletionSidecar> = None;
 
         // Scope for initial submission
         {
@@ -153,12 +162,16 @@ impl Driver for IocpDriver {
                         ));
                         let generation = slot.generation.load(Ordering::Acquire);
                         let _ = unsafe { (*slot.op.get()).take() };
-                        deferred_event = Some((
+                        let payload = unsafe { (*slot.payload.get()).take() };
+                        let detail = unsafe { (*slot.result.get()).take() };
+                        deferred_event = Some(CompletionSidecar {
                             user_data,
                             generation,
-                            -err.raw_os_error().unwrap_or(1).abs(),
-                            0,
-                        ));
+                            res: -err.raw_os_error().unwrap_or(1).abs(),
+                            flags: 0,
+                            payload,
+                            detail,
+                        });
                     }
                 }
                 Ok(SubmissionResult::Timer(duration)) => {
@@ -180,8 +193,16 @@ impl Driver for IocpDriver {
             }
         } // End of submission scope
 
-        if let Some((ud, generation, res, flags)) = deferred_event {
-            self.push_completion_event(ud, generation, res, flags);
+        if let Some(deferred) = deferred_event {
+            self.push_completion_event(
+                deferred.user_data,
+                deferred.generation,
+                deferred.res,
+                deferred.flags,
+                deferred.payload,
+                deferred.detail,
+            );
+            self.ops.remove(deferred.user_data);
         }
         binder.ok(Poll::Ready(()))
     }
@@ -242,7 +263,7 @@ impl Driver for IocpDriver {
                 use veloq_blocking::get_blocking_pool;
                 if get_blocking_pool().execute(task).is_err() {
                     let _ = std::mem::take(&mut op_entry.platform_data);
-                    self.ops.free_indices.push(user_data);
+                    self.ops.shared.push_free(user_data);
                     return Err(io::Error::other("Thread pool overloaded"));
                 }
             }

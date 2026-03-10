@@ -3,6 +3,7 @@
 pub(crate) mod op_registry;
 pub(crate) mod slot;
 use crossbeam_queue::SegQueue;
+use std::cell::UnsafeCell;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -33,8 +34,14 @@ pub struct CompletionCell {
     ready: AtomicBool,
     res: AtomicI32,
     flags: AtomicU32,
+    payload: UnsafeCell<Option<slot::ErasedPayload>>,
+    detail: UnsafeCell<Option<io::Result<usize>>>,
     waker: AtomicWaker,
 }
+
+// CompletionCell uses atomics + carefully synchronized UnsafeCell sidecars.
+// Access to sidecars is serialized by the `ready` flag state machine.
+unsafe impl Sync for CompletionCell {}
 
 impl CompletionCell {
     fn new() -> Self {
@@ -44,9 +51,17 @@ impl CompletionCell {
             ready: AtomicBool::new(false),
             res: AtomicI32::new(0),
             flags: AtomicU32::new(0),
+            payload: UnsafeCell::new(None),
+            detail: UnsafeCell::new(None),
             waker: AtomicWaker::new(),
         }
     }
+}
+
+pub struct CompletionRecord {
+    pub event: CompletionEvent,
+    pub payload: Option<slot::ErasedPayload>,
+    pub detail: Option<io::Result<usize>>,
 }
 
 pub struct CompletionTable {
@@ -66,11 +81,32 @@ impl CompletionTable {
 
     #[inline]
     pub fn record_completion(&self, event: CompletionEvent) {
+        self.record_completion_with_data(event, None, None);
+    }
+
+    #[inline]
+    pub fn record_completion_with_data(
+        &self,
+        event: CompletionEvent,
+        payload: Option<slot::ErasedPayload>,
+        detail: Option<io::Result<usize>>,
+    ) {
         let (idx, generation) = decode_completion_token(event.user_data);
         if idx >= self.cells.len() {
             return;
         }
         let cell = &self.cells[idx];
+        // If stale unconsumed data exists, drop it before overwriting this cell.
+        if cell.ready.swap(false, Ordering::AcqRel) {
+            unsafe {
+                let _ = (*cell.payload.get()).take();
+                let _ = (*cell.detail.get()).take();
+            }
+        }
+        unsafe {
+            *cell.payload.get() = payload;
+            *cell.detail.get() = detail;
+        }
         cell.res.store(event.res, Ordering::Release);
         cell.flags.store(event.flags, Ordering::Release);
         cell.ready_generation.store(generation, Ordering::Release);
@@ -82,6 +118,11 @@ impl CompletionTable {
 
     #[inline]
     pub fn try_take(&self, token: u64) -> Option<CompletionEvent> {
+        self.try_take_record(token).map(|record| record.event)
+    }
+
+    #[inline]
+    pub fn try_take_record(&self, token: u64) -> Option<CompletionRecord> {
         let (idx, generation) = decode_completion_token(token);
         if idx >= self.cells.len() {
             return None;
@@ -100,10 +141,16 @@ impl CompletionTable {
         {
             return None;
         }
-        Some(CompletionEvent {
-            user_data: token,
-            res: cell.res.load(Ordering::Acquire),
-            flags: cell.flags.load(Ordering::Acquire),
+        let payload = unsafe { (*cell.payload.get()).take() };
+        let detail = unsafe { (*cell.detail.get()).take() };
+        Some(CompletionRecord {
+            event: CompletionEvent {
+                user_data: token,
+                res: cell.res.load(Ordering::Acquire),
+                flags: cell.flags.load(Ordering::Acquire),
+            },
+            payload,
+            detail,
         })
     }
 
@@ -215,6 +262,11 @@ pub trait Driver: 'static {
     /// Try take completion for a specific token.
     fn try_take_completion(&mut self, token: u64) -> Option<CompletionEvent> {
         self.completion_table().try_take(token)
+    }
+
+    /// Try take completion for a specific token with optional payload/result sidecar data.
+    fn try_take_completion_record(&mut self, token: u64) -> Option<CompletionRecord> {
+        self.completion_table().try_take_record(token)
     }
 
     /// Register/replace a waiter for token.

@@ -7,7 +7,6 @@
 
 use crate::SockAddrStorage;
 use crate::driver::PlatformOp;
-use crate::driver::iocp::IocpDriver;
 use crate::driver::iocp::ext::Extensions;
 use crate::driver::iocp::rio::RioState;
 use crate::driver::iocp::submit::{self, SubmissionResult};
@@ -149,7 +148,7 @@ macro_rules! define_iocp_ops {
         }
 
         $(
-            impl IntoPlatformOp<IocpDriver> for $OpType {
+            impl IntoPlatformOp<IocpOp> for $OpType {
                 type UserPayload = Box<$OpType>;
                 const PAYLOAD_KIND: OpKind = $kind;
 

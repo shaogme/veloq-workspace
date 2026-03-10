@@ -6,8 +6,7 @@
 //! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
 use crate::driver::PlatformOp;
-use crate::driver::uring::UringDriver;
-use crate::driver::uring::submit;
+use crate::driver::uring::{UringDriver, submit};
 use crate::op::{
     Accept, Close, Connect, Fallocate, Fsync, IntoPlatformOp, IoFd, OpKind, Open, ReadFixed, Recv,
     Send as OpSend, SendTo, SyncFileRange, Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
@@ -109,7 +108,7 @@ macro_rules! define_uring_ops {
         }
 
         $(
-            impl IntoPlatformOp<UringDriver> for $OpType {
+            impl IntoPlatformOp<UringOp> for $OpType {
                 type UserPayload = Box<$OpType>;
                 const PAYLOAD_KIND: OpKind = $kind;
 

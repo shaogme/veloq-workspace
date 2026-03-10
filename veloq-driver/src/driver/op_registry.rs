@@ -17,8 +17,8 @@ pub struct OpRegistry<Op: PlatformOp, P> {
     pub shared: Arc<SlotTable<Op>>,
     // Local state storage, indexed by slot index
     pub local: Box<[OpEntry<P>]>,
-    // Stack of free indices
-    pub free_indices: Vec<usize>,
+    // Locally claimed free-chain head. Additional free nodes are fetched from shared stack.
+    local_free_head: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,42 +35,34 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
     pub fn new(capacity: usize) -> Self {
         let shared = Arc::new(SlotTable::new(capacity));
         let mut local = Vec::with_capacity(capacity);
-        let mut free_indices = Vec::with_capacity(capacity);
 
-        for i in 0..capacity {
+        for _ in 0..capacity {
             local.push(OpEntry {
                 platform_data: P::default(),
             });
-            // Initialize free list in reverse order so we pop 0 first
-            free_indices.push(capacity - 1 - i);
+        }
+        for i in (0..capacity).rev() {
+            shared.push_free(i);
         }
 
         Self {
             shared,
             local: local.into_boxed_slice(),
-            free_indices,
+            local_free_head: SlotTable::<Op>::NULL_INDEX,
         }
     }
 
     pub fn alloc(&mut self, data: P) -> Result<AllocResult, P> {
-        // 1. Recycle remote indices
-        let mut head = self.shared.pop_all();
-        while head != SlotTable::<Op>::NULL_INDEX {
-            // Read next before we potentially lose track or reuse the slot
-            // (Though for simply moving it to free list, order matters less,
-            // we just need to traverse the chain we just claimed ownership of)
-            let next = self.shared.slots[head]
+        if self.local_free_head == SlotTable::<Op>::NULL_INDEX {
+            self.local_free_head = self.shared.pop_all();
+        }
+
+        if self.local_free_head != SlotTable::<Op>::NULL_INDEX {
+            let idx = self.local_free_head;
+            self.local_free_head = self.shared.slots[idx]
                 .next_free
                 .load(std::sync::atomic::Ordering::Relaxed);
 
-            if head < self.local.len() {
-                self.free_indices.push(head);
-            }
-            head = next;
-        }
-
-        // 2. Alloc from free list
-        if let Some(idx) = self.free_indices.pop() {
             // Reset slot generation
             let slot = &self.shared.slots[idx];
             let new_gen = slot
@@ -138,7 +130,7 @@ impl<Op: PlatformOp, P: Default> OpRegistry<Op, P> {
         }
 
         let data = std::mem::take(&mut self.local[user_data].platform_data);
-        self.free_indices.push(user_data);
+        self.shared.push_free(user_data);
 
         OpEntry {
             platform_data: data,

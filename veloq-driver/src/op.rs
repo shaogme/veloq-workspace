@@ -11,7 +11,6 @@ use std::rc::Rc;
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -22,7 +21,7 @@ use veloq_buf::FixedBuf;
 use crate::RawHandle;
 use crate::SockAddrStorage;
 use crate::driver::{
-    Driver, PlatformDriver, SharedCompletionTable, SubmitBinder, decode_completion_token,
+    CompletionRecord, Driver, PlatformDriver, PlatformOp, SharedCompletionTable, SubmitBinder,
     encode_completion_token, event_res_to_io,
 };
 
@@ -140,13 +139,13 @@ pub trait OpLifecycle: Sized {
 }
 
 /// Trait to convert a user-facing operation to a platform-specific driver operation.
-pub trait IntoPlatformOp<D: Driver>: Sized + std::marker::Send {
+pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     /// User payload detached from kernel op.
     type UserPayload: std::marker::Send + 'static;
     const PAYLOAD_KIND: OpKind;
 
     /// Split into kernel-facing op and user payload.
-    fn into_kernel_and_payload(self) -> (D::Op, Self::UserPayload);
+    fn into_kernel_and_payload(self) -> (O, Self::UserPayload);
 
     /// Rebuild the user operation from payload.
     fn from_user_payload(payload: Self::UserPayload) -> Self;
@@ -162,14 +161,14 @@ pub trait IntoPlatformOp<D: Driver>: Sized + std::marker::Send {
 
     /// Compatibility helper for transitional callsites.
     #[inline]
-    fn from_kernel_and_payload(op: D::Op, payload: Self::UserPayload) -> Self {
+    fn from_kernel_and_payload(op: O, payload: Self::UserPayload) -> Self {
         drop(op);
         Self::from_user_payload(payload)
     }
 
     /// Compatibility helper for legacy callsites.
     #[inline]
-    fn into_platform_op(self) -> D::Op
+    fn into_platform_op(self) -> O
     where
         Self::UserPayload: Default,
     {
@@ -178,7 +177,7 @@ pub trait IntoPlatformOp<D: Driver>: Sized + std::marker::Send {
 
     /// Compatibility helper for legacy callsites.
     #[inline]
-    fn from_platform_op(op: D::Op) -> Self
+    fn from_platform_op(op: O) -> Self
     where
         Self::UserPayload: Default,
     {
@@ -208,9 +207,9 @@ impl<T> Op<T> {
 
     /// Submit this operation manually to a specific driver instance.
     /// The operation is submitted synchronously, but completion is awaited asynchronously via the returned future.
-    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D>
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op>
     where
-        T: IntoPlatformOp<D> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
         D: Driver,
     {
         let data = self.data;
@@ -247,7 +246,6 @@ impl<T> Op<T> {
                         drop(op);
                         DetachedOp {
                             completion_table: None,
-                            slot_table: None,
                             token: 0,
                             immediate_failure: Some((e, T::from_user_payload(payload))),
                             _phantom: std::marker::PhantomData,
@@ -255,7 +253,6 @@ impl<T> Op<T> {
                     } else {
                         DetachedOp {
                             completion_table: Some(completion_table),
-                            slot_table: Some(slot_table),
                             token,
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
@@ -264,7 +261,6 @@ impl<T> Op<T> {
                 } else {
                     DetachedOp {
                         completion_table: Some(completion_table),
-                        slot_table: Some(slot_table),
                         token,
                         immediate_failure: None,
                         _phantom: std::marker::PhantomData,
@@ -276,7 +272,6 @@ impl<T> Op<T> {
                 // Return DetachedOp with immediate failure.
                 DetachedOp {
                     completion_table: None,
-                    slot_table: None,
                     token: 0,
                     immediate_failure: Some((e, data)),
                     _phantom: std::marker::PhantomData,
@@ -289,7 +284,7 @@ impl<T> Op<T> {
     /// Returns a `LocalOp` future that resolves when the operation completes.
     pub fn submit_local(self, driver: Rc<RefCell<PlatformDriver>>) -> LocalOp<T>
     where
-        T: IntoPlatformOp<PlatformDriver> + 'static,
+        T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + 'static,
     {
         LocalOp::new(self.data, driver)
     }
@@ -301,32 +296,27 @@ impl<T> Op<T> {
 
 /// A Future representing a detached operation.
 /// It polls a shared completion event queue by token.
-pub struct DetachedOp<T, D>
+pub struct DetachedOp<T, O>
 where
-    D: Driver,
-    T: IntoPlatformOp<D>,
+    O: PlatformOp,
+    T: IntoPlatformOp<O>,
 {
     completion_table: Option<SharedCompletionTable>,
-    slot_table: Option<Arc<crate::driver::slot::SlotTable<D::Op>>>,
     token: u64,
     immediate_failure: Option<(std::io::Error, T)>,
-    _phantom: std::marker::PhantomData<T>,
+    _phantom: std::marker::PhantomData<(T, fn() -> O)>,
 }
 
 // DetachedOp is Send/Sync if the Op data is Send and the Driver Op is Send (implied by SlotTable<Op> bound).
-unsafe impl<T: IntoPlatformOp<D> + std::marker::Send, D: Driver> std::marker::Send
-    for DetachedOp<T, D>
-{
-}
-unsafe impl<T: IntoPlatformOp<D> + std::marker::Send, D: Driver> std::marker::Sync
-    for DetachedOp<T, D>
+unsafe impl<T: IntoPlatformOp<O> + std::marker::Send, O: PlatformOp> std::marker::Send
+    for DetachedOp<T, O>
 {
 }
 
-impl<T, D> Future for DetachedOp<T, D>
+impl<T, O> Future for DetachedOp<T, O>
 where
-    D: Driver,
-    T: IntoPlatformOp<D>,
+    O: PlatformOp,
+    T: IntoPlatformOp<O>,
 {
     type Output = OpResult<T>;
 
@@ -341,27 +331,15 @@ where
             .completion_table
             .as_ref()
             .expect("DetachedOp missing completion_table but no immediate_failure");
-        let slot_table = this
-            .slot_table
-            .as_ref()
-            .expect("DetachedOp missing slot_table but no immediate_failure");
-        if let Some(event) = table.try_take(this.token) {
-            let (user_data, generation) = decode_completion_token(this.token);
-            let slot = &slot_table.slots[user_data];
-            let slot_generation = slot.generation.load(std::sync::atomic::Ordering::Acquire);
-            let payload_any = if slot_generation == generation {
-                let inflight = unsafe { (*slot.payload.get()).take() };
-                if inflight.is_some() {
-                    inflight
-                } else {
-                    take_completed_payload(slot, generation)
-                }
-            } else {
-                take_completed_payload(slot, generation)
-            };
+        if let Some(record) = table.try_take_record(this.token) {
+            let CompletionRecord {
+                event,
+                payload: payload_any,
+                detail,
+            } = record;
             let Some(payload_any) = payload_any else {
                 return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                    "operation payload lost: slot generation mismatch",
+                    "operation payload lost: completion sidecar missing",
                 )));
             };
             if payload_any.kind != T::PAYLOAD_KIND as u16 {
@@ -371,9 +349,7 @@ where
             }
             let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
             let data = T::from_user_payload(payload);
-            let res = take_result_for_generation(slot, generation)
-                .unwrap_or_else(|| event_res_to_io(event.res));
-            slot_table.push_free(user_data);
+            let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
             return Poll::Ready(OpResult::Completed(res, data));
         }
 
@@ -382,46 +358,6 @@ where
         }
 
         Poll::Pending
-    }
-}
-
-#[inline]
-fn take_completed_payload<Op>(
-    slot: &crate::driver::slot::SlotEntry<Op>,
-    generation: u32,
-) -> Option<crate::driver::slot::ErasedPayload> {
-    let completed = unsafe { (*slot.completed_payload.get()).take() };
-    match completed {
-        Some((g, payload)) if g == generation => Some(payload),
-        Some(other) => {
-            unsafe {
-                *slot.completed_payload.get() = Some(other);
-            }
-            None
-        }
-        None => None,
-    }
-}
-
-#[inline]
-fn take_result_for_generation<Op>(
-    slot: &crate::driver::slot::SlotEntry<Op>,
-    generation: u32,
-) -> Option<std::io::Result<usize>> {
-    let inflight = unsafe { (*slot.result.get()).take() };
-    if inflight.is_some() {
-        return inflight;
-    }
-    let completed = unsafe { (*slot.completed_result.get()).take() };
-    match completed {
-        Some((g, res)) if g == generation => Some(res),
-        Some(other) => {
-            unsafe {
-                *slot.completed_result.get() = Some(other);
-            }
-            None
-        }
-        None => None,
     }
 }
 
@@ -436,7 +372,7 @@ enum State {
 }
 
 /// A Future wrapper for asynchronous IO operations executed locally.
-pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
+pub struct LocalOp<T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + 'static> {
     state: State,
     data: Option<T>,
     driver: Rc<RefCell<PlatformDriver>>,
@@ -444,7 +380,7 @@ pub struct LocalOp<T: IntoPlatformOp<PlatformDriver> + 'static> {
     token: u64,
 }
 
-impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
+impl<T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + 'static> LocalOp<T> {
     /// Create a new local operation future.
     pub fn new(data: T, driver: Rc<RefCell<PlatformDriver>>) -> Self {
         Self {
@@ -457,7 +393,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> LocalOp<T> {
     }
 }
 
-impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
+impl<T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + 'static> Future for LocalOp<T> {
     type Output = OpResult<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -512,25 +448,16 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
 
         if let State::Submitted = op.state {
             let mut driver = op.driver.borrow_mut();
-            if let Some(event) = driver.try_take_completion(op.token) {
+            if let Some(record) = driver.try_take_completion_record(op.token) {
                 op.state = State::Completed;
-                let slot_table = driver.slot_table();
-                let slot = &slot_table.slots[op.user_data];
-                let (_, generation) = decode_completion_token(op.token);
-                let slot_generation = slot.generation.load(std::sync::atomic::Ordering::Acquire);
-                let payload_any = if slot_generation == generation {
-                    let inflight = unsafe { (*slot.payload.get()).take() };
-                    if inflight.is_some() {
-                        inflight
-                    } else {
-                        take_completed_payload(slot, generation)
-                    }
-                } else {
-                    take_completed_payload(slot, generation)
-                };
+                let CompletionRecord {
+                    event,
+                    payload: payload_any,
+                    detail,
+                } = record;
                 let Some(payload_any) = payload_any else {
                     return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                        "operation payload lost: slot generation mismatch",
+                        "operation payload lost: completion sidecar missing",
                     )));
                 };
                 if payload_any.kind != T::PAYLOAD_KIND as u16 {
@@ -540,9 +467,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
                 }
                 let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                 let data = T::from_user_payload(payload);
-                let res = take_result_for_generation(slot, generation)
-                    .unwrap_or_else(|| event_res_to_io(event.res));
-                slot_table.push_free(op.user_data);
+                let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
                 Poll::Ready(OpResult::Completed(res, data))
             } else {
                 driver.register_completion_waker(op.token, cx.waker());
@@ -554,7 +479,7 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Future for LocalOp<T> {
     }
 }
 
-impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for LocalOp<T> {
+impl<T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + 'static> Drop for LocalOp<T> {
     fn drop(&mut self) {
         if let State::Submitted = self.state {
             // LocalOp being dropped while submitted means we must cancel it.
@@ -568,13 +493,14 @@ impl<T: IntoPlatformOp<PlatformDriver> + 'static> Drop for LocalOp<T> {
 // ============================================================================
 
 pub trait OpSubmitter: Clone + std::marker::Send + Sync + 'static {
-    type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static>: Future<
+    type Future<T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + std::marker::Send + 'static>:
+        Future<
         Output = OpResult<T>,
     >;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
     where
-        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static;
+        T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + std::marker::Send + 'static;
 
     fn from_current_context() -> std::io::Result<Self>;
 }
@@ -587,11 +513,12 @@ pub trait OpSubmitter: Clone + std::marker::Send + Sync + 'static {
 pub struct LocalSubmitter;
 
 impl OpSubmitter for LocalSubmitter {
-    type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> = LocalOp<T>;
+    type Future<T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + std::marker::Send + 'static> =
+        LocalOp<T>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> LocalOp<T>
     where
-        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
+        T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + std::marker::Send + 'static,
     {
         trace!("Submitting local op");
         op.submit_local(driver)
@@ -616,12 +543,12 @@ impl DetachedSubmitter {
 }
 
 impl OpSubmitter for DetachedSubmitter {
-    type Future<T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static> =
-        DetachedOp<T, PlatformDriver>;
+    type Future<T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + std::marker::Send + 'static> =
+        DetachedOp<T, <PlatformDriver as Driver>::Op>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
     where
-        T: IntoPlatformOp<PlatformDriver> + std::marker::Send + 'static,
+        T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + std::marker::Send + 'static,
     {
         op.submit_detached(&mut *driver.borrow_mut())
     }

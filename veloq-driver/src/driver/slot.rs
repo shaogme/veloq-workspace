@@ -61,7 +61,7 @@ impl Default for OverlappedEntry {
 #[cfg_attr(windows, repr(C))]
 pub struct Slot<Op> {
     // Basic metadata
-    pub index: usize,          // Self-reference index
+    index: usize,              // Self-reference index
     pub generation: AtomicU32, // Generation to prevent ABA
     pub state: AtomicU8,       // Atomic state
 
