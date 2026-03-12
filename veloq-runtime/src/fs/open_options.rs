@@ -231,11 +231,10 @@ impl OpenOptions {
         const FAKE_WRITE_THROUGH: u32 = 1 << 9;
 
         // 1. Process Path (UTF-16 + Null)
-        let path_w: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let os_str = path.as_os_str();
+        let mut path_w = Vec::with_capacity(os_str.len() + 1);
+        path_w.extend(os_str.encode_wide());
+        path_w.push(0);
         let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
 
         let mut buf = crate::runtime::context::try_alloc(len_bytes)?;
