@@ -47,6 +47,14 @@ jobs:
           sudo mount /dev/ram0 /mnt/ramdisk
           sudo chmod 777 /mnt/ramdisk
 
+      - name: Setup RAM Disk (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install imdisk -y
+          imdisk -a -s 4G -m R: -p "/fs:ntfs /q /y"
+          New-Item -ItemType Directory -Force -Path R:\bench | Out-Null
+
       - name: Install Benchmark Tools (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y sysbench fio
@@ -71,4 +79,6 @@ jobs:
 
       - name: Run FS Benchmark (Windows)
         if: runner.os == 'Windows'
+        env:
+          VELOQ_BENCH_DIR: R:\bench
         run: cargo bench -p veloq-runtime --bench fs_benchmark --verbose
