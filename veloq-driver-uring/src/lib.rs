@@ -204,6 +204,7 @@ use veloq_driver_core::driver::{
 };
 use veloq_driver_core::op_registry::{OpEntry, OpHandle};
 
+#[cfg(feature = "test-hooks")]
 impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.registration_stats.chunk_register_attempts

@@ -304,6 +304,7 @@ impl SubmitBinder {
     }
 }
 
+#[cfg(feature = "test-hooks")]
 pub mod test_hooks {
     pub trait DriverTestHooks {
         fn debug_chunk_register_attempts(&self) -> u64;

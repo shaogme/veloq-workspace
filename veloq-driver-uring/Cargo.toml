@@ -12,6 +12,10 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+test-hooks = ["veloq-driver-core/test-hooks"]
+
 [dependencies]
 veloq-driver-core.workspace = true
 veloq-buf.workspace = true

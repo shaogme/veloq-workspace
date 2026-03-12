@@ -54,7 +54,7 @@ veloq-buf = { path = "veloq-buf", version = "0.1.0" }
 veloq-driver-core = { path = "veloq-driver-core", version = "0.1.0" }
 veloq-driver-uring = { path = "veloq-driver-uring", version = "0.1.0" }
 veloq-driver-iocp = { path = "veloq-driver-iocp", version = "0.1.0" }
-veloq-driver = { path = "veloq-driver", version = "0.1.0" }
+veloq-driver = { path = "veloq-driver", version = "0.1.0", feature = "test-hooks" }
 
 veloq-shim = { path = "utils/veloq-shim", version = "0.1.0" }
 veloq-atomic-waker = { path = "utils/veloq-atomic-waker", version = "0.1.0" }
