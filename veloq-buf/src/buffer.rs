@@ -820,7 +820,11 @@ impl BackingPool for SlotBasedPool {
             // This reduces atomics on future allocs significantly.
             const PREFETCH_COUNT: u32 = 32;
             for _ in 0..PREFETCH_COUNT {
-                std::mem::forget(self.pool.clone());
+                // Equivalent to cloning Arc and forgetting it, but avoids
+                // constructing and forgetting temporary Arc values.
+                unsafe {
+                    Arc::increment_strong_count(current_ptr);
+                }
             }
 
             // Since we used clone() PREFETCH_COUNT times, we have PREFETCH_COUNT references.

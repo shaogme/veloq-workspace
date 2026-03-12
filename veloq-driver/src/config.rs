@@ -1,80 +1,43 @@
-use std::num::NonZeroU32;
+#[cfg(windows)]
+pub use veloq_driver_iocp::{BufferRegistrationMode, IocpConfig};
+#[cfg(not(windows))]
+pub use veloq_driver_uring::{BufferRegistrationMode, IoMode, IocpConfig, UringConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BufferRegistrationMode {
-    #[default]
-    Strict,
-    Compatible,
-}
-
-impl BufferRegistrationMode {
-    #[inline]
-    pub const fn is_strict(self) -> bool {
-        matches!(self, Self::Strict)
-    }
-}
-
-/// I/O Driver Operation Mode
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoMode {
-    /// Interrupt driven mode (syscalls + waiting)
     Interrupt,
-    /// Polling mode (SQPOLL on Linux, busy-wait on Windows)
-    Polling(NonZeroU32),
+    Polling(std::num::NonZeroU32),
 }
 
+#[cfg(windows)]
 #[derive(Debug, Clone)]
 pub struct UringConfig {
     pub mode: IoMode,
-    pub entries: NonZeroU32,
+    pub entries: std::num::NonZeroU32,
     pub registration_mode: BufferRegistrationMode,
 }
 
+#[cfg(windows)]
 impl AsRef<UringConfig> for UringConfig {
     fn as_ref(&self) -> &UringConfig {
         self
     }
 }
 
+#[cfg(windows)]
 impl Default for UringConfig {
     fn default() -> Self {
         Self {
             mode: IoMode::Interrupt,
-            entries: NonZeroU32::new(1024).unwrap(),
+            entries: std::num::NonZeroU32::new(1024).unwrap(),
             registration_mode: BufferRegistrationMode::Strict,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct IocpConfig {
-    pub entries: NonZeroU32,
-    pub registration_mode: BufferRegistrationMode,
-}
-
-impl AsRef<IocpConfig> for IocpConfig {
-    fn as_ref(&self) -> &IocpConfig {
-        self
-    }
-}
-
-impl Default for IocpConfig {
-    fn default() -> Self {
-        Self {
-            entries: NonZeroU32::new(1024).unwrap(),
-            registration_mode: BufferRegistrationMode::Strict,
-        }
-    }
-}
-
+#[cfg(windows)]
 impl UringConfig {
-    pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
-        self.registration_mode = mode;
-        self
-    }
-}
-
-impl IocpConfig {
     pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
         self.registration_mode = mode;
         self

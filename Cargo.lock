@@ -1256,14 +1256,60 @@ dependencies = [
  "error-stack",
  "io-uring",
  "libc",
- "rustc-hash",
  "tracing",
  "veloq-atomic-waker",
  "veloq-bitset",
  "veloq-blocking",
  "veloq-buf",
+ "veloq-driver-core",
+ "veloq-driver-iocp",
+ "veloq-driver-uring",
  "veloq-wheel",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "veloq-driver-core"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "libc",
+ "tracing",
+ "veloq-atomic-waker",
+ "veloq-buf",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "veloq-driver-iocp"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
+ "crossbeam-utils",
+ "error-stack",
+ "rustc-hash",
+ "tracing",
+ "veloq-bitset",
+ "veloq-blocking",
+ "veloq-buf",
+ "veloq-driver-core",
+ "veloq-wheel",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "veloq-driver-uring"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
+ "io-uring",
+ "libc",
+ "tracing",
+ "veloq-bitset",
+ "veloq-buf",
+ "veloq-driver-core",
+ "veloq-wheel",
 ]
 
 [[package]]

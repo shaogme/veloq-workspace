@@ -4,13 +4,30 @@ members = [
     "veloq-examples/disk-bench",
     "veloq-sync",
     "veloq-buf", 
+    "veloq-driver-core",
+    "platform-drivers/veloq-driver-uring",
+    "platform-drivers/veloq-driver-iocp",
+    "veloq-driver",
     "utils/veloq-shim",
     "utils/veloq-atomic-waker", 
     "utils/veloq-intrusive-linklist", 
     "utils/veloq-bitset",
     "utils/veloq-wheel", 
     "utils/veloq-blocking",
-    "veloq-driver", 
+]
+default-members = [
+    "veloq-runtime",
+    "veloq-examples/disk-bench",
+    "veloq-sync",
+    "veloq-buf",
+    "veloq-driver-core",
+    "veloq-driver",
+    "utils/veloq-shim",
+    "utils/veloq-atomic-waker",
+    "utils/veloq-intrusive-linklist",
+    "utils/veloq-bitset",
+    "utils/veloq-wheel",
+    "utils/veloq-blocking",
 ]
 resolver = "3"
 
@@ -34,6 +51,9 @@ veloq-runtime = { path = "veloq-runtime", version = "0.1.0" }
 veloq-sync = { path = "veloq-sync", version = "0.1.0" }
 veloq-local = { path = "veloq-local", version = "0.1.0" }
 veloq-buf = { path = "veloq-buf", version = "0.1.0" }
+veloq-driver-core = { path = "veloq-driver-core", version = "0.1.0" }
+veloq-driver-uring = { path = "platform-drivers/veloq-driver-uring", version = "0.1.0" }
+veloq-driver-iocp = { path = "platform-drivers/veloq-driver-iocp", version = "0.1.0" }
 veloq-driver = { path = "veloq-driver", version = "0.1.0" }
 
 veloq-shim = { path = "utils/veloq-shim", version = "0.1.0" }

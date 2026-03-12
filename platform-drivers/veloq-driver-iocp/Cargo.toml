@@ -1,5 +1,5 @@
 [package]
-name = "veloq-driver"
+name = "veloq-driver-iocp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,16 +14,11 @@ categories.workspace = true
 
 [features]
 default = []
-test-hooks = [
-    "veloq-driver-core/test-hooks",
-    "veloq-driver-uring/test-hooks",
-    "veloq-driver-iocp/test-hooks",
-]
+test-hooks = ["veloq-driver-core/test-hooks"]
 
 [dependencies]
-veloq-atomic-waker.workspace = true
-veloq-buf.workspace = true
 veloq-driver-core.workspace = true
+veloq-buf.workspace = true
 veloq-wheel.workspace = true
 veloq-blocking.workspace = true
 veloq-bitset.workspace = true
@@ -31,16 +26,9 @@ veloq-bitset.workspace = true
 crossbeam-utils.workspace = true
 crossbeam-queue.workspace = true
 tracing.workspace = true
-error-stack = "0.6"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7.11"
-libc.workspace = true
-veloq-driver-uring.workspace = true
-
-[target.'cfg(target_os = "windows")'.dependencies]
 windows-sys.workspace = true
-veloq-driver-iocp.workspace = true
+rustc-hash = "2.1.1"
+error-stack = "0.6"
 
 [lints]
 workspace = true
