@@ -51,7 +51,30 @@ use std::{
     num::{NonZeroU16, NonZeroUsize},
     ptr::NonNull,
     sync::Arc,
+    sync::atomic::Ordering,
 };
+
+/// Hack to increment Arc strong count by N in a single atomic operation.
+/// Relies on the standard library's `ArcInner` layout.
+#[repr(C)]
+#[allow(dead_code)]
+struct ArcInner<T: ?Sized> {
+    strong: std::sync::atomic::AtomicUsize,
+    weak: std::sync::atomic::AtomicUsize,
+    data: T,
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+unsafe fn increment_strong_count_by<T>(ptr: *const T, count: usize) {
+    let offset = memoffset::offset_of!(ArcInner<T>, data);
+    let strong_ptr =
+        (ptr as *const u8).wrapping_sub(offset) as *const std::sync::atomic::AtomicUsize;
+    unsafe {
+        debug_assert!((*strong_ptr).load(Ordering::Relaxed) > 0);
+        (*strong_ptr).fetch_add(count, Ordering::Relaxed);
+    }
+}
 
 const NO_REGISTRATION_INDEX: u16 = u16::MAX;
 
@@ -819,8 +842,10 @@ impl BackingPool for SlotBasedPool {
             // Instead of 1, we increment by BATCH.
             // This reduces atomics on future allocs significantly.
             const PREFETCH_COUNT: u32 = 32;
-            for _ in 0..PREFETCH_COUNT {
-                std::mem::forget(self.pool.clone());
+            unsafe {
+                for _ in 0..PREFETCH_COUNT {
+                    Arc::increment_strong_count(current_ptr);
+                }
             }
 
             // Since we used clone() PREFETCH_COUNT times, we have PREFETCH_COUNT references.

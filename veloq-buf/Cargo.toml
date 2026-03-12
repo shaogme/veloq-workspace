@@ -17,6 +17,7 @@ veloq-intrusive-linklist.workspace = true
 crossbeam-utils.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
+memoffset = "0.9.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
