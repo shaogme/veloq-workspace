@@ -22,6 +22,6 @@ fn main() {
             socket.recv_ready(capacity, 100).await.unwrap();
         }
         let elapsed = start.elapsed();
-        println!("Elapsed for 10000 recv_ready: {:?}", elapsed);
+        println!("Elapsed for 100 recv_ready (10000 buffers): {:?}", elapsed);
     });
 }
