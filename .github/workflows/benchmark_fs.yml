@@ -10,14 +10,72 @@ env:
 
 jobs:
   benchmark:
-    name: Benchmark on ${{ matrix.os }}
+    name: Benchmark on ${{ matrix.os }} (${{ matrix.case }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            case: buffered_none_total
+            buffering: buffered
+            sync: none
+            phase: total
+          - os: ubuntu-latest
+            case: buffered_sync_all_total
+            buffering: buffered
+            sync: sync_all
+            phase: total
+          - os: ubuntu-latest
+            case: direct_sync_all_total
+            buffering: direct
+            sync: sync_all
+            phase: total
+          - os: ubuntu-latest
+            case: directsync_sync_all_total
+            buffering: directsync
+            sync: sync_all
+            phase: total
+          - os: ubuntu-latest
+            case: directsync_sync_all_write
+            buffering: directsync
+            sync: sync_all
+            phase: write
+          - os: ubuntu-latest
+            case: directsync_sync_all_flush
+            buffering: directsync
+            sync: sync_all
+            phase: flush
           - os: windows-latest
+            case: buffered_none_total
+            buffering: buffered
+            sync: none
+            phase: total
+          - os: windows-latest
+            case: buffered_sync_all_total
+            buffering: buffered
+            sync: sync_all
+            phase: total
+          - os: windows-latest
+            case: direct_sync_all_total
+            buffering: direct
+            sync: sync_all
+            phase: total
+          - os: windows-latest
+            case: directsync_sync_all_total
+            buffering: directsync
+            sync: sync_all
+            phase: total
+          - os: windows-latest
+            case: directsync_sync_all_write
+            buffering: directsync
+            sync: sync_all
+            phase: write
+          - os: windows-latest
+            case: directsync_sync_all_flush
+            buffering: directsync
+            sync: sync_all
+            phase: flush
 
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +118,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y sysbench fio
 
       - name: Baseline - Memory & I/O (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.case == 'directsync_sync_all_total'
         run: |
           echo "==== Sysbench Memory Test (RAM Bandwidth) ===="
           sysbench memory --memory-block-size=1M --memory-total-size=10G run
@@ -73,12 +131,85 @@ jobs:
         if: runner.os == 'Linux'
         env:
           VELOQ_BENCH_DIR: /mnt/ramdisk
+          VELOQ_BENCH_BUFFERING: ${{ matrix.buffering }}
+          VELOQ_BENCH_SYNC: ${{ matrix.sync }}
+          VELOQ_BENCH_PHASE: ${{ matrix.phase }}
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
-          cargo bench -p veloq-runtime --bench fs_benchmark --verbose
+          cargo bench -p veloq-runtime --bench fs_benchmark --verbose -- write_1gb_concurrent_ 2>&1 | tee bench_output_${{ matrix.os }}_${{ matrix.case }}.log
+
+      - name: Parse Benchmark Row (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          LOG="bench_output_${{ matrix.os }}_${{ matrix.case }}.log"
+          ROW="bench_row_${{ matrix.os }}_${{ matrix.case }}.md"
+          TIME_LINE="$(grep -m1 -E 'time:\s+\[' "$LOG" || true)"
+          THRPT_LINE="$(grep -m1 -E 'thrpt:\s+\[' "$LOG" || true)"
+          TIME_VAL="$(echo "$TIME_LINE" | sed -E 's/.*\[(.*)\].*/\1/' | xargs)"
+          THRPT_VAL="$(echo "$THRPT_LINE" | sed -E 's/.*\[(.*)\].*/\1/' | xargs)"
+          if [ -z "$TIME_VAL" ]; then TIME_VAL="N/A"; fi
+          if [ -z "$THRPT_VAL" ]; then THRPT_VAL="N/A"; fi
+          echo "| Linux | ${{ matrix.case }} | ${{ matrix.buffering }} | ${{ matrix.sync }} | ${{ matrix.phase }} | $TIME_VAL | $THRPT_VAL |" > "$ROW"
 
       - name: Run FS Benchmark (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         env:
           VELOQ_BENCH_DIR: R:\bench
-        run: cargo bench -p veloq-runtime --bench fs_benchmark --verbose
+          VELOQ_BENCH_BUFFERING: ${{ matrix.buffering }}
+          VELOQ_BENCH_SYNC: ${{ matrix.sync }}
+          VELOQ_BENCH_PHASE: ${{ matrix.phase }}
+        run: |
+          cargo bench -p veloq-runtime --bench fs_benchmark --verbose -- write_1gb_concurrent_ 2>&1 | Tee-Object -FilePath bench_output_${{ matrix.os }}_${{ matrix.case }}.log
+
+      - name: Parse Benchmark Row (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $logPath = "bench_output_${{ matrix.os }}_${{ matrix.case }}.log"
+          $rowPath = "bench_row_${{ matrix.os }}_${{ matrix.case }}.md"
+          $content = Get-Content $logPath -Raw
+          $time = [regex]::Match($content, 'time:\s+\[(.*?)\]').Groups[1].Value.Trim()
+          $thrpt = [regex]::Match($content, 'thrpt:\s+\[(.*?)\]').Groups[1].Value.Trim()
+          if ([string]::IsNullOrWhiteSpace($time)) { $time = "N/A" }
+          if ([string]::IsNullOrWhiteSpace($thrpt)) { $thrpt = "N/A" }
+          "| Windows | ${{ matrix.case }} | ${{ matrix.buffering }} | ${{ matrix.sync }} | ${{ matrix.phase }} | $time | $thrpt |" | Out-File -FilePath $rowPath -Encoding utf8
+
+      - name: Upload Benchmark Row
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-row-${{ matrix.os }}-${{ matrix.case }}
+          path: |
+            bench_row_${{ matrix.os }}_${{ matrix.case }}.md
+            bench_output_${{ matrix.os }}_${{ matrix.case }}.log
+
+  benchmark-summary:
+    name: Benchmark Summary
+    needs: benchmark
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Benchmark Rows
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-row-*
+          merge-multiple: true
+          path: bench-results
+
+      - name: Build Summary Table
+        run: |
+          {
+            echo "## FS Benchmark Summary"
+            echo ""
+            echo "| OS | Case | Buffering | Sync | Phase | Time (min..max) | Throughput (min..max) |"
+            echo "|---|---|---|---|---|---|---|"
+            cat bench-results/bench_row_*.md | sort
+          } > benchmark_summary.md
+          cat benchmark_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Summary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-summary
+          path: benchmark_summary.md
