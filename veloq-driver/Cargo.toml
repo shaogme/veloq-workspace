@@ -14,7 +14,11 @@ categories.workspace = true
 
 [features]
 default = []
-test-hooks = ["veloq-driver-core/test-hooks", "veloq-driver-iocp/test-hooks"]
+test-hooks = [
+    "veloq-driver-core/test-hooks",
+    "veloq-driver-uring/test-hooks",
+    "veloq-driver-iocp/test-hooks",
+]
 
 [dependencies]
 veloq-atomic-waker.workspace = true

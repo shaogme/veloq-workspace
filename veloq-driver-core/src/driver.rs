@@ -1,5 +1,5 @@
-use crate::{Handle, IoFd, SlotSidecar};
 use crate::slot;
+use crate::{Handle, IoFd, SlotSidecar};
 use crossbeam_queue::SegQueue;
 use std::cell::UnsafeCell;
 use std::io;

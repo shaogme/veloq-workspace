@@ -1,5 +1,5 @@
-use crate::driver::PlatformOp;
 use crate::SlotSidecar;
+use crate::driver::PlatformOp;
 use crate::slot::{SlotEntry, SlotTable};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;

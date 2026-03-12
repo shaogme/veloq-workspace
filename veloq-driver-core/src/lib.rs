@@ -1,4 +1,5 @@
 pub mod driver;
+pub mod net;
 pub mod op;
 pub mod op_registry;
 pub mod slot;
