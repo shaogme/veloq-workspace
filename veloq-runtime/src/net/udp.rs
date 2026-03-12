@@ -70,7 +70,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
     pub async fn recv_ready(&self, buf_capacity: NonZeroUsize, credits: usize) -> io::Result<()> {
         let target = credits.max(1);
         for _ in 0..target {
-            let buf = FixedBuf::alloc_heap(buf_capacity)?;
+            let buf = crate::runtime::context::try_alloc(buf_capacity)?;
             let refill = UdpRefill {
                 fd: IoFd::Raw(self.inner.raw()),
                 buf: Some(buf),
@@ -121,7 +121,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             let Some(extra_cap) = std::num::NonZeroUsize::new(refill_capacity) else {
                 break;
             };
-            let Ok(extra_buf) = FixedBuf::alloc_heap(extra_cap) else {
+            let Ok(extra_buf) = crate::runtime::context::try_alloc(extra_cap) else {
                 break;
             };
 
