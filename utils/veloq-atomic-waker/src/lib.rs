@@ -286,110 +286,105 @@ impl AtomicWaker {
     /// }
     /// ```
     pub fn register(&self, waker: &Waker) {
-        loop {
-            match self
-                .state
-                .compare_exchange_weak(WAITING, REGISTERING, Acquire, Acquire)
-            {
-                Ok(_) => {
-                    // Locked acquired, update the waker cell
+        match self
+            .state
+            .compare_exchange(WAITING, REGISTERING, Acquire, Acquire)
+        {
+            Ok(_) => {
+                // Locked acquired, update the waker cell
 
-                    // Avoid cloning the waker if the old waker will awaken the same task.
-                    //
-                    // SAFETY: We acquired the lock (state transitioned from WAITING to REGISTERING),
-                    // so we have exclusive access to the waker cell.
-                    unsafe {
-                        self.waker.with_mut(|w| match w {
-                            Some(old_waker) if old_waker.will_wake(waker) => (),
-                            _ => *w = Some(waker.clone()),
-                        });
+                // Avoid cloning the waker if the old waker will awaken the same task.
+                //
+                // SAFETY: We acquired the lock (state transitioned from WAITING to REGISTERING),
+                // so we have exclusive access to the waker cell.
+                unsafe {
+                    self.waker.with_mut(|w| match w {
+                        Some(old_waker) if old_waker.will_wake(waker) => (),
+                        _ => *w = Some(waker.clone()),
+                    });
+                }
+
+                // Release the lock. If the state transitioned to include
+                // the `WAKING` bit, this means that at least one wake has
+                // been called concurrently.
+                //
+                // Start by assuming that the state is `REGISTERING` as this
+                // is what we just set it to. If this holds, we know that no
+                // other writes were performed in the meantime, so there is
+                // nothing to acquire, only release. In case of concurrent
+                // wakers, we need to acquire their releases, so success needs
+                // to do both.
+                let res = self
+                    .state
+                    .compare_exchange(REGISTERING, WAITING, AcqRel, Acquire);
+
+                match res {
+                    Ok(_) => {
+                        // memory ordering: acquired self.state during CAS
+                        // - if previous wakes went through it syncs with
+                        //   their final release (`fetch_and`)
+                        // - if there was no previous wake the next wake
+                        //   will wake us, no sync needed.
                     }
+                    Err(actual) => {
+                        // This branch can only be reached if at least one
+                        // concurrent thread called `wake`. In this
+                        // case, `actual` **must** be `REGISTERING |
+                        // `WAKING`.
+                        debug_assert_eq!(actual, REGISTERING | WAKING);
 
-                    // Release the lock. If the state transitioned to include
-                    // the `WAKING` bit, this means that at least one wake has
-                    // been called concurrently.
-                    //
-                    // Start by assuming that the state is `REGISTERING` as this
-                    // is what we just set it to. If this holds, we know that no
-                    // other writes were performed in the meantime, so there is
-                    // nothing to acquire, only release. In case of concurrent
-                    // wakers, we need to acquire their releases, so success needs
-                    // to do both.
-                    let res = self
-                        .state
-                        .compare_exchange(REGISTERING, WAITING, AcqRel, Acquire);
+                        // Take the waker to wake once the atomic operation has
+                        // completed.
+                        //
+                        // SAFETY: We hold the lock (state is REGISTERING | WAKING), so we have exclusive access.
+                        let waker = unsafe {
+                            self.waker
+                                .with_mut(|w| w.take().expect("invariant broken: waker must exist"))
+                        };
 
-                    match res {
-                        Ok(_) => {
-                            // memory ordering: acquired self.state during CAS
-                            // - if previous wakes went through it syncs with
-                            //   their final release (`fetch_and`)
-                            // - if there was no previous wake the next wake
-                            //   will wake us, no sync needed.
-                            return;
-                        }
-                        Err(actual) => {
-                            // This branch can only be reached if at least one
-                            // concurrent thread called `wake`. In this
-                            // case, `actual` **must** be `REGISTERING |
-                            // `WAKING`.
-                            debug_assert_eq!(actual, REGISTERING | WAKING);
+                        // We need to return to WAITING state (clear our lock and
+                        // concurrent WAKING flag). This needs to acquire all
+                        // WAKING fetch_or releases and it needs to release our
+                        // update to self.waker, so we need a `swap` operation.
+                        self.state.swap(WAITING, AcqRel);
 
-                            // Take the waker to wake once the atomic operation has
-                            // completed.
-                            //
-                            // SAFETY: We hold the lock (state is REGISTERING | WAKING), so we have exclusive access.
-                            let waker = unsafe {
-                                self.waker.with_mut(|w| {
-                                    w.take().expect("invariant broken: waker must exist")
-                                })
-                            };
-
-                            // We need to return to WAITING state (clear our lock and
-                            // concurrent WAKING flag). This needs to acquire all
-                            // WAKING fetch_or releases and it needs to release our
-                            // update to self.waker, so we need a `swap` operation.
-                            self.state.swap(WAITING, AcqRel);
-
-                            // memory ordering: we acquired the state for all
-                            // concurrent wakes, but future wakes might still
-                            // need to wake us in case we can't make progress
-                            // from the pending wakes.
-                            //
-                            // So we simply schedule to come back later (we could
-                            // also simply leave the registration in place above).
-                            waker.wake();
-                            return;
-                        }
+                        // memory ordering: we acquired the state for all
+                        // concurrent wakes, but future wakes might still
+                        // need to wake us in case we can't make progress
+                        // from the pending wakes.
+                        //
+                        // So we simply schedule to come back later (we could
+                        // also simply leave the registration in place above).
+                        waker.wake();
                     }
                 }
-                Err(WAKING) => {
-                    // Currently in the process of waking the task, i.e.,
-                    // `wake` is currently being called on the old task handle.
-                    //
-                    // memory ordering: we acquired the state for all
-                    // concurrent wakes, but future wakes might still
-                    // need to wake us in case we can't make progress
-                    // from the pending wakes.
-                    //
-                    // So we simply schedule to come back later (we
-                    // could also spin here trying to acquire the lock
-                    // to register).
-                    waker.wake_by_ref();
-                    return;
-                }
-                Err(_state) => {
-                    // In this case, a concurrent thread is holding the
-                    // "registering" lock. This probably indicates a bug in the
-                    // caller's code as racing to call `register` doesn't make much
-                    // sense.
-                    //
-                    // We spin until we can acquire the lock.
-                    #[cfg(not(feature = "loom"))]
-                    core::hint::spin_loop();
-                    #[cfg(feature = "loom")]
-                    veloq_shim::thread::yield_now();
-                }
+            }
+            Err(WAKING) => {
+                // Currently in the process of waking the task, i.e.,
+                // `wake` is currently being called on the old task handle.
+                //
+                // memory ordering: we acquired the state for all
+                // concurrent wakes, but future wakes might still
+                // need to wake us in case we can't make progress
+                // from the pending wakes.
+                //
+                // So we simply schedule to come back later (we
+                // could also spin here trying to acquire the lock
+                // to register).
+                waker.wake_by_ref();
+            }
+            Err(state) => {
+                // In this case, a concurrent thread is holding the
+                // "registering" lock. This probably indicates a bug in the
+                // caller's code as racing to call `register` doesn't make much
+                // sense.
+                //
+                // memory ordering: don't care. a concurrent register() is going
+                // to succeed and provide proper memory ordering.
+                //
+                // We just want to maintain memory safety. It is ok to drop the
+                // call to `register`.
+                debug_assert!(state == REGISTERING || state == REGISTERING | WAKING);
             }
         }
     }

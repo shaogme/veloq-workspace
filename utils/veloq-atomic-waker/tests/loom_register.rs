@@ -45,7 +45,14 @@ fn concurrent_register() {
         t1.join().unwrap();
         t2.join().unwrap();
 
-        // Ensure no panic and basic state consistency
+        // Ensure no panic and basic state consistency.
         atomic_waker.wake();
+
+        let woke1 = woken1.load(Ordering::Relaxed);
+        let woke2 = woken2.load(Ordering::Relaxed);
+        assert!(
+            woke1 || woke2,
+            "at least one concurrent registration must remain wakeable"
+        );
     });
 }
