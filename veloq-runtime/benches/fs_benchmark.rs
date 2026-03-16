@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use veloq_buf::{BufPool, nz};
 use veloq_runtime::LocalExecutor;
@@ -12,6 +12,80 @@ use veloq_runtime::fs::{BufferingMode, File};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::runtime::blocking::init_blocking_pool;
 use veloq_runtime::spawn_local;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchSyncMode {
+    None,
+    SyncRange,
+    SyncAll,
+    SyncData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchPhase {
+    Total,
+    Write,
+    Flush,
+}
+
+fn bench_buffering_mode() -> BufferingMode {
+    let raw = std::env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
+    match raw.to_ascii_lowercase().as_str() {
+        "buffered" => BufferingMode::Buffered,
+        "direct" => BufferingMode::Direct,
+        "directsync" => BufferingMode::DirectSync,
+        other => panic!("Unsupported VELOQ_BENCH_BUFFERING: {other}"),
+    }
+}
+
+fn bench_sync_mode() -> BenchSyncMode {
+    let raw = std::env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
+    match raw.to_ascii_lowercase().as_str() {
+        "none" => BenchSyncMode::None,
+        "sync_range" => BenchSyncMode::SyncRange,
+        "sync_all" => BenchSyncMode::SyncAll,
+        "sync_data" => BenchSyncMode::SyncData,
+        other => panic!("Unsupported VELOQ_BENCH_SYNC: {other}"),
+    }
+}
+
+fn bench_phase() -> BenchPhase {
+    let raw = std::env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
+    match raw.to_ascii_lowercase().as_str() {
+        "total" => BenchPhase::Total,
+        "write" => BenchPhase::Write,
+        "flush" => BenchPhase::Flush,
+        other => panic!("Unsupported VELOQ_BENCH_PHASE: {other}"),
+    }
+}
+
+fn bench_case_name() -> String {
+    let buffering =
+        std::env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
+    let sync = std::env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
+    let phase = std::env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
+    format!("{buffering}_{sync}_{phase}")
+}
+
+async fn apply_sync(file: &File, len: u64, mode: BenchSyncMode) {
+    match mode {
+        BenchSyncMode::None => {}
+        BenchSyncMode::SyncRange => {
+            file.sync_range(0, len)
+                .wait_before(false)
+                .write(true)
+                .wait_after(true)
+                .await
+                .expect("SyncRange failed");
+        }
+        BenchSyncMode::SyncAll => {
+            file.sync_all().await.expect("SyncAll failed");
+        }
+        BenchSyncMode::SyncData => {
+            file.sync_data().await.expect("SyncData failed");
+        }
+    }
+}
 
 fn create_local_executor() -> LocalExecutor {
     LocalExecutor::builder().build(move |registrar| {
@@ -45,98 +119,256 @@ fn benchmark_1gb_write(c: &mut Criterion) {
     init_blocking_pool(BlockingPoolConfig::default());
 
     let pool = exec.pool();
+    let buffering_mode = bench_buffering_mode();
+    let sync_mode = bench_sync_mode();
+    let phase = bench_phase();
+    let bench_name = format!("write_1gb_concurrent_{}", bench_case_name());
 
-    group.bench_function("write_1gb_concurrent", |b| {
-        b.iter(|| {
-            let pool = pool.clone();
-            // 复用 LocalExecutor 避免每次迭代创建 driver 的开销
-            exec.block_on(async move {
-                const CHUNK_SIZE: NonZeroUsize = nz!(4 * 1024 * 1024);
-                let chunk_size = CHUNK_SIZE;
-                let base_dir = std::env::var("VELOQ_BENCH_DIR").unwrap_or_else(|_| ".".to_string());
-                let file_path = Path::new(&base_dir).join("bench_1gb_test.tmp");
+    match phase {
+        BenchPhase::Total => {
+            group.bench_function(&bench_name, |b| {
+                b.iter(|| {
+                    let pool = pool.clone();
+                    exec.block_on(async move {
+                        const CHUNK_SIZE: NonZeroUsize = nz!(4 * 1024 * 1024);
+                        let chunk_size = CHUNK_SIZE;
+                        let base_dir =
+                            std::env::var("VELOQ_BENCH_DIR").unwrap_or_else(|_| ".".to_string());
+                        let file_path = Path::new(&base_dir).join("bench_1gb_test.tmp");
 
-                if file_path.exists() {
-                    let _ = std::fs::remove_file(&file_path);
-                }
-
-                // Use File::create which takes pool and context
-                let file = File::options()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .buffering(BufferingMode::DirectSync)
-                    .open(&file_path)
-                    .await
-                    .expect("Failed to create");
-
-                let file = Rc::new(file);
-
-                // Pre-allocate space to avoid metadata lock contention during extended writes
-                file.fallocate(0, TOTAL_SIZE)
-                    .await
-                    .expect("Fallocate failed");
-
-                // 限制并发度为 BufferPool 中该尺寸 Chunk 的最大可用数 (32)
-                let concurrency_limit = 32;
-                let mut tasks = VecDeque::new();
-                let mut offset: u64 = 0;
-
-                while offset < TOTAL_SIZE {
-                    // 1. 尝试分配并在此窗口内提交任务
-                    if tasks.len() < concurrency_limit {
-                        // Use pool directly
-                        if let Some(buf) = pool.alloc(CHUNK_SIZE) {
-                            let remaining = TOTAL_SIZE - offset;
-                            let write_len =
-                                std::cmp::min(remaining, chunk_size.get() as u64) as usize;
-
-                            let file_clone = file.clone();
-                            let current_offset = offset;
-
-                            let fut = async move { file_clone.write_at(buf, current_offset).await };
-
-                            // Use cx.spawn_local
-                            tasks.push_back(spawn_local(fut));
-                            offset += write_len as u64;
-                            continue;
+                        if file_path.exists() {
+                            let _ = std::fs::remove_file(&file_path);
                         }
-                    }
 
-                    // 2. 无法分配或达到并发限制，等待最早的任务完成以释放资源
-                    if let Some(handle) = tasks.pop_front() {
-                        let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                        res.expect("Write failed");
-                    } else {
-                        panic!("Deadlock: No tasks to wait for but cannot allocate buffer");
-                    }
-                }
+                        let file = File::options()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .buffering(buffering_mode)
+                            .open(&file_path)
+                            .await
+                            .expect("Failed to create");
 
-                // 3. 等待剩余任务
-                while let Some(handle) = tasks.pop_front() {
-                    let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                    res.expect("Write failed");
-                }
+                        let file = Rc::new(file);
+                        file.fallocate(0, TOTAL_SIZE)
+                            .await
+                            .expect("Fallocate failed");
 
-                // 使用 verify range 替代 sync_all
-                // Optimize: Skip wait_before because we are the only writer after the loop finishes.
-                file.sync_range(0, TOTAL_SIZE)
-                    .wait_before(false)
-                    .write(true)
-                    .wait_after(true)
-                    .await
-                    .expect("Sync failed");
+                        let concurrency_limit = 32;
+                        let mut tasks = VecDeque::new();
+                        let mut offset: u64 = 0;
 
-                // 清理
-                drop(file);
-                let _ = std::fs::remove_file(file_path);
+                        while offset < TOTAL_SIZE {
+                            if tasks.len() < concurrency_limit
+                                && let Some(buf) = pool.alloc(CHUNK_SIZE)
+                            {
+                                let remaining = TOTAL_SIZE - offset;
+                                let write_len =
+                                    std::cmp::min(remaining, chunk_size.get() as u64) as usize;
+
+                                let file_clone = file.clone();
+                                let current_offset = offset;
+
+                                let fut =
+                                    async move { file_clone.write_at(buf, current_offset).await };
+                                tasks.push_back(spawn_local(fut));
+                                offset += write_len as u64;
+                                continue;
+                            }
+
+                            if let Some(handle) = tasks.pop_front() {
+                                let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                                res.expect("Write failed");
+                            } else {
+                                panic!("Deadlock: No tasks to wait for but cannot allocate buffer");
+                            }
+                        }
+
+                        while let Some(handle) = tasks.pop_front() {
+                            let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                            res.expect("Write failed");
+                        }
+
+                        apply_sync(&file, TOTAL_SIZE, sync_mode).await;
+                        drop(file);
+                        let _ = std::fs::remove_file(file_path);
+                    });
+                })
             });
-        })
-    });
+        }
+        BenchPhase::Write => {
+            group.bench_function(&bench_name, |b| {
+                b.iter_custom(|iters| {
+                    let mut total_elapsed = Duration::ZERO;
+                    for _ in 0..iters {
+                        let pool = pool.clone();
+                        let elapsed = exec.block_on(async move {
+                            const CHUNK_SIZE: NonZeroUsize = nz!(4 * 1024 * 1024);
+                            let chunk_size = CHUNK_SIZE;
+                            let base_dir = std::env::var("VELOQ_BENCH_DIR")
+                                .unwrap_or_else(|_| ".".to_string());
+                            let file_path = Path::new(&base_dir).join("bench_1gb_test.tmp");
+
+                            if file_path.exists() {
+                                let _ = std::fs::remove_file(&file_path);
+                            }
+
+                            let file = File::options()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .buffering(buffering_mode)
+                                .open(&file_path)
+                                .await
+                                .expect("Failed to create");
+
+                            let file = Rc::new(file);
+                            file.fallocate(0, TOTAL_SIZE)
+                                .await
+                                .expect("Fallocate failed");
+
+                            let start = Instant::now();
+                            let concurrency_limit = 32;
+                            let mut tasks = VecDeque::new();
+                            let mut offset: u64 = 0;
+
+                            while offset < TOTAL_SIZE {
+                                if tasks.len() < concurrency_limit
+                                    && let Some(buf) = pool.alloc(CHUNK_SIZE)
+                                {
+                                    let remaining = TOTAL_SIZE - offset;
+                                    let write_len =
+                                        std::cmp::min(remaining, chunk_size.get() as u64) as usize;
+
+                                    let file_clone = file.clone();
+                                    let current_offset = offset;
+
+                                    let fut = async move {
+                                        file_clone.write_at(buf, current_offset).await
+                                    };
+                                    tasks.push_back(spawn_local(fut));
+                                    offset += write_len as u64;
+                                    continue;
+                                }
+
+                                if let Some(handle) = tasks.pop_front() {
+                                    let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                                    res.expect("Write failed");
+                                } else {
+                                    panic!(
+                                        "Deadlock: No tasks to wait for but cannot allocate buffer"
+                                    );
+                                }
+                            }
+
+                            while let Some(handle) = tasks.pop_front() {
+                                let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                                res.expect("Write failed");
+                            }
+                            let elapsed = start.elapsed();
+
+                            drop(file);
+                            let _ = std::fs::remove_file(file_path);
+                            elapsed
+                        });
+                        total_elapsed += elapsed;
+                    }
+                    total_elapsed
+                })
+            });
+        }
+        BenchPhase::Flush => {
+            group.bench_function(&bench_name, |b| {
+                b.iter_custom(|iters| {
+                    let mut total_elapsed = Duration::ZERO;
+                    for _ in 0..iters {
+                        let pool = pool.clone();
+                        let elapsed = exec.block_on(async move {
+                            const CHUNK_SIZE: NonZeroUsize = nz!(4 * 1024 * 1024);
+                            let chunk_size = CHUNK_SIZE;
+                            let base_dir = std::env::var("VELOQ_BENCH_DIR")
+                                .unwrap_or_else(|_| ".".to_string());
+                            let file_path = Path::new(&base_dir).join("bench_1gb_test.tmp");
+
+                            if file_path.exists() {
+                                let _ = std::fs::remove_file(&file_path);
+                            }
+
+                            let file = File::options()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .buffering(buffering_mode)
+                                .open(&file_path)
+                                .await
+                                .expect("Failed to create");
+
+                            let file = Rc::new(file);
+                            file.fallocate(0, TOTAL_SIZE)
+                                .await
+                                .expect("Fallocate failed");
+
+                            let concurrency_limit = 32;
+                            let mut tasks = VecDeque::new();
+                            let mut offset: u64 = 0;
+
+                            while offset < TOTAL_SIZE {
+                                if tasks.len() < concurrency_limit
+                                    && let Some(buf) = pool.alloc(CHUNK_SIZE)
+                                {
+                                    let remaining = TOTAL_SIZE - offset;
+                                    let write_len =
+                                        std::cmp::min(remaining, chunk_size.get() as u64) as usize;
+
+                                    let file_clone = file.clone();
+                                    let current_offset = offset;
+
+                                    let fut = async move {
+                                        file_clone.write_at(buf, current_offset).await
+                                    };
+                                    tasks.push_back(spawn_local(fut));
+                                    offset += write_len as u64;
+                                    continue;
+                                }
+
+                                if let Some(handle) = tasks.pop_front() {
+                                    let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                                    res.expect("Write failed");
+                                } else {
+                                    panic!(
+                                        "Deadlock: No tasks to wait for but cannot allocate buffer"
+                                    );
+                                }
+                            }
+
+                            while let Some(handle) = tasks.pop_front() {
+                                let (res, _buf): (std::io::Result<usize>, _) = handle.await;
+                                res.expect("Write failed");
+                            }
+
+                            let start = Instant::now();
+                            apply_sync(&file, TOTAL_SIZE, sync_mode).await;
+                            let elapsed = start.elapsed();
+
+                            drop(file);
+                            let _ = std::fs::remove_file(file_path);
+                            elapsed
+                        });
+                        total_elapsed += elapsed;
+                    }
+                    total_elapsed
+                })
+            });
+        }
+    }
     group.finish();
 }
 
 fn benchmark_32_files_write(c: &mut Criterion) {
+    if bench_phase() != BenchPhase::Total {
+        return;
+    }
+
     let mut group = c.benchmark_group("fs_throughput_32_files");
 
     // 1GB Total Size
@@ -145,6 +377,8 @@ fn benchmark_32_files_write(c: &mut Criterion) {
     const TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
     const FILE_SIZE: u64 = TOTAL_SIZE / FILE_COUNT as u64;
     const FILES_PER_WORKER: usize = FILE_COUNT / WORKER_COUNT;
+    let buffering_mode = bench_buffering_mode();
+    let sync_mode = bench_sync_mode();
 
     // Ensure accurate division
     assert_eq!(FILES_PER_WORKER * WORKER_COUNT, FILE_COUNT);
@@ -153,9 +387,10 @@ fn benchmark_32_files_write(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(120));
 
-    group.bench_function("write_32_files_concurrent", |b| {
+    let bench_name = format!("write_32_files_concurrent_{}", bench_case_name());
+    group.bench_function(&bench_name, |b| {
         b.iter(|| {
-            let handle = std::thread::spawn(|| {
+            let handle = std::thread::spawn(move || {
                 // Initialize Runtime with 4 workers and BuddyPool
                 // Re-initialized per iteration because block_on consumes the runtime.
                 let runtime = Runtime::builder()
@@ -205,7 +440,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                     .write(true)
                                     .create(true)
                                     .truncate(true)
-                                    .buffering(BufferingMode::DirectSync)
+                                    .buffering(buffering_mode)
                                     .open(&path)
                                     .await
                                     .expect("Failed to create");
@@ -271,12 +506,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
 
                             // 3. Sync and Close
                             for file in &files {
-                                file.sync_range(0, FILE_SIZE)
-                                    .wait_before(false)
-                                    .write(true)
-                                    .wait_after(true)
-                                    .await
-                                    .expect("Sync failed");
+                                apply_sync(file, FILE_SIZE, sync_mode).await;
                             }
 
                             drop(files);

@@ -34,6 +34,31 @@ enum WriteMode {
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
+enum IoBuffering {
+    Buffered,
+    Direct,
+    DirectSync,
+}
+
+impl IoBuffering {
+    fn into_runtime_mode(self) -> BufferingMode {
+        match self {
+            IoBuffering::Buffered => BufferingMode::Buffered,
+            IoBuffering::Direct => BufferingMode::Direct,
+            IoBuffering::DirectSync => BufferingMode::DirectSync,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum SyncMode {
+    None,
+    SyncRange,
+    SyncAll,
+    SyncData,
+}
+
+#[derive(Clone, Copy, ValueEnum, Debug)]
 enum BlockSize {
     K4,
     K8,
@@ -120,6 +145,14 @@ struct Args {
     /// Block size (chunk size) for I/O operations
     #[arg(long, value_enum, default_value_t = BlockSize::M1)]
     block_size: BlockSize,
+
+    /// I/O buffering strategy
+    #[arg(long, value_enum, default_value_t = IoBuffering::Direct)]
+    buffering: IoBuffering,
+
+    /// Post-write sync strategy (measured within iteration)
+    #[arg(long, value_enum, default_value_t = SyncMode::SyncAll)]
+    sync: SyncMode,
 }
 
 // 1GB data per thread for benchmarking
@@ -151,7 +184,7 @@ fn get_file_path(t_idx: usize) -> PathBuf {
 
 /// Prepare files Phase: Create and fallocate files
 /// This runs effectively in parallel per thread, but outside the measurement loop.
-async fn prepare_files_for_thread(file_size: u64, t_idx: usize) {
+async fn prepare_files_for_thread(file_size: u64, t_idx: usize, buffering_mode: BufferingMode) {
     let path = get_file_path(t_idx);
     if path.exists() {
         let _ = std::fs::remove_file(&path);
@@ -161,7 +194,7 @@ async fn prepare_files_for_thread(file_size: u64, t_idx: usize) {
         .write(true)
         .create(true)
         .truncate(true)
-        .buffering(BufferingMode::DirectSync)
+        .buffering(buffering_mode)
         .open_local(&path)
         .await
         .expect("Failed to create file during preparation");
@@ -184,11 +217,32 @@ fn cleanup_files(threads: usize) {
     }
 }
 
+async fn apply_sync(file: &File, mode: SyncMode, bytes: u64) {
+    match mode {
+        SyncMode::None => {}
+        SyncMode::SyncRange => {
+            file.sync_range(0, bytes)
+                .wait_before(false)
+                .write(true)
+                .wait_after(true)
+                .await
+                .expect("sync_range failed");
+        }
+        SyncMode::SyncAll => {
+            file.sync_all().await.expect("sync_all failed");
+        }
+        SyncMode::SyncData => {
+            file.sync_data().await.expect("sync_data failed");
+        }
+    }
+}
+
 async fn run_iteration_measured(
     qdepth: usize,
     file: Rc<File>,
     ops: &[WriteOp],
     block_size: NonZeroUsize,
+    sync_mode: SyncMode,
     available_buffers: &mut Vec<FixedBuf>,
     pending_tasks: &mut VecDeque<LocalJoinHandle<(std::io::Result<usize>, FixedBuf)>>,
 ) -> IterationResult {
@@ -259,6 +313,8 @@ async fn run_iteration_measured(
         available_buffers.push(buf);
     }
 
+    apply_sync(&file, sync_mode, written_bytes).await;
+
     let duration = start_time.elapsed();
 
     IterationResult {
@@ -271,6 +327,8 @@ async fn run_worker(
     qdepth: usize,
     min_duration: Duration,
     min_iters: usize,
+    buffering_mode: BufferingMode,
+    sync_mode: SyncMode,
     config: ThreadConfig,
 ) -> std::io::Result<Vec<IterationResult>> {
     let pool = veloq_runtime::runtime::context::current_pool().expect("No pool");
@@ -279,7 +337,7 @@ async fn run_worker(
     let file = OpenOptions::new()
         .write(true)
         .create(false) // already created
-        .buffering(BufferingMode::DirectSync)
+        .buffering(buffering_mode)
         .open(&config.file_path)
         .await
         .expect("Failed to open file in worker");
@@ -315,6 +373,7 @@ async fn run_worker(
             file.clone(),
             &config.ops,
             config.block_size,
+            sync_mode,
             &mut reuse_buffers,
             &mut pending_tasks,
         )
@@ -355,7 +414,10 @@ fn main() {
         "Block Size: {} ({} Bytes)",
         args.block_size, block_size_bytes
     );
+    println!("Buffering: {:?}, Sync: {:?}", args.buffering, args.sync);
     println!("Pre-allocating files...");
+    let buffering_mode = args.buffering.into_runtime_mode();
+    let sync_mode = args.sync;
 
     // Setup filenames and configs
     let file_size_per_file = FILE_SIZE_PER_THREAD;
@@ -398,8 +460,9 @@ fn main() {
         let mut handles = Vec::new();
         for t_idx in 0..args.threads {
             // Spawn to workers to do it in parallel
+            let prepare_buffering = buffering_mode;
             handles.push(spawn_local(async move {
-                prepare_files_for_thread(FILE_SIZE_PER_THREAD, t_idx).await;
+                prepare_files_for_thread(FILE_SIZE_PER_THREAD, t_idx, prepare_buffering).await;
             }));
         }
         for h in handles {
@@ -416,11 +479,20 @@ fn main() {
             let tx = tx.clone();
             let qdepth = args.qdepth;
             let t_idx = config.thread_index; // needed for placement
+            let worker_buffering = buffering_mode;
+            let worker_sync = sync_mode;
 
             veloq_runtime::runtime::context::spawn_to(t_idx, async move || {
-                let res = run_worker(qdepth, duration_limit, min_iters, config)
-                    .await
-                    .expect("Worker Failed");
+                let res = run_worker(
+                    qdepth,
+                    duration_limit,
+                    min_iters,
+                    worker_buffering,
+                    worker_sync,
+                    config,
+                )
+                .await
+                .expect("Worker Failed");
                 tx.send(res).unwrap();
             });
         }
