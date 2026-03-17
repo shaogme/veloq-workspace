@@ -56,3 +56,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "runtime_init_bench"
+harness = false

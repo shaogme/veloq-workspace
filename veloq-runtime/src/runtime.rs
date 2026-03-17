@@ -174,16 +174,23 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         let mut thread_handles = Vec::with_capacity(worker_count - 1);
 
         // 3. Spawn Background Workers (1..N)
-        for i in 0..(worker_count - 1) {
-            let res = workers_iter.next().expect("Worker missing");
-            let worker_id = i + 1; // Iterator started from index 1 (Worker 0 detached)
+        let shared_clones = std::iter::repeat_with(|| {
+            (
+                registry.clone(),
+                peer_handles.clone(),
+                barrier.clone(),
+                self.config.clone(),
+                self.topology.clone(),
+                state.clone(),
+            )
+        });
 
-            let registry = registry.clone();
-            let peer_handles = peer_handles.clone();
-            let barrier = barrier.clone();
-            let config = self.config.clone();
-            let topology = self.topology.clone();
-            let state = state.clone();
+        for (i, (res, (registry, peer_handles, barrier, config, topology, state))) in workers_iter
+            .zip(shared_clones)
+            .enumerate()
+            .take(worker_count - 1)
+        {
+            let worker_id = i + 1; // Iterator started from index 1 (Worker 0 detached)
 
             let builder = thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
 
