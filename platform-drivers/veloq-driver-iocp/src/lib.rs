@@ -24,7 +24,7 @@ use std::task::Poll;
 use std::time::Instant;
 
 use tracing::trace;
-use veloq_blocking::{get_blocking_pool, BlockingTask};
+use veloq_blocking::{BlockingTask, get_blocking_pool};
 use veloq_driver_core::IoFd as CoreIoFd;
 use veloq_driver_core::driver::{
     CompletionSidecar, Driver, Outcome, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,

@@ -8,33 +8,9 @@
 //! - `runtime`: steady-state operation split into datapath and control-flow.
 //! - `lifecycle`: shutdown sequencing and deferred cleanup semantics.
 
-mod core {
-    /// Core context encoding, registry ownership, and kernel dispatch wrappers.
-    pub(crate) mod op_ctx;
-    /// Core registration table for chunks, slab pages, and heap buffers.
-    pub(crate) mod registry;
-    /// Core RIO kernel/CQ/RQ creation and submission helpers.
-    pub(crate) mod submit_ops;
-}
-
-mod runtime {
-    /// Runtime datapath: hot path buffer/pool state and UDP submissions.
-    pub(crate) mod data_plane {
-        pub(crate) mod pool;
-        pub(crate) mod submit_udp;
-    }
-
-    /// Runtime control-flow: actor coordination and completion routing.
-    pub(crate) mod control_flow {
-        pub(crate) mod actor;
-        pub(crate) mod completion;
-    }
-}
-
-mod lifecycle {
-    /// Drop-time shutdown, background reaper handoff, and strict drain logic.
-    pub(crate) mod shutdown;
-}
+pub(crate) mod core;
+pub(crate) mod lifecycle;
+pub(crate) mod runtime;
 
 use crate::BufferRegistrationMode;
 use crate::IocpOpState;
@@ -47,9 +23,10 @@ use windows_sys::Win32::Networking::WinSock::{RIO_CQ, RIO_RQ};
 
 use self::core::registry::RioRegistry;
 use self::core::submit_ops::{RioDispatch, RioKernel};
-use self::runtime::control_flow::actor::RioSocketActor;
+use self::runtime::control_flow::RioSocketActor;
 
-pub(crate) use self::runtime::data_plane::submit_udp::{RioSendToArgs, RioUdpStreamArgs};
+pub(crate) use self::runtime::RioSendToArgs;
+pub(crate) use self::runtime::RioUdpStreamArgs;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioEnv<'a> {
@@ -76,8 +53,8 @@ pub(crate) struct RioState {
     pub(crate) kernel: RioKernel,
     pub(crate) registry: RioRegistry,
     pub(crate) registration_mode: BufferRegistrationMode,
-    actors: FxHashMap<HANDLE, RioSocketActor>,
-    actor_routes: FxHashMap<u32, HANDLE>,
-    next_actor_id: u32,
+    pub(crate) actors: FxHashMap<HANDLE, RioSocketActor>,
+    pub(crate) actor_routes: FxHashMap<u32, HANDLE>,
+    pub(crate) next_actor_id: u32,
     pub(crate) outstanding_count: usize,
 }

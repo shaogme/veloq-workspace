@@ -1,12 +1,7 @@
-//! UDP-oriented submission entry points in the runtime datapath.
-//!
-//! This module contains:
-//! - `send_to` submissions built on `RIOSendEx` with strict slab-range checks,
-//! - pooled UDP stream receive submissions,
-//! - pool refill helpers used to sustain receive credits.
-//!
-//! All methods are implemented as `RioState` extensions but remain datapath
-//! focused: they prepare buffers, submit requests, and update outstanding counts.
+//! Runtime datapath: hot path buffer/pool state and UDP submissions.
+
+pub(crate) mod control_flow;
+pub(crate) mod pool;
 
 use crate::IoFd;
 use crate::error::{IocpErrorContext, io_error, io_msg};
@@ -181,9 +176,8 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         let _ = self.ensure_actor((fd, handle), env)?;
-        let (registry, actors) = (&mut self.registry, &mut self.actors);
-        let actor = actors.get_mut(&handle).expect("actor exists");
-        let mut ctx = Self::build_ctx(registry, env, (actor.actor_id, actor.rq));
+        let actor = self.actors.get_mut(&handle).expect("actor exists");
+        let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
         let (res, pool_submissions) = actor.pool_manager.try_submit_udp_recv_stream_pooled(
             stream_op,
             (user_data, generation),
@@ -211,9 +205,8 @@ impl RioState {
         };
         let (fd, handle) = target;
         let _ = self.ensure_actor((fd, handle), env)?;
-        let (registry, actors) = (&mut self.registry, &mut self.actors);
-        let actor = actors.get_mut(&handle).expect("actor exists");
-        let mut ctx = Self::build_ctx(registry, env, (actor.actor_id, actor.rq));
+        let actor = self.actors.get_mut(&handle).expect("actor exists");
+        let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
         let pool_submissions = actor.pool_manager.try_refill_udp_pool(buf, &mut ctx)?;
         self.outstanding_count += pool_submissions;
         Ok(())

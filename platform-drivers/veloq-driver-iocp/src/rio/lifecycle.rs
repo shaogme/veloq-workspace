@@ -1,18 +1,9 @@
 //! Shutdown and deferred cleanup orchestration for `RioState`.
-//!
-//! This module defines strict close behavior:
-//! - mark actors draining,
-//! - synchronously or asynchronously drain outstanding CQ completions,
-//! - release registrations and close kernel resources in deterministic order.
-//!
-//! When immediate teardown cannot complete in `Drop`, ownership is moved to a
-//! background reaper thread to avoid blocking critical threads indefinitely.
 
-use crate::error::{IocpErrorContext, io_msg};
 use crate::rio::RioState;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
-use crate::rio::runtime::control_flow::actor::RioSocketActor;
+use crate::rio::runtime::control_flow::RioSocketActor;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::sync::OnceLock;
@@ -21,7 +12,7 @@ use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 const RIO_REAPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-struct DeferredRioCleanup {
+pub(crate) struct DeferredRioCleanup {
     kernel: RioKernel,
     registry: RioRegistry,
     registration_mode: crate::BufferRegistrationMode,
@@ -30,7 +21,7 @@ struct DeferredRioCleanup {
     outstanding_count: usize,
 }
 
-// Safety: deferred cleanup task is transferred by ownership to a single reaper thread.
+// SAFETY: DeferredRioCleanup is transferred by ownership to a single reaper thread.
 unsafe impl Send for DeferredRioCleanup {}
 
 impl DeferredRioCleanup {
@@ -71,11 +62,11 @@ fn reaper_sender() -> &'static std::sync::mpsc::Sender<DeferredRioCleanup> {
 impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) {
         if let Some((actor_id, completion_generation)) =
-            Self::decode_pool_context(res.RequestContext)
+            Self::decode_pool_context(res.RequestContext as u64)
         {
             let _ = self.try_mark_pool_completion(actor_id, completion_generation);
         } else {
-            Self::free_op_request_context(res.RequestContext);
+            Self::free_op_request_context(res.RequestContext as u64);
         }
         if self.outstanding_count > 0 {
             self.outstanding_count -= 1;
@@ -108,8 +99,8 @@ impl RioState {
                 .dequeue(results.as_mut_ptr(), MAX_RESULTS as u32);
 
             if count == RIO_CORRUPT_CQ {
-                return Err(io_msg(
-                    IocpErrorContext::Rio,
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
                     "RIO completion queue is corrupt (RIO_CORRUPT_CQ)",
                 ));
             }
@@ -135,7 +126,7 @@ impl RioState {
         self.kernel.close();
     }
 
-    fn take_deferred_cleanup(&mut self) -> Option<DeferredRioCleanup> {
+    pub(crate) fn take_deferred_cleanup(&mut self) -> Option<DeferredRioCleanup> {
         if self.kernel.cq == 0 {
             return None;
         }

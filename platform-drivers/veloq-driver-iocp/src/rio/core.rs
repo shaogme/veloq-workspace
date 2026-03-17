@@ -1,16 +1,10 @@
-//! Operation request-context encoding and completion token decoding utilities.
-//!
-//! This module defines the wire format used in `RIORESULT.RequestContext` and
-//! provides helper functions to:
-//! - allocate/free operation-scoped context objects for non-pooled requests,
-//! - decode pooled completion tags emitted by UDP receive pools,
-//! - translate raw IO results into completion-table event codes.
-//!
-//! The code here is intentionally low-level and allocation-aware because it is
-//! called on hot completion paths and during shutdown draining.
+//! Core context encoding, registry ownership, and kernel dispatch wrappers.
+
+pub(crate) mod registry;
+pub(crate) mod submit_ops;
 
 use crate::rio::RioState;
-use crate::rio::runtime::data_plane::pool::POOL_CTX_TAG;
+use crate::rio::runtime::pool::POOL_CTX_TAG;
 use std::io;
 
 #[derive(Clone, Copy)]
@@ -28,8 +22,8 @@ pub(crate) enum RioCompletionKind {
 
 #[repr(C)]
 pub(crate) struct RioOpRequestContext {
-    user_data: usize,
-    generation: u32,
+    pub(crate) user_data: usize,
+    pub(crate) generation: u32,
 }
 
 pub(crate) struct RioOpCtxGuard(pub(crate) *mut RioOpRequestContext);
