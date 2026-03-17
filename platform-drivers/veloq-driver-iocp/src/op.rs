@@ -5,13 +5,16 @@
 //! - `OpVTable`: The virtual table for dynamic dispatch without enums
 //! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
+use std::io;
+use std::mem::ManuallyDrop;
+use std::ptr::NonNull;
+
 use crate::SockAddrStorage;
 use crate::ext::Extensions;
 use crate::rio::RioState;
 use crate::submit::{self, SubmissionResult};
 use crate::{IoFd, RawHandle};
-use std::io;
-use std::mem::ManuallyDrop;
+
 use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
@@ -20,6 +23,7 @@ use veloq_driver_core::op::{
     UdpRecvStream as UdpRecvStreamBase, UdpRefill as UdpRefillBase, Wakeup as WakeupBase,
     WriteFixed as WriteFixedBase,
 };
+
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED,
@@ -31,17 +35,24 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 // OverlappedEntry Definition
 // ============================================================================
 
+/// A wrapper for the Windows OVERLAPPED structure with additional metadata.
 #[repr(C)]
 pub struct OverlappedEntry {
+    /// The underlying Windows OVERLAPPED structure.
     pub(crate) inner: OVERLAPPED,
+    /// User-defined data associated with the operation.
     pub(crate) user_data: usize,
+    /// Generation count for slot validation.
     pub(crate) generation: u32,
+    /// Result of an offloaded blocking operation.
     pub(crate) blocking_result: Option<io::Result<usize>>,
 }
 
 impl OverlappedEntry {
+    /// Creates a new `OverlappedEntry` with the given user data.
     pub(crate) fn new(user_data: usize) -> Self {
         Self {
+            // SAFETY: OVERLAPPED can be safely zero-initialized.
             inner: unsafe { std::mem::zeroed() },
             user_data,
             generation: 0,
@@ -56,6 +67,7 @@ impl Default for OverlappedEntry {
     }
 }
 
+// SAFETY: OverlappedEntry is safe to send between threads.
 unsafe impl Send for OverlappedEntry {}
 
 type ReadFixed = ReadFixedBase<RawHandle>;
@@ -77,6 +89,7 @@ type Wakeup = WakeupBase<RawHandle>;
 // SubmitContext Definition
 // ============================================================================
 
+/// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
     pub(crate) port: HANDLE,
     pub(crate) overlapped: *mut OVERLAPPED,
@@ -104,6 +117,7 @@ pub(crate) type DropFn = unsafe fn(op: &mut IocpKernelOp);
 
 pub(crate) type GetFdFn = unsafe fn(op: &IocpKernelOp) -> Option<IoFd>;
 
+/// Virtual table for dynamic dispatch of IOCP operations.
 pub(crate) struct OpVTable {
     pub(crate) submit: SubmitFn,
     pub(crate) on_complete: Option<OnCompleteFn>,
@@ -115,8 +129,7 @@ pub(crate) struct OpVTable {
 // IocpKernelOp Struct & Union (Type-Erased)
 // ============================================================================
 
-use std::ptr::NonNull;
-
+/// A type-erased IOCP kernel operation.
 #[repr(C)]
 pub struct IocpKernelOp {
     /// Virtual Table for dynamic dispatch
@@ -132,13 +145,16 @@ pub struct IocpKernelOp {
 impl PlatformOp for IocpKernelOp {}
 
 impl IocpKernelOp {
+    /// Returns the file descriptor associated with the operation, if any.
     pub(crate) fn get_fd(&self) -> Option<IoFd> {
+        // SAFETY: vtable pointer is guaranteed to be valid and point to a valid OpVTable.
         unsafe { (self.vtable.as_ref().get_fd)(self) }
     }
 }
 
 impl Drop for IocpKernelOp {
     fn drop(&mut self) {
+        // SAFETY: vtable pointer is guaranteed to be valid and point to a valid OpVTable.
         unsafe { (self.vtable.as_ref().drop)(self) };
     }
 }
@@ -189,6 +205,7 @@ macro_rules! define_iocp_ops {
                     let payload = define_iocp_ops!(@construct user_ptr, $($construct)?, $OpType $(, $Payload)?);
 
                     let op = IocpKernelOp {
+                        // SAFETY: TABLE is a static and its address is guaranteed to be non-null.
                         vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
                         header: OverlappedEntry::new(0),
                         payload: IocpOpPayload {
@@ -211,6 +228,7 @@ macro_rules! define_iocp_ops {
                 }
 
                 unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
+                    // SAFETY: ptr is guaranteed to be a valid pointer to $OpType.
                     unsafe { Box::from_raw(ptr as *mut $OpType) }
                 }
             }
@@ -235,6 +253,7 @@ macro_rules! define_iocp_ops {
 
     (@drop_raw_fn $OpType:ty) => {{
         unsafe fn drop_raw(ptr: *mut ()) {
+            // SAFETY: ptr is guaranteed to be a valid pointer to $OpType.
             unsafe { drop(Box::from_raw(ptr as *mut $OpType)) };
         }
         drop_raw
@@ -245,26 +264,31 @@ macro_rules! define_iocp_ops {
 // Payload Structures for Complex Ops
 // ============================================================================
 
+/// Reference to a kernel operation.
 pub(crate) struct KernelRef<T> {
     pub(crate) user: NonNull<T>,
 }
 
+/// Payload for the socket accept operation.
 pub(crate) struct AcceptPayload {
     pub(crate) user: NonNull<Accept>,
     pub(crate) accept_buffer: [u8; 288],
     pub(crate) accept_socket: RawHandle,
 }
 
+/// Payload for the socket send-to operation.
 pub(crate) struct SendToPayload {
     pub(crate) user: NonNull<SendTo>,
     pub(crate) addr: SockAddrStorage,
     pub(crate) addr_len: i32,
 }
 
+/// Payload for the file open operation.
 pub(crate) struct OpenPayload {
     pub(crate) user: NonNull<Open>,
 }
 
+/// Alias for the platform-specific IOCP kernel operation.
 pub type IocpOp = IocpKernelOp;
 
 // ============================================================================
@@ -352,8 +376,10 @@ define_iocp_ops! {
         drop: submit::drop_accept,
         get_fd: submit::get_fd_accept,
         construct: |user: std::ptr::NonNull<Accept>| {
+            // SAFETY: user pointer is valid and points to a valid Accept.
             let op = unsafe { user.as_ref() };
             let family = op.addr.0.ss_family;
+            // SAFETY: WSASocketW is called with valid parameters for IOCP.
             let socket = unsafe {
                 WSASocketW(
                     family as i32,
@@ -389,6 +415,7 @@ define_iocp_ops! {
         drop: submit::drop_send_to,
         get_fd: submit::get_fd_send_to,
         construct: |user: std::ptr::NonNull<SendTo>| {
+            // SAFETY: user pointer is valid and points to a valid SendTo.
             let op = unsafe { user.as_ref() };
             let (addr, raw_addr_len) = crate::socket_addr_to_storage(op.addr);
             let addr_len = if op.addr.is_ipv4() {

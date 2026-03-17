@@ -58,6 +58,8 @@ impl std::fmt::Debug for Extensions {
 
 impl Extensions {
     pub(crate) fn new() -> io::Result<Self> {
+        // SAFETY: Calling `WSASocketW` to create a new TCP socket. The parameters
+        // are standard for a overlapped socket.
         let socket = unsafe {
             let s = WSASocketW(
                 AF_INET as i32,
@@ -76,6 +78,8 @@ impl Extensions {
         let traditional = Self::load_traditional(socket);
         let rio = Self::load_rio(socket)?;
 
+        // SAFETY: `closesocket` is a standard Windows API to close a socket descriptor.
+        // The descriptor `socket` was just created and is valid.
         unsafe { closesocket(socket) };
 
         let (accept_ex, connect_ex, get_accept_ex_sockaddrs) = traditional?;
@@ -91,6 +95,9 @@ impl Extensions {
     fn load_traditional(
         socket: SOCKET,
     ) -> io::Result<(LpfnAcceptEx, LpfnConnectEx, LpfnGetAcceptExSockaddrs)> {
+        // SAFETY: `get_extension` calls `WSAIoctl` to retrieve function pointers.
+        // `transmute` converts the returned pointer to the expected function signature.
+        // The pointers are guaranteed by the OS to be valid pointers to extension functions.
         unsafe {
             let accept_ex_ptr = Self::get_extension(socket, WSAID_ACCEPTEX)?;
             let connect_ex_ptr = Self::get_extension(socket, WSAID_CONNECTEX)?;
@@ -111,6 +118,8 @@ impl Extensions {
     }
 
     fn load_rio(socket: SOCKET) -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
+        // SAFETY: `RIO_EXTENSION_FUNCTION_TABLE` is a POD struct. `WSAIoctl` is
+        // called to fill it. Memory layout for the struct is guaranteed to be compatible.
         unsafe {
             let mut guid = WSAID_MULTIPLE_RIO;
             let mut table: RIO_EXTENSION_FUNCTION_TABLE = std::mem::zeroed();
@@ -138,7 +147,7 @@ impl Extensions {
         }
     }
 
-    unsafe fn get_extension(
+    fn get_extension(
         socket: SOCKET,
         guid: windows_sys::core::GUID,
     ) -> io::Result<*const std::ffi::c_void> {
@@ -146,6 +155,8 @@ impl Extensions {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut bytes_returned = 0;
 
+        // SAFETY: `WSAIoctl` is called with correct pointers and sizes for the requested GUID extension pointer.
+        // The pointers are valid and owned by the stack.
         let ret = unsafe {
             WSAIoctl(
                 socket,
@@ -160,10 +171,10 @@ impl Extensions {
             )
         };
 
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
+        if ret == 0 {
+            Ok(ptr)
+        } else {
+            Err(io::Error::last_os_error())
         }
-
-        Ok(ptr as *const _)
     }
 }
