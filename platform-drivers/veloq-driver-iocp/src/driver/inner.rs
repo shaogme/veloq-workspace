@@ -22,12 +22,13 @@ use crate::common::{
 };
 use crate::config::{BufferRegistrationMode, IocpConfig};
 use crate::driver::{CompletionSidecar, IocpOpState, OpLifecycle};
+use crate::ops::slot_ext::IocpSlotExt;
 use crate::ops::{IocpOp, OverlappedEntry, submit};
 use crate::rio::RioState;
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
-pub(crate) type PreInit = crate::win32::IoCompletionPort;
+pub(crate) type PreInit = crate::common::IoCompletionPort;
 
 struct EmitContext<'a> {
     ops_shared: &'a Arc<SlotTable<IocpOp, OverlappedEntry>>,
@@ -37,7 +38,7 @@ struct EmitContext<'a> {
 
 /// The IOCP driver implementation that manages I/O completion ports and operations.
 pub struct IocpDriver {
-    pub(crate) port: Arc<crate::win32::IoCompletionPort>,
+    pub(crate) port: Arc<crate::common::IoCompletionPort>,
     pub(crate) ops: OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
@@ -69,7 +70,7 @@ impl IocpDriver {
 
     /// Creates a pre-initialization completion port handle.
     pub(crate) fn create_pre_init() -> io::Result<PreInit> {
-        crate::win32::IoCompletionPort::new(0)
+        crate::common::IoCompletionPort::new(0)
     }
 
     /// Creates a new IOCP driver instance.
@@ -136,7 +137,7 @@ impl IocpDriver {
         let status = status?;
 
         match status {
-            crate::win32::CompletionStatus::Completed {
+            crate::common::CompletionStatus::Completed {
                 bytes,
                 key,
                 overlapped,
@@ -163,7 +164,7 @@ impl IocpDriver {
                 trace!(user_data, bytes, "CQE received");
                 self.process_completion(user_data, success, error_code, bytes);
             }
-            crate::win32::CompletionStatus::Timeout => {}
+            crate::common::CompletionStatus::Timeout => {}
         }
         Ok(())
     }
@@ -260,12 +261,11 @@ impl IocpDriver {
 
         let slot = &ops.shared.slots[user_data];
         let generation = slot.generation.load(Ordering::Acquire);
-        // SAFETY: slot.op.get() is a valid pointer for the lifetime of the SlotEntry.
-        let _ = unsafe { (*slot.op.get()).take() };
-        // SAFETY: slot.payload.get() is a valid pointer and contains the payload.
-        let payload = unsafe { (*slot.payload.get()).take() };
-        // SAFETY: slot.result.get() is a valid pointer and contains the result.
-        let detail = unsafe { (*slot.result.get()).take() };
+        // SAFETY: Slot is being processed for timer expiration; exclusively owned.
+        let (payload, detail) = unsafe {
+            slot.take_op();
+            slot.take_completion_data()
+        };
         pending_events.push(CompletionSidecar {
             user_data,
             generation,
@@ -328,12 +328,14 @@ impl IocpDriver {
         } else {
             Ok(bytes_transferred as usize)
         };
-        // SAFETY: slot.op.get() is a valid pointer.
+        // SAFETY: op is checked for presence.
         if let Some(iocp_op) = unsafe { &mut *slot.op.get() } {
-            // SAFETY: slot.sidecar.get() is a valid pointer.
-            let slot_overlapped = unsafe { &mut *slot.sidecar.get() };
-            if let Some(blocking_res) = slot_overlapped.blocking_result.take() {
-                io_result = blocking_res;
+            // SAFETY: Safe access via IocpSlotExt.
+            let blocking_res = unsafe {
+                slot.with_sidecar_mut(|s| s.blocking_result.take())
+            };
+            if let Some(res) = blocking_res {
+                io_result = res;
             } else if let Ok(val) = io_result {
                 // SAFETY: vtable pointer is valid and on_complete is a valid function pointer if present.
                 if let Some(on_comp) = unsafe { iocp_op.vtable.as_ref().on_complete } {
@@ -370,18 +372,16 @@ impl IocpDriver {
                 if op.platform_data.is_background {
                     // SAFETY: Cleaning up background op slots.
                     unsafe {
-                        (*slot.op.get()).take();
-                        (*slot.payload.get()).take();
-                        (*slot.result.get()).take();
+                        slot.take_op();
+                        slot.take_completion_data();
                     }
                     let _data = std::mem::take(&mut op.platform_data);
                     ctx.ops_shared.push_free(user_data);
                 } else {
                     op.platform_data.lifecycle = OpLifecycle::Completed;
                     if !(was_cancelled && op.platform_data.rio_needs_drain) {
-                        // SAFETY: Taking payload and result for event emission.
-                        let (payload, detail) =
-                            unsafe { ((*slot.payload.get()).take(), (*slot.result.get()).take()) };
+                        // SAFETY: Taking completion data using Trait.
+                        let (payload, detail) = unsafe { slot.take_completion_data() };
                         push_completion_shared(
                             ctx.completion_events,
                             ctx.completion_table,
@@ -396,8 +396,8 @@ impl IocpDriver {
                         );
                     }
                     if !op.platform_data.rio_needs_drain || op.platform_data.rio_drained {
-                        // SAFETY: Final cleanup of op slot.
-                        unsafe { (*slot.op.get()).take() };
+                        // SAFETY: Taking values from UnsafeCells after ensuring the IO is finished.
+                        unsafe { slot.take_op() };
                         let _data = std::mem::take(&mut op.platform_data);
                         ctx.ops_shared.push_free(user_data);
                     }
@@ -471,8 +471,8 @@ impl IocpDriver {
                 return;
             }
 
-            // SAFETY: `slot.sidecar.get()` provides a valid overlapped pointer for `CancelIoEx`.
-            let overlapped_ptr = unsafe { &mut (*slot.sidecar.get()).inner as *mut _ };
+            // SAFETY: `overlapped_ptr()` provides a valid overlapped pointer for `CancelIoEx`.
+            let overlapped_ptr = unsafe { slot.overlapped_ptr() };
             // SAFETY: Calling Win32 API to cancel asynchronous I/O.
             unsafe {
                 windows_sys::Win32::System::IO::CancelIoEx(handle, overlapped_ptr);
@@ -488,9 +488,11 @@ impl IocpDriver {
     ) {
         op.platform_data.lifecycle = OpLifecycle::Completed;
         let generation = slot.generation.load(Ordering::Acquire);
-        let (payload, detail) =
-            // SAFETY: slot.payload.get() and slot.result.get() are valid pointers.
-            unsafe { ((*slot.payload.get()).take(), (*slot.result.get()).take()) };
+        // SAFETY: Extracting completion data and removing op from slot.
+        let (payload, detail) = unsafe {
+            slot.take_op();
+            slot.take_completion_data()
+        };
         push_completion_shared(
             ctx.completion_events,
             ctx.completion_table,
@@ -503,8 +505,6 @@ impl IocpDriver {
                 detail,
             }),
         );
-        // SAFETY: slot.op.get() is a valid pointer.
-        unsafe { (*slot.op.get()).take() };
         let _data = std::mem::take(&mut op.platform_data);
         ctx.ops_shared.push_free(user_data);
     }

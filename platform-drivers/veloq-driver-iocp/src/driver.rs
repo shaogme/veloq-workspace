@@ -18,11 +18,12 @@ use veloq_driver_core::driver::{
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
-use veloq_driver_core::slot::{SlotEntry, SlotTable};
+use veloq_driver_core::slot::SlotTable;
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::config::{IoFd, RawHandle};
+use crate::ops::slot_ext::IocpSlotExt;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 pub use inner::IocpDriver;
 use inner::RIO_EVENT_KEY;
@@ -91,14 +92,8 @@ pub(crate) type CompletionSidecar = CoreCompletionSidecar;
 // Driver Implementation
 // ============================================================================
 
-#[inline]
-fn slot_overlapped_ptr(slot: &SlotEntry<IocpOp, OverlappedEntry>) -> *mut OVERLAPPED {
-    // SAFETY: slot is guaranteed to be valid during the operation.
-    unsafe { &mut (*slot.sidecar.get()).inner as *mut _ }
-}
-
 struct SubmitContextInternal<'a> {
-    port: &'a crate::win32::IoCompletionPort,
+    port: &'a crate::common::IoCompletionPort,
     wheel: &'a mut veloq_wheel::Wheel<usize>,
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable,
@@ -115,28 +110,21 @@ impl IocpDriver {
             .get_slot_and_entry_mut(user_data)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Op not found"))?;
 
-        // SAFETY: slot.op.get() is a valid pointer for the lifetime of the SlotEntry.
-        unsafe { *slot.op.get() = Some(op) };
+        let generation = slot.generation.load(Ordering::Acquire);
+        // SAFETY: Initializing slot with op and sidecar data.
+        unsafe { slot.init_op(op, user_data, generation) };
 
-        // SAFETY: We just inserted the op, so it's guaranteed to be Some.
+        // SAFETY: `init_op` ensures `self.op` is `Some`.
         let op_ref = unsafe {
             (*slot.op.get())
                 .as_mut()
                 .ok_or_else(|| io::Error::other("Failed to get op ref"))?
         };
         op_ref.header.user_data = user_data;
-        let generation = slot.generation.load(Ordering::Acquire);
         op_ref.header.generation = generation;
         op_entry.platform_data.generation = generation;
 
-        // SAFETY: slot.sidecar.get() is valid for the lifetime of the SlotEntry.
-        unsafe {
-            let sidecar = &mut *slot.sidecar.get();
-            sidecar.user_data = user_data;
-            sidecar.generation = generation;
-            sidecar.blocking_result = None;
-        }
-        let overlapped_ptr = slot_overlapped_ptr(slot);
+        let overlapped_ptr = unsafe { slot.overlapped_ptr() };
         Ok((op_ref, op_entry, overlapped_ptr))
     }
 
@@ -152,19 +140,13 @@ impl IocpDriver {
         }
         if get_blocking_pool().execute(task).is_err() {
             let err = io::Error::other("Thread pool overloaded");
-            if let Some((slot, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-                // SAFETY: slot.result.get() is a valid pointer.
-                unsafe {
-                    *slot.result.get() = Some(Err(io::Error::new(err.kind(), err.to_string())));
-                }
-                op_entry.platform_data.lifecycle = OpLifecycle::Completed;
+            if let Some((slot, _)) = ops.get_slot_and_entry_mut(user_data) {
                 let generation = slot.generation.load(Ordering::Acquire);
-                // SAFETY: slot.op.get(), slot.payload.get(), slot.result.get() are valid pointers.
-                let _ = unsafe { (*slot.op.get()).take() };
-                // SAFETY: slot.payload.get() is a valid pointer.
-                let payload = unsafe { (*slot.payload.get()).take() };
-                // SAFETY: slot.result.get() is a valid pointer.
-                let detail = unsafe { (*slot.result.get()).take() };
+                // SAFETY: Cleaning up slot and extracting completion data.
+                let (payload, detail) = unsafe {
+                    slot.take_op();
+                    slot.take_completion_data()
+                };
                 let sidecar = CompletionSidecar {
                     user_data,
                     generation,
@@ -215,9 +197,8 @@ impl IocpDriver {
                 if posted == 0 {
                     let err = io::Error::last_os_error();
                     if let Some((slot, _)) = ops.get_slot_and_entry_mut(user_data) {
-                        // SAFETY: slot.op.get() is a valid pointer.
-                        let op = unsafe { (*slot.op.get()).take() };
-                        *op_in = op;
+                        // SAFETY: Taking the op from slot.
+                        *op_in = unsafe { slot.take_op() };
                     }
                     ops.remove(user_data);
                     binder.err(err)
@@ -247,9 +228,8 @@ impl IocpDriver {
             }
             Err(e) => {
                 if let Some((slot, _)) = ops.get_slot_and_entry_mut(user_data) {
-                    // SAFETY: slot.op.get() is a valid pointer.
-                    let op = unsafe { (*slot.op.get()).take() };
-                    *op_in = op;
+                    // SAFETY: Taking the op from slot.
+                    *op_in = unsafe { slot.take_op() };
                 }
                 ops.remove(user_data);
                 binder.err(e)
@@ -386,7 +366,7 @@ impl IocpDriver {
         let status = self.port.get_status(10)?;
 
         match status {
-            crate::win32::CompletionStatus::Completed {
+            crate::common::CompletionStatus::Completed {
                 bytes,
                 key,
                 overlapped,
@@ -408,7 +388,7 @@ impl IocpDriver {
                     return Ok(1);
                 }
             }
-            crate::win32::CompletionStatus::Timeout => {}
+            crate::common::CompletionStatus::Timeout => {}
         }
         Ok(0)
     }
@@ -518,8 +498,8 @@ impl Driver for IocpDriver {
             }
             Err(e) => {
                 if let Some((slot, _)) = self.ops.get_slot_and_entry_mut(user_data) {
-                    // SAFETY: slot.op.get() is a valid pointer.
-                    let _ = unsafe { (*slot.op.get()).take() };
+                    // SAFETY: Taking the op from slot.
+                    let _ = unsafe { slot.take_op() };
                 }
                 self.ops.remove(user_data);
                 return Err(e);

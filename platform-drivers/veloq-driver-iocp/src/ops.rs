@@ -6,6 +6,7 @@
 //! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
 pub(crate) mod overlapped;
+pub(crate) mod slot_ext;
 pub(crate) mod submit;
 
 pub use overlapped::OverlappedEntry;
@@ -60,7 +61,7 @@ type Wakeup = WakeupBase<RawHandle>;
 
 /// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
-    pub(crate) port: &'a crate::win32::IoCompletionPort,
+    pub(crate) port: &'a crate::common::IoCompletionPort,
     pub(crate) overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_files: &'a [Option<HANDLE>],

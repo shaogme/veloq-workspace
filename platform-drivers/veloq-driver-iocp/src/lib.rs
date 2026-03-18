@@ -5,7 +5,6 @@ pub mod ext;
 pub mod net;
 pub mod ops;
 pub mod rio;
-pub mod win32;
 
 #[cfg(test)]
 pub mod tests;

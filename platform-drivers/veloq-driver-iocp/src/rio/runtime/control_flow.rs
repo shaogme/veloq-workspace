@@ -2,6 +2,7 @@
 
 use crate::IoFd;
 use crate::driver::{IocpOpState, OpLifecycle};
+use crate::ops::slot_ext::IocpSlotExt;
 use crate::ops::IocpOp;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpCtxGuard;
@@ -136,19 +137,21 @@ impl<'a> RioCompletionRouter<'a> {
                                 res: res_code,
                                 flags: 0,
                             };
-                            let payload = unsafe { (*slot.payload.get()).take() };
-                            let detail = unsafe { (*slot.result.get()).take() };
+                            // SAFETY: IO completed; safe to take data using IocpSlotExt.
+                            let (payload, detail) = unsafe { slot.take_completion_data() };
                             self.comp
                                 .table
                                 .record_completion_with_data(event, payload, detail);
                             self.comp.events.push(event);
-                            let _ = unsafe { (*slot.op.get()).take() };
+                            unsafe { slot.take_op() };
                             let _ = std::mem::take(&mut op.platform_data);
                             self.comp.ops.shared.push_free(user_data);
                         } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
-                            let _ = unsafe { (*slot.op.get()).take() };
-                            let _ = unsafe { (*slot.payload.get()).take() };
-                            let _ = unsafe { (*slot.result.get()).take() };
+                            // SAFETY: IO completed after cancellation; safe to cleanup.
+                            unsafe {
+                                slot.take_op();
+                                slot.take_completion_data();
+                            }
                             let _ = std::mem::take(&mut op.platform_data);
                             self.comp.ops.shared.push_free(user_data);
                         }
