@@ -10,10 +10,10 @@ pub(crate) mod slot_ext;
 pub(crate) mod submit;
 
 pub use overlapped::OverlappedEntry;
+pub(crate) use slot_ext::IocpSlotExt;
 pub(crate) use submit::SubmissionResult;
 
 use std::io;
-use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
 use crate::config::{IoFd, RawHandle};
@@ -40,20 +40,20 @@ use windows_sys::Win32::Networking::WinSock::{
 // Type Aliases for Core Ops
 // ============================================================================
 
-type ReadFixed = ReadFixedBase<RawHandle>;
-type WriteFixed = WriteFixedBase<RawHandle>;
-type Recv = RecvBase<RawHandle>;
-type OpSend = OpSendBase<RawHandle>;
-type Close = CloseBase<RawHandle>;
-type Fsync = FsyncBase<RawHandle>;
-type Connect = ConnectBase<RawHandle, SockAddrStorage>;
-type Accept = AcceptBase<RawHandle, SockAddrStorage>;
-type SendTo = SendToBase<RawHandle>;
-type SyncFileRange = SyncFileRangeBase<RawHandle>;
-type Fallocate = FallocateBase<RawHandle>;
-type UdpRecvStream = UdpRecvStreamBase<RawHandle>;
-type UdpRefill = UdpRefillBase<RawHandle>;
-type Wakeup = WakeupBase<RawHandle>;
+pub(crate) type ReadFixed = ReadFixedBase<RawHandle>;
+pub(crate) type WriteFixed = WriteFixedBase<RawHandle>;
+pub(crate) type Recv = RecvBase<RawHandle>;
+pub(crate) type OpSend = OpSendBase<RawHandle>;
+pub(crate) type Close = CloseBase<RawHandle>;
+pub(crate) type Fsync = FsyncBase<RawHandle>;
+pub(crate) type Connect = ConnectBase<RawHandle, SockAddrStorage>;
+pub(crate) type Accept = AcceptBase<RawHandle, SockAddrStorage>;
+pub(crate) type SendTo = SendToBase<RawHandle>;
+pub(crate) type SyncFileRange = SyncFileRangeBase<RawHandle>;
+pub(crate) type Fallocate = FallocateBase<RawHandle>;
+pub(crate) type UdpRecvStream = UdpRecvStreamBase<RawHandle>;
+pub(crate) type UdpRefill = UdpRefillBase<RawHandle>;
+pub(crate) type Wakeup = WakeupBase<RawHandle>;
 
 // ============================================================================
 // SubmitContext Definition
@@ -74,62 +74,6 @@ pub(crate) struct SubmitContext<'a> {
 }
 
 // ============================================================================
-// VTable Definition
-// ============================================================================
-
-pub(crate) type SubmitFn =
-    unsafe fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> io::Result<SubmissionResult>;
-
-pub(crate) type OnCompleteFn =
-    unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> io::Result<usize>;
-
-pub(crate) type DropFn = unsafe fn(op: &mut IocpKernelOp);
-
-pub(crate) type GetFdFn = unsafe fn(op: &IocpKernelOp) -> Option<IoFd>;
-
-/// Virtual table for dynamic dispatch of IOCP operations.
-pub(crate) struct OpVTable {
-    pub(crate) submit: SubmitFn,
-    pub(crate) on_complete: Option<OnCompleteFn>,
-    pub(crate) drop: DropFn,
-    pub(crate) get_fd: GetFdFn,
-}
-
-// ============================================================================
-// IocpKernelOp Struct & Union (Type-Erased)
-// ============================================================================
-
-/// A type-erased IOCP kernel operation.
-#[repr(C)]
-pub struct IocpKernelOp {
-    /// Virtual Table for dynamic dispatch
-    pub(crate) vtable: NonNull<OpVTable>,
-
-    /// Public header accessible directly by Driver
-    pub(crate) header: OverlappedEntry,
-
-    /// Type-erased payload
-    pub(crate) payload: IocpOpPayload,
-}
-
-impl PlatformOp for IocpKernelOp {}
-
-impl IocpKernelOp {
-    /// Returns the file descriptor associated with the operation, if any.
-    pub(crate) fn get_fd(&self) -> Option<IoFd> {
-        // SAFETY: vtable pointer is guaranteed to be valid and point to a valid OpVTable.
-        unsafe { (self.vtable.as_ref().get_fd)(self) }
-    }
-}
-
-impl Drop for IocpKernelOp {
-    fn drop(&mut self) {
-        // SAFETY: vtable pointer is guaranteed to be valid and point to a valid OpVTable.
-        unsafe { (self.vtable.as_ref().drop)(self) };
-    }
-}
-
-// ============================================================================
 // Macro Definition
 // ============================================================================
 
@@ -137,24 +81,57 @@ macro_rules! define_iocp_ops {
     (
         $(
             $OpType:ident {
-                field: $field:ident,
+                variant: $Variant:ident,
                 $(payload: $Payload:ty,)?
                 kind: $kind:expr,
                 submit: $submit:path,
                 $(on_complete: $complete:path,)?
-                drop: $drop:path,
                 get_fd: $get_fd:path,
                 $(construct: $construct:expr,)?
                 $(destruct: $destruct:expr,)?
             }
         ),+ $(,)?
     ) => {
-        // Ensure proper alignment
-        #[repr(C)]
-        pub(crate) union IocpOpPayload {
+        /// Type-safe payload enum for IOCP operations.
+        pub(crate) enum IocpOpPayload {
             $(
-                pub(crate) $field: ManuallyDrop< define_iocp_ops!(@payload_type $OpType $(, $Payload)?) >,
+                $Variant( define_iocp_ops!(@payload_type $OpType $(, $Payload)?) ),
             )+
+        }
+
+        /// Virtual table for dynamic dispatch of IOCP operations.
+        pub(crate) struct OpVTable {
+            pub(crate) submit: unsafe fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> io::Result<SubmissionResult>,
+            pub(crate) on_complete: Option<unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> io::Result<usize>>,
+            pub(crate) get_fd: unsafe fn(op: &IocpKernelOp) -> Option<IoFd>,
+        }
+
+        /// A type-erased IOCP kernel operation.
+        pub struct IocpKernelOp {
+            /// Virtual Table for dynamic dispatch
+            pub(crate) vtable: NonNull<OpVTable>,
+            /// Public header accessible directly by Driver
+            pub(crate) header: OverlappedEntry,
+            /// Type-safe payload enum
+            pub(crate) payload: IocpOpPayload,
+        }
+
+        impl PlatformOp for IocpKernelOp {}
+
+        impl IocpKernelOp {
+            pub(crate) fn get_fd(&self) -> Option<IoFd> {
+                unsafe { (self.vtable.as_ref().get_fd)(self) }
+            }
+            pub(crate) fn submit(&mut self, ctx: &mut SubmitContext) -> io::Result<SubmissionResult> {
+                unsafe { (self.vtable.as_ref().submit)(self, ctx) }
+            }
+            pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
+                if let Some(on_complete) = unsafe { self.vtable.as_ref().on_complete } {
+                    unsafe { (on_complete)(self, result, ext) }
+                } else {
+                    Ok(result)
+                }
+            }
         }
 
         $(
@@ -164,10 +141,21 @@ macro_rules! define_iocp_ops {
 
                 fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
-                        submit: $submit,
-                        on_complete: define_iocp_ops!(@optional_complete $($complete)?),
-                        drop: $drop,
-                        get_fd: $get_fd,
+                        submit: |op, ctx| unsafe {
+                            if let IocpOpPayload::$Variant(ref mut p) = op.payload {
+                                $submit(&mut op.header, p, ctx)
+                            } else {
+                                unreachable!("Variant mismatch in IocpKernelOp dispatch for {}", stringify!($OpType));
+                            }
+                        },
+                        on_complete: define_iocp_ops!(@optional_complete_shim $OpType, $Variant, $($complete)?),
+                        get_fd: |op| {
+                            if let IocpOpPayload::$Variant(ref p) = op.payload {
+                                $get_fd(p)
+                            } else {
+                                unreachable!("Variant mismatch in IocpKernelOp get_fd for {}", stringify!($OpType));
+                            }
+                        },
                     };
 
                     let mut user = Box::new(self);
@@ -178,9 +166,7 @@ macro_rules! define_iocp_ops {
                         // SAFETY: TABLE is a static and its address is guaranteed to be non-null.
                         vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
                         header: OverlappedEntry::new(0),
-                        payload: IocpOpPayload {
-                            $field: ManuallyDrop::new(payload),
-                        },
+                        payload: IocpOpPayload::$Variant(payload),
                     };
                     (op, user)
                 }
@@ -208,8 +194,16 @@ macro_rules! define_iocp_ops {
     (@payload_type $OpType:ty) => { KernelRef<$OpType> };
     (@payload_type $OpType:ty, $Payload:ty) => { $Payload };
 
-    (@optional_complete) => { None };
-    (@optional_complete $fn:path) => { Some($fn) };
+    (@optional_complete_shim $OpType:ident, $Variant:ident,) => { None };
+    (@optional_complete_shim $OpType:ident, $Variant:ident, $fn:path) => {
+        Some(|op, result, ext| unsafe {
+            if let IocpOpPayload::$Variant(ref mut p) = op.payload {
+                $fn(&mut op.header, p, result, ext)
+            } else {
+                unreachable!("Variant mismatch in IocpKernelOp on_complete for {}", stringify!($OpType));
+            }
+        })
+    };
 
     // Default construct: keep only a pointer to user payload
     (@construct $user_ptr:expr, , $OpType:ty) => { KernelRef { user: $user_ptr } };
@@ -267,83 +261,72 @@ pub type IocpOp = IocpKernelOp;
 
 define_iocp_ops! {
     ReadFixed {
-        field: read,
+        variant: Read,
         kind: OpKind::ReadFixed,
         submit: submit::submit_read_fixed,
-        drop: submit::drop_read_fixed,
         get_fd: submit::get_fd_read_fixed,
     },
     WriteFixed {
-        field: write,
+        variant: Write,
         kind: OpKind::WriteFixed,
         submit: submit::submit_write_fixed,
-        drop: submit::drop_write_fixed,
         get_fd: submit::get_fd_write_fixed,
     },
     Recv {
-        field: recv,
+        variant: Recv,
         kind: OpKind::Recv,
         submit: submit::submit_recv,
-        drop: submit::drop_recv,
         get_fd: submit::get_fd_recv,
     },
     OpSend {
-        field: send,
+        variant: Send,
         kind: OpKind::Send,
         submit: submit::submit_send,
-        drop: submit::drop_send,
         get_fd: submit::get_fd_send,
     },
     Close {
-        field: close,
+        variant: Close,
         kind: OpKind::Close,
         submit: submit::submit_close,
-        drop: submit::drop_close,
         get_fd: submit::get_fd_close,
     },
     Fsync {
-        field: fsync,
+        variant: Fsync,
         kind: OpKind::Fsync,
         submit: submit::submit_fsync,
-        drop: submit::drop_fsync,
         get_fd: submit::get_fd_fsync,
     },
     SyncFileRange {
-        field: sync_range,
+        variant: SyncRange,
         kind: OpKind::SyncFileRange,
         submit: submit::submit_sync_range,
-        drop: submit::drop_sync_range,
         get_fd: submit::get_fd_sync_range,
     },
     Fallocate {
-        field: fallocate,
+        variant: Fallocate,
         kind: OpKind::Fallocate,
         submit: submit::submit_fallocate,
-        drop: submit::drop_fallocate,
         get_fd: submit::get_fd_fallocate,
     },
     Timeout {
-        field: timeout,
+        variant: Timeout,
         kind: OpKind::Timeout,
         submit: submit::submit_timeout,
-        drop: submit::drop_timeout,
         get_fd: submit::get_fd_timeout,
     },
     Connect {
-        field: connect,
+        variant: Connect,
         kind: OpKind::Connect,
         submit: submit::submit_connect,
         on_complete: submit::on_complete_connect,
-        drop: submit::drop_connect,
         get_fd: submit::get_fd_connect,
     },
     Accept {
-        field: accept,
+        variant: Accept,
         payload: AcceptPayload,
         kind: OpKind::Accept,
         submit: submit::submit_accept,
         on_complete: submit::on_complete_accept,
-        drop: submit::drop_accept,
         get_fd: submit::get_fd_accept,
         construct: |user: std::ptr::NonNull<Accept>| {
             // SAFETY: user pointer is valid and points to a valid Accept.
@@ -378,11 +361,10 @@ define_iocp_ops! {
         destruct: |user: Box<Accept>| *user,
     },
     SendTo {
-        field: send_to,
+        variant: SendTo,
         payload: SendToPayload,
         kind: OpKind::SendTo,
         submit: submit::submit_send_to,
-        drop: submit::drop_send_to,
         get_fd: submit::get_fd_send_to,
         construct: |user: std::ptr::NonNull<SendTo>| {
             // SAFETY: user pointer is valid and points to a valid SendTo.
@@ -402,35 +384,31 @@ define_iocp_ops! {
         destruct: |user: Box<SendTo>| *user,
     },
     UdpRecvStream {
-        field: udp_recv_stream,
+        variant: UdpRecvStream,
         kind: OpKind::UdpRecvStream,
         submit: submit::submit_udp_recv_stream,
         on_complete: submit::on_complete_udp_recv_stream,
-        drop: submit::drop_udp_recv_stream,
         get_fd: submit::get_fd_udp_recv_stream,
     },
     UdpRefill {
-        field: udp_refill,
+        variant: UdpRefill,
         kind: OpKind::UdpRefill,
         submit: submit::submit_udp_refill,
-        drop: submit::drop_udp_refill,
         get_fd: submit::get_fd_udp_refill,
     },
     Open {
-        field: open,
+        variant: Open,
         payload: OpenPayload,
         kind: OpKind::Open,
         submit: submit::submit_open,
-        drop: submit::drop_open,
         get_fd: submit::get_fd_open,
         construct: |user| OpenPayload { user },
         destruct: |user: Box<Open>| *user,
     },
     Wakeup {
-        field: wakeup,
+        variant: Wakeup,
         kind: OpKind::Wakeup,
         submit: submit::submit_wakeup,
-        drop: submit::drop_wakeup,
         get_fd: submit::get_fd_wakeup,
         destruct: |user: Box<Wakeup>| *user,
     },

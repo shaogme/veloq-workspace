@@ -2,8 +2,8 @@
 
 use crate::IoFd;
 use crate::driver::{IocpOpState, OpLifecycle};
-use crate::ops::slot_ext::IocpSlotExt;
 use crate::ops::IocpOp;
+use crate::ops::slot_ext::IocpSlotExt;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpCtxGuard;
 use crate::rio::core::registry::RioRegistry;
@@ -137,6 +137,10 @@ impl<'a> RioCompletionRouter<'a> {
                                 res: res_code,
                                 flags: 0,
                             };
+
+                            // SAFETY: IO completed; safe to reset in-flight status.
+                            unsafe { slot.set_in_flight(false) };
+
                             // SAFETY: IO completed; safe to take data using IocpSlotExt.
                             let (payload, detail) = unsafe { slot.take_completion_data() };
                             self.comp
@@ -149,9 +153,11 @@ impl<'a> RioCompletionRouter<'a> {
                         } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
                             // SAFETY: IO completed after cancellation; safe to cleanup.
                             unsafe {
-                                slot.take_op();
+                                slot.set_in_flight(false);
                                 slot.take_completion_data();
+                                slot.take_op();
                             }
+
                             let _ = std::mem::take(&mut op.platform_data);
                             self.comp.ops.shared.push_free(user_data);
                         }

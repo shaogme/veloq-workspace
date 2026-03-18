@@ -13,18 +13,21 @@ use crate::ops::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex, iocp_submit_connect_ex,
     resolve_fd,
 };
-use crate::ops::{IocpOp, SubmitContext};
+use crate::ops::{
+    AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv, SendToPayload, SubmitContext,
+    UdpRecvStream, UdpRefill,
+};
 
 // ============================================================================
 // Network Operations
 // ============================================================================
 
 pub(crate) unsafe fn submit_recv(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<Recv>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let kernel = unsafe { &mut *op.payload.recv };
-    let val = unsafe { kernel.user.as_mut() };
+    let val = unsafe { payload.user.as_mut() };
 
     let overlapped = unsafe { &mut *ctx.overlapped };
     overlapped.Anonymous.Anonymous.Offset = 0;
@@ -35,7 +38,7 @@ pub(crate) unsafe fn submit_recv(
     // RIO path is mandatory for socket recv.
     ctx.rio
         .try_submit_recv(
-            (val.fd, handle, op.header.user_data, op.header.generation),
+            (val.fd, handle, header.user_data, header.generation),
             &mut val.buf,
             ctx.registrar,
         )
@@ -45,18 +48,18 @@ pub(crate) unsafe fn submit_recv(
                 e,
                 format!(
                     "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, op.header.user_data, op.header.generation
+                    val.fd, header.user_data, header.generation
                 ),
             )
         })
 }
 
 pub(crate) unsafe fn submit_send(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<OpSend>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let kernel = unsafe { &mut *op.payload.send };
-    let val = unsafe { kernel.user.as_mut() };
+    let val = unsafe { payload.user.as_mut() };
 
     let overlapped = unsafe { &mut *ctx.overlapped };
     overlapped.Anonymous.Anonymous.Offset = 0;
@@ -67,7 +70,7 @@ pub(crate) unsafe fn submit_send(
     // RIO path is mandatory for socket send.
     ctx.rio
         .try_submit_send(
-            (val.fd, handle, op.header.user_data, op.header.generation),
+            (val.fd, handle, header.user_data, header.generation),
             &val.buf,
             ctx.registrar,
         )
@@ -77,18 +80,18 @@ pub(crate) unsafe fn submit_send(
                 e,
                 format!(
                     "RIO send submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, op.header.user_data, op.header.generation
+                    val.fd, header.user_data, header.generation
                 ),
             )
         })
 }
 
 pub(crate) unsafe fn submit_connect(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<Connect>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let kernel = unsafe { &mut *op.payload.connect };
-    let connect_op = unsafe { kernel.user.as_mut() };
+    let connect_op = unsafe { payload.user.as_mut() };
     let handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
     // SAFETY: the handle is checked for validity by resolve_fd.
     unsafe {
@@ -97,7 +100,7 @@ pub(crate) unsafe fn submit_connect(
             ctx.port,
             format!(
                 "submit_connect: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-                connect_op.fd, handle, op.header.user_data, op.header.generation
+                connect_op.fd, handle, header.user_data, header.generation
             ),
         )
     }?;
@@ -172,12 +175,12 @@ pub(crate) unsafe fn submit_connect(
 }
 
 pub(crate) unsafe fn on_complete_connect(
-    op: &mut IocpOp,
+    _header: &mut OverlappedEntry,
+    payload: &mut KernelRef<Connect>,
     result: usize,
     _ext: &Extensions,
 ) -> io::Result<usize> {
-    let kernel = unsafe { &*op.payload.connect };
-    let connect_op = unsafe { kernel.user.as_ref() };
+    let connect_op = unsafe { payload.user.as_ref() };
     if let Some(fd) = connect_op.fd.raw() {
         // SAFETY: setsockopt is safe to call after ConnectEx completion to update socket context.
         let ret = unsafe {
@@ -197,10 +200,10 @@ pub(crate) unsafe fn on_complete_connect(
 }
 
 pub(crate) unsafe fn submit_accept(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut AcceptPayload,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &mut *op.payload.accept };
     let user = unsafe { payload.user.as_mut() };
     let handle = resolve_fd(user.fd, ctx.registered_files)?;
     let accept_socket = payload.accept_socket;
@@ -213,7 +216,7 @@ pub(crate) unsafe fn submit_accept(
             ctx.port,
             format!(
                 "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
-                handle as usize, op.header.user_data, op.header.generation
+                handle as usize, header.user_data, header.generation
             ),
         )
     }?;
@@ -226,7 +229,7 @@ pub(crate) unsafe fn submit_accept(
             ctx.port,
             format!(
                 "submit_accept: associate accept socket failed: accept=0x{:x}, listen=0x{:x}, user_data={}, generation={}",
-                accept_socket_raw, handle as usize, op.header.user_data, op.header.generation
+                accept_socket_raw, handle as usize, header.user_data, header.generation
             ),
         )
     }?;
@@ -258,19 +261,19 @@ pub(crate) unsafe fn submit_accept(
                 accept_socket_raw,
                 split,
                 split,
-                op.header.user_data,
-                op.header.generation
+                header.user_data,
+                header.generation
             ),
         )
     })
 }
 
 pub(crate) unsafe fn on_complete_accept(
-    op: &mut IocpOp,
+    _header: &mut OverlappedEntry,
+    payload: &mut AcceptPayload,
     _result: usize,
     ext: &Extensions,
 ) -> io::Result<usize> {
-    let payload = unsafe { &mut *op.payload.accept };
     let user = unsafe { payload.user.as_mut() };
     let accept_socket = payload.accept_socket;
     let listen_handle = user.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
@@ -344,23 +347,23 @@ pub(crate) unsafe fn on_complete_accept(
 }
 
 pub(crate) unsafe fn submit_send_to(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut SendToPayload,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &mut *op.payload.send_to };
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd(user.fd, ctx.registered_files)?;
 
     // RIO path is mandatory for socket send_to.
-    let page_idx = op.header.user_data / ctx.slots_per_page;
+    let page_idx = header.user_data / ctx.slots_per_page;
     let args = crate::rio::RioSendToArgs {
         fd: user.fd,
         handle,
         buf: &user.buf,
         addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
         addr_len: payload.addr_len,
-        user_data: op.header.user_data,
-        generation: op.header.generation,
+        user_data: header.user_data,
+        generation: header.generation,
         page_idx,
     };
     ctx.rio
@@ -371,7 +374,7 @@ pub(crate) unsafe fn submit_send_to(
                 e,
                 format!(
                     "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
-                    user.fd, op.header.user_data, op.header.generation, page_idx
+                    user.fd, header.user_data, header.generation, page_idx
                 ),
             )
         })
@@ -382,18 +385,18 @@ pub(crate) unsafe fn submit_send_to(
 // ============================================================================
 
 pub(crate) unsafe fn submit_udp_recv_stream(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<UdpRecvStream>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let kernel = unsafe { &mut *op.payload.udp_recv_stream };
-    let val = unsafe { kernel.user.as_mut() };
+    let val = unsafe { payload.user.as_mut() };
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
     let args = crate::rio::RioUdpStreamArgs {
         fd: val.fd,
         handle,
         stream_op: val,
-        user_data: op.header.user_data,
-        generation: op.header.generation,
+        user_data: header.user_data,
+        generation: header.generation,
     };
     ctx.rio
         .try_submit_udp_recv_stream_pooled(args, ctx.registrar)
@@ -403,19 +406,19 @@ pub(crate) unsafe fn submit_udp_recv_stream(
                 e,
                 format!(
                     "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, op.header.user_data, op.header.generation
+                    val.fd, header.user_data, header.generation
                 ),
             )
         })
 }
 
 pub(crate) unsafe fn on_complete_udp_recv_stream(
-    op: &mut IocpOp,
+    _header: &mut OverlappedEntry,
+    payload: &mut KernelRef<UdpRecvStream>,
     result: usize,
     _ext: &Extensions,
 ) -> io::Result<usize> {
-    let kernel = unsafe { &mut *op.payload.udp_recv_stream };
-    let val = unsafe { kernel.user.as_mut() };
+    let val = unsafe { payload.user.as_mut() };
     if result == 0
         && let Some(datagram) = val.result.as_ref()
     {
@@ -425,11 +428,11 @@ pub(crate) unsafe fn on_complete_udp_recv_stream(
 }
 
 pub(crate) unsafe fn submit_udp_refill(
-    op: &mut IocpOp,
+    _header: &mut OverlappedEntry,
+    payload: &mut KernelRef<UdpRefill>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let kernel = unsafe { &mut *op.payload.udp_refill };
-    let val = unsafe { kernel.user.as_mut() };
+    let val = unsafe { payload.user.as_mut() };
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
     if let Some(buf) = val.buf.take() {
         ctx.rio

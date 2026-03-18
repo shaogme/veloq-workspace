@@ -12,6 +12,7 @@ use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::driver::OpLifecycle;
 use crate::net::addr::SockAddrStorage;
 use crate::ops::submit::SubmissionResult;
+use crate::ops::{IocpOpPayload, IocpSlotExt};
 use crate::rio::core::registry::RIO_INVALID_BUFFERID;
 use crate::rio::core::submit_ops::RioDispatch;
 use crate::rio::{RioCompletionContext, RioContext};
@@ -436,7 +437,9 @@ impl UdpPoolManager {
             return false;
         };
 
-        let kernel = unsafe { &mut *iocp_op.payload.udp_recv_stream };
+        let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload else {
+            return false;
+        };
         let stream_op: &mut UdpRecvStream<crate::RawHandle> = unsafe { kernel.user.as_mut() };
 
         let owned_datagram = datagram.take().unwrap();
@@ -462,12 +465,18 @@ impl UdpPoolManager {
             res: datagram_len.min(i32::MAX as usize) as i32,
             flags: 0,
         };
+
+        // SAFETY: IO completed from pool; safe to reset in-flight status and take data.
+        unsafe {
+            slot.set_in_flight(false);
+        }
+
         let payload = unsafe { (*slot.payload.get()).take() };
         let detail = unsafe { (*slot.result.get()).take() };
         comp.table
             .record_completion_with_data(event, payload, detail);
         comp.events.push(event);
-        let _ = unsafe { (*slot.op.get()).take() };
+        let _ = unsafe { slot.take_op() };
         let _ = std::mem::take(&mut op.platform_data);
         comp.ops.shared.push_free(user_data);
         true

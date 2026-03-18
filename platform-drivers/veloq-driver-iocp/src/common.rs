@@ -112,6 +112,30 @@ impl IoCompletionPort {
         Ok(())
     }
 
+    /// Notifies the completion port with a user-defined completion key.
+    /// This is a safe wrapper around `PostQueuedCompletionStatus` for notifications.
+    pub fn notify(&self, user_data: usize) -> io::Result<()> {
+        // SAFETY: Posting a null overlapped pointer is safe.
+        unsafe { self.post(0, user_data, ptr::null_mut()) }
+    }
+
+    /// Cancels a pending I/O request for the specified handle and overlapped structure.
+    ///
+    /// # Safety
+    ///
+    /// `overlapped` must point to the same `OVERLAPPED` structure used to start the I/O.
+    pub unsafe fn cancel_request(handle: HANDLE, overlapped: *mut OVERLAPPED) -> io::Result<()> {
+        let res = unsafe { windows_sys::Win32::System::IO::CancelIoEx(handle, overlapped) };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            if err == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
+                return Ok(());
+            }
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+        Ok(())
+    }
+
     /// Retrieves a completion status from the port.
     pub fn get_status(&self, timeout_ms: u32) -> io::Result<CompletionStatus> {
         let mut bytes = 0;
@@ -344,10 +368,7 @@ impl RemoteWaker for IocpWaker {
             return Ok(());
         }
         if !self.is_notified.swap(true, Ordering::AcqRel) {
-            // SAFETY: a null overlapped pointer is used for wakeup.
-            unsafe {
-                self.port.post(0, WAKEUP_USER_DATA, std::ptr::null_mut())?;
-            }
+            self.port.notify(WAKEUP_USER_DATA)?;
         }
         Ok(())
     }

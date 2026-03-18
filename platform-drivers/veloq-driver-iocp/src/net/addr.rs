@@ -1,7 +1,7 @@
-use veloq_pod::{Pod, Zeroable, bytes_of, from_bytes};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use veloq_driver_core::net::SocketAddrCodec;
+use veloq_pod::{Pod, Zeroable, bytes_of, from_bytes};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, IN6_ADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
 };
@@ -54,8 +54,7 @@ pub fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
                     "Invalid address length",
                 ));
             }
-            let sin_wrapped: &SockAddrIn =
-                from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN>()]);
+            let sin_wrapped: &SockAddrIn = from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN>()]);
             let sin = &sin_wrapped.0;
             let s_addr = unsafe { sin.sin_addr.S_un.S_addr };
             let ip = Ipv4Addr::from(u32::from_be(s_addr));

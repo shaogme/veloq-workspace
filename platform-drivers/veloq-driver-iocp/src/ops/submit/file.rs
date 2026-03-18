@@ -7,20 +7,23 @@ use crate::common::IocpErrorContext;
 use crate::ops::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write, resolve_fd,
 };
-use crate::ops::{IocpOp, SubmitContext};
+use crate::ops::{
+    Close, Fallocate, Fsync, KernelRef, OpenPayload, OverlappedEntry, ReadFixed, SubmitContext,
+    SyncFileRange, WriteFixed,
+};
 
 // ============================================================================
 // Macros
 // ============================================================================
 
 macro_rules! submit_io_op {
-    ($fn_name:ident, $field:ident, $wrapper_fn:ident, offset, $ptr_fn:expr) => {
+    ($fn_name:ident, $field_type:ty, $wrapper_fn:ident, offset, $ptr_fn:expr) => {
         pub(crate) unsafe fn $fn_name(
-            op: &mut IocpOp,
+            header: &mut OverlappedEntry,
+            payload: &mut KernelRef<$field_type>,
             ctx: &mut SubmitContext,
         ) -> io::Result<SubmissionResult> {
-            let kernel = unsafe { &mut *op.payload.$field };
-            let val = unsafe { kernel.user.as_mut() };
+            let val = unsafe { payload.user.as_mut() };
             // Using ctx.overlapped (Slot Overlapped)
             let overlapped = unsafe { &mut *ctx.overlapped };
 
@@ -38,8 +41,8 @@ macro_rules! submit_io_op {
                         stringify!($fn_name),
                         val.fd,
                         handle,
-                        op.header.user_data,
-                        op.header.generation,
+                        header.user_data,
+                        header.generation,
                         val.offset,
                         val.buf.len()
                     ),
@@ -67,8 +70,8 @@ macro_rules! submit_io_op {
                         stringify!($fn_name),
                         val.fd,
                         handle,
-                        op.header.user_data,
-                        op.header.generation,
+                        header.user_data,
+                        header.generation,
                         val.offset,
                         val.buf.len()
                     ),
@@ -84,7 +87,7 @@ macro_rules! submit_io_op {
 
 submit_io_op!(
     submit_read_fixed,
-    read,
+    ReadFixed,
     iocp_submit_read,
     offset,
     |b: &mut FixedBuf| b.as_mut_ptr()
@@ -92,7 +95,7 @@ submit_io_op!(
 
 submit_io_op!(
     submit_write_fixed,
-    write,
+    WriteFixed,
     iocp_submit_write,
     offset,
     |b: &mut FixedBuf| b.as_slice().as_ptr() as *mut u8
@@ -103,15 +106,14 @@ submit_io_op!(
 // ============================================================================
 
 pub(crate) unsafe fn submit_open(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut OpenPayload,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let payload = unsafe { &*op.payload.open };
     let user = unsafe { payload.user.as_ref() };
     let path_ptr = user.path.as_slice().as_ptr() as usize;
 
-    let entry = &op.header;
-    let user_data = entry.user_data;
+    let user_data = header.user_data;
 
     let completion = CompletionInfo {
         port: ctx.port.as_raw() as usize,
@@ -129,15 +131,14 @@ pub(crate) unsafe fn submit_open(
 }
 
 pub(crate) unsafe fn submit_close(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<Close>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let kernel = unsafe { &*op.payload.close };
-    let payload = unsafe { kernel.user.as_ref() };
-    let handle = resolve_fd(payload.fd, ctx.registered_files)?;
+    let user = unsafe { payload.user.as_ref() };
+    let handle = resolve_fd(user.fd, ctx.registered_files)?;
 
-    let entry = &op.header;
-    let user_data = entry.user_data;
+    let user_data = header.user_data;
 
     let completion = CompletionInfo {
         port: ctx.port.as_raw() as usize,
@@ -153,15 +154,14 @@ pub(crate) unsafe fn submit_close(
 }
 
 pub(crate) unsafe fn submit_fsync(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<Fsync>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let kernel = unsafe { &*op.payload.fsync };
-    let payload = unsafe { kernel.user.as_ref() };
-    let handle = resolve_fd(payload.fd, ctx.registered_files)?;
+    let user = unsafe { payload.user.as_ref() };
+    let handle = resolve_fd(user.fd, ctx.registered_files)?;
 
-    let entry = &op.header;
-    let user_data = entry.user_data;
+    let user_data = header.user_data;
 
     let completion = CompletionInfo {
         port: ctx.port.as_raw() as usize,
@@ -177,15 +177,14 @@ pub(crate) unsafe fn submit_fsync(
 }
 
 pub(crate) unsafe fn submit_sync_range(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<SyncFileRange>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let kernel = unsafe { &*op.payload.sync_range };
-    let payload = unsafe { kernel.user.as_ref() };
-    let handle = resolve_fd(payload.fd, ctx.registered_files)?;
+    let user = unsafe { payload.user.as_ref() };
+    let handle = resolve_fd(user.fd, ctx.registered_files)?;
 
-    let entry = &op.header;
-    let user_data = entry.user_data;
+    let user_data = header.user_data;
 
     let completion = CompletionInfo {
         port: ctx.port.as_raw() as usize,
@@ -201,15 +200,14 @@ pub(crate) unsafe fn submit_sync_range(
 }
 
 pub(crate) unsafe fn submit_fallocate(
-    op: &mut IocpOp,
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<Fallocate>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    let kernel = unsafe { &*op.payload.fallocate };
-    let payload = unsafe { kernel.user.as_ref() };
-    let handle = resolve_fd(payload.fd, ctx.registered_files)?;
+    let user = unsafe { payload.user.as_ref() };
+    let handle = resolve_fd(user.fd, ctx.registered_files)?;
 
-    let entry = &op.header;
-    let user_data = entry.user_data;
+    let user_data = header.user_data;
 
     let completion = CompletionInfo {
         port: ctx.port.as_raw() as usize,
@@ -219,9 +217,9 @@ pub(crate) unsafe fn submit_fallocate(
 
     let op = BlockingOps::Fallocate {
         handle: handle as usize,
-        mode: payload.mode,
-        offset: payload.offset,
-        len: payload.len,
+        mode: user.mode,
+        offset: user.offset,
+        len: user.len,
         completion,
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))

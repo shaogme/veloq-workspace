@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
-use windows_sys::Win32::System::IO::{OVERLAPPED, PostQueuedCompletionStatus};
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use veloq_blocking::{BlockingTask, get_blocking_pool};
 #[cfg(feature = "test-hooks")]
@@ -18,7 +18,7 @@ use veloq_driver_core::driver::{
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
-use veloq_driver_core::slot::SlotTable;
+use veloq_driver_core::slot::{SlotEntry, SlotTable};
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
@@ -105,7 +105,12 @@ impl IocpDriver {
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
         user_data: usize,
         op: IocpOp,
-    ) -> io::Result<(&mut IocpOp, &mut OpEntry<IocpOpState>, *mut OVERLAPPED)> {
+    ) -> io::Result<(
+        &SlotEntry<IocpOp, OverlappedEntry>,
+        &mut IocpOp,
+        &mut OpEntry<IocpOpState>,
+        *mut OVERLAPPED,
+    )> {
         let (slot, op_entry) = ops
             .get_slot_and_entry_mut(user_data)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Op not found"))?;
@@ -125,7 +130,7 @@ impl IocpDriver {
         op_entry.platform_data.generation = generation;
 
         let overlapped_ptr = unsafe { slot.overlapped_ptr() };
-        Ok((op_ref, op_entry, overlapped_ptr))
+        Ok((slot, op_ref, op_entry, overlapped_ptr))
     }
 
     fn handle_offload(
@@ -144,6 +149,7 @@ impl IocpDriver {
                 let generation = slot.generation.load(Ordering::Acquire);
                 // SAFETY: Cleaning up slot and extracting completion data.
                 let (payload, detail) = unsafe {
+                    slot.set_in_flight(false);
                     slot.take_op();
                     slot.take_completion_data()
                 };
@@ -185,20 +191,13 @@ impl IocpDriver {
                 binder.ok(Poll::Pending)
             }
             Ok(submit::SubmissionResult::PostToQueue) => {
-                // SAFETY: port_handle is a valid IOCP handle.
-                let posted = unsafe {
-                    PostQueuedCompletionStatus(
-                        ctx.port.as_raw(),
-                        0,
-                        user_data,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if posted == 0 {
-                    let err = io::Error::last_os_error();
+                if let Err(err) = ctx.port.notify(user_data) {
                     if let Some((slot, _)) = ops.get_slot_and_entry_mut(user_data) {
-                        // SAFETY: Taking the op from slot.
-                        *op_in = unsafe { slot.take_op() };
+                        // SAFETY: Taking the op from slot. Reset in-flight first.
+                        unsafe {
+                            slot.set_in_flight(false);
+                            *op_in = slot.take_op();
+                        }
                     }
                     ops.remove(user_data);
                     binder.err(err)
@@ -248,15 +247,11 @@ impl IocpDriver {
             .get_page_slice(0)
             .ok_or_else(|| io::Error::other("Failed to get page slice"))?;
 
-        let (op_ref, _, overlapped_ptr) = Self::prep_op_slot(&mut self.ops, user_data, op)?;
+        let (slot, op_ref, _, overlapped_ptr) = Self::prep_op_slot(&mut self.ops, user_data, op)?;
+        let guard = crate::ops::slot_ext::InFlightGuard::new(slot);
 
-        // SAFETY: compare function pointer with known submit function.
-        let is_rio_pool_waiting = unsafe {
-            std::ptr::eq(
-                op_ref.vtable.as_ref().submit as *const (),
-                submit::submit_udp_recv_stream as *const (),
-            )
-        };
+        let is_rio_pool_waiting =
+            matches!(op_ref.payload, crate::ops::IocpOpPayload::UdpRecvStream(_));
 
         let mut ctx = SubmitContext {
             port: self.port.as_ref(),
@@ -269,8 +264,11 @@ impl IocpDriver {
             slab_resolver: &|idx| (idx == 0).then_some((slab_ptr, slab_len)),
         };
 
-        // SAFETY: submit function pointer is valid.
-        let result = unsafe { (op_ref.vtable.as_ref().submit)(op_ref, &mut ctx) };
+        let result = op_ref.submit(&mut ctx);
+
+        if result.is_ok() {
+            guard.persist();
+        }
         Ok((is_rio_pool_waiting, result))
     }
 
@@ -383,7 +381,7 @@ impl IocpDriver {
                 }
 
                 if !overlapped.is_null() {
-                    let user_data = unsafe { (*(overlapped as *const OverlappedEntry)).user_data };
+                    let user_data = unsafe { OverlappedEntry::user_data_from_ptr(overlapped) };
                     self.process_completion(user_data, success, error_code, bytes);
                     return Ok(1);
                 }
