@@ -7,6 +7,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::config::IoFd;
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
+use crate::ops::KernelRef;
 use crate::win32::Overlapped;
 
 // ============================================================================
@@ -186,12 +187,26 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
     }
 }
 
-/// Associates a handle with an IOCP.
+/// Unpacks a [`KernelRef<T>`] and slot overlapped pointer from submit context.
 ///
 /// # Safety
 ///
-/// The caller must ensure that `handle` is a valid file/socket handle.
-pub(crate) unsafe fn ensure_iocp_association(
+/// The caller must ensure `payload.user` and `ctx.overlapped` are both valid for
+/// mutable access during the call.
+pub(crate) unsafe fn unpack_kernel_ref<'a, T>(
+    payload: &'a mut KernelRef<T>,
+    overlapped: *mut Overlapped,
+) -> (&'a mut T, &'a mut Overlapped) {
+    // SAFETY: guaranteed by the caller.
+    let val = unsafe { payload.user.as_mut() };
+    // SAFETY: guaranteed by the caller.
+    let overlapped = unsafe { &mut *overlapped };
+    (val, overlapped)
+}
+
+/// Associates a handle with an IOCP.
+///
+pub(crate) fn ensure_iocp_association(
     handle: HANDLE,
     port: &crate::win32::IoCompletionPort,
     detail: impl Into<String>,

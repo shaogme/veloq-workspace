@@ -61,7 +61,7 @@ impl_get_fd!(get_fd_wakeup, KernelRef<Wakeup>, no_fd);
 /// # Safety
 ///
 /// The caller must ensure that header, payload, and ctx are valid.
-pub(crate) unsafe fn submit_wakeup(
+pub(crate) fn submit_wakeup(
     _header: &mut crate::ops::OverlappedEntry,
     _payload: &mut KernelRef<Wakeup>,
     _ctx: &mut SubmitContext,
@@ -72,7 +72,7 @@ pub(crate) unsafe fn submit_wakeup(
 /// # Safety
 ///
 /// The caller must ensure that header, payload, and ctx are valid.
-pub(crate) unsafe fn submit_timeout(
+pub(crate) fn submit_timeout(
     _header: &mut crate::ops::OverlappedEntry,
     payload: &mut KernelRef<Timeout>,
     _ctx: &mut SubmitContext,

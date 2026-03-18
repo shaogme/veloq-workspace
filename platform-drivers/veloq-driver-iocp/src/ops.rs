@@ -100,7 +100,7 @@ macro_rules! define_iocp_ops {
 
         /// Virtual table for dynamic dispatch of IOCP operations.
         pub(crate) struct OpVTable {
-            pub(crate) submit: unsafe fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> io::Result<SubmissionResult>,
+            pub(crate) submit: fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> io::Result<SubmissionResult>,
             pub(crate) on_complete: Option<unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> io::Result<usize>>,
             pub(crate) get_fd: unsafe fn(op: &IocpKernelOp) -> Option<IoFd>,
         }
@@ -122,7 +122,9 @@ macro_rules! define_iocp_ops {
                 unsafe { (self.vtable.as_ref().get_fd)(self) }
             }
             pub(crate) fn submit(&mut self, ctx: &mut SubmitContext) -> io::Result<SubmissionResult> {
-                unsafe { (self.vtable.as_ref().submit)(self, ctx) }
+                // SAFETY: vtable is initialized from a static TABLE and always non-null.
+                let table = unsafe { self.vtable.as_ref() };
+                (table.submit)(self, ctx)
             }
             pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
                 if let Some(on_complete) = unsafe { self.vtable.as_ref().on_complete } {
@@ -140,7 +142,7 @@ macro_rules! define_iocp_ops {
 
                 fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
-                        submit: |op, ctx| unsafe {
+                        submit: |op, ctx| {
                             if let IocpOpPayload::$Variant(ref mut p) = op.payload {
                                 $submit(&mut op.header, p, ctx)
                             } else {

@@ -12,7 +12,7 @@ use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
 use crate::ops::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex, iocp_submit_connect_ex,
-    iocp_submit_read, iocp_submit_write, resolve_fd,
+    iocp_submit_read, iocp_submit_write, resolve_fd, unpack_kernel_ref,
 };
 use crate::ops::{
     AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv, SendToPayload, SubmitContext,
@@ -24,19 +24,13 @@ use crate::rio::RioTarget;
 // Network Operations
 // ============================================================================
 
-/// # Safety
-///
-/// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
-pub(crate) unsafe fn submit_recv(
+pub(crate) fn submit_recv(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Recv>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    // SAFETY: The caller guarantees that payload is valid.
-    let val = unsafe { payload.user.as_mut() };
-
-    // SAFETY: The caller guarantees that ctx.overlapped is valid.
-    let overlapped = unsafe { &mut *ctx.overlapped };
+    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
+    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
@@ -57,13 +51,13 @@ pub(crate) unsafe fn submit_recv(
         Ok(res) => Ok(res),
         Err(_) if ctx.rio.registration_mode == crate::BufferRegistrationMode::Compatible => {
             // Fallback to standard IOCP for socket recv.
-            // Safety: ensure socket is associated with the completion port.
+            ensure_iocp_association(
+                handle,
+                ctx.port,
+                format!("RIO fallback recv association failed: fd={:?}", val.fd),
+            )?;
+            // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
             unsafe {
-                ensure_iocp_association(
-                    handle,
-                    ctx.port,
-                    format!("RIO fallback recv association failed: fd={:?}", val.fd),
-                )?;
                 iocp_submit_read(
                     handle,
                     val.buf.as_mut_ptr(),
@@ -83,19 +77,13 @@ pub(crate) unsafe fn submit_recv(
     }
 }
 
-/// # Safety
-///
-/// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
-pub(crate) unsafe fn submit_send(
+pub(crate) fn submit_send(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<OpSend>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    // SAFETY: The caller guarantees that payload is valid.
-    let val = unsafe { payload.user.as_mut() };
-
-    // SAFETY: The caller guarantees that ctx.overlapped is valid.
-    let overlapped = unsafe { &mut *ctx.overlapped };
+    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
+    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
@@ -116,13 +104,13 @@ pub(crate) unsafe fn submit_send(
         Ok(res) => Ok(res),
         Err(_) if ctx.rio.registration_mode == crate::BufferRegistrationMode::Compatible => {
             // Fallback to standard IOCP for socket send.
-            // Safety: ensure socket is associated with the completion port.
+            ensure_iocp_association(
+                handle,
+                ctx.port,
+                format!("RIO fallback send association failed: fd={:?}", val.fd),
+            )?;
+            // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
             unsafe {
-                ensure_iocp_association(
-                    handle,
-                    ctx.port,
-                    format!("RIO fallback send association failed: fd={:?}", val.fd),
-                )?;
                 iocp_submit_write(
                     handle,
                     val.buf.as_ptr(),
@@ -142,28 +130,22 @@ pub(crate) unsafe fn submit_send(
     }
 }
 
-/// # Safety
-///
-/// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
-pub(crate) unsafe fn submit_connect(
+pub(crate) fn submit_connect(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Connect>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    // SAFETY: The caller guarantees that payload is valid.
-    let connect_op = unsafe { payload.user.as_mut() };
+    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
+    let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
-    // SAFETY: the handle is checked for validity by resolve_fd.
-    unsafe {
-        ensure_iocp_association(
-            handle,
-            ctx.port,
-            format!(
-                "submit_connect: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-                connect_op.fd, handle, header.user_data, header.generation
-            ),
-        )
-    }?;
+    ensure_iocp_association(
+        handle,
+        ctx.port,
+        format!(
+            "submit_connect: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+            connect_op.fd, handle, header.user_data, header.generation
+        ),
+    )?;
 
     let mut need_bind = true;
     let mut storage = SockAddrStorage::default();
@@ -278,10 +260,7 @@ pub(crate) unsafe fn on_complete_connect(
     Ok(result)
 }
 
-/// # Safety
-///
-/// The caller must ensure that header, payload, and ctx are valid.
-pub(crate) unsafe fn submit_accept(
+pub(crate) fn submit_accept(
     header: &mut OverlappedEntry,
     payload: &mut AcceptPayload,
     ctx: &mut SubmitContext,
@@ -292,30 +271,24 @@ pub(crate) unsafe fn submit_accept(
     let accept_socket = payload.accept_socket;
     let accept_socket_raw = accept_socket.handle as SOCKET;
 
-    // SAFETY: the handle is checked for validity by resolve_fd.
-    unsafe {
-        ensure_iocp_association(
-            handle,
-            ctx.port,
-            format!(
-                "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
-                handle as usize, header.user_data, header.generation
-            ),
-        )
-    }?;
+    ensure_iocp_association(
+        handle,
+        ctx.port,
+        format!(
+            "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
+            handle as usize, header.user_data, header.generation
+        ),
+    )?;
 
     // Ensure the pre-allocated accept socket is also associated with the same IOCP.
-    // SAFETY: the accept socket handle is managed by the driver.
-    unsafe {
-        ensure_iocp_association(
-            accept_socket_raw as HANDLE,
-            ctx.port,
-            format!(
-                "submit_accept: associate accept socket failed: accept=0x{:x}, listen=0x{:x}, user_data={}, generation={}",
-                accept_socket_raw, handle as usize, header.user_data, header.generation
-            ),
-        )
-    }?;
+    ensure_iocp_association(
+        accept_socket_raw as HANDLE,
+        ctx.port,
+        format!(
+            "submit_accept: associate accept socket failed: accept=0x{:x}, listen=0x{:x}, user_data={}, generation={}",
+            accept_socket_raw, handle as usize, header.user_data, header.generation
+        ),
+    )?;
 
     const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
     let split = MIN_ADDR_LEN;
@@ -423,10 +396,7 @@ pub(crate) unsafe fn on_complete_accept(
     Ok(accept_socket_raw as usize)
 }
 
-/// # Safety
-///
-/// The caller must ensure that header, payload, and ctx are valid.
-pub(crate) unsafe fn submit_send_to(
+pub(crate) fn submit_send_to(
     header: &mut OverlappedEntry,
     payload: &mut SendToPayload,
     ctx: &mut SubmitContext,
@@ -465,16 +435,13 @@ pub(crate) unsafe fn submit_send_to(
 // UDP RIO Pool (Stream)
 // ============================================================================
 
-/// # Safety
-///
-/// The caller must ensure that header, payload, and ctx are valid.
-pub(crate) unsafe fn submit_udp_recv_stream(
+pub(crate) fn submit_udp_recv_stream(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<UdpRecvStream>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    // SAFETY: The caller guarantees that payload is valid.
-    let val = unsafe { payload.user.as_mut() };
+    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
+    let (val, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
     let args = crate::rio::RioUdpStreamArgs {
         fd: val.fd,
@@ -516,16 +483,13 @@ pub(crate) unsafe fn on_udp_stream_complete(
     Ok(result)
 }
 
-/// # Safety
-///
-/// The caller must ensure that header, payload, and ctx are valid.
-pub(crate) unsafe fn submit_udp_refill(
+pub(crate) fn submit_udp_refill(
     _header: &mut OverlappedEntry,
     payload: &mut KernelRef<UdpRefill>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
-    // SAFETY: The caller guarantees that payload is valid.
-    let val = unsafe { payload.user.as_mut() };
+    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
+    let (val, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
     if let Some(buf) = val.buf.take() {
         ctx.rio
