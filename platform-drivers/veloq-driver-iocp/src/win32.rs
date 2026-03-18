@@ -1,6 +1,6 @@
 use std::io;
 use std::ptr;
-use veloq_pod::{Pod, Zeroable, zeroed};
+use veloq_pod::{Pod, Zeroable, bytes_of, bytes_of_mut, zeroed};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
@@ -44,15 +44,27 @@ impl Overlapped {
 
     /// Sets the offset of the overlapped operation.
     pub fn set_offset(&mut self, offset: u64) {
-        self.0.Anonymous.Anonymous.Offset = offset as u32;
-        self.0.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        let bytes = bytes_of_mut(self);
+        let low = (offset as u32).to_ne_bytes();
+        let high = ((offset >> 32) as u32).to_ne_bytes();
+        bytes[0..4].copy_from_slice(&low);
+        bytes[4..8].copy_from_slice(&high);
     }
 
     /// Returns the offset of the overlapped operation.
     pub fn offset(&self) -> u64 {
-        let low = unsafe { self.0.Anonymous.Anonymous.Offset };
-        let high = unsafe { self.0.Anonymous.Anonymous.OffsetHigh };
-        (low as u64) | ((high as u64) << 32)
+        let bytes = bytes_of(self);
+        let low = u32::from_ne_bytes(
+            bytes[0..4]
+                .try_into()
+                .expect("OVERLAPPED offset low bytes must be 4 bytes"),
+        ) as u64;
+        let high = u32::from_ne_bytes(
+            bytes[4..8]
+                .try_into()
+                .expect("OVERLAPPED offset high bytes must be 4 bytes"),
+        ) as u64;
+        low | (high << 32)
     }
 }
 

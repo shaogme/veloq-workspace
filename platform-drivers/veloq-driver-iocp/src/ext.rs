@@ -93,26 +93,23 @@ impl Extensions {
     fn load_traditional(
         socket: SOCKET,
     ) -> io::Result<(LpfnAcceptEx, LpfnConnectEx, LpfnGetAcceptExSockaddrs)> {
-        // SAFETY: `get_extension` calls `WSAIoctl` to retrieve function pointers.
-        // `transmute` converts the returned pointer to the expected function signature.
-        // The pointers are guaranteed by the OS to be valid pointers to extension functions.
-        unsafe {
-            let accept_ex_ptr = Self::get_extension(socket, WSAID_ACCEPTEX)?;
-            let connect_ex_ptr = Self::get_extension(socket, WSAID_CONNECTEX)?;
-            let get_accept_ex_sockaddrs_ptr =
-                Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
+        let accept_ex_ptr = Self::get_extension(socket, WSAID_ACCEPTEX)?;
+        let connect_ex_ptr = Self::get_extension(socket, WSAID_CONNECTEX)?;
+        let get_accept_ex_sockaddrs_ptr = Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
 
-            let accept_ex =
-                std::mem::transmute::<*const std::ffi::c_void, LpfnAcceptEx>(accept_ex_ptr);
-            let connect_ex =
-                std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(connect_ex_ptr);
-            let get_accept_ex_sockaddrs = std::mem::transmute::<
-                *const std::ffi::c_void,
-                LpfnGetAcceptExSockaddrs,
-            >(get_accept_ex_sockaddrs_ptr);
+        // SAFETY: These raw pointers are returned by WinSock for the corresponding
+        // extension GUIDs and are valid function pointers with matching ABI/signature.
+        let funcs = unsafe {
+            (
+                std::mem::transmute::<*const std::ffi::c_void, LpfnAcceptEx>(accept_ex_ptr),
+                std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(connect_ex_ptr),
+                std::mem::transmute::<*const std::ffi::c_void, LpfnGetAcceptExSockaddrs>(
+                    get_accept_ex_sockaddrs_ptr,
+                ),
+            )
+        };
 
-            Ok((accept_ex, connect_ex, get_accept_ex_sockaddrs))
-        }
+        Ok(funcs)
     }
 
     fn load_rio(socket: SOCKET) -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
