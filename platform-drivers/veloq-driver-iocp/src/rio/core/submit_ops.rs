@@ -387,88 +387,7 @@ impl RioProvider for RioDispatch {
 pub(crate) struct RioKernel {
     pub(crate) cq: RioCq,
     _notify_overlapped: Box<Overlapped>,
-    pub(crate) dispatch: RioDispatch,
-}
-
-unsafe extern "system" fn noop_create_cq(_: u32, _: *const RIO_NOTIFICATION_COMPLETION) -> RIO_CQ {
-    0
-}
-
-unsafe extern "system" fn noop_create_rq(
-    _: usize,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: u32,
-    _: RIO_CQ,
-    _: RIO_CQ,
-    _: *const std::ffi::c_void,
-) -> RIO_RQ {
-    0
-}
-
-unsafe extern "system" fn noop_register_buffer(_: *const u8, _: u32) -> RIO_BUFFERID {
-    0 as RIO_BUFFERID
-}
-
-unsafe extern "system" fn noop_deregister_buffer(_: RIO_BUFFERID) {}
-
-unsafe extern "system" fn noop_dequeue(_: RIO_CQ, _: *mut RIORESULT, _: u32) -> u32 {
-    0
-}
-
-unsafe extern "system" fn noop_notify(_: RIO_CQ) -> i32 {
-    0
-}
-
-unsafe extern "system" fn noop_close_cq(_: RIO_CQ) {}
-
-unsafe extern "system" fn noop_receive(
-    _: RIO_RQ,
-    _: *const RIO_BUF,
-    _: u32,
-    _: u32,
-    _: *const std::ffi::c_void,
-) -> i32 {
-    0
-}
-
-unsafe extern "system" fn noop_send(
-    _: RIO_RQ,
-    _: *const RIO_BUF,
-    _: u32,
-    _: u32,
-    _: *const std::ffi::c_void,
-) -> i32 {
-    0
-}
-
-unsafe extern "system" fn noop_send_ex(
-    _: RIO_RQ,
-    _: *const RIO_BUF,
-    _: u32,
-    _: *const RIO_BUF,
-    _: *const RIO_BUF,
-    _: *const RIO_BUF,
-    _: *const RIO_BUF,
-    _: u32,
-    _: *const std::ffi::c_void,
-) -> i32 {
-    0
-}
-
-unsafe extern "system" fn noop_receive_ex(
-    _: RIO_RQ,
-    _: *const RIO_BUF,
-    _: u32,
-    _: *const RIO_BUF,
-    _: *const RIO_BUF,
-    _: *const RIO_BUF,
-    _: *const RIO_BUF,
-    _: u32,
-    _: *const std::ffi::c_void,
-) -> i32 {
-    0
+    pub(crate) dispatch: Option<RioDispatch>,
 }
 
 impl RioKernel {
@@ -559,28 +478,15 @@ impl RioKernel {
         Ok(Self {
             cq,
             _notify_overlapped: notify_overlapped,
-            dispatch,
+            dispatch: Some(dispatch),
         })
     }
 
     pub(crate) fn noop() -> Self {
-        let dispatch = RioDispatch {
-            create_cq: noop_create_cq,
-            create_rq: noop_create_rq,
-            register_buffer: noop_register_buffer,
-            deregister_buffer: noop_deregister_buffer,
-            dequeue: noop_dequeue,
-            notify: noop_notify,
-            close_cq: noop_close_cq,
-            receive: noop_receive,
-            send: noop_send,
-            send_ex: noop_send_ex,
-            receive_ex: noop_receive_ex,
-        };
         Self {
             cq: RioCq::INVALID,
             _notify_overlapped: Box::new(Overlapped::zeroed()),
-            dispatch,
+            dispatch: None,
         }
     }
 
@@ -589,23 +495,30 @@ impl RioKernel {
         &'a self,
         registrar: &'a dyn veloq_buf::BufferRegistrar,
         registration_mode: BufferRegistrationMode,
-    ) -> RioEnv<'a> {
-        RioEnv {
+    ) -> Option<RioEnv<'a>> {
+        let dispatch = self.dispatch.as_ref()?;
+        Some(RioEnv {
             registrar,
-            dispatch: &self.dispatch,
+            dispatch,
             cq: self.cq,
             registration_mode,
-        }
+        })
     }
 
     #[inline]
     pub(crate) fn dequeue(&self, results: &mut [RIORESULT]) -> u32 {
-        self.dispatch.dequeue(self.cq, results)
+        let Some(dispatch) = self.dispatch else {
+            return 0;
+        };
+        dispatch.dequeue(self.cq, results)
     }
 
     #[inline]
     pub(crate) fn rearm_notify(&self) -> io::Result<()> {
-        self.dispatch.notify(self.cq)
+        let Some(dispatch) = self.dispatch else {
+            return Ok(());
+        };
+        dispatch.notify(self.cq)
     }
 
     #[inline]
@@ -615,7 +528,10 @@ impl RioKernel {
         buf: &RIO_BUF,
         request_context: *const std::ffi::c_void,
     ) -> io::Result<()> {
-        self.dispatch.receive(rq, buf, 1, 0, request_context)
+        let Some(dispatch) = self.dispatch else {
+            return Ok(());
+        };
+        dispatch.receive(rq, buf, 1, 0, request_context)
     }
 
     #[inline]
@@ -625,7 +541,10 @@ impl RioKernel {
         buf: &RIO_BUF,
         request_context: *const std::ffi::c_void,
     ) -> io::Result<()> {
-        self.dispatch.send(rq, buf, 1, 0, request_context)
+        let Some(dispatch) = self.dispatch else {
+            return Ok(());
+        };
+        dispatch.send(rq, buf, 1, 0, request_context)
     }
 
     #[inline]
@@ -636,7 +555,10 @@ impl RioKernel {
         addr_buf: &RIO_BUF,
         request_context: *const std::ffi::c_void,
     ) -> io::Result<()> {
-        self.dispatch.send_ex(
+        let Some(dispatch) = self.dispatch else {
+            return Ok(());
+        };
+        dispatch.send_ex(
             rq,
             data_buf,
             1,
@@ -652,7 +574,9 @@ impl RioKernel {
     #[inline]
     pub(crate) fn close(&mut self) {
         if !self.cq.is_invalid() {
-            self.dispatch.close_cq(self.cq);
+            if let Some(dispatch) = self.dispatch {
+                dispatch.close_cq(self.cq);
+            }
             self.cq = RioCq::INVALID;
         }
     }
@@ -689,9 +613,12 @@ impl RioState {
     }
 
     pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
-        let env = self
+        let Some(env) = self
             .kernel
-            .env(&veloq_buf::NoopRegistrar, self.registration_mode);
+            .env(&veloq_buf::NoopRegistrar, self.registration_mode)
+        else {
+            return Ok(());
+        };
         self.registry.register_chunk(id, (ptr, len), env)
     }
 
@@ -708,7 +635,9 @@ impl RioState {
             user_data,
             generation,
         } = target;
-        let dispatch = self.kernel.dispatch;
+        let Some(dispatch) = self.kernel.dispatch else {
+            return Ok(SubmissionResult::Pending);
+        };
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -747,7 +676,9 @@ impl RioState {
             user_data,
             generation,
         } = target;
-        let dispatch = self.kernel.dispatch;
+        let Some(dispatch) = self.kernel.dispatch else {
+            return Ok(SubmissionResult::Pending);
+        };
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,

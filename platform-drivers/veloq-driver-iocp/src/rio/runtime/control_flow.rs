@@ -218,9 +218,15 @@ impl RioState {
     }
 
     pub(crate) fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
-        let env = self
+        let Some(env) = self
             .kernel
-            .env(&veloq_buf::NoopRegistrar, self.registration_mode);
+            .env(&veloq_buf::NoopRegistrar, self.registration_mode)
+        else {
+            if let Some(actor) = self.actors.remove(&handle) {
+                self.actor_routes.remove(&actor.actor_id);
+            }
+            return;
+        };
         let mut remove_actor = None;
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
@@ -250,7 +256,9 @@ impl RioState {
         uid: (usize, u32),
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) {
-        let env = self.kernel.env(registrar, self.registration_mode);
+        let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
+            return;
+        };
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             actor.pool_manager.cancel_udp_recv_waiter(uid, &mut ctx);
@@ -274,7 +282,9 @@ impl RioState {
         ticks: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
-        let env = self.kernel.env(registrar, self.registration_mode);
+        let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
+            return Ok(());
+        };
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             for _ in 0..ticks {
@@ -294,7 +304,11 @@ impl RioState {
         &mut self,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) {
-        let env = self.kernel.env(registrar, self.registration_mode);
+        let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
+            self.actors.clear();
+            self.actor_routes.clear();
+            return;
+        };
         for actor in self.actors.values_mut() {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             actor
@@ -320,9 +334,14 @@ impl RioState {
             .pool_manager
             .ack_udp_pool_completion(completion_generation);
         actor.pool_manager.handle_completion_drain_only();
-        let env = self
+        let Some(env) = self
             .kernel
-            .env(&veloq_buf::NoopRegistrar, self.registration_mode);
+            .env(&veloq_buf::NoopRegistrar, self.registration_mode)
+        else {
+            self.actor_routes.remove(&actor_id);
+            self.actors.remove(&handle);
+            return true;
+        };
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor_id, actor.rq));
         if actor
             .pool_manager
@@ -343,7 +362,9 @@ impl RioState {
     ) -> io::Result<usize> {
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
-        let env = self.kernel.env(registrar, self.registration_mode);
+        let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
+            return Ok(0);
+        };
         let mut router = RioCompletionRouter::new(
             &mut self.actors,
             (&mut self.actor_routes, &mut self.outstanding_count),

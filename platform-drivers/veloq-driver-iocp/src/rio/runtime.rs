@@ -60,7 +60,9 @@ impl RioState {
             page_idx,
         } = args;
 
-        let dispatch = self.kernel.dispatch;
+        let Some(dispatch) = self.kernel.dispatch else {
+            return Ok(SubmissionResult::Pending);
+        };
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -175,7 +177,9 @@ impl RioState {
             user_data,
             generation,
         } = args;
-        let dispatch = self.kernel.dispatch;
+        let Some(dispatch) = self.kernel.dispatch else {
+            return Ok(SubmissionResult::Pending);
+        };
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -203,7 +207,9 @@ impl RioState {
         buf: FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<()> {
-        let dispatch = self.kernel.dispatch;
+        let Some(dispatch) = self.kernel.dispatch else {
+            return Ok(());
+        };
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,

@@ -116,10 +116,12 @@ impl RioState {
     fn finalize_shutdown_cleanup(&mut self) {
         self.forget_all_udp_pool_contexts();
         self.shutdown_all_actors_with_registry_cleanup(&veloq_buf::NoopRegistrar);
-        let env = self
+        if let Some(env) = self
             .kernel
-            .env(&veloq_buf::NoopRegistrar, self.registration_mode);
-        self.registry.cleanup_deregister(env);
+            .env(&veloq_buf::NoopRegistrar, self.registration_mode)
+        {
+            self.registry.cleanup_deregister(env);
+        }
         self.kernel.close();
     }
 
