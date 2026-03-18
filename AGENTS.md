@@ -26,6 +26,7 @@ When making modifications to this repository, please adhere to the following str
 - **禁止操作**：
     - **严禁**运行 `Get-Command alloy-check`。
     - **严禁**直接运行 `alloy-check` 命令。
+    - **严禁**在我没有明确指出使用 `alloy-check` 的情况下，运行包含 `alloy-check` 的任何命令。
 - **强制要求**：每次修改并解决一批问题后，**必须**确保 `cargo xtest-windows` 和 `cargo xtest-linux` 全部通过。
 
 

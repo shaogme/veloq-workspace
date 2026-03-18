@@ -1294,6 +1294,7 @@ dependencies = [
  "veloq-blocking",
  "veloq-buf",
  "veloq-driver-core",
+ "veloq-pod",
  "veloq-wheel",
  "windows-sys 0.61.2",
 ]
@@ -1328,6 +1329,10 @@ dependencies = [
  "tokio",
  "veloq-intrusive-linklist",
 ]
+
+[[package]]
+name = "veloq-pod"
+version = "0.1.0"
 
 [[package]]
 name = "veloq-runtime"

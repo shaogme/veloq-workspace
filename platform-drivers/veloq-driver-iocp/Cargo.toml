@@ -27,6 +27,7 @@ crossbeam-utils.workspace = true
 crossbeam-queue.workspace = true
 tracing.workspace = true
 windows-sys.workspace = true
+veloq-pod.workspace = true
 rustc-hash = "2.1.1"
 error-stack = "0.6"
 

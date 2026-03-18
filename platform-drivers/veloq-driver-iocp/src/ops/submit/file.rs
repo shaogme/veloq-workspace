@@ -2,10 +2,11 @@ use std::io;
 use veloq_blocking::BlockingTask;
 use veloq_blocking::blocking_ops::windows::{BlockingOps, CompletionInfo};
 use veloq_buf::FixedBuf;
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 
 use crate::common::IocpErrorContext;
-use crate::ops::submit::common::{SubmissionResult, ensure_iocp_association, resolve_fd};
+use crate::ops::submit::common::{
+    SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write, resolve_fd,
+};
 use crate::ops::{IocpOp, SubmitContext};
 
 // ============================================================================
@@ -13,7 +14,7 @@ use crate::ops::{IocpOp, SubmitContext};
 // ============================================================================
 
 macro_rules! submit_io_op {
-    ($fn_name:ident, $field:ident, $win_api:ident, offset, $ptr_fn:expr) => {
+    ($fn_name:ident, $field:ident, $wrapper_fn:ident, offset, $ptr_fn:expr) => {
         pub(crate) unsafe fn $fn_name(
             op: &mut IocpOp,
             ctx: &mut SubmitContext,
@@ -45,42 +46,34 @@ macro_rules! submit_io_op {
                 )
             }?;
 
-            let mut bytes = 0;
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
             let ptr = get_ptr(&mut val.buf);
 
-            // SAFETY: Calling Win32 ReadFile/WriteFile with valid parameters.
-            let ret = unsafe {
-                $win_api(
+            // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
+            unsafe {
+                $wrapper_fn(
                     handle,
                     ptr as _,
                     val.buf.len() as u32,
-                    &mut bytes,
                     ctx.overlapped,
                 )
-            };
-
-            if ret == 0 {
-                let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-                if err != windows_sys::Win32::Foundation::ERROR_IO_PENDING {
-                    return Err(crate::common::io_error(
-                        IocpErrorContext::Submission,
-                        io::Error::from_raw_os_error(err as i32),
-                        format!(
-                            "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
-                            stringify!($fn_name),
-                            val.fd,
-                            handle,
-                            op.header.user_data,
-                            op.header.generation,
-                            val.offset,
-                            val.buf.len()
-                        ),
-                    ));
-                }
-            }
-            Ok(SubmissionResult::Pending)
+            }.map_err(|e| {
+                crate::common::io_error(
+                    IocpErrorContext::Submission,
+                    e,
+                    format!(
+                        "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
+                        stringify!($fn_name),
+                        val.fd,
+                        handle,
+                        op.header.user_data,
+                        op.header.generation,
+                        val.offset,
+                        val.buf.len()
+                    ),
+                )
+            })
         }
     };
 }
@@ -92,7 +85,7 @@ macro_rules! submit_io_op {
 submit_io_op!(
     submit_read_fixed,
     read,
-    ReadFile,
+    iocp_submit_read,
     offset,
     |b: &mut FixedBuf| b.as_mut_ptr()
 );
@@ -100,7 +93,7 @@ submit_io_op!(
 submit_io_op!(
     submit_write_fixed,
     write,
-    WriteFile,
+    iocp_submit_write,
     offset,
     |b: &mut FixedBuf| b.as_slice().as_ptr() as *mut u8
 );

@@ -1,6 +1,6 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
     SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, bind,
@@ -9,7 +9,10 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use crate::common::{IocpErrorContext, io_error};
 use crate::ext::Extensions;
-use crate::ops::submit::common::{SubmissionResult, ensure_iocp_association, resolve_fd};
+use crate::ops::submit::common::{
+    SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex, iocp_submit_connect_ex,
+    resolve_fd,
+};
 use crate::ops::{IocpOp, SubmitContext};
 
 // ============================================================================
@@ -153,9 +156,10 @@ pub(crate) unsafe fn submit_connect(
     }
 
     let mut bytes_sent = 0;
-    // SAFETY: connect_ex is a WinSock extension function loaded at driver init.
-    let ret = unsafe {
-        (ctx.ext.connect_ex)(
+    // SAFETY: iocp_submit_connect_ex is a safe wrapper for the WinSock extension.
+    unsafe {
+        iocp_submit_connect_ex(
+            ctx.ext.connect_ex,
             handle as SOCKET,
             &connect_op.addr as *const _ as *const SOCKADDR,
             connect_op.addr_len as i32,
@@ -164,15 +168,7 @@ pub(crate) unsafe fn submit_connect(
             &mut bytes_sent,
             ctx.overlapped,
         )
-    };
-
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != windows_sys::Win32::Foundation::ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
-        }
     }
-    Ok(SubmissionResult::Pending)
 }
 
 pub(crate) unsafe fn on_complete_connect(
@@ -239,9 +235,10 @@ pub(crate) unsafe fn submit_accept(
     let split = MIN_ADDR_LEN;
     let mut bytes_received = 0;
 
-    // SAFETY: accept_ex is a WinSock extension function.
-    let ret = unsafe {
-        (ctx.ext.accept_ex)(
+    // SAFETY: iocp_submit_accept_ex is a safe wrapper for the WinSock extension.
+    unsafe {
+        iocp_submit_accept_ex(
+            ctx.ext.accept_ex,
             handle as SOCKET,
             accept_socket_raw,
             payload.accept_buffer.as_mut_ptr() as *mut _,
@@ -251,27 +248,21 @@ pub(crate) unsafe fn submit_accept(
             &mut bytes_received,
             ctx.overlapped,
         )
-    };
-
-    if ret == 0 {
-        let err = unsafe { GetLastError() };
-        if err != windows_sys::Win32::Foundation::ERROR_IO_PENDING {
-            return Err(io_error(
-                IocpErrorContext::Submission,
-                io::Error::from_raw_os_error(err as i32),
-                format!(
-                    "submit_accept: AcceptEx immediate failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
-                    handle as usize,
-                    accept_socket_raw,
-                    split,
-                    split,
-                    op.header.user_data,
-                    op.header.generation
-                ),
-            ));
-        }
-    }
-    Ok(SubmissionResult::Pending)
+    }.map_err(|e| {
+        io_error(
+            IocpErrorContext::Submission,
+            e,
+            format!(
+                "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
+                handle as usize,
+                accept_socket_raw,
+                split,
+                split,
+                op.header.user_data,
+                op.header.generation
+            ),
+        )
+    })
 }
 
 pub(crate) unsafe fn on_complete_accept(

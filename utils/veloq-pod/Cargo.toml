@@ -1,0 +1,15 @@
+[package]
+name = "veloq-pod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A minimal zero-copy abstraction for casting between types and byte slices."
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
