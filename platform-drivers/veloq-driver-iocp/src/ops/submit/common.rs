@@ -24,6 +24,10 @@ pub(crate) enum SubmissionResult {
 // ============================================================================
 
 /// Safe wrapper for ReadFile.
+///
+/// # Safety
+///
+/// The caller must ensure that the handle, buf, and overlapped pointers are valid.
 pub(crate) unsafe fn iocp_submit_read(
     handle: HANDLE,
     buf: *mut u8,
@@ -31,8 +35,10 @@ pub(crate) unsafe fn iocp_submit_read(
     overlapped: *mut OVERLAPPED,
 ) -> io::Result<SubmissionResult> {
     let mut bytes = 0;
+    // SAFETY: ReadFile is called with valid parameters.
     let ret = unsafe { ReadFile(handle, buf as _, len, &mut bytes, overlapped) };
     if ret == 0 {
+        // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return Err(io::Error::from_raw_os_error(err as i32));
@@ -42,6 +48,10 @@ pub(crate) unsafe fn iocp_submit_read(
 }
 
 /// Safe wrapper for WriteFile.
+///
+/// # Safety
+///
+/// The caller must ensure that the handle, buf, and overlapped pointers are valid.
 pub(crate) unsafe fn iocp_submit_write(
     handle: HANDLE,
     buf: *const u8,
@@ -49,8 +59,10 @@ pub(crate) unsafe fn iocp_submit_write(
     overlapped: *mut OVERLAPPED,
 ) -> io::Result<SubmissionResult> {
     let mut bytes = 0;
+    // SAFETY: WriteFile is called with valid parameters.
     let ret = unsafe { WriteFile(handle, buf as _, len, &mut bytes, overlapped) };
     if ret == 0 {
+        // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return Err(io::Error::from_raw_os_error(err as i32));
@@ -60,6 +72,11 @@ pub(crate) unsafe fn iocp_submit_write(
 }
 
 /// Safe wrapper for ConnectEx.
+///
+/// # Safety
+///
+/// The caller must ensure that all pointers and the socket handle are valid.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn iocp_submit_connect_ex(
     connect_ex: LpfnConnectEx,
     s: SOCKET,
@@ -70,6 +87,7 @@ pub(crate) unsafe fn iocp_submit_connect_ex(
     lp_dw_bytes_sent: *mut u32,
     lp_overlapped: *mut OVERLAPPED,
 ) -> io::Result<SubmissionResult> {
+    // SAFETY: connect_ex is called with valid parameters.
     let ret = unsafe {
         connect_ex(
             s,
@@ -82,6 +100,7 @@ pub(crate) unsafe fn iocp_submit_connect_ex(
         )
     };
     if ret == 0 {
+        // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return Err(io::Error::from_raw_os_error(err as i32));
@@ -91,6 +110,11 @@ pub(crate) unsafe fn iocp_submit_connect_ex(
 }
 
 /// Safe wrapper for AcceptEx.
+///
+/// # Safety
+///
+/// The caller must ensure that all pointers and the socket handles are valid.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn iocp_submit_accept_ex(
     accept_ex: LpfnAcceptEx,
     s_listen_socket: SOCKET,
@@ -102,6 +126,7 @@ pub(crate) unsafe fn iocp_submit_accept_ex(
     lp_dw_bytes_received: *mut u32,
     lp_overlapped: *mut OVERLAPPED,
 ) -> io::Result<SubmissionResult> {
+    // SAFETY: accept_ex is called with valid parameters.
     let ret = unsafe {
         accept_ex(
             s_listen_socket,
@@ -115,6 +140,7 @@ pub(crate) unsafe fn iocp_submit_accept_ex(
         )
     };
     if ret == 0 {
+        // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return Err(io::Error::from_raw_os_error(err as i32));

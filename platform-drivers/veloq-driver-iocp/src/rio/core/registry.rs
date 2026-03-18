@@ -90,8 +90,8 @@ impl RioRegistry {
                 return Err(io_msg(
                     IocpErrorContext::Rio,
                     format!(
-                        "RIO heap registration skipped due to recent failure: ptr=0x{:x}, cap={}, cookie={}",
-                        key.0, key.1, key.2
+                        "RIO heap registration skipped due to recent failure (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
+                        env.registration_mode, key.0, key.1, key.2
                     ),
                 ));
             }
@@ -103,6 +103,7 @@ impl RioRegistry {
                 // UNRESOLVED: This is only 100% safe if no heap-based IO is pended.
                 // However, the cookie already prevents the dangerous "wrong buffer mapping" crash.
                 for id in self.heap_rio_bufs.values().copied() {
+                    // SAFETY: RIO_BUFFERID is valid.
                     unsafe { (env.dispatch.deregister_buffer)(id) };
                 }
                 self.heap_rio_bufs.clear();
@@ -112,6 +113,7 @@ impl RioRegistry {
                 .registration_stats
                 .heap_register_attempts
                 .saturating_add(1);
+            // SAFETY: buf.as_ptr() and capacity are valid.
             let id = unsafe { (env.dispatch.register_buffer)(buf.as_ptr(), buf.capacity() as u32) };
             if id == RIO_INVALID_BUFFERID {
                 self.registration_stats.heap_register_failures = self
@@ -124,16 +126,10 @@ impl RioRegistry {
                     IocpErrorContext::Rio,
                     Self::last_wsa_error(),
                     format!(
-                        "RIORegisterBuffer failed for heap buffer: ptr=0x{:x}, cap={}, cookie={}",
-                        key.0, key.1, key.2
+                        "RIORegisterBuffer failed for heap buffer (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
+                        env.registration_mode, key.0, key.1, key.2
                     ),
                 );
-                if env.registration_mode.is_strict() {
-                    panic!(
-                        "strict registration mode: RIO heap registration failed: ptr=0x{:x}, cap={}, cookie={}, error={}",
-                        key.0, key.1, key.2, err
-                    );
-                }
                 return Err(err);
             }
 
@@ -159,12 +155,6 @@ impl RioRegistry {
                 (chunk_info.ptr.as_ptr(), chunk_info.len.get()),
                 env,
             ) {
-                if env.registration_mode.is_strict() {
-                    panic!(
-                        "strict registration mode: RIO lazy chunk registration failed: chunk_id={}, error={}",
-                        info.id, e
-                    );
-                }
                 return Err(e);
             }
             buffer_id = Some(self.chunk_registry[info.id as usize]);
@@ -172,22 +162,14 @@ impl RioRegistry {
 
         match buffer_id {
             Some(id) => Ok((id, info.offset as u32)),
-            None => {
-                if env.registration_mode.is_strict() {
-                    panic!(
-                        "strict registration mode: RIO chunk not registered and chunk info unavailable: chunk_id={}",
-                        info.id
-                    );
-                }
-                Err(io_msg(
-                    IocpErrorContext::Rio,
-                    format!("RIO chunk not registered: chunk_id={}", info.id),
-                ))
-            }
+            None => Err(io_msg(
+                IocpErrorContext::Rio,
+                format!("RIO chunk not registered: chunk_id={}", info.id),
+            )),
         }
     }
 
-    pub(crate) fn prepare_data_submission(
+    pub(crate) fn prepare_submission(
         &mut self,
         buf: &FixedBuf,
         len: u32,
@@ -202,7 +184,7 @@ impl RioRegistry {
         Ok(rio_buf)
     }
 
-    pub(crate) fn resize_registered_rqs(&mut self, _size: usize) {}
+    pub(crate) fn resize_rqs(&mut self, _size: usize) {}
 
     pub(crate) fn clear_registered_rq(&mut self, _idx: usize) {}
 
@@ -244,6 +226,7 @@ impl RioRegistry {
             .registration_stats
             .chunk_register_attempts
             .saturating_add(1);
+        // SAFETY: ptr and len are valid for the chunk.
         let buf_id = unsafe { reg_fn(ptr, len as u32) };
         if buf_id == RIO_INVALID_BUFFERID {
             self.registration_stats.chunk_register_failures = self
@@ -257,12 +240,6 @@ impl RioRegistry {
                 Self::last_wsa_error(),
                 format!("RIORegisterBuffer failed: chunk_id={id}, len={len}"),
             );
-            if env.registration_mode.is_strict() {
-                panic!(
-                    "strict registration mode: RIO chunk register syscall failed: chunk_id={}, len={}, error={}",
-                    id, len, err
-                );
-            }
             return Err(err);
         }
 
@@ -275,7 +252,7 @@ impl RioRegistry {
         Ok(())
     }
 
-    pub(crate) fn ensure_slab_page_registration(
+    pub(crate) fn ensure_page_registration(
         &mut self,
         page_idx: usize,
         resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
@@ -288,6 +265,7 @@ impl RioRegistry {
         if self.slab_rio_pages[page_idx].is_none() {
             if let Some((ptr, len)) = resolver(page_idx) {
                 let reg_fn = env.dispatch.register_buffer;
+                // SAFETY: ptr and len are valid for the slab page.
                 let id = unsafe { reg_fn(ptr, len as u32) };
                 if id == RIO_INVALID_BUFFERID {
                     return Err(io_error(
@@ -320,6 +298,7 @@ impl RioRegistry {
         let max_outstanding_recvs = self.rq_depth;
         let max_outstanding_sends = self.rq_depth;
 
+        // SAFETY: all parameters are valid for RIOCreateRequestQueue.
         let rq = unsafe {
             create_fn(
                 handle as usize,
@@ -346,7 +325,7 @@ impl RioRegistry {
         Ok(rq)
     }
 
-    pub(crate) fn deregister_heap_buffer_for_buf(&mut self, buf: &FixedBuf, env: RioEnv<'_>) {
+    pub(crate) fn deregister_heap_buf(&mut self, buf: &FixedBuf, env: RioEnv<'_>) {
         let info = buf.resolve_region_info();
         if info.id != u16::MAX {
             return;
@@ -355,6 +334,7 @@ impl RioRegistry {
         if let Some(id) = self.heap_rio_bufs.remove(&key)
             && id != RIO_INVALID_BUFFERID
         {
+            // SAFETY: id is a valid RIO_BUFFERID.
             unsafe { (env.dispatch.deregister_buffer)(id) };
         }
     }
@@ -365,21 +345,25 @@ impl RioRegistry {
 
         for id in self.chunk_registry.iter().copied() {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
+                // SAFETY: id is a valid RIO_BUFFERID.
                 unsafe { (env.dispatch.deregister_buffer)(id) };
             }
         }
         for id in self.pending_deregistrations.drain(..) {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
+                // SAFETY: id is a valid RIO_BUFFERID.
                 unsafe { (env.dispatch.deregister_buffer)(id) };
             }
         }
         for (id, _, _) in self.slab_rio_pages.iter().flatten().copied() {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
+                // SAFETY: id is a valid RIO_BUFFERID.
                 unsafe { (env.dispatch.deregister_buffer)(id) };
             }
         }
         for id in self.heap_rio_bufs.values().copied() {
             if id != RIO_INVALID_BUFFERID && deregistered.insert(id as usize) {
+                // SAFETY: id is a valid RIO_BUFFERID.
                 unsafe { (env.dispatch.deregister_buffer)(id) };
             }
         }

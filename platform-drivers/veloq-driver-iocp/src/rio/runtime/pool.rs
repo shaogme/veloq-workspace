@@ -187,8 +187,7 @@ impl UdpPoolManager {
     }
 
     fn deregister_udp_pool_slot_with_registry(&self, slot: UdpRecvPoolSlot, ctx: &mut RioContext) {
-        ctx.registry
-            .deregister_heap_buffer_for_buf(&slot.buf, ctx.env);
+        ctx.registry.deregister_heap_buf(&slot.buf, ctx.env);
         self.deregister_udp_pool_slot(slot, ctx.env.dispatch);
     }
 
@@ -433,17 +432,19 @@ impl UdpPoolManager {
             return false;
         }
 
-        let mut guard = unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) };
+        let mut guard = unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) };
         let datagram_len = datagram.as_ref().unwrap().buf.len();
 
         let stream_op = unsafe {
-            guard.with_op_mut_unchecked(|iocp_op| {
-                if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
-                    Some(kernel.user.as_mut())
-                } else {
-                    None
-                }
-            })
+            guard
+                .op_mut_unchecked(|iocp_op| {
+                    if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
+                        Some(kernel.user.as_mut())
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
         };
 
         let Some(stream_op) = stream_op else {
@@ -472,8 +473,7 @@ impl UdpPoolManager {
             flags: 0,
         };
 
-        let mut guard =
-            unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) }.complete();
+        let mut guard = unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) }.complete();
         let (payload, detail) = guard.take_completion_data();
 
         comp.table

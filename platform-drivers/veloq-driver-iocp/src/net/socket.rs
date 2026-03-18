@@ -230,8 +230,11 @@ impl PlatformSocket for Socket {
         Socket::into_raw(self)
     }
 
-    /// SAFETY: Forwarding to Socket::from_raw which has the same safety requirements.
+    /// # Safety
+    ///
+    /// Forwarding to Socket::from_raw which has the same safety requirements.
     unsafe fn from_raw(handle: Self::Handle) -> Self {
+        // SAFETY: The caller must ensure the handle is valid and the ownership is transferred.
         unsafe { Socket::from_raw(handle) }
     }
 

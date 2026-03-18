@@ -10,10 +10,9 @@
 //! Windows RIO APIs, keeping unsafe calls and pointer setup in one place.
 
 use crate::BufferRegistrationMode;
-use crate::IoFd;
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::ext::Extensions;
-use crate::rio::{RioEnv, RioState};
+use crate::rio::{RioEnv, RioState, RioTarget};
 use std::io;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -391,8 +390,8 @@ impl RioState {
         })
     }
 
-    pub(crate) fn resize_registered_rqs(&mut self, size: usize) {
-        self.registry.resize_registered_rqs(size);
+    pub(crate) fn resize_rqs(&mut self, size: usize) {
+        self.registry.resize_rqs(size);
     }
 
     pub(crate) fn clear_registered_rq(&mut self, idx: usize) {
@@ -408,12 +407,17 @@ impl RioState {
 
     pub(crate) fn try_submit_recv(
         &mut self,
-        target: (IoFd, HANDLE, usize, u32),
+        target: RioTarget,
         buf: &mut veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<crate::ops::submit::SubmissionResult> {
         use crate::ops::submit::SubmissionResult;
-        let (fd, handle, user_data, generation) = target;
+        let RioTarget {
+            fd,
+            handle,
+            user_data,
+            generation,
+        } = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {
             registrar,
@@ -424,7 +428,7 @@ impl RioState {
         let rq = self.ensure_actor((fd, handle), env)?.rq;
         let rio_buf = self
             .registry
-            .prepare_data_submission(buf, buf.capacity() as u32, env)?;
+            .prepare_submission(buf, buf.capacity() as u32, env)?;
         let request_context = Self::encode_request_context(user_data, generation);
         let ret = self.kernel.submit_receive(rq, &rio_buf, request_context);
         if ret == 0 {
@@ -441,12 +445,17 @@ impl RioState {
 
     pub(crate) fn try_submit_send(
         &mut self,
-        target: (IoFd, HANDLE, usize, u32),
+        target: RioTarget,
         buf: &veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<crate::ops::submit::SubmissionResult> {
         use crate::ops::submit::SubmissionResult;
-        let (fd, handle, user_data, generation) = target;
+        let RioTarget {
+            fd,
+            handle,
+            user_data,
+            generation,
+        } = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {
             registrar,
@@ -457,7 +466,7 @@ impl RioState {
         let rq = self.ensure_actor((fd, handle), env)?.rq;
         let rio_buf = self
             .registry
-            .prepare_data_submission(buf, buf.len() as u32, env)?;
+            .prepare_submission(buf, buf.len() as u32, env)?;
         let request_context = Self::encode_request_context(user_data, generation);
         let ret = self.kernel.submit_send(rq, &rio_buf, request_context);
         if ret == 0 {

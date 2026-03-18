@@ -148,7 +148,7 @@ macro_rules! define_iocp_ops {
                             }
                         },
                         on_complete: define_iocp_ops!(@optional_complete_shim $OpType, $Variant, $($complete)?),
-                        get_fd: |op| {
+                        get_fd: |op| unsafe {
                             if let IocpOpPayload::$Variant(ref p) = op.payload {
                                 $get_fd(p)
                             } else {
@@ -386,7 +386,7 @@ define_iocp_ops! {
         variant: UdpRecvStream,
         kind: OpKind::UdpRecvStream,
         submit: submit::submit_udp_recv_stream,
-        on_complete: submit::on_complete_udp_recv_stream,
+        on_complete: submit::on_udp_stream_complete,
         get_fd: submit::get_fd_udp_recv_stream,
     },
     UdpRefill {

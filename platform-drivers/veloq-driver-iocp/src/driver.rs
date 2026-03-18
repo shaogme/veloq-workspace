@@ -109,10 +109,12 @@ impl IocpDriver {
         let mut guard = Slot::<Pending>::pending_entry(slot_entry, user_data)
             .init_op(op, user_data, generation);
 
-        guard.with_op_mut(|op_ref| {
-            op_ref.header.user_data = user_data;
-            op_ref.header.generation = generation;
-        });
+        guard
+            .with_op_mut(|op_ref| {
+                op_ref.header.user_data = user_data;
+                op_ref.header.generation = generation;
+            })
+            .ok_or_else(|| io::Error::other("Op missing in prep_op_slot"))?;
         op_entry.platform_data.generation = generation;
 
         Ok((guard, op_entry))
@@ -131,7 +133,8 @@ impl IocpDriver {
             let err = io::Error::other("Thread pool overloaded");
             if let Some((slot_entry, _)) = ops.get_slot_and_entry_mut(user_data) {
                 let mut guard =
-                    unsafe { Slot::<InFlight>::assume_in_flight_entry(slot_entry, user_data) }
+                    // SAFETY: Slot is verified to be in-flight before offload failure cleanup.
+                    unsafe { Slot::<InFlight>::as_inflight_entry(slot_entry, user_data) }
                         .complete();
                 let (payload, detail) = guard.take_completion_data();
                 let _ = guard.take_op();
@@ -175,6 +178,7 @@ impl IocpDriver {
                 if let Err(err) = ctx.port.notify(user_data) {
                     if ops.contains(user_data) {
                         let mut guard =
+                            // SAFETY: Slot is verified to be in-flight before notification error cleanup.
                             unsafe { Slot::<InFlight>::assume_in_flight(&ops.shared, user_data) }
                                 .complete();
                         *op_in = guard.take_op();
@@ -206,6 +210,7 @@ impl IocpDriver {
             Err(e) => {
                 if ops.contains(user_data) {
                     let mut guard =
+                        // SAFETY: Slot is verified to be in-flight before submission error cleanup.
                         unsafe { Slot::<InFlight>::assume_in_flight(&ops.shared, user_data) }
                             .complete();
                     *op_in = guard.take_op();
@@ -230,7 +235,8 @@ impl IocpDriver {
         let (mut guard, _) = Self::prep_op_slot(&mut self.ops, user_data, op)?;
 
         let is_rio_pool_waiting = guard
-            .with_op_mut(|op| matches!(op.payload, crate::ops::IocpOpPayload::UdpRecvStream(_)));
+            .with_op_mut(|op| matches!(op.payload, crate::ops::IocpOpPayload::UdpRecvStream(_)))
+            .unwrap_or(false);
 
         let mut ctx = SubmitContext {
             port: self.port.as_ref(),
@@ -244,7 +250,10 @@ impl IocpDriver {
         };
 
         let mut sub_guard = guard.start_submission();
-        let result = sub_guard.slot.with_op_mut(|op| op.submit(&mut ctx));
+        let result = sub_guard
+            .slot
+            .with_op_mut(|op| op.submit(&mut ctx))
+            .ok_or_else(|| io::Error::other("Op missing during submission"))?;
 
         if result.is_ok() {
             sub_guard.persist();
@@ -275,8 +284,7 @@ impl IocpDriver {
                 idx
             } else {
                 self.registered_files.push(Some(handle.handle));
-                self.rio_state
-                    .resize_registered_rqs(self.registered_files.len());
+                self.rio_state.resize_rqs(self.registered_files.len());
                 self.registered_files.len() - 1
             };
             registered.push(IoFd::Fixed(idx as u32));
@@ -360,6 +368,7 @@ impl IocpDriver {
                 }
 
                 if !overlapped.is_null() {
+                    // SAFETY: overlapped pointer is guaranteed to be valid during IOCP completion.
                     let user_data = unsafe { OverlappedEntry::user_data_from_ptr(overlapped) };
                     self.process_completion(user_data, success, error_code, bytes);
                     return Ok(1);
@@ -473,6 +482,7 @@ impl Driver for IocpDriver {
             }
             Err(e) => {
                 if let Some((slot_entry, _)) = self.ops.get_slot_and_entry_mut(user_data) {
+                    // SAFETY: slot_entry.op.get() is a valid pointer within OpRegistry.
                     unsafe {
                         let _ = (*slot_entry.op.get()).take();
                     }

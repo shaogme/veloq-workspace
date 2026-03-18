@@ -105,11 +105,15 @@ submit_io_op!(
 // Blocking File Operations
 // ============================================================================
 
+/// # Safety
+///
+/// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
 pub(crate) unsafe fn submit_open(
     header: &mut OverlappedEntry,
     payload: &mut OpenPayload,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
+    // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let path_ptr = user.path.as_slice().as_ptr() as usize;
 
@@ -130,11 +134,15 @@ pub(crate) unsafe fn submit_open(
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
 
+/// # Safety
+///
+/// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
 pub(crate) unsafe fn submit_close(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Close>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
+    // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd(user.fd, ctx.registered_files)?;
 
@@ -153,11 +161,15 @@ pub(crate) unsafe fn submit_close(
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
 
+/// # Safety
+///
+/// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
 pub(crate) unsafe fn submit_fsync(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Fsync>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
+    // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd(user.fd, ctx.registered_files)?;
 
@@ -176,11 +188,15 @@ pub(crate) unsafe fn submit_fsync(
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
 
+/// # Safety
+///
+/// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
 pub(crate) unsafe fn submit_sync_range(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<SyncFileRange>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
+    // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd(user.fd, ctx.registered_files)?;
 
@@ -199,11 +215,15 @@ pub(crate) unsafe fn submit_sync_range(
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
 
+/// # Safety
+///
+/// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
 pub(crate) unsafe fn submit_fallocate(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Fallocate>,
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
+    // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd(user.fd, ctx.registered_files)?;
 

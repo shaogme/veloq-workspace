@@ -11,6 +11,13 @@ use veloq_buf::FixedBuf;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
+pub(crate) struct RioTarget {
+    pub(crate) fd: IoFd,
+    pub(crate) handle: HANDLE,
+    pub(crate) user_data: usize,
+    pub(crate) generation: u32,
+}
+
 pub(crate) struct RioSendToArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: HANDLE,
@@ -63,9 +70,9 @@ impl RioState {
         let rq = self.ensure_actor((fd, handle), env)?.rq;
         let data_buf = self
             .registry
-            .prepare_data_submission(buf, buf.len() as u32, env)?;
+            .prepare_submission(buf, buf.len() as u32, env)?;
         self.registry
-            .ensure_slab_page_registration(page_idx, slab_resolver, env)?;
+            .ensure_page_registration(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
 
         if addr_ptr.is_null() {

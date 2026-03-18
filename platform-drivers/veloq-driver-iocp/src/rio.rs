@@ -26,6 +26,7 @@ use self::core::submit_ops::{RioDispatch, RioKernel};
 use self::runtime::control_flow::RioSocketActor;
 
 pub(crate) use self::runtime::RioSendToArgs;
+pub(crate) use self::runtime::RioTarget;
 pub(crate) use self::runtime::RioUdpStreamArgs;
 
 #[derive(Clone, Copy)]

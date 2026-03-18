@@ -60,8 +60,8 @@ pub struct IoCompletionPort(OwnedHandle);
 impl IoCompletionPort {
     /// Creates a new, unconnected I/O Completion Port.
     pub fn new(threads: u32) -> io::Result<Self> {
-        // SAFETY: Calling CreateIoCompletionPort to create a new port is safe.
         let handle =
+            // SAFETY: Calling CreateIoCompletionPort to create a new port is safe.
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, threads) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
@@ -102,7 +102,9 @@ impl IoCompletionPort {
         key: usize,
         overlapped: *mut OVERLAPPED,
     ) -> io::Result<()> {
-        let res = unsafe { PostQueuedCompletionStatus(self.0.as_raw(), bytes, key, overlapped) };
+        let res =
+            // SAFETY: PostQueuedCompletionStatus is safe to call with valid parameters.
+            unsafe { PostQueuedCompletionStatus(self.0.as_raw(), bytes, key, overlapped) };
         if res == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -122,8 +124,11 @@ impl IoCompletionPort {
     ///
     /// `overlapped` must point to the same `OVERLAPPED` structure used to start the I/O.
     pub unsafe fn cancel_request(handle: HANDLE, overlapped: *mut OVERLAPPED) -> io::Result<()> {
-        let res = unsafe { windows_sys::Win32::System::IO::CancelIoEx(handle, overlapped) };
+        let res =
+            // SAFETY: CancelIoEx is safe to call with valid handle and overlapped.
+            unsafe { windows_sys::Win32::System::IO::CancelIoEx(handle, overlapped) };
         if res == 0 {
+            // SAFETY: GetLastError is safe to call.
             let err = unsafe { GetLastError() };
             if err == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
                 return Ok(());
@@ -139,17 +144,20 @@ impl IoCompletionPort {
         let mut key = 0;
         let mut overlapped = ptr::null_mut();
 
-        let res = unsafe {
-            GetQueuedCompletionStatus(
-                self.0.as_raw(),
-                &mut bytes,
-                &mut key,
-                &mut overlapped,
-                timeout_ms,
-            )
-        };
+        let res =
+            // SAFETY: GetQueuedCompletionStatus is safe with valid pointers.
+            unsafe {
+                GetQueuedCompletionStatus(
+                    self.0.as_raw(),
+                    &mut bytes,
+                    &mut key,
+                    &mut overlapped,
+                    timeout_ms,
+                )
+            };
 
         if res == 0 {
+            // SAFETY: GetLastError is safe to call.
             let err = unsafe { GetLastError() };
             if overlapped.is_null() {
                 if err == WAIT_TIMEOUT {
@@ -177,11 +185,13 @@ impl IoCompletionPort {
         })
     }
 
+    /// Returns the raw HANDLE of the completion port.
     pub fn as_raw(&self) -> HANDLE {
         self.0.as_raw()
     }
 }
 
+/// Represents the status of a completed I/O operation.
 pub enum CompletionStatus {
     Completed {
         bytes: u32,

@@ -21,6 +21,9 @@ pub use net::socket::Socket;
 /// SAFETY: link_section .CRT$XCU is used for global initialization on Windows.
 #[unsafe(link_section = ".CRT$XCU")]
 static INIT_WINSOCK: unsafe extern "C" fn() = {
+    /// # Safety
+    ///
+    /// This function performs global initialization for Winsock and must be called correctly by the CRT.
     unsafe extern "C" fn init() {
         // SAFETY: WSAStartup is required for networking on Windows.
         unsafe {
