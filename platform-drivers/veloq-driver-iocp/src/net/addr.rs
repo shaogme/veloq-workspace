@@ -123,8 +123,8 @@ pub(crate) fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, i32) {
             sin.sin_addr.S_un.S_addr = u32::from_ne_bytes(a.ip().octets());
 
             let ptr = &sin as *const _ as *const u8;
-            // SAFETY: sin is a valid struct.
             let buf =
+                // SAFETY: sin is a valid struct.
                 unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<SOCKADDR_IN>()) }
                     .to_vec();
             (buf, std::mem::size_of::<SOCKADDR_IN>() as i32)
@@ -140,8 +140,8 @@ pub(crate) fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, i32) {
             sin6.Anonymous.sin6_scope_id = a.scope_id();
 
             let ptr = &sin6 as *const _ as *const u8;
-            // SAFETY: sin6 is a valid struct.
             let buf =
+                // SAFETY: sin6 is a valid struct.
                 unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<SOCKADDR_IN6>()) }
                     .to_vec();
             (buf, std::mem::size_of::<SOCKADDR_IN6>() as i32)

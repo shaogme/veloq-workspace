@@ -2,10 +2,10 @@ pub(crate) mod common;
 pub(crate) mod file;
 pub(crate) mod net;
 
-use std::io;
-use std::mem::ManuallyDrop;
 use crate::config::IoFd;
 use crate::ops::IocpOp;
+use std::io;
+use std::mem::ManuallyDrop;
 
 pub(crate) use common::*;
 pub(crate) use file::*;

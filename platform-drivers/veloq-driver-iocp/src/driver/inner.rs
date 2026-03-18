@@ -5,34 +5,29 @@ use std::time::Instant;
 
 use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
-use windows_sys::Win32::Foundation::{
-    GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
-};
-use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
-    PostQueuedCompletionStatus,
-};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
 use veloq_driver_core::driver::{
     CompletionTable, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
-use veloq_driver_core::slot::SlotTable;
+use veloq_driver_core::slot::{SlotEntry, SlotTable};
 use veloq_wheel::{Wheel, WheelConfig};
 
-use crate::config::{BufferRegistrationMode, IocpConfig};
 use crate::common::{
-    CompletionPort, IocpErrorContext, WAKEUP_USER_DATA, completion_record, io_error, io_msg,
-    io_result_to_event_res, push_completion_event_shared, IocpWaker,
+    IocpErrorContext, IocpWaker, WAKEUP_USER_DATA, completion_record, io_error, io_msg,
+    io_result_to_event_res, push_completion_shared,
 };
+use crate::config::{BufferRegistrationMode, IocpConfig};
+use crate::driver::{CompletionSidecar, IocpOpState, OpLifecycle};
 use crate::ops::{IocpOp, OverlappedEntry, submit};
 use crate::rio::RioState;
-use crate::driver::{IocpOpState, OpLifecycle, CompletionSidecar};
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
-pub(crate) type PreInit = usize;
+pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
 struct EmitContext<'a> {
     ops_shared: &'a Arc<SlotTable<IocpOp, OverlappedEntry>>,
@@ -42,7 +37,7 @@ struct EmitContext<'a> {
 
 /// The IOCP driver implementation that manages I/O completion ports and operations.
 pub struct IocpDriver {
-    pub(crate) port: Arc<CompletionPort>,
+    pub(crate) port: Arc<crate::win32::IoCompletionPort>,
     pub(crate) ops: OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
@@ -74,14 +69,7 @@ impl IocpDriver {
 
     /// Creates a pre-initialization completion port handle.
     pub(crate) fn create_pre_init() -> io::Result<PreInit> {
-        // SAFETY: `INVALID_HANDLE_VALUE` is a valid argument for creating a new completion port.
-        let port =
-            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
-        if port.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(port as usize)
-        }
+        crate::win32::IoCompletionPort::new(0)
     }
 
     /// Creates a new IOCP driver instance.
@@ -97,25 +85,27 @@ impl IocpDriver {
         port_val: PreInit,
         registration_mode: BufferRegistrationMode,
     ) -> io::Result<Self> {
-        let port = port_val as HANDLE;
-        debug!(port = ?port, "Initializing IocpDriver");
+        let port_handle = port_val.as_raw();
+        debug!(port = ?port_handle, "Initializing IocpDriver");
         let extensions = crate::ext::Extensions::new().map_err(|e| {
             io_error(
                 IocpErrorContext::DriverInit,
                 e,
-                format!("failed to load IOCP extensions, port={port:?}"),
+                format!("failed to load IOCP extensions, port={port_handle:?}"),
             )
         })?;
-        let rio_state =
-            RioState::new(port, entries, &extensions, registration_mode).map_err(|e| {
+        let rio_state = RioState::new(port_handle, entries, &extensions, registration_mode)
+            .map_err(|e| {
                 io_error(
                     IocpErrorContext::DriverInit,
                     e,
-                    format!("failed to initialize RIO state, entries={entries}, port={port:?}"),
+                    format!(
+                        "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
+                    ),
                 )
             })?;
         Ok(Self {
-            port: Arc::new(CompletionPort { handle: port }),
+            port: Arc::new(port_val),
             ops: OpRegistry::new(entries as usize),
             extensions,
             wheel: Wheel::new(WheelConfig::default()),
@@ -134,50 +124,47 @@ impl IocpDriver {
 
     /// Retrieves completion events from the I/O completion port.
     pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> io::Result<()> {
-        let mut bytes_transferred = 0;
-        let mut completion_key = 0;
-        let mut overlapped = std::ptr::null_mut();
-
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
         trace!(wait_ms, "Entering GetQueuedCompletionStatus");
         let start = Instant::now();
-        // SAFETY: The `self.port.handle` is a valid, open I/O completion port handle.
-        // Pointers for `bytes_transferred`, `completion_key`, and `overlapped` are valid for mutation by the OS.
-        let res = unsafe {
-            GetQueuedCompletionStatus(
-                self.port.handle,
-                &mut bytes_transferred,
-                &mut completion_key,
-                &mut overlapped,
-                wait_ms,
-            )
-        };
+        let status = self.port.get_status(wait_ms);
         let elapsed = start.elapsed();
-
         self.wheel.advance(elapsed, &mut self.timer_buffer);
         self.process_timers();
 
-        if completion_key == RIO_EVENT_KEY {
-            self.rio_state.process_completions(
-                &mut self.ops,
-                &*self.registrar,
-                &self.completion_events,
-                &self.completion_table,
-            )?;
-            return Ok(());
+        let status = status?;
+
+        match status {
+            crate::win32::CompletionStatus::Completed {
+                bytes,
+                key,
+                overlapped,
+                success,
+                error_code,
+            } => {
+                if key == RIO_EVENT_KEY {
+                    self.rio_state.process_completions(
+                        &mut self.ops,
+                        &*self.registrar,
+                        &self.completion_events,
+                        &self.completion_table,
+                    )?;
+                    return Ok(());
+                }
+
+                let user_data = self.resolve_user_data(overlapped, success, key, error_code)?;
+
+                if user_data == WAKEUP_USER_DATA {
+                    self.is_notified.store(false, Ordering::Release);
+                    trace!("Wakeup received");
+                    return Ok(());
+                }
+                trace!(user_data, bytes, "CQE received");
+                self.process_completion(user_data, success, error_code, bytes);
+            }
+            crate::win32::CompletionStatus::Timeout => {}
         }
-
-        let user_data = self.resolve_user_data(overlapped, res, completion_key, wait_ms)?;
-
-        if user_data == WAKEUP_USER_DATA {
-            self.is_notified.store(false, Ordering::Release);
-            trace!("Wakeup received");
-            return Ok(());
-        }
-
-        trace!(user_data, bytes_transferred, "CQE received");
-        self.process_completion(user_data, res, bytes_transferred);
         Ok(())
     }
 
@@ -193,9 +180,9 @@ impl IocpDriver {
     fn resolve_user_data(
         &self,
         overlapped: *mut OVERLAPPED,
-        res: i32,
+        success: bool,
         completion_key: usize,
-        wait_ms: u32,
+        error_code: Option<u32>,
     ) -> io::Result<usize> {
         if !overlapped.is_null() {
             // SAFETY: overlapped is non-null and corresponds to a valid OverlappedEntry.
@@ -206,9 +193,8 @@ impl IocpDriver {
             }
             Ok(idx)
         } else {
-            if res == 0 {
-                // SAFETY: GetLastError is safe to call after failure.
-                let err = unsafe { GetLastError() };
+            if !success {
+                let err = error_code.unwrap_or(0);
                 if err == WAIT_TIMEOUT {
                     return Ok(WAKEUP_USER_DATA);
                 }
@@ -216,8 +202,8 @@ impl IocpDriver {
                     return Err(io_msg(
                         IocpErrorContext::CompletionWait,
                         format!(
-                            "GetQueuedCompletionStatus failed: err={}, wait_ms={}, key={}, overlapped=null",
-                            err, wait_ms, completion_key
+                            "GetQueuedCompletionStatus failed: err={}, key={}, overlapped=null",
+                            err, completion_key
                         ),
                     ));
                 }
@@ -254,7 +240,7 @@ impl IocpDriver {
         }
 
         for completion in pending_events {
-            push_completion_event_shared(
+            push_completion_shared(
                 &self.completion_events,
                 &self.completion_table,
                 completion_record(completion),
@@ -295,7 +281,8 @@ impl IocpDriver {
     pub(crate) fn process_completion(
         &mut self,
         user_data: usize,
-        res: i32,
+        success: bool,
+        error_code: Option<u32>,
         bytes_transferred: u32,
     ) {
         if !self.ops.contains(user_data) {
@@ -316,7 +303,7 @@ impl IocpDriver {
 
         let io_result = {
             let slot = &self.ops.shared.slots[user_data];
-            self.calculate_io_result(slot, res, bytes_transferred)
+            self.calculate_io_result(slot, success, error_code, bytes_transferred)
         };
 
         let op = &mut self.ops.local[user_data];
@@ -332,14 +319,12 @@ impl IocpDriver {
     fn calculate_io_result(
         &self,
         slot: &SlotTableEntry<IocpOp, OverlappedEntry>,
-        res: i32,
+        success: bool,
+        error_code: Option<u32>,
         bytes_transferred: u32,
     ) -> io::Result<usize> {
-        let mut io_result = if res == 0 {
-            // SAFETY: Calling GetLastError to get the reason for failure.
-            Err(io::Error::from_raw_os_error(
-                unsafe { GetLastError() } as i32
-            ))
+        let mut io_result = if !success {
+            Err(io::Error::from_raw_os_error(error_code.unwrap_or(0) as i32))
         } else {
             Ok(bytes_transferred as usize)
         };
@@ -397,7 +382,7 @@ impl IocpDriver {
                         // SAFETY: Taking payload and result for event emission.
                         let (payload, detail) =
                             unsafe { ((*slot.payload.get()).take(), (*slot.result.get()).take()) };
-                        push_completion_event_shared(
+                        push_completion_shared(
                             ctx.completion_events,
                             ctx.completion_table,
                             completion_record(CompletionSidecar {
@@ -503,10 +488,10 @@ impl IocpDriver {
     ) {
         op.platform_data.lifecycle = OpLifecycle::Completed;
         let generation = slot.generation.load(Ordering::Acquire);
-        // SAFETY: slot.payload.get() and slot.result.get() are valid pointers.
         let (payload, detail) =
+            // SAFETY: slot.payload.get() and slot.result.get() are valid pointers.
             unsafe { ((*slot.payload.get()).take(), (*slot.result.get()).take()) };
-        push_completion_event_shared(
+        push_completion_shared(
             ctx.completion_events,
             ctx.completion_table,
             completion_record(CompletionSidecar {
@@ -525,17 +510,8 @@ impl IocpDriver {
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
-        // SAFETY: `self.port.handle` is valid and used to post a wakeup status.
-        let res = unsafe {
-            PostQueuedCompletionStatus(self.port.handle, 0, WAKEUP_USER_DATA, std::ptr::null_mut())
-        };
-        if res == 0 {
-            // SAFETY: Calling GetLastError to get the reason for failure.
-            return Err(io::Error::from_raw_os_error(
-                unsafe { GetLastError() } as i32
-            ));
-        }
-        Ok(())
+        // SAFETY: we are posting a null overlapped pointer for wakeup.
+        unsafe { self.port.post(0, WAKEUP_USER_DATA, std::ptr::null_mut()) }
     }
 
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker> {
@@ -546,7 +522,7 @@ impl IocpDriver {
     }
 }
 
-type SlotTableEntry<Op, Sidecar> = veloq_driver_core::slot::SlotEntry<Op, Sidecar>;
+type SlotTableEntry<Op, Sidecar> = SlotEntry<Op, Sidecar>;
 
 struct CancelContext<'a> {
     registered_files: &'a [Option<HANDLE>],

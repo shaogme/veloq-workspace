@@ -15,10 +15,10 @@ use std::io;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
-use crate::net::addr::SockAddrStorage;
-use crate::ext::Extensions;
-use crate::rio::RioState;
 use crate::config::{IoFd, RawHandle};
+use crate::ext::Extensions;
+use crate::net::addr::SockAddrStorage;
+use crate::rio::RioState;
 
 use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{
@@ -60,7 +60,7 @@ type Wakeup = WakeupBase<RawHandle>;
 
 /// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
-    pub(crate) port: HANDLE,
+    pub(crate) port: &'a crate::win32::IoCompletionPort,
     pub(crate) overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_files: &'a [Option<HANDLE>],

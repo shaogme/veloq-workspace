@@ -5,9 +5,12 @@ pub mod ext;
 pub mod net;
 pub mod ops;
 pub mod rio;
+pub mod win32;
 
 #[cfg(test)]
 pub mod tests;
+
+use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
 
 // Re-exports for convenience and backward compatibility where appropriate
 pub use config::{BufferRegistrationMode, IoFd, IocpConfig, RawHandle};
@@ -15,9 +18,8 @@ pub use driver::{CloseMode, IocpDriver, IocpOpState, OpLifecycle};
 pub use net::addr::{SockAddrStorage, socket_addr_to_storage, to_socket_addr};
 pub use net::socket::Socket;
 
-use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
-
 #[used]
+/// SAFETY: link_section .CRT$XCU is used for global initialization on Windows.
 #[unsafe(link_section = ".CRT$XCU")]
 static INIT_WINSOCK: unsafe extern "C" fn() = {
     unsafe extern "C" fn init() {

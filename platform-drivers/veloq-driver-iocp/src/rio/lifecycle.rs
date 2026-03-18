@@ -62,11 +62,11 @@ fn reaper_sender() -> &'static std::sync::mpsc::Sender<DeferredRioCleanup> {
 impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) {
         if let Some((actor_id, completion_generation)) =
-            Self::decode_pool_context(res.RequestContext as u64)
+            Self::decode_pool_context(res.RequestContext)
         {
             let _ = self.try_mark_pool_completion(actor_id, completion_generation);
         } else {
-            Self::free_op_request_context(res.RequestContext as u64);
+            Self::free_op_request_context(res.RequestContext);
         }
         if self.outstanding_count > 0 {
             self.outstanding_count -= 1;
@@ -99,8 +99,7 @@ impl RioState {
                 .dequeue(results.as_mut_ptr(), MAX_RESULTS as u32);
 
             if count == RIO_CORRUPT_CQ {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "RIO completion queue is corrupt (RIO_CORRUPT_CQ)",
                 ));
             }

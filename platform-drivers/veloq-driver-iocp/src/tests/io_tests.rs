@@ -1,10 +1,10 @@
+use crate::config::IocpConfig;
+use crate::driver::IocpDriver;
+use crate::ops::IocpOp;
+use crate::tests::wait_completion;
 use veloq_driver_core::driver::Driver;
 use veloq_driver_core::op::IntoPlatformOp;
 use veloq_driver_core::op::Timeout;
-use crate::driver::IocpDriver;
-use crate::config::IocpConfig;
-use crate::ops::IocpOp;
-use crate::tests::wait_completion;
 
 #[test]
 fn test_iocp_timeout() {
@@ -19,7 +19,11 @@ fn test_iocp_timeout() {
     let mut iocp_op = Some(iocp_kernel);
     let (user_data, generation) = driver.reserve_op().unwrap();
     let _ = driver
-        .submit(user_data, &mut iocp_op, veloq_driver_core::driver::SubmitBinder::new())
+        .submit(
+            user_data,
+            &mut iocp_op,
+            veloq_driver_core::driver::SubmitBinder::new(),
+        )
         .into_inner()
         .expect("submit timeout failed");
 

@@ -7,10 +7,10 @@ use windows_sys::Win32::Networking::WinSock::{
     getsockname, setsockopt,
 };
 
-use crate::ops::{IocpOp, SubmitContext};
-use crate::ops::submit::common::{SubmissionResult, ensure_iocp_association, resolve_fd};
 use crate::common::{IocpErrorContext, io_error};
 use crate::ext::Extensions;
+use crate::ops::submit::common::{SubmissionResult, ensure_iocp_association, resolve_fd};
+use crate::ops::{IocpOp, SubmitContext};
 
 // ============================================================================
 // Network Operations
@@ -87,14 +87,17 @@ pub(crate) unsafe fn submit_connect(
     let kernel = unsafe { &mut *op.payload.connect };
     let connect_op = unsafe { kernel.user.as_mut() };
     let handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
-    ensure_iocp_association(
-        handle,
-        ctx.port,
-        format!(
-            "submit_connect: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-            connect_op.fd, handle, op.header.user_data, op.header.generation
-        ),
-    )?;
+    // SAFETY: the handle is checked for validity by resolve_fd.
+    unsafe {
+        ensure_iocp_association(
+            handle,
+            ctx.port,
+            format!(
+                "submit_connect: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                connect_op.fd, handle, op.header.user_data, op.header.generation
+            ),
+        )
+    }?;
 
     let mut need_bind = true;
     let mut name: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
@@ -207,24 +210,30 @@ pub(crate) unsafe fn submit_accept(
     let accept_socket = payload.accept_socket;
     let accept_socket_raw = accept_socket.handle as SOCKET;
 
-    ensure_iocp_association(
-        handle,
-        ctx.port,
-        format!(
-            "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
-            handle as usize, op.header.user_data, op.header.generation
-        ),
-    )?;
+    // SAFETY: the handle is checked for validity by resolve_fd.
+    unsafe {
+        ensure_iocp_association(
+            handle,
+            ctx.port,
+            format!(
+                "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
+                handle as usize, op.header.user_data, op.header.generation
+            ),
+        )
+    }?;
 
     // Ensure the pre-allocated accept socket is also associated with the same IOCP.
-    ensure_iocp_association(
-        accept_socket_raw as HANDLE,
-        ctx.port,
-        format!(
-            "submit_accept: associate accept socket failed: accept=0x{:x}, listen=0x{:x}, user_data={}, generation={}",
-            accept_socket_raw, handle as usize, op.header.user_data, op.header.generation
-        ),
-    )?;
+    // SAFETY: the accept socket handle is managed by the driver.
+    unsafe {
+        ensure_iocp_association(
+            accept_socket_raw as HANDLE,
+            ctx.port,
+            format!(
+                "submit_accept: associate accept socket failed: accept=0x{:x}, listen=0x{:x}, user_data={}, generation={}",
+                accept_socket_raw, handle as usize, op.header.user_data, op.header.generation
+            ),
+        )
+    }?;
 
     const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
     let split = MIN_ADDR_LEN;

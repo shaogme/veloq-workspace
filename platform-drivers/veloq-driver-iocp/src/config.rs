@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
-use windows_sys::Win32::Foundation::HANDLE;
 use veloq_driver_core::IoFd as CoreIoFd;
+use windows_sys::Win32::Foundation::HANDLE;
 
 /// Specifies how buffers are registered and validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -38,7 +38,9 @@ impl AsRef<IocpConfig> for IocpConfig {
 impl Default for IocpConfig {
     fn default() -> Self {
         Self {
-            entries: NonZeroU32::new(1024).unwrap_or(unsafe { NonZeroU32::new_unchecked(1024) }),
+            entries:
+                // SAFETY: 1024 is non-zero.
+                unsafe { NonZeroU32::new_unchecked(1024) },
             registration_mode: BufferRegistrationMode::Strict,
         }
     }

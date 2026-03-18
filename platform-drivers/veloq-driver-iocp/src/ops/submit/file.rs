@@ -1,12 +1,12 @@
 use std::io;
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use veloq_blocking::BlockingTask;
 use veloq_blocking::blocking_ops::windows::{BlockingOps, CompletionInfo};
 use veloq_buf::FixedBuf;
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 
-use crate::ops::{IocpOp, SubmitContext};
-use crate::ops::submit::common::{SubmissionResult, ensure_iocp_association, resolve_fd};
 use crate::common::IocpErrorContext;
+use crate::ops::submit::common::{SubmissionResult, ensure_iocp_association, resolve_fd};
+use crate::ops::{IocpOp, SubmitContext};
 
 // ============================================================================
 // Macros
@@ -27,20 +27,23 @@ macro_rules! submit_io_op {
             overlapped.Anonymous.Anonymous.OffsetHigh = (val.offset >> 32) as u32;
 
             let handle = resolve_fd(val.fd, ctx.registered_files)?;
-            ensure_iocp_association(
-                handle,
-                ctx.port,
-                format!(
-                    "{}: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
-                    stringify!($fn_name),
-                    val.fd,
+            // SAFETY: the handle is checked for validity by resolve_fd.
+            unsafe {
+                ensure_iocp_association(
                     handle,
-                    op.header.user_data,
-                    op.header.generation,
-                    val.offset,
-                    val.buf.len()
-                ),
-            )?;
+                    ctx.port,
+                    format!(
+                        "{}: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
+                        stringify!($fn_name),
+                        val.fd,
+                        handle,
+                        op.header.user_data,
+                        op.header.generation,
+                        val.offset,
+                        val.buf.len()
+                    ),
+                )
+            }?;
 
             let mut bytes = 0;
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
@@ -118,7 +121,7 @@ pub(crate) unsafe fn submit_open(
     let user_data = entry.user_data;
 
     let completion = CompletionInfo {
-        port: ctx.port as usize,
+        port: ctx.port.as_raw() as usize,
         user_data,
         overlapped: ctx.overlapped as usize,
     };
@@ -144,7 +147,7 @@ pub(crate) unsafe fn submit_close(
     let user_data = entry.user_data;
 
     let completion = CompletionInfo {
-        port: ctx.port as usize,
+        port: ctx.port.as_raw() as usize,
         user_data,
         overlapped: ctx.overlapped as usize,
     };
@@ -168,7 +171,7 @@ pub(crate) unsafe fn submit_fsync(
     let user_data = entry.user_data;
 
     let completion = CompletionInfo {
-        port: ctx.port as usize,
+        port: ctx.port.as_raw() as usize,
         user_data,
         overlapped: ctx.overlapped as usize,
     };
@@ -192,7 +195,7 @@ pub(crate) unsafe fn submit_sync_range(
     let user_data = entry.user_data;
 
     let completion = CompletionInfo {
-        port: ctx.port as usize,
+        port: ctx.port.as_raw() as usize,
         user_data,
         overlapped: ctx.overlapped as usize,
     };
@@ -216,7 +219,7 @@ pub(crate) unsafe fn submit_fallocate(
     let user_data = entry.user_data;
 
     let completion = CompletionInfo {
-        port: ctx.port as usize,
+        port: ctx.port.as_raw() as usize,
         user_data,
         overlapped: ctx.overlapped as usize,
     };

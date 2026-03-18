@@ -1,9 +1,8 @@
 use std::io;
-use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError, HANDLE};
-use windows_sys::Win32::System::IO::CreateIoCompletionPort;
+use windows_sys::Win32::Foundation::HANDLE;
 
-use crate::config::IoFd;
 use crate::common::{IocpErrorContext, io_error, io_msg};
+use crate::config::IoFd;
 
 // ============================================================================
 // Submission Result
@@ -36,26 +35,17 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
     }
 }
 
-pub(crate) fn ensure_iocp_association(
+/// Associates a handle with an IOCP.
+///
+/// # Safety
+///
+/// The caller must ensure that `handle` is a valid file/socket handle.
+pub(crate) unsafe fn ensure_iocp_association(
     handle: HANDLE,
-    port: HANDLE,
+    port: &crate::win32::IoCompletionPort,
     detail: impl Into<String>,
 ) -> io::Result<()> {
-    // SAFETY: CreateIoCompletionPort is a safe Win32 API to associate a handle with an IOCP.
-    let assoc = unsafe { CreateIoCompletionPort(handle, port, 0, 0) };
-    if assoc.is_null() {
-        // SAFETY: Calling GetLastError to get the reason for failure.
-        let err = unsafe { GetLastError() } as i32;
-        // Windows returns ERROR_INVALID_PARAMETER when trying to re-associate
-        // a handle that is already bound to an IOCP.
-        if err == ERROR_INVALID_PARAMETER as i32 {
-            return Ok(());
-        }
-        return Err(io_error(
-            IocpErrorContext::Submission,
-            io::Error::from_raw_os_error(err),
-            detail,
-        ));
-    }
-    Ok(())
+    // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
+    unsafe { port.associate(handle, 0) }
+        .map_err(|e| io_error(IocpErrorContext::Submission, e, detail))
 }

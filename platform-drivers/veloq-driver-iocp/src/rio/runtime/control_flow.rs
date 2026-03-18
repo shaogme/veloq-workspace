@@ -353,8 +353,7 @@ impl RioState {
                 .dequeue(results.as_mut_ptr(), MAX_RIO_RESULTS as u32);
 
             if count == RIO_CORRUPT_CQ {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "RIO completion queue is corrupt (RIO_CORRUPT_CQ)",
                 ));
             }

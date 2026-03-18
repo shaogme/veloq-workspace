@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use error_stack::Report;
 use tracing::error;
-use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
+// PostQueuedCompletionStatus removed
 
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionRecord, CompletionSidecar, RemoteWaker, SharedCompletionQueue,
@@ -158,7 +157,7 @@ pub(crate) fn completion_record(sidecar: CompletionSidecar) -> CompletionRecord 
 }
 
 #[inline]
-pub(crate) fn push_completion_event_shared(
+pub(crate) fn push_completion_shared(
     queue: &SharedCompletionQueue,
     table: &SharedCompletionTable,
     record: CompletionRecord,
@@ -175,7 +174,7 @@ pub(crate) const WAKEUP_USER_DATA: usize = usize::MAX;
 
 /// A waker that posts a completion status to the port to wake up the event loop.
 pub(crate) struct IocpWaker {
-    pub(crate) port: Arc<CompletionPort>,
+    pub(crate) port: Arc<crate::win32::IoCompletionPort>,
     pub(crate) is_notified: Arc<AtomicBool>,
 }
 
@@ -185,42 +184,13 @@ impl RemoteWaker for IocpWaker {
             return Ok(());
         }
         if !self.is_notified.swap(true, Ordering::AcqRel) {
-            // SAFETY: `self.port.handle` is guaranteed to be a valid, open I/O completion port handle throughout the lifetime of the `IocpWaker`.
-            let res = unsafe {
-                PostQueuedCompletionStatus(
-                    self.port.handle,
-                    0,
-                    WAKEUP_USER_DATA,
-                    std::ptr::null_mut(),
-                )
-            };
-            if res == 0 {
-                return Err(io::Error::last_os_error());
+            // SAFETY: a null overlapped pointer is used for wakeup.
+            unsafe {
+                self.port.post(0, WAKEUP_USER_DATA, std::ptr::null_mut())?;
             }
         }
         Ok(())
     }
 }
 
-// ============================================================================
-// Port
-// ============================================================================
-
-/// A wrapper around a Windows I/O Completion Port handle.
-pub struct CompletionPort {
-    pub(crate) handle: HANDLE,
-}
-
-impl Drop for CompletionPort {
-    fn drop(&mut self) {
-        // SAFETY: The handle is owned by this `CompletionPort` and is guaranteed to be open and valid at this point of drop.
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.handle);
-        }
-    }
-}
-
-// SAFETY: The `CompletionPort` wraps a raw `HANDLE`, which is a thread-safe handle for completion port operations and can be safely sent between threads.
-unsafe impl Send for CompletionPort {}
-// SAFETY: The `CompletionPort` wraps a raw `HANDLE`, which is thread-safe to access concurrently for completion port operations.
-unsafe impl Sync for CompletionPort {}
+// IoCompletionPort moved to win32.rs

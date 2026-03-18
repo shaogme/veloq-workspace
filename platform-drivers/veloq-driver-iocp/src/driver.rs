@@ -7,21 +7,21 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
-use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, GetLastError, HANDLE, WAIT_TIMEOUT};
-use windows_sys::Win32::System::IO::{
-    GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
-};
+use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
+use windows_sys::Win32::System::IO::{OVERLAPPED, PostQueuedCompletionStatus};
 
 use veloq_blocking::{BlockingTask, get_blocking_pool};
+#[cfg(feature = "test-hooks")]
+pub use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar as CoreCompletionSidecar, Driver, Outcome, RemoteWaker,
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
-use veloq_driver_core::slot::SlotTable;
+use veloq_driver_core::slot::{SlotEntry, SlotTable};
 use veloq_wheel::TaskId;
 
-use crate::common::{completion_record, push_completion_event_shared};
+use crate::common::{completion_record, push_completion_shared};
 use crate::config::{IoFd, RawHandle};
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 pub use inner::IocpDriver;
@@ -74,11 +74,7 @@ impl Default for IocpOpState {
     }
 }
 
-impl IocpOpState {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-}
+impl IocpOpState {}
 
 /// Closing mode for the driver or operations.
 #[derive(Clone, Copy, Debug)]
@@ -96,15 +92,13 @@ pub(crate) type CompletionSidecar = CoreCompletionSidecar;
 // ============================================================================
 
 #[inline]
-fn slot_overlapped_ptr(
-    slot: &veloq_driver_core::slot::SlotEntry<IocpOp, OverlappedEntry>,
-) -> *mut OVERLAPPED {
+fn slot_overlapped_ptr(slot: &SlotEntry<IocpOp, OverlappedEntry>) -> *mut OVERLAPPED {
     // SAFETY: slot is guaranteed to be valid during the operation.
     unsafe { &mut (*slot.sidecar.get()).inner as *mut _ }
 }
 
 struct SubmitContextInternal<'a> {
-    port_handle: HANDLE,
+    port: &'a crate::win32::IoCompletionPort,
     wheel: &'a mut veloq_wheel::Wheel<usize>,
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable,
@@ -167,7 +161,9 @@ impl IocpDriver {
                 let generation = slot.generation.load(Ordering::Acquire);
                 // SAFETY: slot.op.get(), slot.payload.get(), slot.result.get() are valid pointers.
                 let _ = unsafe { (*slot.op.get()).take() };
+                // SAFETY: slot.payload.get() is a valid pointer.
                 let payload = unsafe { (*slot.payload.get()).take() };
+                // SAFETY: slot.result.get() is a valid pointer.
                 let detail = unsafe { (*slot.result.get()).take() };
                 let sidecar = CompletionSidecar {
                     user_data,
@@ -177,7 +173,7 @@ impl IocpDriver {
                     payload,
                     detail,
                 };
-                push_completion_event_shared(
+                push_completion_shared(
                     ctx.completion_events,
                     ctx.completion_table,
                     completion_record(sidecar),
@@ -209,7 +205,12 @@ impl IocpDriver {
             Ok(submit::SubmissionResult::PostToQueue) => {
                 // SAFETY: port_handle is a valid IOCP handle.
                 let posted = unsafe {
-                    PostQueuedCompletionStatus(ctx.port_handle, 0, user_data, std::ptr::null_mut())
+                    PostQueuedCompletionStatus(
+                        ctx.port.as_raw(),
+                        0,
+                        user_data,
+                        std::ptr::null_mut(),
+                    )
                 };
                 if posted == 0 {
                     let err = io::Error::last_os_error();
@@ -273,12 +274,12 @@ impl IocpDriver {
         let is_rio_pool_waiting = unsafe {
             std::ptr::eq(
                 op_ref.vtable.as_ref().submit as *const (),
-                crate::ops::submit::submit_udp_recv_stream as *const (),
+                submit::submit_udp_recv_stream as *const (),
             )
         };
 
         let mut ctx = SubmitContext {
-            port: self.port.handle,
+            port: self.port.as_ref(),
             overlapped: overlapped_ptr,
             ext: &self.extensions,
             registered_files: &self.registered_files,
@@ -382,37 +383,32 @@ impl IocpDriver {
     }
 
     pub(crate) fn poll_completion(&mut self) -> io::Result<usize> {
-        let mut bytes = 0;
-        let mut key = 0;
-        let mut overlapped = std::ptr::null_mut();
+        let status = self.port.get_status(10)?;
 
-        // SAFETY: Waiting for a single completion during shutdown.
-        let res = unsafe {
-            GetQueuedCompletionStatus(self.port.handle, &mut bytes, &mut key, &mut overlapped, 10)
-        };
+        match status {
+            crate::win32::CompletionStatus::Completed {
+                bytes,
+                key,
+                overlapped,
+                success,
+                error_code,
+            } => {
+                if key == RIO_EVENT_KEY {
+                    return self.rio_state.process_completions(
+                        &mut self.ops,
+                        &*self.registrar,
+                        &self.completion_events,
+                        &self.completion_table,
+                    );
+                }
 
-        if key == RIO_EVENT_KEY {
-            return self.rio_state.process_completions(
-                &mut self.ops,
-                &*self.registrar,
-                &self.completion_events,
-                &self.completion_table,
-            );
-        }
-
-        if !overlapped.is_null() {
-            // SAFETY: Accessing `user_data` from overlapped entry.
-            let user_data = unsafe { (*(overlapped as *const OverlappedEntry)).user_data };
-            self.process_completion(user_data, res, bytes);
-            return Ok(1);
-        }
-
-        if res == 0 {
-            // SAFETY: Checking for error if no completion received.
-            let err = unsafe { GetLastError() };
-            if err != WAIT_TIMEOUT {
-                return Err(io::Error::from_raw_os_error(err as i32));
+                if !overlapped.is_null() {
+                    let user_data = unsafe { (*(overlapped as *const OverlappedEntry)).user_data };
+                    self.process_completion(user_data, success, error_code, bytes);
+                    return Ok(1);
+                }
             }
+            crate::win32::CompletionStatus::Timeout => {}
         }
         Ok(0)
     }
@@ -437,7 +433,7 @@ impl Driver for IocpDriver {
     type Sidecar = OverlappedEntry;
 
     fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
-        let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::new())) {
+        let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::default())) {
             Ok(handle) => (handle.index, handle.generation),
             Err(_) => {
                 return Err(io::Error::new(
@@ -474,7 +470,7 @@ impl Driver for IocpDriver {
         };
 
         let ctx = SubmitContextInternal {
-            port_handle: self.port.handle,
+            port: self.port.as_ref(),
             wheel: &mut self.wheel,
             completion_events: &self.completion_events,
             completion_table: &self.completion_table,
@@ -579,7 +575,7 @@ impl Driver for IocpDriver {
 
     fn inner_handle(&self) -> RawHandle {
         RawHandle {
-            handle: self.port.handle as _,
+            handle: self.port.as_raw() as _,
         }
     }
 
@@ -588,7 +584,7 @@ impl Driver for IocpDriver {
     }
 
     fn driver_id(&self) -> usize {
-        self.port.handle as usize
+        self.port.as_raw() as usize
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
@@ -604,7 +600,7 @@ impl Drop for IocpDriver {
 }
 
 #[cfg(feature = "test-hooks")]
-impl veloq_driver_core::driver::test_hooks::DriverTestHooks for IocpDriver {
+impl DriverTestHooks for IocpDriver {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.rio_state
             .registry
