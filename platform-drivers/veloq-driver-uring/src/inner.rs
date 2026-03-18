@@ -217,69 +217,73 @@ impl UringDriver {
             // SAFETY: Slot table is valid for the lifetime of the driver.
             unsafe {
                 let slot = &*slot_ptr;
-                if let Some(res) = slot.op_mut().as_mut() {
-                    let vtable = res.vtable.as_ref();
-                    let strategy = vtable.strategy;
+                let maybe_out = slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                    slot_op.as_mut().map(|res| {
+                        let vtable = res.vtable.as_ref();
+                        let strategy = vtable.strategy;
 
-                    match strategy {
-                        SubmissionStrategy::SubmitSqe => {
-                            // --- Lazy Registration ---
-                            let mut chunks = [0u16; 4];
-                            let count = (vtable.resolve_chunks)(res, &mut chunks);
-                            for &chunk_id in chunks.iter().take(count) {
-                                let index = chunk_id as usize;
-                                // Explicitly handle bitset error
-                                let is_registered =
-                                    self.registered_chunks.get(index).map_err(|e| {
+                        match strategy {
+                            SubmissionStrategy::SubmitSqe => {
+                                // --- Lazy Registration ---
+                                let mut chunks = [0u16; 4];
+                                let count = (vtable.resolve_chunks)(res, &mut chunks);
+                                for &chunk_id in chunks.iter().take(count) {
+                                    let index = chunk_id as usize;
+                                    // Explicitly handle bitset error
+                                    let is_registered = self.registered_chunks.get(index).map_err(|e| {
                                         io::Error::other(format!(
                                             "BitSet error getting {}: {:?}",
                                             index, e
                                         ))
                                     })?;
 
-                                if !is_registered
-                                    && let Some(info) = self.registrar.resolve_chunk_info(chunk_id)
-                                {
-                                    if let Err(e) = self.register_chunk(
-                                        info.id,
-                                        info.ptr.as_ptr(),
-                                        info.len.get(),
-                                    ) {
+                                    if !is_registered
+                                        && let Some(info) = self.registrar.resolve_chunk_info(chunk_id)
+                                    {
+                                        if let Err(e) = self.register_chunk(
+                                            info.id,
+                                            info.ptr.as_ptr(),
+                                            info.len.get(),
+                                        ) {
+                                            if self.registration_mode.is_strict() {
+                                                panic!(
+                                                    "strict registration mode: io_uring lazy register failed: chunk_id={}, user_data={}, error={}",
+                                                    chunk_id, user_data, e
+                                                );
+                                            }
+                                            return Err(e);
+                                        }
+                                    } else if !is_registered {
+                                        self.registration_stats.submission_missing_chunk_info = self
+                                            .registration_stats
+                                            .submission_missing_chunk_info
+                                            .saturating_add(1);
                                         if self.registration_mode.is_strict() {
                                             panic!(
-                                                "strict registration mode: io_uring lazy register failed: chunk_id={}, user_data={}, error={}",
-                                                chunk_id, user_data, e
+                                                "strict registration mode: io_uring missing chunk info for lazy registration: chunk_id={}, user_data={}",
+                                                chunk_id, user_data
                                             );
                                         }
-                                        return Err(e);
+                                        return Err(io::Error::other(format!(
+                                            "Missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
+                                        )));
                                     }
-                                } else if !is_registered {
-                                    self.registration_stats.submission_missing_chunk_info = self
-                                        .registration_stats
-                                        .submission_missing_chunk_info
-                                        .saturating_add(1);
-                                    if self.registration_mode.is_strict() {
-                                        panic!(
-                                            "strict registration mode: io_uring missing chunk info for lazy registration: chunk_id={}, user_data={}",
-                                            chunk_id, user_data
-                                        );
-                                    }
-                                    return Err(io::Error::other(format!(
-                                        "Missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
-                                    )));
                                 }
-                            }
-                            // -------------------------
+                                // -------------------------
 
-                            let s = (vtable.make_sqe)(res, self).user_data(user_data as u64);
-                            (Some(s), strategy, None)
+                                let s = (vtable.make_sqe)(res, self).user_data(user_data as u64);
+                                Ok((Some(s), strategy, None))
+                            }
+                            SubmissionStrategy::SoftwareTimer => {
+                                let d = (vtable.get_timeout)(res);
+                                Ok((None, strategy, d))
+                            }
+                            _ => Ok((None, strategy, None)),
                         }
-                        SubmissionStrategy::SoftwareTimer => {
-                            let d = (vtable.get_timeout)(res);
-                            (None, strategy, d)
-                        }
-                        _ => (None, strategy, None),
-                    }
+                    })
+                });
+                if let Some(out) = maybe_out {
+                    out?
                 } else {
                     return Err(io::Error::other("Op missing in slot"));
                 }
@@ -355,7 +359,9 @@ impl UringDriver {
 
             // Put op into slot
             unsafe {
-                *slot.op_mut() = Some(uring_op);
+                slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                    *slot_op = Some(uring_op);
+                });
             }
 
             // Generate SQE
@@ -365,8 +371,10 @@ impl UringDriver {
                 // SAFETY: Slot table is valid for the lifetime of the driver.
                 unsafe {
                     let slot = &*slot_ptr;
-                    let op_ref = slot.op_mut().as_mut().unwrap();
-                    (op_ref.vtable.as_ref().make_sqe)(op_ref, self).user_data(user_data as u64)
+                    slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                        let op_ref = slot_op.as_mut().unwrap();
+                        (op_ref.vtable.as_ref().make_sqe)(op_ref, self).user_data(user_data as u64)
+                    })
                 }
             };
 
@@ -439,12 +447,19 @@ impl UringDriver {
                     let generation = {
                         let slot = &self.ops.shared.slots[user_data];
                         let generation = slot.generation.load(Ordering::Acquire);
-                        let _ = unsafe { slot.op_mut().take() };
+                        unsafe {
+                            slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                                let _ = slot_op.take();
+                            });
+                        }
                         generation
                     };
                     let slot = &self.ops.shared.slots[user_data];
-                    let payload = unsafe { slot.payload_mut().take() };
-                    let detail = unsafe { slot.result_mut().take() };
+                    let (payload, detail) = unsafe {
+                        slot.with_storage_unchecked(|_op, result, payload, _sidecar| {
+                            (payload.take(), result.take())
+                        })
+                    };
                     self.push_completion_event(CompletionSidecar {
                         user_data,
                         generation,
@@ -505,8 +520,11 @@ impl UringDriver {
                     // Don't touch op if Cancelled
                     if matches!(op_state.lifecycle, OpLifecycle::Cancelled) {
                         let generation = slot.generation.load(Ordering::Acquire);
-                        let payload = unsafe { slot.payload_mut().take() };
-                        let detail = unsafe { slot.result_mut().take() };
+                        let (payload, detail) = unsafe {
+                            slot.with_storage_unchecked(|_op, result, payload, _sidecar| {
+                                (payload.take(), result.take())
+                            })
+                        };
                         pending_events.push(CompletionSidecar {
                             user_data,
                             generation,
@@ -516,7 +534,9 @@ impl UringDriver {
                             detail,
                         });
                         unsafe {
-                            *slot.op_mut() = None;
+                            slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                                *slot_op = None;
+                            });
                         }
                         self.ops.remove(user_data);
                     } else {
@@ -524,26 +544,33 @@ impl UringDriver {
                         let res_val = cqe.result();
                         // Call on_complete
                         let final_res = unsafe {
-                            if let Some(op) = slot.op_mut().as_mut() {
-                                (op.vtable.as_ref().on_complete)(op, res_val)
-                            } else {
-                                // Op missing? unexpected
-                                if res_val >= 0 {
+                            slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                                if let Some(op) = slot_op.as_mut() {
+                                    (op.vtable.as_ref().on_complete)(op, res_val)
+                                } else if res_val >= 0 {
                                     Ok(res_val as usize)
                                 } else {
                                     Err(io::Error::from_raw_os_error(-res_val))
                                 }
-                            }
+                            })
                         };
 
                         op_state.lifecycle = OpLifecycle::Completed;
                         let generation = slot.generation.load(Ordering::Acquire);
                         let res_code = io_result_to_event_res(&final_res);
-                        let mut detail = unsafe { slot.result_mut().take() };
+                        let mut detail = unsafe {
+                            slot.with_storage_unchecked(|_op, result, _payload, _sidecar| {
+                                result.take()
+                            })
+                        };
                         if detail.is_none() {
                             detail = clone_result_if_non_os_error(&final_res);
                         }
-                        let payload = unsafe { slot.payload_mut().take() };
+                        let payload = unsafe {
+                            slot.with_storage_unchecked(|_op, _result, payload, _sidecar| {
+                                payload.take()
+                            })
+                        };
                         pending_events.push(CompletionSidecar {
                             user_data,
                             generation,
@@ -552,7 +579,11 @@ impl UringDriver {
                             payload,
                             detail,
                         });
-                        let _ = unsafe { slot.op_mut().take() };
+                        unsafe {
+                            slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                                let _ = slot_op.take();
+                            });
+                        }
                         self.ops.remove(user_data);
                     }
                 }
@@ -641,7 +672,11 @@ impl UringDriver {
                         // Check if op exists in slot
                         let slot = &self.ops.shared.slots[user_data];
                         // SAFETY: Pending state implies Driver owns Op
-                        if unsafe { slot.op_mut().is_some() } {
+                        if unsafe {
+                            slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                                slot_op.is_some()
+                            })
+                        } {
                             BacklogAction::Submit
                         } else {
                             BacklogAction::Drop
@@ -793,12 +828,19 @@ impl UringDriver {
                     let generation = {
                         let slot = &self.ops.shared.slots[user_data];
                         let generation = slot.generation.load(Ordering::Acquire);
-                        let _ = unsafe { slot.op_mut().take() };
+                        unsafe {
+                            slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                                let _ = slot_op.take();
+                            });
+                        }
                         generation
                     };
                     let slot = &self.ops.shared.slots[user_data];
-                    let payload = unsafe { slot.payload_mut().take() };
-                    let detail = unsafe { slot.result_mut().take() };
+                    let (payload, detail) = unsafe {
+                        slot.with_storage_unchecked(|_op, result, payload, _sidecar| {
+                            (payload.take(), result.take())
+                        })
+                    };
                     self.push_completion_event(CompletionSidecar {
                         user_data,
                         generation,
@@ -821,12 +863,21 @@ impl UringDriver {
                         let generation = {
                             let slot = &self.ops.shared.slots[user_data];
                             let generation = slot.generation.load(Ordering::Acquire);
-                            let _ = unsafe { slot.op_mut().take() };
+                            unsafe {
+                                slot.with_storage_unchecked(
+                                    |slot_op, _result, _payload, _sidecar| {
+                                        let _ = slot_op.take();
+                                    },
+                                );
+                            }
                             generation
                         };
                         let slot = &self.ops.shared.slots[user_data];
-                        let payload = unsafe { slot.payload_mut().take() };
-                        let detail = unsafe { slot.result_mut().take() };
+                        let (payload, detail) = unsafe {
+                            slot.with_storage_unchecked(|_op, result, payload, _sidecar| {
+                                (payload.take(), result.take())
+                            })
+                        };
                         self.push_completion_event(CompletionSidecar {
                             user_data,
                             generation,

@@ -484,7 +484,8 @@ impl Driver for IocpDriver {
                 if let Some((slot_entry, _)) = self.ops.get_slot_and_entry_mut(user_data) {
                     // SAFETY: Slot is verified to be owned by this driver during recovery.
                     unsafe {
-                        let _ = slot_entry.op_mut().take();
+                        let _ = slot_entry
+                            .with_storage_unchecked(|op, _result, _payload, _sidecar| op.take());
                     }
                 }
                 self.ops.remove(user_data);

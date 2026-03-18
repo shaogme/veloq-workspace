@@ -40,15 +40,31 @@ pub enum SlotState {
     Completed = 4,
 }
 
+struct SlotStorage<Op, S: SlotSidecar> {
+    op: Option<Op>,
+    result: Option<std::io::Result<usize>>,
+    payload: Option<ErasedPayload>,
+    sidecar: S,
+}
+
+impl<Op, S: SlotSidecar> SlotStorage<Op, S> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            op: None,
+            result: None,
+            payload: None,
+            sidecar: S::default(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SlotData<Op, S: SlotSidecar> {
     pub generation: AtomicU32,
     pub next_free: AtomicUsize,
     pub state: AtomicU8,
-    op: UnsafeCell<Option<Op>>,
-    result: UnsafeCell<Option<std::io::Result<usize>>>,
-    payload: UnsafeCell<Option<ErasedPayload>>,
-    sidecar: UnsafeCell<S>,
+    storage: UnsafeCell<SlotStorage<Op, S>>,
 }
 
 unsafe impl<Op: Send, S: SlotSidecar> Sync for SlotData<Op, S> {}
@@ -61,19 +77,13 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
             generation: AtomicU32::new(0),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             state: AtomicU8::new(SlotState::Free as u8),
-            op: UnsafeCell::new(None),
-            result: UnsafeCell::new(None),
-            payload: UnsafeCell::new(None),
-            sidecar: UnsafeCell::new(S::default()),
+            storage: UnsafeCell::new(SlotStorage::new()),
         }
     }
 
     pub fn reset(&self, generation: u32) {
         unsafe {
-            *self.op.get() = None;
-            *self.result.get() = None;
-            *self.payload.get() = None;
-            *self.sidecar.get() = S::default();
+            *self.storage.get() = SlotStorage::new();
         }
         self.state.store(SlotState::Free as u8, Ordering::Release);
         self.generation.store(generation, Ordering::Release);
@@ -81,34 +91,25 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
 
     /// # Safety
     ///
-    /// Caller must ensure exclusive access based on state.
+    /// Caller must ensure state-based exclusive access to all mutable slot fields.
     #[inline]
-    pub unsafe fn op_mut(&self) -> &mut Option<Op> {
-        unsafe { &mut *self.op.get() }
-    }
-
-    /// # Safety
-    ///
-    /// Caller must ensure exclusive access based on state.
-    #[inline]
-    pub unsafe fn result_mut(&self) -> &mut Option<std::io::Result<usize>> {
-        unsafe { &mut *self.result.get() }
-    }
-
-    /// # Safety
-    ///
-    /// Caller must ensure exclusive access based on state.
-    #[inline]
-    pub unsafe fn payload_mut(&self) -> &mut Option<ErasedPayload> {
-        unsafe { &mut *self.payload.get() }
-    }
-
-    /// # Safety
-    ///
-    /// Caller must ensure exclusive access based on state.
-    #[inline]
-    pub unsafe fn sidecar_mut(&self) -> &mut S {
-        unsafe { &mut *self.sidecar.get() }
+    pub unsafe fn with_storage_unchecked<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(
+            &mut Option<Op>,
+            &mut Option<std::io::Result<usize>>,
+            &mut Option<ErasedPayload>,
+            &mut S,
+        ) -> R,
+    {
+        // SAFETY: Caller guarantees exclusive access to the mutable slot storage.
+        let storage = unsafe { &mut *self.storage.get() };
+        f(
+            &mut storage.op,
+            &mut storage.result,
+            &mut storage.payload,
+            &mut storage.sidecar,
+        )
     }
 
     /// # Safety
@@ -116,7 +117,8 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     /// Caller must ensure state-based safety for reading.
     #[inline]
     pub unsafe fn sidecar_ref(&self) -> &S {
-        unsafe { &*self.sidecar.get() }
+        // SAFETY: delegated to caller via method contract.
+        unsafe { &(*self.storage.get()).sidecar }
     }
 
     /// Forcefully clear slot contents and reset slot to Free state.
@@ -132,9 +134,12 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
         // SAFETY: Caller guarantees this reset path has exclusive ownership for
         // the current slot lifecycle transition.
         unsafe {
-            let _ = self.op_mut().take();
-            let payload = self.payload_mut().take();
-            let detail = self.result_mut().take();
+            let (_op, payload, detail) = self.with_storage_unchecked(|op, result, payload, _| {
+                let op_taken = op.take();
+                let payload_taken = payload.take();
+                let detail_taken = result.take();
+                (op_taken, payload_taken, detail_taken)
+            });
             self.reset(next_generation);
             (payload, detail)
         }

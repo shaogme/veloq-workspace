@@ -60,12 +60,14 @@ impl<'a> Slot<'a, Pending> {
     ) -> Slot<'a, Initialized> {
         // SAFETY: We have exclusive access to the slot in Pending state.
         unsafe {
-            *self.entry.op_mut() = Some(op);
-            let sidecar = self.entry.sidecar_mut();
-            sidecar.user_data = user_data;
-            sidecar.generation = generation;
-            sidecar.blocking_result = None;
-            sidecar.in_flight = false;
+            self.entry
+                .with_storage_unchecked(|slot_op, _result, _payload, sidecar| {
+                    *slot_op = Some(op);
+                    sidecar.user_data = user_data;
+                    sidecar.generation = generation;
+                    sidecar.blocking_result = None;
+                    sidecar.in_flight = false;
+                });
         }
 
         self.entry
@@ -84,7 +86,10 @@ impl<'a> Slot<'a, Initialized> {
     pub(crate) fn start_submission(self) -> SubmissionGuard<'a> {
         // SAFETY: We have exclusive access to the slot in Initialized state.
         unsafe {
-            self.entry.sidecar_mut().in_flight = true;
+            self.entry
+                .with_storage_unchecked(|_op, _result, _payload, sidecar| {
+                    sidecar.in_flight = true;
+                });
         }
         self.entry
             .state
@@ -101,12 +106,20 @@ impl<'a> Slot<'a, Initialized> {
         F: FnOnce(&mut IocpOp) -> R,
     {
         // SAFETY: Slot is in Initialized state, so op must be present and we have exclusive access.
-        unsafe { self.entry.op_mut().as_mut().map(f) }
+        unsafe {
+            self.entry
+                .with_storage_unchecked(|op, _result, _payload, _sidecar| op.as_mut().map(f))
+        }
     }
 
     pub(crate) fn overlapped_ptr(&self) -> *mut Overlapped {
         // SAFETY: Slot is in Initialized state, sidecar is valid and we have exclusive access.
-        unsafe { &mut self.entry.sidecar_mut().inner as *mut Overlapped }
+        unsafe {
+            self.entry
+                .with_storage_unchecked(|_op, _result, _payload, sidecar| {
+                    &mut sidecar.inner as *mut Overlapped
+                })
+        }
     }
 }
 
@@ -154,7 +167,10 @@ impl<'a> Slot<'a, InFlight> {
     pub(crate) fn complete(self) -> Slot<'a, Completed> {
         // SAFETY: We have exclusive access to the slot in InFlight state.
         unsafe {
-            self.entry.sidecar_mut().in_flight = false;
+            self.entry
+                .with_storage_unchecked(|_op, _result, _payload, sidecar| {
+                    sidecar.in_flight = false;
+                });
         }
         self.entry
             .state
@@ -175,7 +191,10 @@ impl<'a> Slot<'a, InFlight> {
         F: FnOnce(&mut OverlappedEntry) -> R,
     {
         // SAFETY: The caller guarantees exclusive access to the sidecar.
-        unsafe { f(self.entry.sidecar_mut()) }
+        unsafe {
+            self.entry
+                .with_storage_unchecked(|_op, _result, _payload, sidecar| f(sidecar))
+        }
     }
 
     /// # Safety
@@ -186,14 +205,22 @@ impl<'a> Slot<'a, InFlight> {
         F: FnOnce(&mut IocpOp) -> R,
     {
         // SAFETY: The caller guarantees exclusive access to the op.
-        unsafe { self.entry.op_mut().as_mut().map(f) }
+        unsafe {
+            self.entry
+                .with_storage_unchecked(|op, _result, _payload, _sidecar| op.as_mut().map(f))
+        }
     }
 
     pub(crate) fn overlapped_ptr(&self) -> *mut Overlapped {
         // SAFETY: Slot is in InFlight state, sidecar is valid.
         // While in flight, the kernel may access OVERLAPPED, but we may also need it for cancellation.
         // The caller must coordinate with the kernel.
-        unsafe { &mut self.entry.sidecar_mut().inner as *mut Overlapped }
+        unsafe {
+            self.entry
+                .with_storage_unchecked(|_op, _result, _payload, sidecar| {
+                    &mut sidecar.inner as *mut Overlapped
+                })
+        }
     }
 }
 
@@ -213,7 +240,10 @@ impl<'a> Slot<'a, Completed> {
 
     pub(crate) fn take_op(&mut self) -> Option<IocpOp> {
         // SAFETY: Slot is in Completed state, we have exclusive access to take the op.
-        unsafe { self.entry.op_mut().take() }
+        unsafe {
+            self.entry
+                .with_storage_unchecked(|op, _result, _payload, _sidecar| op.take())
+        }
     }
 
     pub(crate) fn take_completion_data(
@@ -221,9 +251,10 @@ impl<'a> Slot<'a, Completed> {
     ) -> (Option<ErasedPayload>, Option<io::Result<usize>>) {
         // SAFETY: Slot is in Completed state, we have exclusive access.
         unsafe {
-            let payload = self.entry.payload_mut().take();
-            let detail = self.entry.result_mut().take();
-            (payload, detail)
+            self.entry
+                .with_storage_unchecked(|_op, result, payload, _sidecar| {
+                    (payload.take(), result.take())
+                })
         }
     }
 }
@@ -250,7 +281,11 @@ impl<'a> Drop for SubmissionGuard<'a> {
         if !self.persisted {
             // SAFETY: We have exclusive access to the slot during drop.
             unsafe {
-                self.slot.entry.sidecar_mut().in_flight = false;
+                self.slot
+                    .entry
+                    .with_storage_unchecked(|_op, _result, _payload, sidecar| {
+                        sidecar.in_flight = false;
+                    });
             }
             self.slot
                 .entry

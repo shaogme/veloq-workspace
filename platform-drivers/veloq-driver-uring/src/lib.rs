@@ -150,7 +150,9 @@ impl UringDriver {
         {
             let slot = &self.ops.shared.slots[user_data];
             unsafe {
-                *slot.op_mut() = Some(op);
+                slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                    *slot_op = Some(op);
+                });
             }
         }
 
@@ -166,7 +168,11 @@ impl UringDriver {
             }
             Err(e) => {
                 let slot = &self.ops.shared.slots[user_data];
-                let op = unsafe { slot.op_mut().take().unwrap() };
+                let op = unsafe {
+                    slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                        slot_op.take().unwrap()
+                    })
+                };
                 *op_in = Some(op);
                 binder.err(e)
             }
@@ -183,7 +189,9 @@ impl UringDriver {
         {
             let slot = &self.ops.shared.slots[user_data];
             unsafe {
-                *slot.op_mut() = Some(op);
+                slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                    *slot_op = Some(op);
+                });
             }
         }
 
@@ -202,7 +210,11 @@ impl UringDriver {
             }
             Err(e) => {
                 let slot = &self.ops.shared.slots[user_data];
-                let op = unsafe { slot.op_mut().take().unwrap() };
+                let op = unsafe {
+                    slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                        slot_op.take().unwrap()
+                    })
+                };
                 *op_in = Some(op);
                 binder.err(e)
             }

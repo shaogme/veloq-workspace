@@ -384,7 +384,9 @@ impl IocpDriver {
         {
             // SAFETY: Slot is being processed after successful InFlight guard.
             unsafe {
-                *slot.result_mut() = Some(Err(io::Error::new(e.kind(), e.to_string())));
+                slot.with_storage_unchecked(|_op, result, _payload, _sidecar| {
+                    *result = Some(Err(io::Error::new(e.kind(), e.to_string())));
+                });
             }
         }
         io_result

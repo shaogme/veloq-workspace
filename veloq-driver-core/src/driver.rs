@@ -64,16 +64,17 @@ impl CompletionCell {
 
     /// # Safety
     ///
-    /// Caller must ensure exclusive access.
-    unsafe fn payload_mut(&self) -> &mut Option<slot::ErasedPayload> {
-        unsafe { &mut *self.payload.get() }
-    }
-
-    /// # Safety
-    ///
-    /// Caller must ensure exclusive access.
-    unsafe fn detail_mut(&self) -> &mut Option<io::Result<usize>> {
-        unsafe { &mut *self.detail.get() }
+    /// Caller must ensure exclusive access to completion payload/detail for this cell.
+    #[inline]
+    unsafe fn with_data_unchecked<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Option<slot::ErasedPayload>, &mut Option<io::Result<usize>>) -> R,
+    {
+        // SAFETY: Caller guarantees exclusive mutable access to these fields.
+        let payload = unsafe { &mut *self.payload.get() };
+        // SAFETY: Caller guarantees exclusive mutable access to these fields.
+        let detail = unsafe { &mut *self.detail.get() };
+        f(payload, detail)
     }
 }
 
@@ -112,13 +113,17 @@ impl CompletionTable {
         let cell = &self.cells[idx];
         if cell.ready.swap(false, Ordering::AcqRel) {
             unsafe {
-                let _ = cell.payload_mut().take();
-                let _ = cell.detail_mut().take();
+                cell.with_data_unchecked(|payload_cell, detail_cell| {
+                    let _ = payload_cell.take();
+                    let _ = detail_cell.take();
+                });
             }
         }
         unsafe {
-            *cell.payload_mut() = payload;
-            *cell.detail_mut() = detail;
+            cell.with_data_unchecked(|payload_cell, detail_cell| {
+                *payload_cell = payload;
+                *detail_cell = detail;
+            });
         }
         cell.res.store(event.res, Ordering::Release);
         cell.flags.store(event.flags, Ordering::Release);
@@ -154,8 +159,11 @@ impl CompletionTable {
         {
             return None;
         }
-        let payload = unsafe { cell.payload_mut().take() };
-        let detail = unsafe { cell.detail_mut().take() };
+        let (payload, detail) = unsafe {
+            cell.with_data_unchecked(|payload_cell, detail_cell| {
+                (payload_cell.take(), detail_cell.take())
+            })
+        };
         Some(CompletionRecord {
             event: CompletionEvent {
                 user_data: token,
