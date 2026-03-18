@@ -115,3 +115,29 @@ pub fn from_bytes<T: Pod>(bytes: &[u8]) -> &T {
 pub fn from_bytes_mut<T: Pod>(bytes: &mut [u8]) -> &mut T {
     try_from_bytes_mut(bytes).expect("from_bytes_mut cast failed")
 }
+
+/// Returns a zero-initialized instance of a `Zeroable` type.
+pub fn zeroed<T: Zeroable>() -> T {
+    // SAFETY: T is Zeroable, so it's safe to initialize it with zeros.
+    unsafe { std::mem::zeroed() }
+}
+
+/// Casts a reference to a `Pod` type to a reference of another `Pod` type.
+///
+/// Panics if the types have different sizes or if the alignment is incorrect.
+pub fn cast_ref<T: Pod, U: Pod>(val: &T) -> &U {
+    if size_of::<T>() != size_of::<U>() {
+        panic!("cast_ref size mismatch");
+    }
+    from_bytes(bytes_of(val))
+}
+
+/// Casts a mutable reference to a `Pod` type to a mutable reference of another `Pod` type.
+///
+/// Panics if the types have different sizes or if the alignment is incorrect.
+pub fn cast_mut<T: Pod, U: Pod>(val: &mut T) -> &mut U {
+    if size_of::<T>() != size_of::<U>() {
+        panic!("cast_mut size mismatch");
+    }
+    from_bytes_mut(bytes_of_mut(val))
+}

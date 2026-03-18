@@ -27,8 +27,7 @@ macro_rules! submit_io_op {
             // Using ctx.overlapped (Slot Overlapped)
             let overlapped = unsafe { &mut *ctx.overlapped };
 
-            overlapped.Anonymous.Anonymous.Offset = val.offset as u32;
-            overlapped.Anonymous.Anonymous.OffsetHigh = (val.offset >> 32) as u32;
+            overlapped.set_offset(val.offset);
 
             let handle = resolve_fd(val.fd, ctx.registered_files)?;
             // SAFETY: the handle is checked for validity by resolve_fd.

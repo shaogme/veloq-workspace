@@ -91,3 +91,58 @@ fn test_mut_cast() {
         assert_eq!(bytes, [0x12, 0x34, 0x56, 0x78]);
     }
 }
+
+#[test]
+fn test_zeroed() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct MyStruct {
+        a: u32,
+        b: u64,
+    }
+    unsafe impl Zeroable for MyStruct {}
+
+    let s: MyStruct = zeroed();
+    assert_eq!(s.a, 0);
+    assert_eq!(s.b, 0);
+}
+
+#[test]
+fn test_cast_ref() {
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Foo(u32);
+    unsafe impl Zeroable for Foo {}
+    unsafe impl Pod for Foo {}
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Bar(u32);
+    unsafe impl Zeroable for Bar {}
+    unsafe impl Pod for Bar {}
+
+    let foo = Foo(0x12345678);
+    let bar: &Bar = cast_ref(&foo);
+    assert_eq!(bar.0, 0x12345678);
+}
+
+#[test]
+fn test_cast_mut() {
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Foo(u32);
+    unsafe impl Zeroable for Foo {}
+    unsafe impl Pod for Foo {}
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Bar(u32);
+    unsafe impl Zeroable for Bar {}
+    unsafe impl Pod for Bar {}
+
+    let mut foo = Foo(0);
+    {
+        let bar: &mut Bar = cast_mut(&mut foo);
+        bar.0 = 0x87654321;
+    }
+    assert_eq!(foo.0, 0x87654321);
+}

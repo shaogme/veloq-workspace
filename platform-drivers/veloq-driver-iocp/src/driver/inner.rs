@@ -6,7 +6,6 @@ use std::time::Instant;
 use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
 use veloq_driver_core::driver::{
@@ -25,6 +24,7 @@ use crate::driver::{CompletionSidecar, IocpOpState, OpLifecycle};
 use crate::ops::slot::{InFlight, Slot};
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
 use crate::rio::RioState;
+use crate::win32::Overlapped;
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
@@ -181,7 +181,7 @@ impl IocpDriver {
 
     fn resolve_user_data(
         &self,
-        overlapped: *mut OVERLAPPED,
+        overlapped: *mut Overlapped,
         success: bool,
         completion_key: usize,
         error_code: Option<u32>,
@@ -540,7 +540,10 @@ impl IocpDriver {
 
     pub(crate) fn wake(&self) -> io::Result<()> {
         // SAFETY: we are posting a null overlapped pointer for wakeup.
-        unsafe { self.port.post(0, WAKEUP_USER_DATA, std::ptr::null_mut()) }
+        unsafe {
+            self.port
+                .post(0, WAKEUP_USER_DATA, std::ptr::null_mut() as *mut Overlapped)
+        }
     }
 
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker> {

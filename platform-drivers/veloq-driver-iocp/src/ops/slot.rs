@@ -1,9 +1,9 @@
 use crate::ops::{IocpOp, OverlappedEntry};
+use crate::win32::Overlapped;
 use std::io;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use veloq_driver_core::slot::{ErasedPayload, SlotEntry, SlotState as CoreState, SlotTable};
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 mod sealed {
     /// Sealed trait for SlotState
@@ -104,9 +104,9 @@ impl<'a> Slot<'a, Initialized> {
         unsafe { self.entry.op_mut().as_mut().map(f) }
     }
 
-    pub(crate) fn overlapped_ptr(&self) -> *mut OVERLAPPED {
+    pub(crate) fn overlapped_ptr(&self) -> *mut Overlapped {
         // SAFETY: Slot is in Initialized state, sidecar is valid and we have exclusive access.
-        unsafe { &mut self.entry.sidecar_mut().inner as *mut _ }
+        unsafe { &mut self.entry.sidecar_mut().inner as *mut Overlapped }
     }
 }
 
@@ -189,11 +189,11 @@ impl<'a> Slot<'a, InFlight> {
         unsafe { self.entry.op_mut().as_mut().map(f) }
     }
 
-    pub(crate) fn overlapped_ptr(&self) -> *mut OVERLAPPED {
+    pub(crate) fn overlapped_ptr(&self) -> *mut Overlapped {
         // SAFETY: Slot is in InFlight state, sidecar is valid.
         // While in flight, the kernel may access OVERLAPPED, but we may also need it for cancellation.
         // The caller must coordinate with the kernel.
-        unsafe { &mut self.entry.sidecar_mut().inner as *mut _ }
+        unsafe { &mut self.entry.sidecar_mut().inner as *mut Overlapped }
     }
 }
 

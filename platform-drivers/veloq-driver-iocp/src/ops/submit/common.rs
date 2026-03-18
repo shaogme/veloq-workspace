@@ -7,6 +7,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::config::IoFd;
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
+use crate::win32::Overlapped;
 
 // ============================================================================
 // Submission Result
@@ -32,11 +33,19 @@ pub(crate) unsafe fn iocp_submit_read(
     handle: HANDLE,
     buf: *mut u8,
     len: u32,
-    overlapped: *mut OVERLAPPED,
+    overlapped: *mut Overlapped,
 ) -> io::Result<SubmissionResult> {
     let mut bytes = 0;
     // SAFETY: ReadFile is called with valid parameters.
-    let ret = unsafe { ReadFile(handle, buf as _, len, &mut bytes, overlapped) };
+    let ret = unsafe {
+        ReadFile(
+            handle,
+            buf as _,
+            len,
+            &mut bytes,
+            overlapped as *mut OVERLAPPED,
+        )
+    };
     if ret == 0 {
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
@@ -56,11 +65,19 @@ pub(crate) unsafe fn iocp_submit_write(
     handle: HANDLE,
     buf: *const u8,
     len: u32,
-    overlapped: *mut OVERLAPPED,
+    overlapped: *mut Overlapped,
 ) -> io::Result<SubmissionResult> {
     let mut bytes = 0;
     // SAFETY: WriteFile is called with valid parameters.
-    let ret = unsafe { WriteFile(handle, buf as _, len, &mut bytes, overlapped) };
+    let ret = unsafe {
+        WriteFile(
+            handle,
+            buf as _,
+            len,
+            &mut bytes,
+            overlapped as *mut OVERLAPPED,
+        )
+    };
     if ret == 0 {
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
@@ -85,7 +102,7 @@ pub(crate) unsafe fn iocp_submit_connect_ex(
     lp_send_buffer: *const std::ffi::c_void,
     dw_send_data_length: u32,
     lp_dw_bytes_sent: *mut u32,
-    lp_overlapped: *mut OVERLAPPED,
+    lp_overlapped: *mut Overlapped,
 ) -> io::Result<SubmissionResult> {
     // SAFETY: connect_ex is called with valid parameters.
     let ret = unsafe {
@@ -96,7 +113,7 @@ pub(crate) unsafe fn iocp_submit_connect_ex(
             lp_send_buffer,
             dw_send_data_length,
             lp_dw_bytes_sent,
-            lp_overlapped,
+            lp_overlapped as *mut OVERLAPPED,
         )
     };
     if ret == 0 {
@@ -124,7 +141,7 @@ pub(crate) unsafe fn iocp_submit_accept_ex(
     dw_local_address_length: u32,
     dw_remote_address_length: u32,
     lp_dw_bytes_received: *mut u32,
-    lp_overlapped: *mut OVERLAPPED,
+    lp_overlapped: *mut Overlapped,
 ) -> io::Result<SubmissionResult> {
     // SAFETY: accept_ex is called with valid parameters.
     let ret = unsafe {
@@ -136,7 +153,7 @@ pub(crate) unsafe fn iocp_submit_accept_ex(
             dw_local_address_length,
             dw_remote_address_length,
             lp_dw_bytes_received,
-            lp_overlapped,
+            lp_overlapped as *mut OVERLAPPED,
         )
     };
     if ret == 0 {

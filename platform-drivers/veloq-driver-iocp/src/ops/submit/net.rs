@@ -37,8 +37,7 @@ pub(crate) unsafe fn submit_recv(
 
     // SAFETY: The caller guarantees that ctx.overlapped is valid.
     let overlapped = unsafe { &mut *ctx.overlapped };
-    overlapped.Anonymous.Anonymous.Offset = 0;
-    overlapped.Anonymous.Anonymous.OffsetHigh = 0;
+    overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 
@@ -97,8 +96,7 @@ pub(crate) unsafe fn submit_send(
 
     // SAFETY: The caller guarantees that ctx.overlapped is valid.
     let overlapped = unsafe { &mut *ctx.overlapped };
-    overlapped.Anonymous.Anonymous.Offset = 0;
-    overlapped.Anonymous.Anonymous.OffsetHigh = 0;
+    overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
 

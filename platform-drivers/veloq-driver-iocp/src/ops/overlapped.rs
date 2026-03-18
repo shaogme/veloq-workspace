@@ -1,11 +1,11 @@
+use crate::win32::Overlapped;
 use std::io;
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 /// A wrapper for the Windows OVERLAPPED structure with additional metadata.
 #[repr(C)]
 pub struct OverlappedEntry {
-    /// The underlying Windows OVERLAPPED structure.
-    pub(crate) inner: OVERLAPPED,
+    /// The underlying Windows Overlapped structure.
+    pub(crate) inner: Overlapped,
     /// User-defined data associated with the operation.
     pub(crate) user_data: usize,
     /// Generation count for slot validation.
@@ -20,8 +20,7 @@ impl OverlappedEntry {
     /// Creates a new `OverlappedEntry` with the given user data.
     pub(crate) fn new(user_data: usize) -> Self {
         Self {
-            // SAFETY: OVERLAPPED can be safely zero-initialized.
-            inner: unsafe { std::mem::zeroed() },
+            inner: Overlapped::zeroed(),
             user_data,
             generation: 0,
             in_flight: false,

@@ -1,5 +1,6 @@
 use std::io;
 use std::ptr;
+use veloq_pod::{Pod, Zeroable, zeroed};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
@@ -10,6 +11,56 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
     PostQueuedCompletionStatus,
 };
+
+// ============================================================================
+// Overlapped
+// ============================================================================
+
+/// A safe wrapper for the Windows OVERLAPPED structure.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Overlapped(pub OVERLAPPED);
+
+// SAFETY: OVERLAPPED is a Win32 POD struct and can be safely zero-initialized.
+unsafe impl Zeroable for Overlapped {}
+// SAFETY: Overlapped is repr(transparent) and OVERLAPPED is a POD struct.
+unsafe impl Pod for Overlapped {}
+
+impl Overlapped {
+    /// Returns a zero-initialized Overlapped structure.
+    pub fn zeroed() -> Self {
+        zeroed()
+    }
+
+    /// Returns a pointer to the underlying OVERLAPPED structure.
+    pub fn as_ptr(&self) -> *const OVERLAPPED {
+        &self.0
+    }
+
+    /// Returns a mutable pointer to the underlying OVERLAPPED structure.
+    pub fn as_mut_ptr(&mut self) -> *mut OVERLAPPED {
+        &mut self.0
+    }
+
+    /// Sets the offset of the overlapped operation.
+    pub fn set_offset(&mut self, offset: u64) {
+        self.0.Anonymous.Anonymous.Offset = offset as u32;
+        self.0.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    }
+
+    /// Returns the offset of the overlapped operation.
+    pub fn offset(&self) -> u64 {
+        let low = unsafe { self.0.Anonymous.Anonymous.Offset };
+        let high = unsafe { self.0.Anonymous.Anonymous.OffsetHigh };
+        (low as u64) | ((high as u64) << 32)
+    }
+}
+
+impl Default for Overlapped {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
 
 // ============================================================================
 // OwnedHandle
@@ -163,9 +214,11 @@ impl IoCompletionPort {
         &self,
         bytes: u32,
         key: usize,
-        overlapped: *mut OVERLAPPED,
+        overlapped: *mut Overlapped,
     ) -> io::Result<()> {
-        let res = unsafe { PostQueuedCompletionStatus(self.0.as_raw(), bytes, key, overlapped) };
+        let res = unsafe {
+            PostQueuedCompletionStatus(self.0.as_raw(), bytes, key, overlapped as *mut OVERLAPPED)
+        };
         if res == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -178,8 +231,8 @@ impl IoCompletionPort {
     }
 
     /// Cancels a pending I/O request.
-    pub unsafe fn cancel_request(handle: HANDLE, overlapped: *mut OVERLAPPED) -> io::Result<()> {
-        let res = unsafe { CancelIoEx(handle, overlapped) };
+    pub unsafe fn cancel_request(handle: HANDLE, overlapped: *mut Overlapped) -> io::Result<()> {
+        let res = unsafe { CancelIoEx(handle, overlapped as *mut OVERLAPPED) };
         if res == 0 {
             let err = unsafe { GetLastError() };
             if err == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
@@ -217,7 +270,7 @@ impl IoCompletionPort {
                 return Ok(CompletionStatus::Completed {
                     bytes,
                     key,
-                    overlapped,
+                    overlapped: overlapped as *mut Overlapped,
                     success: false,
                     error_code: Some(err),
                 });
@@ -227,7 +280,7 @@ impl IoCompletionPort {
         Ok(CompletionStatus::Completed {
             bytes,
             key,
-            overlapped,
+            overlapped: overlapped as *mut Overlapped,
             success: true,
             error_code: None,
         })
@@ -244,7 +297,7 @@ pub enum CompletionStatus {
     Completed {
         bytes: u32,
         key: usize,
-        overlapped: *mut OVERLAPPED,
+        overlapped: *mut Overlapped,
         success: bool,
         error_code: Option<u32>,
     },
@@ -260,13 +313,13 @@ pub enum CompletionStatus {
 pub struct OverlappedId(pub usize);
 
 impl OverlappedId {
-    /// Recovers the OverlappedId from a raw pointer to an OVERLAPPED structure.
+    /// Recovers the OverlappedId from a raw pointer to an Overlapped structure.
     ///
     /// # Safety
     ///
-    /// The pointer must be a valid pointer to an OVERLAPPED structure that is
+    /// The pointer must be a valid pointer to an Overlapped structure that is
     /// embedded at the start of an OverlappedEntry.
-    pub unsafe fn from_ptr(ptr: *const OVERLAPPED) -> Self {
+    pub unsafe fn from_ptr(ptr: *const Overlapped) -> Self {
         use crate::ops::OverlappedEntry;
         // SAFETY: The `inner` field is at the start of `OverlappedEntry` due to `#[repr(C)]`.
         let user_data = unsafe { (*(ptr as *const OverlappedEntry)).user_data };

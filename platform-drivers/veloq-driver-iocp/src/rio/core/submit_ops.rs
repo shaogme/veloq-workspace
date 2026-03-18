@@ -13,6 +13,7 @@ use crate::BufferRegistrationMode;
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::ext::Extensions;
 use crate::rio::{RioEnv, RioState, RioTarget};
+use crate::win32::Overlapped;
 use std::io;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -385,7 +386,7 @@ impl RioProvider for RioDispatch {
 
 pub(crate) struct RioKernel {
     pub(crate) cq: RioCq,
-    _notify_overlapped: Box<OVERLAPPED>,
+    _notify_overlapped: Box<Overlapped>,
     pub(crate) dispatch: RioDispatch,
 }
 
@@ -538,14 +539,14 @@ impl RioKernel {
 
     fn new(port: HANDLE, entries: u32, dispatch: RioDispatch) -> io::Result<Self> {
         const RIO_EVENT_KEY: usize = usize::MAX - 1;
-        let mut notify_overlapped = Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() });
+        let mut notify_overlapped = Box::new(Overlapped::zeroed());
         let notification = RIO_NOTIFICATION_COMPLETION {
             Type: RIO_IOCP_COMPLETION,
             Anonymous: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0 {
                 Iocp: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
                     IocpHandle: port,
                     CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
-                    Overlapped: (&mut *notify_overlapped as *mut OVERLAPPED).cast(),
+                    Overlapped: (notify_overlapped.as_mut_ptr() as *mut OVERLAPPED).cast(),
                 },
             },
         };
@@ -578,7 +579,7 @@ impl RioKernel {
         };
         Self {
             cq: RioCq::INVALID,
-            _notify_overlapped: Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() }),
+            _notify_overlapped: Box::new(Overlapped::zeroed()),
             dispatch,
         }
     }

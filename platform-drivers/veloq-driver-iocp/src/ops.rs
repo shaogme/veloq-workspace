@@ -61,7 +61,7 @@ pub(crate) type Wakeup = WakeupBase<RawHandle>;
 /// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
     pub(crate) port: &'a crate::win32::IoCompletionPort,
-    pub(crate) overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
+    pub(crate) overlapped: *mut crate::win32::Overlapped,
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_files: &'a [Option<HANDLE>],
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,

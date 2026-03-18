@@ -1,10 +1,61 @@
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use veloq_driver_core::net::SocketAddrCodec;
-use veloq_pod::{Pod, Zeroable, from_bytes};
+use veloq_pod::{Pod, Zeroable, bytes_of_mut, from_bytes, from_bytes_mut, zeroed};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, IN6_ADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
+    AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
 };
+
+/// Helper trait for safe access to SOCKADDR_IN union fields.
+trait SockAddrInExt {
+    fn s_addr(&self) -> u32;
+    fn set_s_addr(&mut self, addr: u32);
+}
+
+impl SockAddrInExt for SOCKADDR_IN {
+    fn s_addr(&self) -> u32 {
+        // SAFETY: sin_addr.S_un is a union, accessing S_addr is safe for AF_INET.
+        unsafe { self.sin_addr.S_un.S_addr }
+    }
+
+    fn set_s_addr(&mut self, addr: u32) {
+        // SAFETY: sin_addr.S_un is a union, setting S_addr is safe for AF_INET.
+        // In modern Rust, writing to a Copy union field is safe.
+        self.sin_addr.S_un.S_addr = addr;
+    }
+}
+
+/// Helper trait for safe access to SOCKADDR_IN6 union fields.
+trait SockAddrIn6Ext {
+    fn scope_id(&self) -> u32;
+    fn set_scope_id(&mut self, id: u32);
+    fn addr_bytes(&self) -> [u8; 16];
+    fn set_addr_bytes(&mut self, bytes: [u8; 16]);
+}
+
+impl SockAddrIn6Ext for SOCKADDR_IN6 {
+    fn scope_id(&self) -> u32 {
+        // SAFETY: sin6.Anonymous is a union, accessing sin6_scope_id is safe for AF_INET6.
+        unsafe { self.Anonymous.sin6_scope_id }
+    }
+
+    fn set_scope_id(&mut self, id: u32) {
+        // SAFETY: sin6.Anonymous is a union, setting sin6_scope_id is safe for AF_INET6.
+        // In modern Rust, writing to a Copy union field is safe.
+        self.Anonymous.sin6_scope_id = id;
+    }
+
+    fn addr_bytes(&self) -> [u8; 16] {
+        // SAFETY: sin6_addr.u is a union, accessing Byte is safe.
+        unsafe { self.sin6_addr.u.Byte }
+    }
+
+    fn set_addr_bytes(&mut self, bytes: [u8; 16]) {
+        // SAFETY: sin6_addr.u is a union, setting Byte is safe.
+        // In modern Rust, writing to a Copy union field is safe.
+        self.sin6_addr.u.Byte = bytes;
+    }
+}
 
 /// A storage wrapper for socket addresses.
 #[repr(transparent)]
@@ -18,8 +69,7 @@ unsafe impl Pod for SockAddrStorage {}
 
 impl Default for SockAddrStorage {
     fn default() -> Self {
-        // SAFETY: SOCKADDR_STORAGE is a POD struct and can be safely zeroed.
-        Self(unsafe { std::mem::zeroed() })
+        zeroed()
     }
 }
 
@@ -42,18 +92,17 @@ unsafe impl Pod for SockAddrIn {}
 impl SockAddrIn {
     /// Creates a new SockAddrIn from a SocketAddrV4.
     pub fn new(addr: &SocketAddrV4) -> Self {
-        let mut sin: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        let mut sin_wrapped: SockAddrIn = zeroed();
+        let sin = &mut sin_wrapped.0;
         sin.sin_family = AF_INET;
         sin.sin_port = addr.port().to_be();
-        // SAFETY: sin.sin_addr.S_un is a union, accessing S_addr is safe for AF_INET.
-        sin.sin_addr.S_un.S_addr = u32::from_ne_bytes(addr.ip().octets());
-        Self(sin)
+        sin.set_s_addr(u32::from_ne_bytes(addr.ip().octets()));
+        sin_wrapped
     }
 
     /// Converts to a standard library SocketAddrV4.
     pub fn to_std(&self) -> SocketAddrV4 {
-        // SAFETY: sin_addr.S_un is a union, accessing S_addr is safe for AF_INET.
-        let s_addr = unsafe { self.0.sin_addr.S_un.S_addr };
+        let s_addr = self.0.s_addr();
         let ip = Ipv4Addr::from(u32::from_be(s_addr));
         let port = u16::from_be(self.0.sin_port);
         SocketAddrV4::new(ip, port)
@@ -72,26 +121,23 @@ unsafe impl Pod for SockAddrIn6 {}
 impl SockAddrIn6 {
     /// Creates a new SockAddrIn6 from a SocketAddrV6.
     pub fn new(addr: &SocketAddrV6) -> Self {
-        let mut sin6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
+        let mut sin6_wrapped: SockAddrIn6 = zeroed();
+        let sin6 = &mut sin6_wrapped.0;
         sin6.sin6_family = AF_INET6;
         sin6.sin6_port = addr.port().to_be();
-        // SAFETY: IN6_ADDR has the same layout as [u8; 16].
-        sin6.sin6_addr = unsafe { std::mem::transmute::<[u8; 16], IN6_ADDR>(addr.ip().octets()) };
+        sin6.set_addr_bytes(addr.ip().octets());
         sin6.sin6_flowinfo = addr.flowinfo();
-        // SAFETY: sin6.Anonymous is a union, accessing sin6_scope_id is safe for AF_INET6.
-        sin6.Anonymous.sin6_scope_id = addr.scope_id();
-        Self(sin6)
+        sin6.set_scope_id(addr.scope_id());
+        sin6_wrapped
     }
 
     /// Converts to a standard library SocketAddrV6.
     pub fn to_std(&self) -> SocketAddrV6 {
-        // SAFETY: sin6_addr.u is a union, accessing Byte is safe for AF_INET6.
-        let addr_bytes = unsafe { self.0.sin6_addr.u.Byte };
+        let addr_bytes = self.0.addr_bytes();
         let ip = Ipv6Addr::from(addr_bytes);
         let port = u16::from_be(self.0.sin6_port);
         let flowinfo = self.0.sin6_flowinfo;
-        // SAFETY: sin6.Anonymous is a union, accessing sin6_scope_id is safe for AF_INET6.
-        let scope_id = unsafe { self.0.Anonymous.sin6_scope_id };
+        let scope_id = self.0.scope_id();
         SocketAddrV6::new(ip, port, flowinfo, scope_id)
     }
 }
@@ -143,21 +189,19 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, i32) {
     let len = match addr {
         SocketAddr::V4(a) => {
             let sin = SockAddrIn::new(&a);
-            let sin_ptr = &mut storage.0 as *mut _ as *mut SockAddrIn;
-            // SAFETY: sin_ptr points to valid storage and is cast to the correct type.
-            unsafe {
-                *sin_ptr = sin;
-                std::mem::size_of::<SOCKADDR_IN>() as i32
-            }
+            let sin_ref = from_bytes_mut::<SockAddrIn>(
+                &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN>()],
+            );
+            *sin_ref = sin;
+            std::mem::size_of::<SOCKADDR_IN>() as i32
         }
         SocketAddr::V6(a) => {
             let sin6 = SockAddrIn6::new(&a);
-            let sin6_ptr = &mut storage.0 as *mut _ as *mut SockAddrIn6;
-            // SAFETY: sin6_ptr points to valid storage and is cast to the correct type.
-            unsafe {
-                *sin6_ptr = sin6;
-                std::mem::size_of::<SOCKADDR_IN6>() as i32
-            }
+            let sin6_ref = from_bytes_mut::<SockAddrIn6>(
+                &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN6>()],
+            );
+            *sin6_ref = sin6;
+            std::mem::size_of::<SOCKADDR_IN6>() as i32
         }
     };
     (storage, len)
