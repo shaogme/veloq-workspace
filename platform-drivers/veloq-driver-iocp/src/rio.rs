@@ -19,10 +19,9 @@ use rustc_hash::FxHashMap;
 use veloq_driver_core::driver::{SharedCompletionQueue, SharedCompletionTable};
 use veloq_driver_core::op_registry::OpRegistry;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::{RIO_CQ, RIO_RQ};
 
 use self::core::registry::RioRegistry;
-use self::core::submit_ops::{RioDispatch, RioKernel};
+use self::core::submit_ops::{RioCq, RioDispatch, RioKernel, RioRq};
 use self::runtime::control_flow::RioSocketActor;
 
 pub(crate) use self::runtime::RioSendToArgs;
@@ -33,7 +32,7 @@ pub(crate) use self::runtime::RioUdpStreamArgs;
 pub(crate) struct RioEnv<'a> {
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
     pub(crate) dispatch: &'a RioDispatch,
-    pub(crate) cq: RIO_CQ,
+    pub(crate) cq: RioCq,
     pub(crate) registration_mode: BufferRegistrationMode,
 }
 
@@ -41,7 +40,7 @@ pub(crate) struct RioContext<'a> {
     pub(crate) registry: &'a mut RioRegistry,
     pub(crate) env: RioEnv<'a>,
     pub(crate) actor_id: u32,
-    pub(crate) rq: RIO_RQ,
+    pub(crate) rq: RioRq,
 }
 
 pub(crate) struct RioCompletionContext<'a> {

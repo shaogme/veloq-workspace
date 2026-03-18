@@ -1,127 +1,528 @@
-﻿use std::env;
-use std::ffi::OsString;
+﻿use clap::{Parser, ValueEnum};
 use std::io;
-use std::process::{Command, ExitCode};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Output};
 
-#[derive(Clone, Copy)]
+const WINDOWS_TARGET: &str = "x86_64-pc-windows-gnu";
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum Target {
     Linux,
     Windows,
 }
 
 impl Target {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "linux" => Some(Self::Linux),
-            "windows" => Some(Self::Windows),
-            _ => None,
-        }
-    }
-
     fn name(self) -> &'static str {
         match self {
             Self::Linux => "linux",
             Self::Windows => "windows",
         }
     }
+}
 
-    fn cargo_args(self) -> &'static [&'static str] {
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum Task {
+    Test,
+    Clippy,
+    Check,
+}
+
+impl Task {
+    fn name(self) -> &'static str {
         match self {
-            Self::Linux => &[
-                "nextest",
-                "run",
-                "--workspace",
-                "--exclude",
-                "veloq-driver-iocp",
-                "--test-threads",
-                "1",
-                "--run-ignored",
-                "all",
-            ],
-            Self::Windows => &[
-                "nextest",
-                "run",
-                "--workspace",
-                "--exclude",
-                "veloq-driver-uring",
-                "--test-threads",
-                "1",
-                "--run-ignored",
-                "all",
-            ],
+            Self::Test => "xtest",
+            Self::Clippy => "xclippy",
+            Self::Check => "xcheck",
+        }
+    }
+
+    fn default_count(self) -> usize {
+        match self {
+            Self::Test => 20,
+            Self::Clippy | Self::Check => 1,
         }
     }
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "xtest-runner",
+    about = "统一执行跨平台 test/clippy/check 命令",
+    version,
+    disable_help_subcommand = true
+)]
+struct Cli {
+    #[arg(long, value_enum, help = "目标平台")]
+    target: Option<Target>,
+
+    #[arg(value_enum, hide = true)]
+    target_positional: Option<Target>,
+
+    #[arg(long, value_enum, default_value_t = Task::Test, help = "执行任务类型")]
+    task: Task,
+
+    #[arg(long, short = 'n', value_parser = parse_count, help = "执行次数（默认: test=20, clippy/check=1）")]
+    count: Option<usize>,
+
+    #[arg(long, help = "静默模式，仅在失败时输出日志")]
+    quiet: bool,
+}
+
+#[derive(Debug)]
 struct Config {
     target: Target,
+    task: Task,
     count: usize,
     quiet: bool,
 }
 
-impl Config {
-    fn parse() -> Result<Self, String> {
-        let mut args = env::args_os().skip(1);
-        let mut target = None;
-        let mut count = 20usize;
-        let mut quiet = false;
+impl TryFrom<Cli> for Config {
+    type Error = String;
 
-        while let Some(arg) = args.next() {
-            let arg_str = arg
-                .to_str()
-                .ok_or_else(|| "参数中包含无效 UTF-8 字符".to_string())?;
-
-            match arg_str {
-                "--target" => {
-                    let value = next_arg(&mut args, "--target")?;
-                    target = Some(Target::parse(&value).ok_or_else(|| {
-                        format!("不支持的 --target 值: {value}（仅支持 linux/windows）")
-                    })?);
-                }
-                "--count" | "-n" => {
-                    let value = next_arg(&mut args, arg_str)?;
-                    count = value
-                        .parse::<usize>()
-                        .map_err(|_| format!("无效的次数: {value}"))?;
-                    if count == 0 {
-                        return Err("--count 必须大于 0".to_string());
-                    }
-                }
-                "--quiet" => quiet = true,
-                "linux" | "windows" if target.is_none() => {
-                    target = Target::parse(arg_str);
-                }
-                "--help" | "-h" => return Err(help_message()),
-                _ => return Err(format!("未知参数: {arg_str}\n{}", help_message())),
+    fn try_from(cli: Cli) -> Result<Self, Self::Error> {
+        let target = match (cli.target, cli.target_positional) {
+            (Some(target), None) | (None, Some(target)) => target,
+            (Some(flag), Some(positional)) if flag == positional => flag,
+            (Some(_), Some(_)) => {
+                return Err("--target 与位置参数冲突，请仅保留一种写法".to_string());
             }
-        }
+            (None, None) => return Err("缺少目标平台，请使用 --target <linux|windows>".to_string()),
+        };
 
-        let target = target.ok_or_else(help_message)?;
+        let count = cli.count.unwrap_or_else(|| cli.task.default_count());
 
         Ok(Self {
             target,
+            task: cli.task,
             count,
-            quiet,
+            quiet: cli.quiet,
         })
     }
 }
 
-fn next_arg(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<String, String> {
-    let value = args
-        .next()
-        .ok_or_else(|| format!("{flag} 缺少参数值"))?
-        .into_string()
-        .map_err(|_| format!("{flag} 参数值包含无效 UTF-8 字符"))?;
-
-    Ok(value)
+#[derive(Clone, Debug)]
+struct CommandSpec {
+    program: String,
+    args: Vec<String>,
+    envs: Vec<(String, String)>,
 }
 
-fn help_message() -> String {
-    "用法: xtest-runner --target <linux|windows> [--count <次数>] [--quiet]\n示例: xtest-runner --target linux --count 20 --quiet".to_string()
+impl CommandSpec {
+    fn new(program: impl Into<String>, args: impl Into<Vec<String>>) -> Self {
+        Self {
+            program: program.into(),
+            args: args.into(),
+            envs: Vec::new(),
+        }
+    }
+
+    fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.envs.push((key.into(), value.into()));
+        self
+    }
+
+    fn display(&self) -> String {
+        let env_part = self
+            .envs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let command_part = if self.args.is_empty() {
+            self.program.clone()
+        } else {
+            format!("{} {}", self.program, self.args.join(" "))
+        };
+
+        if env_part.is_empty() {
+            command_part
+        } else {
+            format!("{env_part} {command_part}")
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DockerComposeVariant {
+    Standalone,
+    Plugin,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RunMode {
+    Native,
+    WindowsOnLinux,
+    LinuxOnWindows(DockerComposeVariant),
+}
+
+#[derive(Debug)]
+struct Runner {
+    config: Config,
+    workspace_root: PathBuf,
+    mode: RunMode,
+}
+
+impl Runner {
+    fn new(config: Config) -> io::Result<Self> {
+        let workspace_root = workspace_root()?;
+        let mode = determine_mode(config.target, &workspace_root)?;
+
+        let runner = Self {
+            config,
+            workspace_root,
+            mode,
+        };
+        runner.prepare_environment()?;
+        Ok(runner)
+    }
+
+    fn run(&self) -> io::Result<()> {
+        let command = self.round_command();
+
+        for round in 1..=self.config.count {
+            self.run_round(&command, round)?;
+        }
+
+        println!(
+            "{}-{} 连续执行 {} 次全部成功",
+            self.config.task.name(),
+            self.config.target.name(),
+            self.config.count
+        );
+
+        Ok(())
+    }
+
+    fn run_round(&self, command: &CommandSpec, round: usize) -> io::Result<()> {
+        if !self.config.quiet {
+            let status = command_status(command, &self.workspace_root)?;
+            if status.success() {
+                return Ok(());
+            }
+
+            return Err(io::Error::other(format!(
+                "{}-{} 第 {round}/{} 次执行失败（退出码: {:?}）",
+                self.config.task.name(),
+                self.config.target.name(),
+                self.config.count,
+                status.code()
+            )));
+        }
+
+        let output = command_output(command, &self.workspace_root)?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "{}-{} 第 {round}/{} 次执行失败（退出码: {:?}）",
+            self.config.task.name(),
+            self.config.target.name(),
+            self.config.count,
+            output.status.code()
+        );
+        print_output(&output);
+        Err(io::Error::other("命令执行失败"))
+    }
+
+    fn prepare_environment(&self) -> io::Result<()> {
+        if matches!(self.mode, RunMode::WindowsOnLinux) {
+            if !command_works("cross", &["--version"], &self.workspace_root) {
+                self.run_setup(
+                    "安装 cross",
+                    CommandSpec::new("cargo", vec!["install".into(), "cross".into()]),
+                )?;
+            }
+
+            if !has_rust_target(WINDOWS_TARGET, &self.workspace_root)? {
+                self.run_setup(
+                    "安装 x86_64-pc-windows-gnu 工具链",
+                    CommandSpec::new(
+                        "rustup",
+                        vec!["target".into(), "add".into(), WINDOWS_TARGET.into()],
+                    ),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn run_setup(&self, step: &str, command: CommandSpec) -> io::Result<()> {
+        if !self.config.quiet {
+            eprintln!("[xtest-runner] {step}: {}", command.display());
+            let status = command_status(&command, &self.workspace_root)?;
+            if status.success() {
+                return Ok(());
+            }
+
+            return Err(io::Error::other(format!(
+                "{step} 失败（退出码: {:?}）",
+                status.code()
+            )));
+        }
+
+        let output = command_output(&command, &self.workspace_root)?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        eprintln!("{step} 失败（退出码: {:?}）", output.status.code());
+        print_output(&output);
+        Err(io::Error::other(format!("{step} 失败")))
+    }
+
+    fn round_command(&self) -> CommandSpec {
+        match (self.mode, self.config.target) {
+            (RunMode::LinuxOnWindows(DockerComposeVariant::Standalone), Target::Linux) => {
+                CommandSpec::new(
+                    "docker-compose",
+                    vec![
+                        "run".into(),
+                        "--rm".into(),
+                        "dev".into(),
+                        "sh".into(),
+                        "-c".into(),
+                        linux_command_line(self.config.task),
+                    ],
+                )
+            }
+            (RunMode::LinuxOnWindows(DockerComposeVariant::Plugin), Target::Linux) => {
+                CommandSpec::new(
+                    "docker",
+                    vec![
+                        "compose".into(),
+                        "run".into(),
+                        "--rm".into(),
+                        "dev".into(),
+                        "sh".into(),
+                        "-c".into(),
+                        linux_command_line(self.config.task),
+                    ],
+                )
+            }
+            (RunMode::WindowsOnLinux, Target::Windows) => {
+                windows_cross_command(self.config.task).with_env("CROSS_SKIP_AUTO_UPDATE", "1")
+            }
+            (_, Target::Linux) => linux_native_command(self.config.task),
+            (_, Target::Windows) => windows_native_command(self.config.task),
+        }
+    }
+}
+
+fn linux_command_line(task: Task) -> String {
+    linux_native_command(task).display()
+}
+
+fn linux_native_command(task: Task) -> CommandSpec {
+    match task {
+        Task::Test => CommandSpec::new(
+            "cargo",
+            vec![
+                "nextest".into(),
+                "run".into(),
+                "--workspace".into(),
+                "--exclude".into(),
+                "veloq-driver-iocp".into(),
+                "--test-threads".into(),
+                "1".into(),
+                "--run-ignored".into(),
+                "all".into(),
+            ],
+        ),
+        Task::Clippy => CommandSpec::new(
+            "cargo",
+            vec![
+                "clippy".into(),
+                "--all-targets".into(),
+                "--".into(),
+                "-D".into(),
+                "warnings".into(),
+            ],
+        ),
+        Task::Check => CommandSpec::new("cargo", vec!["check".into()]),
+    }
+}
+
+fn windows_native_command(task: Task) -> CommandSpec {
+    match task {
+        Task::Test => CommandSpec::new(
+            "cargo",
+            vec![
+                "nextest".into(),
+                "run".into(),
+                "--workspace".into(),
+                "--exclude".into(),
+                "veloq-driver-uring".into(),
+                "--test-threads".into(),
+                "1".into(),
+                "--run-ignored".into(),
+                "all".into(),
+            ],
+        ),
+        Task::Clippy => CommandSpec::new(
+            "cargo",
+            vec![
+                "clippy".into(),
+                "--all-targets".into(),
+                "--target".into(),
+                WINDOWS_TARGET.into(),
+                "--".into(),
+                "-D".into(),
+                "warnings".into(),
+            ],
+        ),
+        Task::Check => CommandSpec::new(
+            "cargo",
+            vec!["check".into(), "--target".into(), WINDOWS_TARGET.into()],
+        ),
+    }
+}
+
+fn windows_cross_command(task: Task) -> CommandSpec {
+    match task {
+        Task::Test => CommandSpec::new(
+            "cross",
+            vec!["test".into(), "--target".into(), WINDOWS_TARGET.into()],
+        ),
+        Task::Clippy => CommandSpec::new(
+            "cross",
+            vec![
+                "clippy".into(),
+                "--all-targets".into(),
+                "--target".into(),
+                WINDOWS_TARGET.into(),
+                "--".into(),
+                "-D".into(),
+                "warnings".into(),
+            ],
+        ),
+        Task::Check => CommandSpec::new(
+            "cross",
+            vec!["check".into(), "--target".into(), WINDOWS_TARGET.into()],
+        ),
+    }
+}
+
+fn parse_count(input: &str) -> Result<usize, String> {
+    let count = input
+        .parse::<usize>()
+        .map_err(|_| format!("无效的次数: {input}"))?;
+
+    if count == 0 {
+        return Err("--count 必须大于 0".to_string());
+    }
+
+    Ok(count)
+}
+
+fn determine_mode(target: Target, workspace_root: &Path) -> io::Result<RunMode> {
+    if cfg!(target_os = "windows") && target == Target::Linux {
+        let compose_variant = docker_compose_variant(workspace_root).ok_or_else(|| {
+            io::Error::other(
+                "未检测到 docker-compose（或 docker compose），无法在 Windows 上执行 Linux 相关命令",
+            )
+        })?;
+
+        return Ok(RunMode::LinuxOnWindows(compose_variant));
+    }
+
+    if cfg!(target_os = "linux") && target == Target::Windows {
+        return Ok(RunMode::WindowsOnLinux);
+    }
+
+    Ok(RunMode::Native)
+}
+
+fn has_rust_target(target: &str, workspace_root: &Path) -> io::Result<bool> {
+    let output = command_output(
+        &CommandSpec::new(
+            "rustup",
+            vec!["target".into(), "list".into(), "--installed".into()],
+        ),
+        workspace_root,
+    )?;
+
+    if !output.status.success() {
+        eprintln!(
+            "检查 rustup target 失败（退出码: {:?}）",
+            output.status.code()
+        );
+        print_output(&output);
+        return Err(io::Error::other("无法读取已安装 target 列表"));
+    }
+
+    let installed = String::from_utf8_lossy(&output.stdout);
+    Ok(installed.lines().any(|line| line.trim() == target))
+}
+
+fn command_works(program: &str, args: &[&str], workspace_root: &Path) -> bool {
+    Command::new(program)
+        .args(args)
+        .current_dir(workspace_root)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn docker_compose_variant(workspace_root: &Path) -> Option<DockerComposeVariant> {
+    if command_works("docker-compose", &["version"], workspace_root) {
+        return Some(DockerComposeVariant::Standalone);
+    }
+
+    if command_works("docker", &["compose", "version"], workspace_root) {
+        return Some(DockerComposeVariant::Plugin);
+    }
+
+    None
+}
+
+fn print_output(output: &Output) {
+    if !output.stdout.is_empty() {
+        eprintln!("----- stdout -----");
+        eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    if !output.stderr.is_empty() {
+        eprintln!("----- stderr -----");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+fn workspace_root() -> io::Result<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| io::Error::other("无法解析 workspace 根目录"))
+}
+
+fn command_status(
+    command: &CommandSpec,
+    workspace_root: &Path,
+) -> io::Result<std::process::ExitStatus> {
+    let mut process = Command::new(&command.program);
+    process
+        .args(&command.args)
+        .envs(command.envs.iter().map(|(k, v)| (k, v)))
+        .current_dir(workspace_root);
+    process.status()
+}
+
+fn command_output(command: &CommandSpec, workspace_root: &Path) -> io::Result<Output> {
+    let mut process = Command::new(&command.program);
+    process
+        .args(&command.args)
+        .envs(command.envs.iter().map(|(k, v)| (k, v)))
+        .current_dir(workspace_root);
+    process.output()
 }
 
 fn main() -> ExitCode {
-    let config = match Config::parse() {
+    let cli = Cli::parse();
+    let config = match Config::try_from(cli) {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
@@ -129,63 +530,11 @@ fn main() -> ExitCode {
         }
     };
 
-    match run_loop(config) {
+    match Runner::new(config).and_then(|runner| runner.run()) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) if error.kind() == io::ErrorKind::Other => ExitCode::FAILURE,
         Err(error) => {
-            eprintln!("执行器异常: {error}");
+            eprintln!("{error}");
             ExitCode::FAILURE
         }
     }
-}
-
-fn run_loop(config: Config) -> io::Result<()> {
-    let args = config.target.cargo_args();
-
-    for round in 1..=config.count {
-        if !config.quiet {
-            let status = Command::new("cargo").args(args).status()?;
-            if !status.success() {
-                eprintln!(
-                    "xtest-{} 第 {round}/{} 次执行失败（退出码: {:?}）",
-                    config.target.name(),
-                    config.count,
-                    status.code()
-                );
-                return Err(io::Error::other("测试命令失败"));
-            }
-            continue;
-        }
-
-        let output = Command::new("cargo").args(args).output()?;
-
-        if !output.status.success() {
-            eprintln!(
-                "xtest-{} 第 {round}/{} 次执行失败（退出码: {:?}）",
-                config.target.name(),
-                config.count,
-                output.status.code()
-            );
-
-            if !output.stdout.is_empty() {
-                eprintln!("----- stdout -----");
-                eprintln!("{}", String::from_utf8_lossy(&output.stdout));
-            }
-
-            if !output.stderr.is_empty() {
-                eprintln!("----- stderr -----");
-                eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-            }
-
-            return Err(io::Error::other("测试命令失败"));
-        }
-    }
-
-    println!(
-        "xtest-{} 连续执行 {} 次全部成功",
-        config.target.name(),
-        config.count
-    );
-
-    Ok(())
 }

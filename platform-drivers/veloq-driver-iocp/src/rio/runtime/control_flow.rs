@@ -8,6 +8,7 @@ use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpCtxGuard;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
+use crate::rio::core::submit_ops::RioRq;
 use crate::rio::runtime::pool::UdpPoolManager;
 use crate::rio::{RioCompletionContext, RioContext, RioEnv, RioState};
 use rustc_hash::FxHashMap;
@@ -17,16 +18,16 @@ use veloq_driver_core::driver::{
 };
 use veloq_driver_core::op_registry::OpRegistry;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIO_RQ, RIORESULT};
+use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 pub(crate) struct RioSocketActor {
     pub(crate) actor_id: u32,
-    pub(crate) rq: RIO_RQ,
+    pub(crate) rq: RioRq,
     pub(crate) pool_manager: UdpPoolManager,
 }
 
 impl RioSocketActor {
-    pub(crate) fn new(actor_id: u32, rq: RIO_RQ) -> Self {
+    pub(crate) fn new(actor_id: u32, rq: RioRq) -> Self {
         Self {
             actor_id,
             rq,
@@ -176,7 +177,7 @@ impl RioState {
     pub(crate) fn build_ctx<'a>(
         registry: &'a mut RioRegistry,
         env: RioEnv<'a>,
-        actor: (u32, RIO_RQ),
+        actor: (u32, RioRq),
     ) -> RioContext<'a> {
         let (actor_id, rq) = actor;
         RioContext {
@@ -353,11 +354,8 @@ impl RioState {
             },
             (&mut self.registry, env),
         );
-
         loop {
-            let count = self
-                .kernel
-                .dequeue(results.as_mut_ptr(), MAX_RIO_RESULTS as u32);
+            let count = self.kernel.dequeue(&mut results);
 
             if count == RIO_CORRUPT_CQ {
                 return Err(io::Error::other(
@@ -378,6 +376,11 @@ impl RioState {
         }
 
         self.kernel.rearm_notify()?;
+
+        if *router.outstanding_count == 0 {
+            router.registry.flush_pending_deregistrations(router.env);
+        }
+
         Ok(router.completed_count)
     }
 }

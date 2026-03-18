@@ -13,8 +13,7 @@ use crate::net::addr::SockAddrStorage;
 use crate::ops::IocpOpPayload;
 use crate::ops::slot::{InFlight, Slot};
 use crate::ops::submit::SubmissionResult;
-use crate::rio::core::registry::RIO_INVALID_BUFFERID;
-use crate::rio::core::submit_ops::RioDispatch;
+use crate::rio::core::submit_ops::{RioBufferId, RioDispatch, RioProvider};
 use crate::rio::{RioCompletionContext, RioContext};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
@@ -23,7 +22,7 @@ use veloq_buf::FixedBuf;
 use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
-use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIO_BUFFERID, RIORESULT, WSAGetLastError};
+use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIORESULT, WSAGetLastError};
 
 const UDP_RECV_POOL_MIN_CREDITS: usize = 2;
 const UDP_RECV_POOL_INITIAL_CREDITS: usize = 4;
@@ -41,7 +40,7 @@ pub(crate) struct UdpRecvDatagram {
 pub(crate) struct UdpRecvPoolSlot {
     pub(crate) buf: FixedBuf,
     pub(crate) addr: Box<SockAddrStorage>,
-    pub(crate) addr_buf_id: RIO_BUFFERID,
+    pub(crate) addr_buf_id: RioBufferId,
     pub(crate) in_flight: bool,
     pub(crate) stop_requested: bool,
 }
@@ -141,19 +140,18 @@ impl UdpPoolManager {
     ) -> io::Result<UdpRecvPoolSlot> {
         let mut addr = Box::new(SockAddrStorage::default());
 
-        let addr_buf_id = unsafe {
-            (dispatch.register_buffer)(
+        let addr_buf_id = dispatch
+            .register_buffer(
                 (&mut *addr as *mut SockAddrStorage).cast::<u8>(),
                 std::mem::size_of::<SockAddrStorage>() as u32,
             )
-        };
-        if addr_buf_id == RIO_INVALID_BUFFERID {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                "RIORegisterBuffer failed for UDP recv pool addr buffer",
-            ));
-        }
+            .map_err(|e| {
+                io_error(
+                    IocpErrorContext::Rio,
+                    Self::last_wsa_error(),
+                    format!("RIORegisterBuffer failed for UDP recv pool addr buffer: {e}"),
+                )
+            })?;
 
         Ok(UdpRecvPoolSlot {
             buf,
@@ -181,8 +179,8 @@ impl UdpPoolManager {
     }
 
     fn deregister_udp_pool_slot(&self, slot: UdpRecvPoolSlot, dispatch: &RioDispatch) {
-        if slot.addr_buf_id != RIO_INVALID_BUFFERID {
-            unsafe { (dispatch.deregister_buffer)(slot.addr_buf_id) };
+        if !slot.addr_buf_id.is_invalid() {
+            dispatch.deregister_buffer(slot.addr_buf_id);
         }
     }
 
@@ -217,32 +215,28 @@ impl UdpPoolManager {
         slot.stop_requested = false;
 
         let data_buf = RIO_BUF {
-            BufferId: data_buf_id,
+            BufferId: data_buf_id.0,
             Offset: offset,
             Length: slot.buf.capacity() as u32,
         };
         let addr_buf = RIO_BUF {
-            BufferId: slot.addr_buf_id,
+            BufferId: slot.addr_buf_id.0,
             Offset: 0,
             Length: std::mem::size_of::<SockAddrStorage>() as u32,
         };
-        let recv_ex_fn = ctx.env.dispatch.receive_ex;
         let req_ctx = Self::encode_pool_context(actor_id, completion_token);
 
-        let ret = unsafe {
-            recv_ex_fn(
-                rq,
-                &data_buf,
-                1,
-                std::ptr::null(),
-                &addr_buf,
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                req_ctx,
-            )
-        };
-        if ret == 0 {
+        if let Err(e) = ctx.env.dispatch.receive_ex(
+            rq,
+            &data_buf,
+            1,
+            std::ptr::null(),
+            &addr_buf,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            req_ctx,
+        ) {
             self.udp_ctx_map.remove(&completion_token);
             if let Some(pool) = self.pool.as_mut()
                 && let Some(slot) = pool.slots.get_mut(slot_idx)
@@ -254,8 +248,8 @@ impl UdpPoolManager {
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
                 format!(
-                    "RIOReceiveEx submit failed for UDP recv pool: slot_idx={}, rq=0x{:x}",
-                    slot_idx, rq as usize
+                    "RIOReceiveEx submit failed for UDP recv pool: slot_idx={}, rq=0x{:x}, error={e}",
+                    slot_idx, rq.0 as usize
                 ),
             ));
         }
@@ -315,8 +309,8 @@ impl UdpPoolManager {
 
                     if let Some(s) = popped_slot {
                         let UdpRecvPoolSlot { buf, .. } = s;
-                        if s.addr_buf_id != RIO_INVALID_BUFFERID {
-                            unsafe { (ctx.env.dispatch.deregister_buffer)(s.addr_buf_id) };
+                        if !s.addr_buf_id.is_invalid() {
+                            ctx.env.dispatch.deregister_buffer(s.addr_buf_id);
                         }
                         if is_running && let Some(pool) = self.pool.as_mut() {
                             pool.spare_bufs.push_front(buf);

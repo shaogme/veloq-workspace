@@ -94,9 +94,7 @@ impl RioState {
 
             const MAX_RESULTS: usize = 128;
             let mut results: [RIORESULT; MAX_RESULTS] = unsafe { std::mem::zeroed() };
-            let count = self
-                .kernel
-                .dequeue(results.as_mut_ptr(), MAX_RESULTS as u32);
+            let count = self.kernel.dequeue(&mut results);
 
             if count == RIO_CORRUPT_CQ {
                 return Err(io::Error::other(
@@ -126,7 +124,7 @@ impl RioState {
     }
 
     pub(crate) fn take_deferred_cleanup(&mut self) -> Option<DeferredRioCleanup> {
-        if self.kernel.cq == 0 {
+        if self.kernel.cq.is_invalid() {
             return None;
         }
         let kernel = std::mem::replace(&mut self.kernel, RioKernel::noop());

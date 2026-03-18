@@ -21,6 +21,111 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(crate) struct RioBufferId(pub(crate) RIO_BUFFERID);
+
+impl RioBufferId {
+    pub(crate) const INVALID: Self = Self(0 as RIO_BUFFERID);
+
+    #[inline]
+    pub(crate) fn is_invalid(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(crate) struct RioCq(pub(crate) RIO_CQ);
+
+impl RioCq {
+    pub(crate) const INVALID: Self = Self(0);
+
+    #[inline]
+    pub(crate) fn is_invalid(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(crate) struct RioRq(pub(crate) RIO_RQ);
+
+impl RioRq {
+    #[allow(dead_code)]
+    pub(crate) const INVALID: Self = Self(0);
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn is_invalid(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+pub(crate) trait RioProvider: Send + Sync {
+    fn create_cq(
+        &self,
+        entries: u32,
+        notification: &RIO_NOTIFICATION_COMPLETION,
+    ) -> io::Result<RioCq>;
+    fn create_rq(
+        &self,
+        socket: usize,
+        max_outstanding_recvs: u32,
+        max_receive_data_buffers: u32,
+        max_outstanding_sends: u32,
+        max_send_data_buffers: u32,
+        recv_cq: RioCq,
+        send_cq: RioCq,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<RioRq>;
+    fn register_buffer(&self, ptr: *const u8, len: u32) -> io::Result<RioBufferId>;
+    fn deregister_buffer(&self, id: RioBufferId);
+    fn dequeue(&self, cq: RioCq, results: &mut [RIORESULT]) -> u32;
+    fn notify(&self, cq: RioCq) -> io::Result<()>;
+    fn close_cq(&self, cq: RioCq);
+    fn receive(
+        &self,
+        rq: RioRq,
+        buf: &RIO_BUF,
+        num_bufs: u32,
+        flags: u32,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<()>;
+    fn send(
+        &self,
+        rq: RioRq,
+        buf: &RIO_BUF,
+        num_bufs: u32,
+        flags: u32,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<()>;
+    fn send_ex(
+        &self,
+        rq: RioRq,
+        data_buf: &RIO_BUF,
+        data_buf_count: u32,
+        local_addr: *const RIO_BUF,
+        remote_addr: *const RIO_BUF,
+        control_buf: *const RIO_BUF,
+        flags_buf: *const RIO_BUF,
+        flags: u32,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<()>;
+    fn receive_ex(
+        &self,
+        rq: RioRq,
+        data_buf: &RIO_BUF,
+        data_buf_count: u32,
+        local_addr: *const RIO_BUF,
+        remote_addr: *const RIO_BUF,
+        control_buf: *const RIO_BUF,
+        flags_buf: *const RIO_BUF,
+        flags: u32,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<()>;
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RioDispatch {
     pub(crate) create_cq:
@@ -68,8 +173,218 @@ pub(crate) struct RioDispatch {
     ) -> i32,
 }
 
+impl RioProvider for RioDispatch {
+    #[inline]
+    fn create_cq(
+        &self,
+        entries: u32,
+        notification: &RIO_NOTIFICATION_COMPLETION,
+    ) -> io::Result<RioCq> {
+        let cq = unsafe { (self.create_cq)(entries, notification as *const _) };
+        if cq == 0 {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                RioState::last_wsa_error(),
+                "RIOCreateCompletionQueue failed",
+            ));
+        }
+        Ok(RioCq(cq))
+    }
+
+    #[inline]
+    fn create_rq(
+        &self,
+        socket: usize,
+        max_outstanding_recvs: u32,
+        max_receive_data_buffers: u32,
+        max_outstanding_sends: u32,
+        max_send_data_buffers: u32,
+        recv_cq: RioCq,
+        send_cq: RioCq,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<RioRq> {
+        let rq = unsafe {
+            (self.create_rq)(
+                socket,
+                max_outstanding_recvs,
+                max_receive_data_buffers,
+                max_outstanding_sends,
+                max_send_data_buffers,
+                recv_cq.0,
+                send_cq.0,
+                context,
+            )
+        };
+        if rq == 0 {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                RioState::last_wsa_error(),
+                "RIOCreateRequestQueue failed",
+            ));
+        }
+        Ok(RioRq(rq))
+    }
+
+    #[inline]
+    fn register_buffer(&self, ptr: *const u8, len: u32) -> io::Result<RioBufferId> {
+        let id = unsafe { (self.register_buffer)(ptr, len) };
+        if id == 0 {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                RioState::last_wsa_error(),
+                "RIORegisterBuffer failed",
+            ));
+        }
+        Ok(RioBufferId(id))
+    }
+
+    #[inline]
+    fn deregister_buffer(&self, id: RioBufferId) {
+        if !id.is_invalid() {
+            unsafe { (self.deregister_buffer)(id.0) };
+        }
+    }
+
+    #[inline]
+    fn dequeue(&self, cq: RioCq, results: &mut [RIORESULT]) -> u32 {
+        unsafe { (self.dequeue)(cq.0, results.as_mut_ptr(), results.len() as u32) }
+    }
+
+    #[inline]
+    fn notify(&self, cq: RioCq) -> io::Result<()> {
+        let ret = unsafe { (self.notify)(cq.0) };
+        if ret == SOCKET_ERROR {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                RioState::last_wsa_error(),
+                "RIONotify failed",
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn close_cq(&self, cq: RioCq) {
+        if !cq.is_invalid() {
+            unsafe { (self.close_cq)(cq.0) };
+        }
+    }
+
+    #[inline]
+    fn receive(
+        &self,
+        rq: RioRq,
+        buf: &RIO_BUF,
+        num_bufs: u32,
+        flags: u32,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<()> {
+        let ret = unsafe { (self.receive)(rq.0, buf as *const _, num_bufs, flags, context) };
+        if ret == 0 {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                RioState::last_wsa_error(),
+                "RIOReceive failed",
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn send(
+        &self,
+        rq: RioRq,
+        buf: &RIO_BUF,
+        num_bufs: u32,
+        flags: u32,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<()> {
+        let ret = unsafe { (self.send)(rq.0, buf as *const _, num_bufs, flags, context) };
+        if ret == 0 {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                RioState::last_wsa_error(),
+                "RIOSend failed",
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn send_ex(
+        &self,
+        rq: RioRq,
+        data_buf: &RIO_BUF,
+        data_buf_count: u32,
+        local_addr: *const RIO_BUF,
+        remote_addr: *const RIO_BUF,
+        control_buf: *const RIO_BUF,
+        flags_buf: *const RIO_BUF,
+        flags: u32,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<()> {
+        let ret = unsafe {
+            (self.send_ex)(
+                rq.0,
+                data_buf,
+                data_buf_count,
+                local_addr,
+                remote_addr,
+                control_buf,
+                flags_buf,
+                flags,
+                context,
+            )
+        };
+        if ret == 0 {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                RioState::last_wsa_error(),
+                "RIOSendEx failed",
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn receive_ex(
+        &self,
+        rq: RioRq,
+        data_buf: &RIO_BUF,
+        data_buf_count: u32,
+        local_addr: *const RIO_BUF,
+        remote_addr: *const RIO_BUF,
+        control_buf: *const RIO_BUF,
+        flags_buf: *const RIO_BUF,
+        flags: u32,
+        context: *const std::ffi::c_void,
+    ) -> io::Result<()> {
+        let ret = unsafe {
+            (self.receive_ex)(
+                rq.0,
+                data_buf,
+                data_buf_count,
+                local_addr,
+                remote_addr,
+                control_buf,
+                flags_buf,
+                flags,
+                context,
+            )
+        };
+        if ret == 0 {
+            return Err(io_error(
+                IocpErrorContext::Rio,
+                RioState::last_wsa_error(),
+                "RIOReceiveEx failed",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct RioKernel {
-    pub(crate) cq: RIO_CQ,
+    pub(crate) cq: RioCq,
     _notify_overlapped: Box<OVERLAPPED>,
     pub(crate) dispatch: RioDispatch,
 }
@@ -236,25 +551,9 @@ impl RioKernel {
         };
 
         let queue_size = entries.max(128);
-        let cq = unsafe { (dispatch.create_cq)(queue_size, &notification as *const _) };
-        if cq == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                format!(
-                    "RIOCreateCompletionQueue failed: entries={entries}, queue_size={queue_size}"
-                ),
-            ));
-        }
+        let cq = dispatch.create_cq(queue_size, &notification)?;
 
-        let notify_ret = unsafe { (dispatch.notify)(cq) };
-        if notify_ret == SOCKET_ERROR {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIONotify failed after CQ creation",
-            ));
-        }
+        dispatch.notify(cq)?;
 
         Ok(Self {
             cq,
@@ -278,7 +577,7 @@ impl RioKernel {
             receive_ex: noop_receive_ex,
         };
         Self {
-            cq: 0,
+            cq: RioCq::INVALID,
             _notify_overlapped: Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() }),
             dispatch,
         }
@@ -299,71 +598,61 @@ impl RioKernel {
     }
 
     #[inline]
-    pub(crate) fn dequeue(&self, results: *mut RIORESULT, len: u32) -> u32 {
-        unsafe { (self.dispatch.dequeue)(self.cq, results, len) }
+    pub(crate) fn dequeue(&self, results: &mut [RIORESULT]) -> u32 {
+        self.dispatch.dequeue(self.cq, results)
     }
 
     #[inline]
     pub(crate) fn rearm_notify(&self) -> io::Result<()> {
-        let ret = unsafe { (self.dispatch.notify)(self.cq) };
-        if ret == SOCKET_ERROR {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIONotify failed when rearming CQ",
-            ));
-        }
-        Ok(())
+        self.dispatch.notify(self.cq)
     }
 
     #[inline]
     pub(crate) fn submit_receive(
         &self,
-        rq: RIO_RQ,
+        rq: RioRq,
         buf: &RIO_BUF,
         request_context: *const std::ffi::c_void,
-    ) -> i32 {
-        unsafe { (self.dispatch.receive)(rq, buf, 1, 0, request_context) }
+    ) -> io::Result<()> {
+        self.dispatch.receive(rq, buf, 1, 0, request_context)
     }
 
     #[inline]
     pub(crate) fn submit_send(
         &self,
-        rq: RIO_RQ,
+        rq: RioRq,
         buf: &RIO_BUF,
         request_context: *const std::ffi::c_void,
-    ) -> i32 {
-        unsafe { (self.dispatch.send)(rq, buf, 1, 0, request_context) }
+    ) -> io::Result<()> {
+        self.dispatch.send(rq, buf, 1, 0, request_context)
     }
 
     #[inline]
     pub(crate) fn submit_send_ex(
         &self,
-        rq: RIO_RQ,
+        rq: RioRq,
         data_buf: &RIO_BUF,
         addr_buf: &RIO_BUF,
         request_context: *const std::ffi::c_void,
-    ) -> i32 {
-        unsafe {
-            (self.dispatch.send_ex)(
-                rq,
-                data_buf,
-                1,
-                std::ptr::null(),
-                addr_buf,
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                request_context,
-            )
-        }
+    ) -> io::Result<()> {
+        self.dispatch.send_ex(
+            rq,
+            data_buf,
+            1,
+            std::ptr::null(),
+            addr_buf,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            request_context,
+        )
     }
 
     #[inline]
     pub(crate) fn close(&mut self) {
-        if self.cq != 0 {
-            unsafe { (self.dispatch.close_cq)(self.cq) };
-            self.cq = 0;
+        if !self.cq.is_invalid() {
+            self.dispatch.close_cq(self.cq);
+            self.cq = RioCq::INVALID;
         }
     }
 }
@@ -430,13 +719,14 @@ impl RioState {
             .registry
             .prepare_submission(buf, buf.capacity() as u32, env)?;
         let request_context = Self::encode_request_context(user_data, generation);
-        let ret = self.kernel.submit_receive(rq, &rio_buf, request_context);
-        if ret == 0 {
+        if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
             Self::free_op_request_context(request_context as u64);
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
-                format!("RIOReceive submission failed: fd={fd:?}, handle={handle:?}"),
+                format!(
+                    "RIOReceive submission failed: fd={fd:?}, handle={handle:?}, original_error={e}"
+                ),
             ));
         }
         self.outstanding_count += 1;
@@ -468,13 +758,14 @@ impl RioState {
             .registry
             .prepare_submission(buf, buf.len() as u32, env)?;
         let request_context = Self::encode_request_context(user_data, generation);
-        let ret = self.kernel.submit_send(rq, &rio_buf, request_context);
-        if ret == 0 {
+        if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
             Self::free_op_request_context(request_context as u64);
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
-                format!("RIOSend submission failed: fd={fd:?}, handle={handle:?}"),
+                format!(
+                    "RIOSend submission failed: fd={fd:?}, handle={handle:?}, original_error={e}"
+                ),
             ));
         }
         self.outstanding_count += 1;

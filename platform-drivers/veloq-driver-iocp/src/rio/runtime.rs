@@ -127,24 +127,24 @@ impl RioState {
 
         let addr_offset = (addr_addr - base_addr) as u32;
         let addr_buf = RIO_BUF {
-            BufferId: addr_buf_id,
+            BufferId: addr_buf_id.0,
             Offset: addr_offset,
             Length: rio_addr_len as u32,
         };
         let request_context = Self::encode_request_context(user_data, generation);
 
-        let ret = self
+        if let Err(e) = self
             .kernel
-            .submit_send_ex(rq, &data_buf, &addr_buf, request_context);
-        if ret == 0 {
+            .submit_send_ex(rq, &data_buf, &addr_buf, request_context)
+        {
             Self::free_op_request_context(request_context as u64);
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
                 format!(
-                    "RIOSendEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={}, rq=0x{:x}, data_buf_id=0x{:x}, data_off={}, data_len={}, addr_buf_id=0x{:x}, addr_off={}, addr_len={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}",
+                    "RIOSendEx submission failed: fd={fd:?}, handle={handle:?}, page_idx={}, rq=0x{:x}, data_buf_id=0x{:x}, data_off={}, data_len={}, addr_buf_id=0x{:x}, addr_off={}, addr_len={}, addr_ptr=0x{:x}, slab_base=0x{:x}, slab_len={}, original_error={e}",
                     page_idx,
-                    rq as usize,
+                    rq.0 as usize,
                     data_buf.BufferId as usize,
                     data_buf.Offset,
                     data_buf.Length,

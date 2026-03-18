@@ -129,13 +129,13 @@ jobs:
           components: clippy
       - name: Run Clippy (Linux)
         if: runner.os == 'Linux'
-        run: cargo xclippy
+        run: cargo xclippy-linux
 
       - name: Run Clippy (Windows)
         if: runner.os == 'Windows'
         run: |
           rustup target add x86_64-pc-windows-gnu
-          cargo xclippy-win
+          cargo xclippy-windows
 
   ci-success:
     name: CI Success
