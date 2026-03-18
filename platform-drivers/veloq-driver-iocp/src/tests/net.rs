@@ -171,7 +171,10 @@ fn test_iocp_recv_with_buffer_pool() {
         .expect("register chunk failed");
 
     // Poll connect completion before issuing recv.
-    let connect_gen = driver.ops.local[connect_user_data].platform_data.generation;
+    let connect_gen = driver.ops.local[connect_user_data]
+        .entry
+        .platform_data
+        .generation;
     let connect_res = wait_completion(
         &mut driver,
         connect_user_data,

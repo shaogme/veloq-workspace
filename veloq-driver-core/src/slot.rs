@@ -1,6 +1,6 @@
 use crate::SlotSidecar;
 use crossbeam_utils::CachePadded;
-use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
@@ -40,7 +40,7 @@ pub enum SlotState {
     Completed = 4,
 }
 
-struct SlotStorage<Op, S: SlotSidecar> {
+pub struct SlotStorage<Op, S: SlotSidecar> {
     op: Option<Op>,
     result: Option<std::io::Result<usize>>,
     payload: Option<ErasedPayload>,
@@ -49,13 +49,43 @@ struct SlotStorage<Op, S: SlotSidecar> {
 
 impl<Op, S: SlotSidecar> SlotStorage<Op, S> {
     #[inline]
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             op: None,
             result: None,
             payload: None,
             sidecar: S::default(),
         }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    #[inline]
+    pub fn with_mut<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(
+            &mut Option<Op>,
+            &mut Option<std::io::Result<usize>>,
+            &mut Option<ErasedPayload>,
+            &mut S,
+        ) -> R,
+    {
+        f(
+            &mut self.op,
+            &mut self.result,
+            &mut self.payload,
+            &mut self.sidecar,
+        )
+    }
+}
+
+impl<Op, S: SlotSidecar> Default for SlotStorage<Op, S> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -64,10 +94,8 @@ pub struct SlotData<Op, S: SlotSidecar> {
     pub generation: AtomicU32,
     pub next_free: AtomicUsize,
     pub state: AtomicU8,
-    storage: UnsafeCell<SlotStorage<Op, S>>,
+    _marker: PhantomData<fn() -> (Op, S)>,
 }
-
-unsafe impl<Op: Send, S: SlotSidecar> Sync for SlotData<Op, S> {}
 
 impl<Op, S: SlotSidecar> SlotData<Op, S> {
     const NULL_INDEX: usize = usize::MAX;
@@ -77,72 +105,13 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
             generation: AtomicU32::new(0),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             state: AtomicU8::new(SlotState::Free as u8),
-            storage: UnsafeCell::new(SlotStorage::new()),
+            _marker: PhantomData,
         }
     }
 
     pub fn reset(&self, generation: u32) {
-        unsafe {
-            *self.storage.get() = SlotStorage::new();
-        }
         self.state.store(SlotState::Free as u8, Ordering::Release);
         self.generation.store(generation, Ordering::Release);
-    }
-
-    /// # Safety
-    ///
-    /// Caller must ensure state-based exclusive access to all mutable slot fields.
-    #[inline]
-    pub unsafe fn with_storage_unchecked<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(
-            &mut Option<Op>,
-            &mut Option<std::io::Result<usize>>,
-            &mut Option<ErasedPayload>,
-            &mut S,
-        ) -> R,
-    {
-        // SAFETY: Caller guarantees exclusive access to the mutable slot storage.
-        let storage = unsafe { &mut *self.storage.get() };
-        f(
-            &mut storage.op,
-            &mut storage.result,
-            &mut storage.payload,
-            &mut storage.sidecar,
-        )
-    }
-
-    /// # Safety
-    ///
-    /// Caller must ensure state-based safety for reading.
-    #[inline]
-    pub unsafe fn sidecar_ref(&self) -> &S {
-        // SAFETY: delegated to caller via method contract.
-        unsafe { &(*self.storage.get()).sidecar }
-    }
-
-    /// Forcefully clear slot contents and reset slot to Free state.
-    ///
-    /// This helper centralizes unsafe field access when caller needs to
-    /// retrieve completion data from a non-InFlight slot and immediately reset
-    /// it for reuse.
-    #[inline]
-    pub fn force_reset_to_free(
-        &self,
-        next_generation: u32,
-    ) -> (Option<ErasedPayload>, Option<std::io::Result<usize>>) {
-        // SAFETY: Caller guarantees this reset path has exclusive ownership for
-        // the current slot lifecycle transition.
-        unsafe {
-            let (_op, payload, detail) = self.with_storage_unchecked(|op, result, payload, _| {
-                let op_taken = op.take();
-                let payload_taken = payload.take();
-                let detail_taken = result.take();
-                (op_taken, payload_taken, detail_taken)
-            });
-            self.reset(next_generation);
-            (payload, detail)
-        }
     }
 }
 

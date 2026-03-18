@@ -223,6 +223,10 @@ pub trait Driver: 'static {
 
     fn slot_table(&self) -> std::sync::Arc<slot::SlotTable<Self::Op, Self::Sidecar>>;
 
+    fn slot_set_payload(&mut self, user_data: usize, payload: slot::ErasedPayload);
+
+    fn slot_take_payload(&mut self, user_data: usize) -> Option<slot::ErasedPayload>;
+
     fn submit(
         &mut self,
         user_data: usize,

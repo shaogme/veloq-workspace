@@ -101,12 +101,12 @@ impl IocpDriver {
         user_data: usize,
         op: IocpOp,
     ) -> io::Result<(Slot<'_, Initialized>, &mut OpEntry<IocpOpState>)> {
-        let (slot_entry, op_entry) = ops
-            .get_slot_and_entry_mut(user_data)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Op not found"))?;
+        let (slot_entry, op_entry, storage) =
+            ops.get_slot_entry_storage_and_entry_mut(user_data)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Op not found"))?;
 
         let generation = slot_entry.generation.load(Ordering::Acquire);
-        let mut guard = Slot::<Pending>::pending_entry(slot_entry, user_data)
+        let mut guard = Slot::<Pending>::pending_entry(slot_entry, storage, user_data)
             .init_op(op, user_data, generation);
 
         guard
@@ -131,11 +131,11 @@ impl IocpDriver {
         }
         if get_blocking_pool().execute(task).is_err() {
             let err = io::Error::other("Thread pool overloaded");
-            if let Some((slot_entry, _)) = ops.get_slot_and_entry_mut(user_data) {
+            if let Some((slot_entry, _, storage)) =
+                ops.get_slot_entry_storage_and_entry_mut(user_data)
+            {
                 let mut guard =
-                    // SAFETY: Slot is verified to be in-flight before offload failure cleanup.
-                    unsafe { Slot::<InFlight>::as_inflight_entry(slot_entry, user_data) }
-                        .complete();
+                    Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data).complete();
                 let (payload, detail) = guard.take_completion_data();
                 let _ = guard.take_op();
                 let sidecar = CompletionSidecar {
@@ -177,11 +177,14 @@ impl IocpDriver {
             Ok(submit::SubmissionResult::PostToQueue) => {
                 if let Err(err) = ctx.port.notify(user_data) {
                     if ops.contains(user_data) {
-                        let mut guard =
-                            // SAFETY: Slot is verified to be in-flight before notification error cleanup.
-                            unsafe { Slot::<InFlight>::assume_in_flight(&ops.shared, user_data) }
-                                .complete();
-                        *op_in = guard.take_op();
+                        if let Some((slot_entry, _, storage)) =
+                            ops.get_slot_entry_storage_and_entry_mut(user_data)
+                        {
+                            let mut guard =
+                                Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data)
+                                    .complete();
+                            *op_in = guard.take_op();
+                        }
                     }
                     ops.remove(user_data);
                     binder.err(err)
@@ -209,11 +212,14 @@ impl IocpDriver {
             }
             Err(e) => {
                 if ops.contains(user_data) {
-                    let mut guard =
-                        // SAFETY: Slot is verified to be in-flight before submission error cleanup.
-                        unsafe { Slot::<InFlight>::assume_in_flight(&ops.shared, user_data) }
-                            .complete();
-                    *op_in = guard.take_op();
+                    if let Some((slot_entry, _, storage)) =
+                        ops.get_slot_entry_storage_and_entry_mut(user_data)
+                    {
+                        let mut guard =
+                            Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data)
+                                .complete();
+                        *op_in = guard.take_op();
+                    }
                 }
                 ops.remove(user_data);
                 binder.err(e)
@@ -252,7 +258,8 @@ impl IocpDriver {
         let mut sub_guard = guard.start_submission();
         let result = sub_guard
             .slot
-            .with_op_mut(|op| op.submit(&mut ctx))
+            .as_mut()
+            .and_then(|slot| slot.with_op_mut(|op| op.submit(&mut ctx)))
             .ok_or_else(|| io::Error::other("Op missing during submission"))?;
 
         if result.is_ok() {
@@ -416,6 +423,29 @@ impl Driver for IocpDriver {
         self.ops.shared.clone()
     }
 
+    fn slot_set_payload(
+        &mut self,
+        user_data: usize,
+        payload: veloq_driver_core::slot::ErasedPayload,
+    ) {
+        let _ =
+            self.ops
+                .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
+                    *payload_cell = Some(payload);
+                });
+    }
+
+    fn slot_take_payload(
+        &mut self,
+        user_data: usize,
+    ) -> Option<veloq_driver_core::slot::ErasedPayload> {
+        self.ops
+            .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
+                payload_cell.take()
+            })
+            .flatten()
+    }
+
     fn submit(
         &mut self,
         user_data: usize,
@@ -481,13 +511,9 @@ impl Driver for IocpDriver {
                 op_entry.platform_data.is_background = true;
             }
             Err(e) => {
-                if let Some((slot_entry, _)) = self.ops.get_slot_and_entry_mut(user_data) {
-                    // SAFETY: Slot is verified to be owned by this driver during recovery.
-                    unsafe {
-                        let _ = slot_entry
-                            .with_storage_unchecked(|op, _result, _payload, _sidecar| op.take());
-                    }
-                }
+                let _ = self
+                    .ops
+                    .with_slot_storage_mut(user_data, |op, _result, _payload, _sidecar| op.take());
                 self.ops.remove(user_data);
                 return Err(e);
             }

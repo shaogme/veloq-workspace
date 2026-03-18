@@ -147,14 +147,11 @@ impl UringDriver {
         op_in: &mut Option<<Self as Driver>::Op>,
         binder: SubmitBinder,
     ) -> Outcome<io::Result<Poll<()>>> {
-        {
-            let slot = &self.ops.shared.slots[user_data];
-            unsafe {
-                slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+        let _ =
+            self.ops
+                .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
                     *slot_op = Some(op);
                 });
-            }
-        }
 
         match self.submit_from_slot(user_data) {
             Ok(true) => binder.ok(Poll::Ready(())),
@@ -167,12 +164,12 @@ impl UringDriver {
                 binder.ok(Poll::Pending)
             }
             Err(e) => {
-                let slot = &self.ops.shared.slots[user_data];
-                let op = unsafe {
-                    slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                let op = self
+                    .ops
+                    .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
                         slot_op.take().unwrap()
                     })
-                };
+                    .expect("slot storage missing in submit_sqe recovery");
                 *op_in = Some(op);
                 binder.err(e)
             }
@@ -186,14 +183,11 @@ impl UringDriver {
         op_in: &mut Option<<Self as Driver>::Op>,
         binder: SubmitBinder,
     ) -> Outcome<io::Result<Poll<()>>> {
-        {
-            let slot = &self.ops.shared.slots[user_data];
-            unsafe {
-                slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+        let _ =
+            self.ops
+                .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
                     *slot_op = Some(op);
                 });
-            }
-        }
 
         match self.submit_from_slot(user_data) {
             Ok(true) => binder.ok(Poll::Ready(())),
@@ -209,12 +203,12 @@ impl UringDriver {
                 binder.ok(Poll::Pending)
             }
             Err(e) => {
-                let slot = &self.ops.shared.slots[user_data];
-                let op = unsafe {
-                    slot.with_storage_unchecked(|slot_op, _result, _payload, _sidecar| {
+                let op = self
+                    .ops
+                    .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
                         slot_op.take().unwrap()
                     })
-                };
+                    .expect("slot storage missing in submit_timer recovery");
                 *op_in = Some(op);
                 binder.err(e)
             }
@@ -247,6 +241,29 @@ impl Driver for UringDriver {
         &self,
     ) -> std::sync::Arc<veloq_driver_core::slot::SlotTable<Self::Op, Self::Sidecar>> {
         self.ops.shared.clone()
+    }
+
+    fn slot_set_payload(
+        &mut self,
+        user_data: usize,
+        payload: veloq_driver_core::slot::ErasedPayload,
+    ) {
+        let _ =
+            self.ops
+                .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
+                    *payload_cell = Some(payload);
+                });
+    }
+
+    fn slot_take_payload(
+        &mut self,
+        user_data: usize,
+    ) -> Option<veloq_driver_core::slot::ErasedPayload> {
+        self.ops
+            .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
+                payload_cell.take()
+            })
+            .flatten()
     }
 
     fn submit(

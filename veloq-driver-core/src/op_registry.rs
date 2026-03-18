@@ -1,6 +1,6 @@
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
-use crate::slot::{SlotEntry, SlotTable};
+use crate::slot::{ErasedPayload, SlotEntry, SlotStorage, SlotTable};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
@@ -14,9 +14,26 @@ impl<P> OpEntry<P> {
     }
 }
 
+pub struct LocalSlot<Op, P, S: SlotSidecar> {
+    pub entry: OpEntry<P>,
+    pub storage: SlotStorage<Op, S>,
+}
+
+impl<Op, P: Default, S: SlotSidecar> LocalSlot<Op, P, S> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            entry: OpEntry {
+                platform_data: P::default(),
+            },
+            storage: SlotStorage::new(),
+        }
+    }
+}
+
 pub struct OpRegistry<Op: PlatformOp, P, S: SlotSidecar> {
     pub shared: Arc<SlotTable<Op, S>>,
-    pub local: Box<[OpEntry<P>]>,
+    pub local: Box<[LocalSlot<Op, P, S>]>,
     local_free_head: usize,
 }
 
@@ -30,15 +47,19 @@ pub struct AllocResult {
     pub handle: OpHandle,
 }
 
+type SlotEntryBundle<'a, Op, P, S> = (
+    &'a SlotEntry<Op, S>,
+    &'a mut OpEntry<P>,
+    &'a mut SlotStorage<Op, S>,
+);
+
 impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
     pub fn new(capacity: usize) -> Self {
         let shared = Arc::new(SlotTable::new(capacity));
         let mut local = Vec::with_capacity(capacity);
 
         for _ in 0..capacity {
-            local.push(OpEntry {
-                platform_data: P::default(),
-            });
+            local.push(LocalSlot::new());
         }
         for i in (0..capacity).rev() {
             shared.push_free(i);
@@ -69,7 +90,8 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
                 .wrapping_add(1);
             slot.reset(new_gen);
 
-            self.local[idx].platform_data = data;
+            self.local[idx].entry.platform_data = data;
+            self.local[idx].storage.reset();
 
             Ok(AllocResult {
                 handle: OpHandle {
@@ -92,11 +114,11 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
     }
 
     pub fn get(&self, user_data: usize) -> Option<&OpEntry<P>> {
-        self.local.get(user_data)
+        self.local.get(user_data).map(|v| &v.entry)
     }
 
     pub fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<P>> {
-        self.local.get_mut(user_data)
+        self.local.get_mut(user_data).map(|v| &mut v.entry)
     }
 
     pub fn get_slot_and_entry_mut(
@@ -104,7 +126,49 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
         user_data: usize,
     ) -> Option<(&SlotEntry<Op, S>, &mut OpEntry<P>)> {
         if user_data < self.local.len() {
-            Some((&self.shared.slots[user_data], &mut self.local[user_data]))
+            Some((
+                &self.shared.slots[user_data],
+                &mut self.local[user_data].entry,
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub fn get_slot_entry_storage_and_entry_mut(
+        &mut self,
+        user_data: usize,
+    ) -> Option<SlotEntryBundle<'_, Op, P, S>> {
+        if user_data < self.local.len() {
+            let local = &mut self.local[user_data];
+            Some((
+                &self.shared.slots[user_data],
+                &mut local.entry,
+                &mut local.storage,
+            ))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn with_slot_storage_mut<F, R>(&mut self, user_data: usize, f: F) -> Option<R>
+    where
+        F: FnOnce(
+            &mut Option<Op>,
+            &mut Option<std::io::Result<usize>>,
+            &mut Option<ErasedPayload>,
+            &mut S,
+        ) -> R,
+    {
+        self.local
+            .get_mut(user_data)
+            .map(|local| local.storage.with_mut(f))
+    }
+
+    pub fn slot_storage_mut(&mut self, user_data: usize) -> Option<&mut SlotStorage<Op, S>> {
+        if user_data < self.local.len() {
+            Some(&mut self.local[user_data].storage)
         } else {
             None
         }
@@ -117,7 +181,9 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
     pub fn remove(&mut self, user_data: usize) -> OpEntry<P> {
         assert!(user_data < self.local.len(), "Invalid user_data for remove");
 
-        let data = std::mem::take(&mut self.local[user_data].platform_data);
+        let local = &mut self.local[user_data];
+        let data = std::mem::take(&mut local.entry.platform_data);
+        local.storage.reset();
         self.shared.push_free(user_data);
 
         OpEntry {
@@ -127,8 +193,8 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
 
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
         if page_idx == 0 {
-            let ptr = self.shared.slots.as_ptr() as *const u8;
-            let len = std::mem::size_of_val(&*self.shared.slots);
+            let ptr = self.local.as_ptr() as *const u8;
+            let len = std::mem::size_of_val(&*self.local);
             Some((ptr, len))
         } else {
             None
@@ -140,12 +206,12 @@ impl<Op: PlatformOp, P, S: SlotSidecar> Index<usize> for OpRegistry<Op, P, S> {
     type Output = OpEntry<P>;
 
     fn index(&self, index: usize) -> &Self::Output {
-        &self.local[index]
+        &self.local[index].entry
     }
 }
 
 impl<Op: PlatformOp, P, S: SlotSidecar> IndexMut<usize> for OpRegistry<Op, P, S> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.local[index]
+        &mut self.local[index].entry
     }
 }

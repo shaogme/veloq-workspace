@@ -198,13 +198,7 @@ impl<T> Op<T> {
                 let mut op_platform = Some(kernel_op);
                 let token = encode_completion_token(user_data, generation);
                 let completion_table = driver.completion_table();
-                let slot_table = driver.slot_table();
-                let slot = &slot_table.slots[user_data];
-                unsafe {
-                    slot.with_storage_unchecked(|_op, _result, payload_cell, _sidecar| {
-                        *payload_cell = Some(T::payload_into_erased(payload));
-                    });
-                }
+                driver.slot_set_payload(user_data, T::payload_into_erased(payload));
 
                 if let Err(e) = driver
                     .submit(user_data, &mut op_platform, SubmitBinder::new())
@@ -215,12 +209,9 @@ impl<T> Op<T> {
                     // If the platform op is returned, propagate immediate failure with payload.
                     // Otherwise, fall back to slot-monitoring path and let generation check resolve.
                     if let Some(op) = op_platform.take() {
-                        let payload_any = unsafe {
-                            slot.with_storage_unchecked(|_op, _result, payload_cell, _sidecar| {
-                                payload_cell.take()
-                            })
-                        }
-                        .expect("Payload missing while recovering submit failure");
+                        let payload_any = driver
+                            .slot_take_payload(user_data)
+                            .expect("Payload missing while recovering submit failure");
                         if payload_any.kind != T::PAYLOAD_KIND as u16 {
                             panic!("DetachedOp payload kind mismatch on submit recovery");
                         }
@@ -413,13 +404,7 @@ where
             };
             op.user_data = user_data;
             op.token = encode_completion_token(user_data, generation);
-            let slot_table = driver.slot_table();
-            let slot = &slot_table.slots[user_data];
-            unsafe {
-                slot.with_storage_unchecked(|_op, _result, payload_cell, _sidecar| {
-                    *payload_cell = Some(T::payload_into_erased(payload));
-                });
-            }
+            driver.slot_set_payload(user_data, T::payload_into_erased(payload));
 
             // Submit to driver.
             let mut driver_op_opt = Some(driver_op);
@@ -430,12 +415,9 @@ where
                 if let Some(val) = driver_op_opt.take() {
                     drop(val);
                 }
-                let payload_any = unsafe {
-                    slot.with_storage_unchecked(|_op, _result, payload_cell, _sidecar| {
-                        payload_cell.take()
-                    })
-                }
-                .expect("Payload missing while recovering submit failure");
+                let payload_any = driver
+                    .slot_take_payload(user_data)
+                    .expect("Payload missing while recovering submit failure");
                 if payload_any.kind != T::PAYLOAD_KIND as u16 {
                     panic!("LocalOp payload kind mismatch on submit recovery");
                 }

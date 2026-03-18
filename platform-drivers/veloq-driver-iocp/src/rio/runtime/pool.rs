@@ -417,8 +417,10 @@ impl UdpPoolManager {
         if user_data >= ops.local.len() {
             return false;
         }
-        let op = &mut ops.local[user_data];
-        let slot = &ops.shared.slots[user_data];
+        let (slot, op, storage) = match ops.get_slot_entry_storage_and_entry_mut(user_data) {
+            Some(v) => v,
+            None => return false,
+        };
         if op.platform_data.generation != expected_generation {
             return false;
         }
@@ -426,7 +428,7 @@ impl UdpPoolManager {
             return false;
         }
 
-        let mut guard = unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) };
+        let mut guard = Slot::<InFlight>::as_inflight_entry(slot, storage, user_data);
         let datagram_len = datagram.as_ref().unwrap().buf.len();
 
         let stream_op = unsafe {
@@ -467,7 +469,7 @@ impl UdpPoolManager {
             flags: 0,
         };
 
-        let mut guard = unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) }.complete();
+        let mut guard = guard.complete();
         let (payload, detail) = guard.take_completion_data();
 
         comp.table

@@ -120,8 +120,11 @@ impl<'a> RioCompletionRouter<'a> {
                 let ops = &mut self.comp.ops;
 
                 if user_data < ops.local.len() {
-                    let op = &mut ops.local[user_data];
-                    let slot = &ops.shared.slots[user_data];
+                    let (slot, op, storage) =
+                        match ops.get_slot_entry_storage_and_entry_mut(user_data) {
+                            Some(v) => v,
+                            None => return,
+                        };
 
                     if op.platform_data.generation == generation
                         && Slot::<InFlight>::is_in_flight_entry(slot)
@@ -129,8 +132,7 @@ impl<'a> RioCompletionRouter<'a> {
                         let was_cancelled =
                             matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
                         let mut guard =
-                            // SAFETY: Slot is verified to be in-flight.
-                            unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) }
+                            Slot::<InFlight>::as_inflight_entry(slot, storage, user_data)
                                 .complete();
 
                         if was_cancelled {
