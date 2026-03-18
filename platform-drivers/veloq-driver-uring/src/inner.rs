@@ -358,7 +358,8 @@ impl UringDriver {
             assert!(!op_ptr.is_null(), "waker op missing in slot");
             // SAFETY: pointer comes from slot-owned storage and remains stable in place.
             let op = unsafe { &mut *op_ptr };
-            let sqe = unsafe { (op.vtable.as_ref().make_sqe)(op, self).user_data(user_data as u64) };
+            let sqe =
+                unsafe { (op.vtable.as_ref().make_sqe)(op, self).user_data(user_data as u64) };
 
             if self.push_entry(sqe) {
                 if let Some(entry) = self.ops.get_mut(user_data) {
@@ -504,8 +505,9 @@ impl UringDriver {
 
                     // Don't touch op if Cancelled
                     if is_cancelled {
-                        let generation =
-                            self.ops.shared.slots[user_data].generation.load(Ordering::Acquire);
+                        let generation = self.ops.shared.slots[user_data]
+                            .generation
+                            .load(Ordering::Acquire);
                         let (payload, detail) = self
                             .ops
                             .with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
@@ -549,8 +551,9 @@ impl UringDriver {
 
                         self.ops.local[user_data].entry.platform_data.lifecycle =
                             OpLifecycle::Completed;
-                        let generation =
-                            self.ops.shared.slots[user_data].generation.load(Ordering::Acquire);
+                        let generation = self.ops.shared.slots[user_data]
+                            .generation
+                            .load(Ordering::Acquire);
                         let res_code = io_result_to_event_res(&final_res);
                         let mut detail = self
                             .ops

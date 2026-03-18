@@ -59,8 +59,11 @@ impl Socket {
     /// Binds the socket to the given address.
     pub fn bind(&self, addr: SocketAddr) -> std::io::Result<()> {
         let (storage, len) = socket_addr_to_storage(addr);
-        self.inner
-            .bind(&storage.0 as *const _ as *const SOCKADDR, len)
+        // SAFETY: storage is a valid SOCKADDR_STORAGE and we pass its pointer and size.
+        unsafe {
+            self.inner
+                .bind(&storage.0 as *const _ as *const SOCKADDR, len)
+        }
     }
 
     /// Listens for incoming connections.
@@ -88,13 +91,18 @@ impl Socket {
 
     /// Returns the local address of the socket.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        // SAFETY: SOCKADDR_STORAGE is a POD struct and can be safely zeroed.
         let mut storage = unsafe {
             std::mem::zeroed::<windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE>()
         };
         let mut len = std::mem::size_of_val(&storage) as i32;
-        self.inner
-            .getsockname(&mut storage as *mut _ as *mut SOCKADDR, &mut len)?;
+        // SAFETY: storage and len are valid pointers to local variables.
+        unsafe {
+            self.inner
+                .getsockname(&mut storage as *mut _ as *mut SOCKADDR, &mut len)?;
+        }
 
+        // SAFETY: storage is a valid SOCKADDR_STORAGE and len is its size.
         let buf =
             unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
         to_socket_addr(buf)

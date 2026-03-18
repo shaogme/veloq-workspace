@@ -193,10 +193,10 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
 ///
 /// The caller must ensure `payload.user` and `ctx.overlapped` are both valid for
 /// mutable access during the call.
-pub(crate) unsafe fn unpack_kernel_ref<'a, T>(
-    payload: &'a mut KernelRef<T>,
+pub(crate) unsafe fn unpack_kernel_ref<T>(
+    payload: &mut KernelRef<T>,
     overlapped: *mut Overlapped,
-) -> (&'a mut T, &'a mut Overlapped) {
+) -> (&mut T, &mut Overlapped) {
     // SAFETY: guaranteed by the caller.
     let val = unsafe { payload.user.as_mut() };
     // SAFETY: guaranteed by the caller.

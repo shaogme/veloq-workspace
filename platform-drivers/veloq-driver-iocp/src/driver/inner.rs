@@ -258,9 +258,13 @@ impl IocpDriver {
         user_data: usize,
         pending_events: &mut Vec<CompletionSidecar>,
     ) {
-        let (slot, op, storage) = ops
-            .get_slot_entry_storage_and_entry_mut(user_data)
-            .expect("slot should exist in finish_timer_op");
+        let (slot, op, storage) = match ops.get_slot_entry_storage_and_entry_mut(user_data) {
+            Some(res) => res,
+            None => {
+                debug!(user_data, "Slot missing in finish_timer_op");
+                return;
+            }
+        };
         let mut guard = Slot::<InFlight>::as_inflight_entry(slot, storage, user_data).complete();
 
         let generation = slot.generation.load(Ordering::Acquire);
@@ -570,10 +574,7 @@ impl IocpDriver {
 
     pub(crate) fn wake(&self) -> io::Result<()> {
         // SAFETY: we are posting a null overlapped pointer for wakeup.
-        unsafe {
-            self.port
-                .post(0, WAKEUP_USER_DATA, std::ptr::null_mut() as *mut Overlapped)
-        }
+        unsafe { self.port.post(0, WAKEUP_USER_DATA, std::ptr::null_mut()) }
     }
 
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker> {

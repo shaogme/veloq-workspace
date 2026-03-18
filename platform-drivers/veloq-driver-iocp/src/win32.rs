@@ -130,7 +130,12 @@ impl SafeSocket {
     }
 
     /// Binds the socket to a local address.
-    pub fn bind(&self, addr: *const SOCKADDR, len: i32) -> io::Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `addr` is a valid pointer to a `SOCKADDR`
+    /// structure and `len` is its size.
+    pub unsafe fn bind(&self, addr: *const SOCKADDR, len: i32) -> io::Result<()> {
         let ret = unsafe { bind(self.0, addr, len) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
@@ -148,7 +153,11 @@ impl SafeSocket {
     }
 
     /// Retrieves the local address of the socket.
-    pub fn getsockname(&self, addr: *mut SOCKADDR, len: *mut i32) -> io::Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `addr` and `len` are valid pointers.
+    pub unsafe fn getsockname(&self, addr: *mut SOCKADDR, len: *mut i32) -> io::Result<()> {
         let ret = unsafe { getsockname(self.0, addr, len) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
@@ -218,6 +227,10 @@ impl IoCompletionPort {
     }
 
     /// Associates a handle with this I/O Completion Port.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `handle` is valid and not already associated.
     pub unsafe fn associate(&self, handle: HANDLE, completion_key: usize) -> io::Result<()> {
         let res = unsafe { CreateIoCompletionPort(handle, self.0.as_raw(), completion_key, 0) };
         if res.is_null() {
@@ -231,6 +244,10 @@ impl IoCompletionPort {
     }
 
     /// Posts a completion status to the port.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `overlapped` is valid if it is not null.
     pub unsafe fn post(
         &self,
         bytes: u32,
@@ -252,6 +269,10 @@ impl IoCompletionPort {
     }
 
     /// Cancels a pending I/O request.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `handle` and `overlapped` are valid.
     pub unsafe fn cancel_request(handle: HANDLE, overlapped: *mut Overlapped) -> io::Result<()> {
         let res = unsafe { CancelIoEx(handle, overlapped as *mut OVERLAPPED) };
         if res == 0 {

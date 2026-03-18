@@ -10,7 +10,7 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use crate::common::{IocpErrorContext, io_error};
 use crate::ext::Extensions;
-use crate::net::addr::SockAddrStorage;
+use crate::net::addr::{self, SockAddrStorage};
 use crate::ops::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex, iocp_submit_connect_ex,
     iocp_submit_read, iocp_submit_write, resolve_fd, unpack_kernel_ref,
@@ -162,7 +162,8 @@ pub(crate) fn submit_connect(
     let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
 
     if with_borrowed_socket(handle as SOCKET, |socket| {
-        socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen)
+        // SAFETY: storage and namelen are valid for this call.
+        unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
     })
     .is_ok()
     {
@@ -171,19 +172,19 @@ pub(crate) fn submit_connect(
             let buf = unsafe {
                 std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
             };
-            if let Ok(SocketAddr::V4(a)) = crate::net::addr::to_socket_addr(buf) {
-                if a.port() != 0 {
-                    need_bind = false;
-                }
+            if let Ok(SocketAddr::V4(a)) = addr::to_socket_addr(buf)
+                && a.port() != 0
+            {
+                need_bind = false;
             }
         } else if family == AF_INET6 {
             let buf = unsafe {
                 std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
             };
-            if let Ok(SocketAddr::V6(a)) = crate::net::addr::to_socket_addr(buf) {
-                if a.port() != 0 {
-                    need_bind = false;
-                }
+            if let Ok(SocketAddr::V6(a)) = addr::to_socket_addr(buf)
+                && a.port() != 0
+            {
+                need_bind = false;
             }
         }
     }
@@ -192,25 +193,26 @@ pub(crate) fn submit_connect(
         let family = connect_op.addr.family();
         let (storage, len) = if family == AF_INET {
             let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
-            let s = crate::net::addr::SockAddrIn::new(&addr);
+            let s = addr::SockAddrIn::new(&addr);
             let mut storage = SockAddrStorage::default();
-            let sin_ref = from_bytes_mut::<crate::net::addr::SockAddrIn>(
+            let sin_ref = from_bytes_mut::<addr::SockAddrIn>(
                 &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN>()],
             );
             *sin_ref = s;
             (storage, std::mem::size_of::<SOCKADDR_IN>() as i32)
         } else {
             let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-            let s = crate::net::addr::SockAddrIn6::new(&addr);
+            let s = addr::SockAddrIn6::new(&addr);
             let mut storage = SockAddrStorage::default();
-            let sin6_ref = from_bytes_mut::<crate::net::addr::SockAddrIn6>(
+            let sin6_ref = from_bytes_mut::<addr::SockAddrIn6>(
                 &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN6>()],
             );
             *sin6_ref = s;
             (storage, std::mem::size_of::<SOCKADDR_IN6>() as i32)
         };
         with_borrowed_socket(handle as SOCKET, |socket| {
-            socket.bind(&storage.0 as *const _ as *const SOCKADDR, len)
+            // SAFETY: storage is a valid SOCKADDR_STORAGE for this call.
+            unsafe { socket.bind(&storage.0 as *const _ as *const SOCKADDR, len) }
         })?;
     }
 
@@ -370,7 +372,7 @@ pub(crate) unsafe fn on_complete_accept(
         let buf = unsafe {
             std::slice::from_raw_parts(remote_sockaddr as *const u8, remote_len as usize)
         };
-        if let Ok(addr) = crate::net::addr::to_socket_addr(buf) {
+        if let Ok(addr) = addr::to_socket_addr(buf) {
             user.remote_addr = Some(addr);
         }
     }
