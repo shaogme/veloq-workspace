@@ -118,6 +118,27 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     pub unsafe fn sidecar_ref(&self) -> &S {
         unsafe { &*self.sidecar.get() }
     }
+
+    /// Forcefully clear slot contents and reset slot to Free state.
+    ///
+    /// This helper centralizes unsafe field access when caller needs to
+    /// retrieve completion data from a non-InFlight slot and immediately reset
+    /// it for reuse.
+    #[inline]
+    pub fn force_reset_to_free(
+        &self,
+        next_generation: u32,
+    ) -> (Option<ErasedPayload>, Option<std::io::Result<usize>>) {
+        // SAFETY: Caller guarantees this reset path has exclusive ownership for
+        // the current slot lifecycle transition.
+        unsafe {
+            let _ = self.op_mut().take();
+            let payload = self.payload_mut().take();
+            let detail = self.result_mut().take();
+            self.reset(next_generation);
+            (payload, detail)
+        }
+    }
 }
 
 impl<Op, S: SlotSidecar> Default for SlotData<Op, S> {

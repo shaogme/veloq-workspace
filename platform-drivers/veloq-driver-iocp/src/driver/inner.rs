@@ -325,6 +325,21 @@ impl IocpDriver {
         Self::emit_event_inner(ctx, user_data, op, slot, slot_generation, io_result);
     }
 
+    #[inline]
+    fn with_inflight_slot<R>(
+        slot: &SlotEntry<IocpOp, OverlappedEntry>,
+        index: usize,
+        f: impl FnOnce(Slot<InFlight>) -> R,
+    ) -> Option<R> {
+        if Slot::<InFlight>::is_in_flight_entry(slot) {
+            // SAFETY: State check above ensures slot is InFlight.
+            let guard = unsafe { Slot::<InFlight>::as_inflight_entry(slot, index) };
+            Some(f(guard))
+        } else {
+            None
+        }
+    }
+
     fn calculate_io_result(
         &self,
         user_data: usize,
@@ -339,29 +354,35 @@ impl IocpDriver {
             Ok(bytes_transferred as usize)
         };
 
-        let mut guard =
-            // SAFETY: Slot is verified to be in-flight before calculation.
-            unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) };
+        let processed = Self::with_inflight_slot(slot, user_data, |mut guard| {
+            let blocking_res =
+                // SAFETY: InFlight state grants sidecar mutable access.
+                unsafe { guard.sidecar_unchecked(|s| s.blocking_result.take()) };
 
-        let blocking_res =
-            // SAFETY: InFlight state grants sidecar mutable access.
-            unsafe { guard.sidecar_unchecked(|s| s.blocking_result.take()) };
+            // SAFETY: InFlight state grants op mutable access.
+            unsafe {
+                let _ = guard.op_mut_unchecked(|iocp_op: &mut IocpOp| {
+                    if let Some(res) = blocking_res {
+                        io_result = res;
+                    } else if let Ok(val) = io_result {
+                        io_result = iocp_op.on_complete(val, &self.extensions);
+                    }
+                });
+            };
+        });
 
-        // SAFETY: op is checked for presence.
-        unsafe {
-            let _ = guard.op_mut_unchecked(|iocp_op: &mut IocpOp| {
-                if let Some(res) = blocking_res {
-                    io_result = res;
-                } else if let Ok(val) = io_result {
-                    io_result = iocp_op.on_complete(val, &self.extensions);
-                }
-            });
-        };
+        if processed.is_none() {
+            debug!(
+                user_data,
+                "Skipping IO result calculation for non in-flight slot"
+            );
+            return io_result;
+        }
 
         if let Err(e) = &io_result
             && e.raw_os_error().is_none()
         {
-            // SAFETY: Slot is being processed; exclusively owned.
+            // SAFETY: Slot is being processed after successful InFlight guard.
             unsafe {
                 *slot.result_mut() = Some(Err(io::Error::new(e.kind(), e.to_string())));
             }
@@ -377,45 +398,44 @@ impl IocpDriver {
         slot_generation: u32,
         io_result: io::Result<usize>,
     ) {
-        if !Slot::<InFlight>::is_in_flight_entry(slot) {
-            debug!(user_data, "Received completion for non-InFlight slot");
-            return;
-        }
-
         let was_cancelled = matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
         let completion_res = io_result_to_event_res(&io_result);
         op.platform_data.rio_pool_waiting = false;
 
-        let mut guard =
-            // SAFETY: Slot is verified to be in-flight before emitting event.
-            unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) }.complete();
+        let handled = Self::with_inflight_slot(slot, user_data, |guard| {
+            let mut guard = guard.complete();
 
-        if op.platform_data.is_background {
-            let _ = guard.take_op();
-            let _ = guard.take_completion_data();
-            let _data = std::mem::take(&mut op.platform_data);
-            ctx.ops_shared.push_free(user_data);
-        } else {
-            if !(was_cancelled && op.platform_data.rio_needs_drain) {
-                let (payload, detail) = guard.take_completion_data();
-                push_completion_shared(
-                    ctx.completion_events,
-                    ctx.completion_table,
-                    completion_record(CompletionSidecar {
-                        user_data,
-                        generation: slot_generation,
-                        res: completion_res,
-                        flags: 0,
-                        payload,
-                        detail,
-                    }),
-                );
-            }
-            if !op.platform_data.rio_needs_drain || op.platform_data.rio_drained {
+            if op.platform_data.is_background {
                 let _ = guard.take_op();
+                let _ = guard.take_completion_data();
                 let _data = std::mem::take(&mut op.platform_data);
                 ctx.ops_shared.push_free(user_data);
+            } else {
+                if !(was_cancelled && op.platform_data.rio_needs_drain) {
+                    let (payload, detail) = guard.take_completion_data();
+                    push_completion_shared(
+                        ctx.completion_events,
+                        ctx.completion_table,
+                        completion_record(CompletionSidecar {
+                            user_data,
+                            generation: slot_generation,
+                            res: completion_res,
+                            flags: 0,
+                            payload,
+                            detail,
+                        }),
+                    );
+                }
+                if !op.platform_data.rio_needs_drain || op.platform_data.rio_drained {
+                    let _ = guard.take_op();
+                    let _data = std::mem::take(&mut op.platform_data);
+                    ctx.ops_shared.push_free(user_data);
+                }
             }
+        });
+
+        if handled.is_none() {
+            debug!(user_data, "Received completion for non-InFlight slot");
         }
     }
 
@@ -462,37 +482,44 @@ impl IocpDriver {
         op: &mut OpEntry<IocpOpState>,
         slot: &SlotEntry<IocpOp, OverlappedEntry>,
     ) {
-        let guard =
-            // SAFETY: Slot is verified to be in-flight before cancellation.
-            unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) };
+        let handled = Self::with_inflight_slot(slot, user_data, |mut guard| {
+            // SAFETY: InFlight state grants op mutable access.
+            let fd = unsafe { guard.op_mut_unchecked(|iocp_op| iocp_op.get_fd()) }.flatten();
 
-        // SAFETY: Exclusive access is guaranteed by the InFlight state or being on the same thread.
-        if let Some(res) = unsafe { slot.op_mut() }
-            && let Some(fd) = res.get_fd()
-            && let Ok(handle) = submit::resolve_fd(fd, ctx.registered_files)
-        {
-            if op.platform_data.rio_pool_waiting || Self::is_rio_op(res) {
-                if op.platform_data.rio_pool_waiting {
-                    ctx.rio_state.cancel_udp_recv_waiter(
-                        handle,
-                        (user_data, op.platform_data.generation),
-                        ctx.registrar,
-                    );
+            if let Some(fd) = fd
+                && let Ok(handle) = submit::resolve_fd(fd, ctx.registered_files)
+            {
+                // SAFETY: InFlight state grants op mutable access.
+                let is_rio = unsafe { guard.op_mut_unchecked(|iocp_op| Self::is_rio_op(iocp_op)) }
+                    .unwrap_or(false);
+
+                if op.platform_data.rio_pool_waiting || is_rio {
+                    if op.platform_data.rio_pool_waiting {
+                        ctx.rio_state.cancel_udp_recv_waiter(
+                            handle,
+                            (user_data, op.platform_data.generation),
+                            ctx.registrar,
+                        );
+                    }
+                    let emit_ctx = EmitContext {
+                        ops_shared: ctx.ops_shared,
+                        completion_events: ctx.completion_events,
+                        completion_table: ctx.completion_table,
+                    };
+                    Self::emit_aborted_inner(emit_ctx, user_data, op, slot);
+                    return;
                 }
-                let emit_ctx = EmitContext {
-                    ops_shared: ctx.ops_shared,
-                    completion_events: ctx.completion_events,
-                    completion_table: ctx.completion_table,
-                };
-                Self::emit_aborted_inner(emit_ctx, user_data, op, slot);
-                return;
-            }
 
-            // SAFETY: `overlapped_ptr()` provides a valid overlapped pointer for `cancel_request`.
-            let overlapped_ptr = guard.overlapped_ptr();
-            let _ =
-                // SAFETY: handle and overlapped_ptr are valid for this operation.
-                unsafe { crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr) };
+                // SAFETY: `overlapped_ptr()` provides a valid overlapped pointer for `cancel_request`.
+                let overlapped_ptr = guard.overlapped_ptr();
+                let _ =
+                    // SAFETY: handle and overlapped_ptr are valid for this operation.
+                    unsafe { crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr) };
+            }
+        });
+
+        if handled.is_none() {
+            debug!(user_data, "Skipping cancel for non in-flight slot");
         }
     }
 
@@ -503,23 +530,17 @@ impl IocpDriver {
         slot: &SlotEntry<IocpOp, OverlappedEntry>,
     ) {
         let generation = slot.generation.load(Ordering::Acquire);
-        let (payload, detail) = if Slot::<InFlight>::is_in_flight_entry(slot) {
-            let mut guard =
-                // SAFETY: Slot is verified to be in-flight.
-                unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) }.complete();
-            let _ = guard.take_op();
-            let data = guard.take_completion_data();
-            let _ = guard.reset();
+        let (payload, detail) = if let Some(data) =
+            Self::with_inflight_slot(slot, user_data, |guard| {
+                let mut guard = guard.complete();
+                let _ = guard.take_op();
+                let data = guard.take_completion_data();
+                let _ = guard.reset();
+                data
+            }) {
             data
         } else {
-            // SAFETY: Exclusively owning the slot through generation check or state.
-            unsafe {
-                let _ = slot.op_mut().take();
-                let payload = slot.payload_mut().take();
-                let detail = slot.result_mut().take();
-                slot.reset(generation.wrapping_add(1));
-                (payload, detail)
-            }
+            slot.force_reset_to_free(generation.wrapping_add(1))
         };
 
         push_completion_shared(
