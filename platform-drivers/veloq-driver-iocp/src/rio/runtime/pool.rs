@@ -9,7 +9,6 @@
 //! handled by dedicated shutdown logic in the lifecycle layer.
 
 use crate::common::{IocpErrorContext, io_error, io_msg};
-use crate::driver::OpLifecycle;
 use crate::net::addr::SockAddrStorage;
 use crate::ops::IocpOpPayload;
 use crate::ops::slot::{InFlight, Slot};
@@ -430,7 +429,7 @@ impl UdpPoolManager {
         if op.platform_data.generation != expected_generation {
             return false;
         }
-        if !matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+        if !Slot::<InFlight>::is_in_flight_entry(slot) {
             return false;
         }
 
@@ -467,7 +466,6 @@ impl UdpPoolManager {
         });
 
         op.platform_data.rio_pool_waiting = false;
-        op.platform_data.lifecycle = OpLifecycle::Completed;
         let event = CompletionEvent {
             user_data: encode_completion_token(user_data, expected_generation),
             res: datagram_len.min(i32::MAX as usize) as i32,

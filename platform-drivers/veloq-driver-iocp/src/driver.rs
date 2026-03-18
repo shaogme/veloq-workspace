@@ -32,14 +32,10 @@ use inner::RIO_EVENT_KEY;
 // ============================================================================
 
 /// Represents the lifecycle stage of an IOCP operation.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum OpLifecycle {
-    /// Created, resources attached, waiting to be submitted
-    Pending,
-    /// Submitted to true OS operations (IOCP/RIO)
-    InFlight,
-    /// Completion received or Timer fired
-    Completed,
+    #[default]
+    Active,
     /// Cancelled by user
     Cancelled,
 }
@@ -63,7 +59,7 @@ impl Default for IocpOpState {
     fn default() -> Self {
         Self {
             generation: 0,
-            lifecycle: OpLifecycle::Pending,
+            lifecycle: OpLifecycle::Active,
             timer_id: None,
             timer_deadline: None,
             is_background: false,
@@ -129,7 +125,6 @@ impl IocpDriver {
         task: BlockingTask,
     ) -> io::Result<Poll<()>> {
         if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-            op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
             op_entry.platform_data.rio_pool_waiting = false;
         }
         if get_blocking_pool().execute(task).is_err() {
@@ -172,7 +167,6 @@ impl IocpDriver {
         match result {
             Ok(submit::SubmissionResult::Pending) => {
                 if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                     op_entry.platform_data.rio_pool_waiting = is_rio_pool_waiting;
                 }
                 binder.ok(Poll::Pending)
@@ -189,7 +183,6 @@ impl IocpDriver {
                     binder.err(err)
                 } else {
                     if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-                        op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                         op_entry.platform_data.rio_pool_waiting = false;
                     }
                     binder.ok(Poll::Pending)
@@ -206,7 +199,6 @@ impl IocpDriver {
                 if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
                     op_entry.platform_data.timer_id = Some(timeout);
                     op_entry.platform_data.timer_deadline = Some(Instant::now() + duration);
-                    op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                     op_entry.platform_data.rio_pool_waiting = false;
                 }
                 binder.ok(Poll::Pending)
@@ -316,9 +308,7 @@ impl IocpDriver {
 
         let mut in_flight = Vec::new();
         for user_data in 0..self.ops.local.len() {
-            if let Some(op) = self.ops.local.get(user_data)
-                && matches!(op.platform_data.lifecycle, OpLifecycle::InFlight)
-            {
+            if Slot::<InFlight>::is_in_flight(&self.ops.shared, user_data) {
                 in_flight.push(user_data);
             }
         }
@@ -468,7 +458,6 @@ impl Driver for IocpDriver {
                     .get_slot_and_entry_mut(user_data)
                     .ok_or_else(|| io::Error::other("Op not found"))?;
                 op_entry.platform_data.is_background = true;
-                op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
                 if get_blocking_pool().execute(task).is_err() {
                     let _ = std::mem::take(&mut op_entry.platform_data);
                     self.ops.shared.push_free(user_data);
@@ -481,7 +470,6 @@ impl Driver for IocpDriver {
                     .get_slot_and_entry_mut(user_data)
                     .ok_or_else(|| io::Error::other("Op not found"))?;
                 op_entry.platform_data.is_background = true;
-                op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
             }
             Err(e) => {
                 if let Some((slot_entry, _)) = self.ops.get_slot_and_entry_mut(user_data) {

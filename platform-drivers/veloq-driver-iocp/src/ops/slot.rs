@@ -111,6 +111,16 @@ impl<'a> Slot<'a, Initialized> {
 
 impl<'a> Slot<'a, InFlight> {
     #[inline]
+    pub(crate) fn is_in_flight(table: &SlotTable<IocpOp, OverlappedEntry>, index: usize) -> bool {
+        Self::is_in_flight_entry(&table.slots[index])
+    }
+
+    #[inline]
+    pub(crate) fn is_in_flight_entry(entry: &SlotEntry<IocpOp, OverlappedEntry>) -> bool {
+        unsafe { (*entry.sidecar.get()).in_flight }
+    }
+
+    #[inline]
     pub(crate) unsafe fn assume_in_flight(
         table: &'a SlotTable<IocpOp, OverlappedEntry>,
         index: usize,

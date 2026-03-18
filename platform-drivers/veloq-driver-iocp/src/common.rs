@@ -24,18 +24,9 @@ use veloq_driver_core::driver::{
 
 /// A safe wrapper around a Win32 HANDLE that ensures it is closed when dropped.
 #[derive(Debug)]
-pub struct OwnedHandle(HANDLE);
+pub struct OwnedHandle(pub HANDLE);
 
 impl OwnedHandle {
-    /// Creates a new `OwnedHandle` from a raw HANDLE.
-    ///
-    /// # Safety
-    ///
-    /// The handle must be valid and owned by the caller.
-    pub unsafe fn from_raw(handle: HANDLE) -> Self {
-        Self(handle)
-    }
-
     /// Returns the raw HANDLE.
     pub fn as_raw(&self) -> HANDLE {
         self.0
@@ -50,6 +41,7 @@ impl OwnedHandle {
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if self.is_valid() {
+            // SAFETY: Handle is valid and owned by us.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -57,7 +49,9 @@ impl Drop for OwnedHandle {
     }
 }
 
+// SAFETY: Windows HANDLEs are pointers but can be safely transferred between threads.
 unsafe impl Send for OwnedHandle {}
+// SAFETY: Windows HANDLEs are pointers but can be safely shared between threads.
 unsafe impl Sync for OwnedHandle {}
 
 /// A safe wrapper for an I/O Completion Port.
@@ -66,6 +60,7 @@ pub struct IoCompletionPort(OwnedHandle);
 impl IoCompletionPort {
     /// Creates a new, unconnected I/O Completion Port.
     pub fn new(threads: u32) -> io::Result<Self> {
+        // SAFETY: Calling CreateIoCompletionPort to create a new port is safe.
         let handle =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, threads) };
         if handle.is_null() {
@@ -80,8 +75,10 @@ impl IoCompletionPort {
     ///
     /// The caller must ensure that `handle` is a valid file/socket handle.
     pub unsafe fn associate(&self, handle: HANDLE, completion_key: usize) -> io::Result<()> {
+        // SAFETY: Calling CreateIoCompletionPort with a valid handle and our port's handle.
         let res = unsafe { CreateIoCompletionPort(handle, self.0.as_raw(), completion_key, 0) };
         if res.is_null() {
+            // SAFETY: GetLastError is safe to call.
             let err = unsafe { GetLastError() };
             // Windows returns ERROR_INVALID_PARAMETER when trying to re-associate
             // a handle that is already bound to an IOCP.

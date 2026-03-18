@@ -123,43 +123,41 @@ impl<'a> RioCompletionRouter<'a> {
                     let slot = &ops.shared.slots[user_data];
 
                     if op.platform_data.generation == generation {
-                        if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
-                            op.platform_data.lifecycle = OpLifecycle::Completed;
+                        if Slot::<InFlight>::is_in_flight_entry(slot) {
+                            let was_cancelled =
+                                matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
+                            let mut guard = unsafe {
+                                Slot::<InFlight>::assume_in_flight_entry(slot, user_data)
+                            }
+                            .complete();
 
-                            let result_for_slot = if res.Status == 0 {
-                                Ok(res.BytesTransferred as usize)
+                            if was_cancelled {
+                                let _ = guard.take_completion_data();
+                                let _ = guard.take_op();
+                                let _ = std::mem::take(&mut op.platform_data);
+                                self.comp.ops.shared.push_free(user_data);
                             } else {
-                                Err(io::Error::from_raw_os_error(res.Status))
-                            };
-                            let res_code = rio_result_to_event_res(&result_for_slot);
-                            let event = CompletionEvent {
-                                user_data: encode_completion_token(user_data, generation),
-                                res: res_code,
-                                flags: 0,
-                            };
+                                let result_for_slot = if res.Status == 0 {
+                                    Ok(res.BytesTransferred as usize)
+                                } else {
+                                    Err(io::Error::from_raw_os_error(res.Status))
+                                };
+                                let res_code = rio_result_to_event_res(&result_for_slot);
+                                let event = CompletionEvent {
+                                    user_data: encode_completion_token(user_data, generation),
+                                    res: res_code,
+                                    flags: 0,
+                                };
+                                let (payload, detail) = guard.take_completion_data();
 
-                            let mut guard = unsafe {
-                                Slot::<InFlight>::assume_in_flight_entry(slot, user_data)
+                                self.comp
+                                    .table
+                                    .record_completion_with_data(event, payload, detail);
+                                self.comp.events.push(event);
+                                let _ = guard.take_op();
+                                let _ = std::mem::take(&mut op.platform_data);
+                                self.comp.ops.shared.push_free(user_data);
                             }
-                            .complete();
-                            let (payload, detail) = guard.take_completion_data();
-
-                            self.comp
-                                .table
-                                .record_completion_with_data(event, payload, detail);
-                            self.comp.events.push(event);
-                            let _ = guard.take_op();
-                            let _ = std::mem::take(&mut op.platform_data);
-                            self.comp.ops.shared.push_free(user_data);
-                        } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
-                            let mut guard = unsafe {
-                                Slot::<InFlight>::assume_in_flight_entry(slot, user_data)
-                            }
-                            .complete();
-                            let _ = guard.take_completion_data();
-                            let _ = guard.take_op();
-                            let _ = std::mem::take(&mut op.platform_data);
-                            self.comp.ops.shared.push_free(user_data);
                         }
                     }
                 }

@@ -221,8 +221,9 @@ impl IocpDriver {
 
         let mut expired = Vec::new();
         for &user_data in &timer_buffer {
+            let in_flight = Slot::<InFlight>::is_in_flight(&self.ops.shared, user_data);
             if let Some(op) = self.ops.local.get_mut(user_data) {
-                if matches!(op.platform_data.lifecycle, OpLifecycle::InFlight) {
+                if in_flight {
                     if let Some(deadline) = op.platform_data.timer_deadline
                         && now < deadline
                     {
@@ -258,7 +259,6 @@ impl IocpDriver {
         pending_events: &mut Vec<CompletionSidecar>,
     ) {
         let op = &mut ops.local[user_data];
-        op.platform_data.lifecycle = OpLifecycle::Completed;
 
         let slot = &ops.shared.slots[user_data];
         let mut guard =
@@ -300,6 +300,10 @@ impl IocpDriver {
 
             if op.platform_data.generation != slot_generation {
                 debug!(user_data, "Ignoring stale completion");
+                return;
+            }
+            if !Slot::<InFlight>::is_in_flight_entry(slot) {
+                debug!(user_data, "Ignoring completion for non in-flight slot");
                 return;
             }
         }
@@ -369,45 +373,44 @@ impl IocpDriver {
         slot_generation: u32,
         io_result: io::Result<usize>,
     ) {
-        match op.platform_data.lifecycle {
-            OpLifecycle::Cancelled | OpLifecycle::InFlight => {
-                let was_cancelled = matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
-                let completion_res = io_result_to_event_res(&io_result);
-                op.platform_data.rio_pool_waiting = false;
+        if !Slot::<InFlight>::is_in_flight_entry(slot) {
+            debug!(user_data, "Received completion for non-InFlight slot");
+            return;
+        }
 
-                let mut guard =
-                    unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) }.complete();
+        let was_cancelled = matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
+        let completion_res = io_result_to_event_res(&io_result);
+        op.platform_data.rio_pool_waiting = false;
 
-                if op.platform_data.is_background {
-                    let _ = guard.take_op();
-                    let _ = guard.take_completion_data();
-                    let _data = std::mem::take(&mut op.platform_data);
-                    ctx.ops_shared.push_free(user_data);
-                } else {
-                    op.platform_data.lifecycle = OpLifecycle::Completed;
-                    if !(was_cancelled && op.platform_data.rio_needs_drain) {
-                        let (payload, detail) = guard.take_completion_data();
-                        push_completion_shared(
-                            ctx.completion_events,
-                            ctx.completion_table,
-                            completion_record(CompletionSidecar {
-                                user_data,
-                                generation: slot_generation,
-                                res: completion_res,
-                                flags: 0,
-                                payload,
-                                detail,
-                            }),
-                        );
-                    }
-                    if !op.platform_data.rio_needs_drain || op.platform_data.rio_drained {
-                        let _ = guard.take_op();
-                        let _data = std::mem::take(&mut op.platform_data);
-                        ctx.ops_shared.push_free(user_data);
-                    }
-                }
+        let mut guard =
+            unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) }.complete();
+
+        if op.platform_data.is_background {
+            let _ = guard.take_op();
+            let _ = guard.take_completion_data();
+            let _data = std::mem::take(&mut op.platform_data);
+            ctx.ops_shared.push_free(user_data);
+        } else {
+            if !(was_cancelled && op.platform_data.rio_needs_drain) {
+                let (payload, detail) = guard.take_completion_data();
+                push_completion_shared(
+                    ctx.completion_events,
+                    ctx.completion_table,
+                    completion_record(CompletionSidecar {
+                        user_data,
+                        generation: slot_generation,
+                        res: completion_res,
+                        flags: 0,
+                        payload,
+                        detail,
+                    }),
+                );
             }
-            _ => debug!(user_data, "Received completion for non-InFlight op"),
+            if !op.platform_data.rio_needs_drain || op.platform_data.rio_drained {
+                let _ = guard.take_op();
+                let _data = std::mem::take(&mut op.platform_data);
+                ctx.ops_shared.push_free(user_data);
+            }
         }
     }
 
@@ -428,21 +431,22 @@ impl IocpDriver {
                 return;
             }
 
-            match op.platform_data.lifecycle {
-                OpLifecycle::Pending => Self::emit_aborted_inner(emit_ctx, user_data, op, slot),
-                OpLifecycle::InFlight => {
-                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
-                    let ctx = CancelContext {
-                        registered_files: &self.registered_files,
-                        rio_state: &mut self.rio_state,
-                        registrar: &*self.registrar,
-                        ops_shared: &self.ops.shared,
-                        completion_events: &self.completion_events,
-                        completion_table: &self.completion_table,
-                    };
-                    Self::perform_cancel(ctx, user_data, op, slot);
-                }
-                _ => {}
+            if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
+                return;
+            }
+            if Slot::<InFlight>::is_in_flight_entry(slot) {
+                op.platform_data.lifecycle = OpLifecycle::Cancelled;
+                let ctx = CancelContext {
+                    registered_files: &self.registered_files,
+                    rio_state: &mut self.rio_state,
+                    registrar: &*self.registrar,
+                    ops_shared: &self.ops.shared,
+                    completion_events: &self.completion_events,
+                    completion_table: &self.completion_table,
+                };
+                Self::perform_cancel(ctx, user_data, op, slot);
+            } else {
+                Self::emit_aborted_inner(emit_ctx, user_data, op, slot);
             }
         }
     }
@@ -490,13 +494,23 @@ impl IocpDriver {
         op: &mut OpEntry<IocpOpState>,
         slot: &SlotEntry<IocpOp, OverlappedEntry>,
     ) {
-        op.platform_data.lifecycle = OpLifecycle::Completed;
         let generation = slot.generation.load(Ordering::Acquire);
-
-        let mut guard =
-            unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) }.complete();
-        let _ = guard.take_op();
-        let (payload, detail) = guard.take_completion_data();
+        let (payload, detail) = if Slot::<InFlight>::is_in_flight_entry(slot) {
+            let mut guard =
+                unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) }.complete();
+            let _ = guard.take_op();
+            let data = guard.take_completion_data();
+            let _ = guard.reset();
+            data
+        } else {
+            unsafe {
+                let _ = (*slot.op.get()).take();
+                let payload = (*slot.payload.get()).take();
+                let detail = (*slot.result.get()).take();
+                slot.reset(generation.wrapping_add(1));
+                (payload, detail)
+            }
+        };
 
         push_completion_shared(
             ctx.completion_events,
@@ -512,7 +526,6 @@ impl IocpDriver {
         );
         let _data = std::mem::take(&mut op.platform_data);
         ctx.ops_shared.push_free(user_data);
-        let _ = guard.reset();
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
