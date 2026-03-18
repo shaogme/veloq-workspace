@@ -5,15 +5,20 @@
 //! - `OpVTable`: The virtual table for dynamic dispatch without enums
 //! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
+pub(crate) mod overlapped;
+pub(crate) mod submit;
+
+pub use overlapped::OverlappedEntry;
+pub(crate) use submit::SubmissionResult;
+
 use std::io;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
-use crate::SockAddrStorage;
+use crate::net::addr::SockAddrStorage;
 use crate::ext::Extensions;
 use crate::rio::RioState;
-use crate::submit::{self, SubmissionResult};
-use crate::{IoFd, RawHandle};
+use crate::config::{IoFd, RawHandle};
 
 use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{
@@ -29,46 +34,10 @@ use windows_sys::Win32::Networking::WinSock::{
     INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED,
     WSA_FLAG_REGISTERED_IO, WSASocketW,
 };
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // ============================================================================
-// OverlappedEntry Definition
+// Type Aliases for Core Ops
 // ============================================================================
-
-/// A wrapper for the Windows OVERLAPPED structure with additional metadata.
-#[repr(C)]
-pub struct OverlappedEntry {
-    /// The underlying Windows OVERLAPPED structure.
-    pub(crate) inner: OVERLAPPED,
-    /// User-defined data associated with the operation.
-    pub(crate) user_data: usize,
-    /// Generation count for slot validation.
-    pub(crate) generation: u32,
-    /// Result of an offloaded blocking operation.
-    pub(crate) blocking_result: Option<io::Result<usize>>,
-}
-
-impl OverlappedEntry {
-    /// Creates a new `OverlappedEntry` with the given user data.
-    pub(crate) fn new(user_data: usize) -> Self {
-        Self {
-            // SAFETY: OVERLAPPED can be safely zero-initialized.
-            inner: unsafe { std::mem::zeroed() },
-            user_data,
-            generation: 0,
-            blocking_result: None,
-        }
-    }
-}
-
-impl Default for OverlappedEntry {
-    fn default() -> Self {
-        Self::new(0)
-    }
-}
-
-// SAFETY: OverlappedEntry is safe to send between threads.
-unsafe impl Send for OverlappedEntry {}
 
 type ReadFixed = ReadFixedBase<RawHandle>;
 type WriteFixed = WriteFixedBase<RawHandle>;
@@ -92,7 +61,7 @@ type Wakeup = WakeupBase<RawHandle>;
 /// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
     pub(crate) port: HANDLE,
-    pub(crate) overlapped: *mut OVERLAPPED,
+    pub(crate) overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_files: &'a [Option<HANDLE>],
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
@@ -417,13 +386,12 @@ define_iocp_ops! {
         construct: |user: std::ptr::NonNull<SendTo>| {
             // SAFETY: user pointer is valid and points to a valid SendTo.
             let op = unsafe { user.as_ref() };
-            let (addr, raw_addr_len) = crate::socket_addr_to_storage(op.addr);
+            let (addr, _raw_addr_len) = crate::net::addr::socket_addr_to_storage(op.addr);
             let addr_len = if op.addr.is_ipv4() {
                 std::mem::size_of::<SOCKADDR_IN>() as i32
             } else {
                 std::mem::size_of::<SOCKADDR_IN6>() as i32
             };
-            debug_assert_eq!(raw_addr_len, addr_len);
             SendToPayload {
                 user,
                 addr,

@@ -1,6 +1,5 @@
-use super::socket_addr_trans;
-use super::to_socket_addr;
-use crate::RawHandle;
+use super::addr::{socket_addr_trans, to_socket_addr};
+use crate::config::RawHandle;
 use std::io;
 use std::net::SocketAddr;
 use veloq_driver_core::net::PlatformSocket;

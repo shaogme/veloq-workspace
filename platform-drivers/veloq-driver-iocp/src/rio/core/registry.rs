@@ -10,7 +10,7 @@
 //! intentionally avoids actor scheduling or completion routing policy.
 
 use crate::IoFd;
-use crate::error::{IocpErrorContext, io_error, io_msg};
+use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::rio::RioEnv;
 use rustc_hash::FxHashMap;
 use std::io;

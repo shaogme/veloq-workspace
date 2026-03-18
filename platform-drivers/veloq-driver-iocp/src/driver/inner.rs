@@ -1,17 +1,3 @@
-use super::CompletionSidecar;
-use super::error::{IocpErrorContext, io_error, io_msg};
-use super::ext::Extensions;
-use super::port::CompletionPort;
-use super::rio::RioState;
-use super::state::{IocpOpState, OpLifecycle};
-use super::submit::{
-    self, submit_recv, submit_send, submit_send_to, submit_udp_recv_stream, submit_udp_refill,
-};
-use super::utils::{completion_record, io_result_to_event_res, push_completion_event_shared};
-use super::waker::IocpWaker;
-use crate::op::{IocpOp, OverlappedEntry};
-use crate::{BufferRegistrationMode, IocpConfig};
-
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,23 +5,31 @@ use std::time::Instant;
 
 use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
+use windows_sys::Win32::Foundation::{
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::IO::{
+    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
+    PostQueuedCompletionStatus,
+};
+
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
 use veloq_driver_core::driver::{
     CompletionTable, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
-use veloq_driver_core::slot::{SlotEntry, SlotTable};
+use veloq_driver_core::slot::SlotTable;
 use veloq_wheel::{Wheel, WheelConfig};
 
-use windows_sys::Win32::Foundation::{
-    ERROR_OPERATION_ABORTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+use crate::config::{BufferRegistrationMode, IocpConfig};
+use crate::common::{
+    CompletionPort, IocpErrorContext, WAKEUP_USER_DATA, completion_record, io_error, io_msg,
+    io_result_to_event_res, push_completion_event_shared, IocpWaker,
 };
-use windows_sys::Win32::System::IO::{
-    CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
-    PostQueuedCompletionStatus,
-};
+use crate::ops::{IocpOp, OverlappedEntry, submit};
+use crate::rio::RioState;
+use crate::driver::{IocpOpState, OpLifecycle, CompletionSidecar};
 
-pub(crate) const WAKEUP_USER_DATA: usize = usize::MAX;
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
 pub(crate) type PreInit = usize;
@@ -50,7 +44,7 @@ struct EmitContext<'a> {
 pub struct IocpDriver {
     pub(crate) port: Arc<CompletionPort>,
     pub(crate) ops: OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-    pub(crate) extensions: Extensions,
+    pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
     pub(crate) registered_files: Vec<Option<HANDLE>>,
@@ -71,11 +65,11 @@ impl IocpDriver {
     fn is_rio_op(op: &IocpOp) -> bool {
         // SAFETY: The vtable pointer is guaranteed to be valid and point to a valid OpVTable.
         let s = unsafe { op.vtable.as_ref().submit as *const () as usize };
-        s == submit_recv as *const () as usize
-            || s == submit_send as *const () as usize
-            || s == submit_send_to as *const () as usize
-            || s == submit_udp_recv_stream as *const () as usize
-            || s == submit_udp_refill as *const () as usize
+        s == submit::submit_recv as *const () as usize
+            || s == submit::submit_send as *const () as usize
+            || s == submit::submit_send_to as *const () as usize
+            || s == submit::submit_udp_recv_stream as *const () as usize
+            || s == submit::submit_udp_refill as *const () as usize
     }
 
     /// Creates a pre-initialization completion port handle.
@@ -105,7 +99,7 @@ impl IocpDriver {
     ) -> io::Result<Self> {
         let port = port_val as HANDLE;
         debug!(port = ?port, "Initializing IocpDriver");
-        let extensions = Extensions::new().map_err(|e| {
+        let extensions = crate::ext::Extensions::new().map_err(|e| {
             io_error(
                 IocpErrorContext::DriverInit,
                 e,
@@ -337,7 +331,7 @@ impl IocpDriver {
 
     fn calculate_io_result(
         &self,
-        slot: &SlotEntry<IocpOp, OverlappedEntry>,
+        slot: &SlotTableEntry<IocpOp, OverlappedEntry>,
         res: i32,
         bytes_transferred: u32,
     ) -> io::Result<usize> {
@@ -378,7 +372,7 @@ impl IocpDriver {
         ctx: EmitContext<'_>,
         user_data: usize,
         op: &mut OpEntry<IocpOpState>,
-        slot: &SlotEntry<IocpOp, OverlappedEntry>,
+        slot: &SlotTableEntry<IocpOp, OverlappedEntry>,
         slot_generation: u32,
         io_result: io::Result<usize>,
     ) {
@@ -427,18 +421,7 @@ impl IocpDriver {
             _ => debug!(user_data, "Received completion for non-InFlight op"),
         }
     }
-}
 
-struct CancelContext<'a> {
-    registered_files: &'a [Option<HANDLE>],
-    rio_state: &'a mut RioState,
-    registrar: &'a dyn BufferRegistrar,
-    ops_shared: &'a Arc<SlotTable<IocpOp, OverlappedEntry>>,
-    completion_events: &'a SharedCompletionQueue,
-    completion_table: &'a SharedCompletionTable,
-}
-
-impl IocpDriver {
     pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
         if let Some(op) = self.ops.local.get_mut(user_data) {
             trace!(user_data, "Cancelling op");
@@ -479,7 +462,7 @@ impl IocpDriver {
         ctx: CancelContext<'_>,
         user_data: usize,
         op: &mut OpEntry<IocpOpState>,
-        slot: &SlotEntry<IocpOp, OverlappedEntry>,
+        slot: &SlotTableEntry<IocpOp, OverlappedEntry>,
     ) {
         // SAFETY: slot.op.get() is a valid pointer.
         if let Some(res) = unsafe { &mut *slot.op.get() }
@@ -507,7 +490,7 @@ impl IocpDriver {
             let overlapped_ptr = unsafe { &mut (*slot.sidecar.get()).inner as *mut _ };
             // SAFETY: Calling Win32 API to cancel asynchronous I/O.
             unsafe {
-                CancelIoEx(handle, overlapped_ptr);
+                windows_sys::Win32::System::IO::CancelIoEx(handle, overlapped_ptr);
             }
         }
     }
@@ -516,7 +499,7 @@ impl IocpDriver {
         ctx: EmitContext<'_>,
         user_data: usize,
         op: &mut OpEntry<IocpOpState>,
-        slot: &SlotEntry<IocpOp, OverlappedEntry>,
+        slot: &SlotTableEntry<IocpOp, OverlappedEntry>,
     ) {
         op.platform_data.lifecycle = OpLifecycle::Completed;
         let generation = slot.generation.load(Ordering::Acquire);
@@ -529,7 +512,7 @@ impl IocpDriver {
             completion_record(CompletionSidecar {
                 user_data,
                 generation,
-                res: -(ERROR_OPERATION_ABORTED as i32),
+                res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
                 flags: 0,
                 payload,
                 detail,
@@ -561,4 +544,15 @@ impl IocpDriver {
             is_notified: self.is_notified.clone(),
         })
     }
+}
+
+type SlotTableEntry<Op, Sidecar> = veloq_driver_core::slot::SlotEntry<Op, Sidecar>;
+
+struct CancelContext<'a> {
+    registered_files: &'a [Option<HANDLE>],
+    rio_state: &'a mut RioState,
+    registrar: &'a dyn BufferRegistrar,
+    ops_shared: &'a Arc<SlotTable<IocpOp, OverlappedEntry>>,
+    completion_events: &'a SharedCompletionQueue,
+    completion_table: &'a SharedCompletionTable,
 }

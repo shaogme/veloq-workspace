@@ -1,9 +1,8 @@
 //! Actor coordination and completion routing for the RIO runtime.
 
 use crate::IoFd;
-use crate::IocpOp;
-use crate::IocpOpState;
-use crate::OpLifecycle;
+use crate::driver::{IocpOpState, OpLifecycle};
+use crate::ops::IocpOp;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpCtxGuard;
 use crate::rio::core::registry::RioRegistry;
@@ -329,7 +328,7 @@ impl RioState {
 
     pub(crate) fn process_completions(
         &mut self,
-        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::ops::OverlappedEntry>,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable,

@@ -4,7 +4,7 @@ pub(crate) mod control_flow;
 pub(crate) mod pool;
 
 use crate::IoFd;
-use crate::error::{IocpErrorContext, io_error, io_msg};
+use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::rio::{RioEnv, RioState};
 use std::io;
 use veloq_buf::FixedBuf;
@@ -25,7 +25,7 @@ pub(crate) struct RioSendToArgs<'a> {
 pub(crate) struct RioUdpStreamArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: HANDLE,
-    pub(crate) stream_op: &'a mut veloq_driver_core::op::UdpRecvStream<crate::RawHandle>,
+    pub(crate) stream_op: &'a mut veloq_driver_core::op::UdpRecvStream<crate::config::RawHandle>,
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
 }
@@ -36,8 +36,8 @@ impl RioState {
         args: RioSendToArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-    ) -> io::Result<crate::submit::SubmissionResult> {
-        use crate::submit::SubmissionResult;
+    ) -> io::Result<crate::ops::submit::SubmissionResult> {
+        use crate::ops::submit::SubmissionResult;
         use windows_sys::Win32::Networking::WinSock::{
             AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
         };
@@ -158,8 +158,8 @@ impl RioState {
         &mut self,
         args: RioUdpStreamArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::submit::SubmissionResult> {
-        use crate::submit::SubmissionResult;
+    ) -> io::Result<crate::ops::submit::SubmissionResult> {
+        use crate::ops::submit::SubmissionResult;
 
         let RioUdpStreamArgs {
             fd,

@@ -8,13 +8,13 @@
 //! This file represents datapath state machines only; lifecycle teardown is
 //! handled by dedicated shutdown logic in the lifecycle layer.
 
-use crate::OpLifecycle;
-use crate::SockAddrStorage;
-use crate::error::{IocpErrorContext, io_error, io_msg};
+use crate::common::{IocpErrorContext, io_error, io_msg};
+use crate::driver::OpLifecycle;
+use crate::net::addr::SockAddrStorage;
+use crate::ops::submit::SubmissionResult;
 use crate::rio::core::registry::RIO_INVALID_BUFFERID;
 use crate::rio::core::submit_ops::RioDispatch;
 use crate::rio::{RioCompletionContext, RioContext};
-use crate::submit::SubmissionResult;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::io;
@@ -447,7 +447,7 @@ impl UdpPoolManager {
                 &owned_datagram.addr as *const _ as *const u8,
                 owned_datagram.addr_len as usize,
             );
-            crate::to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+            crate::net::addr::to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
         };
 
         stream_op.result = Some(veloq_driver_core::op::UdpRecvDatagram {
@@ -479,7 +479,7 @@ impl UdpPoolManager {
                 &datagram.addr as *const _ as *const u8,
                 datagram.addr_len as usize,
             );
-            crate::to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+            crate::net::addr::to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
         };
 
         veloq_driver_core::op::UdpRecvDatagram {

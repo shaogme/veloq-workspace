@@ -11,7 +11,7 @@
 
 use crate::BufferRegistrationMode;
 use crate::IoFd;
-use crate::error::{IocpErrorContext, io_error, io_msg};
+use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::ext::Extensions;
 use crate::rio::{RioEnv, RioState};
 use std::io;
@@ -411,8 +411,8 @@ impl RioState {
         target: (IoFd, HANDLE, usize, u32),
         buf: &mut veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::submit::SubmissionResult> {
-        use crate::submit::SubmissionResult;
+    ) -> io::Result<crate::ops::submit::SubmissionResult> {
+        use crate::ops::submit::SubmissionResult;
         let (fd, handle, user_data, generation) = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {
@@ -444,8 +444,8 @@ impl RioState {
         target: (IoFd, HANDLE, usize, u32),
         buf: &veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::submit::SubmissionResult> {
-        use crate::submit::SubmissionResult;
+    ) -> io::Result<crate::ops::submit::SubmissionResult> {
+        use crate::ops::submit::SubmissionResult;
         let (fd, handle, user_data, generation) = target;
         let dispatch = self.kernel.dispatch;
         let env = RioEnv {
