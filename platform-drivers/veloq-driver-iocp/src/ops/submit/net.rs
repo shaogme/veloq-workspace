@@ -9,6 +9,7 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use crate::common::{IocpErrorContext, io_error};
 use crate::ext::Extensions;
+use crate::net::addr::SockAddrStorage;
 use crate::ops::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex, iocp_submit_connect_ex,
     iocp_submit_read, iocp_submit_write, resolve_fd,
@@ -167,58 +168,68 @@ pub(crate) unsafe fn submit_connect(
     }?;
 
     let mut need_bind = true;
-    // SAFETY: SOCKADDR_STORAGE is a POD type and zeroing it is safe.
-    let mut name: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
+    let mut storage = SockAddrStorage::default();
     let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
 
     // SAFETY: getsockname is safe to call with a valid socket and buffer.
     let ret = unsafe {
         getsockname(
             handle as SOCKET,
-            &mut name as *mut _ as *mut SOCKADDR,
+            &mut storage.0 as *mut _ as *mut SOCKADDR,
             &mut namelen,
         )
     };
 
     if ret == 0 {
-        let family = name.ss_family;
+        let family = storage.family();
         if family == AF_INET {
-            // SAFETY: name is verified to be AF_INET.
-            let addr_in = unsafe { &*(&name as *const _ as *const SOCKADDR_IN) };
-            if addr_in.sin_port != 0 {
-                need_bind = false;
+            let buf = unsafe {
+                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
+            };
+            if let Ok(SocketAddr::V4(a)) = crate::net::addr::to_socket_addr(buf) {
+                if a.port() != 0 {
+                    need_bind = false;
+                }
             }
         } else if family == AF_INET6 {
-            // SAFETY: name is verified to be AF_INET6.
-            let addr_in6 = unsafe { &*(&name as *const _ as *const SOCKADDR_IN6) };
-            if addr_in6.sin6_port != 0 {
-                need_bind = false;
+            let buf = unsafe {
+                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
+            };
+            if let Ok(SocketAddr::V6(a)) = crate::net::addr::to_socket_addr(buf) {
+                if a.port() != 0 {
+                    need_bind = false;
+                }
             }
         }
     }
 
     if need_bind {
-        let family = connect_op.addr.0.ss_family;
-        // SAFETY: SOCKADDR_IN is a POD type.
-        let mut bind_addr: SOCKADDR_IN = unsafe { std::mem::zeroed() };
-        bind_addr.sin_family = AF_INET;
-        // SAFETY: SOCKADDR_IN6 is a POD type.
-        let mut bind_addr6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
-        bind_addr6.sin6_family = AF_INET6;
-
-        let (ptr, len) = if family == AF_INET {
-            (
-                &bind_addr as *const _ as *const SOCKADDR,
-                std::mem::size_of::<SOCKADDR_IN>() as i32,
-            )
+        let family = connect_op.addr.family();
+        let (storage, len) = if family == AF_INET {
+            let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+            let s = crate::net::addr::SockAddrIn::new(&addr);
+            let mut storage = SockAddrStorage::default();
+            unsafe {
+                *(&mut storage.0 as *mut _ as *mut crate::net::addr::SockAddrIn) = s;
+            }
+            (storage, std::mem::size_of::<SOCKADDR_IN>() as i32)
         } else {
-            (
-                &bind_addr6 as *const _ as *const SOCKADDR,
-                std::mem::size_of::<SOCKADDR_IN6>() as i32,
-            )
+            let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+            let s = crate::net::addr::SockAddrIn6::new(&addr);
+            let mut storage = SockAddrStorage::default();
+            unsafe {
+                *(&mut storage.0 as *mut _ as *mut crate::net::addr::SockAddrIn6) = s;
+            }
+            (storage, std::mem::size_of::<SOCKADDR_IN6>() as i32)
         };
         // SAFETY: bind is safe to call with valid parameters for a new socket.
-        let bind_ret = unsafe { bind(handle as SOCKET, ptr, len) };
+        let bind_ret = unsafe {
+            bind(
+                handle as SOCKET,
+                &storage.0 as *const _ as *const SOCKADDR,
+                len,
+            )
+        };
         if bind_ret == SOCKET_ERROR {
             return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
         }
@@ -404,27 +415,11 @@ pub(crate) unsafe fn on_complete_accept(
     }
 
     if !remote_sockaddr.is_null() && remote_len > 0 {
-        // SAFETY: remote_sockaddr is verified to be non-null.
-        let family = unsafe { (*remote_sockaddr).sa_family };
-        if family == AF_INET {
-            // SAFETY: remote_sockaddr is verified to be AF_INET.
-            let addr_in = unsafe { &*(remote_sockaddr as *const SOCKADDR_IN) };
-            // SAFETY: S_un.S_addr is a POD field.
-            let ip = Ipv4Addr::from(unsafe { addr_in.sin_addr.S_un.S_addr.to_ne_bytes() });
-            let port = u16::from_be(addr_in.sin_port);
-            user.remote_addr = Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
-        } else if family == AF_INET6 {
-            // SAFETY: remote_sockaddr is verified to be AF_INET6.
-            let addr_in6 = unsafe { &*(remote_sockaddr as *const SOCKADDR_IN6) };
-            // SAFETY: sin6_addr.u.Byte is a POD field.
-            let ip = Ipv6Addr::from(unsafe { addr_in6.sin6_addr.u.Byte });
-            let port = u16::from_be(addr_in6.sin6_port);
-            let flowinfo = addr_in6.sin6_flowinfo;
-            // SAFETY: Anonymous.sin6_scope_id is a POD field.
-            let scope_id = unsafe { addr_in6.Anonymous.sin6_scope_id };
-            user.remote_addr = Some(SocketAddr::V6(SocketAddrV6::new(
-                ip, port, flowinfo, scope_id,
-            )));
+        let buf = unsafe {
+            std::slice::from_raw_parts(remote_sockaddr as *const u8, remote_len as usize)
+        };
+        if let Ok(addr) = crate::net::addr::to_socket_addr(buf) {
+            user.remote_addr = Some(addr);
         }
     }
     Ok(accept_socket_raw as usize)

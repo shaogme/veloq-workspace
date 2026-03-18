@@ -60,7 +60,7 @@ pub(crate) type Wakeup = WakeupBase<RawHandle>;
 
 /// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
-    pub(crate) port: &'a crate::common::IoCompletionPort,
+    pub(crate) port: &'a crate::win32::IoCompletionPort,
     pub(crate) overlapped: *mut windows_sys::Win32::System::IO::OVERLAPPED,
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_files: &'a [Option<HANDLE>],
@@ -330,7 +330,7 @@ define_iocp_ops! {
         construct: |user: std::ptr::NonNull<Accept>| {
             // SAFETY: user pointer is valid and points to a valid Accept.
             let op = unsafe { user.as_ref() };
-            let family = op.addr.0.ss_family;
+            let family = op.addr.family();
             // SAFETY: WSASocketW is called with valid parameters for IOCP.
             let socket = unsafe {
                 WSASocketW(
@@ -369,10 +369,9 @@ define_iocp_ops! {
             // SAFETY: user pointer is valid and points to a valid SendTo.
             let op = unsafe { user.as_ref() };
             let (addr, _raw_addr_len) = crate::net::addr::socket_addr_to_storage(op.addr);
-            let addr_len = if op.addr.is_ipv4() {
-                std::mem::size_of::<SOCKADDR_IN>() as i32
-            } else {
-                std::mem::size_of::<SOCKADDR_IN6>() as i32
+            let addr_len = match op.addr {
+                std::net::SocketAddr::V4(_) => std::mem::size_of::<SOCKADDR_IN>() as i32,
+                std::net::SocketAddr::V6(_) => std::mem::size_of::<SOCKADDR_IN6>() as i32,
             };
             SendToPayload {
                 user,

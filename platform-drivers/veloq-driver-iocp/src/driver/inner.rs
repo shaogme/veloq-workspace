@@ -28,7 +28,7 @@ use crate::rio::RioState;
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
-pub(crate) type PreInit = crate::common::IoCompletionPort;
+pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
 struct EmitContext<'a> {
     ops_shared: &'a Arc<SlotTable<IocpOp, OverlappedEntry>>,
@@ -38,7 +38,7 @@ struct EmitContext<'a> {
 
 /// The IOCP driver implementation that manages I/O completion ports and operations.
 pub struct IocpDriver {
-    pub(crate) port: Arc<crate::common::IoCompletionPort>,
+    pub(crate) port: Arc<crate::win32::IoCompletionPort>,
     pub(crate) ops: OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
@@ -71,7 +71,7 @@ impl IocpDriver {
 
     /// Creates a pre-initialization completion port handle.
     pub(crate) fn create_pre_init() -> io::Result<PreInit> {
-        crate::common::IoCompletionPort::new(0)
+        crate::win32::IoCompletionPort::new(0)
     }
 
     /// Creates a new IOCP driver instance.
@@ -138,7 +138,7 @@ impl IocpDriver {
         let status = status?;
 
         match status {
-            crate::common::CompletionStatus::Completed {
+            crate::win32::CompletionStatus::Completed {
                 bytes,
                 key,
                 overlapped,
@@ -165,7 +165,7 @@ impl IocpDriver {
                 trace!(user_data, bytes, "CQE received");
                 self.process_completion(user_data, success, error_code, bytes);
             }
-            crate::common::CompletionStatus::Timeout => {}
+            crate::win32::CompletionStatus::Timeout => {}
         }
         Ok(())
     }
@@ -188,7 +188,8 @@ impl IocpDriver {
     ) -> io::Result<usize> {
         if !overlapped.is_null() {
             // SAFETY: overlapped is non-null and corresponds to a valid OverlappedEntry.
-            let idx = unsafe { OverlappedEntry::user_data_from_ptr(overlapped) };
+            let id = unsafe { crate::win32::OverlappedId::from_ptr(overlapped) };
+            let idx = id.as_usize();
             if idx >= self.ops.local.len() {
                 debug!(idx, "Completed index out of bounds");
                 return Ok(usize::MAX - 2);
@@ -491,7 +492,7 @@ impl IocpDriver {
             let overlapped_ptr = guard.overlapped_ptr();
             let _ =
                 // SAFETY: handle and overlapped_ptr are valid for this operation.
-                unsafe { crate::common::IoCompletionPort::cancel_request(handle, overlapped_ptr) };
+                unsafe { crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr) };
         }
     }
 

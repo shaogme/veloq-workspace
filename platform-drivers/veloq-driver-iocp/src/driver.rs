@@ -88,7 +88,7 @@ pub(crate) type CompletionSidecar = CoreCompletionSidecar;
 // ============================================================================
 
 struct SubmitContextInternal<'a> {
-    port: &'a crate::common::IoCompletionPort,
+    port: &'a crate::win32::IoCompletionPort,
     wheel: &'a mut veloq_wheel::Wheel<usize>,
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable,
@@ -351,7 +351,7 @@ impl IocpDriver {
         let status = self.port.get_status(10)?;
 
         match status {
-            crate::common::CompletionStatus::Completed {
+            crate::win32::CompletionStatus::Completed {
                 bytes,
                 key,
                 overlapped,
@@ -369,12 +369,12 @@ impl IocpDriver {
 
                 if !overlapped.is_null() {
                     // SAFETY: overlapped pointer is guaranteed to be valid during IOCP completion.
-                    let user_data = unsafe { OverlappedEntry::user_data_from_ptr(overlapped) };
-                    self.process_completion(user_data, success, error_code, bytes);
+                    let id = unsafe { crate::win32::OverlappedId::from_ptr(overlapped) };
+                    self.process_completion(id.as_usize(), success, error_code, bytes);
                     return Ok(1);
                 }
             }
-            crate::common::CompletionStatus::Timeout => {}
+            crate::win32::CompletionStatus::Timeout => {}
         }
         Ok(0)
     }

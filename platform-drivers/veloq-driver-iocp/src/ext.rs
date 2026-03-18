@@ -3,7 +3,7 @@ use windows_sys::Win32::Networking::WinSock::{
     AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCK_STREAM,
     SOCKADDR, SOCKET, WSA_FLAG_OVERLAPPED, WSAID_ACCEPTEX, WSAID_CONNECTEX,
-    WSAID_GETACCEPTEXSOCKADDRS, WSAID_MULTIPLE_RIO, WSAIoctl, WSASocketW, closesocket,
+    WSAID_GETACCEPTEXSOCKADDRS, WSAID_MULTIPLE_RIO, WSAIoctl, WSASocketW,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -72,15 +72,13 @@ impl Extensions {
             if s == INVALID_SOCKET {
                 return Err(io::Error::last_os_error());
             }
-            s
+            crate::win32::SafeSocket(s)
         };
 
-        let traditional = Self::load_traditional(socket);
-        let rio = Self::load_rio(socket)?;
+        let traditional = Self::load_traditional(socket.as_raw());
+        let rio = Self::load_rio(socket.as_raw())?;
 
-        // SAFETY: `closesocket` is a standard Windows API to close a socket descriptor.
-        // The descriptor `socket` was just created and is valid.
-        unsafe { closesocket(socket) };
+        // SafeSocket will be dropped here and closesocket will be called automatically.
 
         let (accept_ex, connect_ex, get_accept_ex_sockaddrs) = traditional?;
 

@@ -176,7 +176,7 @@ pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::R
 /// The caller must ensure that `handle` is a valid file/socket handle.
 pub(crate) unsafe fn ensure_iocp_association(
     handle: HANDLE,
-    port: &crate::common::IoCompletionPort,
+    port: &crate::win32::IoCompletionPort,
     detail: impl Into<String>,
 ) -> io::Result<()> {
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.

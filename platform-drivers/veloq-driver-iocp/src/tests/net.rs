@@ -66,7 +66,7 @@ fn test_iocp_accept() {
     assert!(op.remote_addr.is_some(), "Remote addr should be populated");
     unsafe {
         if let Some(fd) = op.fd.raw() {
-            windows_sys::Win32::Networking::WinSock::closesocket(fd.handle as usize);
+            drop(Socket::from_raw(fd));
         }
     }
 }
@@ -108,7 +108,7 @@ fn test_iocp_connect() {
         std::time::Duration::from_secs(5),
     );
     assert!(res.is_ok(), "Connect failed: {:?}", res.err());
-    unsafe { windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize) };
+    unsafe { drop(Socket::from_raw(client_handle)) };
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn test_iocp_recv_with_buffer_pool() {
     op.buf.set_len(bytes_read);
     assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
-    unsafe { windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize) };
+    unsafe { drop(Socket::from_raw(client_handle)) };
     server_thread.join().unwrap();
 }
 
@@ -309,7 +309,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 
     let _ = tx_send.send(());
     server_thread.join().unwrap();
-    unsafe { windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize) };
+    unsafe { drop(Socket::from_raw(client_handle)) };
 }
 
 #[test]
@@ -418,7 +418,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     );
 
     server_thread.join().unwrap();
-    unsafe { windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize) };
+    unsafe { drop(Socket::from_raw(client_handle)) };
 }
 
 #[test]
@@ -548,8 +548,8 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
 
     unsafe {
-        windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize);
-        windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
+        drop(Socket::from_raw(client_handle));
+        drop(Socket::from_raw(server_handle));
     }
 }
 
@@ -685,8 +685,8 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
 
     unsafe {
-        windows_sys::Win32::Networking::WinSock::closesocket(client_handle.handle as usize);
-        windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
+        drop(Socket::from_raw(client_handle));
+        drop(Socket::from_raw(server_handle));
     }
 }
 
@@ -754,7 +754,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
     }
 
     unsafe {
-        windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
+        drop(Socket::from_raw(server_handle));
     }
 }
 
@@ -827,6 +827,6 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
     assert_eq!(stats.waiters_len, 0);
 
     unsafe {
-        windows_sys::Win32::Networking::WinSock::closesocket(server_handle.handle as usize);
+        drop(Socket::from_raw(server_handle));
     }
 }

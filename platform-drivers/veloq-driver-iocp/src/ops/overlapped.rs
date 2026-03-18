@@ -28,18 +28,6 @@ impl OverlappedEntry {
             blocking_result: None,
         }
     }
-
-    /// Recovers the `user_data` from a raw pointer to the `OVERLAPPED` structure.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the pointer was originally obtained via
-    /// `Slot<Initialized>::overlapped_ptr` or that it points to the `inner` field of
-    /// a valid `OverlappedEntry`.
-    pub(crate) unsafe fn user_data_from_ptr(ptr: *const OVERLAPPED) -> usize {
-        // SAFETY: The `inner` field is at the start of `OverlappedEntry` due to `#[repr(C)]`.
-        unsafe { (*(ptr as *const OverlappedEntry)).user_data }
-    }
 }
 
 impl Default for OverlappedEntry {
