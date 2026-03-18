@@ -53,6 +53,7 @@ let
     rust-analyzer
     clippy
     rustfmt
+    cargo-nextest
     pkg-config
     openssl.dev
 
