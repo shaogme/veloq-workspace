@@ -150,7 +150,7 @@ impl UringDriver {
         {
             let slot = &self.ops.shared.slots[user_data];
             unsafe {
-                *slot.op.get() = Some(op);
+                *slot.op_mut() = Some(op);
             }
         }
 
@@ -166,7 +166,7 @@ impl UringDriver {
             }
             Err(e) => {
                 let slot = &self.ops.shared.slots[user_data];
-                let op = unsafe { (*slot.op.get()).take().unwrap() };
+                let op = unsafe { slot.op_mut().take().unwrap() };
                 *op_in = Some(op);
                 binder.err(e)
             }
@@ -183,7 +183,7 @@ impl UringDriver {
         {
             let slot = &self.ops.shared.slots[user_data];
             unsafe {
-                *slot.op.get() = Some(op);
+                *slot.op_mut() = Some(op);
             }
         }
 
@@ -202,7 +202,7 @@ impl UringDriver {
             }
             Err(e) => {
                 let slot = &self.ops.shared.slots[user_data];
-                let op = unsafe { (*slot.op.get()).take().unwrap() };
+                let op = unsafe { slot.op_mut().take().unwrap() };
                 *op_in = Some(op);
                 binder.err(e)
             }

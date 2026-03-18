@@ -2,7 +2,7 @@ use crate::ops::{IocpOp, OverlappedEntry};
 use std::io;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
-use veloq_driver_core::slot::{ErasedPayload, SlotEntry, SlotTable};
+use veloq_driver_core::slot::{ErasedPayload, SlotEntry, SlotState as CoreState, SlotTable};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 mod sealed {
@@ -33,12 +33,7 @@ pub(crate) struct Slot<'a, State: SlotState> {
     _state: PhantomData<State>,
 }
 
-impl<'a, State: SlotState> Slot<'a, State> {
-    #[inline]
-    pub(crate) fn index(&self) -> usize {
-        self.index
-    }
-}
+impl<'a, State: SlotState> Slot<'a, State> {}
 
 impl<'a> Slot<'a, Pending> {
     #[inline]
@@ -46,6 +41,10 @@ impl<'a> Slot<'a, Pending> {
         entry: &'a SlotEntry<IocpOp, OverlappedEntry>,
         index: usize,
     ) -> Self {
+        // Ensure state is correct
+        entry
+            .state
+            .store(CoreState::Pending as u8, Ordering::Release);
         Self {
             entry,
             index,
@@ -59,17 +58,20 @@ impl<'a> Slot<'a, Pending> {
         user_data: usize,
         generation: u32,
     ) -> Slot<'a, Initialized> {
-        // SAFETY: We have exclusive access to the slot in Pending state, and it is not in flight.
+        // SAFETY: We have exclusive access to the slot in Pending state.
         unsafe {
-            let sidecar = &mut *self.entry.sidecar.get();
-            debug_assert!(!sidecar.in_flight, "Cannot init_op on an in-flight slot!");
-
-            *self.entry.op.get() = Some(op);
+            *self.entry.op_mut() = Some(op);
+            let sidecar = self.entry.sidecar_mut();
             sidecar.user_data = user_data;
             sidecar.generation = generation;
             sidecar.blocking_result = None;
             sidecar.in_flight = false;
         }
+
+        self.entry
+            .state
+            .store(CoreState::Initialized as u8, Ordering::Release);
+
         Slot {
             entry: self.entry,
             index: self.index,
@@ -79,20 +81,15 @@ impl<'a> Slot<'a, Pending> {
 }
 
 impl<'a> Slot<'a, Initialized> {
-    /// # Safety
-    ///
-    /// The caller must ensure that the slot is not being concurrently accessed in a way that
-    /// violates memory safety.
-    #[inline]
-    pub(crate) unsafe fn entry(&self) -> &'a SlotEntry<IocpOp, OverlappedEntry> {
-        self.entry
-    }
-
     pub(crate) fn start_submission(self) -> SubmissionGuard<'a> {
         // SAFETY: We have exclusive access to the slot in Initialized state.
         unsafe {
-            (*self.entry.sidecar.get()).in_flight = true;
+            self.entry.sidecar_mut().in_flight = true;
         }
+        self.entry
+            .state
+            .store(CoreState::InFlight as u8, Ordering::Release);
+
         SubmissionGuard {
             slot: self,
             persisted: false,
@@ -103,13 +100,13 @@ impl<'a> Slot<'a, Initialized> {
     where
         F: FnOnce(&mut IocpOp) -> R,
     {
-        // SAFETY: Slot is in Initialized state, so op must be present.
-        unsafe { (*self.entry().op.get()).as_mut().map(f) }
+        // SAFETY: Slot is in Initialized state, so op must be present and we have exclusive access.
+        unsafe { self.entry.op_mut().as_mut().map(f) }
     }
 
     pub(crate) fn overlapped_ptr(&self) -> *mut OVERLAPPED {
-        // SAFETY: Slot is in Initialized state, sidecar is valid.
-        unsafe { &mut (*self.entry().sidecar.get()).inner as *mut _ }
+        // SAFETY: Slot is in Initialized state, sidecar is valid and we have exclusive access.
+        unsafe { &mut self.entry.sidecar_mut().inner as *mut _ }
     }
 }
 
@@ -121,8 +118,7 @@ impl<'a> Slot<'a, InFlight> {
 
     #[inline]
     pub(crate) fn is_in_flight_entry(entry: &SlotEntry<IocpOp, OverlappedEntry>) -> bool {
-        // SAFETY: SlotEntry sidecar is always valid for read.
-        unsafe { (*entry.sidecar.get()).in_flight }
+        entry.state.load(Ordering::Acquire) == CoreState::InFlight as u8
     }
 
     /// # Safety
@@ -155,20 +151,15 @@ impl<'a> Slot<'a, InFlight> {
         }
     }
 
-    /// # Safety
-    ///
-    /// The caller must ensure that the slot is not being concurrently accessed in a way that
-    /// violates memory safety.
-    #[inline]
-    pub(crate) unsafe fn entry(&self) -> &'a SlotEntry<IocpOp, OverlappedEntry> {
-        self.entry
-    }
-
     pub(crate) fn complete(self) -> Slot<'a, Completed> {
         // SAFETY: We have exclusive access to the slot in InFlight state.
         unsafe {
-            (*self.entry.sidecar.get()).in_flight = false;
+            self.entry.sidecar_mut().in_flight = false;
         }
+        self.entry
+            .state
+            .store(CoreState::Completed as u8, Ordering::Release);
+
         Slot {
             entry: self.entry,
             index: self.index,
@@ -184,7 +175,7 @@ impl<'a> Slot<'a, InFlight> {
         F: FnOnce(&mut OverlappedEntry) -> R,
     {
         // SAFETY: The caller guarantees exclusive access to the sidecar.
-        unsafe { f(&mut *self.entry().sidecar.get()) }
+        unsafe { f(self.entry.sidecar_mut()) }
     }
 
     /// # Safety
@@ -195,27 +186,24 @@ impl<'a> Slot<'a, InFlight> {
         F: FnOnce(&mut IocpOp) -> R,
     {
         // SAFETY: The caller guarantees exclusive access to the op.
-        unsafe { (*self.entry().op.get()).as_mut().map(f) }
+        unsafe { self.entry.op_mut().as_mut().map(f) }
     }
 
     pub(crate) fn overlapped_ptr(&self) -> *mut OVERLAPPED {
         // SAFETY: Slot is in InFlight state, sidecar is valid.
-        unsafe { &mut (*self.entry().sidecar.get()).inner as *mut _ }
+        // While in flight, the kernel may access OVERLAPPED, but we may also need it for cancellation.
+        // The caller must coordinate with the kernel.
+        unsafe { &mut self.entry.sidecar_mut().inner as *mut _ }
     }
 }
 
 impl<'a> Slot<'a, Completed> {
-    /// # Safety
-    ///
-    /// The caller must ensure that the slot is not being concurrently accessed.
-    #[inline]
-    pub(crate) unsafe fn entry(&self) -> &'a SlotEntry<IocpOp, OverlappedEntry> {
-        self.entry
-    }
-
     pub(crate) fn reset(self) -> Slot<'a, Pending> {
         let generation = self.entry.generation.load(Ordering::Acquire);
         self.entry.reset(generation + 1);
+        self.entry
+            .state
+            .store(CoreState::Pending as u8, Ordering::Release);
         Slot {
             entry: self.entry,
             index: self.index,
@@ -225,7 +213,7 @@ impl<'a> Slot<'a, Completed> {
 
     pub(crate) fn take_op(&mut self) -> Option<IocpOp> {
         // SAFETY: Slot is in Completed state, we have exclusive access to take the op.
-        unsafe { (*self.entry().op.get()).take() }
+        unsafe { self.entry.op_mut().take() }
     }
 
     pub(crate) fn take_completion_data(
@@ -233,9 +221,8 @@ impl<'a> Slot<'a, Completed> {
     ) -> (Option<ErasedPayload>, Option<io::Result<usize>>) {
         // SAFETY: Slot is in Completed state, we have exclusive access.
         unsafe {
-            let entry = self.entry();
-            let payload = (*entry.payload.get()).take();
-            let detail = (*entry.result.get()).take();
+            let payload = self.entry.payload_mut().take();
+            let detail = self.entry.result_mut().take();
             (payload, detail)
         }
     }
@@ -251,9 +238,8 @@ impl<'a> SubmissionGuard<'a> {
     pub(crate) fn persist(mut self) -> Slot<'a, InFlight> {
         self.persisted = true;
         Slot {
-            // SAFETY: Slot is in Initialized state, entry is valid.
-            entry: unsafe { self.slot.entry() },
-            index: self.slot.index(),
+            entry: self.slot.entry,
+            index: self.slot.index,
             _state: PhantomData,
         }
     }
@@ -264,8 +250,12 @@ impl<'a> Drop for SubmissionGuard<'a> {
         if !self.persisted {
             // SAFETY: We have exclusive access to the slot during drop.
             unsafe {
-                (*self.slot.entry().sidecar.get()).in_flight = false;
+                self.slot.entry.sidecar_mut().in_flight = false;
             }
+            self.slot
+                .entry
+                .state
+                .store(CoreState::Initialized as u8, Ordering::Release);
         }
     }
 }

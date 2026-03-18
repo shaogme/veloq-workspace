@@ -2,7 +2,7 @@ use crate::SlotSidecar;
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 /// Manual payload container: raw pointer + static kind + drop fn.
 pub struct ErasedPayload {
@@ -30,14 +30,25 @@ impl Drop for ErasedPayload {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SlotState {
+    Free = 0,
+    Pending = 1,
+    Initialized = 2,
+    InFlight = 3,
+    Completed = 4,
+}
+
 #[derive(Debug)]
 pub struct SlotData<Op, S: SlotSidecar> {
     pub generation: AtomicU32,
     pub next_free: AtomicUsize,
-    pub op: UnsafeCell<Option<Op>>,
-    pub result: UnsafeCell<Option<std::io::Result<usize>>>,
-    pub payload: UnsafeCell<Option<ErasedPayload>>,
-    pub sidecar: UnsafeCell<S>,
+    pub state: AtomicU8,
+    op: UnsafeCell<Option<Op>>,
+    result: UnsafeCell<Option<std::io::Result<usize>>>,
+    payload: UnsafeCell<Option<ErasedPayload>>,
+    sidecar: UnsafeCell<S>,
 }
 
 unsafe impl<Op: Send, S: SlotSidecar> Sync for SlotData<Op, S> {}
@@ -49,6 +60,7 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
         Self {
             generation: AtomicU32::new(0),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
+            state: AtomicU8::new(SlotState::Free as u8),
             op: UnsafeCell::new(None),
             result: UnsafeCell::new(None),
             payload: UnsafeCell::new(None),
@@ -63,7 +75,48 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
             *self.payload.get() = None;
             *self.sidecar.get() = S::default();
         }
+        self.state.store(SlotState::Free as u8, Ordering::Release);
         self.generation.store(generation, Ordering::Release);
+    }
+
+    /// # Safety
+    ///
+    /// Caller must ensure exclusive access based on state.
+    #[inline]
+    pub unsafe fn op_mut(&self) -> &mut Option<Op> {
+        unsafe { &mut *self.op.get() }
+    }
+
+    /// # Safety
+    ///
+    /// Caller must ensure exclusive access based on state.
+    #[inline]
+    pub unsafe fn result_mut(&self) -> &mut Option<std::io::Result<usize>> {
+        unsafe { &mut *self.result.get() }
+    }
+
+    /// # Safety
+    ///
+    /// Caller must ensure exclusive access based on state.
+    #[inline]
+    pub unsafe fn payload_mut(&self) -> &mut Option<ErasedPayload> {
+        unsafe { &mut *self.payload.get() }
+    }
+
+    /// # Safety
+    ///
+    /// Caller must ensure exclusive access based on state.
+    #[inline]
+    pub unsafe fn sidecar_mut(&self) -> &mut S {
+        unsafe { &mut *self.sidecar.get() }
+    }
+
+    /// # Safety
+    ///
+    /// Caller must ensure state-based safety for reading.
+    #[inline]
+    pub unsafe fn sidecar_ref(&self) -> &S {
+        unsafe { &*self.sidecar.get() }
     }
 }
 

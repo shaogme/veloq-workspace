@@ -17,6 +17,7 @@ use veloq_driver_core::driver::{
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 use veloq_driver_core::op_registry::{AllocResult, OpHandle, OpRegistry};
+use veloq_driver_core::slot::SlotEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum OpLifecycle {
@@ -211,9 +212,12 @@ impl UringDriver {
     /// - Err(e): Fatal error (e.g. missing timer duration)
     pub(crate) fn submit_from_slot(&mut self, user_data: usize) -> io::Result<bool> {
         let (sqe_opt, strategy, duration_opt) = {
-            let slot = &self.ops.shared.slots[user_data];
+            let slot_ptr: *const SlotEntry<UringOp, ()> =
+                &self.ops.shared.slots[user_data] as *const _;
+            // SAFETY: Slot table is valid for the lifetime of the driver.
             unsafe {
-                if let Some(res) = (*slot.op.get()).as_mut() {
+                let slot = &*slot_ptr;
+                if let Some(res) = slot.op_mut().as_mut() {
                     let vtable = res.vtable.as_ref();
                     let strategy = vtable.strategy;
 
@@ -351,14 +355,17 @@ impl UringDriver {
 
             // Put op into slot
             unsafe {
-                *slot.op.get() = Some(uring_op);
+                *slot.op_mut() = Some(uring_op);
             }
 
             // Generate SQE
             let sqe = {
-                let slot = &self.ops.shared.slots[user_data];
+                let slot_ptr: *const SlotEntry<UringOp, ()> =
+                    &self.ops.shared.slots[user_data] as *const _;
+                // SAFETY: Slot table is valid for the lifetime of the driver.
                 unsafe {
-                    let op_ref = (*slot.op.get()).as_mut().unwrap();
+                    let slot = &*slot_ptr;
+                    let op_ref = slot.op_mut().as_mut().unwrap();
                     (op_ref.vtable.as_ref().make_sqe)(op_ref, self).user_data(user_data as u64)
                 }
             };
@@ -432,12 +439,12 @@ impl UringDriver {
                     let generation = {
                         let slot = &self.ops.shared.slots[user_data];
                         let generation = slot.generation.load(Ordering::Acquire);
-                        let _ = unsafe { (*slot.op.get()).take() };
+                        let _ = unsafe { slot.op_mut().take() };
                         generation
                     };
                     let slot = &self.ops.shared.slots[user_data];
-                    let payload = unsafe { (*slot.payload.get()).take() };
-                    let detail = unsafe { (*slot.result.get()).take() };
+                    let payload = unsafe { slot.payload_mut().take() };
+                    let detail = unsafe { slot.result_mut().take() };
                     self.push_completion_event(CompletionSidecar {
                         user_data,
                         generation,
@@ -498,8 +505,8 @@ impl UringDriver {
                     // Don't touch op if Cancelled
                     if matches!(op_state.lifecycle, OpLifecycle::Cancelled) {
                         let generation = slot.generation.load(Ordering::Acquire);
-                        let payload = unsafe { (*slot.payload.get()).take() };
-                        let detail = unsafe { (*slot.result.get()).take() };
+                        let payload = unsafe { slot.payload_mut().take() };
+                        let detail = unsafe { slot.result_mut().take() };
                         pending_events.push(CompletionSidecar {
                             user_data,
                             generation,
@@ -509,7 +516,7 @@ impl UringDriver {
                             detail,
                         });
                         unsafe {
-                            *slot.op.get() = None;
+                            *slot.op_mut() = None;
                         }
                         self.ops.remove(user_data);
                     } else {
@@ -517,7 +524,7 @@ impl UringDriver {
                         let res_val = cqe.result();
                         // Call on_complete
                         let final_res = unsafe {
-                            if let Some(op) = (*slot.op.get()).as_mut() {
+                            if let Some(op) = slot.op_mut().as_mut() {
                                 (op.vtable.as_ref().on_complete)(op, res_val)
                             } else {
                                 // Op missing? unexpected
@@ -532,11 +539,11 @@ impl UringDriver {
                         op_state.lifecycle = OpLifecycle::Completed;
                         let generation = slot.generation.load(Ordering::Acquire);
                         let res_code = io_result_to_event_res(&final_res);
-                        let mut detail = unsafe { (*slot.result.get()).take() };
+                        let mut detail = unsafe { slot.result_mut().take() };
                         if detail.is_none() {
                             detail = clone_result_if_non_os_error(&final_res);
                         }
-                        let payload = unsafe { (*slot.payload.get()).take() };
+                        let payload = unsafe { slot.payload_mut().take() };
                         pending_events.push(CompletionSidecar {
                             user_data,
                             generation,
@@ -545,7 +552,7 @@ impl UringDriver {
                             payload,
                             detail,
                         });
-                        let _ = unsafe { (*slot.op.get()).take() };
+                        let _ = unsafe { slot.op_mut().take() };
                         self.ops.remove(user_data);
                     }
                 }
@@ -634,7 +641,7 @@ impl UringDriver {
                         // Check if op exists in slot
                         let slot = &self.ops.shared.slots[user_data];
                         // SAFETY: Pending state implies Driver owns Op
-                        if unsafe { (*slot.op.get()).is_some() } {
+                        if unsafe { slot.op_mut().is_some() } {
                             BacklogAction::Submit
                         } else {
                             BacklogAction::Drop
@@ -786,12 +793,12 @@ impl UringDriver {
                     let generation = {
                         let slot = &self.ops.shared.slots[user_data];
                         let generation = slot.generation.load(Ordering::Acquire);
-                        let _ = unsafe { (*slot.op.get()).take() };
+                        let _ = unsafe { slot.op_mut().take() };
                         generation
                     };
                     let slot = &self.ops.shared.slots[user_data];
-                    let payload = unsafe { (*slot.payload.get()).take() };
-                    let detail = unsafe { (*slot.result.get()).take() };
+                    let payload = unsafe { slot.payload_mut().take() };
+                    let detail = unsafe { slot.result_mut().take() };
                     self.push_completion_event(CompletionSidecar {
                         user_data,
                         generation,
@@ -814,12 +821,12 @@ impl UringDriver {
                         let generation = {
                             let slot = &self.ops.shared.slots[user_data];
                             let generation = slot.generation.load(Ordering::Acquire);
-                            let _ = unsafe { (*slot.op.get()).take() };
+                            let _ = unsafe { slot.op_mut().take() };
                             generation
                         };
                         let slot = &self.ops.shared.slots[user_data];
-                        let payload = unsafe { (*slot.payload.get()).take() };
-                        let detail = unsafe { (*slot.result.get()).take() };
+                        let payload = unsafe { slot.payload_mut().take() };
+                        let detail = unsafe { slot.result_mut().take() };
                         self.push_completion_event(CompletionSidecar {
                             user_data,
                             generation,

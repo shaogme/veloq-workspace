@@ -361,9 +361,9 @@ impl IocpDriver {
         if let Err(e) = &io_result
             && e.raw_os_error().is_none()
         {
-            // SAFETY: slot.result.get() is a valid pointer.
+            // SAFETY: Slot is being processed; exclusively owned.
             unsafe {
-                *slot.result.get() = Some(Err(io::Error::new(e.kind(), e.to_string())));
+                *slot.result_mut() = Some(Err(io::Error::new(e.kind(), e.to_string())));
             }
         }
         io_result
@@ -466,8 +466,8 @@ impl IocpDriver {
             // SAFETY: Slot is verified to be in-flight before cancellation.
             unsafe { Slot::<InFlight>::as_inflight_entry(slot, user_data) };
 
-        // SAFETY: slot.op.get() is a valid pointer.
-        if let Some(res) = unsafe { &mut *slot.op.get() }
+        // SAFETY: Exclusive access is guaranteed by the InFlight state or being on the same thread.
+        if let Some(res) = unsafe { slot.op_mut() }
             && let Some(fd) = res.get_fd()
             && let Ok(handle) = submit::resolve_fd(fd, ctx.registered_files)
         {
@@ -514,9 +514,9 @@ impl IocpDriver {
         } else {
             // SAFETY: Exclusively owning the slot through generation check or state.
             unsafe {
-                let _ = (*slot.op.get()).take();
-                let payload = (*slot.payload.get()).take();
-                let detail = (*slot.result.get()).take();
+                let _ = slot.op_mut().take();
+                let payload = slot.payload_mut().take();
+                let detail = slot.result_mut().take();
                 slot.reset(generation.wrapping_add(1));
                 (payload, detail)
             }

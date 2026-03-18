@@ -61,6 +61,20 @@ impl CompletionCell {
             waker: AtomicWaker::new(),
         }
     }
+
+    /// # Safety
+    ///
+    /// Caller must ensure exclusive access.
+    unsafe fn payload_mut(&self) -> &mut Option<slot::ErasedPayload> {
+        unsafe { &mut *self.payload.get() }
+    }
+
+    /// # Safety
+    ///
+    /// Caller must ensure exclusive access.
+    unsafe fn detail_mut(&self) -> &mut Option<io::Result<usize>> {
+        unsafe { &mut *self.detail.get() }
+    }
 }
 
 pub struct CompletionRecord {
@@ -98,13 +112,13 @@ impl CompletionTable {
         let cell = &self.cells[idx];
         if cell.ready.swap(false, Ordering::AcqRel) {
             unsafe {
-                let _ = (*cell.payload.get()).take();
-                let _ = (*cell.detail.get()).take();
+                let _ = cell.payload_mut().take();
+                let _ = cell.detail_mut().take();
             }
         }
         unsafe {
-            *cell.payload.get() = payload;
-            *cell.detail.get() = detail;
+            *cell.payload_mut() = payload;
+            *cell.detail_mut() = detail;
         }
         cell.res.store(event.res, Ordering::Release);
         cell.flags.store(event.flags, Ordering::Release);
@@ -140,8 +154,8 @@ impl CompletionTable {
         {
             return None;
         }
-        let payload = unsafe { (*cell.payload.get()).take() };
-        let detail = unsafe { (*cell.detail.get()).take() };
+        let payload = unsafe { cell.payload_mut().take() };
+        let detail = unsafe { cell.detail_mut().take() };
         Some(CompletionRecord {
             event: CompletionEvent {
                 user_data: token,
