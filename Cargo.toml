@@ -14,7 +14,8 @@ members = [
     "utils/veloq-bitset",
     "utils/veloq-wheel", 
     "utils/veloq-blocking",
-    "utils/veloq-pod",
+    "utils/veloq-pod", 
+    "test-utils/xtest-runner",
 ]
 default-members = [
     "veloq-runtime",
@@ -30,6 +31,7 @@ default-members = [
     "utils/veloq-wheel",
     "utils/veloq-blocking",
     "utils/veloq-pod",
+    "test-utils/xtest-runner",
 ]
 resolver = "3"
 

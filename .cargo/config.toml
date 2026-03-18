@@ -1,6 +1,6 @@
-[alias]
-xtest-linux = "nextest run --workspace --exclude veloq-driver-iocp --test-threads 1 --run-ignored all"
-xtest-windows = "nextest run --workspace --exclude veloq-driver-uring --test-threads 1 --run-ignored all"
+﻿[alias]
+xtest-linux = "run --package xtest-runner -- --target linux --count 20 --quiet"
+xtest-windows = "run --package xtest-runner -- --target windows --count 20 --quiet"
 xfmt = "fmt --all -- --check"
 xclippy = "clippy --all-targets -- -D warnings"
 xcheck = "check"
