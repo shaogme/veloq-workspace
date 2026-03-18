@@ -160,6 +160,15 @@ impl SafeSocket {
         }
         Ok(())
     }
+
+    /// Sets a socket option with an empty payload.
+    pub fn setsockopt_empty(&self, level: i32, optname: i32) -> io::Result<()> {
+        let ret = unsafe { setsockopt(self.0, level, optname, std::ptr::null(), 0) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SafeSocket {

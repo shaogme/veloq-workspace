@@ -1,10 +1,11 @@
 use std::io;
+use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use veloq_pod::{bytes_of_mut, from_bytes_mut};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, bind,
-    getsockname, setsockopt,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET,
 };
 
 use crate::common::{IocpErrorContext, io_error};
@@ -19,10 +20,19 @@ use crate::ops::{
     UdpRecvStream, UdpRefill,
 };
 use crate::rio::RioTarget;
+use crate::win32::SafeSocket;
 
 // ============================================================================
 // Network Operations
 // ============================================================================
+
+fn with_borrowed_socket<T>(
+    raw: SOCKET,
+    f: impl FnOnce(&SafeSocket) -> io::Result<T>,
+) -> io::Result<T> {
+    let socket = ManuallyDrop::new(SafeSocket(raw));
+    f(&socket)
+}
 
 pub(crate) fn submit_recv(
     header: &mut OverlappedEntry,
@@ -151,16 +161,11 @@ pub(crate) fn submit_connect(
     let mut storage = SockAddrStorage::default();
     let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
 
-    // SAFETY: getsockname is safe to call with a valid socket and buffer.
-    let ret = unsafe {
-        getsockname(
-            handle as SOCKET,
-            &mut storage.0 as *mut _ as *mut SOCKADDR,
-            &mut namelen,
-        )
-    };
-
-    if ret == 0 {
+    if with_borrowed_socket(handle as SOCKET, |socket| {
+        socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen)
+    })
+    .is_ok()
+    {
         let family = storage.family();
         if family == AF_INET {
             let buf = unsafe {
@@ -189,30 +194,24 @@ pub(crate) fn submit_connect(
             let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
             let s = crate::net::addr::SockAddrIn::new(&addr);
             let mut storage = SockAddrStorage::default();
-            unsafe {
-                *(&mut storage.0 as *mut _ as *mut crate::net::addr::SockAddrIn) = s;
-            }
+            let sin_ref = from_bytes_mut::<crate::net::addr::SockAddrIn>(
+                &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN>()],
+            );
+            *sin_ref = s;
             (storage, std::mem::size_of::<SOCKADDR_IN>() as i32)
         } else {
             let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
             let s = crate::net::addr::SockAddrIn6::new(&addr);
             let mut storage = SockAddrStorage::default();
-            unsafe {
-                *(&mut storage.0 as *mut _ as *mut crate::net::addr::SockAddrIn6) = s;
-            }
+            let sin6_ref = from_bytes_mut::<crate::net::addr::SockAddrIn6>(
+                &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN6>()],
+            );
+            *sin6_ref = s;
             (storage, std::mem::size_of::<SOCKADDR_IN6>() as i32)
         };
-        // SAFETY: bind is safe to call with valid parameters for a new socket.
-        let bind_ret = unsafe {
-            bind(
-                handle as SOCKET,
-                &storage.0 as *const _ as *const SOCKADDR,
-                len,
-            )
-        };
-        if bind_ret == SOCKET_ERROR {
-            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
-        }
+        with_borrowed_socket(handle as SOCKET, |socket| {
+            socket.bind(&storage.0 as *const _ as *const SOCKADDR, len)
+        })?;
     }
 
     let mut bytes_sent = 0;
@@ -243,19 +242,9 @@ pub(crate) unsafe fn on_complete_connect(
     // SAFETY: The caller guarantees that payload is valid.
     let connect_op = unsafe { payload.user.as_ref() };
     if let Some(fd) = connect_op.fd.raw() {
-        // SAFETY: setsockopt is safe to call after ConnectEx completion to update socket context.
-        let ret = unsafe {
-            setsockopt(
-                fd.handle as SOCKET,
-                SOL_SOCKET,
-                SO_UPDATE_CONNECT_CONTEXT,
-                std::ptr::null(),
-                0,
-            )
-        };
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        with_borrowed_socket(fd.handle as SOCKET, |socket| {
+            socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
+        })?;
     }
     Ok(result)
 }
@@ -340,20 +329,12 @@ pub(crate) unsafe fn on_complete_accept(
     let listen_socket = listen_handle.handle as SOCKET;
     let accept_socket_raw = accept_socket.handle as SOCKET;
 
-    // SAFETY: setsockopt is safe to call after AcceptEx Completion.
-    let ret = unsafe {
-        setsockopt(
-            accept_socket_raw,
-            SOL_SOCKET,
-            SO_UPDATE_ACCEPT_CONTEXT,
-            &listen_socket as *const _ as *const _,
-            std::mem::size_of::<SOCKET>() as i32,
-        )
-    };
-    if ret != 0 {
+    if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
+        socket.setsockopt(SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_socket)
+    }) {
         return Err(io_error(
             IocpErrorContext::Submission,
-            io::Error::last_os_error(),
+            e,
             format!(
                 "on_complete_accept: setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed: accept_socket=0x{:x}, listen_socket=0x{:x}, optlen={}",
                 accept_socket_raw,

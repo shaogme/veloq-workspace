@@ -1,60 +1,38 @@
 use std::io;
+use std::mem::offset_of;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use veloq_driver_core::net::SocketAddrCodec;
-use veloq_pod::{Pod, Zeroable, bytes_of_mut, from_bytes, from_bytes_mut, zeroed};
+use veloq_pod::{Pod, Zeroable, bytes_of, bytes_of_mut, from_bytes, from_bytes_mut, zeroed};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
 };
 
-/// Helper trait for safe access to SOCKADDR_IN union fields.
-trait SockAddrInExt {
-    fn s_addr(&self) -> u32;
-    fn set_s_addr(&mut self, addr: u32);
+const SOCKADDR_IN_S_ADDR_OFFSET: usize = offset_of!(SOCKADDR_IN, sin_addr);
+const SOCKADDR_IN6_ADDR_BYTES_OFFSET: usize = offset_of!(SOCKADDR_IN6, sin6_addr);
+const SOCKADDR_IN6_SCOPE_ID_OFFSET: usize = offset_of!(SOCKADDR_IN6, Anonymous);
+
+fn read_u32_ne(bytes: &[u8], offset: usize) -> u32 {
+    const SIZE: usize = std::mem::size_of::<u32>();
+    let mut raw = [0u8; SIZE];
+    raw.copy_from_slice(&bytes[offset..offset + SIZE]);
+    u32::from_ne_bytes(raw)
 }
 
-impl SockAddrInExt for SOCKADDR_IN {
-    fn s_addr(&self) -> u32 {
-        // SAFETY: sin_addr.S_un is a union, accessing S_addr is safe for AF_INET.
-        unsafe { self.sin_addr.S_un.S_addr }
-    }
-
-    fn set_s_addr(&mut self, addr: u32) {
-        // SAFETY: sin_addr.S_un is a union, setting S_addr is safe for AF_INET.
-        // In modern Rust, writing to a Copy union field is safe.
-        self.sin_addr.S_un.S_addr = addr;
-    }
+fn write_u32_ne(bytes: &mut [u8], offset: usize, value: u32) {
+    const SIZE: usize = std::mem::size_of::<u32>();
+    let raw = value.to_ne_bytes();
+    bytes[offset..offset + SIZE].copy_from_slice(&raw);
 }
 
-/// Helper trait for safe access to SOCKADDR_IN6 union fields.
-trait SockAddrIn6Ext {
-    fn scope_id(&self) -> u32;
-    fn set_scope_id(&mut self, id: u32);
-    fn addr_bytes(&self) -> [u8; 16];
-    fn set_addr_bytes(&mut self, bytes: [u8; 16]);
+fn read_ipv6_bytes(bytes: &[u8], offset: usize) -> [u8; 16] {
+    const SIZE: usize = 16;
+    let mut raw = [0u8; SIZE];
+    raw.copy_from_slice(&bytes[offset..offset + SIZE]);
+    raw
 }
 
-impl SockAddrIn6Ext for SOCKADDR_IN6 {
-    fn scope_id(&self) -> u32 {
-        // SAFETY: sin6.Anonymous is a union, accessing sin6_scope_id is safe for AF_INET6.
-        unsafe { self.Anonymous.sin6_scope_id }
-    }
-
-    fn set_scope_id(&mut self, id: u32) {
-        // SAFETY: sin6.Anonymous is a union, setting sin6_scope_id is safe for AF_INET6.
-        // In modern Rust, writing to a Copy union field is safe.
-        self.Anonymous.sin6_scope_id = id;
-    }
-
-    fn addr_bytes(&self) -> [u8; 16] {
-        // SAFETY: sin6_addr.u is a union, accessing Byte is safe.
-        unsafe { self.sin6_addr.u.Byte }
-    }
-
-    fn set_addr_bytes(&mut self, bytes: [u8; 16]) {
-        // SAFETY: sin6_addr.u is a union, setting Byte is safe.
-        // In modern Rust, writing to a Copy union field is safe.
-        self.sin6_addr.u.Byte = bytes;
-    }
+fn write_ipv6_bytes(bytes: &mut [u8], offset: usize, value: [u8; 16]) {
+    bytes[offset..offset + value.len()].copy_from_slice(&value);
 }
 
 /// A storage wrapper for socket addresses.
@@ -93,16 +71,19 @@ impl SockAddrIn {
     /// Creates a new SockAddrIn from a SocketAddrV4.
     pub fn new(addr: &SocketAddrV4) -> Self {
         let mut sin_wrapped: SockAddrIn = zeroed();
-        let sin = &mut sin_wrapped.0;
-        sin.sin_family = AF_INET;
-        sin.sin_port = addr.port().to_be();
-        sin.set_s_addr(u32::from_ne_bytes(addr.ip().octets()));
+        sin_wrapped.0.sin_family = AF_INET;
+        sin_wrapped.0.sin_port = addr.port().to_be();
+        write_u32_ne(
+            bytes_of_mut(&mut sin_wrapped),
+            SOCKADDR_IN_S_ADDR_OFFSET,
+            u32::from_ne_bytes(addr.ip().octets()),
+        );
         sin_wrapped
     }
 
     /// Converts to a standard library SocketAddrV4.
     pub fn to_std(&self) -> SocketAddrV4 {
-        let s_addr = self.0.s_addr();
+        let s_addr = read_u32_ne(bytes_of(self), SOCKADDR_IN_S_ADDR_OFFSET);
         let ip = Ipv4Addr::from(u32::from_be(s_addr));
         let port = u16::from_be(self.0.sin_port);
         SocketAddrV4::new(ip, port)
@@ -122,22 +103,29 @@ impl SockAddrIn6 {
     /// Creates a new SockAddrIn6 from a SocketAddrV6.
     pub fn new(addr: &SocketAddrV6) -> Self {
         let mut sin6_wrapped: SockAddrIn6 = zeroed();
-        let sin6 = &mut sin6_wrapped.0;
-        sin6.sin6_family = AF_INET6;
-        sin6.sin6_port = addr.port().to_be();
-        sin6.set_addr_bytes(addr.ip().octets());
-        sin6.sin6_flowinfo = addr.flowinfo();
-        sin6.set_scope_id(addr.scope_id());
+        sin6_wrapped.0.sin6_family = AF_INET6;
+        sin6_wrapped.0.sin6_port = addr.port().to_be();
+        write_ipv6_bytes(
+            bytes_of_mut(&mut sin6_wrapped),
+            SOCKADDR_IN6_ADDR_BYTES_OFFSET,
+            addr.ip().octets(),
+        );
+        sin6_wrapped.0.sin6_flowinfo = addr.flowinfo();
+        write_u32_ne(
+            bytes_of_mut(&mut sin6_wrapped),
+            SOCKADDR_IN6_SCOPE_ID_OFFSET,
+            addr.scope_id(),
+        );
         sin6_wrapped
     }
 
     /// Converts to a standard library SocketAddrV6.
     pub fn to_std(&self) -> SocketAddrV6 {
-        let addr_bytes = self.0.addr_bytes();
+        let addr_bytes = read_ipv6_bytes(bytes_of(self), SOCKADDR_IN6_ADDR_BYTES_OFFSET);
         let ip = Ipv6Addr::from(addr_bytes);
         let port = u16::from_be(self.0.sin6_port);
         let flowinfo = self.0.sin6_flowinfo;
-        let scope_id = self.0.scope_id();
+        let scope_id = read_u32_ne(bytes_of(self), SOCKADDR_IN6_SCOPE_ID_OFFSET);
         SocketAddrV6::new(ip, port, flowinfo, scope_id)
     }
 }
