@@ -22,7 +22,7 @@ use crate::common::{
 };
 use crate::config::{BufferRegistrationMode, IocpConfig};
 use crate::driver::{CompletionSidecar, IocpOpState, OpLifecycle};
-use crate::ops::slot_ext::IocpSlotExt;
+use crate::ops::slot::{InFlight, Slot};
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
 use crate::rio::RioState;
 
@@ -261,23 +261,22 @@ impl IocpDriver {
         op.platform_data.lifecycle = OpLifecycle::Completed;
 
         let slot = &ops.shared.slots[user_data];
-        // SAFETY: Resetting in-flight status before cleanup.
-        unsafe { slot.set_in_flight(false) };
+        let mut guard =
+            unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) }.complete();
 
         let generation = slot.generation.load(Ordering::Acquire);
         // SAFETY: Slot is being processed for timer expiration; exclusively owned.
-        let (payload, detail) = unsafe {
-            slot.take_op();
-            slot.take_completion_data()
-        };
+        let _ = guard.take_op();
+        let (payload_erased, detail) = guard.take_completion_data();
         pending_events.push(CompletionSidecar {
             user_data,
             generation,
             res: 0,
             flags: 0,
-            payload,
+            payload: payload_erased,
             detail,
         });
+        let _ = guard.reset();
         let _ = std::mem::take(&mut op.platform_data);
         ops.shared.push_free(user_data);
     }
@@ -307,7 +306,7 @@ impl IocpDriver {
 
         let io_result = {
             let slot = &self.ops.shared.slots[user_data];
-            self.calculate_io_result(slot, success, error_code, bytes_transferred)
+            self.calculate_io_result(user_data, slot, success, error_code, bytes_transferred)
         };
 
         let op = &mut self.ops.local[user_data];
@@ -322,7 +321,8 @@ impl IocpDriver {
 
     fn calculate_io_result(
         &self,
-        slot: &SlotTableEntry<IocpOp, OverlappedEntry>,
+        user_data: usize,
+        slot: &SlotEntry<IocpOp, OverlappedEntry>,
         success: bool,
         error_code: Option<u32>,
         bytes_transferred: u32,
@@ -332,16 +332,24 @@ impl IocpDriver {
         } else {
             Ok(bytes_transferred as usize)
         };
+
+        let mut guard = unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) };
+
+        // SAFETY: InFlight state grants sidecar mutable access.
+        let blocking_res =
+            unsafe { guard.with_sidecar_mut_unchecked(|s| s.blocking_result.take()) };
+
         // SAFETY: op is checked for presence.
-        if let Some(iocp_op) = unsafe { &mut *slot.op.get() } {
-            // SAFETY: Safe access via IocpSlotExt.
-            let blocking_res = unsafe { slot.with_sidecar_mut(|s| s.blocking_result.take()) };
-            if let Some(res) = blocking_res {
-                io_result = res;
-            } else if let Ok(val) = io_result {
-                io_result = iocp_op.on_complete(val, &self.extensions);
-            }
-        }
+        unsafe {
+            guard.with_op_mut_unchecked(|iocp_op: &mut IocpOp| {
+                if let Some(res) = blocking_res {
+                    io_result = res;
+                } else if let Ok(val) = io_result {
+                    io_result = iocp_op.on_complete(val, &self.extensions);
+                }
+            })
+        };
+
         if let Err(e) = &io_result
             && e.raw_os_error().is_none()
         {
@@ -357,7 +365,7 @@ impl IocpDriver {
         ctx: EmitContext<'_>,
         user_data: usize,
         op: &mut OpEntry<IocpOpState>,
-        slot: &SlotTableEntry<IocpOp, OverlappedEntry>,
+        slot: &SlotEntry<IocpOp, OverlappedEntry>,
         slot_generation: u32,
         io_result: io::Result<usize>,
     ) {
@@ -367,22 +375,18 @@ impl IocpDriver {
                 let completion_res = io_result_to_event_res(&io_result);
                 op.platform_data.rio_pool_waiting = false;
 
-                // SAFETY: Operation completion received; safe to reset in-flight flag.
-                unsafe { slot.set_in_flight(false) };
+                let mut guard =
+                    unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) }.complete();
 
                 if op.platform_data.is_background {
-                    // SAFETY: Cleaning up background op slots.
-                    unsafe {
-                        slot.take_op();
-                        slot.take_completion_data();
-                    }
+                    let _ = guard.take_op();
+                    let _ = guard.take_completion_data();
                     let _data = std::mem::take(&mut op.platform_data);
                     ctx.ops_shared.push_free(user_data);
                 } else {
                     op.platform_data.lifecycle = OpLifecycle::Completed;
                     if !(was_cancelled && op.platform_data.rio_needs_drain) {
-                        // SAFETY: Taking completion data using Trait.
-                        let (payload, detail) = unsafe { slot.take_completion_data() };
+                        let (payload, detail) = guard.take_completion_data();
                         push_completion_shared(
                             ctx.completion_events,
                             ctx.completion_table,
@@ -397,8 +401,7 @@ impl IocpDriver {
                         );
                     }
                     if !op.platform_data.rio_needs_drain || op.platform_data.rio_drained {
-                        // SAFETY: Taking values from UnsafeCells after ensuring the IO is finished.
-                        unsafe { slot.take_op() };
+                        let _ = guard.take_op();
                         let _data = std::mem::take(&mut op.platform_data);
                         ctx.ops_shared.push_free(user_data);
                     }
@@ -448,8 +451,10 @@ impl IocpDriver {
         ctx: CancelContext<'_>,
         user_data: usize,
         op: &mut OpEntry<IocpOpState>,
-        slot: &SlotTableEntry<IocpOp, OverlappedEntry>,
+        slot: &SlotEntry<IocpOp, OverlappedEntry>,
     ) {
+        let guard = unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) };
+
         // SAFETY: slot.op.get() is a valid pointer.
         if let Some(res) = unsafe { &mut *slot.op.get() }
             && let Some(fd) = res.get_fd()
@@ -473,7 +478,7 @@ impl IocpDriver {
             }
 
             // SAFETY: `overlapped_ptr()` provides a valid overlapped pointer for `cancel_request`.
-            let overlapped_ptr = unsafe { slot.overlapped_ptr() };
+            let overlapped_ptr = guard.overlapped_ptr();
             let _ =
                 unsafe { crate::common::IoCompletionPort::cancel_request(handle, overlapped_ptr) };
         }
@@ -483,16 +488,16 @@ impl IocpDriver {
         ctx: EmitContext<'_>,
         user_data: usize,
         op: &mut OpEntry<IocpOpState>,
-        slot: &SlotTableEntry<IocpOp, OverlappedEntry>,
+        slot: &SlotEntry<IocpOp, OverlappedEntry>,
     ) {
         op.platform_data.lifecycle = OpLifecycle::Completed;
         let generation = slot.generation.load(Ordering::Acquire);
-        // SAFETY: Extracting completion data and removing op from slot.
-        let (payload, detail) = unsafe {
-            slot.set_in_flight(false);
-            slot.take_op();
-            slot.take_completion_data()
-        };
+
+        let mut guard =
+            unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) }.complete();
+        let _ = guard.take_op();
+        let (payload, detail) = guard.take_completion_data();
+
         push_completion_shared(
             ctx.completion_events,
             ctx.completion_table,
@@ -507,6 +512,7 @@ impl IocpDriver {
         );
         let _data = std::mem::take(&mut op.platform_data);
         ctx.ops_shared.push_free(user_data);
+        let _ = guard.reset();
     }
 
     pub(crate) fn wake(&self) -> io::Result<()> {
@@ -521,8 +527,6 @@ impl IocpDriver {
         })
     }
 }
-
-type SlotTableEntry<Op, Sidecar> = SlotEntry<Op, Sidecar>;
 
 struct CancelContext<'a> {
     registered_files: &'a [Option<HANDLE>],

@@ -6,11 +6,10 @@
 //! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
 pub(crate) mod overlapped;
-pub(crate) mod slot_ext;
+pub(crate) mod slot;
 pub(crate) mod submit;
 
 pub use overlapped::OverlappedEntry;
-pub(crate) use slot_ext::IocpSlotExt;
 pub(crate) use submit::SubmissionResult;
 
 use std::io;

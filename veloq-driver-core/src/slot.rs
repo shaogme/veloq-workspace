@@ -31,7 +31,7 @@ impl Drop for ErasedPayload {
 }
 
 #[derive(Debug)]
-pub struct Slot<Op, S: SlotSidecar> {
+pub struct SlotData<Op, S: SlotSidecar> {
     pub generation: AtomicU32,
     pub next_free: AtomicUsize,
     pub op: UnsafeCell<Option<Op>>,
@@ -40,9 +40,9 @@ pub struct Slot<Op, S: SlotSidecar> {
     pub sidecar: UnsafeCell<S>,
 }
 
-unsafe impl<Op: Send, S: SlotSidecar> Sync for Slot<Op, S> {}
+unsafe impl<Op: Send, S: SlotSidecar> Sync for SlotData<Op, S> {}
 
-impl<Op, S: SlotSidecar> Slot<Op, S> {
+impl<Op, S: SlotSidecar> SlotData<Op, S> {
     const NULL_INDEX: usize = usize::MAX;
 
     pub fn new() -> Self {
@@ -67,13 +67,13 @@ impl<Op, S: SlotSidecar> Slot<Op, S> {
     }
 }
 
-impl<Op, S: SlotSidecar> Default for Slot<Op, S> {
+impl<Op, S: SlotSidecar> Default for SlotData<Op, S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub type SlotEntry<Op, S> = CachePadded<Slot<Op, S>>;
+pub type SlotEntry<Op, S> = CachePadded<SlotData<Op, S>>;
 
 pub struct SlotTable<Op, S: SlotSidecar> {
     pub slots: Box<[SlotEntry<Op, S>]>,
@@ -89,7 +89,7 @@ impl<Op, S: SlotSidecar> SlotTable<Op, S> {
     pub fn new(capacity: usize) -> Self {
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            slots.push(CachePadded::new(Slot::new()));
+            slots.push(CachePadded::new(SlotData::new()));
         }
         Self {
             slots: slots.into_boxed_slice(),

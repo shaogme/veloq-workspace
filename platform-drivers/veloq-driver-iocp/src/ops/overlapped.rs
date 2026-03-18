@@ -34,7 +34,7 @@ impl OverlappedEntry {
     /// # Safety
     ///
     /// The caller must ensure that the pointer was originally obtained via
-    /// `IocpSlotExt::overlapped_ptr` or that it points to the `inner` field of
+    /// `Slot<Initialized>::overlapped_ptr` or that it points to the `inner` field of
     /// a valid `OverlappedEntry`.
     pub(crate) unsafe fn user_data_from_ptr(ptr: *const OVERLAPPED) -> usize {
         // SAFETY: The `inner` field is at the start of `OverlappedEntry` due to `#[repr(C)]`.

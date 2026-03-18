@@ -3,7 +3,7 @@
 use crate::IoFd;
 use crate::driver::{IocpOpState, OpLifecycle};
 use crate::ops::IocpOp;
-use crate::ops::slot_ext::IocpSlotExt;
+use crate::ops::slot::{InFlight, Slot};
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpCtxGuard;
 use crate::rio::core::registry::RioRegistry;
@@ -138,26 +138,26 @@ impl<'a> RioCompletionRouter<'a> {
                                 flags: 0,
                             };
 
-                            // SAFETY: IO completed; safe to reset in-flight status.
-                            unsafe { slot.set_in_flight(false) };
+                            let mut guard = unsafe {
+                                Slot::<InFlight>::assume_in_flight_entry(slot, user_data)
+                            }
+                            .complete();
+                            let (payload, detail) = guard.take_completion_data();
 
-                            // SAFETY: IO completed; safe to take data using IocpSlotExt.
-                            let (payload, detail) = unsafe { slot.take_completion_data() };
                             self.comp
                                 .table
                                 .record_completion_with_data(event, payload, detail);
                             self.comp.events.push(event);
-                            unsafe { slot.take_op() };
+                            let _ = guard.take_op();
                             let _ = std::mem::take(&mut op.platform_data);
                             self.comp.ops.shared.push_free(user_data);
                         } else if matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled) {
-                            // SAFETY: IO completed after cancellation; safe to cleanup.
-                            unsafe {
-                                slot.set_in_flight(false);
-                                slot.take_completion_data();
-                                slot.take_op();
+                            let mut guard = unsafe {
+                                Slot::<InFlight>::assume_in_flight_entry(slot, user_data)
                             }
-
+                            .complete();
+                            let _ = guard.take_completion_data();
+                            let _ = guard.take_op();
                             let _ = std::mem::take(&mut op.platform_data);
                             self.comp.ops.shared.push_free(user_data);
                         }

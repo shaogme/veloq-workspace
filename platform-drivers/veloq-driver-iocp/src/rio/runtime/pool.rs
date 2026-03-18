@@ -11,8 +11,9 @@
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::driver::OpLifecycle;
 use crate::net::addr::SockAddrStorage;
+use crate::ops::IocpOpPayload;
+use crate::ops::slot::{InFlight, Slot};
 use crate::ops::submit::SubmissionResult;
-use crate::ops::{IocpOpPayload, IocpSlotExt};
 use crate::rio::core::registry::RIO_INVALID_BUFFERID;
 use crate::rio::core::submit_ops::RioDispatch;
 use crate::rio::{RioCompletionContext, RioContext};
@@ -21,7 +22,7 @@ use std::collections::VecDeque;
 use std::io;
 use veloq_buf::FixedBuf;
 use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
-use veloq_driver_core::op::UdpRecvStream;
+
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIO_BUFFERID, RIORESULT, WSAGetLastError};
 
@@ -433,17 +434,24 @@ impl UdpPoolManager {
             return false;
         }
 
-        let Some(iocp_op) = (unsafe { &mut *slot.op.get() }).as_mut() else {
-            return false;
+        let mut guard = unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) };
+        let datagram_len = datagram.as_ref().unwrap().buf.len();
+
+        let stream_op = unsafe {
+            guard.with_op_mut_unchecked(|iocp_op| {
+                if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
+                    Some(kernel.user.as_mut())
+                } else {
+                    None
+                }
+            })
         };
 
-        let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload else {
+        let Some(stream_op) = stream_op else {
             return false;
         };
-        let stream_op: &mut UdpRecvStream<crate::RawHandle> = unsafe { kernel.user.as_mut() };
 
         let owned_datagram = datagram.take().unwrap();
-        let datagram_len = owned_datagram.buf.len();
 
         let addr = unsafe {
             let s = std::slice::from_raw_parts(
@@ -466,17 +474,14 @@ impl UdpPoolManager {
             flags: 0,
         };
 
-        // SAFETY: IO completed from pool; safe to reset in-flight status and take data.
-        unsafe {
-            slot.set_in_flight(false);
-        }
+        let mut guard =
+            unsafe { Slot::<InFlight>::assume_in_flight_entry(slot, user_data) }.complete();
+        let (payload, detail) = guard.take_completion_data();
 
-        let payload = unsafe { (*slot.payload.get()).take() };
-        let detail = unsafe { (*slot.result.get()).take() };
         comp.table
             .record_completion_with_data(event, payload, detail);
         comp.events.push(event);
-        let _ = unsafe { slot.take_op() };
+        let _ = guard.take_op();
         let _ = std::mem::take(&mut op.platform_data);
         comp.ops.shared.push_free(user_data);
         true

@@ -58,7 +58,7 @@ CROSS_SKIP_AUTO_UPDATE=1 cross test --target x86_64-pc-windows-gnu
 如果你在 Windows 环境下开发，**必须**使用 Docker 来运行 Linux 目标的编译和测试（**严禁**直接运行 `cargo xtest-linux`）：
 
 ```bash
-docker-compose run --rm dev sh -c "cargo install cargo-nextest --locked && cargo xtest-linux"
+docker-compose run --rm dev sh -c "cargo xtest-linux"
 ```
 
 

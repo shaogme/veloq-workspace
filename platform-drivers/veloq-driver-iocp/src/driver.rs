@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use veloq_blocking::{BlockingTask, get_blocking_pool};
 #[cfg(feature = "test-hooks")]
@@ -18,12 +17,12 @@ use veloq_driver_core::driver::{
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
-use veloq_driver_core::slot::{SlotEntry, SlotTable};
+use veloq_driver_core::slot::SlotTable;
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::config::{IoFd, RawHandle};
-use crate::ops::slot_ext::IocpSlotExt;
+use crate::ops::slot::{InFlight, Initialized, Pending, Slot};
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 pub use inner::IocpDriver;
 use inner::RIO_EVENT_KEY;
@@ -105,32 +104,22 @@ impl IocpDriver {
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
         user_data: usize,
         op: IocpOp,
-    ) -> io::Result<(
-        &SlotEntry<IocpOp, OverlappedEntry>,
-        &mut IocpOp,
-        &mut OpEntry<IocpOpState>,
-        *mut OVERLAPPED,
-    )> {
-        let (slot, op_entry) = ops
+    ) -> io::Result<(Slot<'_, Initialized>, &mut OpEntry<IocpOpState>)> {
+        let (slot_entry, op_entry) = ops
             .get_slot_and_entry_mut(user_data)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Op not found"))?;
 
-        let generation = slot.generation.load(Ordering::Acquire);
-        // SAFETY: Initializing slot with op and sidecar data.
-        unsafe { slot.init_op(op, user_data, generation) };
+        let generation = slot_entry.generation.load(Ordering::Acquire);
+        let mut guard = Slot::<Pending>::pending_entry(slot_entry, user_data)
+            .init_op(op, user_data, generation);
 
-        // SAFETY: `init_op` ensures `self.op` is `Some`.
-        let op_ref = unsafe {
-            (*slot.op.get())
-                .as_mut()
-                .ok_or_else(|| io::Error::other("Failed to get op ref"))?
-        };
-        op_ref.header.user_data = user_data;
-        op_ref.header.generation = generation;
+        guard.with_op_mut(|op_ref| {
+            op_ref.header.user_data = user_data;
+            op_ref.header.generation = generation;
+        });
         op_entry.platform_data.generation = generation;
 
-        let overlapped_ptr = unsafe { slot.overlapped_ptr() };
-        Ok((slot, op_ref, op_entry, overlapped_ptr))
+        Ok((guard, op_entry))
     }
 
     fn handle_offload(
@@ -145,17 +134,15 @@ impl IocpDriver {
         }
         if get_blocking_pool().execute(task).is_err() {
             let err = io::Error::other("Thread pool overloaded");
-            if let Some((slot, _)) = ops.get_slot_and_entry_mut(user_data) {
-                let generation = slot.generation.load(Ordering::Acquire);
-                // SAFETY: Cleaning up slot and extracting completion data.
-                let (payload, detail) = unsafe {
-                    slot.set_in_flight(false);
-                    slot.take_op();
-                    slot.take_completion_data()
-                };
+            if let Some((slot_entry, _)) = ops.get_slot_and_entry_mut(user_data) {
+                let mut guard =
+                    unsafe { Slot::<InFlight>::assume_in_flight_entry(slot_entry, user_data) }
+                        .complete();
+                let (payload, detail) = guard.take_completion_data();
+                let _ = guard.take_op();
                 let sidecar = CompletionSidecar {
                     user_data,
-                    generation,
+                    generation: slot_entry.generation.load(Ordering::Acquire),
                     res: -err.raw_os_error().unwrap_or(1).abs(),
                     flags: 0,
                     payload,
@@ -192,12 +179,11 @@ impl IocpDriver {
             }
             Ok(submit::SubmissionResult::PostToQueue) => {
                 if let Err(err) = ctx.port.notify(user_data) {
-                    if let Some((slot, _)) = ops.get_slot_and_entry_mut(user_data) {
-                        // SAFETY: Taking the op from slot. Reset in-flight first.
-                        unsafe {
-                            slot.set_in_flight(false);
-                            *op_in = slot.take_op();
-                        }
+                    if ops.contains(user_data) {
+                        let mut guard =
+                            unsafe { Slot::<InFlight>::assume_in_flight(&ops.shared, user_data) }
+                                .complete();
+                        *op_in = guard.take_op();
                     }
                     ops.remove(user_data);
                     binder.err(err)
@@ -226,9 +212,11 @@ impl IocpDriver {
                 binder.ok(Poll::Pending)
             }
             Err(e) => {
-                if let Some((slot, _)) = ops.get_slot_and_entry_mut(user_data) {
-                    // SAFETY: Taking the op from slot.
-                    *op_in = unsafe { slot.take_op() };
+                if ops.contains(user_data) {
+                    let mut guard =
+                        unsafe { Slot::<InFlight>::assume_in_flight(&ops.shared, user_data) }
+                            .complete();
+                    *op_in = guard.take_op();
                 }
                 ops.remove(user_data);
                 binder.err(e)
@@ -247,15 +235,14 @@ impl IocpDriver {
             .get_page_slice(0)
             .ok_or_else(|| io::Error::other("Failed to get page slice"))?;
 
-        let (slot, op_ref, _, overlapped_ptr) = Self::prep_op_slot(&mut self.ops, user_data, op)?;
-        let guard = crate::ops::slot_ext::InFlightGuard::new(slot);
+        let (mut guard, _) = Self::prep_op_slot(&mut self.ops, user_data, op)?;
 
-        let is_rio_pool_waiting =
-            matches!(op_ref.payload, crate::ops::IocpOpPayload::UdpRecvStream(_));
+        let is_rio_pool_waiting = guard
+            .with_op_mut(|op| matches!(op.payload, crate::ops::IocpOpPayload::UdpRecvStream(_)));
 
         let mut ctx = SubmitContext {
             port: self.port.as_ref(),
-            overlapped: overlapped_ptr,
+            overlapped: guard.overlapped_ptr(),
             ext: &self.extensions,
             registered_files: &self.registered_files,
             registrar: self.registrar.as_ref(),
@@ -264,11 +251,13 @@ impl IocpDriver {
             slab_resolver: &|idx| (idx == 0).then_some((slab_ptr, slab_len)),
         };
 
-        let result = op_ref.submit(&mut ctx);
+        let mut sub_guard = guard.start_submission();
+        let result = sub_guard.slot.with_op_mut(|op| op.submit(&mut ctx));
 
         if result.is_ok() {
-            guard.persist();
+            sub_guard.persist();
         }
+
         Ok((is_rio_pool_waiting, result))
     }
 
@@ -495,9 +484,10 @@ impl Driver for IocpDriver {
                 op_entry.platform_data.lifecycle = OpLifecycle::InFlight;
             }
             Err(e) => {
-                if let Some((slot, _)) = self.ops.get_slot_and_entry_mut(user_data) {
-                    // SAFETY: Taking the op from slot.
-                    let _ = unsafe { slot.take_op() };
+                if let Some((slot_entry, _)) = self.ops.get_slot_and_entry_mut(user_data) {
+                    unsafe {
+                        let _ = (*slot_entry.op.get()).take();
+                    }
                 }
                 self.ops.remove(user_data);
                 return Err(e);
