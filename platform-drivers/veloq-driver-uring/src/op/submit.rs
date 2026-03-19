@@ -1,18 +1,9 @@
-//! io_uring Operation Submission Implementations (Static Functions)
-//!
-//! This module implements the logic for submitting operations and handling completions,
-//! exposed as static functions for VTable construction.
-
-use crate::IoFd;
-use crate::UringDriver;
+use crate::config::IoFd;
+use crate::driver::UringDriver;
 use crate::op::UringOp;
 use io_uring::{opcode, squeue, types};
 use std::io;
 use std::mem::ManuallyDrop;
-
-// ============================================================================
-// Macros
-// ============================================================================
 
 macro_rules! impl_lifecycle {
     ($drop_fn:ident, $variant:ident, direct_fd) => {
@@ -50,10 +41,6 @@ macro_rules! impl_default_completion {
     };
 }
 
-// ============================================================================
-// ReadFixed / WriteFixed
-// ============================================================================
-
 macro_rules! make_rw_fixed {
     ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path) => {
         pub(crate) unsafe fn $fn_name(op: &mut UringOp, driver: &mut UringDriver) -> squeue::Entry {
@@ -63,7 +50,6 @@ macro_rules! make_rw_fixed {
             let ptr = rw_op.buf.as_mut_ptr();
             let len = rw_op.buf.capacity() as u32;
 
-            // Check if chunk is actually registered in kernel
             let is_registered = if region_info.id != u16::MAX {
                 driver
                     .registered_chunks
@@ -84,7 +70,6 @@ macro_rules! make_rw_fixed {
                         .build(),
                 }
             } else {
-                // Fallback to standard IO (or if region is MAX)
                 match rw_op.fd {
                     IoFd::Raw(fd) => $type_raw(types::Fd(fd.fd), ptr, len)
                         .offset(rw_op.offset)
@@ -104,7 +89,6 @@ macro_rules! make_rw_fixed {
             let ptr = rw_op.buf.as_slice().as_ptr();
             let len = rw_op.buf.len() as u32;
 
-            // Check if chunk is actually registered in kernel
             let is_registered = if region_info.id != u16::MAX {
                 driver
                     .registered_chunks
@@ -157,10 +141,6 @@ impl_lifecycle!(drop_read_fixed, read, direct_fd);
 
 impl_default_completion!(on_complete_write_fixed);
 impl_lifecycle!(drop_write_fixed, write, direct_fd);
-
-// ============================================================================
-// Recv / Send / Connect / Accept
-// ============================================================================
 
 macro_rules! make_buf_op {
     ($fn_name:ident, $field:ident, $opcode:path, recv_args) => {
@@ -266,14 +246,13 @@ pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Re
     if result >= 0 {
         let payload = unsafe { &mut *op.payload.accept };
         let accept_op = unsafe { payload.user.as_mut() };
-        // Try fallback parsing to populate remote_addr early
         let addr_bytes = unsafe {
             std::slice::from_raw_parts(
                 &accept_op.addr.0 as *const _ as *const u8,
                 accept_op.addr_len as usize,
             )
         };
-        if let Ok(addr) = crate::to_socket_addr(addr_bytes) {
+        if let Ok(addr) = crate::net::to_socket_addr(addr_bytes) {
             accept_op.remote_addr = Some(addr);
         }
         Ok(result as usize)
@@ -284,10 +263,6 @@ pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Re
 
 impl_lifecycle!(drop_accept, accept, nested_fd);
 
-// ============================================================================
-// SendTo
-// ============================================================================
-
 pub(crate) unsafe fn make_sqe_send_to(
     op: &mut UringOp,
     _driver: &mut UringDriver,
@@ -295,7 +270,6 @@ pub(crate) unsafe fn make_sqe_send_to(
     let payload = unsafe { &mut *op.payload.send_to };
     let user = unsafe { payload.user.as_ref() };
 
-    // Initialize internal pointers
     payload.iovec[0].iov_base = user.buf.as_slice().as_ptr() as *mut _;
     payload.iovec[0].iov_len = user.buf.len();
 
@@ -303,7 +277,6 @@ pub(crate) unsafe fn make_sqe_send_to(
     payload.msghdr.msg_namelen = payload.msg_namelen;
     payload.msghdr.msg_iov = payload.iovec.as_mut_ptr();
     payload.msghdr.msg_iovlen = 1;
-    // msg_control already zeroed
 
     match user.fd {
         IoFd::Raw(fd) => {
@@ -318,10 +291,6 @@ pub(crate) unsafe fn make_sqe_send_to(
 impl_default_completion!(on_complete_send_to);
 impl_lifecycle!(drop_send_to, send_to, nested_fd);
 
-// ============================================================================
-// UDP Recv Stream
-// ============================================================================
-
 pub(crate) unsafe fn make_sqe_udp_recv_stream(
     op: &mut UringOp,
     _driver: &mut UringDriver,
@@ -334,7 +303,6 @@ pub(crate) unsafe fn make_sqe_udp_recv_stream(
         .as_mut()
         .expect("udp_recv_stream requires a buffer on io_uring");
 
-    // Initialize internal pointers
     payload.iovec[0].iov_base = recv_buf.as_mut_ptr() as *mut _;
     payload.iovec[0].iov_len = recv_buf.capacity();
 
@@ -363,7 +331,7 @@ pub(crate) unsafe fn on_complete_udp_recv_stream(
         let len = payload.msghdr.msg_namelen as usize;
         let addr_bytes =
             unsafe { std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len) };
-        if let Ok(addr) = crate::to_socket_addr(addr_bytes) {
+        if let Ok(addr) = crate::net::to_socket_addr(addr_bytes) {
             user.addr = Some(addr);
         }
         Ok(result as usize)
@@ -384,10 +352,6 @@ pub(crate) unsafe fn make_sqe_udp_refill(
 impl_default_completion!(on_complete_udp_refill);
 impl_lifecycle!(drop_udp_refill, udp_refill, direct_fd);
 
-// ============================================================================
-// Close
-// ============================================================================
-
 pub(crate) unsafe fn make_sqe_close(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
     let kernel = unsafe { &mut *op.payload.close };
     let close_op = unsafe { kernel.user.as_mut() };
@@ -399,10 +363,6 @@ pub(crate) unsafe fn make_sqe_close(op: &mut UringOp, _driver: &mut UringDriver)
 
 impl_default_completion!(on_complete_close);
 impl_lifecycle!(drop_close, close, direct_fd);
-
-// ============================================================================
-// Fsync
-// ============================================================================
 
 pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
     let kernel = unsafe { &mut *op.payload.fsync };
@@ -421,10 +381,6 @@ pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp, _driver: &mut UringDriver)
 
 impl_default_completion!(on_complete_fsync);
 impl_lifecycle!(drop_fsync, fsync, direct_fd);
-
-// ============================================================================
-// SyncFileRange
-// ============================================================================
 
 pub(crate) unsafe fn make_sqe_sync_range(
     op: &mut UringOp,
@@ -447,10 +403,6 @@ pub(crate) unsafe fn make_sqe_sync_range(
 impl_default_completion!(on_complete_sync_range);
 impl_lifecycle!(drop_sync_range, sync_range, direct_fd);
 
-// ============================================================================
-// Fallocate
-// ============================================================================
-
 pub(crate) unsafe fn make_sqe_fallocate(
     op: &mut UringOp,
     _driver: &mut UringDriver,
@@ -472,10 +424,6 @@ pub(crate) unsafe fn make_sqe_fallocate(
 impl_default_completion!(on_complete_fallocate);
 impl_lifecycle!(drop_fallocate, fallocate, direct_fd);
 
-// ============================================================================
-// Open
-// ============================================================================
-
 pub(crate) unsafe fn make_sqe_open(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.open };
     let user = unsafe { payload.user.as_ref() };
@@ -488,10 +436,6 @@ pub(crate) unsafe fn make_sqe_open(op: &mut UringOp, _driver: &mut UringDriver) 
 
 impl_default_completion!(on_complete_open);
 impl_lifecycle!(drop_open, open, no_fd);
-
-// ============================================================================
-// Timeout
-// ============================================================================
 
 pub(crate) unsafe fn make_sqe_timeout(
     op: &mut UringOp,
@@ -510,10 +454,6 @@ pub(crate) unsafe fn make_sqe_timeout(
 impl_default_completion!(on_complete_timeout);
 impl_lifecycle!(drop_timeout, timeout, no_fd);
 
-// ============================================================================
-// Wakeup
-// ============================================================================
-
 pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
     let payload = unsafe { &mut *op.payload.wakeup };
     let user = unsafe { payload.user.as_ref() };
@@ -525,10 +465,6 @@ pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp, _driver: &mut UringDriver
 
 impl_default_completion!(on_complete_wakeup);
 impl_lifecycle!(drop_wakeup, wakeup, no_fd);
-
-// ============================================================================
-// VTable Helpers
-// ============================================================================
 
 pub(crate) unsafe fn get_timeout_timeout(op: &UringOp) -> Option<std::time::Duration> {
     let payload = unsafe { &*op.payload.timeout };

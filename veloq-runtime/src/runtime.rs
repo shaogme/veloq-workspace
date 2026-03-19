@@ -80,13 +80,13 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
     pub fn build(self) -> std::io::Result<Runtime<T>> {
         let worker_count = self
             .config
-            .worker_threads
+            .worker_threads_opt()
             .map(|w| w.get())
             .unwrap_or(num_cpus::get());
         debug!("Building Runtime with {} workers", worker_count);
 
         // Initialize the blocking pool
-        init_blocking_pool(self.config.blocking_pool.clone());
+        init_blocking_pool(self.config.blocking_pool_config().clone());
 
         // Step 1: Initialize Pool Strategy State
         let state = self.topology.init(worker_count)?;
@@ -99,7 +99,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             worker: Worker<Runnable>,
         }
 
-        let queue_capacity = self.config.internal_queue_capacity;
+        let queue_capacity = self.config.queue_capacity();
 
         // 1. Initialize Resources per Worker (Functional / Pipeline)
         let (handles, workers): (Vec<_>, Vec<_>) = (0..worker_count)

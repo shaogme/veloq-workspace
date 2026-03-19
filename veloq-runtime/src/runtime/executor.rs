@@ -133,7 +133,7 @@ impl LocalExecutorBuilder {
             // Default state is RUNNING
             let state = Arc::new(AtomicU8::new(RUNNING));
 
-            let queue_capacity = self.config.internal_queue_capacity;
+            let queue_capacity = self.config.queue_capacity();
 
             let shared = Arc::new(ExecutorShared {
                 pinned: pinned_tx,
@@ -170,9 +170,9 @@ impl LocalExecutorBuilder {
         let buf_pool = pool_constructor(registrar);
 
         #[cfg(target_os = "linux")]
-        let registration_mode = self.config.uring.registration_mode;
+        let registration_mode = self.config.get_uring().registration_mode;
         #[cfg(target_os = "windows")]
-        let registration_mode = self.config.iocp.registration_mode;
+        let registration_mode = self.config.get_iocp().registration_mode;
 
         LocalExecutor {
             driver,

@@ -1,58 +1,29 @@
-use io_uring::{IoUring, opcode, squeue};
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use io_uring::{IoUring, squeue};
+use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::task::Poll;
+use std::time::Instant;
 
 use tracing::{debug, trace};
 
 use crate::op::{SubmissionStrategy, UringOp};
-use crate::{BufferRegistrationMode, IoFd, IoMode, RawHandle, UringConfig};
+use crate::config::{BufferRegistrationMode, IoFd, IoMode, RawHandle, UringConfig};
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionSidecar, CompletionTable, RemoteWaker, SharedCompletionQueue,
-    SharedCompletionTable, encode_completion_token,
+    CompletionEvent, CompletionSidecar, CompletionTable, Driver, Outcome, RemoteWaker,
+    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, encode_completion_token,
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
-use veloq_driver_core::op_registry::{AllocResult, OpHandle, OpRegistry};
+use veloq_driver_core::op_registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum OpLifecycle {
-    /// Created, waiting to be submitted
-    Pending,
-    /// Submitted to ring or timer wheel
-    InFlight,
-    /// Completion arrived (result is in Slot)
-    #[default]
-    Completed,
-    /// Aborted by user
-    Cancelled,
-}
+mod lifecycle;
+mod registration;
 
-#[derive(Clone)]
-pub struct UringOpState {
-    pub(crate) lifecycle: OpLifecycle,
-    pub(crate) next: Option<usize>,
-    pub(crate) timer_id: Option<veloq_wheel::TaskId>,
-}
-
-impl Default for UringOpState {
-    fn default() -> Self {
-        Self {
-            lifecycle: OpLifecycle::Completed,
-            next: None,
-            timer_id: None,
-        }
-    }
-}
-
-impl UringOpState {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-}
+pub(crate) use lifecycle::OpLifecycle;
+pub use lifecycle::UringOpState;
+pub(crate) use registration::{MAX_CHUNKS, UringRegistrationStats};
 
 pub(crate) struct EventFd {
     pub(crate) fd: RawFd,
@@ -93,17 +64,6 @@ impl RemoteWaker for UringWaker {
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 pub(crate) const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
-pub(crate) const MAX_CHUNKS: usize = 1024;
-const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct UringRegistrationStats {
-    pub(crate) chunk_register_attempts: u64,
-    pub(crate) chunk_register_success: u64,
-    pub(crate) chunk_register_failures: u64,
-    pub(crate) chunk_register_skipped_recent_failure: u64,
-    pub(crate) submission_missing_chunk_info: u64,
-}
 
 pub struct UringDriver {
     pub(crate) ring: IoUring,
@@ -125,7 +85,7 @@ pub struct UringDriver {
     pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
-    chunk_register_failures_recent: HashMap<u16, Instant>,
+    pub(crate) chunk_register_failures_recent: HashMap<u16, Instant>,
 }
 
 impl UringDriver {
@@ -195,8 +155,6 @@ impl UringDriver {
             MAX_CHUNKS
         ];
 
-        // We ignore errors here? Or warn?
-        // If this fails, then subsequent register_chunk will likely fail or revert to slow path.
         if let Err(e) = unsafe { driver.ring.submitter().register_buffers(&iovecs) } {
             tracing::warn!("Failed to register sparse buffers: {}", e);
         }
@@ -204,11 +162,6 @@ impl UringDriver {
         Ok(driver)
     }
 
-    /// Tries to submit the op at `user_data` to the ring or timer wheel.
-    /// Returns:
-    /// - Ok(true): Submitted (SQE pushed or Timer started)
-    /// - Ok(false): SQ Full (SQE not pushed)
-    /// - Err(e): Fatal error (e.g. missing timer duration)
     pub(crate) fn submit_from_slot(&mut self, user_data: usize) -> io::Result<bool> {
         let op_ptr = self
             .ops
@@ -222,7 +175,6 @@ impl UringDriver {
         if op_ptr.is_null() {
             return Err(io::Error::other("Op missing in slot"));
         }
-        // SAFETY: pointer comes from slot-owned storage and op is not moved while generating SQE.
         let op = unsafe { &mut *op_ptr };
         let vtable = unsafe { op.vtable.as_ref() };
         let strategy = vtable.strategy;
@@ -240,7 +192,7 @@ impl UringDriver {
                         && let Some(info) = self.registrar.resolve_chunk_info(chunk_id)
                     {
                         if let Err(e) =
-                            self.register_chunk(info.id, info.ptr.as_ptr(), info.len.get())
+                            self.register_chunk_internal(info.id, info.ptr.as_ptr(), info.len.get())
                         {
                             if self.registration_mode.is_strict() {
                                 panic!(
@@ -323,7 +275,7 @@ impl UringDriver {
             <Wakeup<RawHandle> as IntoPlatformOp<UringOp>>::into_kernel_and_payload(op);
 
         let state = UringOpState {
-            lifecycle: OpLifecycle::Pending, // Will change to InFlight below
+            lifecycle: OpLifecycle::Pending,
             next: None,
             timer_id: None,
         };
@@ -345,7 +297,6 @@ impl UringDriver {
                 },
             );
 
-            // Generate SQE
             let op_ptr = self
                 .ops
                 .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
@@ -356,7 +307,6 @@ impl UringDriver {
                 })
                 .unwrap_or(std::ptr::null_mut());
             assert!(!op_ptr.is_null(), "waker op missing in slot");
-            // SAFETY: pointer comes from slot-owned storage and remains stable in place.
             let op = unsafe { &mut *op_ptr };
             let sqe =
                 unsafe { (op.vtable.as_ref().make_sqe)(op, self).user_data(user_data as u64) };
@@ -369,7 +319,6 @@ impl UringDriver {
                 self.push_backlog(user_data);
             }
         } else {
-            // Should not happen during init unless 0 entries
             panic!("Failed to reserve waker slot");
         }
     }
@@ -387,7 +336,7 @@ impl UringDriver {
         Ok(())
     }
 
-    pub(crate) fn wait(&mut self) -> io::Result<()> {
+    pub(crate) fn wait_internal(&mut self) -> io::Result<()> {
         self.flush_cancellations();
         self.flush_backlog();
 
@@ -503,7 +452,6 @@ impl UringDriver {
                         OpLifecycle::Cancelled
                     );
 
-                    // Don't touch op if Cancelled
                     if is_cancelled {
                         let generation = self.ops.shared.slots[user_data]
                             .generation
@@ -530,9 +478,7 @@ impl UringDriver {
                         );
                         self.ops.remove(user_data);
                     } else {
-                        // Standard completion
                         let res_val = cqe.result();
-                        // Call on_complete
                         let final_res = self
                             .ops
                             .with_slot_storage_mut(
@@ -596,7 +542,6 @@ impl UringDriver {
         if needs_waker_resubmit {
             self.is_waked.store(false, Ordering::Release);
             if let Some(token) = self.waker_token.take() {
-                // Remove existing waker op/slot
                 self.ops.remove(token);
             }
             self.waker_payload = None;
@@ -623,286 +568,6 @@ impl UringDriver {
 
         debug!("SQ full even after flush");
         false
-    }
-
-    pub(crate) fn flush_cancellations(&mut self) {
-        let mut submitted_count = 0;
-        let limit = self.pending_cancellations.len();
-
-        while submitted_count < limit {
-            if let Some(user_data) = self.pending_cancellations.front().cloned() {
-                if !self.ops.contains(user_data) {
-                    self.pending_cancellations.pop_front();
-                    continue;
-                }
-
-                let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
-                    .build()
-                    .user_data(CANCEL_USER_DATA);
-
-                if self.push_entry(cancel_sqe) {
-                    self.pending_cancellations.pop_front();
-                    submitted_count += 1;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    pub(crate) fn flush_backlog(&mut self) {
-        enum BacklogAction {
-            Submit,
-            Cancel,
-            Drop,
-        }
-
-        while let Some(user_data) = self.backlog_head {
-            // Inspect state to decide action before taking mutable borrow for processing.
-            // We need to check if the Op is still valid/pending cancellation.
-
-            let mut action = BacklogAction::Drop;
-
-            if let Some(entry) = self.ops.get(user_data) {
-                action = match entry.platform_data.lifecycle {
-                    OpLifecycle::Cancelled => BacklogAction::Cancel,
-                    OpLifecycle::Pending => {
-                        // Check if op exists in slot
-                        if self
-                            .ops
-                            .with_slot_storage_mut(
-                                user_data,
-                                |slot_op, _result, _payload, _sidecar| slot_op.is_some(),
-                            )
-                            .unwrap_or(false)
-                        {
-                            BacklogAction::Submit
-                        } else {
-                            BacklogAction::Drop
-                        }
-                    }
-                    _ => BacklogAction::Drop,
-                };
-            }
-
-            match action {
-                BacklogAction::Cancel => {
-                    self.pop_backlog();
-                    self.cancel_op_internal(user_data);
-                }
-                BacklogAction::Drop => {
-                    self.pop_backlog();
-                }
-                BacklogAction::Submit => {
-                    match self.submit_from_slot(user_data) {
-                        Ok(true) => {
-                            self.pop_backlog();
-                        }
-                        Ok(false) => {
-                            // SQ Full, stop processing backlog
-                            break;
-                        }
-                        Err(_) => {
-                            // Error during submission (e.g. invalid op state)
-                            // We should probably drop it from backlog to avoid infinite loop
-                            self.pop_backlog();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) fn push_backlog(&mut self, user_data: usize) {
-        if let Some(tail) = self.backlog_tail {
-            if let Some(entry) = self.ops.get_mut(tail) {
-                entry.platform_data.next = Some(user_data);
-            }
-            self.backlog_tail = Some(user_data);
-        } else {
-            self.backlog_head = Some(user_data);
-            self.backlog_tail = Some(user_data);
-        }
-        if let Some(entry) = self.ops.get_mut(user_data) {
-            entry.platform_data.next = None;
-        }
-    }
-
-    pub(crate) fn pop_backlog(&mut self) -> Option<usize> {
-        let head = self.backlog_head?;
-        let next = if let Some(entry) = self.ops.get_mut(head) {
-            entry.platform_data.next
-        } else {
-            None
-        };
-
-        self.backlog_head = next;
-        if next.is_none() {
-            self.backlog_tail = None;
-        }
-
-        if let Some(entry) = self.ops.get_mut(head) {
-            entry.platform_data.next = None;
-        }
-
-        Some(head)
-    }
-
-    pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
-        if let Some(last_fail) = self.chunk_register_failures_recent.get(&id)
-            && last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN
-        {
-            self.registration_stats
-                .chunk_register_skipped_recent_failure = self
-                .registration_stats
-                .chunk_register_skipped_recent_failure
-                .saturating_add(1);
-            return Err(io::Error::other(format!(
-                "io_uring register_chunk skipped due to recent failure: chunk_id={id}"
-            )));
-        }
-
-        let index = id as usize;
-        if index >= MAX_CHUNKS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ChunkID exceeds MAX_CHUNKS",
-            ));
-        }
-
-        let iovecs = [libc::iovec {
-            iov_base: ptr as *mut _,
-            iov_len: len,
-        }];
-
-        // Use register_buffers_update
-        // offset = index
-        self.registration_stats.chunk_register_attempts = self
-            .registration_stats
-            .chunk_register_attempts
-            .saturating_add(1);
-        let register_result = unsafe {
-            self.ring
-                .submitter()
-                .register_buffers_update(index as u32, &iovecs, None)
-        };
-        if let Err(e) = register_result {
-            self.registration_stats.chunk_register_failures = self
-                .registration_stats
-                .chunk_register_failures
-                .saturating_add(1);
-            self.chunk_register_failures_recent
-                .insert(id, Instant::now());
-            return Err(e);
-        }
-
-        // Mark as registered in local bitset
-        let _ = self.registered_chunks.set(index); // ignore out of bounds error as we checked
-        self.chunk_register_failures_recent.remove(&id);
-        self.registration_stats.chunk_register_success = self
-            .registration_stats
-            .chunk_register_success
-            .saturating_add(1);
-
-        Ok(())
-    }
-
-    pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
-        let (action, timer_id) = if let Some(op) = self.ops.get_mut(user_data) {
-            match &op.platform_data.lifecycle {
-                OpLifecycle::Completed | OpLifecycle::Cancelled => (None, None),
-                OpLifecycle::Pending => (Some(OpLifecycle::Pending), None),
-                OpLifecycle::InFlight => (Some(OpLifecycle::InFlight), op.platform_data.timer_id),
-            }
-        } else {
-            (None, None)
-        };
-
-        match action {
-            None => {}
-            Some(OpLifecycle::Completed) | Some(OpLifecycle::Cancelled) => {} // already done
-            Some(OpLifecycle::Pending) => {
-                if let Some(op) = self.ops.get_mut(user_data) {
-                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
-                    let generation = {
-                        let slot = &self.ops.shared.slots[user_data];
-                        let generation = slot.generation.load(Ordering::Acquire);
-                        let _ = self.ops.with_slot_storage_mut(
-                            user_data,
-                            |slot_op, _result, _payload, _sidecar| {
-                                let _ = slot_op.take();
-                            },
-                        );
-                        generation
-                    };
-                    let (payload, detail) = self
-                        .ops
-                        .with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
-                            (payload.take(), result.take())
-                        })
-                        .unwrap_or((None, None));
-                    self.push_completion_event(CompletionSidecar {
-                        user_data,
-                        generation,
-                        res: -libc::ECANCELED,
-                        flags: 0,
-                        payload,
-                        detail,
-                    });
-                    self.ops.remove(user_data);
-                }
-            }
-            Some(OpLifecycle::InFlight) => {
-                if let Some(op) = self.ops.get_mut(user_data) {
-                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
-                }
-
-                if let Some(tid) = timer_id {
-                    self.wheel.cancel(tid);
-                    if self.ops.get_mut(user_data).is_some() {
-                        let generation = {
-                            let slot = &self.ops.shared.slots[user_data];
-                            let generation = slot.generation.load(Ordering::Acquire);
-                            let _ = self.ops.with_slot_storage_mut(
-                                user_data,
-                                |slot_op, _result, _payload, _sidecar| {
-                                    let _ = slot_op.take();
-                                },
-                            );
-                            generation
-                        };
-                        let (payload, detail) = self
-                            .ops
-                            .with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
-                                (payload.take(), result.take())
-                            })
-                            .unwrap_or((None, None));
-                        self.push_completion_event(CompletionSidecar {
-                            user_data,
-                            generation,
-                            res: -libc::ECANCELED,
-                            flags: 0,
-                            payload,
-                            detail,
-                        });
-                        self.ops.remove(user_data);
-                    }
-                    return;
-                }
-
-                let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
-                    .build()
-                    .user_data(CANCEL_USER_DATA);
-
-                if !self.push_entry(cancel_sqe) {
-                    self.pending_cancellations.push_back(user_data);
-                }
-
-                // Cancellation is async, we wait for CQE to clean up.
-            }
-        }
     }
 }
 
@@ -945,6 +610,275 @@ fn clone_result_if_non_os_error(res: &io::Result<usize>) -> Option<io::Result<us
 
 impl Drop for UringDriver {
     fn drop(&mut self) {
-        // waker_fd is closed when Arc<EventFd> drops
+    }
+}
+
+impl Driver for UringDriver {
+    type Op = UringOp;
+    type Handle = RawHandle;
+    type Sidecar = ();
+
+    fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
+        match self.ops.insert(OpEntry::new(UringOpState::new())) {
+            Ok(OpHandle {
+                index: id,
+                generation,
+            }) => {
+                trace!(id, generation, "Reserved op slot");
+                Ok((id, generation))
+            }
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "OpRegistry full",
+            )),
+        }
+    }
+
+    fn slot_table(
+        &self,
+    ) -> std::sync::Arc<veloq_driver_core::slot::SlotTable<Self::Op, Self::Sidecar>> {
+        self.ops.shared.clone()
+    }
+
+    fn slot_set_payload(
+        &mut self,
+        user_data: usize,
+        payload: veloq_driver_core::slot::ErasedPayload,
+    ) {
+        let _ =
+            self.ops
+                .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
+                    *payload_cell = Some(payload);
+                });
+    }
+
+    fn slot_take_payload(
+        &mut self,
+        user_data: usize,
+    ) -> Option<veloq_driver_core::slot::ErasedPayload> {
+        self.ops
+            .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
+                payload_cell.take()
+            })
+            .flatten()
+    }
+
+    fn submit(
+        &mut self,
+        user_data: usize,
+        op_in: &mut Option<Self::Op>,
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>> {
+        let op: UringOp = op_in.take().expect("submit called with empty Option");
+        let strategy = unsafe { op.vtable.as_ref().strategy };
+        if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
+            *op_in = Some(op);
+            return binder.err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "background op cannot be submitted normally",
+            ));
+        }
+
+        match strategy {
+            crate::op::SubmissionStrategy::BackgroundOnly => unreachable!(),
+            crate::op::SubmissionStrategy::SubmitSqe => {
+                self.submit_sqe_internal(user_data, op, op_in, binder)
+            }
+            crate::op::SubmissionStrategy::SoftwareTimer => {
+                self.submit_timer_internal(user_data, op, op_in, binder)
+            }
+        }
+    }
+
+    fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
+        let strategy = unsafe { op.vtable.as_ref().strategy };
+        if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
+            let sqe = unsafe {
+                (op.vtable.as_ref().make_sqe)(&mut op, self).user_data(BACKGROUND_USER_DATA)
+            };
+
+            if !self.push_entry(sqe) {
+                return Err(io::Error::other("sq full"));
+            }
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "background op only supports BackgroundOnly strategy",
+            ))
+        }
+    }
+
+    fn submit_queue(&mut self) -> io::Result<()> {
+        self.flush_cancellations();
+        self.flush_backlog();
+        self.submit_to_kernel()
+    }
+
+    fn wait(&mut self) -> io::Result<()> {
+        self.wait_internal()
+    }
+
+    fn process_completions(&mut self) {
+        self.process_completions_internal();
+        self.flush_cancellations();
+        self.flush_backlog();
+    }
+
+    fn completion_queue(&self) -> SharedCompletionQueue {
+        self.completion_events.clone()
+    }
+
+    fn completion_table(&self) -> SharedCompletionTable {
+        self.completion_table.clone()
+    }
+
+    fn wait_and_drain_completions(
+        &mut self,
+        out: &mut Vec<veloq_driver_core::driver::CompletionEvent>,
+    ) -> io::Result<usize> {
+        self.wait_internal()?;
+        Ok(self.drain_completions(out))
+    }
+
+    fn cancel_op(&mut self, user_data: usize) {
+        self.cancel_op_internal(user_data);
+    }
+
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
+        self.register_chunk_internal(id, ptr, len)
+    }
+
+    fn register_files(&mut self, files: &[RawHandle]) -> io::Result<Vec<IoFd>> {
+        let fds: Vec<i32> = files.iter().map(|h| h.fd).collect();
+        self.ring.submitter().register_files(&fds)?;
+
+        let mut fixed_fds = Vec::with_capacity(files.len());
+        for i in 0..files.len() {
+            fixed_fds.push(IoFd::Fixed(i as u32));
+        }
+        Ok(fixed_fds)
+    }
+
+    fn unregister_files(&mut self, _files: Vec<IoFd>) -> io::Result<()> {
+        self.ring.submitter().unregister_files()
+    }
+
+    fn wake(&mut self) -> io::Result<()> {
+        let buf = 1u64.to_ne_bytes();
+        let ret = unsafe { libc::write(self.waker_fd.fd, buf.as_ptr() as *const _, 8) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn inner_handle(&self) -> RawHandle {
+        RawHandle {
+            fd: self.ring.as_raw_fd(),
+        }
+    }
+
+    fn create_waker(&self) -> Arc<dyn RemoteWaker> {
+        Arc::new(UringWaker {
+            fd: self.waker_fd.clone(),
+            is_waked: self.is_waked.clone(),
+        })
+    }
+
+    fn driver_id(&self) -> usize {
+        self.waker_fd.fd as usize
+    }
+
+    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
+        self.registrar = registrar;
+    }
+}
+
+impl UringDriver {
+    fn submit_sqe_internal(
+        &mut self,
+        user_data: usize,
+        op: <Self as Driver>::Op,
+        op_in: &mut Option<<Self as Driver>::Op>,
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>> {
+        let _ =
+            self.ops
+                .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
+                    *slot_op = Some(op);
+                });
+
+        match self.submit_from_slot(user_data) {
+            Ok(true) => binder.ok(Poll::Ready(())),
+            Ok(false) => {
+                debug!(user_data, "SQ full, pushing to backlog");
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    entry.platform_data.lifecycle = OpLifecycle::Pending;
+                }
+                self.push_backlog(user_data);
+                binder.ok(Poll::Pending)
+            }
+            Err(e) => {
+                let op = self
+                    .ops
+                    .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
+                        slot_op.take().unwrap()
+                    })
+                    .expect("slot storage missing in submit_sqe recovery");
+                *op_in = Some(op);
+                binder.err(e)
+            }
+        }
+    }
+
+    fn submit_timer_internal(
+        &mut self,
+        user_data: usize,
+        op: <Self as Driver>::Op,
+        op_in: &mut Option<<Self as Driver>::Op>,
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>> {
+        let _ =
+            self.ops
+                .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
+                    *slot_op = Some(op);
+                });
+
+        match self.submit_from_slot(user_data) {
+            Ok(true) => binder.ok(Poll::Ready(())),
+            Ok(false) => {
+                debug!(
+                    user_data,
+                    "SQ full (unexpected for timer), pushing to backlog"
+                );
+                if let Some(entry) = self.ops.get_mut(user_data) {
+                    entry.platform_data.lifecycle = OpLifecycle::Pending;
+                }
+                self.push_backlog(user_data);
+                binder.ok(Poll::Pending)
+            }
+            Err(e) => {
+                let op = self
+                    .ops
+                    .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
+                        slot_op.take().unwrap()
+                    })
+                    .expect("slot storage missing in submit_timer recovery");
+                *op_in = Some(op);
+                binder.err(e)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver {
+    fn debug_chunk_register_attempts(&self) -> u64 {
+        self.registration_stats.chunk_register_attempts
     }
 }
