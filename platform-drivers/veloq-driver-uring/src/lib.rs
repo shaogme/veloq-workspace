@@ -1,14 +1,14 @@
+mod inner;
+mod net;
+mod op;
+mod submit;
+
 use std::io;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::task::Poll;
 
 use tracing::{debug, trace};
-
-mod inner;
-mod net;
-mod op;
-mod submit;
 
 pub use inner::{UringDriver, UringOpState};
 pub use net::{Socket, socket_addr_to_storage, to_socket_addr};

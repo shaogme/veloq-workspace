@@ -1,13 +1,13 @@
 use super::{
-    POOL_CTX_TAG, UDP_RECV_POOL_QUEUE_CAP, UdpPoolState, UdpRecvDatagram, UdpRecvPool,
-    UdpRecvPoolSlot,
+    POOL_CTX_TAG, PoolCompletionEvent, UDP_RECV_POOL_QUEUE_CAP, UdpPoolState, UdpRecvDatagram,
+    UdpRecvPool, UdpRecvPoolSlot,
 };
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::net::addr::{SockAddrStorage, to_socket_addr};
 use crate::ops::IocpOpPayload;
 use crate::ops::slot::{InFlight, Slot};
 use crate::ops::submit::SubmissionResult;
-use crate::rio::core::submit_ops::{RioDispatch, RioExConfig, RioProvider};
+use crate::rio::core::submit_ops::{RioDispatch, RioExConfig, RioProvider, RioRq};
 use crate::rio::{RioCompletionContext, RioContext};
 use rustc_hash::FxHashMap;
 use std::collections::{VecDeque, hash_map};
@@ -18,21 +18,6 @@ use veloq_driver_core::op::{UdpRecvDatagram as OpUdpRecvDatagram, UdpRecvStream}
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIORESULT, WSAGetLastError};
-
-#[derive(Debug, Clone, Copy)]
-pub(super) enum PoolCompletionEvent {
-    SlotMissing,
-    DrainingAck,
-    ReceivedNoDatagram,
-    DatagramQueued { resubmit: bool },
-}
-
-#[derive(Default, Debug, Clone, Copy)]
-pub(super) struct CompletionActions {
-    pub(super) resubmit_slot: Option<usize>,
-    pub(super) dispatch_waiters: bool,
-    pub(super) rebalance_pool: bool,
-}
 
 pub(crate) struct UdpPoolManager {
     pub(crate) pool: Option<UdpRecvPool>,
@@ -136,11 +121,11 @@ impl UdpPoolManager {
         ctx: &mut RioContext,
     ) -> io::Result<usize> {
         let (slot_idx, completion_token) = target;
-        let actor_id = ctx.actor_id;
-        let rq = ctx.rq;
-        let Some(pool) = self.pool.as_mut() else {
-            return Err(io_msg(IocpErrorContext::Rio, "UDP recv pool missing"));
-        };
+        let pool = self
+            .pool
+            .as_mut()
+            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
+
         if !matches!(pool.state, UdpPoolState::Running) {
             return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
         }
@@ -149,7 +134,6 @@ impl UdpPoolManager {
             .slots
             .get_mut(slot_idx)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool slot missing"))?;
-
         let (data_buf_id, offset) = ctx.registry.resolve_buffer_id(&slot.buf, ctx.env)?;
 
         slot.in_flight = true;
@@ -165,10 +149,9 @@ impl UdpPoolManager {
             Offset: 0,
             Length: std::mem::size_of::<SockAddrStorage>() as u32,
         };
-        let req_ctx = Self::encode_pool_context(actor_id, completion_token);
 
         if let Err(e) = ctx.env.dispatch.receive_ex(RioExConfig {
-            rq,
+            rq: ctx.rq,
             data_buf: &data_buf,
             data_buf_count: 1,
             local_addr: std::ptr::null(),
@@ -176,25 +159,36 @@ impl UdpPoolManager {
             control_buf: std::ptr::null(),
             flags_buf: std::ptr::null(),
             flags: 0,
-            context: req_ctx,
+            context: Self::encode_pool_context(ctx.actor_id, completion_token),
         }) {
-            self.udp_ctx_map.remove(&completion_token);
-            if let Some(pool) = self.pool.as_mut()
-                && let Some(slot) = pool.slots.get_mut(slot_idx)
-            {
-                slot.in_flight = false;
-                slot.stop_requested = false;
-            }
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!(
-                    "RIOReceiveEx submit failed for UDP recv pool: slot_idx={}, rq=0x{:x}, error={e}",
-                    slot_idx, rq.0 as usize
-                ),
-            ));
+            self.on_recv_submit_fail(slot_idx, completion_token, e, ctx.rq)
+        } else {
+            Ok(1)
         }
-        Ok(1)
+    }
+
+    fn on_recv_submit_fail(
+        &mut self,
+        slot_idx: usize,
+        token: u32,
+        e: io::Error,
+        rq: RioRq,
+    ) -> io::Result<usize> {
+        self.udp_ctx_map.remove(&token);
+        if let Some(pool) = self.pool.as_mut()
+            && let Some(slot) = pool.slots.get_mut(slot_idx)
+        {
+            slot.in_flight = false;
+            slot.stop_requested = false;
+        }
+        Err(io_error(
+            IocpErrorContext::Rio,
+            Self::last_wsa_error(),
+            format!(
+                "RIOReceiveEx submit failed: slot={}, rq=0x{:x}, error={e}",
+                slot_idx, rq.0 as usize
+            ),
+        ))
     }
 
     fn grow_pool_to(&mut self, target: usize, ctx: &mut RioContext) -> io::Result<usize> {
@@ -355,7 +349,7 @@ impl UdpPoolManager {
         uid: (usize, u32),
         datagram: &mut Option<UdpRecvDatagram>,
     ) -> bool {
-        let (user_data, expected_generation) = uid;
+        let (user_data, generation) = uid;
         let ops = &mut comp.ops;
         if user_data >= ops.local.len() {
             return false;
@@ -364,10 +358,8 @@ impl UdpPoolManager {
             Some(v) => v,
             None => return false,
         };
-        if op.platform_data.generation != expected_generation {
-            return false;
-        }
-        if !Slot::<InFlight>::is_in_flight_entry(slot) {
+        if op.platform_data.generation != generation || !Slot::<InFlight>::is_in_flight_entry(slot)
+        {
             return false;
         }
 
@@ -378,49 +370,22 @@ impl UdpPoolManager {
         };
         let d_len = d.buf.len();
 
-        // SAFETY: op_mut_unchecked is safe because we've verified the slot is InFlight
-        // and its generation matches.
-        let stream_op = unsafe {
-            guard
-                .op_mut_unchecked(|iocp_op| {
-                    if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
-                        Some(kernel.user.as_mut())
-                    } else {
-                        None
-                    }
-                })
-                .flatten()
-        };
-
+        let stream_op = Self::get_stream_op_mut(&mut guard);
         if let Some(stream_op) = stream_op {
             let Some(owned_d) = datagram.take() else {
                 return false;
             };
-            // SAFETY: addr and addr_len are provided by RIO completion and are guaranteed
-            // to be valid SockAddrStorage data.
-            let addr = unsafe {
-                let s = std::slice::from_raw_parts(
-                    &owned_d.addr as *const _ as *const u8,
-                    owned_d.addr_len as usize,
-                );
-                to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
-            };
-
-            stream_op.result = Some(OpUdpRecvDatagram {
-                buf: owned_d.buf,
-                addr,
-            });
-
+            stream_op.result = Some(Self::into_op_datagram(owned_d));
             op.platform_data.rio_pool_waiting = false;
+
             let event = CompletionEvent {
-                user_data: encode_completion_token(user_data, expected_generation),
+                user_data: encode_completion_token(user_data, generation),
                 res: d_len.min(i32::MAX as usize) as i32,
                 flags: 0,
             };
 
             let mut guard = guard.complete();
             let (payload, detail) = guard.take_completion_data();
-
             comp.table
                 .record_completion_with_data(event, payload, detail);
             comp.events.push(event);
@@ -433,6 +398,23 @@ impl UdpPoolManager {
         }
     }
 
+    fn get_stream_op_mut<'a>(
+        guard: &'a mut Slot<'_, InFlight>,
+    ) -> Option<&'a mut UdpRecvStream<crate::RawHandle>> {
+        // SAFETY: The slot is in-flight.
+        unsafe {
+            guard
+                .op_mut_unchecked(|iocp_op| {
+                    if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
+                        Some(kernel.user.as_mut())
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+        }
+    }
+
     fn into_op_datagram(datagram: UdpRecvDatagram) -> OpUdpRecvDatagram {
         // SAFETY: addr and addr_len are provided by RIO completion.
         let addr = unsafe {
@@ -440,7 +422,12 @@ impl UdpPoolManager {
                 &datagram.addr as *const _ as *const u8,
                 datagram.addr_len as usize,
             );
-            to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+            to_socket_addr(s).map_err(|_| ()).unwrap_or_else(|_| {
+                std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::UNSPECIFIED,
+                    0,
+                ))
+            })
         };
 
         OpUdpRecvDatagram {
@@ -540,63 +527,7 @@ impl UdpPoolManager {
         slot_idx: usize,
         res: &RIORESULT,
     ) -> PoolCompletionEvent {
-        let Some(slot) = pool.slots.get_mut(slot_idx) else {
-            return PoolCompletionEvent::SlotMissing;
-        };
-
-        slot.in_flight = false;
-        let stopping = slot.stop_requested;
-        slot.stop_requested = false;
-
-        if !matches!(pool.state, UdpPoolState::Running) {
-            return PoolCompletionEvent::DrainingAck;
-        }
-
-        if !(res.Status == 0 && res.BytesTransferred > 0) {
-            return PoolCompletionEvent::ReceivedNoDatagram;
-        }
-
-        if pool.queue.len() >= UDP_RECV_POOL_QUEUE_CAP {
-            let _ = pool.queue.pop_front();
-        }
-
-        let replacement_buf = pool.spare_bufs.pop_front().or_else(|| {
-            std::num::NonZeroUsize::new(slot.buf.capacity())
-                .and_then(|cap| FixedBuf::alloc_heap(cap).ok())
-        });
-
-        if let Some(new_buf) = replacement_buf {
-            let mut old_buf = std::mem::replace(&mut slot.buf, new_buf);
-            old_buf.set_len(res.BytesTransferred as usize);
-
-            pool.queue.push_back(UdpRecvDatagram {
-                buf: old_buf,
-                addr: *slot.addr,
-                addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
-            });
-
-            return PoolCompletionEvent::DatagramQueued {
-                resubmit: !stopping && slot_idx < pool.target_credits,
-            };
-        }
-
-        PoolCompletionEvent::ReceivedNoDatagram
-    }
-
-    pub(super) fn plan_actions(event: PoolCompletionEvent, slot_idx: usize) -> CompletionActions {
-        match event {
-            PoolCompletionEvent::DatagramQueued { resubmit } => CompletionActions {
-                resubmit_slot: resubmit.then_some(slot_idx),
-                dispatch_waiters: true,
-                rebalance_pool: true,
-            },
-            PoolCompletionEvent::ReceivedNoDatagram => CompletionActions {
-                dispatch_waiters: true,
-                rebalance_pool: true,
-                ..CompletionActions::default()
-            },
-            _ => CompletionActions::default(),
-        }
+        pool.update_state(slot_idx, res)
     }
 
     pub(crate) fn handle_completion(
@@ -612,7 +543,7 @@ impl UdpPoolManager {
         let event = Self::update_pool_state(pool, slot_idx, res);
 
         let mut submissions = 0;
-        let actions = Self::plan_actions(event, slot_idx);
+        let actions = UdpRecvPool::plan_actions(event, slot_idx);
 
         if let Some(idx) = actions.resubmit_slot {
             let token = self.alloc_udp_ctx_token(idx);

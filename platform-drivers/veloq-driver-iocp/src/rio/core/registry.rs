@@ -162,7 +162,7 @@ impl RioRegistry {
 
         let buf_id = match env.dispatch.register_buffer(ptr, len as u32) {
             Ok(id) => id,
-            Err(e) => return Err(self.handle_chunk_reg_fail(id, len, e)),
+            Err(e) => return Err(self.on_chunk_reg_fail(id, len, e)),
         };
 
         self.chunk_registry[id_idx] = buf_id;
@@ -325,7 +325,6 @@ impl RioRegistry {
             ));
         }
 
-        // Simple eviction to prevent unbounded growth of registered heap buffers.
         if self.heap_rio_bufs.len() >= 1024 {
             for id in self.heap_rio_bufs.values().copied() {
                 self.pending_deregistrations.push(id);
@@ -333,6 +332,16 @@ impl RioRegistry {
             self.heap_rio_bufs.clear();
         }
 
+        let id = self.register_heap_raw(buf, key, env)?;
+        Ok((id, offset as u32))
+    }
+
+    fn register_heap_raw(
+        &mut self,
+        buf: &FixedBuf,
+        key: (usize, usize, u64),
+        env: RioEnv<'_>,
+    ) -> io::Result<RioBufferId> {
         self.registration_stats.heap_register_attempts = self
             .registration_stats
             .heap_register_attempts
@@ -367,10 +376,10 @@ impl RioRegistry {
             .registration_stats
             .heap_register_success
             .saturating_add(1);
-        Ok((id, offset as u32))
+        Ok(id)
     }
 
-    fn handle_chunk_reg_fail(&mut self, id: u16, len: usize, e: std::io::Error) -> std::io::Error {
+    fn on_chunk_reg_fail(&mut self, id: u16, len: usize, e: std::io::Error) -> std::io::Error {
         self.registration_stats.chunk_register_failures = self
             .registration_stats
             .chunk_register_failures
