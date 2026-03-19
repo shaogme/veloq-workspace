@@ -1,38 +1,17 @@
 use crate::driver::{CANCEL_USER_DATA, UringDriver};
 use io_uring::opcode;
+use std::io;
 use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::CompletionSidecar;
 
-use crate::op::slot::{InFlight, Pending, Slot};
+use crate::op::slot::UringOpRegistryExt;
+use veloq_driver_core::slot::{ErasedPayload, SlotState as CoreState};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum OpLifecycle {
-    /// Created, waiting to be submitted
-    Pending,
-    /// Submitted to ring or timer wheel
-    InFlight,
-    /// Completion arrived (result is in Slot)
-    #[default]
-    Completed,
-    /// Aborted by user
-    Cancelled,
-}
-
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct UringOpState {
-    pub(crate) lifecycle: OpLifecycle,
+    pub(crate) is_cancelled: bool,
     pub(crate) next: Option<usize>,
     pub(crate) timer_id: Option<veloq_wheel::TaskId>,
-}
-
-impl Default for UringOpState {
-    fn default() -> Self {
-        Self {
-            lifecycle: OpLifecycle::Completed,
-            next: None,
-            timer_id: None,
-        }
-    }
 }
 
 impl UringOpState {
@@ -43,52 +22,107 @@ impl UringOpState {
 
 impl UringDriver {
     pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
-        let (slot_entry, op_entry, storage) = match self.ops.get_slot_entry_storage_and_entry_mut(user_data) {
-            Some(v) => v,
+        let (state, is_cancelled) = match self.ops.get_slot_and_entry_mut(user_data) {
+            Some((slot_entry, op_entry)) => (
+                slot_entry.state.load(Ordering::Acquire),
+                op_entry.platform_data.is_cancelled,
+            ),
             None => return,
         };
 
-        match op_entry.platform_data.lifecycle {
-            OpLifecycle::Completed | OpLifecycle::Cancelled => {} // already done
-            OpLifecycle::Pending => {
-                let slot = Slot::<Pending>::new(slot_entry, storage, &mut op_entry.platform_data, user_data);
-                
-                let generation = slot.entry.generation.load(Ordering::Acquire);
-                let _ = slot.storage.with_mut(|op: &mut Option<crate::op::UringOp>, _, _, _| op.take());
-                let (payload, detail) = slot.storage.with_mut(|_op: &mut Option<crate::op::UringOp>, result, payload, _sidecar| (payload.take(), result.take()));
-                
-                self.push_completion_event(CompletionSidecar {
-                    user_data,
-                    generation,
-                    res: -(libc::ECANCELED as i32),
-                    flags: 0,
-                    payload,
-                    detail,
-                });
-                self.ops.remove(user_data);
-            }
-            OpLifecycle::InFlight => {
-                let timer_id = op_entry.platform_data.timer_id;
-                let slot = Slot::<InFlight>::as_in_flight(slot_entry, storage, &mut op_entry.platform_data, user_data);
-                
-                let cancelled = slot.cancel();
+        if is_cancelled || state == CoreState::Completed as u8 {
+            return;
+        }
 
-                if let Some(tid) = timer_id {
-                    self.wheel.cancel(tid);
-                    
-                    let mut completed = cancelled.complete();
-                    let generation = completed.entry.generation.load(Ordering::Acquire);
-                    let _ = completed.take_op();
-                    let (payload, detail) = completed.take_completion_data();
-                    
-                    self.push_completion_event(CompletionSidecar {
-                        user_data,
-                        generation,
-                        res: -(libc::ECANCELED as i32),
-                        flags: 0,
-                        payload,
-                        detail,
+        match state {
+            s if s == CoreState::Pending as u8 || s == CoreState::Initialized as u8 => {
+                let sidecar = self
+                    .ops
+                    .slot_initialized(user_data)
+                    .map(|slot| {
+                        let generation = slot.entry.generation.load(Ordering::Acquire);
+                        let (payload, detail) = slot.storage.with_mut(
+                            |_op: &mut Option<crate::op::UringOp>,
+                             result: &mut Option<io::Result<usize>>,
+                             payload: &mut Option<ErasedPayload>,
+                             _sidecar| {
+                                (payload.take(), result.take())
+                            },
+                        );
+                        let _ = slot
+                            .storage
+                            .with_mut(|op: &mut Option<crate::op::UringOp>, _, _, _| op.take());
+
+                        CompletionSidecar {
+                            user_data,
+                            generation,
+                            res: -libc::ECANCELED,
+                            flags: 0,
+                            payload,
+                            detail,
+                        }
+                    })
+                    .or_else(|| {
+                        self.ops.slot_pending(user_data).map(|slot| {
+                            let generation = slot.entry.generation.load(Ordering::Acquire);
+                            let (payload, detail) = slot.storage.with_mut(
+                                |_op: &mut Option<crate::op::UringOp>,
+                                 result: &mut Option<io::Result<usize>>,
+                                 payload: &mut Option<ErasedPayload>,
+                                 _sidecar| {
+                                    (payload.take(), result.take())
+                                },
+                            );
+                            let _ = slot
+                                .storage
+                                .with_mut(|op: &mut Option<crate::op::UringOp>, _, _, _| op.take());
+
+                            CompletionSidecar {
+                                user_data,
+                                generation,
+                                res: -libc::ECANCELED,
+                                flags: 0,
+                                payload,
+                                detail,
+                            }
+                        })
                     });
+
+                if let Some(s) = sidecar {
+                    self.push_completion_event(s);
+                    self.ops.remove(user_data);
+                }
+            }
+            s if s == CoreState::InFlight as u8 => {
+                let timer_data = self.ops.slot_in_flight(user_data).map(|slot| {
+                    let timer_id = slot.platform.timer_id;
+                    let cancelled = slot.cancel();
+
+                    if let Some(tid) = timer_id {
+                        let mut completed = cancelled.complete();
+                        let generation = completed.entry.generation.load(Ordering::Acquire);
+                        let _ = completed.take_op();
+                        let (payload, detail) = completed.take_completion_data();
+
+                        Some((
+                            tid,
+                            CompletionSidecar {
+                                user_data,
+                                generation,
+                                res: -libc::ECANCELED,
+                                flags: 0,
+                                payload,
+                                detail,
+                            },
+                        ))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(Some((tid, sidecar))) = timer_data {
+                    self.wheel.cancel(tid);
+                    self.push_completion_event(sidecar);
                     self.ops.remove(user_data);
                     return;
                 }
@@ -103,6 +137,7 @@ impl UringDriver {
 
                 // Cancellation is async, we wait for CQE to clean up.
             }
+            _ => {}
         }
     }
 
@@ -144,25 +179,26 @@ impl UringDriver {
             // Inspect state to decide action before taking mutable borrow for processing.
             let mut action = BacklogAction::Drop;
 
-            if let Some(entry) = self.ops.get(user_data) {
-                action = match entry.platform_data.lifecycle {
-                    OpLifecycle::Cancelled => BacklogAction::Cancel,
-                    OpLifecycle::Pending => {
-                        // Check if op exists in slot
-                        if self
-                            .ops
-                            .with_slot_storage_mut(
-                                user_data,
-                                |slot_op, _result, _payload, _sidecar| slot_op.is_some(),
-                            )
-                            .unwrap_or(false)
-                        {
-                            BacklogAction::Submit
-                        } else {
-                            BacklogAction::Drop
-                        }
+            if let Some((slot_entry, op_entry)) = self.ops.get_slot_and_entry_mut(user_data) {
+                let state = slot_entry.state.load(Ordering::Acquire);
+                action = if op_entry.platform_data.is_cancelled {
+                    BacklogAction::Cancel
+                } else if state == CoreState::Pending as u8 || state == CoreState::Initialized as u8
+                {
+                    // Check if op exists in slot
+                    if self
+                        .ops
+                        .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
+                            slot_op.is_some()
+                        })
+                        .unwrap_or(false)
+                    {
+                        BacklogAction::Submit
+                    } else {
+                        BacklogAction::Drop
                     }
-                    _ => BacklogAction::Drop,
+                } else {
+                    BacklogAction::Drop
                 };
             }
 

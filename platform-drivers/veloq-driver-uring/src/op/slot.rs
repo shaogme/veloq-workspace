@@ -1,8 +1,9 @@
-use crate::driver::{OpLifecycle, UringOpState};
+use crate::driver::UringOpState;
 use crate::op::UringOp;
 use std::io;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
+use veloq_driver_core::op_registry::OpRegistry;
 use veloq_driver_core::slot::{ErasedPayload, SlotEntry, SlotState as CoreState, SlotStorage};
 
 mod sealed {
@@ -37,7 +38,38 @@ pub(crate) struct Slot<'a, State: SlotState> {
     _state: PhantomData<State>,
 }
 
+impl<'a, S: SlotState> Slot<'a, S> {
+    #[inline]
+    fn new_internal(
+        entry: &'a SlotEntry<UringOp, ()>,
+        storage: &'a mut SlotStorage<UringOp, ()>,
+        platform: &'a mut UringOpState,
+        index: usize,
+    ) -> Self {
+        Self {
+            entry,
+            storage,
+            platform,
+            index,
+            _state: PhantomData,
+        }
+    }
+}
+
 impl<'a> Slot<'a, Pending> {
+    pub(crate) fn try_bind(
+        entry: &'a SlotEntry<UringOp, ()>,
+        storage: &'a mut SlotStorage<UringOp, ()>,
+        platform: &'a mut UringOpState,
+        index: usize,
+    ) -> Option<Self> {
+        if entry.state.load(Ordering::Acquire) == CoreState::Pending as u8 {
+            Some(Self::new_internal(entry, storage, platform, index))
+        } else {
+            None
+        }
+    }
+
     #[inline]
     pub(crate) fn new(
         entry: &'a SlotEntry<UringOp, ()>,
@@ -48,7 +80,7 @@ impl<'a> Slot<'a, Pending> {
         entry
             .state
             .store(CoreState::Pending as u8, Ordering::Release);
-        platform.lifecycle = OpLifecycle::Pending;
+        platform.is_cancelled = false;
         Self {
             entry,
             storage,
@@ -68,95 +100,74 @@ impl<'a> Slot<'a, Pending> {
             .state
             .store(CoreState::Initialized as u8, Ordering::Release);
 
-        Slot {
-            entry: self.entry,
-            storage: self.storage,
-            platform: self.platform,
-            index: self.index,
-            _state: PhantomData,
-        }
+        Slot::new_internal(self.entry, self.storage, self.platform, self.index)
     }
 }
 
 impl<'a> Slot<'a, Initialized> {
-    pub(crate) fn as_initialized(
+    pub(crate) fn try_bind(
         entry: &'a SlotEntry<UringOp, ()>,
         storage: &'a mut SlotStorage<UringOp, ()>,
         platform: &'a mut UringOpState,
         index: usize,
-    ) -> Self {
-        Self {
-            entry,
-            storage,
-            platform,
-            index,
-            _state: PhantomData,
+    ) -> Option<Self> {
+        if entry.state.load(Ordering::Acquire) == CoreState::Initialized as u8 {
+            Some(Self::new_internal(entry, storage, platform, index))
+        } else {
+            None
         }
     }
 
-    pub(crate) fn start_submission(self) -> SubmissionGuard<'a> {
-        self.platform.lifecycle = OpLifecycle::InFlight;
+    pub(crate) fn start_submission(self) -> SubmissionGuard {
         self.entry
             .state
             .store(CoreState::InFlight as u8, Ordering::Release);
 
         SubmissionGuard {
-            slot: Some(self),
+            entry: self.entry as *const SlotEntry<UringOp, ()>,
             persisted: false,
         }
     }
 
-    pub(crate) fn with_op_mut<F, R>(&mut self, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut UringOp) -> R,
-    {
-        self.storage
-            .with_mut(|op, _result, _payload, _sidecar| op.as_mut().map(f))
+    #[inline]
+    pub(crate) fn op_mut(&mut self) -> &mut UringOp {
+        let op_ptr = self
+            .storage
+            .with_mut(|op, _result, _payload, _sidecar| op.as_mut().map(|op| op as *mut UringOp))
+            .expect("slot in Initialized state must contain an op");
+        unsafe { &mut *op_ptr }
     }
 }
 
 impl<'a> Slot<'a, InFlight> {
-    #[inline]
-    pub(crate) fn as_in_flight(
+    pub(crate) fn try_bind(
         entry: &'a SlotEntry<UringOp, ()>,
         storage: &'a mut SlotStorage<UringOp, ()>,
         platform: &'a mut UringOpState,
         index: usize,
-    ) -> Self {
-        Self {
-            entry,
-            storage,
-            platform,
-            index,
-            _state: PhantomData,
+    ) -> Option<Self> {
+        if entry.state.load(Ordering::Acquire) == CoreState::InFlight as u8
+            && !platform.is_cancelled
+        {
+            Some(Self::new_internal(entry, storage, platform, index))
+        } else {
+            None
         }
     }
 
+    #[inline]
     pub(crate) fn complete(self) -> Slot<'a, Completed> {
         self.entry
             .state
             .store(CoreState::Completed as u8, Ordering::Release);
-        self.platform.lifecycle = OpLifecycle::Completed;
 
-        Slot {
-            entry: self.entry,
-            storage: self.storage,
-            platform: self.platform,
-            index: self.index,
-            _state: PhantomData,
-        }
+        Slot::new_internal(self.entry, self.storage, self.platform, self.index)
     }
 
     pub(crate) fn cancel(self) -> Slot<'a, Cancelled> {
-        self.platform.lifecycle = OpLifecycle::Cancelled;
+        self.platform.is_cancelled = true;
 
-        Slot {
-            entry: self.entry,
-            storage: self.storage,
-            platform: self.platform,
-            index: self.index,
-            _state: PhantomData,
-        }
+        Slot::new_internal(self.entry, self.storage, self.platform, self.index)
     }
 
     pub(crate) fn with_op_mut<F, R>(&mut self, f: F) -> Option<R>
@@ -169,19 +180,26 @@ impl<'a> Slot<'a, InFlight> {
 }
 
 impl<'a> Slot<'a, Cancelled> {
+    pub(crate) fn try_bind(
+        entry: &'a SlotEntry<UringOp, ()>,
+        storage: &'a mut SlotStorage<UringOp, ()>,
+        platform: &'a mut UringOpState,
+        index: usize,
+    ) -> Option<Self> {
+        if entry.state.load(Ordering::Acquire) == CoreState::InFlight as u8 && platform.is_cancelled
+        {
+            Some(Self::new_internal(entry, storage, platform, index))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn complete(self) -> Slot<'a, Completed> {
         self.entry
             .state
             .store(CoreState::Completed as u8, Ordering::Release);
-        self.platform.lifecycle = OpLifecycle::Completed;
 
-        Slot {
-            entry: self.entry,
-            storage: self.storage,
-            platform: self.platform,
-            index: self.index,
-            _state: PhantomData,
-        }
+        Slot::new_internal(self.entry, self.storage, self.platform, self.index)
     }
 }
 
@@ -199,34 +217,62 @@ impl<'a> Slot<'a, Completed> {
     }
 }
 
-pub(crate) struct SubmissionGuard<'a> {
-    pub(crate) slot: Option<Slot<'a, Initialized>>,
+pub(crate) struct SubmissionGuard {
+    entry: *const SlotEntry<UringOp, ()>,
     persisted: bool,
 }
 
-impl<'a> SubmissionGuard<'a> {
-    pub(crate) fn persist(mut self) -> Slot<'a, InFlight> {
+impl SubmissionGuard {
+    pub(crate) fn persist(mut self) {
         self.persisted = true;
-        let slot = self.slot.take().expect("slot missing in SubmissionGuard");
-        Slot {
-            entry: slot.entry,
-            storage: slot.storage,
-            platform: slot.platform,
-            index: slot.index,
-            _state: PhantomData,
+    }
+}
+
+impl Drop for SubmissionGuard {
+    fn drop(&mut self) {
+        if !self.persisted {
+            unsafe {
+                (&*self.entry)
+                    .state
+                    .store(CoreState::Initialized as u8, Ordering::Release);
+            }
         }
     }
 }
 
-impl<'a> Drop for SubmissionGuard<'a> {
-    fn drop(&mut self) {
-        if !self.persisted {
-            if let Some(slot) = self.slot.take() {
-                slot.entry
-                    .state
-                    .store(CoreState::Initialized as u8, Ordering::Release);
-                slot.platform.lifecycle = OpLifecycle::Pending;
-            }
-        }
+pub(crate) trait UringOpRegistryExt {
+    fn slot_pending(&mut self, index: usize) -> Option<Slot<'_, Pending>>;
+    fn slot_initialized(&mut self, index: usize) -> Option<Slot<'_, Initialized>>;
+    fn slot_in_flight(&mut self, index: usize) -> Option<Slot<'_, InFlight>>;
+    fn slot_cancelled(&mut self, index: usize) -> Option<Slot<'_, Cancelled>>;
+    fn slot_init_pending(&mut self, index: usize) -> Slot<'_, Pending>;
+}
+
+impl UringOpRegistryExt for OpRegistry<UringOp, UringOpState, ()> {
+    fn slot_pending(&mut self, index: usize) -> Option<Slot<'_, Pending>> {
+        let (entry, op_entry, storage) = self.get_slot_entry_storage_and_entry_mut(index)?;
+        Slot::<Pending>::try_bind(entry, storage, &mut op_entry.platform_data, index)
+    }
+
+    fn slot_initialized(&mut self, index: usize) -> Option<Slot<'_, Initialized>> {
+        let (entry, op_entry, storage) = self.get_slot_entry_storage_and_entry_mut(index)?;
+        Slot::<Initialized>::try_bind(entry, storage, &mut op_entry.platform_data, index)
+    }
+
+    fn slot_in_flight(&mut self, index: usize) -> Option<Slot<'_, InFlight>> {
+        let (entry, op_entry, storage) = self.get_slot_entry_storage_and_entry_mut(index)?;
+        Slot::<InFlight>::try_bind(entry, storage, &mut op_entry.platform_data, index)
+    }
+
+    fn slot_cancelled(&mut self, index: usize) -> Option<Slot<'_, Cancelled>> {
+        let (entry, op_entry, storage) = self.get_slot_entry_storage_and_entry_mut(index)?;
+        Slot::<Cancelled>::try_bind(entry, storage, &mut op_entry.platform_data, index)
+    }
+
+    fn slot_init_pending(&mut self, index: usize) -> Slot<'_, Pending> {
+        let (entry, op_entry, storage) = self
+            .get_slot_entry_storage_and_entry_mut(index)
+            .expect("slot missing in registry during init");
+        Slot::<Pending>::new(entry, storage, &mut op_entry.platform_data, index)
     }
 }
