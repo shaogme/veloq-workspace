@@ -1,4 +1,3 @@
-use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
 use veloq_driver_core::op::{
@@ -64,22 +63,21 @@ pub(crate) struct TimeoutPayload {
     pub(crate) ts: [i64; 2],
 }
 
-#[repr(C)]
-pub(crate) union UringOpPayload {
-    pub(crate) read: ManuallyDrop<KernelRef<ReadFixed>>,
-    pub(crate) write: ManuallyDrop<KernelRef<WriteFixed>>,
-    pub(crate) recv: ManuallyDrop<KernelRef<Recv>>,
-    pub(crate) send: ManuallyDrop<KernelRef<OpSend>>,
-    pub(crate) connect: ManuallyDrop<KernelRef<Connect>>,
-    pub(crate) close: ManuallyDrop<KernelRef<Close>>,
-    pub(crate) fsync: ManuallyDrop<KernelRef<Fsync>>,
-    pub(crate) sync_range: ManuallyDrop<KernelRef<SyncFileRange>>,
-    pub(crate) fallocate: ManuallyDrop<KernelRef<Fallocate>>,
-    pub(crate) accept: ManuallyDrop<AcceptPayload>,
-    pub(crate) send_to: ManuallyDrop<SendToPayload>,
-    pub(crate) udp_recv_stream: ManuallyDrop<UdpRecvStreamPayload>,
-    pub(crate) udp_refill: ManuallyDrop<KernelRef<UdpRefill>>,
-    pub(crate) open: ManuallyDrop<OpenPayload>,
-    pub(crate) wakeup: ManuallyDrop<WakeupPayload>,
-    pub(crate) timeout: ManuallyDrop<TimeoutPayload>,
+pub(crate) enum UringOpPayload {
+    Read(KernelRef<ReadFixed>),
+    Write(KernelRef<WriteFixed>),
+    Recv(KernelRef<Recv>),
+    Send(KernelRef<OpSend>),
+    Connect(KernelRef<Connect>),
+    Close(KernelRef<Close>),
+    Fsync(KernelRef<Fsync>),
+    SyncRange(KernelRef<SyncFileRange>),
+    Fallocate(KernelRef<Fallocate>),
+    Accept(AcceptPayload),
+    SendTo(SendToPayload),
+    UdpRecvStream(UdpRecvStreamPayload),
+    UdpRefill(KernelRef<UdpRefill>),
+    Open(OpenPayload),
+    Wakeup(WakeupPayload),
+    Timeout(TimeoutPayload),
 }

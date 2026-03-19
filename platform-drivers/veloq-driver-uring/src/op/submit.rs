@@ -1,31 +1,18 @@
 use crate::config::IoFd;
 use crate::driver::UringDriver;
-use crate::op::UringOp;
+use crate::op::{UringOp, UringOpPayload};
 use io_uring::{opcode, squeue, types};
 use std::io;
-use std::mem::ManuallyDrop;
 
 macro_rules! impl_lifecycle {
     ($drop_fn:ident, $variant:ident, direct_fd) => {
-        pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
-            unsafe {
-                ManuallyDrop::drop(&mut op.payload.$variant);
-            }
-        }
+        pub(crate) unsafe fn $drop_fn(_op: &mut UringOp) {}
     };
     ($drop_fn:ident, $variant:ident, nested_fd) => {
-        pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
-            unsafe {
-                ManuallyDrop::drop(&mut op.payload.$variant);
-            }
-        }
+        pub(crate) unsafe fn $drop_fn(_op: &mut UringOp) {}
     };
     ($drop_fn:ident, $variant:ident, no_fd) => {
-        pub(crate) unsafe fn $drop_fn(op: &mut UringOp) {
-            unsafe {
-                ManuallyDrop::drop(&mut op.payload.$variant);
-            }
-        }
+        pub(crate) unsafe fn $drop_fn(_op: &mut UringOp) {}
     };
 }
 
@@ -42,9 +29,12 @@ macro_rules! impl_default_completion {
 }
 
 macro_rules! make_rw_fixed {
-    ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path) => {
+    ($fn_name:ident, $variant:ident, $type_raw:path, $type_fixed:path) => {
         pub(crate) unsafe fn $fn_name(op: &mut UringOp, driver: &mut UringDriver) -> squeue::Entry {
-            let kernel = unsafe { &mut *op.payload.$field };
+            let kernel = match &mut op.payload {
+                UringOpPayload::$variant(kernel) => kernel,
+                _ => return opcode::Nop::new().build(),
+            };
             let rw_op = unsafe { kernel.user.as_mut() };
             let region_info = rw_op.buf.resolve_region_info();
             let ptr = rw_op.buf.as_mut_ptr();
@@ -81,9 +71,12 @@ macro_rules! make_rw_fixed {
             }
         }
     };
-    ($fn_name:ident, $field:ident, $type_raw:path, $type_fixed:path, write) => {
+    ($fn_name:ident, $variant:ident, $type_raw:path, $type_fixed:path, write) => {
         pub(crate) unsafe fn $fn_name(op: &mut UringOp, driver: &mut UringDriver) -> squeue::Entry {
-            let kernel = unsafe { &mut *op.payload.$field };
+            let kernel = match &mut op.payload {
+                UringOpPayload::$variant(kernel) => kernel,
+                _ => return opcode::Nop::new().build(),
+            };
             let rw_op = unsafe { kernel.user.as_mut() };
             let region_info = rw_op.buf.resolve_region_info();
             let ptr = rw_op.buf.as_slice().as_ptr();
@@ -124,31 +117,34 @@ macro_rules! make_rw_fixed {
 
 make_rw_fixed!(
     make_sqe_read_fixed,
-    read,
+    Read,
     opcode::Read::new,
     opcode::ReadFixed::new
 );
 make_rw_fixed!(
     make_sqe_write_fixed,
-    write,
+    Write,
     opcode::Write::new,
     opcode::WriteFixed::new,
     write
 );
 
 impl_default_completion!(on_complete_read_fixed);
-impl_lifecycle!(drop_read_fixed, read, direct_fd);
+impl_lifecycle!(drop_read_fixed, Read, direct_fd);
 
 impl_default_completion!(on_complete_write_fixed);
-impl_lifecycle!(drop_write_fixed, write, direct_fd);
+impl_lifecycle!(drop_write_fixed, Write, direct_fd);
 
 macro_rules! make_buf_op {
-    ($fn_name:ident, $field:ident, $opcode:path, recv_args) => {
+    ($fn_name:ident, $variant:ident, $opcode:path, recv_args) => {
         pub(crate) unsafe fn $fn_name(
             op: &mut UringOp,
             _driver: &mut UringDriver,
         ) -> squeue::Entry {
-            let kernel = unsafe { &mut *op.payload.$field };
+            let kernel = match &mut op.payload {
+                UringOpPayload::$variant(kernel) => kernel,
+                _ => return opcode::Nop::new().build(),
+            };
             let val = unsafe { kernel.user.as_mut() };
             match val.fd {
                 IoFd::Raw(fd) => $opcode(
@@ -166,12 +162,15 @@ macro_rules! make_buf_op {
             }
         }
     };
-    ($fn_name:ident, $field:ident, $opcode:path, send_args) => {
+    ($fn_name:ident, $variant:ident, $opcode:path, send_args) => {
         pub(crate) unsafe fn $fn_name(
             op: &mut UringOp,
             _driver: &mut UringDriver,
         ) -> squeue::Entry {
-            let kernel = unsafe { &mut *op.payload.$field };
+            let kernel = match &mut op.payload {
+                UringOpPayload::$variant(kernel) => kernel,
+                _ => return opcode::Nop::new().build(),
+            };
             let val = unsafe { kernel.user.as_mut() };
             match val.fd {
                 IoFd::Raw(fd) => $opcode(
@@ -191,19 +190,22 @@ macro_rules! make_buf_op {
     };
 }
 
-make_buf_op!(make_sqe_recv, recv, opcode::Recv::new, recv_args);
+make_buf_op!(make_sqe_recv, Recv, opcode::Recv::new, recv_args);
 impl_default_completion!(on_complete_recv);
-impl_lifecycle!(drop_recv, recv, direct_fd);
+impl_lifecycle!(drop_recv, Recv, direct_fd);
 
-make_buf_op!(make_sqe_send, send, opcode::Send::new, send_args);
+make_buf_op!(make_sqe_send, Send, opcode::Send::new, send_args);
 impl_default_completion!(on_complete_send);
-impl_lifecycle!(drop_send, send, direct_fd);
+impl_lifecycle!(drop_send, Send, direct_fd);
 
 pub(crate) unsafe fn make_sqe_connect(
     op: &mut UringOp,
     _driver: &mut UringDriver,
 ) -> squeue::Entry {
-    let kernel = unsafe { &mut *op.payload.connect };
+    let kernel = match &mut op.payload {
+        UringOpPayload::Connect(kernel) => kernel,
+        _ => return opcode::Nop::new().build(),
+    };
     let val = unsafe { kernel.user.as_mut() };
     match val.fd {
         IoFd::Raw(fd) => opcode::Connect::new(
@@ -221,10 +223,13 @@ pub(crate) unsafe fn make_sqe_connect(
     }
 }
 impl_default_completion!(on_complete_connect);
-impl_lifecycle!(drop_connect, connect, direct_fd);
+impl_lifecycle!(drop_connect, Connect, direct_fd);
 
 pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
-    let payload = unsafe { &mut *op.payload.accept };
+    let payload = match &mut op.payload {
+        UringOpPayload::Accept(payload) => payload,
+        _ => return opcode::Nop::new().build(),
+    };
     let val = unsafe { payload.user.as_mut() };
     match val.fd {
         IoFd::Raw(fd) => opcode::Accept::new(
@@ -243,31 +248,43 @@ pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp, _driver: &mut UringDriver
 }
 
 pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Result<usize> {
-    if result >= 0 {
-        let payload = unsafe { &mut *op.payload.accept };
-        let accept_op = unsafe { payload.user.as_mut() };
-        let addr_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &accept_op.addr.0 as *const _ as *const u8,
-                accept_op.addr_len as usize,
-            )
-        };
-        if let Ok(addr) = crate::net::to_socket_addr(addr_bytes) {
-            accept_op.remote_addr = Some(addr);
-        }
-        Ok(result as usize)
-    } else {
-        Err(io::Error::from_raw_os_error(-result))
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(-result));
     }
+
+    let payload = match &mut op.payload {
+        UringOpPayload::Accept(payload) => payload,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload variant mismatch for accept",
+            ));
+        }
+    };
+
+    let accept_op = unsafe { payload.user.as_mut() };
+    let addr_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &accept_op.addr.0 as *const _ as *const u8,
+            accept_op.addr_len as usize,
+        )
+    };
+    if let Ok(addr) = crate::net::to_socket_addr(addr_bytes) {
+        accept_op.remote_addr = Some(addr);
+    }
+    Ok(result as usize)
 }
 
-impl_lifecycle!(drop_accept, accept, nested_fd);
+impl_lifecycle!(drop_accept, Accept, nested_fd);
 
 pub(crate) unsafe fn make_sqe_send_to(
     op: &mut UringOp,
     _driver: &mut UringDriver,
 ) -> squeue::Entry {
-    let payload = unsafe { &mut *op.payload.send_to };
+    let payload = match &mut op.payload {
+        UringOpPayload::SendTo(payload) => payload,
+        _ => return opcode::Nop::new().build(),
+    };
     let user = unsafe { payload.user.as_ref() };
 
     payload.iovec[0].iov_base = user.buf.as_slice().as_ptr() as *mut _;
@@ -289,19 +306,22 @@ pub(crate) unsafe fn make_sqe_send_to(
 }
 
 impl_default_completion!(on_complete_send_to);
-impl_lifecycle!(drop_send_to, send_to, nested_fd);
+impl_lifecycle!(drop_send_to, SendTo, nested_fd);
 
 pub(crate) unsafe fn make_sqe_udp_recv_stream(
     op: &mut UringOp,
     _driver: &mut UringDriver,
 ) -> squeue::Entry {
-    let payload = unsafe { &mut *op.payload.udp_recv_stream };
+    let payload = match &mut op.payload {
+        UringOpPayload::UdpRecvStream(payload) => payload,
+        _ => return opcode::Nop::new().build(),
+    };
     let user = unsafe { payload.user.as_mut() };
     let fd = user.fd;
-    let recv_buf = user
-        .buf
-        .as_mut()
-        .expect("udp_recv_stream requires a buffer on io_uring");
+    let recv_buf = match user.buf.as_mut() {
+        Some(buf) => buf,
+        None => return opcode::Nop::new().build(),
+    };
 
     payload.iovec[0].iov_base = recv_buf.as_mut_ptr() as *mut _;
     payload.iovec[0].iov_len = recv_buf.capacity();
@@ -325,35 +345,50 @@ pub(crate) unsafe fn on_complete_udp_recv_stream(
     op: &mut UringOp,
     result: i32,
 ) -> io::Result<usize> {
-    if result >= 0 {
-        let payload = unsafe { &mut *op.payload.udp_recv_stream };
-        let user = unsafe { payload.user.as_mut() };
-        let len = payload.msghdr.msg_namelen as usize;
-        let addr_bytes =
-            unsafe { std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len) };
-        if let Ok(addr) = crate::net::to_socket_addr(addr_bytes) {
-            user.addr = Some(addr);
-        }
-        Ok(result as usize)
-    } else {
-        Err(io::Error::from_raw_os_error(-result))
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(-result));
     }
+
+    let payload = match &mut op.payload {
+        UringOpPayload::UdpRecvStream(payload) => payload,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload variant mismatch for udp_recv_stream",
+            ));
+        }
+    };
+    let user = unsafe { payload.user.as_mut() };
+    let len = payload.msghdr.msg_namelen as usize;
+    let addr_bytes =
+        unsafe { std::slice::from_raw_parts(&payload.msg_name as *const _ as *const u8, len) };
+    if let Ok(addr) = crate::net::to_socket_addr(addr_bytes) {
+        user.addr = Some(addr);
+    }
+    Ok(result as usize)
 }
 
-impl_lifecycle!(drop_udp_recv_stream, udp_recv_stream, direct_fd);
+impl_lifecycle!(drop_udp_recv_stream, UdpRecvStream, direct_fd);
 
 pub(crate) unsafe fn make_sqe_udp_refill(
-    _op: &mut UringOp,
+    op: &mut UringOp,
     _driver: &mut UringDriver,
 ) -> squeue::Entry {
+    let _ = match &mut op.payload {
+        UringOpPayload::UdpRefill(kernel) => Some(kernel),
+        _ => None,
+    };
     opcode::Nop::new().build()
 }
 
 impl_default_completion!(on_complete_udp_refill);
-impl_lifecycle!(drop_udp_refill, udp_refill, direct_fd);
+impl_lifecycle!(drop_udp_refill, UdpRefill, direct_fd);
 
 pub(crate) unsafe fn make_sqe_close(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
-    let kernel = unsafe { &mut *op.payload.close };
+    let kernel = match &mut op.payload {
+        UringOpPayload::Close(kernel) => kernel,
+        _ => return opcode::Nop::new().build(),
+    };
     let close_op = unsafe { kernel.user.as_mut() };
     match close_op.fd {
         IoFd::Raw(fd) => opcode::Close::new(types::Fd(fd.fd)).build(),
@@ -362,10 +397,13 @@ pub(crate) unsafe fn make_sqe_close(op: &mut UringOp, _driver: &mut UringDriver)
 }
 
 impl_default_completion!(on_complete_close);
-impl_lifecycle!(drop_close, close, direct_fd);
+impl_lifecycle!(drop_close, Close, direct_fd);
 
 pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
-    let kernel = unsafe { &mut *op.payload.fsync };
+    let kernel = match &mut op.payload {
+        UringOpPayload::Fsync(kernel) => kernel,
+        _ => return opcode::Nop::new().build(),
+    };
     let fsync_op = unsafe { kernel.user.as_mut() };
     let flags = if fsync_op.datasync {
         io_uring::types::FsyncFlags::DATASYNC
@@ -380,13 +418,16 @@ pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp, _driver: &mut UringDriver)
 }
 
 impl_default_completion!(on_complete_fsync);
-impl_lifecycle!(drop_fsync, fsync, direct_fd);
+impl_lifecycle!(drop_fsync, Fsync, direct_fd);
 
 pub(crate) unsafe fn make_sqe_sync_range(
     op: &mut UringOp,
     _driver: &mut UringDriver,
 ) -> squeue::Entry {
-    let kernel = unsafe { &mut *op.payload.sync_range };
+    let kernel = match &mut op.payload {
+        UringOpPayload::SyncRange(kernel) => kernel,
+        _ => return opcode::Nop::new().build(),
+    };
     let sync_op = unsafe { kernel.user.as_mut() };
     match sync_op.fd {
         IoFd::Raw(fd) => opcode::SyncFileRange::new(types::Fd(fd.fd), sync_op.nbytes as u32)
@@ -401,13 +442,16 @@ pub(crate) unsafe fn make_sqe_sync_range(
 }
 
 impl_default_completion!(on_complete_sync_range);
-impl_lifecycle!(drop_sync_range, sync_range, direct_fd);
+impl_lifecycle!(drop_sync_range, SyncRange, direct_fd);
 
 pub(crate) unsafe fn make_sqe_fallocate(
     op: &mut UringOp,
     _driver: &mut UringDriver,
 ) -> squeue::Entry {
-    let kernel = unsafe { &mut *op.payload.fallocate };
+    let kernel = match &mut op.payload {
+        UringOpPayload::Fallocate(kernel) => kernel,
+        _ => return opcode::Nop::new().build(),
+    };
     let fallocate_op = unsafe { kernel.user.as_mut() };
     match fallocate_op.fd {
         IoFd::Raw(fd) => opcode::Fallocate::new(types::Fd(fd.fd), fallocate_op.len)
@@ -422,10 +466,13 @@ pub(crate) unsafe fn make_sqe_fallocate(
 }
 
 impl_default_completion!(on_complete_fallocate);
-impl_lifecycle!(drop_fallocate, fallocate, direct_fd);
+impl_lifecycle!(drop_fallocate, Fallocate, direct_fd);
 
 pub(crate) unsafe fn make_sqe_open(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
-    let payload = unsafe { &mut *op.payload.open };
+    let payload = match &mut op.payload {
+        UringOpPayload::Open(payload) => payload,
+        _ => return opcode::Nop::new().build(),
+    };
     let user = unsafe { payload.user.as_ref() };
     let path_ptr = user.path.as_slice().as_ptr() as *const _;
     opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
@@ -435,13 +482,16 @@ pub(crate) unsafe fn make_sqe_open(op: &mut UringOp, _driver: &mut UringDriver) 
 }
 
 impl_default_completion!(on_complete_open);
-impl_lifecycle!(drop_open, open, no_fd);
+impl_lifecycle!(drop_open, Open, no_fd);
 
 pub(crate) unsafe fn make_sqe_timeout(
     op: &mut UringOp,
     _driver: &mut UringDriver,
 ) -> squeue::Entry {
-    let payload = unsafe { &mut *op.payload.timeout };
+    let payload = match &mut op.payload {
+        UringOpPayload::Timeout(payload) => payload,
+        _ => return opcode::Nop::new().build(),
+    };
     let user = unsafe { payload.user.as_ref() };
 
     payload.ts[0] = user.duration.as_secs() as i64;
@@ -452,24 +502,33 @@ pub(crate) unsafe fn make_sqe_timeout(
 }
 
 impl_default_completion!(on_complete_timeout);
-impl_lifecycle!(drop_timeout, timeout, no_fd);
+impl_lifecycle!(drop_timeout, Timeout, no_fd);
 
 pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp, _driver: &mut UringDriver) -> squeue::Entry {
-    let payload = unsafe { &mut *op.payload.wakeup };
+    let payload = match &mut op.payload {
+        UringOpPayload::Wakeup(payload) => payload,
+        _ => return opcode::Nop::new().build(),
+    };
     let user = unsafe { payload.user.as_ref() };
     match user.fd {
         IoFd::Raw(fd) => opcode::Read::new(types::Fd(fd.fd), payload.buf.as_mut_ptr(), 8).build(),
-        _ => panic!("Wakeup only supports raw fd"),
+        IoFd::Fixed(idx) => {
+            opcode::Read::new(types::Fixed(idx), payload.buf.as_mut_ptr(), 8).build()
+        }
     }
 }
 
 impl_default_completion!(on_complete_wakeup);
-impl_lifecycle!(drop_wakeup, wakeup, no_fd);
+impl_lifecycle!(drop_wakeup, Wakeup, no_fd);
 
 pub(crate) unsafe fn get_timeout_timeout(op: &UringOp) -> Option<std::time::Duration> {
-    let payload = unsafe { &*op.payload.timeout };
-    let user = unsafe { payload.user.as_ref() };
-    Some(user.duration)
+    match &op.payload {
+        UringOpPayload::Timeout(payload) => {
+            let user = unsafe { payload.user.as_ref() };
+            Some(user.duration)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) unsafe fn get_timeout_none(_op: &UringOp) -> Option<std::time::Duration> {
@@ -481,7 +540,10 @@ pub(crate) unsafe fn resolve_chunks_none(_op: &UringOp, _chunks: &mut [u16]) -> 
 }
 
 pub(crate) unsafe fn resolve_chunks_read_fixed(op: &UringOp, chunks: &mut [u16]) -> usize {
-    let kernel = unsafe { &*op.payload.read };
+    let kernel = match &op.payload {
+        UringOpPayload::Read(kernel) => kernel,
+        _ => return 0,
+    };
     let rw_op = unsafe { kernel.user.as_ref() };
     let info = rw_op.buf.resolve_region_info();
     if info.id != u16::MAX {
@@ -493,7 +555,10 @@ pub(crate) unsafe fn resolve_chunks_read_fixed(op: &UringOp, chunks: &mut [u16])
 }
 
 pub(crate) unsafe fn resolve_chunks_write_fixed(op: &UringOp, chunks: &mut [u16]) -> usize {
-    let kernel = unsafe { &*op.payload.write };
+    let kernel = match &op.payload {
+        UringOpPayload::Write(kernel) => kernel,
+        _ => return 0,
+    };
     let rw_op = unsafe { kernel.user.as_ref() };
     let info = rw_op.buf.resolve_region_info();
     if info.id != u16::MAX {
