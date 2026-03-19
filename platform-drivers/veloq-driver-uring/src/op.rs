@@ -3,7 +3,6 @@
 use crate::driver::UringDriver;
 use io_uring::squeue;
 use std::io;
-use std::ptr::NonNull;
 use std::time::Duration;
 use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{IntoPlatformOp, OpKind};
@@ -13,7 +12,7 @@ mod submit;
 
 pub(crate) use payload::UringOpPayload;
 pub(crate) use payload::{
-    Accept, Close, Connect, Fallocate, Fsync, Open, OpSend, ReadFixed, Recv, SendTo, SyncFileRange,
+    Accept, Close, Connect, Fallocate, Fsync, OpSend, Open, ReadFixed, Recv, SendTo, SyncFileRange,
     Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
 };
 
@@ -54,7 +53,7 @@ pub(crate) struct OpVTable {
 #[repr(C)]
 pub struct UringKernelOp {
     /// Virtual Table for dynamic dispatch
-    pub(crate) vtable: NonNull<OpVTable>,
+    pub(crate) vtable: &'static OpVTable,
 
     /// Type-erased payload
     pub(crate) payload: UringOpPayload,
@@ -64,7 +63,7 @@ impl PlatformOp for UringKernelOp {}
 
 impl Drop for UringKernelOp {
     fn drop(&mut self) {
-        unsafe { (self.vtable.as_ref().drop)(self) };
+        unsafe { (self.vtable.drop)(self) };
     }
 }
 
@@ -112,7 +111,7 @@ macro_rules! define_uring_ops {
                     let payload = define_uring_ops!(@construct user_ptr, $($construct)?, $OpType $(, $Payload)?);
 
                     let op = UringKernelOp {
-                        vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
+                        vtable: &TABLE,
                         payload: UringOpPayload {
                             $field: std::mem::ManuallyDrop::new(payload),
                         },

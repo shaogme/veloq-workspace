@@ -109,7 +109,7 @@ impl UringDriver {
                             .with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
                                 (payload.take(), result.take())
                             })
-                        .unwrap_or((None, None));
+                            .unwrap_or((None, None));
                         self.push_completion_event(CompletionSidecar {
                             user_data,
                             generation,

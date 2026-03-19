@@ -15,7 +15,12 @@ pub(crate) struct UringRegistrationStats {
 }
 
 impl UringDriver {
-    pub(crate) fn register_chunk_internal(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
+    pub(crate) fn register_chunk_internal(
+        &mut self,
+        id: u16,
+        ptr: *const u8,
+        len: usize,
+    ) -> io::Result<()> {
         if let Some(last_fail) = self.chunk_register_failures_recent.get(&id)
             && last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN
         {

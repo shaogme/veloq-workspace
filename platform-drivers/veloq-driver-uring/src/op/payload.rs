@@ -3,10 +3,9 @@ use std::ptr::NonNull;
 
 use veloq_driver_core::op::{
     Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
-    Fsync as CoreFsync, ReadFixed as CoreReadFixed, Recv as CoreRecv,
-    Send as CoreSend, SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange,
-    UdpRecvStream as CoreUdpRecvStream, UdpRefill as CoreUdpRefill, Wakeup as CoreWakeup,
-    WriteFixed as CoreWriteFixed,
+    Fsync as CoreFsync, ReadFixed as CoreReadFixed, Recv as CoreRecv, Send as CoreSend,
+    SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange, UdpRecvStream as CoreUdpRecvStream,
+    UdpRefill as CoreUdpRefill, Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
 };
 
 pub(crate) use veloq_driver_core::op::{Open, Timeout};

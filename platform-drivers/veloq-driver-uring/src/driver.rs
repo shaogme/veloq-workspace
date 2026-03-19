@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use tracing::{debug, trace};
 
-use crate::op::{SubmissionStrategy, UringOp};
 use crate::config::{BufferRegistrationMode, IoFd, IoMode, RawHandle, UringConfig};
+use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, CompletionTable, Driver, Outcome, RemoteWaker,
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder, encode_completion_token,
@@ -176,7 +176,7 @@ impl UringDriver {
             return Err(io::Error::other("Op missing in slot"));
         }
         let op = unsafe { &mut *op_ptr };
-        let vtable = unsafe { op.vtable.as_ref() };
+        let vtable = op.vtable;
         let strategy = vtable.strategy;
         let (sqe_opt, duration_opt) = match strategy {
             SubmissionStrategy::SubmitSqe => {
@@ -308,8 +308,7 @@ impl UringDriver {
                 .unwrap_or(std::ptr::null_mut());
             assert!(!op_ptr.is_null(), "waker op missing in slot");
             let op = unsafe { &mut *op_ptr };
-            let sqe =
-                unsafe { (op.vtable.as_ref().make_sqe)(op, self).user_data(user_data as u64) };
+            let sqe = unsafe { (op.vtable.make_sqe)(op, self).user_data(user_data as u64) };
 
             if self.push_entry(sqe) {
                 if let Some(entry) = self.ops.get_mut(user_data) {
@@ -485,7 +484,7 @@ impl UringDriver {
                                 user_data,
                                 |slot_op, _result, _payload, _sidecar| {
                                     if let Some(op) = slot_op.as_mut() {
-                                        unsafe { (op.vtable.as_ref().on_complete)(op, res_val) }
+                                        unsafe { (op.vtable.on_complete)(op, res_val) }
                                     } else if res_val >= 0 {
                                         Ok(res_val as usize)
                                     } else {
@@ -609,8 +608,7 @@ fn clone_result_if_non_os_error(res: &io::Result<usize>) -> Option<io::Result<us
 }
 
 impl Drop for UringDriver {
-    fn drop(&mut self) {
-    }
+    fn drop(&mut self) {}
 }
 
 impl Driver for UringDriver {
@@ -670,7 +668,7 @@ impl Driver for UringDriver {
         binder: SubmitBinder,
     ) -> Outcome<io::Result<Poll<()>>> {
         let op: UringOp = op_in.take().expect("submit called with empty Option");
-        let strategy = unsafe { op.vtable.as_ref().strategy };
+        let strategy = op.vtable.strategy;
         if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
             *op_in = Some(op);
             return binder.err(io::Error::new(
@@ -691,11 +689,10 @@ impl Driver for UringDriver {
     }
 
     fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
-        let strategy = unsafe { op.vtable.as_ref().strategy };
+        let strategy = op.vtable.strategy;
         if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
-            let sqe = unsafe {
-                (op.vtable.as_ref().make_sqe)(&mut op, self).user_data(BACKGROUND_USER_DATA)
-            };
+            let sqe =
+                unsafe { (op.vtable.make_sqe)(&mut op, self).user_data(BACKGROUND_USER_DATA) };
 
             if !self.push_entry(sqe) {
                 return Err(io::Error::other("sq full"));
