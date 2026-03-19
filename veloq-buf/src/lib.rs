@@ -5,7 +5,7 @@ pub mod heap;
 
 pub use buffer::*;
 
-/// 创建 NonZeroUsize 的宏
+/// 创建 NonZero<T> 的宏
 /// - 输入 0：编译失败
 /// - 输入非 0 字面量/常量：编译通过，且无运行时开销
 #[macro_export]
@@ -17,6 +17,6 @@ macro_rules! nz {
 
         // 2. 如果上面通过了，说明 $value 肯定不为 0
         // 使用 unsafe 块调用 new_unchecked
-        unsafe { std::num::NonZeroUsize::new_unchecked($value) }
+        unsafe { std::num::NonZero::new_unchecked($value) }
     }};
 }

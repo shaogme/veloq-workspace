@@ -92,7 +92,7 @@ fn create_local_executor() -> LocalExecutor {
         use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 
         // 128x multiplier -> ~256MB
-        let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(128) });
+        let multiplier = ThreadMemoryMultiplier(nz!(128));
         let topology = UniformSlot::new(multiplier);
 
         let global_pool = topology

@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 
+use veloq_buf::nz;
 #[cfg(windows)]
 pub use veloq_driver_iocp::{BufferRegistrationMode, IocpConfig};
 
@@ -40,7 +41,7 @@ impl IocpConfig {
 impl Default for IocpConfig {
     fn default() -> Self {
         Self {
-            entries: unsafe { NonZeroU32::new_unchecked(1024) },
+            entries: nz!(1024),
             registration_mode: BufferRegistrationMode::Strict,
         }
     }
@@ -72,7 +73,7 @@ impl Default for UringConfig {
     fn default() -> Self {
         Self {
             mode: IoMode::Interrupt,
-            entries: unsafe { NonZeroU32::new_unchecked(1024) },
+            entries: nz!(1024),
             registration_mode: BufferRegistrationMode::Strict,
         }
     }

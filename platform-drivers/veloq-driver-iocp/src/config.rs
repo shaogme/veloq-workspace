@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use veloq_buf::nz;
 use veloq_driver_core::IoFd as CoreIoFd;
 use windows_sys::Win32::Foundation::HANDLE;
 
@@ -38,9 +39,7 @@ impl AsRef<IocpConfig> for IocpConfig {
 impl Default for IocpConfig {
     fn default() -> Self {
         Self {
-            entries:
-                // SAFETY: 1024 is non-zero.
-                unsafe { NonZeroU32::new_unchecked(1024) },
+            entries: nz!(1024),
             registration_mode: BufferRegistrationMode::Strict,
         }
     }

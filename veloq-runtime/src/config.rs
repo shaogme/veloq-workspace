@@ -27,7 +27,7 @@ impl AsRef<UringConfig> for Config {
         {
             static DEFAULT_URING: UringConfig = UringConfig {
                 mode: veloq_driver::config::IoMode::Interrupt,
-                entries: unsafe { std::num::NonZeroU32::new_unchecked(1024) },
+                entries: nz!(1024),
                 registration_mode: BufferRegistrationMode::Strict,
             };
             &DEFAULT_URING
@@ -44,7 +44,7 @@ impl AsRef<IocpConfig> for Config {
         #[cfg(not(windows))]
         {
             static DEFAULT_IOCP: IocpConfig = IocpConfig {
-                entries: unsafe { std::num::NonZeroU32::new_unchecked(1024) },
+                entries: nz!(1024),
                 registration_mode: BufferRegistrationMode::Strict,
             };
             &DEFAULT_IOCP

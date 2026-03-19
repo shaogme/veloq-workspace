@@ -1,9 +1,8 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::future::IntoFuture;
 use std::hint::black_box;
-use std::num::NonZeroUsize;
 use std::path::Path;
-use veloq_buf::PoolTopology;
+use veloq_buf::{PoolTopology, nz};
 
 use veloq_runtime::LocalExecutor;
 use veloq_runtime::config::BlockingPoolConfig;
@@ -16,7 +15,7 @@ fn create_local_executor() -> LocalExecutor {
         use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
 
         // 16x multiplier -> 32MB (BuddyPool default block size is 2MB * 16 = 32MB)
-        let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(16) });
+        let multiplier = ThreadMemoryMultiplier(nz!(16));
         let topology = UniformSlot::new(multiplier);
 
         let global_pool = topology
