@@ -67,7 +67,7 @@ impl<'a> RioCompletionRouter<'a> {
     }
 
     fn handle_one(&mut self, res: &RIORESULT) {
-        let Some(kind) = RioState::decode_request_context(res.RequestContext) else {
+        let Some(kind) = RioState::decode_req_ctx(res.RequestContext) else {
             return;
         };
 
@@ -219,7 +219,7 @@ impl RioState {
         Ok(self.actors.get_mut(&handle).expect("actor inserted"))
     }
 
-    pub(crate) fn begin_udp_pool_shutdown_for_handle(&mut self, handle: HANDLE) {
+    pub(crate) fn shutdown_udp_pool(&mut self, handle: HANDLE) {
         let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)
@@ -401,7 +401,7 @@ impl RioState {
         self.kernel.rearm_notify()?;
 
         if *router.outstanding_count == 0 {
-            router.registry.flush_pending_deregistrations(router.env);
+            router.registry.flush_deregs(router.env);
         }
 
         Ok(router.completed_count)

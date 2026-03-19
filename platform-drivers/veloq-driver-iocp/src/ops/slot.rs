@@ -8,6 +8,7 @@ use veloq_driver_core::slot::{
 };
 
 mod sealed {
+    /// Sealed trait for Slot states.
     pub trait Sealed {}
 }
 
@@ -34,8 +35,6 @@ pub(crate) struct Slot<'a, State: SlotState> {
     index: usize,
     _state: PhantomData<State>,
 }
-
-impl<'a, State: SlotState> Slot<'a, State> {}
 
 impl<'a> Slot<'a, Pending> {
     #[inline]
@@ -150,6 +149,11 @@ impl<'a> Slot<'a, InFlight> {
         }
     }
 
+    /// Access sidecar without state checks.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the slot is in a valid state for sidecar access.
     pub(crate) unsafe fn sidecar_unchecked<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(&mut OverlappedEntry) -> R,
@@ -158,6 +162,11 @@ impl<'a> Slot<'a, InFlight> {
             .with_mut(|_op, _result, _payload, sidecar| f(sidecar))
     }
 
+    /// Access op without state checks.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the slot is in a valid state for op access.
     pub(crate) unsafe fn op_mut_unchecked<F, R>(&mut self, f: F) -> Option<R>
     where
         F: FnOnce(&mut IocpOp) -> R,
@@ -207,15 +216,18 @@ pub(crate) struct SubmissionGuard<'a> {
 }
 
 impl<'a> SubmissionGuard<'a> {
-    pub(crate) fn persist(mut self) -> Slot<'a, InFlight> {
+    pub(crate) fn persist(mut self) -> io::Result<Slot<'a, InFlight>> {
         self.persisted = true;
-        let slot = self.slot.take().expect("submission guard slot missing");
-        Slot {
+        let slot = match self.slot.take() {
+            Some(s) => s,
+            None => return Err(io::Error::other("submission guard slot missing in persist")),
+        };
+        Ok(Slot {
             entry: slot.entry,
             storage: slot.storage,
             index: slot.index,
             _state: PhantomData,
-        }
+        })
     }
 }
 

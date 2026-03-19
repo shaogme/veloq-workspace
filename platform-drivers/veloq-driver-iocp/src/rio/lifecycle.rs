@@ -66,7 +66,7 @@ impl RioState {
         {
             let _ = self.try_mark_pool_completion(actor_id, completion_generation);
         } else {
-            Self::free_op_request_context(res.RequestContext);
+            Self::free_op_req_ctx(res.RequestContext);
         }
         if self.outstanding_count > 0 {
             self.outstanding_count -= 1;

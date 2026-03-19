@@ -153,13 +153,11 @@ impl RioRegistry {
         if buffer_id.is_none()
             && let Some(chunk_info) = env.registrar.resolve_chunk_info(info.id)
         {
-            if let Err(e) = self.register_chunk(
+            self.register_chunk(
                 info.id,
                 (chunk_info.ptr.as_ptr(), chunk_info.len.get()),
                 env,
-            ) {
-                return Err(e);
-            }
+            )?;
             buffer_id = Some(self.chunk_registry[info.id as usize]);
         }
 
@@ -258,7 +256,7 @@ impl RioRegistry {
         Ok(())
     }
 
-    pub(crate) fn ensure_page_registration(
+    pub(crate) fn ensure_page_reg(
         &mut self,
         page_idx: usize,
         resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
@@ -337,7 +335,7 @@ impl RioRegistry {
         }
     }
 
-    pub(crate) fn flush_pending_deregistrations(&mut self, env: RioEnv<'_>) {
+    pub(crate) fn flush_deregs(&mut self, env: RioEnv<'_>) {
         if self.pending_deregistrations.is_empty() {
             return;
         }

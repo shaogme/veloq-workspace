@@ -346,9 +346,8 @@ impl IocpDriver {
         };
 
         let processed = Self::with_inflight_slot(&mut self.ops, user_data, |mut guard, _op| {
-            let blocking_res =
-                // SAFETY: InFlight state grants sidecar mutable access.
-                unsafe { guard.sidecar_unchecked(|s| s.blocking_result.take()) };
+            // SAFETY: InFlight state grants sidecar mutable access.
+            let blocking_res = unsafe { guard.sidecar_unchecked(|s| s.blocking_result.take()) };
 
             // SAFETY: InFlight state grants op mutable access.
             unsafe {
@@ -510,9 +509,10 @@ impl IocpDriver {
 
                 // SAFETY: `overlapped_ptr()` provides a valid overlapped pointer for `cancel_request`.
                 let overlapped_ptr = guard.overlapped_ptr();
-                let _ =
-                    // SAFETY: handle and overlapped_ptr are valid for this operation.
-                    unsafe { crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr) };
+                // SAFETY: handle and overlapped_ptr are valid for this operation.
+                let _ = unsafe {
+                    crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
+                };
             }
         });
 

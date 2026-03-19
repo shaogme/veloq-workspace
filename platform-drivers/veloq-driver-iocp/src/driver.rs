@@ -17,7 +17,7 @@ use veloq_driver_core::driver::{
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
-use veloq_driver_core::slot::SlotTable;
+use veloq_driver_core::slot::{ErasedPayload, SlotTable};
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
@@ -69,8 +69,6 @@ impl Default for IocpOpState {
         }
     }
 }
-
-impl IocpOpState {}
 
 /// Closing mode for the driver or operations.
 #[derive(Clone, Copy, Debug)]
@@ -176,15 +174,13 @@ impl IocpDriver {
             }
             Ok(submit::SubmissionResult::PostToQueue) => {
                 if let Err(err) = ctx.port.notify(user_data) {
-                    if ops.contains(user_data) {
-                        if let Some((slot_entry, _, storage)) =
-                            ops.get_slot_entry_storage_and_entry_mut(user_data)
-                        {
-                            let mut guard =
-                                Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data)
-                                    .complete();
-                            *op_in = guard.take_op();
-                        }
+                    if let Some((slot_entry, _, storage)) =
+                        ops.get_slot_entry_storage_and_entry_mut(user_data)
+                    {
+                        let mut guard =
+                            Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data)
+                                .complete();
+                        *op_in = guard.take_op();
                     }
                     ops.remove(user_data);
                     binder.err(err)
@@ -211,15 +207,13 @@ impl IocpDriver {
                 binder.ok(Poll::Pending)
             }
             Err(e) => {
-                if ops.contains(user_data) {
-                    if let Some((slot_entry, _, storage)) =
-                        ops.get_slot_entry_storage_and_entry_mut(user_data)
-                    {
-                        let mut guard =
-                            Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data)
-                                .complete();
-                        *op_in = guard.take_op();
-                    }
+                if let Some((slot_entry, _, storage)) =
+                    ops.get_slot_entry_storage_and_entry_mut(user_data)
+                {
+                    let mut guard =
+                        Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data)
+                            .complete();
+                    *op_in = guard.take_op();
                 }
                 ops.remove(user_data);
                 binder.err(e)
@@ -263,7 +257,7 @@ impl IocpDriver {
             .ok_or_else(|| io::Error::other("Op missing during submission"))?;
 
         if result.is_ok() {
-            sub_guard.persist();
+            sub_guard.persist()?;
         }
 
         Ok((is_rio_pool_waiting, result))
@@ -277,8 +271,7 @@ impl IocpDriver {
 
     /// Shuts down the UDP buffer pool associated with the specified handle.
     pub fn shutdown_udp_pool(&mut self, handle: RawHandle) {
-        self.rio_state
-            .begin_udp_pool_shutdown_for_handle(handle.handle);
+        self.rio_state.shutdown_udp_pool(handle.handle);
     }
 
     /// Registers a set of file/socket handles for use with the driver.
@@ -423,11 +416,7 @@ impl Driver for IocpDriver {
         self.ops.shared.clone()
     }
 
-    fn slot_set_payload(
-        &mut self,
-        user_data: usize,
-        payload: veloq_driver_core::slot::ErasedPayload,
-    ) {
+    fn slot_set_payload(&mut self, user_data: usize, payload: ErasedPayload) {
         let _ =
             self.ops
                 .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
@@ -435,10 +424,7 @@ impl Driver for IocpDriver {
                 });
     }
 
-    fn slot_take_payload(
-        &mut self,
-        user_data: usize,
-    ) -> Option<veloq_driver_core::slot::ErasedPayload> {
+    fn slot_take_payload(&mut self, user_data: usize) -> Option<ErasedPayload> {
         self.ops
             .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
                 payload_cell.take()

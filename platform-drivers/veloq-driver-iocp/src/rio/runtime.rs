@@ -74,7 +74,7 @@ impl RioState {
             .registry
             .prepare_submission(buf, buf.len() as u32, env)?;
         self.registry
-            .ensure_page_registration(page_idx, slab_resolver, env)?;
+            .ensure_page_reg(page_idx, slab_resolver, env)?;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx].unwrap();
 
         if addr_ptr.is_null() {
@@ -133,13 +133,13 @@ impl RioState {
             Offset: addr_offset,
             Length: rio_addr_len as u32,
         };
-        let request_context = Self::encode_request_context(user_data, generation);
+        let request_context = Self::encode_req_ctx(user_data, generation);
 
         if let Err(e) = self
             .kernel
             .submit_send_ex(rq, &data_buf, &addr_buf, request_context)
         {
-            Self::free_op_request_context(request_context as u64);
+            Self::free_op_req_ctx(request_context as u64);
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),

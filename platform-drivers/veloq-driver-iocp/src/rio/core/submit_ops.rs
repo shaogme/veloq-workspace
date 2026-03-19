@@ -12,6 +12,8 @@
 use crate::BufferRegistrationMode;
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::ext::Extensions;
+use crate::ops::submit::SubmissionResult;
+use crate::rio::core::registry::RioRegistry;
 use crate::rio::{RioEnv, RioState, RioTarget};
 use crate::win32::Overlapped;
 use std::io;
@@ -20,7 +22,6 @@ use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION, RIO_RQ,
     RIORESULT, SOCKET_ERROR,
 };
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -69,6 +70,7 @@ pub(crate) trait RioProvider: Send + Sync {
         entries: u32,
         notification: &RIO_NOTIFICATION_COMPLETION,
     ) -> io::Result<RioCq>;
+    #[allow(clippy::too_many_arguments)]
     fn create_rq(
         &self,
         socket: usize,
@@ -101,6 +103,7 @@ pub(crate) trait RioProvider: Send + Sync {
         flags: u32,
         context: *const std::ffi::c_void,
     ) -> io::Result<()>;
+    #[allow(clippy::too_many_arguments)]
     fn send_ex(
         &self,
         rq: RioRq,
@@ -113,6 +116,7 @@ pub(crate) trait RioProvider: Send + Sync {
         flags: u32,
         context: *const std::ffi::c_void,
     ) -> io::Result<()>;
+    #[allow(clippy::too_many_arguments)]
     fn receive_ex(
         &self,
         rq: RioRq,
@@ -131,6 +135,7 @@ pub(crate) trait RioProvider: Send + Sync {
 pub(crate) struct RioDispatch {
     pub(crate) create_cq:
         unsafe extern "system" fn(u32, *const RIO_NOTIFICATION_COMPLETION) -> RIO_CQ,
+    #[allow(clippy::too_many_arguments)]
     pub(crate) create_rq: unsafe extern "system" fn(
         usize,
         u32,
@@ -150,6 +155,7 @@ pub(crate) struct RioDispatch {
         unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
     pub(crate) send:
         unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
+    #[allow(clippy::too_many_arguments)]
     pub(crate) send_ex: unsafe extern "system" fn(
         RIO_RQ,
         *const RIO_BUF,
@@ -161,6 +167,7 @@ pub(crate) struct RioDispatch {
         u32,
         *const std::ffi::c_void,
     ) -> i32,
+    #[allow(clippy::too_many_arguments)]
     pub(crate) receive_ex: unsafe extern "system" fn(
         RIO_RQ,
         *const RIO_BUF,
@@ -181,6 +188,7 @@ impl RioProvider for RioDispatch {
         entries: u32,
         notification: &RIO_NOTIFICATION_COMPLETION,
     ) -> io::Result<RioCq> {
+        // SAFETY: Function pointer is verified at startup. Parameters are validated by the caller.
         let cq = unsafe { (self.create_cq)(entries, notification as *const _) };
         if cq == 0 {
             return Err(io_error(
@@ -193,6 +201,7 @@ impl RioProvider for RioDispatch {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn create_rq(
         &self,
         socket: usize,
@@ -204,6 +213,7 @@ impl RioProvider for RioDispatch {
         send_cq: RioCq,
         context: *const std::ffi::c_void,
     ) -> io::Result<RioRq> {
+        // SAFETY: Function pointer is verified at startup. Parameters are validated by the caller.
         let rq = unsafe {
             (self.create_rq)(
                 socket,
@@ -228,6 +238,7 @@ impl RioProvider for RioDispatch {
 
     #[inline]
     fn register_buffer(&self, ptr: *const u8, len: u32) -> io::Result<RioBufferId> {
+        // SAFETY: Function pointer is verified at startup. Buffer must be valid for the given length.
         let id = unsafe { (self.register_buffer)(ptr, len) };
         if id == 0 {
             return Err(io_error(
@@ -242,17 +253,20 @@ impl RioProvider for RioDispatch {
     #[inline]
     fn deregister_buffer(&self, id: RioBufferId) {
         if !id.is_invalid() {
+            // SAFETY: Function pointer is verified at startup.
             unsafe { (self.deregister_buffer)(id.0) };
         }
     }
 
     #[inline]
     fn dequeue(&self, cq: RioCq, results: &mut [RIORESULT]) -> u32 {
+        // SAFETY: Function pointer and results buffer validity are verified by caller.
         unsafe { (self.dequeue)(cq.0, results.as_mut_ptr(), results.len() as u32) }
     }
 
     #[inline]
     fn notify(&self, cq: RioCq) -> io::Result<()> {
+        // SAFETY: Function pointer is verified at startup.
         let ret = unsafe { (self.notify)(cq.0) };
         if ret == SOCKET_ERROR {
             return Err(io_error(
@@ -312,6 +326,7 @@ impl RioProvider for RioDispatch {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn send_ex(
         &self,
         rq: RioRq,
@@ -348,6 +363,7 @@ impl RioProvider for RioDispatch {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn receive_ex(
         &self,
         rq: RioRq,
@@ -465,7 +481,7 @@ impl RioKernel {
                 Iocp: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
                     IocpHandle: port,
                     CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
-                    Overlapped: (notify_overlapped.as_mut_ptr() as *mut OVERLAPPED).cast(),
+                    Overlapped: notify_overlapped.as_mut_ptr().cast(),
                 },
             },
         };
@@ -595,7 +611,7 @@ impl RioState {
 
         Ok(Self {
             kernel,
-            registry: crate::rio::core::registry::RioRegistry::new(rq_depth),
+            registry: RioRegistry::new(rq_depth),
             registration_mode,
             actors: rustc_hash::FxHashMap::default(),
             actor_routes: rustc_hash::FxHashMap::default(),
@@ -627,8 +643,7 @@ impl RioState {
         target: RioTarget,
         buf: &mut veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::ops::submit::SubmissionResult> {
-        use crate::ops::submit::SubmissionResult;
+    ) -> io::Result<SubmissionResult> {
         let RioTarget {
             fd,
             handle,
@@ -648,9 +663,9 @@ impl RioState {
         let rio_buf = self
             .registry
             .prepare_submission(buf, buf.capacity() as u32, env)?;
-        let request_context = Self::encode_request_context(user_data, generation);
+        let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
-            Self::free_op_request_context(request_context as u64);
+            Self::free_op_req_ctx(request_context as u64);
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
@@ -668,8 +683,7 @@ impl RioState {
         target: RioTarget,
         buf: &veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::ops::submit::SubmissionResult> {
-        use crate::ops::submit::SubmissionResult;
+    ) -> io::Result<SubmissionResult> {
         let RioTarget {
             fd,
             handle,
@@ -689,9 +703,9 @@ impl RioState {
         let rio_buf = self
             .registry
             .prepare_submission(buf, buf.len() as u32, env)?;
-        let request_context = Self::encode_request_context(user_data, generation);
+        let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
-            Self::free_op_request_context(request_context as u64);
+            Self::free_op_req_ctx(request_context as u64);
             return Err(io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),

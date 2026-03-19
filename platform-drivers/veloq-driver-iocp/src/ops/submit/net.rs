@@ -12,8 +12,8 @@ use crate::common::{IocpErrorContext, io_error};
 use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
 use crate::ops::submit::common::{
-    SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex, iocp_submit_connect_ex,
-    iocp_submit_read, iocp_submit_write, resolve_fd, unpack_kernel_ref,
+    AcceptExArgs, ConnectExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex,
+    iocp_submit_connect_ex, iocp_submit_read, iocp_submit_write, resolve_fd, unpack_kernel_ref,
 };
 use crate::ops::{
     AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv, SendToPayload, SubmitContext,
@@ -169,6 +169,7 @@ pub(crate) fn submit_connect(
     {
         let family = storage.family();
         if family == AF_INET {
+            // SAFETY: storage and namelen are valid and initialized by getsockname.
             let buf = unsafe {
                 std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
             };
@@ -178,6 +179,7 @@ pub(crate) fn submit_connect(
                 need_bind = false;
             }
         } else if family == AF_INET6 {
+            // SAFETY: storage and namelen are valid and initialized by getsockname.
             let buf = unsafe {
                 std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
             };
@@ -219,16 +221,16 @@ pub(crate) fn submit_connect(
     let mut bytes_sent = 0;
     // SAFETY: iocp_submit_connect_ex is a safe wrapper for the WinSock extension.
     unsafe {
-        iocp_submit_connect_ex(
-            ctx.ext.connect_ex,
-            handle as SOCKET,
-            &connect_op.addr as *const _ as *const SOCKADDR,
-            connect_op.addr_len as i32,
-            std::ptr::null(),
-            0,
-            &mut bytes_sent,
-            ctx.overlapped,
-        )
+        iocp_submit_connect_ex(ConnectExArgs {
+            connect_ex: ctx.ext.connect_ex,
+            s: handle as SOCKET,
+            name: &connect_op.addr as *const _ as *const SOCKADDR,
+            namelen: connect_op.addr_len as i32,
+            lp_send_buffer: std::ptr::null(),
+            dw_send_data_length: 0,
+            lp_dw_bytes_sent: &mut bytes_sent,
+            lp_overlapped: ctx.overlapped,
+        })
     }
 }
 
@@ -287,17 +289,17 @@ pub(crate) fn submit_accept(
 
     // SAFETY: iocp_submit_accept_ex is a safe wrapper for the WinSock extension.
     unsafe {
-        iocp_submit_accept_ex(
-            ctx.ext.accept_ex,
-            handle as SOCKET,
-            accept_socket_raw,
-            payload.accept_buffer.as_mut_ptr() as *mut _,
-            0,
-            split as u32,
-            split as u32,
-            &mut bytes_received,
-            ctx.overlapped,
-        )
+        iocp_submit_accept_ex(AcceptExArgs {
+            accept_ex: ctx.ext.accept_ex,
+            s_listen_socket: handle as SOCKET,
+            s_accept_socket: accept_socket_raw,
+            lp_output_buffer: payload.accept_buffer.as_mut_ptr() as *mut _,
+            dw_receive_data_length: 0,
+            dw_local_address_length: split as u32,
+            dw_remote_address_length: split as u32,
+            lp_dw_bytes_received: &mut bytes_received,
+            lp_overlapped: ctx.overlapped,
+        })
     }.map_err(|e| {
         io_error(
             IocpErrorContext::Submission,
@@ -369,6 +371,7 @@ pub(crate) unsafe fn on_complete_accept(
     }
 
     if !remote_sockaddr.is_null() && remote_len > 0 {
+        // SAFETY: remote_sockaddr and remote_len are provided by AcceptEx.
         let buf = unsafe {
             std::slice::from_raw_parts(remote_sockaddr as *const u8, remote_len as usize)
         };

@@ -47,10 +47,7 @@ pub(crate) fn rio_result_to_event_res(res: &io::Result<usize>) -> i32 {
 
 impl RioState {
     #[inline]
-    pub(crate) fn encode_request_context(
-        user_data: usize,
-        generation: u32,
-    ) -> *const std::ffi::c_void {
+    pub(crate) fn encode_req_ctx(user_data: usize, generation: u32) -> *const std::ffi::c_void {
         let ctx = Box::new(RioOpRequestContext {
             user_data,
             generation,
@@ -61,7 +58,7 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn decode_request_context(ctx: u64) -> Option<RioCompletionKind> {
+    pub(crate) fn decode_req_ctx(ctx: u64) -> Option<RioCompletionKind> {
         if ctx == 0 {
             return None;
         }
@@ -90,7 +87,7 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn free_op_request_context(ctx: u64) {
+    pub(crate) fn free_op_req_ctx(ctx: u64) {
         if ctx == 0 {
             return;
         }
@@ -134,8 +131,8 @@ mod tests {
 
     #[test]
     fn op_ctx_roundtrip_decode_and_free() {
-        let ptr = RioState::encode_request_context(11, 17);
-        let decoded = RioState::decode_request_context(ptr as u64);
+        let ptr = RioState::encode_req_ctx(11, 17);
+        let decoded = RioState::decode_req_ctx(ptr as u64);
         assert!(matches!(
             decoded,
             Some(RioCompletionKind::Op {
@@ -144,7 +141,7 @@ mod tests {
                 ..
             })
         ));
-        RioState::free_op_request_context(ptr as u64);
+        RioState::free_op_req_ctx(ptr as u64);
     }
 
     #[test]
@@ -154,10 +151,10 @@ mod tests {
         let raw = (((actor_id as usize) << 33) | ((token as usize) << 1) | POOL_CTX_TAG) as u64;
         assert_eq!(RioState::decode_pool_context(raw), Some((actor_id, token)));
         assert!(matches!(
-            RioState::decode_request_context(raw),
+            RioState::decode_req_ctx(raw),
             Some(RioCompletionKind::Pool {
                 actor_id: 9,
-                generation: 7
+                generation: 7,
             })
         ));
     }
@@ -168,8 +165,8 @@ mod tests {
         let zero_actor = (((7_usize) << 1) | POOL_CTX_TAG) as u64;
         assert!(RioState::decode_pool_context(zero_token).is_none());
         assert!(RioState::decode_pool_context(zero_actor).is_none());
-        assert!(RioState::decode_request_context(zero_token).is_none());
-        assert!(RioState::decode_request_context(zero_actor).is_none());
+        assert!(RioState::decode_req_ctx(zero_token).is_none());
+        assert!(RioState::decode_req_ctx(zero_actor).is_none());
     }
 
     #[test]
@@ -186,6 +183,6 @@ mod tests {
     #[test]
     fn free_pool_tagged_context_is_noop() {
         let tagged = (((1_usize) << 33) | ((1_usize) << 1) | POOL_CTX_TAG) as u64;
-        RioState::free_op_request_context(tagged);
+        RioState::free_op_req_ctx(tagged);
     }
 }

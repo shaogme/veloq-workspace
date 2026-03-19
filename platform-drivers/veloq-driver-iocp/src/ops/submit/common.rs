@@ -25,6 +25,29 @@ pub(crate) enum SubmissionResult {
 // FFI Wrappers
 // ============================================================================
 
+pub(crate) struct ConnectExArgs {
+    pub(crate) connect_ex: LpfnConnectEx,
+    pub(crate) s: SOCKET,
+    pub(crate) name: *const windows_sys::Win32::Networking::WinSock::SOCKADDR,
+    pub(crate) namelen: i32,
+    pub(crate) lp_send_buffer: *const std::ffi::c_void,
+    pub(crate) dw_send_data_length: u32,
+    pub(crate) lp_dw_bytes_sent: *mut u32,
+    pub(crate) lp_overlapped: *mut Overlapped,
+}
+
+pub(crate) struct AcceptExArgs {
+    pub(crate) accept_ex: LpfnAcceptEx,
+    pub(crate) s_listen_socket: SOCKET,
+    pub(crate) s_accept_socket: SOCKET,
+    pub(crate) lp_output_buffer: *mut std::ffi::c_void,
+    pub(crate) dw_receive_data_length: u32,
+    pub(crate) dw_local_address_length: u32,
+    pub(crate) dw_remote_address_length: u32,
+    pub(crate) lp_dw_bytes_received: *mut u32,
+    pub(crate) lp_overlapped: *mut Overlapped,
+}
+
 /// Safe wrapper for ReadFile.
 ///
 /// # Safety
@@ -94,27 +117,17 @@ pub(crate) unsafe fn iocp_submit_write(
 /// # Safety
 ///
 /// The caller must ensure that all pointers and the socket handle are valid.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn iocp_submit_connect_ex(
-    connect_ex: LpfnConnectEx,
-    s: SOCKET,
-    name: *const windows_sys::Win32::Networking::WinSock::SOCKADDR,
-    namelen: i32,
-    lp_send_buffer: *const std::ffi::c_void,
-    dw_send_data_length: u32,
-    lp_dw_bytes_sent: *mut u32,
-    lp_overlapped: *mut Overlapped,
-) -> io::Result<SubmissionResult> {
+pub(crate) unsafe fn iocp_submit_connect_ex(args: ConnectExArgs) -> io::Result<SubmissionResult> {
     // SAFETY: connect_ex is called with valid parameters.
     let ret = unsafe {
-        connect_ex(
-            s,
-            name,
-            namelen,
-            lp_send_buffer,
-            dw_send_data_length,
-            lp_dw_bytes_sent,
-            lp_overlapped as *mut OVERLAPPED,
+        (args.connect_ex)(
+            args.s,
+            args.name,
+            args.namelen,
+            args.lp_send_buffer,
+            args.dw_send_data_length,
+            args.lp_dw_bytes_sent,
+            args.lp_overlapped as *mut OVERLAPPED,
         )
     };
     if ret == 0 {
@@ -132,29 +145,18 @@ pub(crate) unsafe fn iocp_submit_connect_ex(
 /// # Safety
 ///
 /// The caller must ensure that all pointers and the socket handles are valid.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn iocp_submit_accept_ex(
-    accept_ex: LpfnAcceptEx,
-    s_listen_socket: SOCKET,
-    s_accept_socket: SOCKET,
-    lp_output_buffer: *mut std::ffi::c_void,
-    dw_receive_data_length: u32,
-    dw_local_address_length: u32,
-    dw_remote_address_length: u32,
-    lp_dw_bytes_received: *mut u32,
-    lp_overlapped: *mut Overlapped,
-) -> io::Result<SubmissionResult> {
+pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> io::Result<SubmissionResult> {
     // SAFETY: accept_ex is called with valid parameters.
     let ret = unsafe {
-        accept_ex(
-            s_listen_socket,
-            s_accept_socket,
-            lp_output_buffer,
-            dw_receive_data_length,
-            dw_local_address_length,
-            dw_remote_address_length,
-            lp_dw_bytes_received,
-            lp_overlapped as *mut OVERLAPPED,
+        (args.accept_ex)(
+            args.s_listen_socket,
+            args.s_accept_socket,
+            args.lp_output_buffer,
+            args.dw_receive_data_length,
+            args.dw_local_address_length,
+            args.dw_remote_address_length,
+            args.lp_dw_bytes_received,
+            args.lp_overlapped as *mut OVERLAPPED,
         )
     };
     if ret == 0 {
