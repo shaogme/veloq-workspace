@@ -1,4 +1,4 @@
-﻿use clap::{Parser, ValueEnum};
+use clap::{Parser, ValueEnum};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
@@ -180,6 +180,17 @@ impl Runner {
     fn run(&self) -> io::Result<()> {
         let command = self.round_command();
 
+        if !matches!(self.mode, RunMode::Native) {
+            // 在非原生环境下，我们直接运行一次 xtest-runner，由内部的 xtest-runner 负责循环
+            let status = command_status(&command, &self.workspace_root)?;
+            if status.success() {
+                return Ok(());
+            } else {
+                // 代理子命令已经输出了详细报告（含 count 信息），外层直接对应 code 退出即可
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+
         for round in 1..=self.config.count {
             self.run_round(&command, round)?;
         }
@@ -275,35 +286,41 @@ impl Runner {
 
     fn round_command(&self) -> CommandSpec {
         match (self.mode, self.config.target) {
-            (RunMode::LinuxOnWindows(DockerComposeVariant::Standalone), Target::Linux) => {
-                CommandSpec::new(
-                    "docker-compose",
-                    vec![
-                        "run".into(),
-                        "--rm".into(),
-                        "dev".into(),
-                        "sh".into(),
-                        "-c".into(),
-                        linux_command_line(self.config.task),
-                    ],
-                )
-            }
-            (RunMode::LinuxOnWindows(DockerComposeVariant::Plugin), Target::Linux) => {
-                CommandSpec::new(
-                    "docker",
-                    vec![
-                        "compose".into(),
-                        "run".into(),
-                        "--rm".into(),
-                        "dev".into(),
-                        "sh".into(),
-                        "-c".into(),
-                        linux_command_line(self.config.task),
-                    ],
-                )
+            (RunMode::LinuxOnWindows(variant), Target::Linux) => {
+                let program = match variant {
+                    DockerComposeVariant::Standalone => "docker-compose",
+                    DockerComposeVariant::Plugin => "docker",
+                };
+                let mut args = if matches!(variant, DockerComposeVariant::Plugin) {
+                    vec!["compose".into()]
+                } else {
+                    vec![]
+                };
+                args.extend(vec![
+                    "run".into(),
+                    "--rm".into(),
+                    "dev".into(),
+                    "cargo".into(),
+                    "run".into(),
+                    "-q".into(),
+                    "-p".into(),
+                    "xtest-runner".into(),
+                    "--".into(),
+                ]);
+                args.extend(std::env::args().skip(1));
+                CommandSpec::new(program, args)
             }
             (RunMode::WindowsOnLinux, Target::Windows) => {
-                windows_cross_command(self.config.task).with_env("CROSS_SKIP_AUTO_UPDATE", "1")
+                let mut args = vec![
+                    "run".into(),
+                    "--target".into(),
+                    WINDOWS_TARGET.into(),
+                    "-p".into(),
+                    "xtest-runner".into(),
+                    "--".into(),
+                ];
+                args.extend(std::env::args().skip(1));
+                CommandSpec::new("cross", args).with_env("CROSS_SKIP_AUTO_UPDATE", "1")
             }
             (_, Target::Linux) => linux_native_command(self.config.task),
             (_, Target::Windows) => windows_native_command(self.config.task),
@@ -311,9 +328,6 @@ impl Runner {
     }
 }
 
-fn linux_command_line(task: Task) -> String {
-    linux_native_command(task).display()
-}
 
 fn linux_native_command(task: Task) -> CommandSpec {
     match task {
@@ -375,31 +389,6 @@ fn windows_native_command(task: Task) -> CommandSpec {
         ),
         Task::Check => CommandSpec::new(
             "cargo",
-            vec!["check".into(), "--target".into(), WINDOWS_TARGET.into()],
-        ),
-    }
-}
-
-fn windows_cross_command(task: Task) -> CommandSpec {
-    match task {
-        Task::Test => CommandSpec::new(
-            "cross",
-            vec!["test".into(), "--target".into(), WINDOWS_TARGET.into()],
-        ),
-        Task::Clippy => CommandSpec::new(
-            "cross",
-            vec![
-                "clippy".into(),
-                "--all-targets".into(),
-                "--target".into(),
-                WINDOWS_TARGET.into(),
-                "--".into(),
-                "-D".into(),
-                "warnings".into(),
-            ],
-        ),
-        Task::Check => CommandSpec::new(
-            "cross",
             vec!["check".into(), "--target".into(), WINDOWS_TARGET.into()],
         ),
     }
