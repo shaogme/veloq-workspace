@@ -37,7 +37,8 @@ pub enum SlotState {
     Pending = 1,
     Initialized = 2,
     InFlight = 3,
-    Completed = 4,
+    Cancelled = 4,
+    Completed = 5,
 }
 
 pub struct SlotStorage<Op, S: SlotSidecar> {

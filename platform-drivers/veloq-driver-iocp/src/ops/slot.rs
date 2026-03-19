@@ -17,16 +17,19 @@ pub(crate) trait SlotState: sealed::Sealed {}
 pub(crate) struct Pending;
 pub(crate) struct Initialized;
 pub(crate) struct InFlight;
+pub(crate) struct Cancelled;
 pub(crate) struct Completed;
 
 impl sealed::Sealed for Pending {}
 impl sealed::Sealed for Initialized {}
 impl sealed::Sealed for InFlight {}
+impl sealed::Sealed for Cancelled {}
 impl sealed::Sealed for Completed {}
 
 impl SlotState for Pending {}
 impl SlotState for Initialized {}
 impl SlotState for InFlight {}
+impl SlotState for Cancelled {}
 impl SlotState for Completed {}
 
 pub(crate) struct Slot<'a, State: SlotState> {
@@ -118,7 +121,13 @@ impl<'a> Slot<'a, InFlight> {
 
     #[inline]
     pub(crate) fn is_in_flight_entry(entry: &SlotEntry<IocpOp, OverlappedEntry>) -> bool {
-        entry.state.load(Ordering::Acquire) == CoreState::InFlight as u8
+        let state = entry.state.load(Ordering::Acquire);
+        state == CoreState::InFlight as u8 || state == CoreState::Cancelled as u8
+    }
+
+    #[inline]
+    pub(crate) fn is_cancelled_entry(entry: &SlotEntry<IocpOp, OverlappedEntry>) -> bool {
+        entry.state.load(Ordering::Acquire) == CoreState::Cancelled as u8
     }
 
     pub(crate) fn as_inflight_entry(
@@ -141,6 +150,18 @@ impl<'a> Slot<'a, InFlight> {
             .state
             .store(CoreState::Completed as u8, Ordering::Release);
 
+        Slot {
+            entry: self.entry,
+            storage: self.storage,
+            index: self.index,
+            _state: PhantomData,
+        }
+    }
+
+    pub(crate) fn cancel(self) -> Slot<'a, Cancelled> {
+        self.entry
+            .state
+            .store(CoreState::Cancelled as u8, Ordering::Release);
         Slot {
             entry: self.entry,
             storage: self.storage,

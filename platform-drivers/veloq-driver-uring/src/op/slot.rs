@@ -38,6 +38,13 @@ pub(crate) struct Slot<'a, State: SlotState> {
     _state: PhantomData<State>,
 }
 
+pub(crate) struct SlotSession<'a> {
+    entry: &'a SlotEntry<UringOp, ()>,
+    storage: &'a mut SlotStorage<UringOp, ()>,
+    platform: &'a mut UringOpState,
+    index: usize,
+}
+
 impl<'a, S: SlotState> Slot<'a, S> {
     #[inline]
     fn new_internal(
@@ -53,6 +60,28 @@ impl<'a, S: SlotState> Slot<'a, S> {
             index,
             _state: PhantomData,
         }
+    }
+}
+
+impl<'a> SlotSession<'a> {
+    #[inline]
+    pub(crate) fn bind_pending(self) -> Option<Slot<'a, Pending>> {
+        Slot::<Pending>::try_bind(self.entry, self.storage, self.platform, self.index)
+    }
+
+    #[inline]
+    pub(crate) fn bind_initialized(self) -> Option<Slot<'a, Initialized>> {
+        Slot::<Initialized>::try_bind(self.entry, self.storage, self.platform, self.index)
+    }
+
+    #[inline]
+    pub(crate) fn bind_in_flight(self) -> Option<Slot<'a, InFlight>> {
+        Slot::<InFlight>::try_bind(self.entry, self.storage, self.platform, self.index)
+    }
+
+    #[inline]
+    pub(crate) fn bind_cancelled(self) -> Option<Slot<'a, Cancelled>> {
+        Slot::<Cancelled>::try_bind(self.entry, self.storage, self.platform, self.index)
     }
 }
 
@@ -80,7 +109,6 @@ impl<'a> Slot<'a, Pending> {
         entry
             .state
             .store(CoreState::Pending as u8, Ordering::Release);
-        platform.is_cancelled = false;
         Self {
             entry,
             storage,
@@ -146,9 +174,7 @@ impl<'a> Slot<'a, InFlight> {
         platform: &'a mut UringOpState,
         index: usize,
     ) -> Option<Self> {
-        if entry.state.load(Ordering::Acquire) == CoreState::InFlight as u8
-            && !platform.is_cancelled
-        {
+        if entry.state.load(Ordering::Acquire) == CoreState::InFlight as u8 {
             Some(Self::new_internal(entry, storage, platform, index))
         } else {
             None
@@ -165,7 +191,9 @@ impl<'a> Slot<'a, InFlight> {
     }
 
     pub(crate) fn cancel(self) -> Slot<'a, Cancelled> {
-        self.platform.is_cancelled = true;
+        self.entry
+            .state
+            .store(CoreState::Cancelled as u8, Ordering::Release);
 
         Slot::new_internal(self.entry, self.storage, self.platform, self.index)
     }
@@ -186,8 +214,7 @@ impl<'a> Slot<'a, Cancelled> {
         platform: &'a mut UringOpState,
         index: usize,
     ) -> Option<Self> {
-        if entry.state.load(Ordering::Acquire) == CoreState::InFlight as u8 && platform.is_cancelled
-        {
+        if entry.state.load(Ordering::Acquire) == CoreState::Cancelled as u8 {
             Some(Self::new_internal(entry, storage, platform, index))
         } else {
             None
@@ -241,6 +268,7 @@ impl Drop for SubmissionGuard {
 }
 
 pub(crate) trait UringOpRegistryExt {
+    fn slot_session(&mut self, index: usize) -> Option<SlotSession<'_>>;
     fn slot_pending(&mut self, index: usize) -> Option<Slot<'_, Pending>>;
     fn slot_initialized(&mut self, index: usize) -> Option<Slot<'_, Initialized>>;
     fn slot_in_flight(&mut self, index: usize) -> Option<Slot<'_, InFlight>>;
@@ -249,24 +277,30 @@ pub(crate) trait UringOpRegistryExt {
 }
 
 impl UringOpRegistryExt for OpRegistry<UringOp, UringOpState, ()> {
-    fn slot_pending(&mut self, index: usize) -> Option<Slot<'_, Pending>> {
+    fn slot_session(&mut self, index: usize) -> Option<SlotSession<'_>> {
         let (entry, op_entry, storage) = self.get_slot_entry_storage_and_entry_mut(index)?;
-        Slot::<Pending>::try_bind(entry, storage, &mut op_entry.platform_data, index)
+        Some(SlotSession {
+            entry,
+            storage,
+            platform: &mut op_entry.platform_data,
+            index,
+        })
+    }
+
+    fn slot_pending(&mut self, index: usize) -> Option<Slot<'_, Pending>> {
+        self.slot_session(index)?.bind_pending()
     }
 
     fn slot_initialized(&mut self, index: usize) -> Option<Slot<'_, Initialized>> {
-        let (entry, op_entry, storage) = self.get_slot_entry_storage_and_entry_mut(index)?;
-        Slot::<Initialized>::try_bind(entry, storage, &mut op_entry.platform_data, index)
+        self.slot_session(index)?.bind_initialized()
     }
 
     fn slot_in_flight(&mut self, index: usize) -> Option<Slot<'_, InFlight>> {
-        let (entry, op_entry, storage) = self.get_slot_entry_storage_and_entry_mut(index)?;
-        Slot::<InFlight>::try_bind(entry, storage, &mut op_entry.platform_data, index)
+        self.slot_session(index)?.bind_in_flight()
     }
 
     fn slot_cancelled(&mut self, index: usize) -> Option<Slot<'_, Cancelled>> {
-        let (entry, op_entry, storage) = self.get_slot_entry_storage_and_entry_mut(index)?;
-        Slot::<Cancelled>::try_bind(entry, storage, &mut op_entry.platform_data, index)
+        self.slot_session(index)?.bind_cancelled()
     }
 
     fn slot_init_pending(&mut self, index: usize) -> Slot<'_, Pending> {

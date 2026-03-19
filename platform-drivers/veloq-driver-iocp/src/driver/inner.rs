@@ -19,7 +19,7 @@ use crate::common::{
     io_result_to_event_res, push_completion_shared,
 };
 use crate::config::{BufferRegistrationMode, IocpConfig};
-use crate::driver::{CompletionSidecar, IocpOpState, OpLifecycle};
+use crate::driver::{CompletionSidecar, IocpOpState};
 use crate::ops::slot::{InFlight, Slot};
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
 use crate::rio::RioState;
@@ -322,14 +322,15 @@ impl IocpDriver {
     fn with_inflight_slot<R>(
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
         index: usize,
-        f: impl FnOnce(Slot<InFlight>, &mut OpEntry<IocpOpState>) -> R,
+        f: impl FnOnce(Slot<InFlight>, &mut OpEntry<IocpOpState>, bool) -> R,
     ) -> Option<R> {
         let (slot, op, storage) = ops.get_slot_entry_storage_and_entry_mut(index)?;
         if !Slot::<InFlight>::is_in_flight_entry(slot) {
             return None;
         }
+        let was_cancelled = Slot::<InFlight>::is_cancelled_entry(slot);
         let guard = Slot::<InFlight>::as_inflight_entry(slot, storage, index);
-        Some(f(guard, op))
+        Some(f(guard, op, was_cancelled))
     }
 
     fn calculate_io_result(
@@ -345,7 +346,7 @@ impl IocpDriver {
             Ok(bytes_transferred as usize)
         };
 
-        let processed = Self::with_inflight_slot(&mut self.ops, user_data, |mut guard, _op| {
+        let processed = Self::with_inflight_slot(&mut self.ops, user_data, |mut guard, _op, _| {
             // SAFETY: InFlight state grants sidecar mutable access.
             let blocking_res = unsafe { guard.sidecar_unchecked(|s| s.blocking_result.take()) };
 
@@ -389,8 +390,7 @@ impl IocpDriver {
         io_result: io::Result<usize>,
     ) {
         let mut should_free = false;
-        let handled = Self::with_inflight_slot(ops, user_data, |guard, op| {
-            let was_cancelled = matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
+        let handled = Self::with_inflight_slot(ops, user_data, |guard, op, was_cancelled| {
             let completion_res = io_result_to_event_res(&io_result);
             op.platform_data.rio_pool_waiting = false;
             let mut guard = guard.complete();
@@ -425,7 +425,7 @@ impl IocpDriver {
         });
 
         if handled.is_none() {
-            debug!(user_data, "Received completion for non-InFlight slot");
+            debug!(user_data, "Received completion for non-active slot");
         } else if should_free {
             ops.shared.push_free(user_data);
         }
@@ -454,17 +454,19 @@ impl IocpDriver {
             return;
         }
 
-        if self
+        let already_cancelled = self
             .ops
+            .shared
+            .slots
             .get(user_data)
-            .is_some_and(|op| matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled))
-        {
+            .is_some_and(Slot::<InFlight>::is_cancelled_entry);
+        if already_cancelled {
             return;
         }
         if in_flight {
-            if let Some(op) = self.ops.get_mut(user_data) {
-                op.platform_data.lifecycle = OpLifecycle::Cancelled;
-            }
+            let _ = Self::with_inflight_slot(&mut self.ops, user_data, |guard, _op, _| {
+                let _ = guard.cancel();
+            });
             let ctx = CancelContext {
                 registered_files: &self.registered_files,
                 rio_state: &mut self.rio_state,
@@ -484,7 +486,7 @@ impl IocpDriver {
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
     ) {
         let mut should_emit_aborted = false;
-        let handled = Self::with_inflight_slot(ops, user_data, |mut guard, op| {
+        let handled = Self::with_inflight_slot(ops, user_data, |mut guard, op, _| {
             // SAFETY: InFlight state grants op mutable access.
             let fd = unsafe { guard.op_mut_unchecked(|iocp_op| iocp_op.get_fd()) }.flatten();
 
@@ -536,7 +538,7 @@ impl IocpDriver {
             .generation
             .load(Ordering::Acquire);
         let (payload, detail) = if let Some(data) =
-            Self::with_inflight_slot(ops, user_data, |guard, _op| {
+            Self::with_inflight_slot(ops, user_data, |guard, _op, _| {
                 let mut guard = guard.complete();
                 let _ = guard.take_op();
                 let data = guard.take_completion_data();

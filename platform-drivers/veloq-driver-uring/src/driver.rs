@@ -394,6 +394,7 @@ impl UringDriver {
             state == CoreState::Pending as u8
                 || state == CoreState::Initialized as u8
                 || state == CoreState::InFlight as u8
+                || state == CoreState::Cancelled as u8
         })
     }
 

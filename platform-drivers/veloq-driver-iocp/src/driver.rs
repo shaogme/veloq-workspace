@@ -31,19 +31,9 @@ use inner::RIO_EVENT_KEY;
 // State & Lifecycle Types
 // ============================================================================
 
-/// Represents the lifecycle stage of an IOCP operation.
-#[derive(Debug, Default)]
-pub enum OpLifecycle {
-    #[default]
-    Active,
-    /// Cancelled by user
-    Cancelled,
-}
-
 /// State associated with an IOCP operation.
 pub struct IocpOpState {
     pub(crate) generation: u32,
-    pub(crate) lifecycle: OpLifecycle,
     pub(crate) timer_id: Option<TaskId>,
     pub(crate) timer_deadline: Option<Instant>,
     pub(crate) is_background: bool,
@@ -59,7 +49,6 @@ impl Default for IocpOpState {
     fn default() -> Self {
         Self {
             generation: 0,
-            lifecycle: OpLifecycle::Active,
             timer_id: None,
             timer_deadline: None,
             is_background: false,

@@ -9,7 +9,6 @@ use veloq_driver_core::slot::{ErasedPayload, SlotState as CoreState};
 
 #[derive(Clone, Default)]
 pub struct UringOpState {
-    pub(crate) is_cancelled: bool,
     pub(crate) next: Option<usize>,
     pub(crate) timer_id: Option<veloq_wheel::TaskId>,
 }
@@ -22,15 +21,12 @@ impl UringOpState {
 
 impl UringDriver {
     pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
-        let (state, is_cancelled) = match self.ops.get_slot_and_entry_mut(user_data) {
-            Some((slot_entry, op_entry)) => (
-                slot_entry.state.load(Ordering::Acquire),
-                op_entry.platform_data.is_cancelled,
-            ),
+        let state = match self.ops.get_slot_and_entry_mut(user_data) {
+            Some((slot_entry, _op_entry)) => slot_entry.state.load(Ordering::Acquire),
             None => return,
         };
 
-        if is_cancelled || state == CoreState::Completed as u8 {
+        if state == CoreState::Cancelled as u8 || state == CoreState::Completed as u8 {
             return;
         }
 
@@ -179,9 +175,9 @@ impl UringDriver {
             // Inspect state to decide action before taking mutable borrow for processing.
             let mut action = BacklogAction::Drop;
 
-            if let Some((slot_entry, op_entry)) = self.ops.get_slot_and_entry_mut(user_data) {
+            if let Some((slot_entry, _op_entry)) = self.ops.get_slot_and_entry_mut(user_data) {
                 let state = slot_entry.state.load(Ordering::Acquire);
-                action = if op_entry.platform_data.is_cancelled {
+                action = if state == CoreState::Cancelled as u8 {
                     BacklogAction::Cancel
                 } else if state == CoreState::Pending as u8 || state == CoreState::Initialized as u8
                 {

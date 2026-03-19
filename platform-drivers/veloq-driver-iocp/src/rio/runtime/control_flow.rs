@@ -1,7 +1,7 @@
 //! Actor coordination and completion routing for the RIO runtime.
 
 use crate::IoFd;
-use crate::driver::{IocpOpState, OpLifecycle};
+use crate::driver::IocpOpState;
 use crate::ops::IocpOp;
 use crate::ops::slot::{InFlight, Slot};
 use crate::rio::core::RioCompletionKind;
@@ -113,7 +113,7 @@ impl<'a> RioCompletionRouter<'a> {
             if op.platform_data.generation == generation
                 && Slot::<InFlight>::is_in_flight_entry(slot)
             {
-                let was_cancelled = matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
+                let was_cancelled = Slot::<InFlight>::is_cancelled_entry(slot);
                 let mut guard =
                     Slot::<InFlight>::as_inflight_entry(slot, storage, user_data).complete();
 
