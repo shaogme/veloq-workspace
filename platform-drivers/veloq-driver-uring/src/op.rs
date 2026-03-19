@@ -8,6 +8,7 @@ use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{IntoPlatformOp, OpKind};
 
 mod payload;
+pub(crate) mod slot;
 mod submit;
 
 pub(crate) use payload::UringOpPayload;

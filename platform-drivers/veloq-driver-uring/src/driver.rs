@@ -10,11 +10,12 @@ use std::time::Instant;
 use tracing::{debug, trace};
 
 use crate::config::{BufferRegistrationMode, IoFd, IoMode, RawHandle, UringConfig};
-use crate::op::{SubmissionStrategy, UringOp};
+use crate::op::{OpVTable, SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, CompletionTable, Driver, Outcome, RemoteWaker,
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder, encode_completion_token,
 };
+use veloq_driver_core::slot::ErasedPayload;
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 use veloq_driver_core::op_registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
 
@@ -24,6 +25,8 @@ mod registration;
 pub(crate) use lifecycle::OpLifecycle;
 pub use lifecycle::UringOpState;
 pub(crate) use registration::{MAX_CHUNKS, UringRegistrationStats};
+
+use crate::op::slot::{InFlight, Initialized, Pending, Slot};
 
 pub(crate) struct EventFd {
     pub(crate) fd: RawFd,
@@ -163,25 +166,29 @@ impl UringDriver {
     }
 
     pub(crate) fn submit_from_slot(&mut self, user_data: usize) -> io::Result<bool> {
-        let op_ptr = self
-            .ops
-            .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
-                slot_op
-                    .as_mut()
-                    .map(|op| op as *mut UringOp)
-                    .unwrap_or(std::ptr::null_mut())
-            })
-            .unwrap_or(std::ptr::null_mut());
-        if op_ptr.is_null() {
-            return Err(io::Error::other("Op missing in slot"));
-        }
-        let op = unsafe { &mut *op_ptr };
-        let vtable = op.vtable;
-        let strategy = vtable.strategy;
-        let (sqe_opt, duration_opt) = match strategy {
+        let (vtable, strategy) = {
+            let (_, _, storage) = self
+                .ops
+                .get_slot_entry_storage_and_entry_mut(user_data)
+                .ok_or_else(|| io::Error::other("Op missing in slot"))?;
+
+            storage.with_mut(|op, _, _, _| {
+                let op = op.as_ref().ok_or_else(|| io::Error::other("Op missing"))?;
+                Ok::<(&'static OpVTable, SubmissionStrategy), io::Error>((op.vtable, op.vtable.strategy))
+            })?
+        };
+
+        match strategy {
             SubmissionStrategy::SubmitSqe => {
                 let mut chunks = [0u16; 4];
-                let count = unsafe { (vtable.resolve_chunks)(op, &mut chunks) };
+                let count = {
+                    let (_, _, storage) = self.ops.get_slot_entry_storage_and_entry_mut(user_data).unwrap();
+                    storage.with_mut(|op, _, _, _| {
+                        let op = op.as_ref().unwrap();
+                        unsafe { (vtable.resolve_chunks)(op, &mut chunks) }
+                    })
+                };
+
                 for &chunk_id in chunks.iter().take(count) {
                     let index = chunk_id as usize;
                     let is_registered = self.registered_chunks.get(index).map_err(|e| {
@@ -218,36 +225,42 @@ impl UringDriver {
                         )));
                     }
                 }
-                let sqe = unsafe { (vtable.make_sqe)(op, self).user_data(user_data as u64) };
-                (Some(sqe), None)
-            }
-            SubmissionStrategy::SoftwareTimer => (None, unsafe { (vtable.get_timeout)(op) }),
-            _ => (None, None),
-        };
-
-        match strategy {
-            SubmissionStrategy::SubmitSqe => {
-                if let Some(sqe) = sqe_opt {
-                    if self.push_entry(sqe) {
-                        if let Some(entry) = self.ops.get_mut(user_data) {
-                            entry.platform_data.lifecycle = OpLifecycle::InFlight;
-                        }
-                        trace!(user_data, "Submitted to SQ");
-                        Ok(true)
-                    } else {
-                        debug!(user_data, "SQ full");
-                        Ok(false)
+                
+                let driver_ptr = self as *mut UringDriver;
+                let sqe = {
+                    let (slot_entry, op_entry, storage) = self.ops.get_slot_entry_storage_and_entry_mut(user_data).unwrap();
+                    let mut slot = Slot::<Initialized>::as_initialized(slot_entry, storage, &mut op_entry.platform_data, user_data);
+                    slot.with_op_mut(|op| {
+                        unsafe { (vtable.make_sqe)(op, &mut *driver_ptr).user_data(user_data as u64) }
+                    }).expect("op missing in slot")
+                };
+                
+                if self.push_entry(sqe) {
+                    if let Some((slot_entry, op_entry, storage)) = self.ops.get_slot_entry_storage_and_entry_mut(user_data) {
+                        let slot = Slot::<Initialized>::as_initialized(slot_entry, storage, &mut op_entry.platform_data, user_data);
+                        let _in_flight = slot.start_submission().persist();
                     }
+                    trace!(user_data, "Submitted to SQ");
+                    Ok(true)
                 } else {
-                    Err(io::Error::other("SQE generation failed"))
+                    debug!(user_data, "SQ full");
+                    Ok(false)
                 }
             }
             SubmissionStrategy::SoftwareTimer => {
+                let duration_opt = {
+                    let (_, _, storage) = self.ops.get_slot_entry_storage_and_entry_mut(user_data).unwrap();
+                    storage.with_mut(|op, _, _, _| {
+                        let op = op.as_ref().unwrap();
+                        unsafe { (vtable.get_timeout)(op) }
+                    })
+                };
                 if let Some(duration) = duration_opt {
                     let task_id = self.wheel.insert(user_data, duration);
-                    if let Some(entry) = self.ops.get_mut(user_data) {
-                        entry.platform_data.lifecycle = OpLifecycle::InFlight;
-                        entry.platform_data.timer_id = Some(task_id);
+                    if let Some((slot_entry, op_entry, storage)) = self.ops.get_slot_entry_storage_and_entry_mut(user_data) {
+                        let slot = Slot::<Initialized>::as_initialized(slot_entry, storage, &mut op_entry.platform_data, user_data);
+                        let in_flight = slot.start_submission().persist();
+                        in_flight.platform.timer_id = Some(task_id);
                     }
                     trace!(user_data, ?duration, "Registered software timer");
                     Ok(true)
@@ -255,10 +268,12 @@ impl UringDriver {
                     Err(io::Error::other("Timer duration missing"))
                 }
             }
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Unsupported strategy for slot submission",
-            )),
+            _ => {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Unsupported strategy for slot submission",
+                ))
+            }
         }
     }
 
@@ -274,13 +289,7 @@ impl UringDriver {
         let (uring_op, payload) =
             <Wakeup<RawHandle> as IntoPlatformOp<UringOp>>::into_kernel_and_payload(op);
 
-        let state = UringOpState {
-            lifecycle: OpLifecycle::Pending,
-            next: None,
-            timer_id: None,
-        };
-
-        let result = self.ops.alloc(state);
+        let result = self.ops.alloc(UringOpState::new());
 
         if let Ok(AllocResult {
             handle: OpHandle {
@@ -290,29 +299,34 @@ impl UringDriver {
         {
             self.waker_token = Some(user_data);
             self.waker_payload = Some(payload);
-            let _ = self.ops.with_slot_storage_mut(
-                user_data,
-                |slot_op, _result, _payload, _sidecar| {
-                    *slot_op = Some(uring_op);
-                },
-            );
 
-            let op_ptr = self
-                .ops
-                .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
-                    slot_op
-                        .as_mut()
-                        .map(|op| op as *mut UringOp)
-                        .unwrap_or(std::ptr::null_mut())
-                })
-                .unwrap_or(std::ptr::null_mut());
-            assert!(!op_ptr.is_null(), "waker op missing in slot");
-            let op = unsafe { &mut *op_ptr };
-            let sqe = unsafe { (op.vtable.make_sqe)(op, self).user_data(user_data as u64) };
+            let vtable = {
+                let (slot_entry, op_entry, storage) = self
+                    .ops
+                    .get_slot_entry_storage_and_entry_mut(user_data)
+                    .expect("Failed to get waker slot");
+
+                let mut slot = Slot::<Pending>::new(slot_entry, storage, &mut op_entry.platform_data, user_data)
+                    .init_op(uring_op);
+                
+                let vtable = slot.with_op_mut(|op| op.vtable).expect("waker op missing in slot");
+                vtable
+            };
+
+            let driver_ptr = self as *mut UringDriver;
+            let sqe = {
+                let (slot_entry, op_entry, storage) = self.ops.get_slot_entry_storage_and_entry_mut(user_data).unwrap();
+                let mut slot = Slot::<Initialized>::as_initialized(slot_entry, storage, &mut op_entry.platform_data, user_data);
+                slot.with_op_mut(|op| {
+                    unsafe { (vtable.make_sqe)(op, &mut *driver_ptr).user_data(user_data as u64) }
+                }).expect("waker op missing in slot during SQE build")
+            };
 
             if self.push_entry(sqe) {
-                if let Some(entry) = self.ops.get_mut(user_data) {
-                    entry.platform_data.lifecycle = OpLifecycle::InFlight;
+                if let Some((slot_entry, op_entry, storage)) = self.ops.get_slot_entry_storage_and_entry_mut(user_data) {
+                    let slot = Slot::<Initialized>::as_initialized(slot_entry, storage, &mut op_entry.platform_data, user_data);
+                    let in_flight = slot.start_submission().persist();
+                    in_flight.platform.lifecycle = OpLifecycle::InFlight;
                 }
             } else {
                 self.push_backlog(user_data);
@@ -369,29 +383,18 @@ impl UringDriver {
 
             let timer_buffer = std::mem::take(&mut self.timer_buffer);
             for user_data in timer_buffer {
-                if let Some(entry) = self.ops.get_mut(user_data)
-                    && matches!(entry.platform_data.lifecycle, OpLifecycle::InFlight)
+                if let Some((slot_entry, op_entry, storage)) = self.ops.get_slot_entry_storage_and_entry_mut(user_data) 
+                    && matches!(op_entry.platform_data.lifecycle, OpLifecycle::InFlight)
                 {
-                    entry.platform_data.lifecycle = OpLifecycle::Completed;
-                    entry.platform_data.timer_id = None;
+                    let slot = Slot::<InFlight>::as_in_flight(slot_entry, storage, &mut op_entry.platform_data, user_data);
+                    
+                    slot.platform.timer_id = None;
+                    let mut completed = slot.complete();
+                    
+                    let generation = completed.entry.generation.load(Ordering::Acquire);
+                    let _ = completed.take_op();
+                    let (payload, detail) = completed.take_completion_data();
 
-                    let generation = {
-                        let slot = &self.ops.shared.slots[user_data];
-                        let generation = slot.generation.load(Ordering::Acquire);
-                        let _ = self.ops.with_slot_storage_mut(
-                            user_data,
-                            |slot_op, _result, _payload, _sidecar| {
-                                let _ = slot_op.take();
-                            },
-                        );
-                        generation
-                    };
-                    let (payload, detail) = self
-                        .ops
-                        .with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
-                            (payload.take(), result.take())
-                        })
-                        .unwrap_or((None, None));
                     self.push_completion_event(CompletionSidecar {
                         user_data,
                         generation,
@@ -445,22 +448,15 @@ impl UringDriver {
                     continue;
                 }
 
-                if user_data < self.ops.local.len() {
-                    let is_cancelled = matches!(
-                        self.ops.local[user_data].entry.platform_data.lifecycle,
-                        OpLifecycle::Cancelled
-                    );
+                if let Some((slot_entry, op_entry, storage)) = self.ops.get_slot_entry_storage_and_entry_mut(user_data) {
+                    let mut slot = Slot::<InFlight>::as_in_flight(slot_entry, storage, &mut op_entry.platform_data, user_data);
+                    let is_cancelled = matches!(slot.platform.lifecycle, OpLifecycle::Cancelled);
 
                     if is_cancelled {
-                        let generation = self.ops.shared.slots[user_data]
-                            .generation
-                            .load(Ordering::Acquire);
-                        let (payload, detail) = self
-                            .ops
-                            .with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
-                                (payload.take(), result.take())
-                            })
-                            .unwrap_or((None, None));
+                        let generation = slot.entry.generation.load(Ordering::Acquire);
+                        let mut completed = slot.complete();
+                        let (payload, detail) = completed.take_completion_data();
+                        
                         pending_events.push(CompletionSidecar {
                             user_data,
                             generation,
@@ -469,52 +465,29 @@ impl UringDriver {
                             payload,
                             detail,
                         });
-                        let _ = self.ops.with_slot_storage_mut(
-                            user_data,
-                            |slot_op, _result, _payload, _sidecar| {
-                                *slot_op = None;
-                            },
-                        );
+                        let _ = completed.take_op();
                         self.ops.remove(user_data);
                     } else {
                         let res_val = cqe.result();
-                        let final_res = self
-                            .ops
-                            .with_slot_storage_mut(
-                                user_data,
-                                |slot_op, _result, _payload, _sidecar| {
-                                    if let Some(op) = slot_op.as_mut() {
-                                        unsafe { (op.vtable.on_complete)(op, res_val) }
-                                    } else if res_val >= 0 {
-                                        Ok(res_val as usize)
-                                    } else {
-                                        Err(io::Error::from_raw_os_error(-res_val))
-                                    }
-                                },
-                            )
-                            .unwrap_or_else(|| Err(io::Error::other("missing slot storage")));
+                        let final_res = slot.with_op_mut(|op| {
+                            unsafe { (op.vtable.on_complete)(op, res_val) }
+                        }).unwrap_or_else(|| {
+                            if res_val >= 0 {
+                                Ok(res_val as usize)
+                            } else {
+                                Err(io::Error::from_raw_os_error(-res_val))
+                            }
+                        });
 
-                        self.ops.local[user_data].entry.platform_data.lifecycle =
-                            OpLifecycle::Completed;
-                        let generation = self.ops.shared.slots[user_data]
-                            .generation
-                            .load(Ordering::Acquire);
+                        let mut completed = slot.complete();
+                        let generation = completed.entry.generation.load(Ordering::Acquire);
                         let res_code = io_result_to_event_res(&final_res);
-                        let mut detail = self
-                            .ops
-                            .with_slot_storage_mut(user_data, |_op, result, _payload, _sidecar| {
-                                result.take()
-                            })
-                            .flatten();
+                        
+                        let (payload, mut detail): (Option<ErasedPayload>, Option<io::Result<usize>>) = completed.take_completion_data();
                         if detail.is_none() {
                             detail = clone_result_if_non_os_error(&final_res);
                         }
-                        let payload = self
-                            .ops
-                            .with_slot_storage_mut(user_data, |_op, _result, payload, _sidecar| {
-                                payload.take()
-                            })
-                            .flatten();
+                        
                         pending_events.push(CompletionSidecar {
                             user_data,
                             generation,
@@ -523,12 +496,7 @@ impl UringDriver {
                             payload,
                             detail,
                         });
-                        let _ = self.ops.with_slot_storage_mut(
-                            user_data,
-                            |slot_op, _result, _payload, _sidecar| {
-                                let _ = slot_op.take();
-                            },
-                        );
+                        let _ = completed.take_op();
                         self.ops.remove(user_data);
                     }
                 }

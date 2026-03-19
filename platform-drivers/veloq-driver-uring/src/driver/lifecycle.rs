@@ -3,6 +3,8 @@ use io_uring::opcode;
 use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::CompletionSidecar;
 
+use crate::op::slot::{InFlight, Pending, Slot};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum OpLifecycle {
     /// Created, waiting to be submitted
@@ -41,85 +43,53 @@ impl UringOpState {
 
 impl UringDriver {
     pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
-        let (action, timer_id) = if let Some(op) = self.ops.get_mut(user_data) {
-            match &op.platform_data.lifecycle {
-                OpLifecycle::Completed | OpLifecycle::Cancelled => (None, None),
-                OpLifecycle::Pending => (Some(OpLifecycle::Pending), None),
-                OpLifecycle::InFlight => (Some(OpLifecycle::InFlight), op.platform_data.timer_id),
-            }
-        } else {
-            (None, None)
+        let (slot_entry, op_entry, storage) = match self.ops.get_slot_entry_storage_and_entry_mut(user_data) {
+            Some(v) => v,
+            None => return,
         };
 
-        match action {
-            None => {}
-            Some(OpLifecycle::Completed) | Some(OpLifecycle::Cancelled) => {} // already done
-            Some(OpLifecycle::Pending) => {
-                if let Some(op) = self.ops.get_mut(user_data) {
-                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
-                    let generation = {
-                        let slot = &self.ops.shared.slots[user_data];
-                        let generation = slot.generation.load(Ordering::Acquire);
-                        let _ = self.ops.with_slot_storage_mut(
-                            user_data,
-                            |slot_op, _result, _payload, _sidecar| {
-                                let _ = slot_op.take();
-                            },
-                        );
-                        generation
-                    };
-                    let (payload, detail) = self
-                        .ops
-                        .with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
-                            (payload.take(), result.take())
-                        })
-                        .unwrap_or((None, None));
+        match op_entry.platform_data.lifecycle {
+            OpLifecycle::Completed | OpLifecycle::Cancelled => {} // already done
+            OpLifecycle::Pending => {
+                let slot = Slot::<Pending>::new(slot_entry, storage, &mut op_entry.platform_data, user_data);
+                
+                let generation = slot.entry.generation.load(Ordering::Acquire);
+                let _ = slot.storage.with_mut(|op: &mut Option<crate::op::UringOp>, _, _, _| op.take());
+                let (payload, detail) = slot.storage.with_mut(|_op: &mut Option<crate::op::UringOp>, result, payload, _sidecar| (payload.take(), result.take()));
+                
+                self.push_completion_event(CompletionSidecar {
+                    user_data,
+                    generation,
+                    res: -(libc::ECANCELED as i32),
+                    flags: 0,
+                    payload,
+                    detail,
+                });
+                self.ops.remove(user_data);
+            }
+            OpLifecycle::InFlight => {
+                let timer_id = op_entry.platform_data.timer_id;
+                let slot = Slot::<InFlight>::as_in_flight(slot_entry, storage, &mut op_entry.platform_data, user_data);
+                
+                let cancelled = slot.cancel();
+
+                if let Some(tid) = timer_id {
+                    self.wheel.cancel(tid);
+                    
+                    let mut completed = cancelled.complete();
+                    let generation = completed.entry.generation.load(Ordering::Acquire);
+                    let _ = completed.take_op();
+                    let (payload, detail) = completed.take_completion_data();
+                    
                     self.push_completion_event(CompletionSidecar {
                         user_data,
                         generation,
-                        res: -libc::ECANCELED,
+                        res: -(libc::ECANCELED as i32),
                         flags: 0,
                         payload,
                         detail,
                     });
                     self.ops.remove(user_data);
-                }
-            }
-            Some(OpLifecycle::InFlight) => {
-                if let Some(op) = self.ops.get_mut(user_data) {
-                    op.platform_data.lifecycle = OpLifecycle::Cancelled;
-                }
-
-                if let Some(tid) = timer_id {
-                    self.wheel.cancel(tid);
-                    if self.ops.get_mut(user_data).is_some() {
-                        let generation = {
-                            let slot = &self.ops.shared.slots[user_data];
-                            let generation = slot.generation.load(Ordering::Acquire);
-                            let _ = self.ops.with_slot_storage_mut(
-                                user_data,
-                                |slot_op, _result, _payload, _sidecar| {
-                                    let _ = slot_op.take();
-                                },
-                            );
-                            generation
-                        };
-                        let (payload, detail) = self
-                            .ops
-                            .with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
-                                (payload.take(), result.take())
-                            })
-                            .unwrap_or((None, None));
-                        self.push_completion_event(CompletionSidecar {
-                            user_data,
-                            generation,
-                            res: -libc::ECANCELED,
-                            flags: 0,
-                            payload,
-                            detail,
-                        });
-                        self.ops.remove(user_data);
-                    }
                     return;
                 }
 
