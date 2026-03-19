@@ -5,6 +5,7 @@ pub(crate) mod pool;
 
 use crate::IoFd;
 use crate::common::{IocpErrorContext, io_error, io_msg};
+use crate::ops::SubmissionResult;
 use crate::rio::{RioEnv, RioState};
 use std::io;
 use veloq_buf::FixedBuf;
@@ -91,9 +92,7 @@ impl RioState {
         args: RioSendToArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-    ) -> io::Result<crate::ops::submit::SubmissionResult> {
-        use crate::ops::submit::SubmissionResult;
-
+    ) -> io::Result<SubmissionResult> {
         let RioSendToArgs {
             fd,
             handle,
@@ -150,13 +149,11 @@ impl RioState {
         Ok(SubmissionResult::Pending)
     }
 
-    pub(crate) fn try_submit_pooled_recv(
+    pub(crate) fn try_submit_pool_recv(
         &mut self,
         args: RioUdpStreamArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<crate::ops::submit::SubmissionResult> {
-        use crate::ops::submit::SubmissionResult;
-
+    ) -> io::Result<SubmissionResult> {
         let RioUdpStreamArgs {
             fd,
             handle,
@@ -180,7 +177,7 @@ impl RioState {
             .get_mut(&handle)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-        let (res, pool_submissions) = actor.pool_manager.try_submit_pooled_recv(
+        let (res, pool_submissions) = actor.pool_manager.try_submit_pool_recv(
             stream_op,
             (user_data, generation),
             &mut ctx,

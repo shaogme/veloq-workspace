@@ -75,7 +75,7 @@ impl RioRegistry {
         let info = buf.resolve_region_info();
 
         if info.id == u16::MAX {
-            return self.resolve_heap_buffer_id(buf, info.offset, env);
+            return self.resolve_heap_id(buf, info.offset, env);
         }
 
         let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
@@ -162,7 +162,7 @@ impl RioRegistry {
 
         let buf_id = match env.dispatch.register_buffer(ptr, len as u32) {
             Ok(id) => id,
-            Err(e) => return Err(self.handle_chunk_register_fail(id, len, e)),
+            Err(e) => return Err(self.handle_chunk_reg_fail(id, len, e)),
         };
 
         self.chunk_registry[id_idx] = buf_id;
@@ -294,7 +294,7 @@ impl RioRegistry {
         self.heap_register_failures_recent.clear();
     }
 
-    fn resolve_heap_buffer_id(
+    fn resolve_heap_id(
         &mut self,
         buf: &FixedBuf,
         offset: usize,
@@ -370,12 +370,7 @@ impl RioRegistry {
         Ok((id, offset as u32))
     }
 
-    fn handle_chunk_register_fail(
-        &mut self,
-        id: u16,
-        len: usize,
-        e: std::io::Error,
-    ) -> std::io::Error {
+    fn handle_chunk_reg_fail(&mut self, id: u16, len: usize, e: std::io::Error) -> std::io::Error {
         self.registration_stats.chunk_register_failures = self
             .registration_stats
             .chunk_register_failures

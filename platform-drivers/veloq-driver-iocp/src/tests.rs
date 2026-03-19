@@ -7,6 +7,7 @@ use crate::driver::IocpDriver;
 pub(crate) mod basic;
 pub(crate) mod io_tests;
 pub(crate) mod net;
+pub(crate) mod net_udp;
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);

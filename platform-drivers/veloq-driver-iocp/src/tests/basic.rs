@@ -2,6 +2,7 @@ use crate::config::IocpConfig;
 use crate::driver::IocpDriver;
 use crate::ext::Extensions;
 use std::io;
+use std::os::windows::io::AsRawHandle;
 
 #[test]
 fn test_extensions_load() {
@@ -20,7 +21,7 @@ fn test_register_files() {
     let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
     let handle = std::fs::File::open("Cargo.toml").unwrap();
     let raw = crate::config::RawHandle {
-        handle: std::os::windows::io::AsRawHandle::as_raw_handle(&handle) as _,
+        handle: handle.as_raw_handle() as _,
     };
     let fds = driver.register_files(&[raw]).unwrap();
     assert_eq!(fds.len(), 1);

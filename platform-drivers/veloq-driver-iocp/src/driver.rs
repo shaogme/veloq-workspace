@@ -182,7 +182,7 @@ impl IocpDriver {
                 }
             }
             Ok(submit::SubmissionResult::Timer(duration)) => {
-                Self::handle_timer_submission(ops, ctx, user_data, duration, binder)
+                Self::handle_timer_sub(ops, ctx, user_data, duration, binder)
             }
             Err(e) => {
                 if let Some((slot_entry, _, storage)) =
@@ -224,7 +224,7 @@ impl IocpDriver {
         }
     }
 
-    fn handle_timer_submission(
+    fn handle_timer_sub(
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
         ctx: SubmitContextInternal<'_>,
         user_data: usize,

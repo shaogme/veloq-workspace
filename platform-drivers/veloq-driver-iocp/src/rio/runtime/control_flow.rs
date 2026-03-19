@@ -321,7 +321,7 @@ impl RioState {
             return false;
         };
         let _ = actor.pool_manager.ack_pool_done(completion_generation);
-        actor.pool_manager.handle_drain_completion();
+        actor.pool_manager.handle_drain_comp();
         let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)

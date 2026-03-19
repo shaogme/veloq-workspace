@@ -40,8 +40,6 @@ impl RioCq {
 #[repr(transparent)]
 pub(crate) struct RioRq(pub(crate) RIO_RQ);
 
-impl RioRq {}
-
 pub(crate) struct RioRqConfig {
     pub(crate) socket: usize,
     pub(crate) max_outstanding_recvs: u32,

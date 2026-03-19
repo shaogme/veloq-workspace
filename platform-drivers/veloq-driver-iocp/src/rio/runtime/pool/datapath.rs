@@ -14,7 +14,7 @@ use std::collections::{VecDeque, hash_map};
 use std::io;
 use veloq_buf::FixedBuf;
 use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
-use veloq_driver_core::op::UdpRecvDatagram as OpUdpRecvDatagram;
+use veloq_driver_core::op::{UdpRecvDatagram as OpUdpRecvDatagram, UdpRecvStream};
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIORESULT, WSAGetLastError};
@@ -209,14 +209,12 @@ impl UdpPoolManager {
             };
 
             let slot = self.create_pool_slot(slot_buf, ctx.env.dispatch)?;
-            let idx = self
-                .pool
-                .as_mut()
-                .map(|p| {
-                    p.slots.push(slot);
-                    p.slots.len() - 1
-                })
-                .expect("pool existence verified by should_grow");
+            let idx = if let Some(p) = self.pool.as_mut() {
+                p.slots.push(slot);
+                p.slots.len() - 1
+            } else {
+                return Ok(submissions);
+            };
 
             let token = self.alloc_udp_ctx_token(idx);
             if let Err(e) = self.submit_pool_slot((idx, token), ctx) {
@@ -325,13 +323,14 @@ impl UdpPoolManager {
     }
 
     fn ensure_pool(&mut self, ctx: &mut RioContext) -> io::Result<usize> {
+        use super::{
+            UDP_RECV_POOL_INITIAL_CREDITS, UDP_RECV_POOL_MAX_CREDITS, UDP_RECV_POOL_MIN_CREDITS,
+        };
+
         if self.pool.is_some() {
             return Ok(0);
         }
 
-        use super::{
-            UDP_RECV_POOL_INITIAL_CREDITS, UDP_RECV_POOL_MAX_CREDITS, UDP_RECV_POOL_MIN_CREDITS,
-        };
         let min = UDP_RECV_POOL_MIN_CREDITS;
         let max = UDP_RECV_POOL_MAX_CREDITS.max(min);
         let initial = UDP_RECV_POOL_INITIAL_CREDITS.clamp(min, max);
@@ -373,9 +372,10 @@ impl UdpPoolManager {
         }
 
         let mut guard = Slot::<InFlight>::as_inflight_entry(slot, storage, user_data);
-        let d = datagram
-            .as_ref()
-            .expect("datagram must exist when deliver_to_waiter is called");
+        let d = match datagram.as_ref() {
+            Some(d) => d,
+            None => return false,
+        };
         let d_len = d.buf.len();
 
         // SAFETY: op_mut_unchecked is safe because we've verified the slot is InFlight
@@ -393,7 +393,9 @@ impl UdpPoolManager {
         };
 
         if let Some(stream_op) = stream_op {
-            let owned_d = datagram.take().expect("datagram must be taken only once");
+            let Some(owned_d) = datagram.take() else {
+                return false;
+            };
             // SAFETY: addr and addr_len are provided by RIO completion and are guaranteed
             // to be valid SockAddrStorage data.
             let addr = unsafe {
@@ -401,7 +403,7 @@ impl UdpPoolManager {
                     &owned_d.addr as *const _ as *const u8,
                     owned_d.addr_len as usize,
                 );
-                to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().expect("static parse"))
+                to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
             };
 
             stream_op.result = Some(OpUdpRecvDatagram {
@@ -438,7 +440,7 @@ impl UdpPoolManager {
                 &datagram.addr as *const _ as *const u8,
                 datagram.addr_len as usize,
             );
-            to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().expect("static parse"))
+            to_socket_addr(s).unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
         };
 
         OpUdpRecvDatagram {
@@ -475,9 +477,9 @@ impl UdpPoolManager {
         }
     }
 
-    pub(crate) fn try_submit_pooled_recv(
+    pub(crate) fn try_submit_pool_recv(
         &mut self,
-        stream_op: &mut veloq_driver_core::op::UdpRecvStream<crate::RawHandle>,
+        stream_op: &mut UdpRecvStream<crate::RawHandle>,
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> io::Result<(SubmissionResult, usize)> {
@@ -510,10 +512,9 @@ impl UdpPoolManager {
         ctx: &mut RioContext,
     ) -> io::Result<usize> {
         let mut total_submissions = self.ensure_pool(ctx)?;
-        let pool = self
-            .pool
-            .as_mut()
-            .expect("ensure_pool guarantees existence");
+        let Some(pool) = self.pool.as_mut() else {
+            return Ok(total_submissions);
+        };
 
         pool.spare_bufs.push_back(buf);
         total_submissions += self.rebalance_udp_pool(ctx)?;
@@ -631,7 +632,7 @@ impl UdpPoolManager {
         submissions
     }
 
-    pub(crate) fn handle_drain_completion(&mut self) {
+    pub(crate) fn handle_drain_comp(&mut self) {
         // Pure side effect to satisfy RIO requirements
     }
 

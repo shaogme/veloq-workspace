@@ -436,7 +436,7 @@ pub(crate) fn submit_udp_recv_stream(
         generation: header.generation,
     };
     ctx.rio
-        .try_submit_pooled_recv(args, ctx.registrar)
+        .try_submit_pool_recv(args, ctx.registrar)
         .map_err(|e| {
             io_error(
                 IocpErrorContext::Submission,
