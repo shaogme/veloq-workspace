@@ -91,6 +91,7 @@ impl Socket {
 
     /// Returns the local address of the socket.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        // SAFETY: SOCKADDR_STORAGE is a POD struct and safe to zero-initialize.
         let mut storage = unsafe {
             std::mem::zeroed::<windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE>()
         };

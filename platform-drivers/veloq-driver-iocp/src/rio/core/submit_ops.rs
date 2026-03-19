@@ -281,6 +281,7 @@ impl RioProvider for RioDispatch {
     #[inline]
     fn close_cq(&self, cq: RioCq) {
         if !cq.is_invalid() {
+            // SAFETY: Function pointer is verified at startup.
             unsafe { (self.close_cq)(cq.0) };
         }
     }
@@ -294,6 +295,7 @@ impl RioProvider for RioDispatch {
         flags: u32,
         context: *const std::ffi::c_void,
     ) -> io::Result<()> {
+        // SAFETY: Function pointer is verified at startup. Parameters are validated by the caller.
         let ret = unsafe { (self.receive)(rq.0, buf as *const _, num_bufs, flags, context) };
         if ret == 0 {
             return Err(io_error(
@@ -314,6 +316,7 @@ impl RioProvider for RioDispatch {
         flags: u32,
         context: *const std::ffi::c_void,
     ) -> io::Result<()> {
+        // SAFETY: Function pointer is verified at startup. Parameters are validated by the caller.
         let ret = unsafe { (self.send)(rq.0, buf as *const _, num_bufs, flags, context) };
         if ret == 0 {
             return Err(io_error(
@@ -339,6 +342,7 @@ impl RioProvider for RioDispatch {
         flags: u32,
         context: *const std::ffi::c_void,
     ) -> io::Result<()> {
+        // SAFETY: Function pointer is verified at startup. Parameters are validated by the caller.
         let ret = unsafe {
             (self.send_ex)(
                 rq.0,
@@ -376,6 +380,7 @@ impl RioProvider for RioDispatch {
         flags: u32,
         context: *const std::ffi::c_void,
     ) -> io::Result<()> {
+        // SAFETY: Function pointer is verified at startup. Parameters are validated by the caller.
         let ret = unsafe {
             (self.receive_ex)(
                 rq.0,

@@ -497,7 +497,7 @@ impl IocpDriver {
 
                 if op.platform_data.rio_pool_waiting || is_rio {
                     if op.platform_data.rio_pool_waiting {
-                        ctx.rio_state.cancel_udp_recv_waiter(
+                        ctx.rio_state.cancel_udp_waiter(
                             handle,
                             (user_data, op.platform_data.generation),
                             ctx.registrar,

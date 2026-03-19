@@ -1,6 +1,6 @@
 use std::io;
 use std::mem::ManuallyDrop;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use veloq_pod::{bytes_of_mut, from_bytes_mut};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -157,66 +157,7 @@ pub(crate) fn submit_connect(
         ),
     )?;
 
-    let mut need_bind = true;
-    let mut storage = SockAddrStorage::default();
-    let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
-
-    if with_borrowed_socket(handle as SOCKET, |socket| {
-        // SAFETY: storage and namelen are valid for this call.
-        unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
-    })
-    .is_ok()
-    {
-        let family = storage.family();
-        if family == AF_INET {
-            // SAFETY: storage and namelen are valid and initialized by getsockname.
-            let buf = unsafe {
-                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
-            };
-            if let Ok(SocketAddr::V4(a)) = addr::to_socket_addr(buf)
-                && a.port() != 0
-            {
-                need_bind = false;
-            }
-        } else if family == AF_INET6 {
-            // SAFETY: storage and namelen are valid and initialized by getsockname.
-            let buf = unsafe {
-                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
-            };
-            if let Ok(SocketAddr::V6(a)) = addr::to_socket_addr(buf)
-                && a.port() != 0
-            {
-                need_bind = false;
-            }
-        }
-    }
-
-    if need_bind {
-        let family = connect_op.addr.family();
-        let (storage, len) = if family == AF_INET {
-            let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
-            let s = addr::SockAddrIn::new(&addr);
-            let mut storage = SockAddrStorage::default();
-            let sin_ref = from_bytes_mut::<addr::SockAddrIn>(
-                &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN>()],
-            );
-            *sin_ref = s;
-            (storage, std::mem::size_of::<SOCKADDR_IN>() as i32)
-        } else {
-            let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-            let s = addr::SockAddrIn6::new(&addr);
-            let mut storage = SockAddrStorage::default();
-            let sin6_ref = from_bytes_mut::<addr::SockAddrIn6>(
-                &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN6>()],
-            );
-            *sin6_ref = s;
-            (storage, std::mem::size_of::<SOCKADDR_IN6>() as i32)
-        };
-        with_borrowed_socket(handle as SOCKET, |socket| {
-            // SAFETY: storage is a valid SOCKADDR_STORAGE for this call.
-            unsafe { socket.bind(&storage.0 as *const _ as *const SOCKADDR, len) }
-        })?;
-    }
+    ensure_socket_bound(handle, connect_op)?;
 
     let mut bytes_sent = 0;
     // SAFETY: iocp_submit_connect_ex is a safe wrapper for the WinSock extension.
@@ -232,6 +173,64 @@ pub(crate) fn submit_connect(
             lp_overlapped: ctx.overlapped,
         })
     }
+}
+
+fn ensure_socket_bound(handle: HANDLE, connect_op: &Connect) -> io::Result<()> {
+    let mut storage = SockAddrStorage::default();
+    let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
+
+    if with_borrowed_socket(handle as SOCKET, |socket| {
+        // SAFETY: storage and namelen are valid for this call.
+        unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
+    })
+    .is_ok()
+    {
+        let family = storage.family();
+        let is_bound = if family == AF_INET {
+            // SAFETY: storage and namelen are valid and initialized by getsockname.
+            let buf = unsafe {
+                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
+            };
+            addr::to_socket_addr(buf).is_ok_and(|a| a.port() != 0)
+        } else if family == AF_INET6 {
+            // SAFETY: storage and namelen are valid and initialized by getsockname.
+            let buf = unsafe {
+                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
+            };
+            addr::to_socket_addr(buf).is_ok_and(|a| a.port() != 0)
+        } else {
+            false
+        };
+
+        if is_bound {
+            return Ok(());
+        }
+    }
+
+    let family = connect_op.addr.family();
+    let (storage, len) = if family == AF_INET {
+        let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+        let s = addr::SockAddrIn::new(&addr);
+        let mut storage = SockAddrStorage::default();
+        let sin_ref = from_bytes_mut::<addr::SockAddrIn>(
+            &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN>()],
+        );
+        *sin_ref = s;
+        (storage, std::mem::size_of::<SOCKADDR_IN>() as i32)
+    } else {
+        let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+        let s = addr::SockAddrIn6::new(&addr);
+        let mut storage = SockAddrStorage::default();
+        let sin6_ref = from_bytes_mut::<addr::SockAddrIn6>(
+            &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN6>()],
+        );
+        *sin6_ref = s;
+        (storage, std::mem::size_of::<SOCKADDR_IN6>() as i32)
+    };
+    with_borrowed_socket(handle as SOCKET, |socket| {
+        // SAFETY: storage is a valid SOCKADDR_STORAGE for this call.
+        unsafe { socket.bind(&storage.0 as *const _ as *const SOCKADDR, len) }
+    })
 }
 
 /// # Safety

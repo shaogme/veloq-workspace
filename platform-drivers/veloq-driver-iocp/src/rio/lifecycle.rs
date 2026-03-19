@@ -36,10 +36,10 @@ impl DeferredRioCleanup {
             outstanding_count: self.outstanding_count,
         };
         state.begin_shutdown();
-        if let Err(e) = state.drain_outstanding_for(RIO_REAPER_DRAIN_TIMEOUT) {
+        if let Err(e) = state.drain_outstanding(RIO_REAPER_DRAIN_TIMEOUT) {
             tracing::warn!(error = ?e, "RioReaper: background drain timed out");
         }
-        state.finalize_shutdown_cleanup();
+        state.finalize_cleanup();
     }
 }
 
@@ -54,7 +54,7 @@ fn reaper_sender() -> &'static std::sync::mpsc::Sender<DeferredRioCleanup> {
                     task.run();
                 }
             })
-            .expect("failed to spawn veloq-rio-reaper");
+            .unwrap_or_else(|e| panic!("failed to spawn veloq-rio-reaper: {e}"));
         tx
     })
 }
@@ -64,7 +64,7 @@ impl RioState {
         if let Some((actor_id, completion_generation)) =
             Self::decode_pool_context(res.RequestContext)
         {
-            let _ = self.try_mark_pool_completion(actor_id, completion_generation);
+            let _ = self.mark_pool_done(actor_id, completion_generation);
         } else {
             Self::free_op_req_ctx(res.RequestContext);
         }
@@ -79,7 +79,7 @@ impl RioState {
         }
     }
 
-    pub(crate) fn drain_outstanding_for(&mut self, timeout: std::time::Duration) -> io::Result<()> {
+    pub(crate) fn drain_outstanding(&mut self, timeout: std::time::Duration) -> io::Result<()> {
         let start = std::time::Instant::now();
         while self.outstanding_count > 0 {
             if start.elapsed() >= timeout {
@@ -93,6 +93,7 @@ impl RioState {
             }
 
             const MAX_RESULTS: usize = 128;
+            // SAFETY: RIORESULT is a POD struct and safe to zero-initialize.
             let mut results: [RIORESULT; MAX_RESULTS] = unsafe { std::mem::zeroed() };
             let count = self.kernel.dequeue(&mut results);
 
@@ -113,9 +114,9 @@ impl RioState {
         Ok(())
     }
 
-    fn finalize_shutdown_cleanup(&mut self) {
-        self.forget_all_udp_pool_contexts();
-        self.shutdown_all_actors_with_registry_cleanup(&veloq_buf::NoopRegistrar);
+    fn finalize_cleanup(&mut self) {
+        self.forget_udp_contexts();
+        self.shutdown_rio_actors(&veloq_buf::NoopRegistrar);
         if let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)
@@ -125,7 +126,7 @@ impl RioState {
         self.kernel.close();
     }
 
-    pub(crate) fn take_deferred_cleanup(&mut self) -> Option<DeferredRioCleanup> {
+    pub(crate) fn take_deferred(&mut self) -> Option<DeferredRioCleanup> {
         if self.kernel.cq.is_invalid() {
             return None;
         }
@@ -146,11 +147,11 @@ impl Drop for RioState {
     fn drop(&mut self) {
         self.begin_shutdown();
         if self.outstanding_count == 0 {
-            self.finalize_shutdown_cleanup();
+            self.finalize_cleanup();
             return;
         }
 
-        if let Some(task) = self.take_deferred_cleanup() {
+        if let Some(task) = self.take_deferred() {
             let tx = reaper_sender();
             if let Err(err) = tx.send(task) {
                 tracing::warn!("RioReaper unavailable, falling back to inline cleanup");
@@ -159,7 +160,7 @@ impl Drop for RioState {
             return;
         }
 
-        self.finalize_shutdown_cleanup();
+        self.finalize_cleanup();
     }
 }
 

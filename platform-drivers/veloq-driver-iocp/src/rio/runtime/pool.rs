@@ -81,17 +81,12 @@ struct CompletionActions {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UdpRecvPoolDebugStats {
     pub(crate) min_credits: usize,
     pub(crate) max_credits: usize,
     pub(crate) target_credits: usize,
-    pub(crate) slots_len: usize,
-    pub(crate) in_flight: usize,
     pub(crate) waiters_len: usize,
-    pub(crate) queue_len: usize,
-    pub(crate) idle_hits: u32,
 }
 
 pub(crate) struct UdpPoolManager {
@@ -110,6 +105,7 @@ impl UdpPoolManager {
     }
 
     fn last_wsa_error() -> io::Error {
+        // SAFETY: WSAGetLastError is safe to call.
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
 
@@ -178,15 +174,15 @@ impl UdpPoolManager {
         }
     }
 
-    fn deregister_udp_pool_slot(&self, slot: UdpRecvPoolSlot, dispatch: &RioDispatch) {
+    fn deregister_slot(&self, slot: UdpRecvPoolSlot, dispatch: &RioDispatch) {
         if !slot.addr_buf_id.is_invalid() {
             dispatch.deregister_buffer(slot.addr_buf_id);
         }
     }
 
-    fn deregister_udp_pool_slot_with_registry(&self, slot: UdpRecvPoolSlot, ctx: &mut RioContext) {
+    fn free_slot(&self, slot: UdpRecvPoolSlot, ctx: &mut RioContext) {
         ctx.registry.deregister_heap_buf(&slot.buf, ctx.env);
-        self.deregister_udp_pool_slot(slot, ctx.env.dispatch);
+        self.deregister_slot(slot, ctx.env.dispatch);
     }
 
     fn submit_udp_pool_slot(
@@ -339,7 +335,7 @@ impl UdpPoolManager {
                 pool.slots.pop()
             };
             if let Some(slot) = maybe_slot {
-                self.deregister_udp_pool_slot_with_registry(slot, ctx);
+                self.free_slot(slot, ctx);
             } else {
                 return;
             }
@@ -576,7 +572,7 @@ impl UdpPoolManager {
         let _ = self.rebalance_udp_pool(ctx);
     }
 
-    pub(crate) fn ack_udp_pool_completion(&mut self, completion_generation: u32) -> Option<usize> {
+    pub(crate) fn ack_pool_done(&mut self, completion_generation: u32) -> Option<usize> {
         self.udp_ctx_map.remove(&completion_generation)
     }
 
@@ -689,7 +685,7 @@ impl UdpPoolManager {
         }
     }
 
-    pub(crate) fn cleanup_shutdown_udp_pool_if_drained(&mut self, ctx: &mut RioContext) -> bool {
+    pub(crate) fn cleanup_drained_pool(&mut self, ctx: &mut RioContext) -> bool {
         let drained = self.pool.as_ref().is_some_and(|pool| {
             !matches!(pool.state, UdpPoolState::Running)
                 && pool.slots.iter().all(|slot| !slot.in_flight)
@@ -703,7 +699,7 @@ impl UdpPoolManager {
         }
         if let Some(pool) = self.pool.take() {
             for slot in pool.slots {
-                self.deregister_udp_pool_slot_with_registry(slot, ctx);
+                self.free_slot(slot, ctx);
             }
         }
         self.udp_ctx_map.clear();
@@ -717,7 +713,7 @@ impl UdpPoolManager {
                     std::mem::forget(slot);
                     continue;
                 }
-                self.deregister_udp_pool_slot_with_registry(slot, ctx);
+                self.free_slot(slot, ctx);
             }
         }
         self.udp_ctx_map.clear();
@@ -729,11 +725,7 @@ impl UdpPoolManager {
             min_credits: pool.min_credits,
             max_credits: pool.max_credits,
             target_credits: pool.target_credits,
-            slots_len: pool.slots.len(),
-            in_flight: pool.slots.iter().filter(|s| s.in_flight).count(),
             waiters_len: pool.waiters.len(),
-            queue_len: pool.queue.len(),
-            idle_hits: pool.idle_hits,
         })
     }
 }

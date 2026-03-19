@@ -63,6 +63,7 @@ impl RioRegistry {
     }
 
     fn last_wsa_error() -> io::Error {
+        // SAFETY: WSAGetLastError is a simple getter with no side effects.
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
 

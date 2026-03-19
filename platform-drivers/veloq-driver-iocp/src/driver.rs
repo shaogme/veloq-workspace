@@ -173,23 +173,7 @@ impl IocpDriver {
                 binder.ok(Poll::Pending)
             }
             Ok(submit::SubmissionResult::PostToQueue) => {
-                if let Err(err) = ctx.port.notify(user_data) {
-                    if let Some((slot_entry, _, storage)) =
-                        ops.get_slot_entry_storage_and_entry_mut(user_data)
-                    {
-                        let mut guard =
-                            Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data)
-                                .complete();
-                        *op_in = guard.take_op();
-                    }
-                    ops.remove(user_data);
-                    binder.err(err)
-                } else {
-                    if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-                        op_entry.platform_data.rio_pool_waiting = false;
-                    }
-                    binder.ok(Poll::Pending)
-                }
+                Self::handle_post_to_queue(ops, ctx, user_data, op_in, binder)
             }
             Ok(submit::SubmissionResult::Offload(task)) => {
                 match Self::handle_offload(ops, ctx, user_data, task) {
@@ -198,13 +182,7 @@ impl IocpDriver {
                 }
             }
             Ok(submit::SubmissionResult::Timer(duration)) => {
-                let timeout = ctx.wheel.insert(user_data, duration);
-                if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-                    op_entry.platform_data.timer_id = Some(timeout);
-                    op_entry.platform_data.timer_deadline = Some(Instant::now() + duration);
-                    op_entry.platform_data.rio_pool_waiting = false;
-                }
-                binder.ok(Poll::Pending)
+                Self::handle_timer_submission(ops, ctx, user_data, duration, binder)
             }
             Err(e) => {
                 if let Some((slot_entry, _, storage)) =
@@ -219,6 +197,47 @@ impl IocpDriver {
                 binder.err(e)
             }
         }
+    }
+
+    fn handle_post_to_queue(
+        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ctx: SubmitContextInternal<'_>,
+        user_data: usize,
+        op_in: &mut Option<IocpOp>,
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>> {
+        if let Err(err) = ctx.port.notify(user_data) {
+            if let Some((slot_entry, _, storage)) =
+                ops.get_slot_entry_storage_and_entry_mut(user_data)
+            {
+                let mut guard =
+                    Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data).complete();
+                *op_in = guard.take_op();
+            }
+            ops.remove(user_data);
+            binder.err(err)
+        } else {
+            if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
+                op_entry.platform_data.rio_pool_waiting = false;
+            }
+            binder.ok(Poll::Pending)
+        }
+    }
+
+    fn handle_timer_submission(
+        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ctx: SubmitContextInternal<'_>,
+        user_data: usize,
+        duration: Duration,
+        binder: SubmitBinder,
+    ) -> Outcome<io::Result<Poll<()>>> {
+        let timeout = ctx.wheel.insert(user_data, duration);
+        if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
+            op_entry.platform_data.timer_id = Some(timeout);
+            op_entry.platform_data.timer_deadline = Some(Instant::now() + duration);
+            op_entry.platform_data.rio_pool_waiting = false;
+        }
+        binder.ok(Poll::Pending)
     }
 
     fn call_op_submit(
@@ -386,7 +405,7 @@ impl IocpDriver {
         let pending = self.shutdown_ops();
         if let CloseMode::Strict { timeout } = mode {
             self.drain_pending_iocp(pending, timeout)?;
-            self.rio_state.drain_outstanding_for(timeout)?;
+            self.rio_state.drain_outstanding(timeout)?;
         }
         self.closed = true;
         Ok(())

@@ -31,6 +31,7 @@ pub(crate) struct RioOpCtxGuard(pub(crate) *mut RioOpRequestContext);
 impl Drop for RioOpCtxGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: self.0 was created from Box::into_raw in encode_req_ctx.
             unsafe { drop(Box::from_raw(self.0)) };
             self.0 = std::ptr::null_mut();
         }
@@ -78,6 +79,7 @@ impl RioState {
         if ctx_ptr.is_null() {
             return None;
         }
+        // SAFETY: ctx_ptr is a valid pointer to RioOpRequestContext if it's not a pool context.
         let op_ctx = unsafe { &*ctx_ptr };
         Some(RioCompletionKind::Op {
             user_data: op_ctx.user_data,
@@ -97,6 +99,7 @@ impl RioState {
         }
         let ptr = raw as *mut RioOpRequestContext;
         if !ptr.is_null() {
+            // SAFETY: ptr was created from Box::into_raw in encode_req_ctx.
             unsafe { drop(Box::from_raw(ptr)) };
         }
     }
@@ -119,6 +122,7 @@ impl RioState {
     }
 
     pub(crate) fn last_wsa_error() -> io::Error {
+        // SAFETY: WSAGetLastError is safe to call.
         io::Error::from_raw_os_error(unsafe {
             windows_sys::Win32::Networking::WinSock::WSAGetLastError()
         })

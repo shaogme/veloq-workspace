@@ -10,6 +10,8 @@ use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
 use crate::rio::runtime::pool::UdpPoolManager;
+#[cfg(test)]
+use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::{RioCompletionContext, RioContext, RioEnv, RioState};
 use rustc_hash::FxHashMap;
 use std::io;
@@ -66,6 +68,91 @@ impl<'a> RioCompletionRouter<'a> {
         }
     }
 
+    fn handle_pool_completion(&mut self, actor_id: u32, generation: u32, res: &RIORESULT) {
+        let Some(&handle) = self.actor_routes.get(&actor_id) else {
+            return;
+        };
+        let (pool_submissions, remove_actor) = {
+            let Some(actor) = self.actors.get_mut(&handle) else {
+                return;
+            };
+            let Some(slot_idx) = actor.pool_manager.ack_pool_done(generation) else {
+                return;
+            };
+            let mut ctx = RioContext {
+                registry: self.registry,
+                env: self.env,
+                actor_id: actor.actor_id,
+                rq: actor.rq,
+            };
+            let submissions =
+                actor
+                    .pool_manager
+                    .handle_completion((slot_idx, res), &mut self.comp, &mut ctx);
+            let remove = actor.pool_manager.cleanup_drained_pool(&mut ctx);
+            (submissions, remove)
+        };
+        if remove_actor {
+            self.actors.remove(&handle);
+            self.actor_routes.remove(&actor_id);
+        }
+        *self.outstanding_count -= 1;
+        *self.outstanding_count += pool_submissions;
+        self.completed_count += 1;
+    }
+
+    fn handle_op_completion(&mut self, user_data: usize, generation: u32, res: &RIORESULT) {
+        let ops = &mut self.comp.ops;
+
+        if user_data < ops.local.len() {
+            let (slot, op, storage) = match ops.get_slot_entry_storage_and_entry_mut(user_data) {
+                Some(v) => v,
+                None => return,
+            };
+
+            if op.platform_data.generation == generation
+                && Slot::<InFlight>::is_in_flight_entry(slot)
+            {
+                let was_cancelled = matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
+                let mut guard =
+                    Slot::<InFlight>::as_inflight_entry(slot, storage, user_data).complete();
+
+                if was_cancelled {
+                    let _ = guard.take_completion_data();
+                    let _ = guard.take_op();
+                    let _ = std::mem::take(&mut op.platform_data);
+                    self.comp.ops.shared.push_free(user_data);
+                } else {
+                    let result_for_slot = if res.Status == 0 {
+                        Ok(res.BytesTransferred as usize)
+                    } else {
+                        Err(io::Error::from_raw_os_error(res.Status))
+                    };
+                    let res_code = rio_result_to_event_res(&result_for_slot);
+                    let event = CompletionEvent {
+                        user_data: encode_completion_token(user_data, generation),
+                        res: res_code,
+                        flags: 0,
+                    };
+                    let (payload, detail) = guard.take_completion_data();
+
+                    self.comp
+                        .table
+                        .record_completion_with_data(event, payload, detail);
+                    self.comp.events.push(event);
+                    let _ = guard.take_op();
+                    let _ = std::mem::take(&mut op.platform_data);
+                    self.comp.ops.shared.push_free(user_data);
+                }
+            }
+        }
+
+        if *self.outstanding_count > 0 {
+            *self.outstanding_count -= 1;
+        }
+        self.completed_count += 1;
+    }
+
     fn handle_one(&mut self, res: &RIORESULT) {
         let Some(kind) = RioState::decode_req_ctx(res.RequestContext) else {
             return;
@@ -75,100 +162,14 @@ impl<'a> RioCompletionRouter<'a> {
             RioCompletionKind::Pool {
                 actor_id,
                 generation,
-            } => {
-                let Some(&handle) = self.actor_routes.get(&actor_id) else {
-                    return;
-                };
-                let (pool_submissions, remove_actor) = {
-                    let Some(actor) = self.actors.get_mut(&handle) else {
-                        return;
-                    };
-                    let Some(slot_idx) = actor.pool_manager.ack_udp_pool_completion(generation)
-                    else {
-                        return;
-                    };
-                    let mut ctx = RioContext {
-                        registry: self.registry,
-                        env: self.env,
-                        actor_id: actor.actor_id,
-                        rq: actor.rq,
-                    };
-                    let submissions = actor.pool_manager.handle_completion(
-                        (slot_idx, res),
-                        &mut self.comp,
-                        &mut ctx,
-                    );
-                    let remove = actor
-                        .pool_manager
-                        .cleanup_shutdown_udp_pool_if_drained(&mut ctx);
-                    (submissions, remove)
-                };
-                if remove_actor {
-                    self.actors.remove(&handle);
-                    self.actor_routes.remove(&actor_id);
-                }
-                *self.outstanding_count -= 1;
-                *self.outstanding_count += pool_submissions;
-                self.completed_count += 1;
-            }
+            } => self.handle_pool_completion(actor_id, generation, res),
             RioCompletionKind::Op {
                 user_data,
                 generation,
                 ctx_ptr,
             } => {
                 let _ctx_guard = RioOpCtxGuard(ctx_ptr);
-                let ops = &mut self.comp.ops;
-
-                if user_data < ops.local.len() {
-                    let (slot, op, storage) =
-                        match ops.get_slot_entry_storage_and_entry_mut(user_data) {
-                            Some(v) => v,
-                            None => return,
-                        };
-
-                    if op.platform_data.generation == generation
-                        && Slot::<InFlight>::is_in_flight_entry(slot)
-                    {
-                        let was_cancelled =
-                            matches!(op.platform_data.lifecycle, OpLifecycle::Cancelled);
-                        let mut guard =
-                            Slot::<InFlight>::as_inflight_entry(slot, storage, user_data)
-                                .complete();
-
-                        if was_cancelled {
-                            let _ = guard.take_completion_data();
-                            let _ = guard.take_op();
-                            let _ = std::mem::take(&mut op.platform_data);
-                            self.comp.ops.shared.push_free(user_data);
-                        } else {
-                            let result_for_slot = if res.Status == 0 {
-                                Ok(res.BytesTransferred as usize)
-                            } else {
-                                Err(io::Error::from_raw_os_error(res.Status))
-                            };
-                            let res_code = rio_result_to_event_res(&result_for_slot);
-                            let event = CompletionEvent {
-                                user_data: encode_completion_token(user_data, generation),
-                                res: res_code,
-                                flags: 0,
-                            };
-                            let (payload, detail) = guard.take_completion_data();
-
-                            self.comp
-                                .table
-                                .record_completion_with_data(event, payload, detail);
-                            self.comp.events.push(event);
-                            let _ = guard.take_op();
-                            let _ = std::mem::take(&mut op.platform_data);
-                            self.comp.ops.shared.push_free(user_data);
-                        }
-                    }
-                }
-
-                if *self.outstanding_count > 0 {
-                    *self.outstanding_count -= 1;
-                }
-                self.completed_count += 1;
+                self.handle_op_completion(user_data, generation, res);
             }
         }
     }
@@ -216,7 +217,10 @@ impl RioState {
             self.actors
                 .insert(handle, RioSocketActor::new(actor_id, rq));
         }
-        Ok(self.actors.get_mut(&handle).expect("actor inserted"))
+        Ok(self
+            .actors
+            .get_mut(&handle)
+            .unwrap_or_else(|| unreachable!("actor MUST be inserted")))
     }
 
     pub(crate) fn shutdown_udp_pool(&mut self, handle: HANDLE) {
@@ -233,10 +237,7 @@ impl RioState {
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             actor.pool_manager.begin_udp_pool_shutdown();
-            if actor
-                .pool_manager
-                .cleanup_shutdown_udp_pool_if_drained(&mut ctx)
-            {
+            if actor.pool_manager.cleanup_drained_pool(&mut ctx) {
                 remove_actor = Some(actor.actor_id);
             }
         }
@@ -252,7 +253,7 @@ impl RioState {
         }
     }
 
-    pub(crate) fn cancel_udp_recv_waiter(
+    pub(crate) fn cancel_udp_waiter(
         &mut self,
         handle: HANDLE,
         uid: (usize, u32),
@@ -268,10 +269,7 @@ impl RioState {
     }
 
     #[cfg(test)]
-    pub(crate) fn udp_pool_debug_stats(
-        &self,
-        handle: HANDLE,
-    ) -> Option<crate::rio::runtime::pool::UdpRecvPoolDebugStats> {
+    pub(crate) fn udp_pool_debug_stats(&self, handle: HANDLE) -> Option<UdpRecvPoolDebugStats> {
         self.actors
             .get(&handle)
             .and_then(|actor| actor.pool_manager.udp_pool_debug_stats())
@@ -296,16 +294,13 @@ impl RioState {
         Ok(())
     }
 
-    pub(crate) fn forget_all_udp_pool_contexts(&mut self) {
+    pub(crate) fn forget_udp_contexts(&mut self) {
         for actor in self.actors.values_mut() {
             actor.pool_manager.udp_ctx_map.clear();
         }
     }
 
-    pub(crate) fn shutdown_all_actors_with_registry_cleanup(
-        &mut self,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) {
+    pub(crate) fn shutdown_rio_actors(&mut self, registrar: &dyn veloq_buf::BufferRegistrar) {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             self.actors.clear();
             self.actor_routes.clear();
@@ -321,20 +316,14 @@ impl RioState {
         self.actor_routes.clear();
     }
 
-    pub(crate) fn try_mark_pool_completion(
-        &mut self,
-        actor_id: u32,
-        completion_generation: u32,
-    ) -> bool {
+    pub(crate) fn mark_pool_done(&mut self, actor_id: u32, completion_generation: u32) -> bool {
         let Some(handle) = self.actor_routes.get(&actor_id).copied() else {
             return false;
         };
         let Some(actor) = self.actors.get_mut(&handle) else {
             return false;
         };
-        let _ = actor
-            .pool_manager
-            .ack_udp_pool_completion(completion_generation);
+        let _ = actor.pool_manager.ack_pool_done(completion_generation);
         actor.pool_manager.handle_completion_drain_only();
         let Some(env) = self
             .kernel
@@ -345,10 +334,7 @@ impl RioState {
             return true;
         };
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor_id, actor.rq));
-        if actor
-            .pool_manager
-            .cleanup_shutdown_udp_pool_if_drained(&mut ctx)
-        {
+        if actor.pool_manager.cleanup_drained_pool(&mut ctx) {
             self.actor_routes.remove(&actor_id);
             self.actors.remove(&handle);
         }
@@ -363,6 +349,7 @@ impl RioState {
         completion_table: &SharedCompletionTable,
     ) -> io::Result<usize> {
         const MAX_RIO_RESULTS: usize = 128;
+        // SAFETY: RIORESULT is a POD struct and safe to zero-initialize.
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             return Ok(0);
