@@ -34,6 +34,7 @@ impl SlotState for Completed {}
 
 pub(crate) struct Slot<'a, State: SlotState> {
     entry: &'a SlotEntry<IocpOp, OverlappedEntry>,
+    op: &'a mut Option<IocpOp>,
     storage: &'a mut SlotStorage<IocpOp, OverlappedEntry>,
     index: usize,
     _state: PhantomData<State>,
@@ -53,12 +54,18 @@ impl<'a> Slot<'a, Pending> {
     #[inline]
     pub(crate) fn pending_entry(
         entry: &'a SlotEntry<IocpOp, OverlappedEntry>,
+        op: &'a mut Option<IocpOp>,
         storage: &'a mut SlotStorage<IocpOp, OverlappedEntry>,
         index: usize,
     ) -> Self {
+        assert!(
+            op.is_none(),
+            "slot {index} entering Pending state must not contain an op"
+        );
         entry.set_state(CoreState::Pending, Ordering::Release);
         Self {
             entry,
+            op,
             storage,
             index,
             _state: PhantomData,
@@ -71,20 +78,25 @@ impl<'a> Slot<'a, Pending> {
         user_data: usize,
         generation: u32,
     ) -> Slot<'a, Initialized> {
-        self.storage
-            .with_mut(|slot_op, _result, _payload, sidecar| {
-                *slot_op = Some(op);
-                sidecar.user_data = user_data;
-                sidecar.generation = generation;
-                sidecar.blocking_result = None;
-                sidecar.in_flight = false;
-            });
+        assert!(
+            self.op.is_none(),
+            "slot {} entering Initialized state must not already contain an op",
+            self.index
+        );
+        *self.op = Some(op);
+        self.storage.with_mut(|_op, _result, _payload, sidecar| {
+            sidecar.user_data = user_data;
+            sidecar.generation = generation;
+            sidecar.blocking_result = None;
+            sidecar.in_flight = false;
+        });
 
         self.entry
             .set_state(CoreState::Initialized, Ordering::Release);
 
         Slot {
             entry: self.entry,
+            op: self.op,
             storage: self.storage,
             index: self.index,
             _state: PhantomData,
@@ -94,6 +106,11 @@ impl<'a> Slot<'a, Pending> {
 
 impl<'a> Slot<'a, Initialized> {
     pub(crate) fn start_submission(self) -> SubmissionGuard<'a> {
+        assert!(
+            self.op.is_some(),
+            "slot {} in Initialized state must contain an op",
+            self.index
+        );
         self.storage
             .with_mut(|_op, _result, _payload, sidecar| sidecar.in_flight = true);
         self.entry.set_state(CoreState::InFlight, Ordering::Release);
@@ -108,8 +125,12 @@ impl<'a> Slot<'a, Initialized> {
     where
         F: FnOnce(&mut IocpOp) -> R,
     {
-        self.storage
-            .with_mut(|op, _result, _payload, _sidecar| op.as_mut().map(f))
+        assert!(
+            self.op.is_some(),
+            "slot {} in Initialized state must contain an op",
+            self.index
+        );
+        self.op.as_mut().map(f)
     }
 
     pub(crate) fn overlapped_ptr(&mut self) -> *mut Overlapped {
@@ -136,11 +157,17 @@ impl<'a> Slot<'a, InFlight> {
 
     pub(crate) fn as_inflight_entry(
         entry: &'a SlotEntry<IocpOp, OverlappedEntry>,
+        op: &'a mut Option<IocpOp>,
         storage: &'a mut SlotStorage<IocpOp, OverlappedEntry>,
         index: usize,
     ) -> Self {
+        assert!(
+            op.is_some(),
+            "slot {index} in InFlight state must contain an op"
+        );
         Self {
             entry,
+            op,
             storage,
             index,
             _state: PhantomData,
@@ -148,6 +175,11 @@ impl<'a> Slot<'a, InFlight> {
     }
 
     pub(crate) fn complete(self) -> Slot<'a, Completed> {
+        assert!(
+            self.op.is_some(),
+            "slot {} in InFlight state must contain an op",
+            self.index
+        );
         self.storage
             .with_mut(|_op, _result, _payload, sidecar| sidecar.in_flight = false);
         self.entry
@@ -155,6 +187,7 @@ impl<'a> Slot<'a, InFlight> {
 
         Slot {
             entry: self.entry,
+            op: self.op,
             storage: self.storage,
             index: self.index,
             _state: PhantomData,
@@ -162,14 +195,32 @@ impl<'a> Slot<'a, InFlight> {
     }
 
     pub(crate) fn cancel(self) -> Slot<'a, Cancelled> {
+        assert!(
+            self.op.is_some(),
+            "slot {} in InFlight state must contain an op",
+            self.index
+        );
         self.entry
             .set_state(CoreState::Cancelled, Ordering::Release);
         Slot {
             entry: self.entry,
+            op: self.op,
             storage: self.storage,
             index: self.index,
             _state: PhantomData,
         }
+    }
+
+    pub(crate) fn with_op_mut<F, R>(&mut self, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut IocpOp) -> R,
+    {
+        assert!(
+            self.op.is_some(),
+            "slot {} in InFlight state must contain an op",
+            self.index
+        );
+        self.op.as_mut().map(f)
     }
 
     /// Access sidecar without state checks.
@@ -185,19 +236,6 @@ impl<'a> Slot<'a, InFlight> {
             .with_mut(|_op, _result, _payload, sidecar| f(sidecar))
     }
 
-    /// Access op without state checks.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the slot is in a valid state for op access.
-    pub(crate) unsafe fn op_mut_unchecked<F, R>(&mut self, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut IocpOp) -> R,
-    {
-        self.storage
-            .with_mut(|op, _result, _payload, _sidecar| op.as_mut().map(f))
-    }
-
     pub(crate) fn overlapped_ptr(&mut self) -> *mut Overlapped {
         self.storage
             .with_mut(|_op, _result, _payload, sidecar| &mut sidecar.inner as *mut Overlapped)
@@ -206,12 +244,14 @@ impl<'a> Slot<'a, InFlight> {
 
 impl<'a> Slot<'a, Completed> {
     pub(crate) fn reset(self) -> Slot<'a, Pending> {
+        let _ = self.op.take();
         let generation = self.entry.generation.load(Ordering::Acquire);
         self.storage.reset();
         self.entry.reset(generation + 1);
         self.entry.set_state(CoreState::Pending, Ordering::Release);
         Slot {
             entry: self.entry,
+            op: self.op,
             storage: self.storage,
             index: self.index,
             _state: PhantomData,
@@ -219,8 +259,12 @@ impl<'a> Slot<'a, Completed> {
     }
 
     pub(crate) fn take_op(&mut self) -> Option<IocpOp> {
-        self.storage
-            .with_mut(|op, _result, _payload, _sidecar| op.take())
+        assert!(
+            self.op.is_some(),
+            "slot {} in Completed state must contain an op",
+            self.index
+        );
+        self.op.take()
     }
 
     pub(crate) fn take_completion_data(
@@ -245,6 +289,7 @@ impl<'a> SubmissionGuard<'a> {
         };
         Ok(Slot {
             entry: slot.entry,
+            op: slot.op,
             storage: slot.storage,
             index: slot.index,
             _state: PhantomData,

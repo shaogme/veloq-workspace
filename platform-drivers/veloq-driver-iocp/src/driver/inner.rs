@@ -258,14 +258,16 @@ impl IocpDriver {
         user_data: usize,
         pending_events: &mut Vec<CompletionSidecar>,
     ) {
-        let (slot, op, storage) = match ops.get_slot_entry_storage_and_entry_mut(user_data) {
-            Some(res) => res,
-            None => {
-                debug!(user_data, "Slot missing in finish_timer_op");
-                return;
-            }
-        };
-        let mut guard = Slot::<InFlight>::as_inflight_entry(slot, storage, user_data).complete();
+        let (slot, op, slot_op, storage) =
+            match ops.get_slot_entry_op_storage_and_entry_mut(user_data) {
+                Some(res) => res,
+                None => {
+                    debug!(user_data, "Slot missing in finish_timer_op");
+                    return;
+                }
+            };
+        let mut guard =
+            Slot::<InFlight>::as_inflight_entry(slot, slot_op, storage, user_data).complete();
 
         let generation = slot.generation.load(Ordering::Acquire);
         let _ = guard.take_op();
@@ -324,12 +326,12 @@ impl IocpDriver {
         index: usize,
         f: impl FnOnce(Slot<InFlight>, &mut OpEntry<IocpOpState>, bool) -> R,
     ) -> Option<R> {
-        let (slot, op, storage) = ops.get_slot_entry_storage_and_entry_mut(index)?;
+        let (slot, op, slot_op, storage) = ops.get_slot_entry_op_storage_and_entry_mut(index)?;
         if !Slot::<InFlight>::is_in_flight_entry(slot) {
             return None;
         }
         let was_cancelled = Slot::<InFlight>::is_cancelled_entry(slot);
-        let guard = Slot::<InFlight>::as_inflight_entry(slot, storage, index);
+        let guard = Slot::<InFlight>::as_inflight_entry(slot, slot_op, storage, index);
         Some(f(guard, op, was_cancelled))
     }
 
@@ -350,16 +352,13 @@ impl IocpDriver {
             // SAFETY: InFlight state grants sidecar mutable access.
             let blocking_res = unsafe { guard.sidecar_unchecked(|s| s.blocking_result.take()) };
 
-            // SAFETY: InFlight state grants op mutable access.
-            unsafe {
-                let _ = guard.op_mut_unchecked(|iocp_op: &mut IocpOp| {
-                    if let Some(res) = blocking_res {
-                        io_result = res;
-                    } else if let Ok(val) = io_result {
-                        io_result = iocp_op.on_complete(val, &self.extensions);
-                    }
-                });
-            };
+            let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
+                if let Some(res) = blocking_res {
+                    io_result = res;
+                } else if let Ok(val) = io_result {
+                    io_result = iocp_op.on_complete(val, &self.extensions);
+                }
+            });
         });
 
         if processed.is_none() {
@@ -487,14 +486,13 @@ impl IocpDriver {
     ) {
         let mut should_emit_aborted = false;
         let handled = Self::with_inflight_slot(ops, user_data, |mut guard, op, _| {
-            // SAFETY: InFlight state grants op mutable access.
-            let fd = unsafe { guard.op_mut_unchecked(|iocp_op| iocp_op.get_fd()) }.flatten();
+            let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten();
 
             if let Some(fd) = fd
                 && let Ok(handle) = submit::resolve_fd(fd, ctx.registered_files)
             {
-                // SAFETY: InFlight state grants op mutable access.
-                let is_rio = unsafe { guard.op_mut_unchecked(|iocp_op| Self::is_rio_op(iocp_op)) }
+                let is_rio = guard
+                    .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                     .unwrap_or(false);
 
                 if op.platform_data.rio_pool_waiting || is_rio {

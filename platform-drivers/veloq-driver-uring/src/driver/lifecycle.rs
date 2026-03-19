@@ -180,9 +180,7 @@ fn cancel_slot_immediate<'a, S: SlotState>(
          payload: &mut Option<ErasedPayload>,
          _sidecar| (payload.take(), result.take()),
     );
-    let _ = slot
-        .storage
-        .with_mut(|op: &mut Option<crate::op::UringOp>, _, _, _| op.take());
+    let _ = slot.op.take();
 
     CompletionSidecar {
         user_data,
@@ -195,6 +193,5 @@ fn cancel_slot_immediate<'a, S: SlotState>(
 }
 
 fn slot_has_op<'a, S: SlotState>(slot: Slot<'a, S>) -> bool {
-    slot.storage
-        .with_mut(|slot_op, _result, _payload, _sidecar| slot_op.is_some())
+    slot.op.is_some()
 }

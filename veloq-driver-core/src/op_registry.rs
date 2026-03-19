@@ -15,6 +15,7 @@ impl<P> OpEntry<P> {
 }
 
 pub struct LocalSlot<Op, P, S: SlotSidecar> {
+    op: Option<Op>,
     pub entry: OpEntry<P>,
     pub storage: SlotStorage<Op, S>,
 }
@@ -23,6 +24,7 @@ impl<Op, P: Default, S: SlotSidecar> LocalSlot<Op, P, S> {
     #[inline]
     fn new() -> Self {
         Self {
+            op: None,
             entry: OpEntry {
                 platform_data: P::default(),
             },
@@ -47,9 +49,10 @@ pub struct AllocResult {
     pub handle: OpHandle,
 }
 
-type SlotEntryBundle<'a, Op, P, S> = (
+type SlotEntryOpBundle<'a, Op, P, S> = (
     &'a SlotEntry<Op, S>,
     &'a mut OpEntry<P>,
+    &'a mut Option<Op>,
     &'a mut SlotStorage<Op, S>,
 );
 
@@ -90,6 +93,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
                 .wrapping_add(1);
             slot.reset(new_gen);
 
+            self.local[idx].op = None;
             self.local[idx].entry.platform_data = data;
             self.local[idx].storage.reset();
 
@@ -112,11 +116,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
             }),
         }
     }
-
-    pub fn get(&self, user_data: usize) -> Option<&OpEntry<P>> {
-        self.local.get(user_data).map(|v| &v.entry)
-    }
-
+    
     pub fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<P>> {
         self.local.get_mut(user_data).map(|v| &mut v.entry)
     }
@@ -135,15 +135,16 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
         }
     }
 
-    pub fn get_slot_entry_storage_and_entry_mut(
+    pub fn get_slot_entry_op_storage_and_entry_mut(
         &mut self,
         user_data: usize,
-    ) -> Option<SlotEntryBundle<'_, Op, P, S>> {
+    ) -> Option<SlotEntryOpBundle<'_, Op, P, S>> {
         if user_data < self.local.len() {
             let local = &mut self.local[user_data];
             Some((
                 &self.shared.slots[user_data],
                 &mut local.entry,
+                &mut local.op,
                 &mut local.storage,
             ))
         } else {
@@ -182,6 +183,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
         assert!(user_data < self.local.len(), "Invalid user_data for remove");
 
         let local = &mut self.local[user_data];
+        let _ = local.op.take();
         let data = std::mem::take(&mut local.entry.platform_data);
         local.storage.reset();
         self.shared.push_free(user_data);

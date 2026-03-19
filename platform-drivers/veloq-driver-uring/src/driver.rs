@@ -777,10 +777,9 @@ impl UringDriver {
             Err(e) => {
                 let op = self
                     .ops
-                    .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
-                        slot_op.take().unwrap()
-                    })
-                    .expect("slot storage missing in submit_sqe recovery");
+                    .get_slot_entry_op_storage_and_entry_mut(user_data)
+                    .and_then(|(_, _, op, _)| op.take())
+                    .expect("slot op missing in submit_sqe recovery");
                 *op_in = Some(op);
                 binder.err(e)
             }
@@ -823,10 +822,9 @@ impl UringDriver {
             Err(e) => {
                 let op = self
                     .ops
-                    .with_slot_storage_mut(user_data, |slot_op, _result, _payload, _sidecar| {
-                        slot_op.take().unwrap()
-                    })
-                    .expect("slot storage missing in submit_timer recovery");
+                    .get_slot_entry_op_storage_and_entry_mut(user_data)
+                    .and_then(|(_, _, op, _)| op.take())
+                    .expect("slot op missing in submit_timer recovery");
                 *op_in = Some(op);
                 binder.err(e)
             }

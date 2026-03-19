@@ -105,17 +105,19 @@ impl<'a> RioCompletionRouter<'a> {
         let ops = &mut self.comp.ops;
 
         if user_data < ops.local.len() {
-            let (slot, op, storage) = match ops.get_slot_entry_storage_and_entry_mut(user_data) {
-                Some(v) => v,
-                None => return,
-            };
+            let (slot, op, slot_op, storage) =
+                match ops.get_slot_entry_op_storage_and_entry_mut(user_data) {
+                    Some(v) => v,
+                    None => return,
+                };
 
             if op.platform_data.generation == generation
                 && Slot::<InFlight>::is_in_flight_entry(slot)
             {
                 let was_cancelled = Slot::<InFlight>::is_cancelled_entry(slot);
                 let mut guard =
-                    Slot::<InFlight>::as_inflight_entry(slot, storage, user_data).complete();
+                    Slot::<InFlight>::as_inflight_entry(slot, slot_op, storage, user_data)
+                        .complete();
 
                 if was_cancelled {
                     let _ = guard.take_completion_data();

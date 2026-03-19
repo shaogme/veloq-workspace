@@ -32,6 +32,7 @@ use inner::RIO_EVENT_KEY;
 // ============================================================================
 
 /// State associated with an IOCP operation.
+#[derive(Default)]
 pub struct IocpOpState {
     pub(crate) generation: u32,
     pub(crate) timer_id: Option<TaskId>,
@@ -43,20 +44,6 @@ pub struct IocpOpState {
     pub(crate) rio_drained: bool,
     // recv_from served by internal RIO UDP pre-post pool; no per-op kernel I/O in flight.
     pub(crate) rio_pool_waiting: bool,
-}
-
-impl Default for IocpOpState {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            timer_id: None,
-            timer_deadline: None,
-            is_background: false,
-            rio_needs_drain: false,
-            rio_drained: false,
-            rio_pool_waiting: false,
-        }
-    }
 }
 
 /// Closing mode for the driver or operations.
@@ -88,12 +75,12 @@ impl IocpDriver {
         user_data: usize,
         op: IocpOp,
     ) -> io::Result<(Slot<'_, Initialized>, &mut OpEntry<IocpOpState>)> {
-        let (slot_entry, op_entry, storage) =
-            ops.get_slot_entry_storage_and_entry_mut(user_data)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Op not found"))?;
+        let (slot_entry, op_entry, slot_op, storage) = ops
+            .get_slot_entry_op_storage_and_entry_mut(user_data)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Op not found"))?;
 
         let generation = slot_entry.generation.load(Ordering::Acquire);
-        let mut guard = Slot::<Pending>::pending_entry(slot_entry, storage, user_data)
+        let mut guard = Slot::<Pending>::pending_entry(slot_entry, slot_op, storage, user_data)
             .init_op(op, user_data, generation);
 
         guard
@@ -118,11 +105,12 @@ impl IocpDriver {
         }
         if get_blocking_pool().execute(task).is_err() {
             let err = io::Error::other("Thread pool overloaded");
-            if let Some((slot_entry, _, storage)) =
-                ops.get_slot_entry_storage_and_entry_mut(user_data)
+            if let Some((slot_entry, _, slot_op, storage)) =
+                ops.get_slot_entry_op_storage_and_entry_mut(user_data)
             {
                 let mut guard =
-                    Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data).complete();
+                    Slot::<InFlight>::as_inflight_entry(slot_entry, slot_op, storage, user_data)
+                        .complete();
                 let (payload, detail) = guard.take_completion_data();
                 let _ = guard.take_op();
                 let sidecar = CompletionSidecar {
@@ -174,12 +162,13 @@ impl IocpDriver {
                 Self::handle_timer_sub(ops, ctx, user_data, duration, binder)
             }
             Err(e) => {
-                if let Some((slot_entry, _, storage)) =
-                    ops.get_slot_entry_storage_and_entry_mut(user_data)
+                if let Some((slot_entry, _, slot_op, storage)) =
+                    ops.get_slot_entry_op_storage_and_entry_mut(user_data)
                 {
-                    let mut guard =
-                        Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data)
-                            .complete();
+                    let mut guard = Slot::<InFlight>::as_inflight_entry(
+                        slot_entry, slot_op, storage, user_data,
+                    )
+                    .complete();
                     *op_in = guard.take_op();
                 }
                 ops.remove(user_data);
@@ -196,11 +185,12 @@ impl IocpDriver {
         binder: SubmitBinder,
     ) -> Outcome<io::Result<Poll<()>>> {
         if let Err(err) = ctx.port.notify(user_data) {
-            if let Some((slot_entry, _, storage)) =
-                ops.get_slot_entry_storage_and_entry_mut(user_data)
+            if let Some((slot_entry, _, slot_op, storage)) =
+                ops.get_slot_entry_op_storage_and_entry_mut(user_data)
             {
                 let mut guard =
-                    Slot::<InFlight>::as_inflight_entry(slot_entry, storage, user_data).complete();
+                    Slot::<InFlight>::as_inflight_entry(slot_entry, slot_op, storage, user_data)
+                        .complete();
                 *op_in = guard.take_op();
             }
             ops.remove(user_data);
@@ -507,7 +497,8 @@ impl Driver for IocpDriver {
             Err(e) => {
                 let _ = self
                     .ops
-                    .with_slot_storage_mut(user_data, |op, _result, _payload, _sidecar| op.take());
+                    .get_slot_entry_op_storage_and_entry_mut(user_data)
+                    .and_then(|(_, _, op, _)| op.take());
                 self.ops.remove(user_data);
                 return Err(e);
             }

@@ -354,16 +354,17 @@ impl UdpPoolManager {
         if user_data >= ops.local.len() {
             return false;
         }
-        let (slot, op, storage) = match ops.get_slot_entry_storage_and_entry_mut(user_data) {
-            Some(v) => v,
-            None => return false,
-        };
+        let (slot, op, slot_op, storage) =
+            match ops.get_slot_entry_op_storage_and_entry_mut(user_data) {
+                Some(v) => v,
+                None => return false,
+            };
         if op.platform_data.generation != generation || !Slot::<InFlight>::is_in_flight_entry(slot)
         {
             return false;
         }
 
-        let mut guard = Slot::<InFlight>::as_inflight_entry(slot, storage, user_data);
+        let mut guard = Slot::<InFlight>::as_inflight_entry(slot, slot_op, storage, user_data);
         let d = match datagram.as_ref() {
             Some(d) => d,
             None => return false,
@@ -401,18 +402,16 @@ impl UdpPoolManager {
     fn get_stream_op_mut<'a>(
         guard: &'a mut Slot<'_, InFlight>,
     ) -> Option<&'a mut UdpRecvStream<crate::RawHandle>> {
-        // SAFETY: The slot is in-flight.
-        unsafe {
-            guard
-                .op_mut_unchecked(|iocp_op| {
-                    if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
-                        Some(kernel.user.as_mut())
-                    } else {
-                        None
-                    }
-                })
-                .flatten()
-        }
+        guard
+            .with_op_mut(|iocp_op| {
+                if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
+                    // SAFETY: `kernel.user` is a live `NonNull` while the op is in-flight.
+                    Some(unsafe { kernel.user.as_mut() })
+                } else {
+                    None
+                }
+            })
+            .flatten()
     }
 
     fn into_op_datagram(datagram: UdpRecvDatagram) -> OpUdpRecvDatagram {
