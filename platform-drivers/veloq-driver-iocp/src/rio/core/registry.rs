@@ -12,7 +12,7 @@
 use crate::IoFd;
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::rio::RioEnv;
-use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq};
+use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
 use rustc_hash::FxHashMap;
 use std::io;
 use std::time::{Duration, Instant};
@@ -74,76 +74,8 @@ impl RioRegistry {
     ) -> io::Result<(RioBufferId, u32)> {
         let info = buf.resolve_region_info();
 
-        // Heap-allocated buffers use sentinel id=u16::MAX (no pre-registration).
         if info.id == u16::MAX {
-            let key = (buf.as_ptr() as usize, buf.capacity(), info.cookie);
-            if let Some(&id) = self.heap_rio_bufs.get(&key) {
-                return Ok((id, info.offset as u32));
-            }
-
-            if let Some(last_fail) = self.heap_register_failures_recent.get(&key)
-                && last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN
-            {
-                self.registration_stats.heap_register_skipped_recent_failure = self
-                    .registration_stats
-                    .heap_register_skipped_recent_failure
-                    .saturating_add(1);
-                return Err(io_msg(
-                    IocpErrorContext::Rio,
-                    format!(
-                        "RIO heap registration skipped due to recent failure (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
-                        env.registration_mode, key.0, key.1, key.2
-                    ),
-                ));
-            }
-
-            // Simple eviction to prevent unbounded growth of registered heap buffers.
-            // Note: RIO_BUFFERIDs are a limited kernel resource.
-            if self.heap_rio_bufs.len() >= 1024 {
-                // We move them to pending_deregistrations instead of immediate deregistration.
-                // This is only 100% safe to actually deregister when outstanding_count == 0.
-                for id in self.heap_rio_bufs.values().copied() {
-                    self.pending_deregistrations.push(id);
-                }
-                self.heap_rio_bufs.clear();
-            }
-
-            self.registration_stats.heap_register_attempts = self
-                .registration_stats
-                .heap_register_attempts
-                .saturating_add(1);
-
-            let id = env
-                .dispatch
-                .register_buffer(buf.as_ptr(), buf.capacity() as u32);
-            let id = match id {
-                Ok(id) => id,
-                Err(e) => {
-                    self.registration_stats.heap_register_failures = self
-                        .registration_stats
-                        .heap_register_failures
-                        .saturating_add(1);
-                    self.heap_register_failures_recent
-                        .insert(key, Instant::now());
-                    let err = io_error(
-                        IocpErrorContext::Rio,
-                        Self::last_wsa_error(),
-                        format!(
-                            "RIORegisterBuffer failed for heap buffer (mode={:?}): ptr=0x{:x}, cap={}, cookie={}, original_error={e}",
-                            env.registration_mode, key.0, key.1, key.2
-                        ),
-                    );
-                    return Err(err);
-                }
-            };
-
-            self.heap_rio_bufs.insert(key, id);
-            self.heap_register_failures_recent.remove(&key);
-            self.registration_stats.heap_register_success = self
-                .registration_stats
-                .heap_register_success
-                .saturating_add(1);
-            return Ok((id, info.offset as u32));
+            return self.resolve_heap_buffer_id(buf, info.offset, env);
         }
 
         let mut buffer_id = match self.chunk_registry.get(info.id as usize) {
@@ -230,22 +162,7 @@ impl RioRegistry {
 
         let buf_id = match env.dispatch.register_buffer(ptr, len as u32) {
             Ok(id) => id,
-            Err(e) => {
-                self.registration_stats.chunk_register_failures = self
-                    .registration_stats
-                    .chunk_register_failures
-                    .saturating_add(1);
-                self.chunk_register_failures_recent
-                    .insert(id, Instant::now());
-                let err = io_error(
-                    IocpErrorContext::Rio,
-                    Self::last_wsa_error(),
-                    format!(
-                        "RIORegisterBuffer failed: chunk_id={id}, len={len}, original_error={e}"
-                    ),
-                );
-                return Err(err);
-            }
+            Err(e) => return Err(self.handle_chunk_register_fail(id, len, e)),
         };
 
         self.chunk_registry[id_idx] = buf_id;
@@ -302,16 +219,16 @@ impl RioRegistry {
         let max_outstanding_recvs = self.rq_depth;
         let max_outstanding_sends = self.rq_depth;
 
-        env.dispatch.create_rq(
-            handle as usize,
+        env.dispatch.create_rq(RioRqConfig {
+            socket: handle as usize,
             max_outstanding_recvs,
-            1,
+            max_receive_data_buffers: 1,
             max_outstanding_sends,
-            1,
-            env.cq,
-            env.cq,
-            std::ptr::null_mut(),
-        ).map_err(|e| {
+            max_send_data_buffers: 1,
+            recv_cq: env.cq,
+            send_cq: env.cq,
+            context: std::ptr::null(),
+        }).map_err(|e| {
             io_error(
                 IocpErrorContext::Rio,
                 Self::last_wsa_error(),
@@ -375,5 +292,100 @@ impl RioRegistry {
         self.heap_rio_bufs.clear();
         self.chunk_register_failures_recent.clear();
         self.heap_register_failures_recent.clear();
+    }
+
+    fn resolve_heap_buffer_id(
+        &mut self,
+        buf: &FixedBuf,
+        offset: usize,
+        env: RioEnv<'_>,
+    ) -> io::Result<(RioBufferId, u32)> {
+        let key = (
+            buf.as_ptr() as usize,
+            buf.capacity(),
+            buf.resolve_region_info().cookie,
+        );
+        if let Some(&id) = self.heap_rio_bufs.get(&key) {
+            return Ok((id, offset as u32));
+        }
+
+        if let Some(last_fail) = self.heap_register_failures_recent.get(&key)
+            && last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN
+        {
+            self.registration_stats.heap_register_skipped_recent_failure = self
+                .registration_stats
+                .heap_register_skipped_recent_failure
+                .saturating_add(1);
+            return Err(io_msg(
+                IocpErrorContext::Rio,
+                format!(
+                    "RIO heap registration skipped due to recent failure (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
+                    env.registration_mode, key.0, key.1, key.2
+                ),
+            ));
+        }
+
+        // Simple eviction to prevent unbounded growth of registered heap buffers.
+        if self.heap_rio_bufs.len() >= 1024 {
+            for id in self.heap_rio_bufs.values().copied() {
+                self.pending_deregistrations.push(id);
+            }
+            self.heap_rio_bufs.clear();
+        }
+
+        self.registration_stats.heap_register_attempts = self
+            .registration_stats
+            .heap_register_attempts
+            .saturating_add(1);
+
+        let id = match env
+            .dispatch
+            .register_buffer(buf.as_ptr(), buf.capacity() as u32)
+        {
+            Ok(id) => id,
+            Err(e) => {
+                self.registration_stats.heap_register_failures = self
+                    .registration_stats
+                    .heap_register_failures
+                    .saturating_add(1);
+                self.heap_register_failures_recent
+                    .insert(key, Instant::now());
+                return Err(io_error(
+                    IocpErrorContext::Rio,
+                    Self::last_wsa_error(),
+                    format!(
+                        "RIORegisterBuffer failed for heap buffer (mode={:?}): ptr=0x{:x}, cap={}, cookie={}, original_error={e}",
+                        env.registration_mode, key.0, key.1, key.2
+                    ),
+                ));
+            }
+        };
+
+        self.heap_rio_bufs.insert(key, id);
+        self.heap_register_failures_recent.remove(&key);
+        self.registration_stats.heap_register_success = self
+            .registration_stats
+            .heap_register_success
+            .saturating_add(1);
+        Ok((id, offset as u32))
+    }
+
+    fn handle_chunk_register_fail(
+        &mut self,
+        id: u16,
+        len: usize,
+        e: std::io::Error,
+    ) -> std::io::Error {
+        self.registration_stats.chunk_register_failures = self
+            .registration_stats
+            .chunk_register_failures
+            .saturating_add(1);
+        self.chunk_register_failures_recent
+            .insert(id, Instant::now());
+        io_error(
+            IocpErrorContext::Rio,
+            Self::last_wsa_error(),
+            format!("RIORegisterBuffer failed: chunk_id={id}, len={len}, original_error={e}"),
+        )
     }
 }

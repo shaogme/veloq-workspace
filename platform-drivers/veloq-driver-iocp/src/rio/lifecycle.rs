@@ -43,20 +43,25 @@ impl DeferredRioCleanup {
     }
 }
 
-fn reaper_sender() -> &'static std::sync::mpsc::Sender<DeferredRioCleanup> {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<DeferredRioCleanup>> = OnceLock::new();
-    SENDER.get_or_init(|| {
+fn reaper_sender() -> Option<&'static std::sync::mpsc::Sender<DeferredRioCleanup>> {
+    static SENDER: OnceLock<Option<std::sync::mpsc::Sender<DeferredRioCleanup>>> = OnceLock::new();
+    let opt = SENDER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<DeferredRioCleanup>();
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("veloq-rio-reaper".to_string())
             .spawn(move || {
                 while let Ok(task) = rx.recv() {
                     task.run();
                 }
-            })
-            .unwrap_or_else(|e| panic!("failed to spawn veloq-rio-reaper: {e}"));
-        tx
-    })
+            }) {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                tracing::error!("failed to spawn veloq-rio-reaper: {e}");
+                None
+            }
+        }
+    });
+    opt.as_ref()
 }
 
 impl RioState {
@@ -152,10 +157,14 @@ impl Drop for RioState {
         }
 
         if let Some(task) = self.take_deferred() {
-            let tx = reaper_sender();
-            if let Err(err) = tx.send(task) {
-                tracing::warn!("RioReaper unavailable, falling back to inline cleanup");
-                err.0.run();
+            if let Some(tx) = reaper_sender() {
+                if let Err(err) = tx.send(task) {
+                    tracing::warn!("RioReaper unavailable, falling back to inline cleanup");
+                    err.0.run();
+                }
+            } else {
+                tracing::warn!("RioReaper thread failed to start, falling back to inline cleanup");
+                task.run();
             }
             return;
         }

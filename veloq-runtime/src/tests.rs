@@ -36,7 +36,6 @@ impl NetworkTestRunner {
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) fn buffer_sizes(mut self, sizes: Vec<std::num::NonZeroUsize>) -> Self {
         self.buffer_sizes = sizes;
         self

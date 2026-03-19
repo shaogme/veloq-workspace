@@ -68,7 +68,7 @@ impl<'a> RioCompletionRouter<'a> {
         }
     }
 
-    fn handle_pool_completion(&mut self, actor_id: u32, generation: u32, res: &RIORESULT) {
+    fn on_pool_completion(&mut self, actor_id: u32, generation: u32, res: &RIORESULT) {
         let Some(&handle) = self.actor_routes.get(&actor_id) else {
             return;
         };
@@ -162,7 +162,7 @@ impl<'a> RioCompletionRouter<'a> {
             RioCompletionKind::Pool {
                 actor_id,
                 generation,
-            } => self.handle_pool_completion(actor_id, generation, res),
+            } => self.on_pool_completion(actor_id, generation, res),
             RioCompletionKind::Op {
                 user_data,
                 generation,
@@ -217,10 +217,9 @@ impl RioState {
             self.actors
                 .insert(handle, RioSocketActor::new(actor_id, rq));
         }
-        Ok(self
-            .actors
+        self.actors
             .get_mut(&handle)
-            .unwrap_or_else(|| unreachable!("actor MUST be inserted")))
+            .ok_or_else(|| io::Error::other("failed to retrieve inserted actor"))
     }
 
     pub(crate) fn shutdown_udp_pool(&mut self, handle: HANDLE) {
@@ -236,7 +235,7 @@ impl RioState {
         let mut remove_actor = None;
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-            actor.pool_manager.begin_udp_pool_shutdown();
+            actor.pool_manager.shutdown_pool();
             if actor.pool_manager.cleanup_drained_pool(&mut ctx) {
                 remove_actor = Some(actor.actor_id);
             }
@@ -249,7 +248,7 @@ impl RioState {
 
     pub(crate) fn begin_shutdown(&mut self) {
         for actor in self.actors.values_mut() {
-            actor.pool_manager.begin_udp_pool_shutdown();
+            actor.pool_manager.shutdown_pool();
         }
     }
 
@@ -264,7 +263,7 @@ impl RioState {
         };
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-            actor.pool_manager.cancel_udp_recv_waiter(uid, &mut ctx);
+            actor.pool_manager.cancel_waiter(uid, &mut ctx);
         }
     }
 
@@ -308,9 +307,7 @@ impl RioState {
         };
         for actor in self.actors.values_mut() {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-            actor
-                .pool_manager
-                .forget_in_flight_and_deregister_rest(&mut ctx);
+            actor.pool_manager.forget_and_cleanup(&mut ctx);
         }
         self.actors.clear();
         self.actor_routes.clear();
@@ -324,7 +321,7 @@ impl RioState {
             return false;
         };
         let _ = actor.pool_manager.ack_pool_done(completion_generation);
-        actor.pool_manager.handle_completion_drain_only();
+        actor.pool_manager.handle_drain_completion();
         let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)
