@@ -31,14 +31,77 @@ impl Drop for ErasedPayload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum SlotState {
-    Free = 0,
-    Pending = 1,
-    Initialized = 2,
-    InFlight = 3,
-    Cancelled = 4,
-    Completed = 5,
+    Free,
+    Pending,
+    Initialized,
+    InFlight,
+    Cancelled,
+    Completed,
+}
+
+#[derive(Debug)]
+pub struct AtomicSlotState(AtomicU8);
+
+impl AtomicSlotState {
+    #[inline]
+    pub const fn new(state: SlotState) -> Self {
+        Self(AtomicU8::new(encode_slot_state(state)))
+    }
+
+    #[inline]
+    pub fn load(&self, ordering: Ordering) -> SlotState {
+        decode_slot_state(self.0.load(ordering))
+    }
+
+    #[inline]
+    pub fn store(&self, state: SlotState, ordering: Ordering) {
+        self.0.store(encode_slot_state(state), ordering);
+    }
+
+    #[inline]
+    pub fn compare_exchange(
+        &self,
+        current: SlotState,
+        new: SlotState,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<SlotState, SlotState> {
+        self.0
+            .compare_exchange(
+                encode_slot_state(current),
+                encode_slot_state(new),
+                success,
+                failure,
+            )
+            .map(decode_slot_state)
+            .map_err(decode_slot_state)
+    }
+}
+
+#[inline]
+const fn encode_slot_state(state: SlotState) -> u8 {
+    match state {
+        SlotState::Free => 0,
+        SlotState::Pending => 1,
+        SlotState::Initialized => 2,
+        SlotState::InFlight => 3,
+        SlotState::Cancelled => 4,
+        SlotState::Completed => 5,
+    }
+}
+
+#[inline]
+fn decode_slot_state(raw: u8) -> SlotState {
+    match raw {
+        0 => SlotState::Free,
+        1 => SlotState::Pending,
+        2 => SlotState::Initialized,
+        3 => SlotState::InFlight,
+        4 => SlotState::Cancelled,
+        5 => SlotState::Completed,
+        _ => panic!("invalid SlotState encoding: {raw}"),
+    }
 }
 
 pub struct SlotStorage<Op, S: SlotSidecar> {
@@ -94,7 +157,7 @@ impl<Op, S: SlotSidecar> Default for SlotStorage<Op, S> {
 pub struct SlotData<Op, S: SlotSidecar> {
     pub generation: AtomicU32,
     pub next_free: AtomicUsize,
-    pub state: AtomicU8,
+    state: AtomicSlotState,
     _marker: PhantomData<fn() -> (Op, S)>,
 }
 
@@ -105,13 +168,23 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
         Self {
             generation: AtomicU32::new(0),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
-            state: AtomicU8::new(SlotState::Free as u8),
+            state: AtomicSlotState::new(SlotState::Free),
             _marker: PhantomData,
         }
     }
 
+    #[inline]
+    pub fn state(&self, ordering: Ordering) -> SlotState {
+        self.state.load(ordering)
+    }
+
+    #[inline]
+    pub fn set_state(&self, state: SlotState, ordering: Ordering) {
+        self.state.store(state, ordering);
+    }
+
     pub fn reset(&self, generation: u32) {
-        self.state.store(SlotState::Free as u8, Ordering::Release);
+        self.set_state(SlotState::Free, Ordering::Release);
         self.generation.store(generation, Ordering::Release);
     }
 }

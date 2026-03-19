@@ -39,6 +39,16 @@ pub(crate) struct Slot<'a, State: SlotState> {
     _state: PhantomData<State>,
 }
 
+#[inline]
+fn is_inflight_or_cancelled(state: CoreState) -> bool {
+    matches!(state, CoreState::InFlight | CoreState::Cancelled)
+}
+
+#[inline]
+fn is_cancelled(state: CoreState) -> bool {
+    matches!(state, CoreState::Cancelled)
+}
+
 impl<'a> Slot<'a, Pending> {
     #[inline]
     pub(crate) fn pending_entry(
@@ -46,9 +56,7 @@ impl<'a> Slot<'a, Pending> {
         storage: &'a mut SlotStorage<IocpOp, OverlappedEntry>,
         index: usize,
     ) -> Self {
-        entry
-            .state
-            .store(CoreState::Pending as u8, Ordering::Release);
+        entry.set_state(CoreState::Pending, Ordering::Release);
         Self {
             entry,
             storage,
@@ -73,8 +81,7 @@ impl<'a> Slot<'a, Pending> {
             });
 
         self.entry
-            .state
-            .store(CoreState::Initialized as u8, Ordering::Release);
+            .set_state(CoreState::Initialized, Ordering::Release);
 
         Slot {
             entry: self.entry,
@@ -89,9 +96,7 @@ impl<'a> Slot<'a, Initialized> {
     pub(crate) fn start_submission(self) -> SubmissionGuard<'a> {
         self.storage
             .with_mut(|_op, _result, _payload, sidecar| sidecar.in_flight = true);
-        self.entry
-            .state
-            .store(CoreState::InFlight as u8, Ordering::Release);
+        self.entry.set_state(CoreState::InFlight, Ordering::Release);
 
         SubmissionGuard {
             slot: Some(self),
@@ -121,13 +126,12 @@ impl<'a> Slot<'a, InFlight> {
 
     #[inline]
     pub(crate) fn is_in_flight_entry(entry: &SlotEntry<IocpOp, OverlappedEntry>) -> bool {
-        let state = entry.state.load(Ordering::Acquire);
-        state == CoreState::InFlight as u8 || state == CoreState::Cancelled as u8
+        is_inflight_or_cancelled(entry.state(Ordering::Acquire))
     }
 
     #[inline]
     pub(crate) fn is_cancelled_entry(entry: &SlotEntry<IocpOp, OverlappedEntry>) -> bool {
-        entry.state.load(Ordering::Acquire) == CoreState::Cancelled as u8
+        is_cancelled(entry.state(Ordering::Acquire))
     }
 
     pub(crate) fn as_inflight_entry(
@@ -147,8 +151,7 @@ impl<'a> Slot<'a, InFlight> {
         self.storage
             .with_mut(|_op, _result, _payload, sidecar| sidecar.in_flight = false);
         self.entry
-            .state
-            .store(CoreState::Completed as u8, Ordering::Release);
+            .set_state(CoreState::Completed, Ordering::Release);
 
         Slot {
             entry: self.entry,
@@ -160,8 +163,7 @@ impl<'a> Slot<'a, InFlight> {
 
     pub(crate) fn cancel(self) -> Slot<'a, Cancelled> {
         self.entry
-            .state
-            .store(CoreState::Cancelled as u8, Ordering::Release);
+            .set_state(CoreState::Cancelled, Ordering::Release);
         Slot {
             entry: self.entry,
             storage: self.storage,
@@ -207,9 +209,7 @@ impl<'a> Slot<'a, Completed> {
         let generation = self.entry.generation.load(Ordering::Acquire);
         self.storage.reset();
         self.entry.reset(generation + 1);
-        self.entry
-            .state
-            .store(CoreState::Pending as u8, Ordering::Release);
+        self.entry.set_state(CoreState::Pending, Ordering::Release);
         Slot {
             entry: self.entry,
             storage: self.storage,
@@ -260,8 +260,7 @@ impl<'a> Drop for SubmissionGuard<'a> {
             slot.storage
                 .with_mut(|_op, _result, _payload, sidecar| sidecar.in_flight = false);
             slot.entry
-                .state
-                .store(CoreState::Initialized as u8, Ordering::Release);
+                .set_state(CoreState::Initialized, Ordering::Release);
         }
     }
 }

@@ -52,6 +52,14 @@ pub(crate) enum SlotView<'a> {
     Cancelled(Slot<'a, Cancelled>),
 }
 
+#[inline]
+pub(crate) fn is_runnable_state(state: CoreState) -> bool {
+    matches!(
+        state,
+        CoreState::Pending | CoreState::Initialized | CoreState::InFlight | CoreState::Cancelled
+    )
+}
+
 impl<'a, S: SlotState> Slot<'a, S> {
     #[inline]
     fn new_internal(
@@ -73,21 +81,21 @@ impl<'a, S: SlotState> Slot<'a, S> {
 impl<'a> SlotSession<'a> {
     #[inline]
     pub(crate) fn view(self) -> Option<SlotView<'a>> {
-        match self.entry.state.load(Ordering::Acquire) {
-            state if state == CoreState::Pending as u8 => {
+        match self.entry.state(Ordering::Acquire) {
+            CoreState::Pending => {
                 Slot::<Pending>::try_bind(self.entry, self.storage, self.platform, self.index)
                     .map(SlotView::Pending)
             }
-            state if state == CoreState::Initialized as u8 => {
+            CoreState::Initialized => {
                 Slot::<Initialized>::try_bind(self.entry, self.storage, self.platform, self.index)
                     .map(SlotView::Initialized)
             }
-            state if state == CoreState::InFlight as u8 => {
+            CoreState::InFlight => {
                 Slot::<InFlight>::try_bind(self.entry, self.storage, self.platform, self.index)
                     .map(SlotView::InFlight)
             }
-            state if state == CoreState::Completed as u8 => None,
-            state if state == CoreState::Cancelled as u8 => {
+            CoreState::Completed => None,
+            CoreState::Cancelled => {
                 Slot::<Cancelled>::try_bind(self.entry, self.storage, self.platform, self.index)
                     .map(SlotView::Cancelled)
             }
@@ -104,7 +112,6 @@ impl<'a> SlotSession<'a> {
     pub(crate) fn bind_in_flight(self) -> Option<Slot<'a, InFlight>> {
         Slot::<InFlight>::try_bind(self.entry, self.storage, self.platform, self.index)
     }
-
 }
 
 impl<'a> Slot<'a, Pending> {
@@ -114,7 +121,7 @@ impl<'a> Slot<'a, Pending> {
         platform: &'a mut UringOpState,
         index: usize,
     ) -> Option<Self> {
-        if entry.state.load(Ordering::Acquire) == CoreState::Pending as u8 {
+        if entry.state(Ordering::Acquire) == CoreState::Pending {
             Some(Self::new_internal(entry, storage, platform, index))
         } else {
             None
@@ -128,9 +135,7 @@ impl<'a> Slot<'a, Pending> {
         platform: &'a mut UringOpState,
         index: usize,
     ) -> Self {
-        entry
-            .state
-            .store(CoreState::Pending as u8, Ordering::Release);
+        entry.set_state(CoreState::Pending, Ordering::Release);
         Self {
             entry,
             storage,
@@ -147,8 +152,7 @@ impl<'a> Slot<'a, Pending> {
             });
 
         self.entry
-            .state
-            .store(CoreState::Initialized as u8, Ordering::Release);
+            .set_state(CoreState::Initialized, Ordering::Release);
 
         Slot::new_internal(self.entry, self.storage, self.platform, self.index)
     }
@@ -161,7 +165,7 @@ impl<'a> Slot<'a, Initialized> {
         platform: &'a mut UringOpState,
         index: usize,
     ) -> Option<Self> {
-        if entry.state.load(Ordering::Acquire) == CoreState::Initialized as u8 {
+        if entry.state(Ordering::Acquire) == CoreState::Initialized {
             Some(Self::new_internal(entry, storage, platform, index))
         } else {
             None
@@ -169,9 +173,7 @@ impl<'a> Slot<'a, Initialized> {
     }
 
     pub(crate) fn start_submission(self) -> SubmissionGuard {
-        self.entry
-            .state
-            .store(CoreState::InFlight as u8, Ordering::Release);
+        self.entry.set_state(CoreState::InFlight, Ordering::Release);
 
         SubmissionGuard {
             entry: self.entry as *const SlotEntry<UringOp, ()>,
@@ -196,7 +198,7 @@ impl<'a> Slot<'a, InFlight> {
         platform: &'a mut UringOpState,
         index: usize,
     ) -> Option<Self> {
-        if entry.state.load(Ordering::Acquire) == CoreState::InFlight as u8 {
+        if entry.state(Ordering::Acquire) == CoreState::InFlight {
             Some(Self::new_internal(entry, storage, platform, index))
         } else {
             None
@@ -206,16 +208,14 @@ impl<'a> Slot<'a, InFlight> {
     #[inline]
     pub(crate) fn complete(self) -> Slot<'a, Completed> {
         self.entry
-            .state
-            .store(CoreState::Completed as u8, Ordering::Release);
+            .set_state(CoreState::Completed, Ordering::Release);
 
         Slot::new_internal(self.entry, self.storage, self.platform, self.index)
     }
 
     pub(crate) fn cancel(self) -> Slot<'a, Cancelled> {
         self.entry
-            .state
-            .store(CoreState::Cancelled as u8, Ordering::Release);
+            .set_state(CoreState::Cancelled, Ordering::Release);
 
         Slot::new_internal(self.entry, self.storage, self.platform, self.index)
     }
@@ -236,7 +236,7 @@ impl<'a> Slot<'a, Cancelled> {
         platform: &'a mut UringOpState,
         index: usize,
     ) -> Option<Self> {
-        if entry.state.load(Ordering::Acquire) == CoreState::Cancelled as u8 {
+        if entry.state(Ordering::Acquire) == CoreState::Cancelled {
             Some(Self::new_internal(entry, storage, platform, index))
         } else {
             None
@@ -245,8 +245,7 @@ impl<'a> Slot<'a, Cancelled> {
 
     pub(crate) fn complete(self) -> Slot<'a, Completed> {
         self.entry
-            .state
-            .store(CoreState::Completed as u8, Ordering::Release);
+            .set_state(CoreState::Completed, Ordering::Release);
 
         Slot::new_internal(self.entry, self.storage, self.platform, self.index)
     }
@@ -281,9 +280,7 @@ impl Drop for SubmissionGuard {
     fn drop(&mut self) {
         if !self.persisted {
             unsafe {
-                (&*self.entry)
-                    .state
-                    .store(CoreState::Initialized as u8, Ordering::Release);
+                (&*self.entry).set_state(CoreState::Initialized, Ordering::Release);
             }
         }
     }

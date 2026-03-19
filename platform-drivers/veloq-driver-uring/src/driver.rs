@@ -23,9 +23,8 @@ mod registration;
 
 pub use lifecycle::UringOpState;
 pub(crate) use registration::{MAX_CHUNKS, UringRegistrationStats};
-use veloq_driver_core::slot::SlotState as CoreState;
 
-use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
+use crate::op::slot::{Slot, SlotView, UringOpRegistryExt, is_runnable_state};
 
 pub(crate) struct EventFd {
     pub(crate) fd: RawFd,
@@ -391,13 +390,8 @@ impl UringDriver {
     }
 
     fn has_active_ops(&self) -> bool {
-        (0..self.ops.local.len()).any(|idx| {
-            let state = self.ops.shared.slots[idx].state.load(Ordering::Acquire);
-            state == CoreState::Pending as u8
-                || state == CoreState::Initialized as u8
-                || state == CoreState::InFlight as u8
-                || state == CoreState::Cancelled as u8
-        })
+        (0..self.ops.local.len())
+            .any(|idx| is_runnable_state(self.ops.shared.slots[idx].state(Ordering::Acquire)))
     }
 
     pub(crate) fn process_completions_internal(&mut self) {
@@ -769,7 +763,7 @@ impl UringDriver {
                 slot
             }
             Some(SlotView::InFlight(_)) | Some(SlotView::Cancelled(_)) | None => {
-                return binder.err(io::Error::other("Op slot missing in registry"))
+                return binder.err(io::Error::other("Op slot missing in registry"));
             }
         };
 
@@ -812,7 +806,7 @@ impl UringDriver {
                 slot
             }
             Some(SlotView::InFlight(_)) | Some(SlotView::Cancelled(_)) | None => {
-                return binder.err(io::Error::other("Op slot missing in registry"))
+                return binder.err(io::Error::other("Op slot missing in registry"));
             }
         };
 
