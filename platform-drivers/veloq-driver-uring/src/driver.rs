@@ -24,7 +24,7 @@ mod registration;
 pub use lifecycle::UringOpState;
 pub(crate) use registration::{MAX_CHUNKS, UringRegistrationStats};
 
-use crate::op::slot::{Slot, SlotView, UringOpRegistryExt, is_runnable_state};
+use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
 
 pub(crate) struct EventFd {
     pub(crate) fd: RawFd,
@@ -164,24 +164,34 @@ impl UringDriver {
     pub(crate) unsafe fn submit_from_slot_raw(
         driver: *mut UringDriver,
         user_data: usize,
-        mut slot: Slot<'_, crate::op::slot::Initialized>,
+        slot: Slot<'_, crate::op::slot::Initialized>,
     ) -> io::Result<bool> {
         let driver = unsafe { &mut *driver };
-        let strategy = slot.op_mut().vtable.strategy;
+        let mut sub_guard = slot.start_submission_with(None);
+        let strategy = sub_guard
+            .slot
+            .as_mut()
+            .expect("submission guard slot missing")
+            .op_mut()
+            .vtable
+            .strategy;
 
         match strategy {
             SubmissionStrategy::SubmitSqe => {
                 let mut chunks = [0u16; 4];
-                let (count, sqe, submission_guard) = {
+                let (count, sqe) = {
                     let driver_ptr = driver as *mut UringDriver;
-                    let op = slot.op_mut();
+                    let op = sub_guard
+                        .slot
+                        .as_mut()
+                        .expect("submission guard slot missing")
+                        .op_mut();
                     let vtable = op.vtable;
                     let count = unsafe { (vtable.resolve_chunks)(op, &mut chunks) };
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr).user_data(user_data as u64)
                     };
-                    let submission_guard = slot.start_submission();
-                    (count, sqe, submission_guard)
+                    (count, sqe)
                 };
 
                 for &chunk_id in chunks.iter().take(count) {
@@ -224,7 +234,7 @@ impl UringDriver {
                 }
 
                 if driver.push_entry(sqe) {
-                    submission_guard.persist();
+                    let _ = sub_guard.persist();
                     trace!(user_data, "Submitted to SQ");
                     Ok(true)
                 } else {
@@ -233,18 +243,20 @@ impl UringDriver {
                 }
             }
             SubmissionStrategy::SoftwareTimer => {
-                let (duration_opt, submission_guard) = {
+                let duration_opt = {
+                    let slot = sub_guard
+                        .slot
+                        .as_mut()
+                        .expect("submission guard slot missing");
                     let vtable = slot.op_mut().vtable;
-                    let duration_opt = unsafe { (vtable.get_timeout)(slot.op_mut()) };
-                    let submission_guard = slot.start_submission();
-                    (duration_opt, submission_guard)
+                    unsafe { (vtable.get_timeout)(slot.op_mut()) }
                 };
                 if let Some(duration) = duration_opt {
                     let task_id = driver.wheel.insert(user_data, duration);
-                    submission_guard.persist();
                     if let Some(entry) = driver.ops.get_mut(user_data) {
                         entry.platform_data.timer_id = Some(task_id);
                     }
+                    let _ = sub_guard.persist();
                     trace!(user_data, ?duration, "Registered software timer");
                     Ok(true)
                 } else {
@@ -260,10 +272,10 @@ impl UringDriver {
 
     pub(crate) fn submit_from_slot_index(&mut self, user_data: usize) -> io::Result<bool> {
         let driver_ptr = self as *mut UringDriver;
-        let slot = self
-            .ops
-            .slot_initialized(user_data)
-            .ok_or_else(|| io::Error::other("Op missing in slot"))?;
+        let slot = match self.ops.slot_view(user_data) {
+            Some(SlotView::Initialized(slot)) => slot,
+            _ => return Err(io::Error::other("Op missing in slot")),
+        };
         unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) }
     }
 
@@ -290,21 +302,12 @@ impl UringDriver {
             self.waker_token = Some(user_data);
             self.waker_payload = Some(payload);
 
-            let (sqe, submission_guard) = {
-                let driver_ptr = self as *mut UringDriver;
-                let mut slot = self.ops.slot_init_pending(user_data).init_op(uring_op);
-                let vtable = slot.op_mut().vtable;
-                let sqe = unsafe {
-                    (vtable.make_sqe)(slot.op_mut(), &mut *driver_ptr).user_data(user_data as u64)
-                };
-                let submission_guard = slot.start_submission();
-                (sqe, submission_guard)
-            };
-
-            if self.push_entry(sqe) {
-                submission_guard.persist();
-            } else {
-                self.push_backlog(user_data);
+            let driver_ptr = self as *mut UringDriver;
+            let slot = self.ops.slot_init_pending(user_data).init_op_with(uring_op, |_| {});
+            match unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) } {
+                Ok(true) => {}
+                Ok(false) => self.push_backlog(user_data),
+                Err(e) => panic!("waker submission failed: {e}"),
             }
         } else {
             panic!("Failed to reserve waker slot");
@@ -358,22 +361,25 @@ impl UringDriver {
 
             let timer_buffer = std::mem::take(&mut self.timer_buffer);
             for user_data in timer_buffer {
-                let sidecar = self.ops.slot_in_flight(user_data).map(|slot| {
-                    slot.platform.timer_id = None;
-                    let mut completed = slot.complete();
+                let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
+                    SlotView::InFlight(mut slot) => {
+                        slot.platform_mut().timer_id = None;
+                        let mut completed = slot.complete();
 
-                    let generation = completed.entry.generation.load(Ordering::Acquire);
-                    let _ = completed.take_op();
-                    let (payload, detail) = completed.take_completion_data();
+                        let generation = completed.entry.generation.load(Ordering::Acquire);
+                        let _ = completed.take_op();
+                        let (payload, detail) = completed.take_completion_data();
 
-                    CompletionSidecar {
-                        user_data,
-                        generation,
-                        res: 0,
-                        flags: 0,
-                        payload,
-                        detail,
+                        Some(CompletionSidecar {
+                            user_data,
+                            generation,
+                            res: 0,
+                            flags: 0,
+                            payload,
+                            detail,
+                        })
                     }
+                    _ => None,
                 });
 
                 if let Some(sidecar) = sidecar {
@@ -389,9 +395,14 @@ impl UringDriver {
         Ok(())
     }
 
-    fn has_active_ops(&self) -> bool {
-        (0..self.ops.local.len())
-            .any(|idx| is_runnable_state(self.ops.shared.slots[idx].state(Ordering::Acquire)))
+    fn has_active_ops(&mut self) -> bool {
+        let len = self.ops.local.len();
+        for idx in 0..len {
+            if self.ops.slot_view(idx).is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn process_completions_internal(&mut self) {
@@ -752,12 +763,8 @@ impl UringDriver {
         binder: SubmitBinder,
     ) -> Outcome<io::Result<Poll<()>>> {
         let driver_ptr = self as *mut UringDriver;
-        let slot = match self
-            .ops
-            .slot_session(user_data)
-            .and_then(|session| session.view())
-        {
-            Some(SlotView::Pending(slot)) => slot.init_op(op),
+        let slot = match self.ops.slot_view(user_data) {
+            Some(SlotView::Pending(slot)) => slot.init_op_with(op, |_| {}),
             Some(SlotView::Initialized(mut slot)) => {
                 *slot.op_mut() = op;
                 slot
@@ -794,12 +801,8 @@ impl UringDriver {
         binder: SubmitBinder,
     ) -> Outcome<io::Result<Poll<()>>> {
         let driver_ptr = self as *mut UringDriver;
-        let slot = match self
-            .ops
-            .slot_session(user_data)
-            .and_then(|session| session.view())
-        {
-            Some(SlotView::Pending(slot)) => slot.init_op(op),
+        let slot = match self.ops.slot_view(user_data) {
+            Some(SlotView::Pending(slot)) => slot.init_op_with(op, |_| {}),
             Some(SlotView::Initialized(mut slot)) => {
                 *slot.op_mut() = op;
                 slot

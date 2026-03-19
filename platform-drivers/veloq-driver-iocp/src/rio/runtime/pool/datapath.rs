@@ -5,7 +5,7 @@ use super::{
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::net::addr::{SockAddrStorage, to_socket_addr};
 use crate::ops::IocpOpPayload;
-use crate::ops::slot::{InFlight, Slot};
+use crate::ops::slot::Slot;
 use crate::ops::submit::SubmissionResult;
 use crate::rio::core::submit_ops::{RioDispatch, RioExConfig, RioProvider, RioRq};
 use crate::rio::{RioCompletionContext, RioContext};
@@ -15,6 +15,7 @@ use std::io;
 use veloq_buf::FixedBuf;
 use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
 use veloq_driver_core::op::{UdpRecvDatagram as OpUdpRecvDatagram, UdpRecvStream};
+use veloq_driver_core::slot::{InFlight, SlotRegistryExt, SlotView};
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIORESULT, WSAGetLastError};
@@ -354,17 +355,14 @@ impl UdpPoolManager {
         if user_data >= ops.local.len() {
             return false;
         }
-        let (slot, op, slot_op, storage) =
-            match ops.get_slot_entry_op_storage_and_entry_mut(user_data) {
-                Some(v) => v,
-                None => return false,
-            };
-        if op.platform_data.generation != generation || !Slot::<InFlight>::is_in_flight_entry(slot)
-        {
+        let Some(SlotView::InFlight(mut slot)) = ops.slot_view(user_data) else {
+            return false;
+        };
+        if slot.platform_mut().generation != generation {
             return false;
         }
 
-        let mut guard = Slot::<InFlight>::as_inflight_entry(slot, slot_op, storage, user_data);
+        let mut guard = slot;
         let d = match datagram.as_ref() {
             Some(d) => d,
             None => return false,
@@ -377,7 +375,7 @@ impl UdpPoolManager {
                 return false;
             };
             stream_op.result = Some(Self::into_op_datagram(owned_d));
-            op.platform_data.rio_pool_waiting = false;
+            guard.platform_mut().rio_pool_waiting = false;
 
             let event = CompletionEvent {
                 user_data: encode_completion_token(user_data, generation),
@@ -391,7 +389,7 @@ impl UdpPoolManager {
                 .record_completion_with_data(event, payload, detail);
             comp.events.push(event);
             let _ = guard.take_op();
-            let _ = std::mem::take(&mut op.platform_data);
+            let _ = std::mem::take(guard.platform_mut());
             comp.ops.shared.push_free(user_data);
             true
         } else {

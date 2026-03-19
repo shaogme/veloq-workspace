@@ -35,9 +35,9 @@ impl UringDriver {
                 self.push_completion_event(sidecar);
                 self.ops.remove(user_data);
             }
-            SlotView::InFlight(slot) => {
+            SlotView::InFlight(mut slot) => {
                 let timer_data = {
-                    let timer_id = slot.platform.timer_id;
+                    let timer_id = slot.platform_mut().timer_id;
                     let cancelled = slot.cancel();
 
                     timer_id.map(|tid| {

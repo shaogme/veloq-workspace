@@ -116,7 +116,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
             }),
         }
     }
-    
+
     pub fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<P>> {
         self.local.get_mut(user_data).map(|v| &mut v.entry)
     }
@@ -186,11 +186,24 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
         let _ = local.op.take();
         let data = std::mem::take(&mut local.entry.platform_data);
         local.storage.reset();
+        self.shared.slots[user_data].free();
         self.shared.push_free(user_data);
 
         OpEntry {
             platform_data: data,
         }
+    }
+
+    pub fn recycle(&mut self, user_data: usize, generation: u32) {
+        assert!(user_data < self.local.len(), "Invalid user_data for recycle");
+
+        let local = &mut self.local[user_data];
+        let _ = local.op.take();
+        let _ = std::mem::take(&mut local.entry.platform_data);
+        local.storage.reset();
+
+        self.shared.slots[user_data].reset(generation);
+        self.shared.push_free(user_data);
     }
 
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {

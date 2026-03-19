@@ -17,12 +17,12 @@ use veloq_driver_core::driver::{
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
-use veloq_driver_core::slot::{ErasedPayload, SlotTable};
+use veloq_driver_core::slot::{ErasedPayload, Initialized, SlotRegistryExt, SlotTable, SlotView};
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::config::{IoFd, RawHandle};
-use crate::ops::slot::{InFlight, Initialized, Pending, Slot};
+use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 pub use inner::IocpDriver;
 use inner::RIO_EVENT_KEY;
@@ -74,14 +74,16 @@ impl IocpDriver {
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
         user_data: usize,
         op: IocpOp,
-    ) -> io::Result<(Slot<'_, Initialized>, &mut OpEntry<IocpOpState>)> {
-        let (slot_entry, op_entry, slot_op, storage) = ops
-            .get_slot_entry_op_storage_and_entry_mut(user_data)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Op not found"))?;
-
-        let generation = slot_entry.generation.load(Ordering::Acquire);
-        let mut guard = Slot::<Pending>::pending_entry(slot_entry, slot_op, storage, user_data)
-            .init_op(op, user_data, generation);
+    ) -> io::Result<Slot<'_, Initialized>> {
+        let mut guard = ops.slot_init_pending(user_data);
+        let generation = guard.entry.generation.load(Ordering::Acquire);
+        guard.platform_mut().generation = generation;
+        let mut guard = guard.init_op_with(op, |sidecar| {
+            sidecar.user_data = user_data;
+            sidecar.generation = generation;
+            sidecar.blocking_result = None;
+            sidecar.in_flight = false;
+        });
 
         guard
             .with_op_mut(|op_ref| {
@@ -89,9 +91,8 @@ impl IocpDriver {
                 op_ref.header.generation = generation;
             })
             .ok_or_else(|| io::Error::other("Op missing in prep_op_slot"))?;
-        op_entry.platform_data.generation = generation;
 
-        Ok((guard, op_entry))
+        Ok(guard)
     }
 
     fn handle_offload(
@@ -105,17 +106,13 @@ impl IocpDriver {
         }
         if get_blocking_pool().execute(task).is_err() {
             let err = io::Error::other("Thread pool overloaded");
-            if let Some((slot_entry, _, slot_op, storage)) =
-                ops.get_slot_entry_op_storage_and_entry_mut(user_data)
-            {
-                let mut guard =
-                    Slot::<InFlight>::as_inflight_entry(slot_entry, slot_op, storage, user_data)
-                        .complete();
+            if let Some(SlotView::InFlight(slot)) = ops.slot_view(user_data) {
+                let mut guard = slot.complete();
                 let (payload, detail) = guard.take_completion_data();
                 let _ = guard.take_op();
                 let sidecar = CompletionSidecar {
                     user_data,
-                    generation: slot_entry.generation.load(Ordering::Acquire),
+                    generation: guard.entry.generation.load(Ordering::Acquire),
                     res: -err.raw_os_error().unwrap_or(1).abs(),
                     flags: 0,
                     payload,
@@ -162,13 +159,8 @@ impl IocpDriver {
                 Self::handle_timer_sub(ops, ctx, user_data, duration, binder)
             }
             Err(e) => {
-                if let Some((slot_entry, _, slot_op, storage)) =
-                    ops.get_slot_entry_op_storage_and_entry_mut(user_data)
-                {
-                    let mut guard = Slot::<InFlight>::as_inflight_entry(
-                        slot_entry, slot_op, storage, user_data,
-                    )
-                    .complete();
+                if let Some(SlotView::InFlight(slot)) = ops.slot_view(user_data) {
+                    let mut guard = slot.complete();
                     *op_in = guard.take_op();
                 }
                 ops.remove(user_data);
@@ -185,12 +177,8 @@ impl IocpDriver {
         binder: SubmitBinder,
     ) -> Outcome<io::Result<Poll<()>>> {
         if let Err(err) = ctx.port.notify(user_data) {
-            if let Some((slot_entry, _, slot_op, storage)) =
-                ops.get_slot_entry_op_storage_and_entry_mut(user_data)
-            {
-                let mut guard =
-                    Slot::<InFlight>::as_inflight_entry(slot_entry, slot_op, storage, user_data)
-                        .complete();
+            if let Some(SlotView::InFlight(slot)) = ops.slot_view(user_data) {
+                let mut guard = slot.complete();
                 *op_in = guard.take_op();
             }
             ops.remove(user_data);
@@ -230,15 +218,18 @@ impl IocpDriver {
             .get_page_slice(0)
             .ok_or_else(|| io::Error::other("Failed to get page slice"))?;
 
-        let (mut guard, _) = Self::prep_op_slot(&mut self.ops, user_data, op)?;
+        let mut guard = Self::prep_op_slot(&mut self.ops, user_data, op)?;
 
         let is_rio_pool_waiting = guard
             .with_op_mut(|op| matches!(op.payload, crate::ops::IocpOpPayload::UdpRecvStream(_)))
             .unwrap_or(false);
+        let overlapped = guard.storage.with_mut(|_op, _result, _payload, sidecar| {
+            &mut sidecar.inner as *mut crate::win32::Overlapped
+        });
 
         let mut ctx = SubmitContext {
             port: self.port.as_ref(),
-            overlapped: guard.overlapped_ptr(),
+            overlapped,
             ext: &self.extensions,
             registered_files: &self.registered_files,
             registrar: self.registrar.as_ref(),
@@ -247,7 +238,10 @@ impl IocpDriver {
             slab_resolver: &|idx| (idx == 0).then_some((slab_ptr, slab_len)),
         };
 
-        let mut sub_guard = guard.start_submission();
+        let mut sub_guard = guard.start_submission_with(Some(|slot| {
+            slot.storage
+                .with_mut(|_op, _result, _payload, sidecar| sidecar.in_flight = false);
+        }));
         let result = sub_guard
             .slot
             .as_mut()
@@ -255,7 +249,7 @@ impl IocpDriver {
             .ok_or_else(|| io::Error::other("Op missing during submission"))?;
 
         if result.is_ok() {
-            sub_guard.persist()?;
+            let _ = sub_guard.persist();
         }
 
         Ok((is_rio_pool_waiting, result))
@@ -314,7 +308,10 @@ impl IocpDriver {
 
         let mut in_flight = Vec::new();
         for user_data in 0..self.ops.local.len() {
-            if Slot::<InFlight>::is_in_flight(&self.ops.shared, user_data) {
+            if matches!(
+                self.ops.slot_view(user_data),
+                Some(SlotView::InFlight(_)) | Some(SlotView::Cancelled(_))
+            ) {
                 in_flight.push(user_data);
             }
         }

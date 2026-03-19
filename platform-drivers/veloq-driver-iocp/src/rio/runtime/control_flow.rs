@@ -3,7 +3,6 @@
 use crate::IoFd;
 use crate::driver::IocpOpState;
 use crate::ops::IocpOp;
-use crate::ops::slot::{InFlight, Slot};
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpCtxGuard;
 use crate::rio::core::registry::RioRegistry;
@@ -19,6 +18,7 @@ use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
 use veloq_driver_core::op_registry::OpRegistry;
+use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
@@ -105,26 +105,13 @@ impl<'a> RioCompletionRouter<'a> {
         let ops = &mut self.comp.ops;
 
         if user_data < ops.local.len() {
-            let (slot, op, slot_op, storage) =
-                match ops.get_slot_entry_op_storage_and_entry_mut(user_data) {
-                    Some(v) => v,
-                    None => return,
-                };
+            match ops.slot_view(user_data) {
+                Some(SlotView::InFlight(mut slot)) => {
+                    if slot.platform_mut().generation != generation {
+                        return;
+                    }
 
-            if op.platform_data.generation == generation
-                && Slot::<InFlight>::is_in_flight_entry(slot)
-            {
-                let was_cancelled = Slot::<InFlight>::is_cancelled_entry(slot);
-                let mut guard =
-                    Slot::<InFlight>::as_inflight_entry(slot, slot_op, storage, user_data)
-                        .complete();
-
-                if was_cancelled {
-                    let _ = guard.take_completion_data();
-                    let _ = guard.take_op();
-                    let _ = std::mem::take(&mut op.platform_data);
-                    self.comp.ops.shared.push_free(user_data);
-                } else {
+                    let mut guard = slot.complete();
                     let result_for_slot = if res.Status == 0 {
                         Ok(res.BytesTransferred as usize)
                     } else {
@@ -143,9 +130,21 @@ impl<'a> RioCompletionRouter<'a> {
                         .record_completion_with_data(event, payload, detail);
                     self.comp.events.push(event);
                     let _ = guard.take_op();
-                    let _ = std::mem::take(&mut op.platform_data);
+                    let _ = std::mem::take(guard.platform_mut());
                     self.comp.ops.shared.push_free(user_data);
                 }
+                Some(SlotView::Cancelled(mut slot)) => {
+                    if slot.platform_mut().generation != generation {
+                        return;
+                    }
+
+                    let mut guard = slot.complete();
+                    let _ = guard.take_completion_data();
+                    let _ = guard.take_op();
+                    let _ = std::mem::take(guard.platform_mut());
+                    self.comp.ops.shared.push_free(user_data);
+                }
+                _ => {}
             }
         }
 
