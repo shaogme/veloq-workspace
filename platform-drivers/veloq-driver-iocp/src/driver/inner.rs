@@ -513,11 +513,10 @@ impl IocpDriver {
                         should_emit_aborted = true;
                     } else {
                         // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
-                        let overlapped_ptr = guard.storage.with_mut(
-                            |_op, _result, _payload, sidecar| {
+                        let overlapped_ptr =
+                            guard.storage.with_mut(|_op, _result, _payload, sidecar| {
                                 &mut sidecar.inner as *mut crate::win32::Overlapped
-                            },
-                        );
+                            });
                         // SAFETY: handle and overlapped_ptr are valid for this operation.
                         let _ = unsafe {
                             crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
@@ -560,11 +559,10 @@ impl IocpDriver {
         let (payload, detail) = if let Some(data) = inflight {
             data
         } else {
-            ops
-                .with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
-                    (payload.take(), result.take())
-                })
-                .unwrap_or((None, None))
+            ops.with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
+                (payload.take(), result.take())
+            })
+            .unwrap_or((None, None))
         };
 
         push_completion_shared(

@@ -195,7 +195,10 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
     }
 
     pub fn recycle(&mut self, user_data: usize, generation: u32) {
-        assert!(user_data < self.local.len(), "Invalid user_data for recycle");
+        assert!(
+            user_data < self.local.len(),
+            "Invalid user_data for recycle"
+        );
 
         let local = &mut self.local[user_data];
         let _ = local.op.take();

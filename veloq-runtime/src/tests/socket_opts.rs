@@ -109,8 +109,7 @@ fn test_udp_socket_options() {
             let mut rx = rx;
             loop {
                 let buf = crate::runtime::context::alloc(nz!(1024));
-                let (res, _) = client.send_to(buf, addr).await;
-                res.expect("Failed to send");
+                client.send_to(buf, addr).await.expect("Failed to send");
 
                 let sleep = crate::time::sleep(std::time::Duration::from_millis(50));
 

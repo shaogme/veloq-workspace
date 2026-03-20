@@ -42,8 +42,7 @@ fn test_file_integrity() {
                     let data = b"Hello World!";
                     write_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
 
-                    let (res, _) = file.write_at(write_buf, 0).await;
-                    let wrote = res.expect("Write failed");
+                    let (wrote, _) = file.write_at(write_buf, 0).await.expect("Write failed");
                     assert_eq!(wrote, size.get());
 
                     file.sync_all().await.expect("Sync failed");
@@ -55,8 +54,7 @@ fn test_file_integrity() {
 
                     let read_buf = alloc(size);
 
-                    let (res, read_buf) = file.read_at(read_buf, 0).await;
-                    let n = res.expect("Read failed");
+                    let (n, read_buf) = file.read_at(read_buf, 0).await.expect("Read failed");
                     assert_eq!(n, size.get());
                     assert_eq!(&read_buf.as_slice()[..12], b"Hello World!");
                 }
@@ -110,8 +108,7 @@ fn test_multithread_file_ops() {
                     write_buf.set_len(len.get());
                     write_buf.as_slice_mut().copy_from_slice(content.as_bytes());
 
-                    let (res, _) = file.write_at(write_buf, 0).await;
-                    let wrote = res.expect("Write failed");
+                    let (wrote, _) = file.write_at(write_buf, 0).await.expect("Write failed");
                     assert_eq!(wrote, len.get());
 
                     file.sync_all().await.expect("Sync failed");
@@ -122,8 +119,7 @@ fn test_multithread_file_ops() {
                     let file = File::open(path).await.expect("Failed to open file");
                     let read_buf = alloc(len);
 
-                    let (res, read_buf) = file.read_at(read_buf, 0).await;
-                    let n = res.expect("Read failed");
+                    let (n, read_buf) = file.read_at(read_buf, 0).await.expect("Read failed");
                     assert_eq!(n, len.get());
                     assert_eq!(&read_buf.as_slice()[..n], content.as_bytes());
                 }
@@ -191,7 +187,7 @@ fn test_fs_cancel_read() {
         // Fill properly to avoid sparse optimization if any?
         write_buf.as_slice_mut().fill(1);
 
-        file.write_at(write_buf, 0).await.0.expect("Write failed");
+        file.write_at(write_buf, 0).await.expect("Write failed");
         file.sync_all().await.expect("Sync failed");
         drop(file);
 
@@ -201,8 +197,8 @@ fn test_fs_cancel_read() {
 
         select! {
             res = file.read_at(read_buf, 0) => {
-                 let _ = res.0.expect("Read success");
-                 println!("Read completed instantly - cancellation skipped");
+                 let (n, _) = res.expect("Read success");
+                 println!("Read completed instantly - cancellation skipped (received {} bytes)", n);
             },
             _ = YieldOnce(false) => {
                  println!("File read cancelled successfully");
@@ -217,8 +213,8 @@ fn test_fs_cancel_read() {
 
         completion_count_clone.fetch_add(1, Ordering::SeqCst);
     });
- 
-     assert_eq!(completion_count.load(Ordering::SeqCst), 1);
+
+    assert_eq!(completion_count.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -232,8 +228,10 @@ fn test_fs_read_exact_write_all() {
             let _ = fs::remove_file(path);
         }
 
-        let file = LocalFile::create(path).await.expect("Failed to create file");
-        
+        let file = LocalFile::create(path)
+            .await
+            .expect("Failed to create file");
+
         // 1. Test write_all
         const DATA: &[u8] = b"Hello Exact World!";
         let mut write_buf = alloc(nz!(DATA.len()));
@@ -241,9 +239,8 @@ fn test_fs_read_exact_write_all() {
         write_buf.set_len(DATA.len());
 
         use crate::io::{AsyncBufRead, AsyncBufWrite};
-        let (res, _) = file.write_all(write_buf).await;
-        res.expect("write_all failed");
-        
+        file.write_all(write_buf).await.expect("write_all failed");
+
         file.sync_all().await.expect("Sync failed");
         drop(file);
 
@@ -251,8 +248,8 @@ fn test_fs_read_exact_write_all() {
         let file = LocalFile::open(path).await.expect("Failed to open file");
         let mut read_buf = alloc(nz!(DATA.len()));
         read_buf.set_len(DATA.len());
-        let (res, read_buf) = file.read_exact(read_buf).await;
-        res.expect("read_exact failed");
+        let (n, read_buf) = file.read_exact(read_buf).await.expect("read_exact failed");
+        assert_eq!(n, DATA.len());
         assert_eq!(read_buf.as_slice(), DATA);
 
         // Cleanup

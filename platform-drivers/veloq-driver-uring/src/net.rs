@@ -291,7 +291,6 @@ pub fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
     }
 }
 
-
 pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) {
     let mut storage = SockAddrStorage::default();
     let len = match addr {

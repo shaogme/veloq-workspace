@@ -581,7 +581,6 @@ pub enum SlotView<'a, Op: PlatformOp, P, S: SlotSidecar> {
     Cancelled(Slot<'a, Cancelled, Op, P, S>),
 }
 
-
 pub trait SlotRegistryExt<Op: PlatformOp, P, S: SlotSidecar> {
     fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Op, P, S>>;
     fn slot_init_pending(&mut self, index: usize) -> Slot<'_, Pending, Op, P, S>;

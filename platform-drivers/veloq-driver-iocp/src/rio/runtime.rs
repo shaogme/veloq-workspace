@@ -119,9 +119,12 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let data_buf = self
-            .registry
-            .prepare_submission(buf, buf_offset, (buf.len().saturating_sub(buf_offset)) as u32, env)?;
+        let data_buf = self.registry.prepare_submission(
+            buf,
+            buf_offset,
+            (buf.len().saturating_sub(buf_offset)) as u32,
+            env,
+        )?;
         self.registry
             .ensure_page_reg(page_idx, slab_resolver, env)?;
 

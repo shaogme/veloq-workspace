@@ -17,9 +17,9 @@ async fn udp_send_to_with_retry(
     let mut last_err = None;
     for _ in 0..attempts.max(1) {
         let buf = build_buf();
-        let (result, _) =
+        let res =
             crate::tests::timeout_op(ctx, "send_to_retry", 5, socket.send_to(buf, addr)).await;
-        match result {
+        match res {
             Ok(_) => return,
             Err(e) => last_err = Some(e),
         }
@@ -125,14 +125,14 @@ fn test_udp_send_receive() {
             send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
             send_buf.set_len(test_data.len());
 
-            let (result, _) = crate::tests::timeout_op(
+            let (bytes_sent, _) = crate::tests::timeout_op(
                 "sender",
                 "send_to",
                 5,
                 socket2_arc.send_to(send_buf, addr1),
             )
-            .await;
-            let bytes_sent = result.expect("send_to failed");
+            .await
+            .expect("send_to failed");
             println!("Socket 2 sent {} bytes to {}", bytes_sent, addr1);
 
             crate::tests::timeout_op("main", "wait_handler", 5, handler).await;
@@ -181,14 +181,14 @@ fn test_udp_echo() {
                     .copy_from_slice(&buf.as_slice()[..bytes_read]);
                 echo_buf.set_len(bytes_read);
 
-                let (result, _) = crate::tests::timeout_op(
+                crate::tests::timeout_op(
                     "server",
                     "send_to",
                     5,
                     server_clone.send_to(echo_buf, from_addr),
                 )
-                .await;
-                result.expect("Server send_to failed");
+                .await
+                .expect("Server send_to failed");
                 println!("Server echoed data back to {}", from_addr);
             });
 
@@ -198,14 +198,14 @@ fn test_udp_echo() {
             send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
             send_buf.set_len(test_data.len());
 
-            let (result, _) = crate::tests::timeout_op(
+            let (bytes_sent, _) = crate::tests::timeout_op(
                 "client",
                 "send_to",
                 5,
                 client_arc.send_to(send_buf, server_addr),
             )
-            .await;
-            let bytes_sent = result.expect("Client send_to failed");
+            .await
+            .expect("Client send_to failed");
             println!("Client sent {} bytes", bytes_sent);
 
             // Receive echo response
@@ -291,14 +291,9 @@ fn test_udp_multiple_messages() {
                 buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
                 buf.set_len(msg.len());
 
-                let (result, _) = crate::tests::timeout_op(
-                    "sender",
-                    "send_to",
-                    5,
-                    socket2_arc.send_to(buf, addr1),
-                )
-                .await;
-                result.expect("send_to failed");
+                crate::tests::timeout_op("sender", "send_to", 5, socket2_arc.send_to(buf, addr1))
+                    .await
+                    .expect("send_to failed");
                 println!("Sent message {}", i);
             }
             println!("Sent all {} messages", NUM_MESSAGES);
@@ -354,10 +349,10 @@ fn test_udp_large_data() {
             }
 
             buf.set_len(DATA_SIZE);
-            let (result, _) =
+            let (bytes, _) =
                 crate::tests::timeout_op("sender", "send_to", 5, socket2_arc.send_to(buf, addr1))
-                    .await;
-            let bytes = result.expect("send_to failed");
+                    .await
+                    .expect("send_to failed");
             println!("Sent {} bytes", bytes);
 
             crate::tests::timeout_op("main", "wait_receiver", 5, h_recv).await;
@@ -400,9 +395,9 @@ fn test_udp_heap_buffer() {
             buf.as_slice_mut()[..data.len()].copy_from_slice(data);
             buf.set_len(data.len());
 
-            let (result, _) =
-                crate::tests::timeout_op("sender", "send_to", 5, socket2.send_to(buf, addr1)).await;
-            result.expect("send_to failed");
+            crate::tests::timeout_op("sender", "send_to", 5, socket2.send_to(buf, addr1))
+                .await
+                .expect("send_to failed");
             println!("UDP client sent data from heap buffer correctly");
 
             crate::tests::timeout_op("main", "wait_receiver", 5, h_recv).await;
@@ -583,14 +578,14 @@ fn test_multithread_udp_echo() {
                 echo_buf.spare_capacity_mut()[..bytes].copy_from_slice(&buf.as_slice()[..bytes]);
                 echo_buf.set_len(bytes);
 
-                let (result, _) = crate::tests::timeout_op(
+                crate::tests::timeout_op(
                     "server",
                     "send_to",
                     5,
                     socket.send_to(echo_buf, from_addr),
                 )
-                .await;
-                result.expect("Server send_to failed");
+                .await
+                .expect("Server send_to failed");
                 println!("Server echoed response");
             });
 
@@ -634,14 +629,14 @@ fn test_multithread_udp_echo() {
                 send_buf.as_slice_mut()[..data.len()].copy_from_slice(data);
                 send_buf.set_len(data.len());
 
-                let (result, _) = crate::tests::timeout_op(
+                let (sent, _) = crate::tests::timeout_op(
                     "client",
                     "send_to",
                     5,
                     client.send_to(send_buf, server_addr),
                 )
-                .await;
-                let sent = result.expect("Client send_to failed");
+                .await
+                .expect("Client send_to failed");
                 println!("Client sent {} bytes", sent);
 
                 let (from, recv_buf) =
@@ -804,25 +799,34 @@ fn test_udp_read_exact_write_all() {
         .worker_threads(1)
         .run(|_| async move {
             let socket_server = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP socket");
-            let server_addr = socket_server.local_addr().expect("Failed to get local address");
-            
+            let server_addr = socket_server
+                .local_addr()
+                .expect("Failed to get local address");
+
             let socket_client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP socket");
-            let client_addr = socket_client.local_addr().expect("Failed to get local address");
-            
+            let client_addr = socket_client
+                .local_addr()
+                .expect("Failed to get local address");
+
             const DATA: &[u8] = b"UDP Exact World!";
             use crate::io::{AsyncBufRead, AsyncBufWrite};
             let (ready_tx, mut ready_rx) = crate::sync::mpsc::unbounded::<()>();
 
             let server_h = crate::runtime::context::spawn(async move {
-                socket_server.connect(client_addr).await.expect("Server connect failed");
+                socket_server
+                    .connect(client_addr)
+                    .await
+                    .expect("Server connect failed");
                 let mut read_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
                 read_buf.set_len(DATA.len());
-                
+
                 ready_tx.send(()).unwrap();
 
                 // For UDP, read_exact will read datagrams until the buffer is full.
-                let (res, buf) = socket_server.read_exact(read_buf).await;
-                res.expect("Server read_exact failed");
+                let (_, buf) = socket_server
+                    .read_exact(read_buf)
+                    .await
+                    .expect("Server read_exact failed");
                 assert_eq!(buf.as_slice(), DATA);
             });
 
@@ -830,14 +834,19 @@ fn test_udp_read_exact_write_all() {
             ready_rx.recv().await.expect("Server ready signal failed");
 
             // We need to connect the socket to use AsyncBufWrite/Read effectively with write()
-            socket_client.connect(server_addr).await.expect("Connect failed");
+            socket_client
+                .connect(server_addr)
+                .await
+                .expect("Connect failed");
 
             let mut write_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
             write_buf.as_slice_mut()[..DATA.len()].copy_from_slice(DATA);
             write_buf.set_len(DATA.len());
 
-            let (res, _) = socket_client.write_all(write_buf).await;
-            res.expect("Client write_all failed");
+            socket_client
+                .write_all(write_buf)
+                .await
+                .expect("Client write_all failed");
 
             server_h.await;
         });

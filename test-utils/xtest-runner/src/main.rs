@@ -66,6 +66,9 @@ struct Cli {
 
     #[arg(long, help = "静默模式，仅在失败时输出日志")]
     quiet: bool,
+
+    #[arg(long, help = "启用 features")]
+    features: Option<String>,
 }
 
 #[derive(Debug)]
@@ -74,6 +77,7 @@ struct Config {
     task: Task,
     count: usize,
     quiet: bool,
+    features: Option<String>,
 }
 
 impl TryFrom<Cli> for Config {
@@ -96,6 +100,7 @@ impl TryFrom<Cli> for Config {
             task: cli.task,
             count,
             quiet: cli.quiet,
+            features: cli.features,
         })
     }
 }
@@ -322,20 +327,31 @@ impl Runner {
                 args.extend(std::env::args().skip(1));
                 CommandSpec::new("cross", args).with_env("CROSS_SKIP_AUTO_UPDATE", "1")
             }
-            (_, Target::Linux) => linux_native_command(self.config.task),
-            (_, Target::Windows) => windows_native_command(self.config.task),
+            (_, Target::Linux) => {
+                linux_native_command(self.config.task, self.config.features.as_deref())
+            }
+            (_, Target::Windows) => {
+                windows_native_command(self.config.task, self.config.features.as_deref())
+            }
         }
     }
 }
 
+fn linux_native_command(task: Task, features: Option<&str>) -> CommandSpec {
+    let mut args = match task {
+        Task::Test => vec!["nextest".into(), "run".into()],
+        Task::Clippy => vec!["clippy".into()],
+        Task::Check => vec!["check".into()],
+    };
 
-fn linux_native_command(task: Task) -> CommandSpec {
+    if let Some(f) = features {
+        args.push("--features".into());
+        args.push(f.into());
+    }
+
     match task {
-        Task::Test => CommandSpec::new(
-            "cargo",
-            vec![
-                "nextest".into(),
-                "run".into(),
+        Task::Test => {
+            args.extend(vec![
                 "--workspace".into(),
                 "--exclude".into(),
                 "veloq-driver-iocp".into(),
@@ -343,29 +359,37 @@ fn linux_native_command(task: Task) -> CommandSpec {
                 "1".into(),
                 "--run-ignored".into(),
                 "all".into(),
-            ],
-        ),
-        Task::Clippy => CommandSpec::new(
-            "cargo",
-            vec![
-                "clippy".into(),
+            ]);
+        }
+        Task::Clippy => {
+            args.extend(vec![
                 "--all-targets".into(),
                 "--".into(),
                 "-D".into(),
                 "warnings".into(),
-            ],
-        ),
-        Task::Check => CommandSpec::new("cargo", vec!["check".into()]),
+            ]);
+        }
+        Task::Check => {}
     }
+
+    CommandSpec::new("cargo", args)
 }
 
-fn windows_native_command(task: Task) -> CommandSpec {
+fn windows_native_command(task: Task, features: Option<&str>) -> CommandSpec {
+    let mut args = match task {
+        Task::Test => vec!["nextest".into(), "run".into()],
+        Task::Clippy => vec!["clippy".into()],
+        Task::Check => vec!["check".into()],
+    };
+
+    if let Some(f) = features {
+        args.push("--features".into());
+        args.push(f.into());
+    }
+
     match task {
-        Task::Test => CommandSpec::new(
-            "cargo",
-            vec![
-                "nextest".into(),
-                "run".into(),
+        Task::Test => {
+            args.extend(vec![
                 "--workspace".into(),
                 "--exclude".into(),
                 "veloq-driver-uring".into(),
@@ -373,25 +397,24 @@ fn windows_native_command(task: Task) -> CommandSpec {
                 "1".into(),
                 "--run-ignored".into(),
                 "all".into(),
-            ],
-        ),
-        Task::Clippy => CommandSpec::new(
-            "cargo",
-            vec![
-                "clippy".into(),
+            ]);
+        }
+        Task::Clippy => {
+            args.extend(vec![
                 "--all-targets".into(),
                 "--target".into(),
                 WINDOWS_TARGET.into(),
                 "--".into(),
                 "-D".into(),
                 "warnings".into(),
-            ],
-        ),
-        Task::Check => CommandSpec::new(
-            "cargo",
-            vec!["check".into(), "--target".into(), WINDOWS_TARGET.into()],
-        ),
+            ]);
+        }
+        Task::Check => {
+            args.extend(vec!["--target".into(), WINDOWS_TARGET.into()]);
+        }
     }
+
+    CommandSpec::new("cargo", args)
 }
 
 fn parse_count(input: &str) -> Result<usize, String> {

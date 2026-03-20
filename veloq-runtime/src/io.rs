@@ -16,11 +16,11 @@ pub use compat::Compat;
 pub trait AsyncBufRead {
     /// Read data into the buffer.
     /// Returns the number of bytes read and the original buffer.
-    fn read(&self, buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)>;
+    fn read(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>>;
 
     /// Read the exact number of bytes required to fill the buffer.
     /// Returns the total bytes read and the original buffer.
-    fn read_exact(&self, buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)>;
+    fn read_exact(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>>;
 }
 
 /// Async buffered writing trait.
@@ -28,11 +28,11 @@ pub trait AsyncBufRead {
 pub trait AsyncBufWrite {
     /// Write data from the buffer.
     /// Returns the number of bytes written and the original buffer.
-    fn write(&self, buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)>;
+    fn write(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>>;
 
     /// Write all data from the buffer.
     /// Returns the total bytes written and the original buffer.
-    fn write_all(&self, buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)>;
+    fn write_all(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>>;
 
     /// Flush the buffer (e.g., sync file to disk).
     fn flush(&self) -> impl Future<Output = io::Result<()>>;

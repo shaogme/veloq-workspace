@@ -25,8 +25,8 @@ pub struct Compat<T> {
     // Futures for async operations.
     // We erase the lifetime to store them, as they borrow `inner` (which is stable on heap).
     // We must ensure they are dropped before `inner` (the Box) is dropped.
-    read_future: Option<Pin<Box<dyn Future<Output = (io::Result<usize>, FixedBuf)>>>>,
-    write_future: Option<Pin<Box<dyn Future<Output = (io::Result<usize>, FixedBuf)>>>>,
+    read_future: Option<Pin<Box<dyn Future<Output = io::Result<(usize, FixedBuf)>>>>>,
+    write_future: Option<Pin<Box<dyn Future<Output = io::Result<(usize, FixedBuf)>>>>>,
     flush_future: Option<Pin<Box<dyn Future<Output = io::Result<()>>>>>,
     shutdown_future: Option<Pin<Box<dyn Future<Output = io::Result<()>>>>>,
 
@@ -76,8 +76,8 @@ impl<T> Drop for Compat<T> {
 
 // Helper to erase lifetime of future.
 unsafe fn erase_lifetime_read(
-    fut: Pin<Box<dyn Future<Output = (io::Result<usize>, FixedBuf)> + '_>>,
-) -> Pin<Box<dyn Future<Output = (io::Result<usize>, FixedBuf)>>> {
+    fut: Pin<Box<dyn Future<Output = io::Result<(usize, FixedBuf)>> + '_>>,
+) -> Pin<Box<dyn Future<Output = io::Result<(usize, FixedBuf)>>>> {
     unsafe { mem::transmute(fut) }
 }
 
@@ -99,19 +99,17 @@ impl<T: AsyncBufRead> AsyncRead for Compat<T> {
         loop {
             if let Some(mut fut) = this.read_future.take() {
                 match fut.as_mut().poll(cx) {
-                    Poll::Ready((res, buf)) => {
-                        this.buf = Some(buf);
-                        match res {
-                            Ok(n) => {
-                                this.read_pos = 0;
-                                this.read_cap = n;
-                                if n == 0 {
-                                    return Poll::Ready(Ok(0));
-                                }
+                    Poll::Ready(res) => match res {
+                        Ok((n, buf)) => {
+                            this.buf = Some(buf);
+                            this.read_pos = 0;
+                            this.read_cap = n;
+                            if n == 0 {
+                                return Poll::Ready(Ok(0));
                             }
-                            Err(e) => return Poll::Ready(Err(e)),
                         }
-                    }
+                        Err(e) => return Poll::Ready(Err(e)),
+                    },
                     Poll::Pending => {
                         this.read_future = Some(fut);
                         return Poll::Pending;
@@ -148,7 +146,7 @@ impl<T: AsyncBufRead> AsyncRead for Compat<T> {
 
             // Reset length to capacity to ensure we read as much as possible.
             let cap = buf.capacity();
-            buf.set_len(unsafe { std::num::NonZeroUsize::new_unchecked(cap) });
+            buf.set_len(cap);
 
             let inner = this.inner.as_ref().expect("Compat polled after into_inner");
             let fut = inner.read(buf);
@@ -168,11 +166,9 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
         loop {
             if let Some(mut fut) = this.write_future.take() {
                 match fut.as_mut().poll(cx) {
-                    Poll::Ready((res, buf)) => {
+                    Poll::Ready(res) => {
+                        let (_, buf) = res?;
                         this.buf = Some(buf);
-                        if let Err(e) = res {
-                            return Poll::Ready(Err(e));
-                        }
                         this.write_len = 0;
                     }
                     Poll::Pending => {
@@ -214,7 +210,7 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
             }
 
             let mut buf = this.buf.take().unwrap();
-            buf.set_len(unsafe { std::num::NonZeroUsize::new_unchecked(this.write_len) });
+            buf.set_len(this.write_len);
 
             let inner = this.inner.as_ref().expect("Compat polled after into_inner");
             let fut = inner.write_all(buf);
@@ -228,11 +224,9 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
         loop {
             if let Some(mut fut) = this.write_future.take() {
                 match fut.as_mut().poll(cx) {
-                    Poll::Ready((res, buf)) => {
+                    Poll::Ready(res) => {
+                        let (_, buf) = res?;
                         this.buf = Some(buf);
-                        if let Err(e) = res {
-                            return Poll::Ready(Err(e));
-                        }
                         this.write_len = 0;
                     }
                     Poll::Pending => {
@@ -244,7 +238,7 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
 
             if this.write_len > 0 {
                 if let Some(mut buf) = this.buf.take() {
-                    buf.set_len(unsafe { std::num::NonZeroUsize::new_unchecked(this.write_len) });
+                    buf.set_len(this.write_len);
 
                     let inner = this.inner.as_ref().expect("Compat polled after into_inner");
                     let fut = inner.write_all(buf);
@@ -275,11 +269,9 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
         loop {
             if let Some(mut fut) = this.write_future.take() {
                 match fut.as_mut().poll(cx) {
-                    Poll::Ready((res, buf)) => {
+                    Poll::Ready(res) => {
+                        let (_, buf) = res?;
                         this.buf = Some(buf);
-                        if let Err(e) = res {
-                            return Poll::Ready(Err(e));
-                        }
                         this.write_len = 0;
                     }
                     Poll::Pending => {
@@ -291,7 +283,7 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
 
             if this.write_len > 0 {
                 if let Some(mut buf) = this.buf.take() {
-                    buf.set_len(unsafe { std::num::NonZeroUsize::new_unchecked(this.write_len) });
+                    buf.set_len(this.write_len);
 
                     let inner = this.inner.as_ref().expect("Compat polled after into_inner");
                     let fut = inner.write_all(buf);

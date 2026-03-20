@@ -103,7 +103,7 @@ impl RioState {
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }
- 
+
     pub(crate) fn try_submit_send(
         &mut self,
         target: RioTarget,

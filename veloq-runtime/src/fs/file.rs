@@ -243,15 +243,20 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         self.pos.get()
     }
 
-    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
+    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> io::Result<(usize, FixedBuf)> {
         self.read_at_subset(buf, offset, 0).await
     }
 
-    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
+    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> io::Result<(usize, FixedBuf)> {
         self.write_at_subset(buf, offset, 0).await
     }
 
-    pub async fn read_at_subset(&self, buf: FixedBuf, offset: u64, buf_offset: usize) -> (io::Result<usize>, FixedBuf) {
+    pub async fn read_at_subset(
+        &self,
+        buf: FixedBuf,
+        offset: u64,
+        buf_offset: usize,
+    ) -> io::Result<(usize, FixedBuf)> {
         let op = ReadFixed {
             fd: IoFd::Raw(self.inner.0),
             buf,
@@ -263,11 +268,16 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
 
         let buf = op
             .map(|o| o.buf)
-            .unwrap_or_else(|| panic!("Op buffer lost"));
-        (res, buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
+        Ok((res?, buf))
     }
 
-    pub async fn write_at_subset(&self, buf: FixedBuf, offset: u64, buf_offset: usize) -> (io::Result<usize>, FixedBuf) {
+    pub async fn write_at_subset(
+        &self,
+        buf: FixedBuf,
+        offset: u64,
+        buf_offset: usize,
+    ) -> io::Result<(usize, FixedBuf)> {
         let op = WriteFixed {
             fd: IoFd::Raw(self.inner.0),
             buf,
@@ -279,8 +289,8 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
 
         let buf = op
             .map(|o| o.buf)
-            .unwrap_or_else(|| panic!("Op buffer lost"));
-        (res, buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
+        Ok((res?, buf))
     }
 
     pub async fn sync_all(&self) -> io::Result<()> {
@@ -327,80 +337,58 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
 }
 
 impl<S: OpSubmitter, P: FilePos> crate::io::AsyncBufRead for GenericFile<S, P> {
-    async fn read(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
-        let (res, buf) = self.read_at(buf, offset).await;
-        if let Ok(n) = res {
-            self.pos.add(n as u64);
-        }
-        (res, buf)
+        let (n, buf) = self.read_at(buf, offset).await?;
+        self.pos.add(n as u64);
+        Ok((n, buf))
     }
 
-    async fn read_exact(&self, mut buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
             let offset = self.pos.get();
-            let (res, b) = self.read_at_subset(buf, offset, total).await;
+            let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
-            match res {
-                Ok(0) => {
-                    return (
-                        Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "failed to fill whole buffer",
-                        )),
-                        buf,
-                    );
-                }
-                Ok(n) => {
-                    total += n;
-                    self.pos.add(n as u64);
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return (Err(e), buf),
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
             }
+            total += n;
+            self.pos.add(n as u64);
         }
-        (Ok(total), buf)
+        Ok((total, buf))
     }
 }
 
 impl<S: OpSubmitter, P: FilePos> crate::io::AsyncBufWrite for GenericFile<S, P> {
-    async fn write(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
-        let (res, buf) = self.write_at(buf, offset).await;
-        if let Ok(n) = res {
-            self.pos.add(n as u64);
-        }
-        (res, buf)
+        let (n, buf) = self.write_at(buf, offset).await?;
+        self.pos.add(n as u64);
+        Ok((n, buf))
     }
 
-    async fn write_all(&self, mut buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
             let offset = self.pos.get();
-            let (res, b) = self.write_at_subset(buf, offset, total).await;
+            let (n, b) = self.write_at_subset(buf, offset, total).await?;
             buf = b;
-            match res {
-                Ok(0) => {
-                    return (
-                        Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "failed to write whole buffer",
-                        )),
-                        buf,
-                    );
-                }
-                Ok(n) => {
-                    total += n;
-                    self.pos.add(n as u64);
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return (Err(e), buf),
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
             }
+            total += n;
+            self.pos.add(n as u64);
         }
-        (Ok(total), buf)
+        Ok((total, buf))
     }
 
     fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {

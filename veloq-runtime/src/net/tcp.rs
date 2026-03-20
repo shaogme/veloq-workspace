@@ -78,7 +78,8 @@ impl<S: OpSubmitter> GenericTcpListener<S> {
 
         // Wait for connection
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let op = op_back.expect("Accept op lost");
+        let op =
+            op_back.ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Accept op lost"))?;
 
         // Check result and get fd, addr
         let (fd, addr) = op.into_output(res)?;
@@ -126,15 +127,19 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         Ok(Self { inner, submitter })
     }
 
-    pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    pub async fn recv(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.recv_subset(buf, 0).await
     }
 
-    pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    pub async fn send(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.send_subset(buf, 0).await
     }
 
-    pub async fn recv_subset(&self, buf: FixedBuf, buf_offset: usize) -> (io::Result<usize>, FixedBuf) {
+    pub async fn recv_subset(
+        &self,
+        buf: FixedBuf,
+        buf_offset: usize,
+    ) -> io::Result<(usize, FixedBuf)> {
         let op = Recv {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
@@ -143,11 +148,15 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let buf = op_back
             .map(|o| o.buf)
-            .unwrap_or_else(|| panic!("Op buffer lost"));
-        (res, buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
+        Ok((res?, buf))
     }
 
-    pub async fn send_subset(&self, buf: FixedBuf, buf_offset: usize) -> (io::Result<usize>, FixedBuf) {
+    pub async fn send_subset(
+        &self,
+        buf: FixedBuf,
+        buf_offset: usize,
+    ) -> io::Result<(usize, FixedBuf)> {
         let op = OpSend {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
@@ -156,8 +165,8 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let buf = op_back
             .map(|o| o.buf)
-            .unwrap_or_else(|| panic!("Op buffer lost"));
-        (res, buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
+        Ok((res?, buf))
     }
 }
 
@@ -165,32 +174,25 @@ impl<S: OpSubmitter> crate::io::AsyncBufRead for GenericTcpStream<S> {
     fn read(
         &self,
         buf: FixedBuf,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
+    ) -> impl std::future::Future<Output = io::Result<(usize, FixedBuf)>> {
         self.recv(buf)
     }
 
-    async fn read_exact(&self, mut buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (res, b) = self.recv_subset(buf, total).await;
+            let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
-            match res {
-                Ok(0) => {
-                    return (
-                        Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "failed to fill whole buffer",
-                        )),
-                        buf,
-                    );
-                }
-                Ok(n) => total += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return (Err(e), buf),
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
             }
+            total += n;
         }
-        (Ok(total), buf)
+        Ok((total, buf))
     }
 }
 
@@ -198,32 +200,25 @@ impl<S: OpSubmitter> crate::io::AsyncBufWrite for GenericTcpStream<S> {
     fn write(
         &self,
         buf: FixedBuf,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
+    ) -> impl std::future::Future<Output = io::Result<(usize, FixedBuf)>> {
         self.send(buf)
     }
 
-    async fn write_all(&self, mut buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (res, b) = self.send_subset(buf, total).await;
+            let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
-            match res {
-                Ok(0) => {
-                    return (
-                        Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "failed to write whole buffer",
-                        )),
-                        buf,
-                    );
-                }
-                Ok(n) => total += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return (Err(e), buf),
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
             }
+            total += n;
         }
-        (Ok(total), buf)
+        Ok((total, buf))
     }
 
     fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {

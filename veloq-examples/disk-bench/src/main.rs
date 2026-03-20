@@ -229,7 +229,7 @@ async fn run_iteration_measured(
     block_size: NonZeroUsize,
     sync_mode: SyncMode,
     available_buffers: &mut Vec<FixedBuf>,
-    pending_tasks: &mut VecDeque<LocalJoinHandle<(std::io::Result<usize>, FixedBuf)>>,
+    pending_tasks: &mut VecDeque<LocalJoinHandle<std::io::Result<(usize, FixedBuf)>>>,
 ) -> IterationResult {
     let pool =
         veloq_runtime::runtime::context::current_pool().expect("Worker should have bound pool");
@@ -287,12 +287,8 @@ async fn run_iteration_measured(
 
         // 3. Wait for ONE task
         let handle = pending_tasks.pop_front().unwrap();
-        let (res, buf) = handle.await;
-
-        match res {
-            Ok(n) => written_bytes += n as u64,
-            Err(e) => panic!("IO Error at index {}: {}", current_op_idx, e),
-        }
+        let (n, buf) = handle.await.expect("Write failed");
+        written_bytes += n as u64;
 
         // Recycle buffer
         available_buffers.push(buf);

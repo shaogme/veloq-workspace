@@ -30,10 +30,18 @@ macro_rules! impl_default_completion {
 
 macro_rules! make_rw_fixed {
     ($fn_name:ident, $variant:ident, $type_raw:path, $type_fixed:path) => {
-        pub(crate) unsafe fn $fn_name(op: &mut UringOp, driver: &mut UringDriver) -> io::Result<squeue::Entry> {
+        pub(crate) unsafe fn $fn_name(
+            op: &mut UringOp,
+            driver: &mut UringDriver,
+        ) -> io::Result<squeue::Entry> {
             let kernel = match &mut op.payload {
                 UringOpPayload::$variant(kernel) => kernel,
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UringOpPayload variant mismatch",
+                    ))
+                }
             };
             let rw_op = unsafe { kernel.user.as_mut() };
             let region_info = rw_op.buf.resolve_region_info();
@@ -55,9 +63,11 @@ macro_rules! make_rw_fixed {
                     IoFd::Raw(fd) => Ok($type_fixed(types::Fd(fd.fd), ptr, len, fixed_idx)
                         .offset(rw_op.offset)
                         .build()),
-                    IoFd::Fixed(fd_idx) => Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
-                        .offset(rw_op.offset)
-                        .build()),
+                    IoFd::Fixed(fd_idx) => {
+                        Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
+                            .offset(rw_op.offset)
+                            .build())
+                    }
                 }
             } else {
                 match rw_op.fd {
@@ -72,10 +82,18 @@ macro_rules! make_rw_fixed {
         }
     };
     ($fn_name:ident, $variant:ident, $type_raw:path, $type_fixed:path, write) => {
-        pub(crate) unsafe fn $fn_name(op: &mut UringOp, driver: &mut UringDriver) -> io::Result<squeue::Entry> {
+        pub(crate) unsafe fn $fn_name(
+            op: &mut UringOp,
+            driver: &mut UringDriver,
+        ) -> io::Result<squeue::Entry> {
             let kernel = match &mut op.payload {
                 UringOpPayload::$variant(kernel) => kernel,
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UringOpPayload variant mismatch",
+                    ))
+                }
             };
             let rw_op = unsafe { kernel.user.as_mut() };
             let region_info = rw_op.buf.resolve_region_info();
@@ -97,9 +115,11 @@ macro_rules! make_rw_fixed {
                     IoFd::Raw(fd) => Ok($type_fixed(types::Fd(fd.fd), ptr, len, fixed_idx)
                         .offset(rw_op.offset)
                         .build()),
-                    IoFd::Fixed(fd_idx) => Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
-                        .offset(rw_op.offset)
-                        .build()),
+                    IoFd::Fixed(fd_idx) => {
+                        Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
+                            .offset(rw_op.offset)
+                            .build())
+                    }
                 }
             } else {
                 match rw_op.fd {
@@ -143,24 +163,19 @@ macro_rules! make_buf_op {
         ) -> io::Result<squeue::Entry> {
             let kernel = match &mut op.payload {
                 UringOpPayload::$variant(kernel) => kernel,
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UringOpPayload variant mismatch",
+                    ))
+                }
             };
             let val = unsafe { kernel.user.as_mut() };
             let ptr = unsafe { val.buf.as_mut_ptr().add(val.buf_offset) };
             let len = (val.buf.capacity() - val.buf_offset) as u32;
             match val.fd {
-                IoFd::Raw(fd) => Ok($opcode(
-                    types::Fd(fd.fd),
-                    ptr,
-                    len,
-                )
-                .build()),
-                IoFd::Fixed(idx) => Ok($opcode(
-                    types::Fixed(idx),
-                    ptr,
-                    len,
-                )
-                .build()),
+                IoFd::Raw(fd) => Ok($opcode(types::Fd(fd.fd), ptr, len).build()),
+                IoFd::Fixed(idx) => Ok($opcode(types::Fixed(idx), ptr, len).build()),
             }
         }
     };
@@ -171,24 +186,19 @@ macro_rules! make_buf_op {
         ) -> io::Result<squeue::Entry> {
             let kernel = match &mut op.payload {
                 UringOpPayload::$variant(kernel) => kernel,
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UringOpPayload variant mismatch",
+                    ))
+                }
             };
             let val = unsafe { kernel.user.as_mut() };
             let ptr = unsafe { val.buf.as_slice().as_ptr().add(val.buf_offset) };
             let len = (val.buf.len() - val.buf_offset) as u32;
             match val.fd {
-                IoFd::Raw(fd) => Ok($opcode(
-                    types::Fd(fd.fd),
-                    ptr,
-                    len,
-                )
-                .build()),
-                IoFd::Fixed(idx) => Ok($opcode(
-                    types::Fixed(idx),
-                    ptr,
-                    len,
-                )
-                .build()),
+                IoFd::Raw(fd) => Ok($opcode(types::Fd(fd.fd), ptr, len).build()),
+                IoFd::Fixed(idx) => Ok($opcode(types::Fixed(idx), ptr, len).build()),
             }
         }
     };
@@ -208,7 +218,12 @@ pub(crate) unsafe fn make_sqe_connect(
 ) -> io::Result<squeue::Entry> {
     let kernel = match &mut op.payload {
         UringOpPayload::Connect(kernel) => kernel,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let val = unsafe { kernel.user.as_mut() };
     match val.fd {
@@ -229,10 +244,18 @@ pub(crate) unsafe fn make_sqe_connect(
 impl_default_completion!(on_complete_connect);
 impl_lifecycle!(drop_connect, Connect, direct_fd);
 
-pub(crate) unsafe fn make_sqe_accept(op: &mut UringOp, _driver: &mut UringDriver) -> io::Result<squeue::Entry> {
+pub(crate) unsafe fn make_sqe_accept(
+    op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> io::Result<squeue::Entry> {
     let payload = match &mut op.payload {
         UringOpPayload::Accept(payload) => payload,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let val = unsafe { payload.user.as_mut() };
     match val.fd {
@@ -287,11 +310,17 @@ pub(crate) unsafe fn make_sqe_send_to(
 ) -> io::Result<squeue::Entry> {
     let payload = match &mut op.payload {
         UringOpPayload::SendTo(payload) => payload,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let user = unsafe { payload.user.as_ref() };
 
-    payload.iovec[0].iov_base = unsafe { user.buf.as_slice().as_ptr().add(user.buf_offset) } as *mut _;
+    payload.iovec[0].iov_base =
+        unsafe { user.buf.as_slice().as_ptr().add(user.buf_offset) } as *mut _;
     payload.iovec[0].iov_len = user.buf.len() - user.buf_offset;
 
     payload.msghdr.msg_name = &mut payload.msg_name as *mut _ as *mut libc::c_void;
@@ -318,13 +347,23 @@ pub(crate) unsafe fn make_sqe_udp_recv_stream(
 ) -> io::Result<squeue::Entry> {
     let payload = match &mut op.payload {
         UringOpPayload::UdpRecvStream(payload) => payload,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let user = unsafe { payload.user.as_mut() };
     let fd = user.fd;
     let recv_buf = match user.buf.as_mut() {
         Some(buf) => buf,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidData, "UdpRecvStream buffer missing")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UdpRecvStream buffer missing",
+            ));
+        }
     };
 
     payload.iovec[0].iov_base = recv_buf.as_mut_ptr() as *mut _;
@@ -380,7 +419,12 @@ pub(crate) unsafe fn make_sqe_udp_refill(
 ) -> io::Result<squeue::Entry> {
     let _ = match &mut op.payload {
         UringOpPayload::UdpRefill(kernel) => Some(kernel),
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     Ok(opcode::Nop::new().build())
 }
@@ -388,10 +432,18 @@ pub(crate) unsafe fn make_sqe_udp_refill(
 impl_default_completion!(on_complete_udp_refill);
 impl_lifecycle!(drop_udp_refill, UdpRefill, direct_fd);
 
-pub(crate) unsafe fn make_sqe_close(op: &mut UringOp, _driver: &mut UringDriver) -> io::Result<squeue::Entry> {
+pub(crate) unsafe fn make_sqe_close(
+    op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> io::Result<squeue::Entry> {
     let kernel = match &mut op.payload {
         UringOpPayload::Close(kernel) => kernel,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let close_op = unsafe { kernel.user.as_mut() };
     match close_op.fd {
@@ -403,10 +455,18 @@ pub(crate) unsafe fn make_sqe_close(op: &mut UringOp, _driver: &mut UringDriver)
 impl_default_completion!(on_complete_close);
 impl_lifecycle!(drop_close, Close, direct_fd);
 
-pub(crate) unsafe fn make_sqe_fsync(op: &mut UringOp, _driver: &mut UringDriver) -> io::Result<squeue::Entry> {
+pub(crate) unsafe fn make_sqe_fsync(
+    op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> io::Result<squeue::Entry> {
     let kernel = match &mut op.payload {
         UringOpPayload::Fsync(kernel) => kernel,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let fsync_op = unsafe { kernel.user.as_mut() };
     let flags = if fsync_op.datasync {
@@ -430,7 +490,12 @@ pub(crate) unsafe fn make_sqe_sync_range(
 ) -> io::Result<squeue::Entry> {
     let kernel = match &mut op.payload {
         UringOpPayload::SyncRange(kernel) => kernel,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let sync_op = unsafe { kernel.user.as_mut() };
     let nbytes = if sync_op.nbytes > u32::MAX as u64 {
@@ -470,7 +535,12 @@ pub(crate) unsafe fn make_sqe_fallocate(
 ) -> io::Result<squeue::Entry> {
     let kernel = match &mut op.payload {
         UringOpPayload::Fallocate(kernel) => kernel,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let fallocate_op = unsafe { kernel.user.as_mut() };
     match fallocate_op.fd {
@@ -488,10 +558,18 @@ pub(crate) unsafe fn make_sqe_fallocate(
 impl_default_completion!(on_complete_fallocate);
 impl_lifecycle!(drop_fallocate, Fallocate, direct_fd);
 
-pub(crate) unsafe fn make_sqe_open(op: &mut UringOp, _driver: &mut UringDriver) -> io::Result<squeue::Entry> {
+pub(crate) unsafe fn make_sqe_open(
+    op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> io::Result<squeue::Entry> {
     let payload = match &mut op.payload {
         UringOpPayload::Open(payload) => payload,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let user = unsafe { payload.user.as_ref() };
     let path_ptr = user.path.as_slice().as_ptr() as *const _;
@@ -510,7 +588,12 @@ pub(crate) unsafe fn make_sqe_timeout(
 ) -> io::Result<squeue::Entry> {
     let payload = match &mut op.payload {
         UringOpPayload::Timeout(payload) => payload,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let user = unsafe { payload.user.as_ref() };
 
@@ -524,14 +607,24 @@ pub(crate) unsafe fn make_sqe_timeout(
 impl_default_completion!(on_complete_timeout);
 impl_lifecycle!(drop_timeout, Timeout, no_fd);
 
-pub(crate) unsafe fn make_sqe_wakeup(op: &mut UringOp, _driver: &mut UringDriver) -> io::Result<squeue::Entry> {
+pub(crate) unsafe fn make_sqe_wakeup(
+    op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> io::Result<squeue::Entry> {
     let payload = match &mut op.payload {
         UringOpPayload::Wakeup(payload) => payload,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "UringOpPayload variant mismatch")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
     };
     let user = unsafe { payload.user.as_ref() };
     match user.fd {
-        IoFd::Raw(fd) => Ok(opcode::Read::new(types::Fd(fd.fd), payload.buf.as_mut_ptr(), 8).build()),
+        IoFd::Raw(fd) => {
+            Ok(opcode::Read::new(types::Fd(fd.fd), payload.buf.as_mut_ptr(), 8).build())
+        }
         IoFd::Fixed(idx) => {
             Ok(opcode::Read::new(types::Fixed(idx), payload.buf.as_mut_ptr(), 8).build())
         }

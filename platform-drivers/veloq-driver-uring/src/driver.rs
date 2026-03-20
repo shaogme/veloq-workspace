@@ -303,7 +303,10 @@ impl UringDriver {
             self.waker_payload = Some(payload);
 
             let driver_ptr = self as *mut UringDriver;
-            let slot = self.ops.slot_init_pending(user_data).init_op_with(uring_op, |_| {});
+            let slot = self
+                .ops
+                .slot_init_pending(user_data)
+                .init_op_with(uring_op, |_| {});
             match unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) } {
                 Ok(true) => {}
                 Ok(false) => self.push_backlog(user_data),

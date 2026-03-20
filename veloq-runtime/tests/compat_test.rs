@@ -6,7 +6,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
-use veloq_buf::{DeallocParams, FixedBuf, PoolVTable};
+use veloq_buf::{DeallocParams, FixedBuf, PoolVTable, RegionInfo};
 use veloq_runtime::io::{AsyncBufRead, AsyncBufWrite, Compat};
 
 // --- Mock Pool ---
@@ -22,8 +22,12 @@ unsafe fn mock_dealloc(_pool_data: NonNull<()>, params: DeallocParams) {
     unsafe { dealloc(params.ptr.as_ptr(), layout) };
 }
 
-unsafe fn mock_resolve(_pool_data: NonNull<()>, _buf: &FixedBuf) -> (usize, usize) {
-    (0, 0)
+unsafe fn mock_resolve(_pool_data: NonNull<()>, _buf: &FixedBuf) -> RegionInfo {
+    RegionInfo {
+        id: 0,
+        offset: 0,
+        cookie: 0,
+    }
 }
 
 impl MockPool {
@@ -55,7 +59,7 @@ impl MockIo {
 }
 
 impl AsyncBufRead for MockIo {
-    fn read(&self, mut buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)> {
+    fn read(&self, mut buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>> {
         let read_data = self.read_data.clone();
         let read_pos = self.read_pos.clone();
         async move {
@@ -71,23 +75,32 @@ impl AsyncBufRead for MockIo {
             *pos += n;
 
             if n > 0 {
-                buf.set_len(unsafe { NonZeroUsize::new_unchecked(n) });
+                buf.set_len(n);
             }
 
-            (Ok(n), buf)
+            Ok((n, buf))
         }
+    }
+
+    fn read_exact(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>> {
+        // Mock read already fills as much as possible, for simplicity in test:
+        self.read(buf)
     }
 }
 
 impl AsyncBufWrite for MockIo {
-    fn write(&self, buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)> {
+    fn write(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>> {
         let write_data = self.write_data.clone();
         async move {
             let n = buf.len();
             let mut data = write_data.lock().unwrap();
             data.extend_from_slice(buf.as_slice());
-            (Ok(n), buf)
+            Ok((n, buf))
         }
+    }
+
+    fn write_all(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>> {
+        self.write(buf)
     }
 
     fn flush(&self) -> impl Future<Output = io::Result<()>> {
