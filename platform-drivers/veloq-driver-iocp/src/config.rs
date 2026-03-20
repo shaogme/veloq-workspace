@@ -38,9 +38,7 @@ impl AsRef<IocpConfig> for IocpConfig {
 impl Default for IocpConfig {
     fn default() -> Self {
         Self {
-            entries:
-                // SAFETY: 1024 is non-zero.
-                unsafe { NonZeroU32::new_unchecked(1024) },
+            entries: NonZeroU32::new(1024).unwrap(),
             registration_mode: BufferRegistrationMode::Strict,
         }
     }

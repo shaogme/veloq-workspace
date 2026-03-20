@@ -40,13 +40,13 @@ async fn write_all(stream: &LocalTcpStream, mut buf: FixedBuf, total_len: usize)
         }
         buf = b;
         written += n;
-        
+
         // We need to shift the unwritten part of the buffer if we had a partial write.
-        // For simplicity in the benchmark since we reuse the buffer we can just assume 
-        // standard send. But strictly speaking, FixedBuf doesn't have an easy way 
+        // For simplicity in the benchmark since we reuse the buffer we can just assume
+        // standard send. But strictly speaking, FixedBuf doesn't have an easy way
         // to slice the front off. However, LocalTcpStream::send sends the whole `buf`.
         // To implement a true `write_all` with FixedBuf, we'd need to shift contents.
-        // For this benchmark, since send sends the *entire* valid length of `buf`, 
+        // For this benchmark, since send sends the *entire* valid length of `buf`,
         // we can just shift the data to the front by `n`.
         if written < total_len {
             let remaining = buf.len() - n;
@@ -71,7 +71,7 @@ fn benchmark_tcp(c: &mut Criterion) {
             exec.block_on(async {
                 let listener = LocalTcpListener::bind("127.0.0.1:0").unwrap();
                 let addr = listener.local_addr().unwrap();
-                
+
                 let server = spawn_local(async move {
                     let (stream, _): (LocalTcpStream, _) = listener.accept().await.unwrap();
                     let pool = veloq_runtime::runtime::context::current_pool().unwrap();
@@ -93,7 +93,7 @@ fn benchmark_tcp(c: &mut Criterion) {
                         buf = read_exact(&stream, buf, 4096).await;
                     }
                 });
-                
+
                 server.await;
                 client.await;
             });
@@ -106,7 +106,7 @@ fn benchmark_tcp(c: &mut Criterion) {
             rt.block_on(async {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
-                
+
                 let server = tokio::spawn(async move {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut buf = vec![0u8; 4096];
@@ -124,7 +124,7 @@ fn benchmark_tcp(c: &mut Criterion) {
                         tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
                     }
                 });
-                
+
                 server.await.unwrap();
                 client.await.unwrap();
             });
@@ -145,7 +145,7 @@ fn benchmark_udp(c: &mut Criterion) {
             exec.block_on(async {
                 let server_sock = LocalUdpSocket::bind("127.0.0.1:0").unwrap();
                 let server_addr = server_sock.local_addr().unwrap();
-                
+
                 let client_sock = LocalUdpSocket::bind("127.0.0.1:0").unwrap();
                 let client_addr = client_sock.local_addr().unwrap();
                 let _ = client_addr;
@@ -174,7 +174,7 @@ fn benchmark_udp(c: &mut Criterion) {
                         let _datagram = client_sock.recv_stream(buf).await.unwrap();
                     }
                 });
-                
+
                 server.await;
                 client.await;
             });
@@ -187,7 +187,7 @@ fn benchmark_udp(c: &mut Criterion) {
             rt.block_on(async {
                 let server_sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
                 let server_addr = server_sock.local_addr().unwrap();
-                
+
                 let client_sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
                 let client_addr = client_sock.local_addr().unwrap();
                 let _ = client_addr;
@@ -209,7 +209,7 @@ fn benchmark_udp(c: &mut Criterion) {
                         let (_len, _) = c.recv_from(&mut buf).await.unwrap();
                     }
                 });
-                
+
                 server.await.unwrap();
                 client.await.unwrap();
             });

@@ -85,7 +85,7 @@ pub fn try_from_bytes<T: Pod>(bytes: &[u8]) -> Result<&T, PodError> {
     if bytes.len() != size_of::<T>() {
         return Err(PodError::SizeMismatch);
     }
-    if (bytes.as_ptr() as usize) % align_of::<T>() != 0 {
+    if !(bytes.as_ptr() as usize).is_multiple_of(align_of::<T>()) {
         return Err(PodError::AlignmentMismatch);
     }
     // SAFETY: Size and alignment are checked. T is Pod, so any bit pattern is valid.
@@ -99,7 +99,7 @@ pub fn try_from_bytes_mut<T: Pod>(bytes: &mut [u8]) -> Result<&mut T, PodError> 
     if bytes.len() != size_of::<T>() {
         return Err(PodError::SizeMismatch);
     }
-    if (bytes.as_ptr() as usize) % align_of::<T>() != 0 {
+    if !(bytes.as_ptr() as usize).is_multiple_of(align_of::<T>()) {
         return Err(PodError::AlignmentMismatch);
     }
     // SAFETY: Size and alignment are checked. T is Pod, so any bit pattern is valid.

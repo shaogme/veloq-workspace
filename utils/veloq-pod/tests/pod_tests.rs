@@ -55,7 +55,7 @@ fn test_try_from_bytes_alignment_mismatch() {
     let res: Result<&u32, PodError> = try_from_bytes(slice);
     // Note: slice.as_ptr() might happen to be aligned by chance if we are extremely unlucky with stack layout,
     // but usually it will be misaligned.
-    if (slice.as_ptr() as usize) % 4 != 0 {
+    if !(slice.as_ptr() as usize).is_multiple_of(4) {
         assert_eq!(res, Err(PodError::AlignmentMismatch));
     }
 }
