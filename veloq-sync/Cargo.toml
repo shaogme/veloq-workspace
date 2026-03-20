@@ -21,7 +21,7 @@ futures-core.workspace = true
 crossbeam-queue.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full", "rt-multi-thread"] }
+tokio.workspace = true
 criterion.workspace = true
 
 [dependencies.loom]

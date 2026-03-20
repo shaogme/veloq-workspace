@@ -72,7 +72,7 @@ veloq-pod = { path = "utils/veloq-pod", version = "0.1.0" }
 crossbeam-utils = { version = "0.8", default-features = false }
 futures-core = "0.3"
 crossbeam-queue = "0.3"
-libc = "0.2.182"
+libc = "0.2.183"
 windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
@@ -84,8 +84,10 @@ tracing = "0.1.44"
 parking_lot = "0.12"
 
 clap = { version = "4.6", features = ["derive"] }
-loom = "0.7.0"
+loom = "0.7.2"
 criterion = { version = "0.8", features = ["async_tokio"] }
+
+tokio = { version = "1", features = ["full"] }
 
 [workspace.lints.rust]
 warnings = "deny"
