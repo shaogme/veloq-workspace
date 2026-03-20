@@ -842,7 +842,7 @@ impl<H: Handle + From<usize>, A: SockAddr> OpLifecycle for Accept<H, A> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     use std::sync::Arc;

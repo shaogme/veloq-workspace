@@ -96,8 +96,7 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
             return;
         }
         let cell = &self.slots[idx];
-
-        loop {
+        let ready_from = loop {
             let current = cell.core_state(Ordering::Acquire);
             let state = slot::core_state(current);
             let cell_gen = slot::core_generation(current);
@@ -117,24 +116,21 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                     if cell
                         .compare_exchange_core_state(
                             current,
-                            slot::core_with_state_generation(
-                                current,
-                                slot::SlotState::Finalizing,
-                                generation,
-                            ),
-                            Ordering::AcqRel,
+                            current,
+                            Ordering::Acquire,
                             Ordering::Acquire,
                         )
-                        .is_ok()
+                        .is_err()
                     {
-                        if state == slot::SlotState::InFlightReady {
-                            cell.completion_with_data(|payload_cell, detail_cell| {
-                                let _ = payload_cell.take();
-                                let _ = detail_cell.take();
-                            });
-                        }
-                        break;
+                        continue;
                     }
+                    if state == slot::SlotState::InFlightReady {
+                        cell.completion_with_data(|payload_cell, detail_cell| {
+                            let _ = payload_cell.take();
+                            let _ = detail_cell.take();
+                        });
+                    }
+                    break current;
                 }
                 slot::SlotState::InFlightOrphaned => {
                     if cell_gen == generation {
@@ -162,11 +158,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                         return;
                     }
                 }
-                slot::SlotState::Finalizing => {
-                    std::thread::yield_now();
-                }
+                slot::SlotState::Finalizing => continue,
             }
-        }
+        };
 
         cell.completion_with_data(|payload_cell, detail_cell| {
             *payload_cell = payload.take();
@@ -175,12 +169,57 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
         cell.completion_res.store(event.res, Ordering::Release);
         cell.completion_flags.store(event.flags, Ordering::Release);
 
-        cell.set_state_generation(
-            slot::SlotState::InFlightReady,
-            generation,
+        match cell.compare_exchange_core_state(
+            ready_from,
+            slot::core_with_state_generation(
+                ready_from,
+                slot::SlotState::InFlightReady,
+                generation,
+            ),
             Ordering::Release,
             Ordering::Acquire,
-        );
+        ) {
+            Ok(_) => {}
+            Err(next) => {
+                let next_gen = slot::core_generation(next);
+                let next_state = slot::core_state(next);
+                if next_gen == generation && next_state == slot::SlotState::InFlightWaiting {
+                    if cell
+                        .compare_exchange_core_state(
+                            next,
+                            slot::core_with_state_generation(
+                                next,
+                                slot::SlotState::InFlightReady,
+                                generation,
+                            ),
+                            Ordering::Release,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        cell.completion_waker.wake();
+                        return;
+                    }
+                }
+
+                cell.completion_with_data(|payload_cell, detail_cell| {
+                    let _ = payload_cell.take();
+                    let _ = detail_cell.take();
+                });
+                let cur = cell.core_state(Ordering::Acquire);
+                if slot::core_generation(cur) == generation
+                    && slot::core_state(cur) == slot::SlotState::InFlightOrphaned
+                {
+                    let _ = cell.compare_exchange_core_state(
+                        cur,
+                        slot::core_with_state_generation(cur, slot::SlotState::Idle, generation),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                return;
+            }
+        }
 
         cell.completion_waker.wake();
     }
@@ -209,7 +248,7 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
         if cell
             .compare_exchange_core_state(
                 current,
-                slot::core_with_state_generation(current, slot::SlotState::Finalizing, generation),
+                slot::core_with_state_generation(current, slot::SlotState::Idle, generation),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -221,12 +260,6 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
         let (payload, detail) = cell.completion_with_data(|payload_cell, detail_cell| {
             (payload_cell.take(), detail_cell.take())
         });
-        cell.set_state_generation(
-            slot::SlotState::Idle,
-            generation,
-            Ordering::Release,
-            Ordering::Acquire,
-        );
         PollRecordResult::Ready(CompletionRecord {
             event: CompletionEvent {
                 user_data: token,
@@ -372,7 +405,7 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                         }
                     }
                     slot::SlotState::Finalizing => {
-                        std::thread::yield_now();
+                        return;
                     }
                     slot::SlotState::Reserved | slot::SlotState::InFlightReady => return,
                 }
@@ -421,7 +454,7 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                                 current,
                                 slot::core_with_state_generation(
                                     current,
-                                    slot::SlotState::Finalizing,
+                                    slot::SlotState::Idle,
                                     generation,
                                 ),
                                 Ordering::AcqRel,
@@ -433,12 +466,6 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                                 let _ = payload_cell.take();
                                 let _ = detail_cell.take();
                             });
-                            cell.set_state_generation(
-                                slot::SlotState::Idle,
-                                generation,
-                                Ordering::Release,
-                                Ordering::Acquire,
-                            );
                             return;
                         }
                     } else {
@@ -446,9 +473,7 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                         return;
                     }
                 }
-                slot::SlotState::Finalizing => {
-                    std::thread::yield_now();
-                }
+                slot::SlotState::Finalizing => continue,
                 _ => return,
             }
         }

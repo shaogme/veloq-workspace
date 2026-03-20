@@ -215,27 +215,6 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     }
 
     #[inline]
-    pub(crate) fn set_state_generation(
-        &self,
-        state: SlotState,
-        generation: u32,
-        success: Ordering,
-        failure: Ordering,
-    ) -> u64 {
-        let mut current = self.core_state.load(failure);
-        loop {
-            let new = core_with_state_generation(current, state, generation);
-            match self
-                .core_state
-                .compare_exchange_weak(current, new, success, failure)
-            {
-                Ok(_) => return new,
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    #[inline]
     pub(crate) fn set_state(&self, state: SlotState, ordering: Ordering) {
         let mut current = self.core_state.load(Ordering::Acquire);
         loop {
@@ -768,7 +747,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     use crate::driver::encode_completion_token;
