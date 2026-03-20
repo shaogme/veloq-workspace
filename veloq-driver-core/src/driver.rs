@@ -72,7 +72,7 @@ unsafe impl Sync for CompletionCell {}
 impl CompletionCell {
     fn new() -> Self {
         Self {
-            state_gen: AtomicU64::new(pack_state_gen(CELL_STATE_IDLE, u32::MAX)),
+            state_gen: AtomicU64::new(pack_state_gen(CELL_STATE_IDLE, 0)),
             res: AtomicI32::new(0),
             flags: AtomicU32::new(0),
             payload: UnsafeCell::new(None),
@@ -101,6 +101,16 @@ pub struct CompletionRecord {
     pub event: CompletionEvent,
     pub payload: Option<slot::ErasedPayload>,
     pub detail: Option<io::Result<usize>>,
+}
+
+/// Result of a completion poll, enabling detection of recycled slots.
+pub enum PollRecordResult {
+    /// Operation completed successfully or with an error.
+    Ready(CompletionRecord),
+    /// Operation is still in flight.
+    Pending,
+    /// Operation lost because the slot has been recycled for a newer generation.
+    Stale,
 }
 
 pub struct CompletionTable {
@@ -212,23 +222,31 @@ impl CompletionTable {
     }
 
     #[inline]
-    pub fn try_take(&self, token: u64) -> Option<CompletionEvent> {
-        self.try_take_record(token).map(|record| record.event)
+    pub fn try_take(&self, token: u64) -> PollRecordResult {
+        match self.try_take_record(token) {
+            PollRecordResult::Ready(record) => PollRecordResult::Ready(record),
+            other => other,
+        }
     }
 
     #[inline]
-    pub fn try_take_record(&self, token: u64) -> Option<CompletionRecord> {
+    pub fn try_take_record(&self, token: u64) -> PollRecordResult {
         let (idx, generation) = decode_completion_token(token);
         if idx >= self.cells.len() {
-            return None;
+            return PollRecordResult::Pending;
         }
         let cell = &self.cells[idx];
 
         let current = cell.state_gen.load(Ordering::Acquire);
         let (state, cell_gen) = unpack_state_gen(current);
 
+        // If the cell's generation is strictly greater than ours, we are stale.
+        if cell_gen > generation {
+            return PollRecordResult::Stale;
+        }
+
         if state != CELL_STATE_READY || cell_gen != generation {
-            return None;
+            return PollRecordResult::Pending;
         }
 
         if cell
@@ -241,7 +259,7 @@ impl CompletionTable {
             )
             .is_err()
         {
-            return None;
+            return PollRecordResult::Pending;
         }
 
         let (payload, detail) = unsafe {
@@ -249,7 +267,7 @@ impl CompletionTable {
                 (payload_cell.take(), detail_cell.take())
             })
         };
-        Some(CompletionRecord {
+        PollRecordResult::Ready(CompletionRecord {
             event: CompletionEvent {
                 user_data: token,
                 res: cell.res.load(Ordering::Acquire),
@@ -275,7 +293,12 @@ impl CompletionTable {
             // Register waker first to avoid missing a race.
             cell.waker.register(waker);
 
-            if cell_gen != generation {
+            if cell_gen > generation {
+                // Already stale, no point in waiting or updating.
+                return;
+            }
+
+            if cell_gen < generation {
                 // Try to initial/update generation while keeping state if possible.
                 // This is needed for LocalOp which doesn't call mark_waiting.
                 if cell
@@ -313,6 +336,11 @@ impl CompletionTable {
         loop {
             let current = cell.state_gen.load(Ordering::Acquire);
             let (state, cell_generation) = unpack_state_gen(current);
+
+            if cell_generation > generation {
+                // Stale request, slot already repurposed for a newer op.
+                return;
+            }
 
             if state == CELL_STATE_READY && cell_generation == generation {
                 // Fast completion happened, leave as READY.
@@ -526,11 +554,11 @@ pub trait Driver: 'static {
         Ok(self.drain_completions(out))
     }
 
-    fn try_take_completion(&mut self, token: u64) -> Option<CompletionEvent> {
+    fn try_take_completion(&mut self, token: u64) -> PollRecordResult {
         self.completion_table().try_take(token)
     }
 
-    fn try_take_completion_record(&mut self, token: u64) -> Option<CompletionRecord> {
+    fn try_take_completion_record(&mut self, token: u64) -> PollRecordResult {
         self.completion_table().try_take_record(token)
     }
 

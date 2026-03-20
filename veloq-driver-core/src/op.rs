@@ -19,7 +19,7 @@ use tracing::trace;
 use veloq_buf::FixedBuf;
 
 use crate::driver::{
-    CompletionRecord, Driver, PlatformOp, SharedCompletionTable, SubmitBinder,
+    CompletionRecord, Driver, PlatformOp, PollRecordResult, SharedCompletionTable, SubmitBinder,
     encode_completion_token, event_res_to_io,
 };
 use crate::slot::DetachedCancelTable;
@@ -329,26 +329,35 @@ where
             .completion_table
             .as_ref()
             .expect("DetachedOp missing completion_table but no immediate_failure");
-        if let Some(record) = table.try_take_record(this.token) {
-            let CompletionRecord {
-                event,
-                payload: payload_any,
-                detail,
-            } = record;
-            let Some(payload_any) = payload_any else {
-                return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                    "operation payload lost: completion sidecar missing",
-                )));
-            };
-            if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                    "operation payload lost: kind mismatch",
+        match table.try_take_record(this.token) {
+            PollRecordResult::Ready(record) => {
+                let CompletionRecord {
+                    event,
+                    payload: payload_any,
+                    detail,
+                } = record;
+                let Some(payload_any) = payload_any else {
+                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                        "operation payload lost: completion sidecar missing",
+                    )));
+                };
+                if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                        "operation payload lost: kind mismatch",
+                    )));
+                }
+                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                let data = T::from_user_payload(payload);
+                let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
+                return Poll::Ready(OpResult::Completed(res, data));
+            }
+            PollRecordResult::Stale => {
+                return Poll::Ready(OpResult::Lost(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "operation lost: slot recycled (generation mismatch)",
                 )));
             }
-            let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-            let data = T::from_user_payload(payload);
-            let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
-            return Poll::Ready(OpResult::Completed(res, data));
+            PollRecordResult::Pending => {}
         }
 
         if let Some(table) = this.completion_table.as_ref() {
@@ -455,30 +464,40 @@ where
 
         if let State::Submitted = op.state {
             let mut driver = op.driver.borrow_mut();
-            if let Some(record) = driver.try_take_completion_record(op.token) {
-                op.state = State::Completed;
-                let CompletionRecord {
-                    event,
-                    payload: payload_any,
-                    detail,
-                } = record;
-                let Some(payload_any) = payload_any else {
-                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                        "operation payload lost: completion sidecar missing",
-                    )));
-                };
-                if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                        "operation payload lost: kind mismatch",
-                    )));
+            match driver.try_take_completion_record(op.token) {
+                PollRecordResult::Ready(record) => {
+                    op.state = State::Completed;
+                    let CompletionRecord {
+                        event,
+                        payload: payload_any,
+                        detail,
+                    } = record;
+                    let Some(payload_any) = payload_any else {
+                        return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                            "operation payload lost: completion sidecar missing",
+                        )));
+                    };
+                    if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                        return Poll::Ready(OpResult::Lost(std::io::Error::other(
+                            "operation payload lost: kind mismatch",
+                        )));
+                    }
+                    let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                    let data = T::from_user_payload(payload);
+                    let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
+                    Poll::Ready(OpResult::Completed(res, data))
                 }
-                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-                let data = T::from_user_payload(payload);
-                let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
-                Poll::Ready(OpResult::Completed(res, data))
-            } else {
-                driver.register_completion_waker(op.token, cx.waker());
-                Poll::Pending
+                PollRecordResult::Stale => {
+                    op.state = State::Completed;
+                    Poll::Ready(OpResult::Lost(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "operation lost: slot recycled (generation mismatch)",
+                    )))
+                }
+                PollRecordResult::Pending => {
+                    driver.register_completion_waker(op.token, cx.waker());
+                    Poll::Pending
+                }
             }
         } else {
             panic!("Polled after completion");

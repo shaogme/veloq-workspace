@@ -5,7 +5,9 @@ pub(crate) mod net_udp;
 
 use std::io;
 use std::sync::atomic::Ordering;
-use veloq_driver_core::driver::{Driver, encode_completion_token, event_res_to_io};
+use veloq_driver_core::driver::{
+    Driver, PollRecordResult, encode_completion_token, event_res_to_io,
+};
 use veloq_driver_core::slot::SlotTable;
 
 use crate::driver::IocpDriver;
@@ -42,8 +44,16 @@ pub(crate) fn wait_completion(
             ));
         }
         driver.process_completions();
-        if let Some(ev) = driver.try_take_completion(token) {
-            return event_res_to_io(ev.res);
+        match driver.try_take_completion(token) {
+            PollRecordResult::Ready(record) => {
+                return event_res_to_io(record.event.res);
+            }
+            PollRecordResult::Stale => {
+                return Err(io::Error::other(
+                    "stale completion record (generation mismatch)",
+                ));
+            }
+            PollRecordResult::Pending => {}
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
