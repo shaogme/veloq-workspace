@@ -1,5 +1,3 @@
-#![no_std]
-
 #[cfg(not(feature = "loom"))]
 pub mod atomic {
     pub use core::sync::atomic::{
@@ -211,6 +209,110 @@ pub mod hint {
     pub use core::hint::spin_loop;
     #[cfg(feature = "loom")]
     pub use loom::hint::spin_loop;
+}
+
+pub mod sync {
+    #[cfg(not(feature = "loom"))]
+    pub struct Mutex<T> {
+        inner: std::sync::Mutex<T>,
+    }
+
+    #[cfg(not(feature = "loom"))]
+    impl<T: core::fmt::Debug> core::fmt::Debug for Mutex<T> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let guard = self.lock();
+            guard.fmt(f)
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
+    impl<T> Mutex<T> {
+        pub const fn new(value: T) -> Self {
+            Self {
+                inner: std::sync::Mutex::new(value),
+            }
+        }
+
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            let inner = match self.inner.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            MutexGuard { inner }
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
+    pub struct MutexGuard<'a, T> {
+        inner: std::sync::MutexGuard<'a, T>,
+    }
+
+    #[cfg(not(feature = "loom"))]
+    impl<T> core::ops::Deref for MutexGuard<'_, T> {
+        type Target = T;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
+    impl<T> core::ops::DerefMut for MutexGuard<'_, T> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    pub struct Mutex<T> {
+        inner: loom::sync::Mutex<T>,
+    }
+
+    #[cfg(feature = "loom")]
+    impl<T: core::fmt::Debug> core::fmt::Debug for Mutex<T> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let guard = self.lock();
+            guard.fmt(f)
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    impl<T> Mutex<T> {
+        pub fn new(value: T) -> Self {
+            Self {
+                inner: loom::sync::Mutex::new(value),
+            }
+        }
+
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            let inner = match self.inner.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            MutexGuard { inner }
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    pub struct MutexGuard<'a, T> {
+        inner: loom::sync::MutexGuard<'a, T>,
+    }
+
+    #[cfg(feature = "loom")]
+    impl<T> core::ops::Deref for MutexGuard<'_, T> {
+        type Target = T;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    impl<T> core::ops::DerefMut for MutexGuard<'_, T> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
 }
 
 #[cfg(feature = "alloc")]

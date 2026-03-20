@@ -6,7 +6,7 @@ use std::io;
 use std::marker::PhantomData;
 use veloq_atomic_waker::AtomicWaker;
 use veloq_shim::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use veloq_shim::cell::UnsafeCell;
+use veloq_shim::sync::Mutex;
 
 /// Manual payload container: raw pointer + static kind + drop fn.
 #[derive(Debug)]
@@ -161,10 +161,15 @@ pub struct SlotData<Op, S: SlotSidecar> {
     pub next_free: AtomicUsize,
     pub(crate) completion_res: AtomicI32,
     pub(crate) completion_flags: AtomicU32,
-    pub(crate) completion_payload: UnsafeCell<Option<ErasedPayload>>,
-    pub(crate) completion_detail: UnsafeCell<Option<io::Result<usize>>>,
+    pub(crate) completion_data: Mutex<CompletionData>,
     pub(crate) completion_waker: AtomicWaker,
     _marker: PhantomData<fn() -> (Op, S)>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CompletionData {
+    pub payload: Option<ErasedPayload>,
+    pub detail: Option<io::Result<usize>>,
 }
 
 impl<Op, S: SlotSidecar> SlotData<Op, S> {
@@ -176,8 +181,7 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             completion_res: AtomicI32::new(0),
             completion_flags: AtomicU32::new(0),
-            completion_payload: UnsafeCell::new(None),
-            completion_detail: UnsafeCell::new(None),
+            completion_data: Mutex::new(CompletionData::default()),
             completion_waker: AtomicWaker::new(),
             _marker: PhantomData,
         }
@@ -276,18 +280,14 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
         }
     }
 
-    /// # Safety
-    ///
-    /// The caller must guarantee exclusive mutable access to completion payload/detail.
     #[inline]
-    pub(crate) unsafe fn completion_with_data_unchecked<F, R>(&self, f: F) -> R
+    pub(crate) fn completion_with_data<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Option<ErasedPayload>, &mut Option<io::Result<usize>>) -> R,
     {
-        unsafe {
-            self.completion_payload
-                .with_mut(|payload| self.completion_detail.with_mut(|detail| f(payload, detail)))
-        }
+        let mut data = self.completion_data.lock();
+        let CompletionData { payload, detail } = &mut *data;
+        f(payload, detail)
     }
 }
 
@@ -424,22 +424,19 @@ mod sealed {
     pub trait Sealed {}
 }
 
-pub struct Pending;
-pub struct Initialized;
-pub struct InFlight;
-pub struct Cancelled;
+pub struct Reserved;
+pub struct InFlightWaiting;
+pub struct InFlightOrphaned;
 pub struct Completed;
 
-impl sealed::Sealed for Pending {}
-impl sealed::Sealed for Initialized {}
-impl sealed::Sealed for InFlight {}
-impl sealed::Sealed for Cancelled {}
+impl sealed::Sealed for Reserved {}
+impl sealed::Sealed for InFlightWaiting {}
+impl sealed::Sealed for InFlightOrphaned {}
 impl sealed::Sealed for Completed {}
 
-impl SlotMarker for Pending {}
-impl SlotMarker for Initialized {}
-impl SlotMarker for InFlight {}
-impl SlotMarker for Cancelled {}
+impl SlotMarker for Reserved {}
+impl SlotMarker for InFlightWaiting {}
+impl SlotMarker for InFlightOrphaned {}
 impl SlotMarker for Completed {}
 
 pub struct Slot<'a, State: SlotMarker, Op: PlatformOp, P, S: SlotSidecar> {
@@ -481,7 +478,7 @@ pub fn is_runnable_state(state: SlotState) -> bool {
     matches!(state, SlotState::Reserved | SlotState::InFlightWaiting)
 }
 
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Pending, Op, P, S> {
+impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Reserved, Op, P, S> {
     #[inline]
     fn try_bind(
         entry: &'a SlotEntry<Op, S>,
@@ -491,23 +488,24 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Pending, Op, P, S> {
         index: usize,
     ) -> Option<Self> {
         if entry.state(Ordering::Acquire) == SlotState::Reserved && op.is_none() {
-            assert!(
-                op.is_none(),
-                "slot {index} in Pending state must not contain an op"
-            );
             Some(Self::new_internal(entry, op, storage, platform, index))
         } else {
             None
         }
     }
 
-    pub fn init_op_with<F>(self, op: Op, init_sidecar: F) -> Slot<'a, Initialized, Op, P, S>
+    #[inline]
+    pub fn has_op(&self) -> bool {
+        self.op.is_some()
+    }
+
+    pub fn init_op_with<F>(self, op: Op, init_sidecar: F) -> Slot<'a, Reserved, Op, P, S>
     where
         F: FnOnce(&mut S),
     {
         assert!(
             self.op.is_none(),
-            "slot {} entering Initialized state must not already contain an op",
+            "slot {} entering Reserved state must not already contain an op",
             self.index
         );
         *self.op = Some(op);
@@ -516,27 +514,6 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Pending, Op, P, S> {
 
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
-}
-
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Initialized, Op, P, S> {
-    #[inline]
-    fn try_bind(
-        entry: &'a SlotEntry<Op, S>,
-        op: &'a mut Option<Op>,
-        storage: &'a mut SlotStorage<Op, S>,
-        platform: &'a mut P,
-        index: usize,
-    ) -> Option<Self> {
-        if entry.state(Ordering::Acquire) == SlotState::Reserved && op.is_some() {
-            assert!(
-                op.is_some(),
-                "slot {index} in Initialized state must contain an op"
-            );
-            Some(Self::new_internal(entry, op, storage, platform, index))
-        } else {
-            None
-        }
-    }
 
     pub fn start_submission_with(
         self,
@@ -544,7 +521,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Initialized, Op, P, S> {
     ) -> SubmissionGuard<'a, Op, P, S> {
         assert!(
             self.op.is_some(),
-            "slot {} in Initialized state must contain an op",
+            "slot {} in Reserved state must contain an op",
             self.index
         );
         self.entry
@@ -564,7 +541,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Initialized, Op, P, S> {
     {
         assert!(
             self.op.is_some(),
-            "slot {} in Initialized state must contain an op",
+            "slot {} in Reserved state must contain an op",
             self.index
         );
         self.op.as_mut().map(f)
@@ -574,11 +551,11 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Initialized, Op, P, S> {
     pub fn op_mut(&mut self) -> &mut Op {
         self.op
             .as_mut()
-            .expect("slot in Initialized state must contain an op")
+            .expect("slot in Reserved state must contain an op")
     }
 }
 
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlight, Op, P, S> {
+impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlightWaiting, Op, P, S> {
     #[inline]
     fn try_bind(
         entry: &'a SlotEntry<Op, S>,
@@ -607,7 +584,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlight, Op, P, S> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
-    pub fn cancel(self) -> Slot<'a, Cancelled, Op, P, S> {
+    pub fn cancel(self) -> Slot<'a, InFlightOrphaned, Op, P, S> {
         assert!(
             self.op.is_some(),
             "slot {} in InFlight state must contain an op",
@@ -653,7 +630,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlight, Op, P, S> {
 }
 
 impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Completed, Op, P, S> {
-    pub fn reset(self) -> Slot<'a, Pending, Op, P, S> {
+    pub fn reset(self) -> Slot<'a, Reserved, Op, P, S> {
         let _ = self.op.take();
         let generation = self.entry.generation(Ordering::Acquire);
         self.storage.reset();
@@ -678,7 +655,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Completed, Op, P, S> {
     }
 }
 
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Cancelled, Op, P, S> {
+impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlightOrphaned, Op, P, S> {
     #[inline]
     fn try_bind(
         entry: &'a SlotEntry<Op, S>,
@@ -703,16 +680,16 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Cancelled, Op, P, S> {
     }
 }
 
-type SubmissionRollback<'a, Op, P, S> = fn(&mut Slot<'a, Initialized, Op, P, S>);
+type SubmissionRollback<'a, Op, P, S> = fn(&mut Slot<'a, Reserved, Op, P, S>);
 
 pub struct SubmissionGuard<'a, Op: PlatformOp, P, S: SlotSidecar> {
-    pub slot: Option<Slot<'a, Initialized, Op, P, S>>,
+    pub slot: Option<Slot<'a, Reserved, Op, P, S>>,
     rollback: Option<SubmissionRollback<'a, Op, P, S>>,
     persisted: bool,
 }
 
 impl<'a, Op: PlatformOp, P, S: SlotSidecar> SubmissionGuard<'a, Op, P, S> {
-    pub fn persist(mut self) -> Slot<'a, InFlight, Op, P, S> {
+    pub fn persist(mut self) -> Slot<'a, InFlightWaiting, Op, P, S> {
         self.persisted = true;
         let slot = self
             .slot
@@ -736,15 +713,14 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Drop for SubmissionGuard<'a, Op, P, 
 }
 
 pub enum SlotView<'a, Op: PlatformOp, P, S: SlotSidecar> {
-    Pending(Slot<'a, Pending, Op, P, S>),
-    Initialized(Slot<'a, Initialized, Op, P, S>),
-    InFlight(Slot<'a, InFlight, Op, P, S>),
-    Cancelled(Slot<'a, Cancelled, Op, P, S>),
+    Reserved(Slot<'a, Reserved, Op, P, S>),
+    InFlightWaiting(Slot<'a, InFlightWaiting, Op, P, S>),
+    InFlightOrphaned(Slot<'a, InFlightOrphaned, Op, P, S>),
 }
 
 pub trait SlotRegistryExt<Op: PlatformOp, P, S: SlotSidecar> {
     fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Op, P, S>>;
-    fn slot_init_pending(&mut self, index: usize) -> Slot<'_, Pending, Op, P, S>;
+    fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Op, P, S>;
 }
 
 impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
@@ -754,52 +730,39 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
     fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Op, P, S>> {
         let (entry, op_entry, op, storage) = self.get_slot_entry_op_storage_and_entry_mut(index)?;
         match entry.state(Ordering::Acquire) {
-            SlotState::Reserved if op.is_none() => Slot::<Pending, Op, P, S>::try_bind(
+            SlotState::Reserved => Slot::<Reserved, Op, P, S>::try_bind(
                 entry,
                 op,
                 storage,
                 &mut op_entry.platform_data,
                 index,
             )
-            .map(SlotView::Pending),
-            SlotState::Reserved if op.is_some() => Slot::<Initialized, Op, P, S>::try_bind(
+            .map(SlotView::Reserved),
+            SlotState::InFlightWaiting => Slot::<InFlightWaiting, Op, P, S>::try_bind(
                 entry,
                 op,
                 storage,
                 &mut op_entry.platform_data,
                 index,
             )
-            .map(SlotView::Initialized),
-            SlotState::InFlightWaiting => Slot::<InFlight, Op, P, S>::try_bind(
+            .map(SlotView::InFlightWaiting),
+            SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Op, P, S>::try_bind(
                 entry,
                 op,
                 storage,
                 &mut op_entry.platform_data,
                 index,
             )
-            .map(SlotView::InFlight),
-            SlotState::InFlightOrphaned => Slot::<Cancelled, Op, P, S>::try_bind(
-                entry,
-                op,
-                storage,
-                &mut op_entry.platform_data,
-                index,
-            )
-            .map(SlotView::Cancelled),
+            .map(SlotView::InFlightOrphaned),
             SlotState::Idle | SlotState::InFlightReady | SlotState::Finalizing => None,
-            SlotState::Reserved => None,
         }
     }
 
     #[inline]
-    fn slot_init_pending(&mut self, index: usize) -> Slot<'_, Pending, Op, P, S> {
+    fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Op, P, S> {
         let (entry, op_entry, op, storage) = self
             .get_slot_entry_op_storage_and_entry_mut(index)
-            .expect("slot missing in registry during init");
-        assert!(
-            op.is_none(),
-            "slot {index} entering Pending state must not contain an op"
-        );
+            .expect("slot missing in registry during reserve");
         entry.set_state(SlotState::Reserved, Ordering::Release);
         Slot::new_internal(entry, op, storage, &mut op_entry.platform_data, index)
     }

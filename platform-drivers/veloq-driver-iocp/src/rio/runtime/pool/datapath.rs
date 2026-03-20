@@ -15,7 +15,7 @@ use std::io;
 use veloq_buf::FixedBuf;
 use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
 use veloq_driver_core::op::{UdpRecvDatagram as OpUdpRecvDatagram, UdpRecvStream};
-use veloq_driver_core::slot::{InFlight, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIORESULT, WSAGetLastError};
@@ -355,7 +355,7 @@ impl UdpPoolManager {
         if user_data >= ops.local.len() {
             return false;
         }
-        let Some(SlotView::InFlight(mut slot)) = ops.slot_view(user_data) else {
+        let Some(SlotView::InFlightWaiting(mut slot)) = ops.slot_view(user_data) else {
             return false;
         };
         if slot.platform_mut().generation != generation {
@@ -398,7 +398,7 @@ impl UdpPoolManager {
     }
 
     fn get_stream_op_mut<'a>(
-        guard: &'a mut Slot<'_, InFlight>,
+        guard: &'a mut Slot<'_, InFlightWaiting>,
     ) -> Option<&'a mut UdpRecvStream<crate::RawHandle>> {
         guard
             .with_op_mut(|iocp_op| {

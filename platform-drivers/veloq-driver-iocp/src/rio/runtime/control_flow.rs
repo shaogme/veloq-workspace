@@ -106,7 +106,7 @@ impl<'a> RioCompletionRouter<'a> {
 
         if user_data < ops.local.len() {
             match ops.slot_view(user_data) {
-                Some(SlotView::InFlight(mut slot)) => {
+                Some(SlotView::InFlightWaiting(mut slot)) => {
                     if slot.platform_mut().generation != generation {
                         return;
                     }
@@ -133,7 +133,7 @@ impl<'a> RioCompletionRouter<'a> {
                     let _ = std::mem::take(guard.platform_mut());
                     self.comp.ops.shared.push_free(user_data);
                 }
-                Some(SlotView::Cancelled(mut slot)) => {
+                Some(SlotView::InFlightOrphaned(mut slot)) => {
                     if slot.platform_mut().generation != generation {
                         return;
                     }

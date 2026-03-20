@@ -18,7 +18,7 @@ use veloq_driver_core::driver::{
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
 use veloq_driver_core::slot::{
-    DetachedCancelTable, ErasedPayload, Initialized, SlotRegistryExt, SlotTable, SlotView,
+    DetachedCancelTable, ErasedPayload, Reserved, SlotRegistryExt, SlotTable, SlotView,
 };
 use veloq_wheel::TaskId;
 
@@ -76,8 +76,8 @@ impl IocpDriver {
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
         user_data: usize,
         op: IocpOp,
-    ) -> io::Result<Slot<'_, Initialized>> {
-        let mut guard = ops.slot_init_pending(user_data);
+    ) -> io::Result<Slot<'_, Reserved>> {
+        let mut guard = ops.slot_reserve(user_data);
         let generation = guard.entry.generation(Ordering::Acquire);
         guard.platform_mut().generation = generation;
         let mut guard = guard.init_op_with(op, |sidecar| {
@@ -108,7 +108,7 @@ impl IocpDriver {
         }
         if get_blocking_pool().execute(task).is_err() {
             let err = io::Error::other("Thread pool overloaded");
-            if let Some(SlotView::InFlight(slot)) = ops.slot_view(user_data) {
+            if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                 let mut guard = slot.complete();
                 let (payload, detail) = guard.take_completion_data();
                 let _ = guard.take_op();
@@ -161,7 +161,7 @@ impl IocpDriver {
                 Self::handle_timer_sub(ops, ctx, user_data, duration, binder)
             }
             Err(e) => {
-                if let Some(SlotView::InFlight(slot)) = ops.slot_view(user_data) {
+                if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                     let mut guard = slot.complete();
                     *op_in = guard.take_op();
                 }
@@ -179,7 +179,7 @@ impl IocpDriver {
         binder: SubmitBinder,
     ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         if let Err(err) = ctx.port.notify(user_data) {
-            if let Some(SlotView::InFlight(slot)) = ops.slot_view(user_data) {
+            if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                 let mut guard = slot.complete();
                 *op_in = guard.take_op();
             }
@@ -312,7 +312,7 @@ impl IocpDriver {
         for user_data in 0..self.ops.local.len() {
             if matches!(
                 self.ops.slot_view(user_data),
-                Some(SlotView::InFlight(_)) | Some(SlotView::Cancelled(_))
+                Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_))
             ) {
                 in_flight.push(user_data);
             }

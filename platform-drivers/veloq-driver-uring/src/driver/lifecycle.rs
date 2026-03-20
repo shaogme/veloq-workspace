@@ -25,17 +25,12 @@ impl UringDriver {
         };
 
         match slot {
-            SlotView::Pending(slot) => {
+            SlotView::Reserved(slot) => {
                 let sidecar = cancel_slot_immediate(slot, user_data);
                 self.push_completion_event(sidecar);
                 self.ops.remove(user_data);
             }
-            SlotView::Initialized(slot) => {
-                let sidecar = cancel_slot_immediate(slot, user_data);
-                self.push_completion_event(sidecar);
-                self.ops.remove(user_data);
-            }
-            SlotView::InFlight(mut slot) => {
+            SlotView::InFlightWaiting(mut slot) => {
                 let timer_data = {
                     let timer_id = slot.platform_mut().timer_id;
                     let cancelled = slot.cancel();
@@ -77,7 +72,7 @@ impl UringDriver {
 
                 // Cancellation is async, we wait for CQE to clean up.
             }
-            SlotView::Cancelled(_) => {}
+            SlotView::InFlightOrphaned(_) => {}
         }
     }
 
@@ -117,15 +112,8 @@ impl UringDriver {
 
         while let Some(&user_data) = self.backlog.front() {
             let action = match self.ops.slot_view(user_data) {
-                Some(SlotView::Cancelled(_)) => BacklogAction::Cancel,
-                Some(SlotView::Pending(slot)) => {
-                    if slot_has_op(slot) {
-                        BacklogAction::Submit
-                    } else {
-                        BacklogAction::Drop
-                    }
-                }
-                Some(SlotView::Initialized(slot)) => {
+                Some(SlotView::InFlightOrphaned(_)) => BacklogAction::Cancel,
+                Some(SlotView::Reserved(slot)) => {
                     if slot_has_op(slot) {
                         BacklogAction::Submit
                     } else {

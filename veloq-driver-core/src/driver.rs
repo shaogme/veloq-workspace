@@ -4,7 +4,6 @@ use crate::{Handle, IoFd, SlotSidecar};
 use crossbeam_queue::SegQueue;
 
 use veloq_shim::atomic::Ordering;
-use veloq_shim::hint;
 
 use std::io;
 use std::sync::Arc;
@@ -129,12 +128,10 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                         .is_ok()
                     {
                         if state == slot::SlotState::InFlightReady {
-                            unsafe {
-                                cell.completion_with_data_unchecked(|payload_cell, detail_cell| {
-                                    let _ = payload_cell.take();
-                                    let _ = detail_cell.take();
-                                });
-                            }
+                            cell.completion_with_data(|payload_cell, detail_cell| {
+                                let _ = payload_cell.take();
+                                let _ = detail_cell.take();
+                            });
                         }
                         break;
                     }
@@ -166,17 +163,15 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                     }
                 }
                 slot::SlotState::Finalizing => {
-                    hint::spin_loop();
+                    std::thread::yield_now();
                 }
             }
         }
 
-        unsafe {
-            cell.completion_with_data_unchecked(|payload_cell, detail_cell| {
-                *payload_cell = payload.take();
-                *detail_cell = detail.take();
-            });
-        }
+        cell.completion_with_data(|payload_cell, detail_cell| {
+            *payload_cell = payload.take();
+            *detail_cell = detail.take();
+        });
         cell.completion_res.store(event.res, Ordering::Release);
         cell.completion_flags.store(event.flags, Ordering::Release);
 
@@ -223,11 +218,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
             return PollRecordResult::Pending;
         }
 
-        let (payload, detail) = unsafe {
-            cell.completion_with_data_unchecked(|payload_cell, detail_cell| {
-                (payload_cell.take(), detail_cell.take())
-            })
-        };
+        let (payload, detail) = cell.completion_with_data(|payload_cell, detail_cell| {
+            (payload_cell.take(), detail_cell.take())
+        });
         cell.set_state_generation(
             slot::SlotState::Idle,
             generation,
@@ -378,7 +371,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                             return;
                         }
                     }
-                    slot::SlotState::Finalizing => hint::spin_loop(),
+                    slot::SlotState::Finalizing => {
+                        std::thread::yield_now();
+                    }
                     slot::SlotState::Reserved | slot::SlotState::InFlightReady => return,
                 }
             }
@@ -434,12 +429,10 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                             )
                             .is_ok()
                         {
-                            unsafe {
-                                cell.completion_with_data_unchecked(|payload_cell, detail_cell| {
-                                    let _ = payload_cell.take();
-                                    let _ = detail_cell.take();
-                                });
-                            }
+                            cell.completion_with_data(|payload_cell, detail_cell| {
+                                let _ = payload_cell.take();
+                                let _ = detail_cell.take();
+                            });
                             cell.set_state_generation(
                                 slot::SlotState::Idle,
                                 generation,
@@ -454,7 +447,7 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                     }
                 }
                 slot::SlotState::Finalizing => {
-                    hint::spin_loop();
+                    std::thread::yield_now();
                 }
                 _ => return,
             }

@@ -168,7 +168,7 @@ impl UringDriver {
     pub(crate) unsafe fn submit_from_slot_raw(
         driver: *mut UringDriver,
         user_data: usize,
-        slot: Slot<'_, crate::op::slot::Initialized>,
+        slot: Slot<'_, crate::op::slot::Reserved>,
     ) -> io::Result<bool> {
         let driver = unsafe { &mut *driver };
         let mut sub_guard = slot.start_submission_with(None);
@@ -277,7 +277,7 @@ impl UringDriver {
     pub(crate) fn submit_from_slot_index(&mut self, user_data: usize) -> io::Result<bool> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
-            Some(SlotView::Initialized(slot)) => slot,
+            Some(SlotView::Reserved(slot)) => slot,
             _ => return Err(io::Error::other("Op missing in slot")),
         };
         unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) }
@@ -309,7 +309,7 @@ impl UringDriver {
             let driver_ptr = self as *mut UringDriver;
             let slot = self
                 .ops
-                .slot_init_pending(user_data)
+                .slot_reserve(user_data)
                 .init_op_with(uring_op, |_| {});
             match unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) } {
                 Ok(true) => {}
@@ -370,7 +370,7 @@ impl UringDriver {
             let timer_buffer = std::mem::take(&mut self.timer_buffer);
             for user_data in timer_buffer {
                 let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
-                    SlotView::InFlight(mut slot) => {
+                    SlotView::InFlightWaiting(mut slot) => {
                         slot.platform_mut().timer_id = None;
                         let mut completed = slot.complete();
 
@@ -444,7 +444,7 @@ impl UringDriver {
             }
 
             let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
-                SlotView::InFlight(mut slot) => {
+                SlotView::InFlightWaiting(mut slot) => {
                     let res_val = cqe_res;
                     let final_res = slot
                         .with_op_mut(|op| unsafe { (op.vtable.on_complete)(op, res_val) })
@@ -475,7 +475,7 @@ impl UringDriver {
                         detail,
                     })
                 }
-                SlotView::Cancelled(slot) => {
+                SlotView::InFlightOrphaned(slot) => {
                     let generation = slot.entry.generation(Ordering::Acquire);
                     let mut completed = slot.complete();
                     let (payload, detail) = completed.take_completion_data();
@@ -588,7 +588,7 @@ impl Driver for UringDriver {
                 generation,
             }) => {
                 trace!(id, generation, "Reserved op slot");
-                self.ops.slot_init_pending(id);
+                self.ops.slot_reserve(id);
                 Ok((id, generation))
             }
             Err(_) => Err(io::Error::new(
@@ -781,12 +781,16 @@ impl UringDriver {
     ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
-            Some(SlotView::Pending(slot)) => slot.init_op_with(op, |_| {}),
-            Some(SlotView::Initialized(mut slot)) => {
-                *slot.op_mut() = op;
-                slot
+            Some(SlotView::Reserved(slot)) => {
+                if slot.has_op() {
+                    let mut slot = slot;
+                    *slot.op_mut() = op;
+                    slot
+                } else {
+                    slot.init_op_with(op, |_| {})
+                }
             }
-            Some(SlotView::InFlight(_)) | Some(SlotView::Cancelled(_)) | None => {
+            Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
                 return binder.err(
                     io::Error::other("Op slot missing in registry"),
                     SubmitStatus::Void,
@@ -822,12 +826,16 @@ impl UringDriver {
     ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
-            Some(SlotView::Pending(slot)) => slot.init_op_with(op, |_| {}),
-            Some(SlotView::Initialized(mut slot)) => {
-                *slot.op_mut() = op;
-                slot
+            Some(SlotView::Reserved(slot)) => {
+                if slot.has_op() {
+                    let mut slot = slot;
+                    *slot.op_mut() = op;
+                    slot
+                } else {
+                    slot.init_op_with(op, |_| {})
+                }
             }
-            Some(SlotView::InFlight(_)) | Some(SlotView::Cancelled(_)) | None => {
+            Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
                 return binder.err(
                     io::Error::other("Op slot missing in registry"),
                     SubmitStatus::Void,

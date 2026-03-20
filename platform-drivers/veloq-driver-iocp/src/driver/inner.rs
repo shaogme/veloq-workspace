@@ -24,7 +24,7 @@ use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
 use crate::rio::RioState;
 use crate::win32::Overlapped;
-use veloq_driver_core::slot::{DetachedCancelTable, InFlight, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{DetachedCancelTable, InFlightWaiting, SlotRegistryExt, SlotView};
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
@@ -228,7 +228,7 @@ impl IocpDriver {
         for &user_data in &timer_buffer {
             let in_flight = matches!(
                 self.ops.slot_view(user_data),
-                Some(SlotView::InFlight(_)) | Some(SlotView::Cancelled(_))
+                Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_))
             );
             if let Some(op) = self.ops.local.get_mut(user_data) {
                 if in_flight {
@@ -268,7 +268,7 @@ impl IocpDriver {
         pending_events: &mut Vec<CompletionSidecar>,
     ) {
         let mut guard = match ops.slot_view(user_data) {
-            Some(SlotView::InFlight(slot)) => slot.complete(),
+            Some(SlotView::InFlightWaiting(slot)) => slot.complete(),
             _ => return,
         };
 
@@ -301,7 +301,7 @@ impl IocpDriver {
 
         let io_result = self.calculate_io_result(user_data, success, error_code, bytes_transferred);
         match self.ops.slot_view(user_data) {
-            Some(SlotView::InFlight(_)) => {
+            Some(SlotView::InFlightWaiting(_)) => {
                 let slot_generation;
                 {
                     let slot = &self.ops.shared.slots[user_data];
@@ -320,7 +320,7 @@ impl IocpDriver {
                 };
                 Self::emit_event_inner(ctx, &mut self.ops, user_data, slot_generation, io_result);
             }
-            Some(SlotView::Cancelled(slot)) => {
+            Some(SlotView::InFlightOrphaned(slot)) => {
                 let slot_generation = slot.entry.generation(Ordering::Acquire);
                 let mut completed = slot.complete();
                 let (payload, detail) = completed.take_completion_data();
@@ -349,10 +349,10 @@ impl IocpDriver {
     fn with_inflight_slot<R>(
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
         index: usize,
-        f: impl FnOnce(Slot<'_, InFlight>) -> R,
+        f: impl FnOnce(Slot<'_, InFlightWaiting>) -> R,
     ) -> Option<R> {
         match ops.slot_view(index)? {
-            SlotView::InFlight(slot) => Some(f(slot)),
+            SlotView::InFlightWaiting(slot) => Some(f(slot)),
             _ => None,
         }
     }
@@ -473,8 +473,8 @@ impl IocpDriver {
 
         let state = self.ops.slot_view(user_data);
         match state {
-            Some(SlotView::Cancelled(_)) => {}
-            Some(SlotView::InFlight(_)) => {
+            Some(SlotView::InFlightOrphaned(_)) => {}
+            Some(SlotView::InFlightWaiting(_)) => {
                 let ctx = CancelContext {
                     registered_files: &self.registered_files,
                     rio_state: &mut self.rio_state,
@@ -497,7 +497,7 @@ impl IocpDriver {
     ) {
         let mut should_emit_aborted = false;
         let handled = match ops.slot_view(user_data) {
-            Some(SlotView::InFlight(mut guard)) => {
+            Some(SlotView::InFlightWaiting(mut guard)) => {
                 let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten();
 
                 if let Some(fd) = fd
