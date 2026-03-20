@@ -22,7 +22,7 @@ pub(crate) use payload::{
 // ============================================================================
 
 pub(crate) type MakeSqeFn =
-    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> squeue::Entry;
+    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> io::Result<squeue::Entry>;
 pub(crate) type OnCompleteFn = unsafe fn(op: &mut UringKernelOp, result: i32) -> io::Result<usize>;
 pub(crate) type DropFn = unsafe fn(op: &mut UringKernelOp);
 pub(crate) type GetTimeoutFn = unsafe fn(op: &UringKernelOp) -> Option<Duration>;

@@ -189,7 +189,7 @@ impl UringDriver {
                     let vtable = op.vtable;
                     let count = unsafe { (vtable.resolve_chunks)(op, &mut chunks) };
                     let sqe = unsafe {
-                        (vtable.make_sqe)(op, &mut *driver_ptr).user_data(user_data as u64)
+                        (vtable.make_sqe)(op, &mut *driver_ptr)?.user_data(user_data as u64)
                     };
                     (count, sqe)
                 };
@@ -650,7 +650,7 @@ impl Driver for UringDriver {
         let strategy = op.vtable.strategy;
         if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
             let sqe =
-                unsafe { (op.vtable.make_sqe)(&mut op, self).user_data(BACKGROUND_USER_DATA) };
+                unsafe { (op.vtable.make_sqe)(&mut op, self)?.user_data(BACKGROUND_USER_DATA) };
 
             if !self.push_entry(sqe) {
                 return Err(io::Error::other("sq full"));
