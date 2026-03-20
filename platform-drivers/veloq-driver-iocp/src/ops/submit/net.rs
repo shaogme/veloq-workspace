@@ -4,8 +4,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use veloq_pod::{bytes_of_mut, from_bytes_mut};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET,
+    AF_INET, AF_INET6, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM,
+    SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, getsockopt,
 };
 
 use crate::common::{IocpErrorContext, io_error};
@@ -34,6 +34,25 @@ fn with_borrowed_socket<T>(
     f(&socket)
 }
 
+fn is_udp_socket(handle: HANDLE) -> io::Result<bool> {
+    let mut socket_type: i32 = 0;
+    let mut opt_len = std::mem::size_of::<i32>() as i32;
+    // SAFETY: `socket_type` and `opt_len` are valid writable pointers.
+    let ret = unsafe {
+        getsockopt(
+            handle as SOCKET,
+            SOL_SOCKET,
+            SO_TYPE,
+            (&mut socket_type as *mut i32).cast::<u8>(),
+            &mut opt_len,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(socket_type == SOCK_DGRAM)
+}
+
 pub(crate) fn submit_recv(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Recv>,
@@ -44,6 +63,19 @@ pub(crate) fn submit_recv(
     overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
+
+    if is_udp_socket(handle)? {
+        return ctx.rio.try_submit_pool_recv_for_recv(
+            crate::rio::RioUdpRecvArgs {
+                fd: val.fd,
+                handle,
+                recv_op: val,
+                user_data: header.user_data,
+                generation: header.generation,
+            },
+            ctx.registrar,
+        );
+    }
 
     // Try RIO path first.
     let rio_res = ctx.rio.try_submit_recv(

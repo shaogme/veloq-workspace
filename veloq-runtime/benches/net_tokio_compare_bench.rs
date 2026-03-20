@@ -12,6 +12,7 @@ use veloq_runtime::io::{AsyncBufRead, AsyncBufWrite};
 use veloq_runtime::net::{TcpListener, TcpStream, UdpSocket};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn;
+use veloq_runtime::yield_now;
 
 const PAYLOAD_SIZE: usize = 8192;
 const ROUNDS: usize = 2048;
@@ -157,6 +158,16 @@ async fn run_veloq_udp_roundtrip(payload_size: NonZeroUsize, rounds: usize) {
         .local_addr()
         .expect("get veloq udp client addr failed");
 
+    // Prime UDP recv credits on RIO path to avoid first-packet timing windows.
+    server
+        .recv_ready(payload_size, 8)
+        .await
+        .expect("veloq udp server recv_ready failed");
+    client
+        .recv_ready(payload_size, 8)
+        .await
+        .expect("veloq udp client recv_ready failed");
+
     server
         .connect(client_addr)
         .await
@@ -182,6 +193,9 @@ async fn run_veloq_udp_roundtrip(payload_size: NonZeroUsize, rounds: usize) {
             io_buf = buf;
         }
     });
+
+    // Let server task run once before the first client send.
+    yield_now().await;
 
     let mut write_buf = alloc_fixed(payload_size);
     for b in write_buf.as_slice_mut() {

@@ -26,6 +26,19 @@ pub(crate) struct UdpRecvDatagram {
     pub(crate) addr_len: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UdpWaiterKind {
+    Stream,
+    Recv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UdpWaiter {
+    pub(crate) user_data: usize,
+    pub(crate) generation: u32,
+    pub(crate) kind: UdpWaiterKind,
+}
+
 pub(crate) struct UdpRecvPoolSlot {
     pub(crate) buf: FixedBuf,
     pub(crate) addr: Box<SockAddrStorage>,
@@ -37,7 +50,7 @@ pub(crate) struct UdpRecvPoolSlot {
 pub(crate) struct UdpRecvPool {
     pub(crate) slots: Vec<UdpRecvPoolSlot>,
     pub(crate) queue: VecDeque<UdpRecvDatagram>,
-    pub(crate) waiters: VecDeque<(usize, u32)>,
+    pub(crate) waiters: VecDeque<UdpWaiter>,
     pub(crate) spare_bufs: VecDeque<FixedBuf>,
     pub(crate) min_credits: usize,
     pub(crate) max_credits: usize,

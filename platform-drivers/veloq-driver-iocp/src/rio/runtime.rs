@@ -9,7 +9,7 @@ use crate::ops::SubmissionResult;
 use crate::rio::{RioEnv, RioState};
 use std::io;
 use veloq_buf::FixedBuf;
-use veloq_driver_core::op::UdpRecvStream;
+use veloq_driver_core::op::{Recv, UdpRecvStream};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, RIO_BUF, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
@@ -39,6 +39,14 @@ pub(crate) struct RioUdpStreamArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: HANDLE,
     pub(crate) stream_op: &'a mut UdpRecvStream<crate::config::RawHandle>,
+    pub(crate) user_data: usize,
+    pub(crate) generation: u32,
+}
+
+pub(crate) struct RioUdpRecvArgs<'a> {
+    pub(crate) fd: IoFd,
+    pub(crate) handle: HANDLE,
+    pub(crate) recv_op: &'a mut Recv<crate::config::RawHandle>,
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
 }
@@ -185,6 +193,46 @@ impl RioState {
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
         let (res, pool_submissions) = actor.pool_manager.try_submit_pool_recv(
             stream_op,
+            (user_data, generation),
+            &mut ctx,
+        )?;
+        self.outstanding_count += pool_submissions;
+        if matches!(res, SubmissionResult::Pending) {
+            self.outstanding_count += 1;
+        }
+        Ok(res)
+    }
+
+    pub(crate) fn try_submit_pool_recv_for_recv(
+        &mut self,
+        args: RioUdpRecvArgs<'_>,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+    ) -> io::Result<SubmissionResult> {
+        let RioUdpRecvArgs {
+            fd,
+            handle,
+            recv_op,
+            user_data,
+            generation,
+        } = args;
+        let dispatch = self
+            .kernel
+            .dispatch
+            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "lost RIO context"))?;
+        let env = RioEnv {
+            registrar,
+            dispatch: &dispatch,
+            cq: self.kernel.cq,
+            registration_mode: self.registration_mode,
+        };
+        let _ = self.ensure_actor((fd, handle), env)?;
+        let actor = self
+            .actors
+            .get_mut(&handle)
+            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
+        let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
+        let (res, pool_submissions) = actor.pool_manager.try_submit_pool_recv_recv(
+            recv_op,
             (user_data, generation),
             &mut ctx,
         )?;
