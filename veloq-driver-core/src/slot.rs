@@ -37,64 +37,50 @@ impl Drop for ErasedPayload {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
-    Free,
-    Pending,
-    Initialized,
-    InFlight,
-    Cancelled,
-    Completed,
+    Idle,
+    Reserved,
+    InFlightWaiting,
+    InFlightReady,
+    InFlightOrphaned,
+    Finalizing,
 }
 
 #[inline]
 const fn encode_slot_state(state: SlotState) -> u8 {
     match state {
-        SlotState::Free => 0,
-        SlotState::Pending => 1,
-        SlotState::Initialized => 2,
-        SlotState::InFlight => 3,
-        SlotState::Cancelled => 4,
-        SlotState::Completed => 5,
+        SlotState::Idle => 0,
+        SlotState::Reserved => 1,
+        SlotState::InFlightWaiting => 2,
+        SlotState::InFlightReady => 3,
+        SlotState::InFlightOrphaned => 4,
+        SlotState::Finalizing => 5,
     }
 }
 
 #[inline]
 fn decode_slot_state(raw: u8) -> SlotState {
     match raw {
-        0 => SlotState::Free,
-        1 => SlotState::Pending,
-        2 => SlotState::Initialized,
-        3 => SlotState::InFlight,
-        4 => SlotState::Cancelled,
-        5 => SlotState::Completed,
+        0 => SlotState::Idle,
+        1 => SlotState::Reserved,
+        2 => SlotState::InFlightWaiting,
+        3 => SlotState::InFlightReady,
+        4 => SlotState::InFlightOrphaned,
+        5 => SlotState::Finalizing,
         _ => panic!("invalid SlotState encoding: {raw}"),
     }
 }
 
 const CORE_GENERATION_SHIFT: u32 = 0;
-const CORE_LIFECYCLE_SHIFT: u32 = 32;
-const CORE_INTERACTION_SHIFT: u32 = 36;
+const CORE_STATE_SHIFT: u32 = 32;
 const CORE_FLAGS_SHIFT: u32 = 40;
 
 const CORE_GENERATION_MASK: u64 = 0xffff_ffff;
-const CORE_LIFECYCLE_MASK: u64 = 0x0f << CORE_LIFECYCLE_SHIFT;
-const CORE_INTERACTION_MASK: u64 = 0x0f << CORE_INTERACTION_SHIFT;
-
-pub(crate) const INTERACTION_IDLE: u8 = 0;
-pub(crate) const INTERACTION_WAITING: u8 = 1;
-pub(crate) const INTERACTION_READY: u8 = 2;
-pub(crate) const INTERACTION_ORPHANED: u8 = 3;
-pub(crate) const INTERACTION_BUSY: u8 = 4;
+const CORE_STATE_MASK: u64 = 0xff << CORE_STATE_SHIFT;
 
 #[inline]
-pub(crate) const fn pack_core_state(
-    generation: u32,
-    lifecycle: SlotState,
-    interaction: u8,
-    flags: u32,
-) -> u64 {
+pub(crate) const fn pack_core_state(generation: u32, state: SlotState, flags: u32) -> u64 {
     ((generation as u64) << CORE_GENERATION_SHIFT)
-        | (((encode_slot_state(lifecycle) as u64) & 0x0f) << CORE_LIFECYCLE_SHIFT)
-        | (((interaction as u64) & 0x0f) << CORE_INTERACTION_SHIFT)
+        | (((encode_slot_state(state) as u64) & 0xff) << CORE_STATE_SHIFT)
         | (((flags as u64) & 0x00ff_ffff) << CORE_FLAGS_SHIFT)
 }
 
@@ -104,29 +90,19 @@ pub(crate) const fn core_generation(raw: u64) -> u32 {
 }
 
 #[inline]
-pub(crate) fn core_lifecycle(raw: u64) -> SlotState {
-    decode_slot_state(((raw & CORE_LIFECYCLE_MASK) >> CORE_LIFECYCLE_SHIFT) as u8)
+pub(crate) fn core_state(raw: u64) -> SlotState {
+    decode_slot_state(((raw & CORE_STATE_MASK) >> CORE_STATE_SHIFT) as u8)
 }
 
 #[inline]
-pub(crate) const fn core_interaction(raw: u64) -> u8 {
-    ((raw & CORE_INTERACTION_MASK) >> CORE_INTERACTION_SHIFT) as u8
+pub(crate) const fn core_with_state(raw: u64, state: SlotState) -> u64 {
+    (raw & !CORE_STATE_MASK) | (((encode_slot_state(state) as u64) & 0xff) << CORE_STATE_SHIFT)
 }
 
 #[inline]
-pub(crate) const fn core_with_lifecycle(raw: u64, lifecycle: SlotState) -> u64 {
-    (raw & !CORE_LIFECYCLE_MASK)
-        | (((encode_slot_state(lifecycle) as u64) & 0x0f) << CORE_LIFECYCLE_SHIFT)
-}
-
-#[inline]
-pub(crate) const fn core_with_interaction_generation(
-    raw: u64,
-    interaction: u8,
-    generation: u32,
-) -> u64 {
-    (raw & !(CORE_INTERACTION_MASK | CORE_GENERATION_MASK))
-        | (((interaction as u64) & 0x0f) << CORE_INTERACTION_SHIFT)
+pub(crate) const fn core_with_state_generation(raw: u64, state: SlotState, generation: u32) -> u64 {
+    (raw & !(CORE_STATE_MASK | CORE_GENERATION_MASK))
+        | (((encode_slot_state(state) as u64) & 0xff) << CORE_STATE_SHIFT)
         | ((generation as u64) << CORE_GENERATION_SHIFT)
 }
 
@@ -196,7 +172,7 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
 
     pub fn new() -> Self {
         Self {
-            core_state: AtomicU64::new(pack_core_state(0, SlotState::Free, INTERACTION_IDLE, 0)),
+            core_state: AtomicU64::new(pack_core_state(0, SlotState::Idle, 0)),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             completion_res: AtomicI32::new(0),
             completion_flags: AtomicU32::new(0),
@@ -209,7 +185,7 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
 
     #[inline]
     pub(crate) fn state(&self, ordering: Ordering) -> SlotState {
-        core_lifecycle(self.core_state.load(ordering))
+        core_state(self.core_state.load(ordering))
     }
 
     #[inline]
@@ -235,16 +211,16 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     }
 
     #[inline]
-    pub(crate) fn set_interaction_state_generation(
+    pub(crate) fn set_state_generation(
         &self,
-        interaction: u8,
+        state: SlotState,
         generation: u32,
         success: Ordering,
         failure: Ordering,
     ) -> u64 {
         let mut current = self.core_state.load(failure);
         loop {
-            let new = core_with_interaction_generation(current, interaction, generation);
+            let new = core_with_state_generation(current, state, generation);
             match self
                 .core_state
                 .compare_exchange_weak(current, new, success, failure)
@@ -259,7 +235,7 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     pub(crate) fn set_state(&self, state: SlotState, ordering: Ordering) {
         let mut current = self.core_state.load(Ordering::Acquire);
         loop {
-            let new = core_with_lifecycle(current, state);
+            let new = core_with_state(current, state);
             match self
                 .core_state
                 .compare_exchange_weak(current, new, ordering, Ordering::Acquire)
@@ -272,7 +248,7 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
 
     pub(crate) fn reset(&self, generation: u32) {
         self.core_state.store(
-            pack_core_state(generation, SlotState::Free, INTERACTION_IDLE, 0),
+            pack_core_state(generation, SlotState::Idle, 0),
             Ordering::Release,
         );
     }
@@ -280,9 +256,14 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     pub(crate) fn free(&self) {
         let mut current = self.core_state.load(Ordering::Acquire);
         loop {
-            // Preserve interaction/generation so READY completion is not lost
-            // when lifecycle is recycled to Free.
-            let new = core_with_lifecycle(current, SlotState::Free);
+            let state = core_state(current);
+            // Preserve READY state so detached completion can still be consumed.
+            let target = if state == SlotState::InFlightReady {
+                SlotState::InFlightReady
+            } else {
+                SlotState::Idle
+            };
+            let new = core_with_state(current, target);
             match self.core_state.compare_exchange_weak(
                 current,
                 new,
@@ -432,7 +413,7 @@ impl<Op, S: SlotSidecar> SlotTable<Op, S> {
     pub(crate) fn slot_snapshot(&self, idx: usize) -> Option<(u32, SlotState)> {
         self.slots.get(idx).map(|slot| {
             let core = slot.core_state(Ordering::Acquire);
-            (core_generation(core), core_lifecycle(core))
+            (core_generation(core), core_state(core))
         })
     }
 }
@@ -497,10 +478,7 @@ impl<'a, State: SlotMarker, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, State, O
 
 #[inline]
 pub fn is_runnable_state(state: SlotState) -> bool {
-    matches!(
-        state,
-        SlotState::Pending | SlotState::Initialized | SlotState::InFlight | SlotState::Cancelled
-    )
+    matches!(state, SlotState::Reserved | SlotState::InFlightWaiting)
 }
 
 impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Pending, Op, P, S> {
@@ -512,7 +490,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Pending, Op, P, S> {
         platform: &'a mut P,
         index: usize,
     ) -> Option<Self> {
-        if entry.state(Ordering::Acquire) == SlotState::Pending {
+        if entry.state(Ordering::Acquire) == SlotState::Reserved && op.is_none() {
             assert!(
                 op.is_none(),
                 "slot {index} in Pending state must not contain an op"
@@ -536,9 +514,6 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Pending, Op, P, S> {
         self.storage
             .with_mut(|_op, _result, _payload, sidecar| init_sidecar(sidecar));
 
-        self.entry
-            .set_state(SlotState::Initialized, Ordering::Release);
-
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 }
@@ -552,7 +527,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Initialized, Op, P, S> {
         platform: &'a mut P,
         index: usize,
     ) -> Option<Self> {
-        if entry.state(Ordering::Acquire) == SlotState::Initialized {
+        if entry.state(Ordering::Acquire) == SlotState::Reserved && op.is_some() {
             assert!(
                 op.is_some(),
                 "slot {index} in Initialized state must contain an op"
@@ -572,7 +547,8 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Initialized, Op, P, S> {
             "slot {} in Initialized state must contain an op",
             self.index
         );
-        self.entry.set_state(SlotState::InFlight, Ordering::Release);
+        self.entry
+            .set_state(SlotState::InFlightWaiting, Ordering::Release);
 
         SubmissionGuard {
             slot: Some(self),
@@ -611,7 +587,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlight, Op, P, S> {
         platform: &'a mut P,
         index: usize,
     ) -> Option<Self> {
-        if entry.state(Ordering::Acquire) == SlotState::InFlight {
+        if entry.state(Ordering::Acquire) == SlotState::InFlightWaiting {
             assert!(
                 op.is_some(),
                 "slot {index} in InFlight state must contain an op"
@@ -628,8 +604,6 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlight, Op, P, S> {
             "slot {} in InFlight state must contain an op",
             self.index
         );
-        self.entry
-            .set_state(SlotState::Completed, Ordering::Release);
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
@@ -640,7 +614,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlight, Op, P, S> {
             self.index
         );
         self.entry
-            .set_state(SlotState::Cancelled, Ordering::Release);
+            .set_state(SlotState::InFlightOrphaned, Ordering::Release);
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
@@ -684,7 +658,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Completed, Op, P, S> {
         let generation = self.entry.generation(Ordering::Acquire);
         self.storage.reset();
         self.entry.reset(generation);
-        self.entry.set_state(SlotState::Pending, Ordering::Release);
+        self.entry.set_state(SlotState::Reserved, Ordering::Release);
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
@@ -713,7 +687,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Cancelled, Op, P, S> {
         platform: &'a mut P,
         index: usize,
     ) -> Option<Self> {
-        if entry.state(Ordering::Acquire) == SlotState::Cancelled {
+        if entry.state(Ordering::Acquire) == SlotState::InFlightOrphaned {
             assert!(
                 op.is_some(),
                 "slot {index} in Cancelled state must contain an op"
@@ -725,9 +699,6 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Cancelled, Op, P, S> {
     }
 
     pub fn complete(self) -> Slot<'a, Completed, Op, P, S> {
-        self.entry
-            .set_state(SlotState::Completed, Ordering::Release);
-
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 }
@@ -759,8 +730,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Drop for SubmissionGuard<'a, Op, P, 
             if let Some(rollback) = self.rollback {
                 rollback(slot);
             }
-            slot.entry
-                .set_state(SlotState::Initialized, Ordering::Release);
+            slot.entry.set_state(SlotState::Reserved, Ordering::Release);
         }
     }
 }
@@ -784,7 +754,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
     fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Op, P, S>> {
         let (entry, op_entry, op, storage) = self.get_slot_entry_op_storage_and_entry_mut(index)?;
         match entry.state(Ordering::Acquire) {
-            SlotState::Pending => Slot::<Pending, Op, P, S>::try_bind(
+            SlotState::Reserved if op.is_none() => Slot::<Pending, Op, P, S>::try_bind(
                 entry,
                 op,
                 storage,
@@ -792,7 +762,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
                 index,
             )
             .map(SlotView::Pending),
-            SlotState::Initialized => Slot::<Initialized, Op, P, S>::try_bind(
+            SlotState::Reserved if op.is_some() => Slot::<Initialized, Op, P, S>::try_bind(
                 entry,
                 op,
                 storage,
@@ -800,7 +770,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
                 index,
             )
             .map(SlotView::Initialized),
-            SlotState::InFlight => Slot::<InFlight, Op, P, S>::try_bind(
+            SlotState::InFlightWaiting => Slot::<InFlight, Op, P, S>::try_bind(
                 entry,
                 op,
                 storage,
@@ -808,7 +778,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
                 index,
             )
             .map(SlotView::InFlight),
-            SlotState::Cancelled => Slot::<Cancelled, Op, P, S>::try_bind(
+            SlotState::InFlightOrphaned => Slot::<Cancelled, Op, P, S>::try_bind(
                 entry,
                 op,
                 storage,
@@ -816,7 +786,8 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
                 index,
             )
             .map(SlotView::Cancelled),
-            SlotState::Completed | SlotState::Free => None,
+            SlotState::Idle | SlotState::InFlightReady | SlotState::Finalizing => None,
+            SlotState::Reserved => None,
         }
     }
 
@@ -829,7 +800,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
             op.is_none(),
             "slot {index} entering Pending state must not contain an op"
         );
-        entry.set_state(SlotState::Pending, Ordering::Release);
+        entry.set_state(SlotState::Reserved, Ordering::Release);
         Slot::new_internal(entry, op, storage, &mut op_entry.platform_data, index)
     }
 }
