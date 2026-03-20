@@ -8,6 +8,7 @@
 //! - `io/driver/iocp/op.rs` for Windows IOCP
 
 use std::rc::Rc;
+use std::sync::Arc;
 use std::{
     future::Future,
     pin::Pin,
@@ -19,8 +20,8 @@ use tracing::trace;
 use veloq_buf::FixedBuf;
 
 use crate::driver::{
-    CompletionRecord, Driver, PlatformOp, PollRecordResult, SharedCompletionTable, SubmitBinder,
-    encode_completion_token, event_res_to_io,
+    CompletionRecord, Driver, PlatformOp, PollRecordResult, RemoteWaker, SharedCompletionTable,
+    SubmitBinder, encode_completion_token, event_res_to_io,
 };
 use crate::slot::DetachedCancelTable;
 use crate::{Handle, IoFd, SockAddr};
@@ -200,6 +201,7 @@ impl<T> Op<T> {
                 let token = encode_completion_token(user_data, generation);
                 let completion_table = driver.completion_table();
                 let cancel_signal = driver.detached_cancel_table();
+                let cancel_waker = driver.create_waker();
                 driver.slot_set_payload(user_data, T::payload_into_erased(payload));
 
                 if let Err(e) = driver
@@ -222,6 +224,7 @@ impl<T> Op<T> {
                         DetachedOp {
                             completion_table: None,
                             cancel_signal: None,
+                            cancel_waker: None,
                             token: 0,
                             immediate_failure: Some((e, T::from_user_payload(payload))),
                             _phantom: std::marker::PhantomData,
@@ -231,6 +234,7 @@ impl<T> Op<T> {
                         DetachedOp {
                             completion_table: Some(completion_table),
                             cancel_signal: Some(cancel_signal),
+                            cancel_waker: Some(cancel_waker),
                             token,
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
@@ -241,6 +245,7 @@ impl<T> Op<T> {
                     DetachedOp {
                         completion_table: Some(completion_table),
                         cancel_signal: Some(cancel_signal),
+                        cancel_waker: Some(cancel_waker),
                         token,
                         immediate_failure: None,
                         _phantom: std::marker::PhantomData,
@@ -253,6 +258,7 @@ impl<T> Op<T> {
                 DetachedOp {
                     completion_table: None,
                     cancel_signal: None,
+                    cancel_waker: None,
                     token: 0,
                     immediate_failure: Some((e, data)),
                     _phantom: std::marker::PhantomData,
@@ -285,6 +291,7 @@ where
 {
     completion_table: Option<SharedCompletionTable>,
     cancel_signal: Option<std::sync::Arc<DetachedCancelTable>>,
+    cancel_waker: Option<Arc<dyn RemoteWaker>>,
     token: u64,
     immediate_failure: Option<(std::io::Error, T)>,
     _phantom: std::marker::PhantomData<(T, fn() -> O)>,
@@ -307,6 +314,11 @@ where
         }
         if let Some(cancel_signal) = self.cancel_signal.as_ref() {
             cancel_signal.request_cancel(self.token);
+        }
+        if let Some(cancel_waker) = self.cancel_waker.as_ref() {
+            if let Err(e) = cancel_waker.wake() {
+                trace!("DetachedOp cancel wake failed: {}", e);
+            }
         }
     }
 }
@@ -756,5 +768,88 @@ impl<H: Handle + From<usize>, A: SockAddr> OpLifecycle for Accept<H, A> {
             )
         })?;
         Ok((fd, addr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::CompletionTable;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy)]
+    struct DummyOp;
+
+    #[derive(Clone, Copy)]
+    struct DummyPayload;
+
+    struct DummyPlatformOp;
+
+    impl crate::driver::PlatformOp for DummyPlatformOp {}
+
+    struct CountingWaker {
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl RemoteWaker for CountingWaker {
+        fn wake(&self) -> std::io::Result<()> {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl IntoPlatformOp<DummyPlatformOp> for DummyOp {
+        type UserPayload = DummyPayload;
+        const PAYLOAD_KIND: OpKind = OpKind::Wakeup;
+
+        fn into_kernel_and_payload(self) -> (DummyPlatformOp, Self::UserPayload) {
+            (DummyPlatformOp, DummyPayload)
+        }
+
+        fn from_user_payload(_: Self::UserPayload) -> Self {
+            Self
+        }
+
+        fn payload_into_erased(_: Self::UserPayload) -> crate::slot::ErasedPayload {
+            unsafe fn drop_payload(ptr: *mut ()) {
+                let _ = unsafe { Box::from_raw(ptr as *mut ()) };
+            }
+
+            let ptr = Box::into_raw(Box::new(())) as *mut ();
+            crate::slot::ErasedPayload {
+                ptr,
+                kind: 1,
+                drop_fn: drop_payload,
+            }
+        }
+
+        unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
+            let _ = unsafe { Box::from_raw(ptr as *mut ()) };
+            DummyPayload
+        }
+    }
+
+    #[test]
+    fn detached_op_drop_triggers_cancel_wake() {
+        let completion_table = Arc::new(CompletionTable::new(1));
+        let cancel_signal = Arc::new(DetachedCancelTable::new(1));
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let cancel_waker: Arc<dyn RemoteWaker> = Arc::new(CountingWaker {
+            wakes: wake_count.clone(),
+        });
+
+        let op = DetachedOp::<DummyOp, DummyPlatformOp> {
+            completion_table: Some(completion_table),
+            cancel_signal: Some(cancel_signal),
+            cancel_waker: Some(cancel_waker),
+            token: encode_completion_token(0, 1),
+            immediate_failure: None,
+            _phantom: std::marker::PhantomData,
+        };
+
+        drop(op);
+
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
     }
 }
