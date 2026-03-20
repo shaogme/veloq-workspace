@@ -155,7 +155,12 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             .take()
             .ok_or_else(|| io::Error::other("udp recv_stream buffer missing"))?;
         recv_buf.set_len(n);
-        let addr = op_back.addr.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+        let addr = op_back.addr.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "driver must populate UdpRecvStream::addr before completion",
+            )
+        })?;
         Ok(UdpRecvDatagram {
             buf: recv_buf,
             addr,

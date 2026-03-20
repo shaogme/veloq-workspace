@@ -93,9 +93,7 @@ fn test_udp_socket_options() {
         let client = builder2
             .bind("127.0.0.1:0")
             .expect("Failed to bind UDP client");
-        let _client_addr = client
-            .local_addr()
-            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        let _client_addr = client.local_addr().expect("Failed to get local addr");
 
         let socket_clone = socket.clone();
         let (tx, rx) = veloq_sync::oneshot::channel::<()>();
