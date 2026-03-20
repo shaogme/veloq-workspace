@@ -17,6 +17,7 @@ use veloq_driver_core::driver::{
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 use veloq_driver_core::op_registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
+use veloq_driver_core::slot::DetachedCancelTable;
 
 mod lifecycle;
 mod registration;
@@ -73,6 +74,7 @@ pub struct UringDriver {
     pub(crate) pending_cancellations: VecDeque<usize>,
     pub(crate) completion_events: SharedCompletionQueue,
     pub(crate) completion_table: SharedCompletionTable,
+    pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_token: Option<usize>,
@@ -129,6 +131,7 @@ impl UringDriver {
             pending_cancellations: VecDeque::new(),
             completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
             completion_table: std::sync::Arc::new(CompletionTable::new(entries as usize)),
+            detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
             waker_fd: Arc::new(EventFd { fd: waker_fd }),
             waker_token: None,
             waker_payload: None,
@@ -331,6 +334,7 @@ impl UringDriver {
     }
 
     pub(crate) fn wait_internal(&mut self) -> io::Result<()> {
+        self.drain_cancel_requests();
         self.flush_cancellations();
         self.flush_backlog();
 
@@ -599,6 +603,10 @@ impl Driver for UringDriver {
         self.ops.shared.clone()
     }
 
+    fn detached_cancel_table(&self) -> std::sync::Arc<DetachedCancelTable> {
+        self.detached_cancel_table.clone()
+    }
+
     fn slot_set_payload(
         &mut self,
         user_data: usize,
@@ -668,6 +676,7 @@ impl Driver for UringDriver {
     }
 
     fn submit_queue(&mut self) -> io::Result<()> {
+        self.drain_cancel_requests();
         self.flush_cancellations();
         self.flush_backlog();
         self.submit_to_kernel()
@@ -678,6 +687,7 @@ impl Driver for UringDriver {
     }
 
     fn process_completions(&mut self) {
+        self.drain_cancel_requests();
         self.process_completions_internal();
         self.flush_cancellations();
         self.flush_backlog();

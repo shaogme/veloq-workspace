@@ -9,7 +9,7 @@ use windows_sys::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
 
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
 use veloq_driver_core::driver::{
-    CompletionTable, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    CompletionTable, Driver, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
 };
 use veloq_driver_core::op_registry::OpRegistry;
 use veloq_wheel::{Wheel, WheelConfig};
@@ -24,7 +24,7 @@ use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
 use crate::rio::RioState;
 use crate::win32::Overlapped;
-use veloq_driver_core::slot::{InFlight, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{DetachedCancelTable, InFlight, SlotRegistryExt, SlotView};
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
@@ -47,6 +47,7 @@ pub struct IocpDriver {
     pub(crate) is_notified: Arc<AtomicBool>,
     pub(crate) completion_events: SharedCompletionQueue,
     pub(crate) completion_table: SharedCompletionTable,
+    pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
 
     // RIO Support (required)
     pub(crate) rio_state: RioState,
@@ -116,6 +117,7 @@ impl IocpDriver {
             is_notified: Arc::new(AtomicBool::new(false)),
             completion_events: Arc::new(SegQueue::new()),
             completion_table: Arc::new(CompletionTable::new(entries as usize)),
+            detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
             rio_state,
             registrar: Box::new(NoopRegistrar),
             shutting_down: false,
@@ -125,6 +127,7 @@ impl IocpDriver {
 
     /// Retrieves completion events from the I/O completion port.
     pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> io::Result<()> {
+        self.drain_cancel_requests();
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
         trace!(wait_ms, "Entering GetQueuedCompletionStatus");

@@ -17,7 +17,9 @@ use veloq_driver_core::driver::{
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
-use veloq_driver_core::slot::{ErasedPayload, Initialized, SlotRegistryExt, SlotTable, SlotView};
+use veloq_driver_core::slot::{
+    DetachedCancelTable, ErasedPayload, Initialized, SlotRegistryExt, SlotTable, SlotView,
+};
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
@@ -411,6 +413,10 @@ impl Driver for IocpDriver {
         self.ops.shared.clone()
     }
 
+    fn detached_cancel_table(&self) -> Arc<DetachedCancelTable> {
+        self.detached_cancel_table.clone()
+    }
+
     fn slot_set_payload(&mut self, user_data: usize, payload: ErasedPayload) {
         let _ =
             self.ops
@@ -504,6 +510,7 @@ impl Driver for IocpDriver {
     }
 
     fn submit_queue(&mut self) -> io::Result<()> {
+        self.drain_cancel_requests();
         Ok(())
     }
 

@@ -4,7 +4,7 @@ use crate::op_registry::OpRegistry;
 use crossbeam_utils::CachePadded;
 use std::io;
 use std::marker::PhantomData;
-use veloq_shim::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use veloq_shim::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Manual payload container: raw pointer + static kind + drop fn.
 pub struct ErasedPayload {
@@ -183,12 +183,12 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     }
 
     #[inline]
-    fn state(&self, ordering: Ordering) -> SlotState {
+    pub(crate) fn state(&self, ordering: Ordering) -> SlotState {
         self.state.load(ordering)
     }
 
     #[inline]
-    fn set_state(&self, state: SlotState, ordering: Ordering) {
+    pub(crate) fn set_state(&self, state: SlotState, ordering: Ordering) {
         self.state.store(state, ordering);
     }
 
@@ -209,6 +209,73 @@ impl<Op, S: SlotSidecar> Default for SlotData<Op, S> {
 }
 
 pub type SlotEntry<Op, S> = CachePadded<SlotData<Op, S>>;
+
+pub struct DetachedCancelTable {
+    slot_count: usize,
+    cancel_words: Box<[CachePadded<AtomicU64>]>,
+    cancel_generations: Box<[CachePadded<AtomicU64>]>,
+}
+
+impl DetachedCancelTable {
+    pub fn new(capacity: usize) -> Self {
+        let word_count = capacity.div_ceil(64);
+        let mut cancel_words = Vec::with_capacity(word_count);
+        for _ in 0..word_count {
+            cancel_words.push(CachePadded::new(AtomicU64::new(0)));
+        }
+        let mut cancel_generations = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            cancel_generations.push(CachePadded::new(AtomicU64::new(0)));
+        }
+        Self {
+            slot_count: capacity,
+            cancel_words: cancel_words.into_boxed_slice(),
+            cancel_generations: cancel_generations.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn request_cancel(&self, token: u64) {
+        let (idx, generation) = crate::driver::decode_completion_token(token);
+        if idx >= self.slot_count {
+            return;
+        }
+
+        let generation = generation as u64;
+        let cell = &self.cancel_generations[idx];
+        let mut current = cell.load(Ordering::Acquire);
+        while generation > current {
+            match cell.compare_exchange_weak(
+                current,
+                generation,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        self.cancel_words[word_idx].fetch_or(1u64 << bit_idx, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn cancel_word_count(&self) -> usize {
+        self.cancel_words.len()
+    }
+
+    #[inline]
+    pub fn take_cancel_word(&self, word_idx: usize) -> u64 {
+        self.cancel_words[word_idx].fetch_and(0, Ordering::AcqRel)
+    }
+
+    #[inline]
+    pub(crate) fn cancel_generation(&self, idx: usize) -> u64 {
+        self.cancel_generations[idx].load(Ordering::Acquire)
+    }
+}
 
 pub struct SlotTable<Op, S: SlotSidecar> {
     pub slots: Box<[SlotEntry<Op, S>]>,
@@ -252,6 +319,16 @@ impl<Op, S: SlotSidecar> SlotTable<Op, S> {
     pub fn pop_all(&self) -> usize {
         self.remote_free_head
             .swap(Self::NULL_INDEX, Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn slot_snapshot(&self, idx: usize) -> Option<(u32, SlotState)> {
+        self.slots.get(idx).map(|slot| {
+            (
+                slot.generation.load(Ordering::Acquire),
+                slot.state(Ordering::Acquire),
+            )
+        })
     }
 }
 
@@ -647,5 +724,31 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
         );
         entry.set_state(SlotState::Pending, Ordering::Release);
         Slot::new_internal(entry, op, storage, &mut op_entry.platform_data, index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::encode_completion_token;
+
+    #[test]
+    fn request_cancel_sets_bit_and_generation() {
+        let cancel_table = DetachedCancelTable::new(64);
+        cancel_table.request_cancel(encode_completion_token(5, 7));
+
+        assert_eq!(cancel_table.take_cancel_word(0), 1u64 << 5);
+        assert_eq!(cancel_table.cancel_generation(5), 7);
+    }
+
+    #[test]
+    fn request_cancel_keeps_newest_generation() {
+        let cancel_table = DetachedCancelTable::new(64);
+
+        cancel_table.request_cancel(encode_completion_token(5, 7));
+        cancel_table.request_cancel(encode_completion_token(5, 11));
+        cancel_table.request_cancel(encode_completion_token(5, 9));
+
+        assert_eq!(cancel_table.cancel_generation(5), 11);
     }
 }

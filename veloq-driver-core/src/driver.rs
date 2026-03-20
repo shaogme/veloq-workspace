@@ -1,4 +1,5 @@
 use crate::slot;
+use crate::slot::is_runnable_state;
 use crate::{Handle, IoFd, SlotSidecar};
 use crossbeam_queue::SegQueue;
 
@@ -459,6 +460,31 @@ pub trait Driver: 'static {
     fn reserve_op(&mut self) -> io::Result<(usize, u32)>;
 
     fn slot_table(&self) -> std::sync::Arc<slot::SlotTable<Self::Op, Self::Sidecar>>;
+
+    fn detached_cancel_table(&self) -> std::sync::Arc<slot::DetachedCancelTable>;
+
+    fn drain_cancel_requests(&mut self) {
+        let shared = self.slot_table();
+        let cancel_table = self.detached_cancel_table();
+        let word_count = cancel_table.cancel_word_count();
+        for word_idx in 0..word_count {
+            let mut bits = cancel_table.take_cancel_word(word_idx);
+            while bits != 0 {
+                let bit_idx = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+
+                let user_data = word_idx * 64 + bit_idx;
+                let Some((generation, state)) = shared.slot_snapshot(user_data) else {
+                    continue;
+                };
+                if cancel_table.cancel_generation(user_data) == generation as u64
+                    && is_runnable_state(state)
+                {
+                    self.cancel_op(user_data);
+                }
+            }
+        }
+    }
 
     fn slot_set_payload(&mut self, user_data: usize, payload: slot::ErasedPayload);
 

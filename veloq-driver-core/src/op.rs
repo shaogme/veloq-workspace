@@ -22,6 +22,7 @@ use crate::driver::{
     CompletionRecord, Driver, PlatformOp, SharedCompletionTable, SubmitBinder,
     encode_completion_token, event_res_to_io,
 };
+use crate::slot::DetachedCancelTable;
 use crate::{Handle, IoFd, SockAddr};
 
 #[repr(u16)]
@@ -198,6 +199,7 @@ impl<T> Op<T> {
                 let mut op_platform = Some(kernel_op);
                 let token = encode_completion_token(user_data, generation);
                 let completion_table = driver.completion_table();
+                let cancel_signal = driver.detached_cancel_table();
                 driver.slot_set_payload(user_data, T::payload_into_erased(payload));
 
                 if let Err(e) = driver
@@ -219,6 +221,7 @@ impl<T> Op<T> {
                         drop(op);
                         DetachedOp {
                             completion_table: None,
+                            cancel_signal: None,
                             token: 0,
                             immediate_failure: Some((e, T::from_user_payload(payload))),
                             _phantom: std::marker::PhantomData,
@@ -227,6 +230,7 @@ impl<T> Op<T> {
                         completion_table.mark_waiting(token);
                         DetachedOp {
                             completion_table: Some(completion_table),
+                            cancel_signal: Some(cancel_signal),
                             token,
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
@@ -236,6 +240,7 @@ impl<T> Op<T> {
                     completion_table.mark_waiting(token);
                     DetachedOp {
                         completion_table: Some(completion_table),
+                        cancel_signal: Some(cancel_signal),
                         token,
                         immediate_failure: None,
                         _phantom: std::marker::PhantomData,
@@ -247,6 +252,7 @@ impl<T> Op<T> {
                 // Return DetachedOp with immediate failure.
                 DetachedOp {
                     completion_table: None,
+                    cancel_signal: None,
                     token: 0,
                     immediate_failure: Some((e, data)),
                     _phantom: std::marker::PhantomData,
@@ -278,6 +284,7 @@ where
     T: IntoPlatformOp<O>,
 {
     completion_table: Option<SharedCompletionTable>,
+    cancel_signal: Option<std::sync::Arc<DetachedCancelTable>>,
     token: u64,
     immediate_failure: Option<(std::io::Error, T)>,
     _phantom: std::marker::PhantomData<(T, fn() -> O)>,
@@ -297,6 +304,9 @@ where
     fn drop(&mut self) {
         if let Some(table) = self.completion_table.as_ref() {
             table.mark_orphaned(self.token);
+        }
+        if let Some(cancel_signal) = self.cancel_signal.as_ref() {
+            cancel_signal.request_cancel(self.token);
         }
     }
 }

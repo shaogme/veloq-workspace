@@ -83,15 +83,10 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
 
         if self.local_free_head != SlotTable::<Op, S>::NULL_INDEX {
             let idx = self.local_free_head;
-            self.local_free_head = self.shared.slots[idx]
-                .next_free
-                .load(Ordering::Relaxed);
+            self.local_free_head = self.shared.slots[idx].next_free.load(Ordering::Relaxed);
 
             let slot = &self.shared.slots[idx];
-            let new_gen = slot
-                .generation
-                .load(Ordering::Relaxed)
-                .wrapping_add(1);
+            let new_gen = slot.generation.load(Ordering::Relaxed).wrapping_add(1);
             slot.reset(new_gen);
 
             self.local[idx].op = None;
