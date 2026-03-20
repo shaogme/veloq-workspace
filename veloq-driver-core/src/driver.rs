@@ -545,7 +545,7 @@ pub trait Driver: 'static {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<io::Result<Poll<()>>>;
+    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>>;
 
     fn submit_queue(&mut self) -> io::Result<()>;
 
@@ -623,6 +623,15 @@ impl<T> Outcome<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitStatus {
+    /// Operation successfully submitted or queued. It *will* eventually produce
+    /// a completion result in the `CompletionTable`.
+    InFlight,
+    /// Operation failed synchronously and no completion result will be produced.
+    Void,
+}
+
 #[derive(Default)]
 pub struct SubmitBinder;
 
@@ -633,13 +642,17 @@ impl SubmitBinder {
     }
 
     #[inline]
-    pub fn ok(self, poll: Poll<()>) -> Outcome<io::Result<Poll<()>>> {
+    pub fn ok(self, poll: Poll<()>) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         Outcome(Ok(poll))
     }
 
     #[inline]
-    pub fn err(self, err: io::Error) -> Outcome<io::Result<Poll<()>>> {
-        Outcome(Err(err))
+    pub fn err(
+        self,
+        err: io::Error,
+        status: SubmitStatus,
+    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
+        Outcome(Err((err, status)))
     }
 }
 

@@ -14,7 +14,7 @@ use veloq_blocking::{BlockingTask, get_blocking_pool};
 pub use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar as CoreCompletionSidecar, Driver, Outcome, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
 use veloq_driver_core::slot::{
@@ -140,7 +140,7 @@ impl IocpDriver {
         op_in: &mut Option<IocpOp>,
         binder: SubmitBinder,
         is_rio_pool_waiting: bool,
-    ) -> Outcome<io::Result<Poll<()>>> {
+    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         match result {
             Ok(submit::SubmissionResult::Pending) => {
                 if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
@@ -154,7 +154,7 @@ impl IocpDriver {
             Ok(submit::SubmissionResult::Offload(task)) => {
                 match Self::handle_offload(ops, ctx, user_data, task) {
                     Ok(poll) => binder.ok(poll),
-                    Err(e) => binder.err(e),
+                    Err(e) => binder.err(e, SubmitStatus::InFlight),
                 }
             }
             Ok(submit::SubmissionResult::Timer(duration)) => {
@@ -166,7 +166,7 @@ impl IocpDriver {
                     *op_in = guard.take_op();
                 }
                 ops.remove(user_data);
-                binder.err(e)
+                binder.err(e, SubmitStatus::Void)
             }
         }
     }
@@ -177,14 +177,14 @@ impl IocpDriver {
         user_data: usize,
         op_in: &mut Option<IocpOp>,
         binder: SubmitBinder,
-    ) -> Outcome<io::Result<Poll<()>>> {
+    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         if let Err(err) = ctx.port.notify(user_data) {
             if let Some(SlotView::InFlight(slot)) = ops.slot_view(user_data) {
                 let mut guard = slot.complete();
                 *op_in = guard.take_op();
             }
             ops.remove(user_data);
-            binder.err(err)
+            binder.err(err, SubmitStatus::Void)
         } else {
             if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
                 op_entry.platform_data.rio_pool_waiting = false;
@@ -199,7 +199,7 @@ impl IocpDriver {
         user_data: usize,
         duration: Duration,
         binder: SubmitBinder,
-    ) -> Outcome<io::Result<Poll<()>>> {
+    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         let timeout = ctx.wheel.insert(user_data, duration);
         if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
             op_entry.platform_data.timer_id = Some(timeout);
@@ -438,18 +438,28 @@ impl Driver for IocpDriver {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<io::Result<Poll<()>>> {
+    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         if self.shutting_down {
-            return binder.err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
+            return binder.err(
+                io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+                ),
+                SubmitStatus::Void,
+            );
         }
         let op = match op_in.take() {
             Some(op) => op,
-            None => return binder.err(io::Error::new(io::ErrorKind::InvalidInput, "Empty Option")),
+            None => {
+                return binder.err(
+                    io::Error::new(io::ErrorKind::InvalidInput, "Empty Option"),
+                    SubmitStatus::Void,
+                );
+            }
         };
 
         let (is_rio_pool_waiting, result) = match self.call_op_submit(user_data, op) {
             Ok(res) => res,
-            Err(e) => return binder.err(e),
+            Err(e) => return binder.err(e, SubmitStatus::Void),
         };
 
         let ctx = SubmitContextInternal {

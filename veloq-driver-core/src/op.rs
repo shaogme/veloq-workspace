@@ -21,7 +21,7 @@ use veloq_buf::FixedBuf;
 
 use crate::driver::{
     CompletionRecord, Driver, PlatformOp, PollRecordResult, RemoteWaker, SharedCompletionTable,
-    SubmitBinder, encode_completion_token, event_res_to_io,
+    SubmitBinder, SubmitStatus, encode_completion_token, event_res_to_io,
 };
 use crate::slot::DetachedCancelTable;
 use crate::{Handle, IoFd, SockAddr};
@@ -204,32 +204,12 @@ impl<T> Op<T> {
                 let cancel_waker = driver.create_waker();
                 driver.slot_set_payload(user_data, T::payload_into_erased(payload));
 
-                if let Err(e) = driver
+                let result = driver
                     .submit(user_data, &mut op_platform, SubmitBinder::new())
-                    .into_inner()
-                {
-                    trace!("Submit failed: {}", e);
-                    // Submit failed synchronously.
-                    // If the platform op is returned, propagate immediate failure with payload.
-                    // Otherwise, fall back to slot-monitoring path and let generation check resolve.
-                    if let Some(op) = op_platform.take() {
-                        let payload_any = driver
-                            .slot_take_payload(user_data)
-                            .expect("Payload missing while recovering submit failure");
-                        if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                            panic!("DetachedOp payload kind mismatch on submit recovery");
-                        }
-                        let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-                        drop(op);
-                        DetachedOp {
-                            completion_table: None,
-                            cancel_signal: None,
-                            cancel_waker: None,
-                            token: 0,
-                            immediate_failure: Some((e, T::from_user_payload(payload))),
-                            _phantom: std::marker::PhantomData,
-                        }
-                    } else {
+                    .into_inner();
+
+                match result {
+                    Ok(_) => {
                         completion_table.mark_waiting(token);
                         DetachedOp {
                             completion_table: Some(completion_table),
@@ -240,15 +220,39 @@ impl<T> Op<T> {
                             _phantom: std::marker::PhantomData,
                         }
                     }
-                } else {
-                    completion_table.mark_waiting(token);
-                    DetachedOp {
-                        completion_table: Some(completion_table),
-                        cancel_signal: Some(cancel_signal),
-                        cancel_waker: Some(cancel_waker),
-                        token,
-                        immediate_failure: None,
-                        _phantom: std::marker::PhantomData,
+                    Err((e, status)) => {
+                        trace!("Submit failed synchronously: {} (status={:?})", e, status);
+                        if status == SubmitStatus::Void {
+                            let payload_any = driver
+                                .slot_take_payload(user_data)
+                                .expect("Payload missing while recovering submit failure");
+                            if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                                panic!("DetachedOp payload kind mismatch on submit recovery");
+                            }
+                            let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                            if let Some(op) = op_platform.take() {
+                                drop(op);
+                            }
+                            DetachedOp {
+                                completion_table: None,
+                                cancel_signal: None,
+                                cancel_waker: None,
+                                token: 0,
+                                immediate_failure: Some((e, T::from_user_payload(payload))),
+                                _phantom: std::marker::PhantomData,
+                            }
+                        } else {
+                            // status == InFlight: driver guaranteed an asynchronous result
+                            completion_table.mark_waiting(token);
+                            DetachedOp {
+                                completion_table: Some(completion_table),
+                                cancel_signal: Some(cancel_signal),
+                                cancel_waker: Some(cancel_waker),
+                                token,
+                                immediate_failure: None,
+                                _phantom: std::marker::PhantomData,
+                            }
+                        }
                     }
                 }
             }
@@ -453,22 +457,33 @@ where
 
             // Submit to driver.
             let mut driver_op_opt = Some(driver_op);
-            if let Err(e) = driver
+            let result = driver
                 .submit(user_data, &mut driver_op_opt, SubmitBinder::new())
-                .into_inner()
-            {
-                if let Some(val) = driver_op_opt.take() {
-                    drop(val);
+                .into_inner();
+
+            match result {
+                Ok(_) => {
+                    op.state = State::Submitted;
                 }
-                let payload_any = driver
-                    .slot_take_payload(user_data)
-                    .expect("Payload missing while recovering submit failure");
-                if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                    panic!("LocalOp payload kind mismatch on submit recovery");
+                Err((e, status)) => {
+                    if status == SubmitStatus::Void {
+                        if let Some(val) = driver_op_opt.take() {
+                            drop(val);
+                        }
+                        let payload_any = driver
+                            .slot_take_payload(user_data)
+                            .expect("Payload missing while recovering submit failure");
+                        if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                            panic!("LocalOp payload kind mismatch on submit recovery");
+                        }
+                        let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                        let data = T::from_user_payload(payload);
+                        return Poll::Ready(OpResult::Completed(Err(e), data));
+                    } else {
+                        // status == InFlight: driver guaranteed an asynchronous result
+                        op.state = State::Submitted;
+                    }
                 }
-                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-                let data = T::from_user_payload(payload);
-                return Poll::Ready(OpResult::Completed(Err(e), data));
             }
 
             op.state = State::Submitted;

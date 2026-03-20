@@ -13,7 +13,8 @@ use crate::config::{BufferRegistrationMode, IoFd, IoMode, RawHandle, UringConfig
 use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, CompletionTable, Driver, Outcome, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, encode_completion_token,
+    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    encode_completion_token,
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 use veloq_driver_core::op_registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
@@ -635,15 +636,18 @@ impl Driver for UringDriver {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<io::Result<Poll<()>>> {
+    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         let op: UringOp = op_in.take().expect("submit called with empty Option");
         let strategy = op.vtable.strategy;
         if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
             *op_in = Some(op);
-            return binder.err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "background op cannot be submitted normally",
-            ));
+            return binder.err(
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "background op cannot be submitted normally",
+                ),
+                SubmitStatus::Void,
+            );
         }
 
         match strategy {
@@ -774,7 +778,7 @@ impl UringDriver {
         op: <Self as Driver>::Op,
         op_in: &mut Option<<Self as Driver>::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<io::Result<Poll<()>>> {
+    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
             Some(SlotView::Pending(slot)) => slot.init_op_with(op, |_| {}),
@@ -783,7 +787,10 @@ impl UringDriver {
                 slot
             }
             Some(SlotView::InFlight(_)) | Some(SlotView::Cancelled(_)) | None => {
-                return binder.err(io::Error::other("Op slot missing in registry"));
+                return binder.err(
+                    io::Error::other("Op slot missing in registry"),
+                    SubmitStatus::Void,
+                );
             }
         };
 
@@ -801,7 +808,7 @@ impl UringDriver {
                     .and_then(|(_, _, op, _)| op.take())
                     .expect("slot op missing in submit_sqe recovery");
                 *op_in = Some(op);
-                binder.err(e)
+                binder.err(e, SubmitStatus::Void)
             }
         }
     }
@@ -812,7 +819,7 @@ impl UringDriver {
         op: <Self as Driver>::Op,
         op_in: &mut Option<<Self as Driver>::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<io::Result<Poll<()>>> {
+    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
             Some(SlotView::Pending(slot)) => slot.init_op_with(op, |_| {}),
@@ -821,7 +828,10 @@ impl UringDriver {
                 slot
             }
             Some(SlotView::InFlight(_)) | Some(SlotView::Cancelled(_)) | None => {
-                return binder.err(io::Error::other("Op slot missing in registry"));
+                return binder.err(
+                    io::Error::other("Op slot missing in registry"),
+                    SubmitStatus::Void,
+                );
             }
         };
 
@@ -842,7 +852,7 @@ impl UringDriver {
                     .and_then(|(_, _, op, _)| op.take())
                     .expect("slot op missing in submit_timer recovery");
                 *op_in = Some(op);
-                binder.err(e)
+                binder.err(e, SubmitStatus::Void)
             }
         }
     }
