@@ -1,19 +1,62 @@
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::num::NonZeroUsize;
-use veloq_buf::{BufPool, FixedBuf, PoolTopology, nz};
-use veloq_runtime::net::{tcp::LocalTcpListener, tcp::LocalTcpStream, udp::LocalUdpSocket};
+use veloq_buf::{nz, BufPool, PoolTopology, FixedBuf};
 use veloq_runtime::{LocalExecutor, spawn_local};
+use veloq_runtime::net::{tcp::LocalTcpListener, tcp::LocalTcpStream, udp::LocalUdpSocket};
 
 fn create_local_executor() -> LocalExecutor {
     LocalExecutor::builder().build(move |registrar| {
         use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
         let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(16) });
         let topology = UniformSlot::new(multiplier);
-        let global_pool = topology
-            .create_pool(1)
-            .expect("Failed to create global pool");
+        let global_pool = topology.create_pool(1).expect("Failed to create global pool");
         topology.build(&global_pool, 0, registrar)
     })
+}
+
+async fn read_exact(stream: &LocalTcpStream, mut buf: FixedBuf, mut total_len: usize) -> FixedBuf {
+    buf.set_len(0);
+    while total_len > 0 {
+        let (res, b) = stream.recv(buf).await;
+        let n = res.unwrap();
+        if n == 0 {
+            panic!("Unexpected EOF");
+        }
+        buf = b;
+        let current_len = buf.len();
+        buf.set_len(current_len + n);
+        total_len -= n;
+    }
+    buf
+}
+
+async fn write_all(stream: &LocalTcpStream, mut buf: FixedBuf, total_len: usize) -> FixedBuf {
+    let mut written = 0;
+    while written < total_len {
+        let (res, b) = stream.send(buf).await;
+        let n = res.unwrap();
+        if n == 0 {
+            panic!("Unexpected EOF during write");
+        }
+        buf = b;
+        written += n;
+        
+        // We need to shift the unwritten part of the buffer if we had a partial write.
+        // For simplicity in the benchmark since we reuse the buffer we can just assume 
+        // standard send. But strictly speaking, FixedBuf doesn't have an easy way 
+        // to slice the front off. However, LocalTcpStream::send sends the whole `buf`.
+        // To implement a true `write_all` with FixedBuf, we'd need to shift contents.
+        // For this benchmark, since send sends the *entire* valid length of `buf`, 
+        // we can just shift the data to the front by `n`.
+        if written < total_len {
+            let remaining = buf.len() - n;
+            unsafe {
+                std::ptr::copy(buf.as_ptr().add(n), buf.as_mut_ptr(), remaining);
+            }
+            buf.set_len(remaining);
+        }
+    }
+    buf
 }
 
 fn benchmark_tcp(c: &mut Criterion) {
@@ -28,17 +71,15 @@ fn benchmark_tcp(c: &mut Criterion) {
             exec.block_on(async {
                 let listener = LocalTcpListener::bind("127.0.0.1:0").unwrap();
                 let addr = listener.local_addr().unwrap();
-
+                
                 let server = spawn_local(async move {
                     let (stream, _): (LocalTcpStream, _) = listener.accept().await.unwrap();
                     let pool = veloq_runtime::runtime::context::current_pool().unwrap();
                     for _ in 0..iterations {
                         let mut buf = pool.alloc(nz!(4096)).unwrap();
-                        let (res, b): (std::io::Result<usize>, FixedBuf) = stream.recv(buf).await;
-                        res.unwrap();
-                        buf = b;
-                        let (res, _): (std::io::Result<usize>, FixedBuf) = stream.send(buf).await;
-                        res.unwrap();
+                        buf = read_exact(&stream, buf, 4096).await;
+                        buf.set_len(4096); // Reset length for writing
+                        buf = write_all(&stream, buf, 4096).await;
                     }
                 });
 
@@ -48,14 +89,11 @@ fn benchmark_tcp(c: &mut Criterion) {
                     for _ in 0..iterations {
                         let mut buf = pool.alloc(nz!(4096)).unwrap();
                         buf.set_len(4096);
-                        let (res, b): (std::io::Result<usize>, FixedBuf) = stream.send(buf).await;
-                        res.unwrap();
-                        buf = b;
-                        let (res, _): (std::io::Result<usize>, FixedBuf) = stream.recv(buf).await;
-                        res.unwrap();
+                        buf = write_all(&stream, buf, 4096).await;
+                        buf = read_exact(&stream, buf, 4096).await;
                     }
                 });
-
+                
                 server.await;
                 client.await;
             });
@@ -63,25 +101,18 @@ fn benchmark_tcp(c: &mut Criterion) {
     });
 
     group.bench_function("tokio_tcp", |b| {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         b.iter(|| {
             rt.block_on(async {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
-
+                
                 let server = tokio::spawn(async move {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut buf = vec![0u8; 4096];
                     for _ in 0..iterations {
-                        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf)
-                            .await
-                            .unwrap();
-                        tokio::io::AsyncWriteExt::write_all(&mut stream, &buf)
-                            .await
-                            .unwrap();
+                        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+                        tokio::io::AsyncWriteExt::write_all(&mut stream, &buf).await.unwrap();
                     }
                 });
 
@@ -89,15 +120,11 @@ fn benchmark_tcp(c: &mut Criterion) {
                     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
                     let mut buf = vec![0u8; 4096];
                     for _ in 0..iterations {
-                        tokio::io::AsyncWriteExt::write_all(&mut stream, &buf)
-                            .await
-                            .unwrap();
-                        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf)
-                            .await
-                            .unwrap();
+                        tokio::io::AsyncWriteExt::write_all(&mut stream, &buf).await.unwrap();
+                        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
                     }
                 });
-
+                
                 server.await.unwrap();
                 client.await.unwrap();
             });
@@ -118,7 +145,7 @@ fn benchmark_udp(c: &mut Criterion) {
             exec.block_on(async {
                 let server_sock = LocalUdpSocket::bind("127.0.0.1:0").unwrap();
                 let server_addr = server_sock.local_addr().unwrap();
-
+                
                 let client_sock = LocalUdpSocket::bind("127.0.0.1:0").unwrap();
                 let client_addr = client_sock.local_addr().unwrap();
                 let _ = client_addr;
@@ -147,7 +174,7 @@ fn benchmark_udp(c: &mut Criterion) {
                         let _datagram = client_sock.recv_stream(buf).await.unwrap();
                     }
                 });
-
+                
                 server.await;
                 client.await;
             });
@@ -155,18 +182,13 @@ fn benchmark_udp(c: &mut Criterion) {
     });
 
     group.bench_function("tokio_udp", |b| {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         b.iter(|| {
             rt.block_on(async {
-                let server_sock =
-                    std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let server_sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
                 let server_addr = server_sock.local_addr().unwrap();
-
-                let client_sock =
-                    std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                
+                let client_sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
                 let client_addr = client_sock.local_addr().unwrap();
                 let _ = client_addr;
 
@@ -187,7 +209,7 @@ fn benchmark_udp(c: &mut Criterion) {
                         let (_len, _) = c.recv_from(&mut buf).await.unwrap();
                     }
                 });
-
+                
                 server.await.unwrap();
                 client.await.unwrap();
             });
