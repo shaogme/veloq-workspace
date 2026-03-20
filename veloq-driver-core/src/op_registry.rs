@@ -1,6 +1,6 @@
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
-use crate::slot::{ErasedPayload, SlotEntry, SlotStorage, SlotTable};
+use crate::slot::{ErasedPayload, SlotEntry, SlotState, SlotStorage, SlotTable};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 use veloq_shim::atomic::Ordering;
@@ -81,11 +81,20 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
             self.local_free_head = self.shared.pop_all();
         }
 
-        if self.local_free_head != SlotTable::<Op, S>::NULL_INDEX {
+        let mut deferred_non_idle = Vec::new();
+        while self.local_free_head != SlotTable::<Op, S>::NULL_INDEX {
             let idx = self.local_free_head;
             self.local_free_head = self.shared.slots[idx].next_free.load(Ordering::Relaxed);
 
             let slot = &self.shared.slots[idx];
+            let state = slot.state(Ordering::Acquire);
+            if state != SlotState::Idle {
+                // Detached completions may temporarily keep slots in READY/WAITING states.
+                // Those slots are not safe to recycle yet.
+                deferred_non_idle.push(idx);
+                continue;
+            }
+
             let new_gen = slot.generation(Ordering::Relaxed).wrapping_add(1);
             slot.reset(new_gen);
             slot.set_state(crate::slot::SlotState::Reserved, Ordering::Release);
@@ -94,15 +103,23 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
             self.local[idx].entry.platform_data = data;
             self.local[idx].storage.reset();
 
-            Ok(AllocResult {
+            for deferred_idx in deferred_non_idle {
+                self.shared.push_free(deferred_idx);
+            }
+
+            return Ok(AllocResult {
                 handle: OpHandle {
                     index: idx,
                     generation: new_gen,
                 },
-            })
-        } else {
-            Err(data)
+            });
         }
+
+        for deferred_idx in deferred_non_idle {
+            self.shared.push_free(deferred_idx);
+        }
+
+        Err(data)
     }
 
     pub fn insert(&mut self, entry: OpEntry<P>) -> Result<OpHandle, OpEntry<P>> {
