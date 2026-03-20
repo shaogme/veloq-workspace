@@ -787,3 +787,44 @@ fn test_tcp_cancel_recv() {
             crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
         });
 }
+
+#[test]
+fn test_tcp_read_exact_write_all() {
+    crate::tests::NetworkTestRunner::new("test_tcp_read_exact_write_all")
+        .worker_threads(1)
+        .run(|_| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+            const DATA: &[u8] = b"TCP Echo World!";
+            use crate::io::{AsyncBufRead, AsyncBufWrite};
+            let server_h = crate::runtime::context::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("Accept failed");
+                let mut read_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
+                read_buf.set_len(DATA.len());
+                
+                let (res, buf) = stream.read_exact(read_buf).await;
+                res.expect("Server read_exact failed");
+                assert_eq!(buf.as_slice(), DATA);
+
+                let (res, _) = stream.write_all(buf).await;
+                res.expect("Server write_all failed");
+            });
+
+            let client = TcpStream::connect(listen_addr).await.expect("Failed to connect");
+            let mut write_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
+            write_buf.as_slice_mut()[..DATA.len()].copy_from_slice(DATA);
+            write_buf.set_len(DATA.len());
+
+            let (res, _) = client.write_all(write_buf).await;
+            res.expect("Client write_all failed");
+
+            let mut read_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
+            read_buf.set_len(DATA.len());
+            let (res, buf) = client.read_exact(read_buf).await;
+            res.expect("Client read_exact failed");
+            assert_eq!(buf.as_slice(), DATA);
+
+            server_h.await;
+        });
+}

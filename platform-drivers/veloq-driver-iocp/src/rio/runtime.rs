@@ -20,6 +20,7 @@ pub(crate) struct RioTarget {
     pub(crate) handle: HANDLE,
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
+    pub(crate) buf_offset: usize,
 }
 
 pub(crate) struct RioSendToArgs<'a> {
@@ -31,6 +32,7 @@ pub(crate) struct RioSendToArgs<'a> {
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
     pub(crate) page_idx: usize,
+    pub(crate) buf_offset: usize,
 }
 
 pub(crate) struct RioUdpStreamArgs<'a> {
@@ -102,6 +104,7 @@ impl RioState {
             user_data,
             generation,
             page_idx,
+            buf_offset,
             ..
         } = args;
 
@@ -118,7 +121,7 @@ impl RioState {
         let rq = self.ensure_actor((fd, handle), env)?.rq;
         let data_buf = self
             .registry
-            .prepare_submission(buf, buf.len() as u32, env)?;
+            .prepare_submission(buf, buf_offset, (buf.len().saturating_sub(buf_offset)) as u32, env)?;
         self.registry
             .ensure_page_reg(page_idx, slab_resolver, env)?;
 

@@ -59,9 +59,29 @@ impl Socket {
     }
 
     pub fn bind(&self, addr: SocketAddr) -> io::Result<()> {
-        let (raw_addr, raw_addr_len) = socket_addr_trans(addr);
-        let ret =
-            unsafe { libc::bind(self.fd, raw_addr.as_ptr() as *const sockaddr, raw_addr_len) };
+        let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
+        let ret = unsafe {
+            libc::bind(
+                self.fd,
+                &raw_addr.0 as *const _ as *const sockaddr,
+                raw_addr_len,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
+        let ret = unsafe {
+            libc::connect(
+                self.fd,
+                &raw_addr.0 as *const _ as *const sockaddr,
+                raw_addr_len,
+            )
+        };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -161,6 +181,10 @@ impl PlatformSocket for Socket {
 
     fn listen(&self, backlog: i32) -> io::Result<()> {
         Socket::listen(self, backlog)
+    }
+
+    fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        Socket::connect(self, addr)
     }
 
     fn into_raw(self) -> Self::Handle {
@@ -267,36 +291,6 @@ pub fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
     }
 }
 
-fn socket_addr_trans(addr: SocketAddr) -> (Vec<u8>, socklen_t) {
-    match addr {
-        SocketAddr::V4(a) => {
-            let mut sin: sockaddr_in = unsafe { std::mem::zeroed() };
-            sin.sin_family = libc::AF_INET as _;
-            sin.sin_port = a.port().to_be();
-            sin.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
-
-            let ptr = &sin as *const _ as *const u8;
-            let buf =
-                unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<sockaddr_in>()) }
-                    .to_vec();
-            (buf, std::mem::size_of::<sockaddr_in>() as socklen_t)
-        }
-        SocketAddr::V6(a) => {
-            let mut sin6: sockaddr_in6 = unsafe { std::mem::zeroed() };
-            sin6.sin6_family = libc::AF_INET6 as _;
-            sin6.sin6_port = a.port().to_be();
-            sin6.sin6_addr.s6_addr = a.ip().octets();
-            sin6.sin6_flowinfo = a.flowinfo();
-            sin6.sin6_scope_id = a.scope_id();
-
-            let ptr = &sin6 as *const _ as *const u8;
-            let buf =
-                unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<sockaddr_in6>()) }
-                    .to_vec();
-            (buf, std::mem::size_of::<sockaddr_in6>() as socklen_t)
-        }
-    }
-}
 
 pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) {
     let mut storage = SockAddrStorage::default();

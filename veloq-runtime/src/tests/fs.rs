@@ -217,6 +217,48 @@ fn test_fs_cancel_read() {
 
         completion_count_clone.fetch_add(1, Ordering::SeqCst);
     });
+ 
+     assert_eq!(completion_count.load(Ordering::SeqCst), 1);
+}
 
-    assert_eq!(completion_count.load(Ordering::SeqCst), 1);
+#[test]
+fn test_fs_read_exact_write_all() {
+    init_blocking_pool(BlockingPoolConfig::default());
+    let mut exec = create_local_executor();
+
+    exec.block_on(async move {
+        let path = Path::new("test_fs_exact.tmp");
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+
+        let file = LocalFile::create(path).await.expect("Failed to create file");
+        
+        // 1. Test write_all
+        const DATA: &[u8] = b"Hello Exact World!";
+        let mut write_buf = alloc(nz!(DATA.len()));
+        write_buf.as_slice_mut()[..DATA.len()].copy_from_slice(DATA);
+        write_buf.set_len(DATA.len());
+
+        use crate::io::{AsyncBufRead, AsyncBufWrite};
+        let (res, _) = file.write_all(write_buf).await;
+        res.expect("write_all failed");
+        
+        file.sync_all().await.expect("Sync failed");
+        drop(file);
+
+        // 2. Test read_exact
+        let file = LocalFile::open(path).await.expect("Failed to open file");
+        let mut read_buf = alloc(nz!(DATA.len()));
+        read_buf.set_len(DATA.len());
+        let (res, read_buf) = file.read_exact(read_buf).await;
+        res.expect("read_exact failed");
+        assert_eq!(read_buf.as_slice(), DATA);
+
+        // Cleanup
+        drop(file);
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+    });
 }

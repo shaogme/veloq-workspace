@@ -551,6 +551,7 @@ pub struct ReadFixed<H: Handle> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub offset: u64,
+    pub buf_offset: usize,
 }
 
 /// Write to a file descriptor at a specific offset using a fixed buffer.
@@ -558,18 +559,21 @@ pub struct WriteFixed<H: Handle> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub offset: u64,
+    pub buf_offset: usize,
 }
 
 /// Receive data from a socket into a fixed buffer.
 pub struct Recv<H: Handle> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
+    pub buf_offset: usize,
 }
 
 /// Send data from a fixed buffer to a socket.
 pub struct Send<H: Handle> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
+    pub buf_offset: usize,
 }
 
 /// Connect a socket to a remote address.
@@ -631,6 +635,7 @@ pub struct Accept<H: Handle, A: SockAddr> {
 pub struct SendTo<H: Handle> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
+    pub buf_offset: usize,
     /// Target address.
     pub addr: std::net::SocketAddr,
 }

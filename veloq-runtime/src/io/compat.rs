@@ -217,7 +217,7 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
             buf.set_len(unsafe { std::num::NonZeroUsize::new_unchecked(this.write_len) });
 
             let inner = this.inner.as_ref().expect("Compat polled after into_inner");
-            let fut = inner.write(buf);
+            let fut = inner.write_all(buf);
             this.write_future = Some(unsafe { erase_lifetime_read(Box::pin(fut)) });
         }
     }
@@ -247,7 +247,7 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
                     buf.set_len(unsafe { std::num::NonZeroUsize::new_unchecked(this.write_len) });
 
                     let inner = this.inner.as_ref().expect("Compat polled after into_inner");
-                    let fut = inner.write(buf);
+                    let fut = inner.write_all(buf);
                     this.write_future = Some(unsafe { erase_lifetime_read(Box::pin(fut)) });
                     continue;
                 }
@@ -294,7 +294,7 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
                     buf.set_len(unsafe { std::num::NonZeroUsize::new_unchecked(this.write_len) });
 
                     let inner = this.inner.as_ref().expect("Compat polled after into_inner");
-                    let fut = inner.write(buf);
+                    let fut = inner.write_all(buf);
                     this.write_future = Some(unsafe { erase_lifetime_read(Box::pin(fut)) });
                     continue;
                 }

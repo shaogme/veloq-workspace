@@ -37,8 +37,8 @@ macro_rules! make_rw_fixed {
             };
             let rw_op = unsafe { kernel.user.as_mut() };
             let region_info = rw_op.buf.resolve_region_info();
-            let ptr = rw_op.buf.as_mut_ptr();
-            let len = rw_op.buf.capacity() as u32;
+            let ptr = unsafe { rw_op.buf.as_mut_ptr().add(rw_op.buf_offset) };
+            let len = (rw_op.buf.capacity() - rw_op.buf_offset) as u32;
 
             let is_registered = if region_info.id != u16::MAX {
                 driver
@@ -79,8 +79,8 @@ macro_rules! make_rw_fixed {
             };
             let rw_op = unsafe { kernel.user.as_mut() };
             let region_info = rw_op.buf.resolve_region_info();
-            let ptr = rw_op.buf.as_slice().as_ptr();
-            let len = rw_op.buf.len() as u32;
+            let ptr = unsafe { rw_op.buf.as_slice().as_ptr().add(rw_op.buf_offset) };
+            let len = (rw_op.buf.len() - rw_op.buf_offset) as u32;
 
             let is_registered = if region_info.id != u16::MAX {
                 driver
@@ -146,17 +146,19 @@ macro_rules! make_buf_op {
                 _ => return opcode::Nop::new().build(),
             };
             let val = unsafe { kernel.user.as_mut() };
+            let ptr = unsafe { val.buf.as_mut_ptr().add(val.buf_offset) };
+            let len = (val.buf.capacity() - val.buf_offset) as u32;
             match val.fd {
                 IoFd::Raw(fd) => $opcode(
                     types::Fd(fd.fd),
-                    val.buf.as_mut_ptr(),
-                    val.buf.capacity() as u32,
+                    ptr,
+                    len,
                 )
                 .build(),
                 IoFd::Fixed(idx) => $opcode(
                     types::Fixed(idx),
-                    val.buf.as_mut_ptr(),
-                    val.buf.capacity() as u32,
+                    ptr,
+                    len,
                 )
                 .build(),
             }
@@ -172,17 +174,19 @@ macro_rules! make_buf_op {
                 _ => return opcode::Nop::new().build(),
             };
             let val = unsafe { kernel.user.as_mut() };
+            let ptr = unsafe { val.buf.as_slice().as_ptr().add(val.buf_offset) };
+            let len = (val.buf.len() - val.buf_offset) as u32;
             match val.fd {
                 IoFd::Raw(fd) => $opcode(
                     types::Fd(fd.fd),
-                    val.buf.as_slice().as_ptr(),
-                    val.buf.len() as u32,
+                    ptr,
+                    len,
                 )
                 .build(),
                 IoFd::Fixed(idx) => $opcode(
                     types::Fixed(idx),
-                    val.buf.as_slice().as_ptr(),
-                    val.buf.len() as u32,
+                    ptr,
+                    len,
                 )
                 .build(),
             }
@@ -287,8 +291,8 @@ pub(crate) unsafe fn make_sqe_send_to(
     };
     let user = unsafe { payload.user.as_ref() };
 
-    payload.iovec[0].iov_base = user.buf.as_slice().as_ptr() as *mut _;
-    payload.iovec[0].iov_len = user.buf.len();
+    payload.iovec[0].iov_base = unsafe { user.buf.as_slice().as_ptr().add(user.buf_offset) } as *mut _;
+    payload.iovec[0].iov_len = user.buf.len() - user.buf_offset;
 
     payload.msghdr.msg_name = &mut payload.msg_name as *mut _ as *mut libc::c_void;
     payload.msghdr.msg_namelen = payload.msg_namelen;

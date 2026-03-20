@@ -5,7 +5,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, getsockname, listen, setsockopt,
+    INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, connect, getsockname, listen, setsockopt,
 };
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
@@ -140,6 +140,21 @@ impl SafeSocket {
     pub fn listen(&self, backlog: i32) -> io::Result<()> {
         // SAFETY: The socket is valid and owned by us.
         let ret = unsafe { listen(self.0, backlog) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Connects the socket to a remote address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `addr` is a valid pointer to a `SOCKADDR`
+    /// structure and `len` is its size.
+    pub unsafe fn connect(&self, addr: *const SOCKADDR, len: i32) -> io::Result<()> {
+        // SAFETY: The caller ensures that `addr` and `len` are valid.
+        let ret = unsafe { connect(self.0, addr, len) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }

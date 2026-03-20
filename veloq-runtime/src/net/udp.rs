@@ -7,7 +7,7 @@ use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
-    Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, Recv as OpRecv,
+    DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, Recv as OpRecv,
     Send as OpSend, SendTo, UdpRecvDatagram, UdpRecvStream, UdpRefill,
 };
 
@@ -93,6 +93,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         let op = SendTo {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
+            buf_offset: 0,
             addr: target,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
@@ -162,21 +163,22 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
-        #[allow(clippy::unnecessary_cast)]
-        let op = Connect {
-            fd: IoFd::Raw(self.inner.raw()),
-            addr: raw_addr,
-            addr_len: raw_addr_len as u32,
-        };
-        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ())
+        self.inner.connect(addr)
     }
 
     pub async fn send(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+        self.send_subset(buf, 0).await
+    }
+
+    pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+        self.recv_subset(buf, 0).await
+    }
+
+    pub async fn send_subset(&self, buf: FixedBuf, buf_offset: usize) -> (io::Result<usize>, FixedBuf) {
         let op = OpSend {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
+            buf_offset,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let buf = op_back
@@ -185,10 +187,11 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         (res, buf)
     }
 
-    pub async fn recv(&self, buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+    pub async fn recv_subset(&self, buf: FixedBuf, buf_offset: usize) -> (io::Result<usize>, FixedBuf) {
         let op = OpRecv {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
+            buf_offset,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let buf = op_back
@@ -205,6 +208,30 @@ impl<S: OpSubmitter> crate::io::AsyncBufRead for GenericUdpSocket<S> {
     ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
         self.recv(buf)
     }
+
+    async fn read_exact(&self, mut buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+        let target = buf.len();
+        let mut total = 0;
+        while total < target {
+            let (res, b) = self.recv_subset(buf, total).await;
+            buf = b;
+            match res {
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "failed to fill whole buffer",
+                        )),
+                        buf,
+                    );
+                }
+                Ok(n) => total += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return (Err(e), buf),
+            }
+        }
+        (Ok(total), buf)
+    }
 }
 
 impl<S: OpSubmitter> crate::io::AsyncBufWrite for GenericUdpSocket<S> {
@@ -213,6 +240,30 @@ impl<S: OpSubmitter> crate::io::AsyncBufWrite for GenericUdpSocket<S> {
         buf: FixedBuf,
     ) -> impl std::future::Future<Output = (io::Result<usize>, FixedBuf)> {
         self.send(buf)
+    }
+
+    async fn write_all(&self, mut buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+        let target = buf.len();
+        let mut total = 0;
+        while total < target {
+            let (res, b) = self.send_subset(buf, total).await;
+            buf = b;
+            match res {
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        )),
+                        buf,
+                    );
+                }
+                Ok(n) => total += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return (Err(e), buf),
+            }
+        }
+        (Ok(total), buf)
     }
 
     fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {

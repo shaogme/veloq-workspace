@@ -52,6 +52,7 @@ pub(crate) fn submit_recv(
             handle,
             user_data: header.user_data,
             generation: header.generation,
+            buf_offset: val.buf_offset,
         },
         &mut val.buf,
         ctx.registrar,
@@ -70,8 +71,8 @@ pub(crate) fn submit_recv(
             unsafe {
                 iocp_submit_read(
                     handle,
-                    val.buf.as_mut_ptr(),
-                    val.buf.len() as u32,
+                    val.buf.as_mut_ptr().add(val.buf_offset),
+                    (val.buf.len().saturating_sub(val.buf_offset)) as u32,
                     ctx.overlapped,
                 )
             }
@@ -105,6 +106,7 @@ pub(crate) fn submit_send(
             handle,
             user_data: header.user_data,
             generation: header.generation,
+            buf_offset: val.buf_offset,
         },
         &val.buf,
         ctx.registrar,
@@ -123,8 +125,8 @@ pub(crate) fn submit_send(
             unsafe {
                 iocp_submit_write(
                     handle,
-                    val.buf.as_ptr(),
-                    val.buf.len() as u32,
+                    val.buf.as_ptr().add(val.buf_offset),
+                    (val.buf.len().saturating_sub(val.buf_offset)) as u32,
                     ctx.overlapped,
                 )
             }
@@ -401,6 +403,7 @@ pub(crate) fn submit_send_to(
         user_data: header.user_data,
         generation: header.generation,
         page_idx,
+        buf_offset: user.buf_offset,
     };
     ctx.rio
         .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)

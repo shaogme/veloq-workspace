@@ -187,6 +187,7 @@ fn test_iocp_recv_with_buffer_pool() {
     let recv_op = Recv {
         fd: IoFd::Raw(client_handle),
         buf,
+        buf_offset: 0,
     };
 
     let (iocp_kernel, recv_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(recv_op);
@@ -285,6 +286,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let recv_op = Recv {
         fd: IoFd::Raw(client_handle),
         buf,
+        buf_offset: 0,
     };
     let (iocp_kernel, _recv_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(recv_op);
     let mut iocp_op = Some(iocp_kernel);
@@ -373,6 +375,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let recv_op = Recv {
         fd: IoFd::Raw(client_handle),
         buf,
+        buf_offset: 0,
     };
     let (iocp_kernel, _recv_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(recv_op);
     let mut iocp_op = Some(iocp_kernel);

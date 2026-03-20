@@ -38,4 +38,9 @@ impl InnerSocket {
         let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.0)) };
         socket.local_addr()
     }
+
+    pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.0)) };
+        socket.connect(addr)
+    }
 }

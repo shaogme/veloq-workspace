@@ -102,6 +102,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     let send_op = SendTo {
         fd: IoFd::Raw(client_handle),
         buf: send_buf,
+        buf_offset: 0,
         addr: server_addr,
     };
 
@@ -235,6 +236,7 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     let send_op = SendTo {
         fd: IoFd::Raw(client_handle),
         buf: send_buf,
+        buf_offset: 0,
         addr: server_addr,
     };
 

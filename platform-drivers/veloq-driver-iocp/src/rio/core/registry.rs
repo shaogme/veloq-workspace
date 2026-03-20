@@ -106,13 +106,14 @@ impl RioRegistry {
     pub(crate) fn prepare_submission(
         &mut self,
         buf: &FixedBuf,
+        buf_offset: usize,
         len: u32,
         env: RioEnv<'_>,
     ) -> io::Result<RIO_BUF> {
         let (buffer_id, offset) = self.resolve_buffer_id(buf, env)?;
         let rio_buf = RIO_BUF {
             BufferId: buffer_id.0,
-            Offset: offset,
+            Offset: offset + buf_offset as u32,
             Length: len,
         };
         Ok(rio_buf)

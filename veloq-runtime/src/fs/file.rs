@@ -244,28 +244,35 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
     }
 
     pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
+        self.read_at_subset(buf, offset, 0).await
+    }
+
+    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
+        self.write_at_subset(buf, offset, 0).await
+    }
+
+    pub async fn read_at_subset(&self, buf: FixedBuf, offset: u64, buf_offset: usize) -> (io::Result<usize>, FixedBuf) {
         let op = ReadFixed {
             fd: IoFd::Raw(self.inner.0),
             buf,
             offset,
+            buf_offset,
         };
 
         let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
 
-        // If Op is lost (Generation Mismatch), we lost the buffer.
-        // We cannot return the buffer as promised by the API.
-        // Panic is the only option to satisfy the signature without changing it.
         let buf = op
             .map(|o| o.buf)
             .unwrap_or_else(|| panic!("Op buffer lost"));
         (res, buf)
     }
 
-    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> (io::Result<usize>, FixedBuf) {
+    pub async fn write_at_subset(&self, buf: FixedBuf, offset: u64, buf_offset: usize) -> (io::Result<usize>, FixedBuf) {
         let op = WriteFixed {
             fd: IoFd::Raw(self.inner.0),
             buf,
             offset,
+            buf_offset,
         };
 
         let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
@@ -328,6 +335,34 @@ impl<S: OpSubmitter, P: FilePos> crate::io::AsyncBufRead for GenericFile<S, P> {
         }
         (res, buf)
     }
+
+    async fn read_exact(&self, mut buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+        let target = buf.len();
+        let mut total = 0;
+        while total < target {
+            let offset = self.pos.get();
+            let (res, b) = self.read_at_subset(buf, offset, total).await;
+            buf = b;
+            match res {
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "failed to fill whole buffer",
+                        )),
+                        buf,
+                    );
+                }
+                Ok(n) => {
+                    total += n;
+                    self.pos.add(n as u64);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return (Err(e), buf),
+            }
+        }
+        (Ok(total), buf)
+    }
 }
 
 impl<S: OpSubmitter, P: FilePos> crate::io::AsyncBufWrite for GenericFile<S, P> {
@@ -338,6 +373,34 @@ impl<S: OpSubmitter, P: FilePos> crate::io::AsyncBufWrite for GenericFile<S, P> 
             self.pos.add(n as u64);
         }
         (res, buf)
+    }
+
+    async fn write_all(&self, mut buf: FixedBuf) -> (io::Result<usize>, FixedBuf) {
+        let target = buf.len();
+        let mut total = 0;
+        while total < target {
+            let offset = self.pos.get();
+            let (res, b) = self.write_at_subset(buf, offset, total).await;
+            buf = b;
+            match res {
+                Ok(0) => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write whole buffer",
+                        )),
+                        buf,
+                    );
+                }
+                Ok(n) => {
+                    total += n;
+                    self.pos.add(n as u64);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return (Err(e), buf),
+            }
+        }
+        (Ok(total), buf)
     }
 
     fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {

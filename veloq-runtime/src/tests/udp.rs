@@ -797,3 +797,48 @@ fn test_udp_cancel_recv_stream() {
             };
         });
 }
+
+#[test]
+fn test_udp_read_exact_write_all() {
+    crate::tests::NetworkTestRunner::new("test_udp_read_exact_write_all")
+        .worker_threads(1)
+        .run(|_| async move {
+            let socket_server = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP socket");
+            let server_addr = socket_server.local_addr().expect("Failed to get local address");
+            
+            let socket_client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP socket");
+            let client_addr = socket_client.local_addr().expect("Failed to get local address");
+            
+            const DATA: &[u8] = b"UDP Exact World!";
+            use crate::io::{AsyncBufRead, AsyncBufWrite};
+            let (ready_tx, mut ready_rx) = crate::sync::mpsc::unbounded::<()>();
+
+            let server_h = crate::runtime::context::spawn(async move {
+                socket_server.connect(client_addr).await.expect("Server connect failed");
+                let mut read_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
+                read_buf.set_len(DATA.len());
+                
+                ready_tx.send(()).unwrap();
+
+                // For UDP, read_exact will read datagrams until the buffer is full.
+                let (res, buf) = socket_server.read_exact(read_buf).await;
+                res.expect("Server read_exact failed");
+                assert_eq!(buf.as_slice(), DATA);
+            });
+
+            // Wait for server to connect
+            ready_rx.recv().await.expect("Server ready signal failed");
+
+            // We need to connect the socket to use AsyncBufWrite/Read effectively with write()
+            socket_client.connect(server_addr).await.expect("Connect failed");
+
+            let mut write_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
+            write_buf.as_slice_mut()[..DATA.len()].copy_from_slice(DATA);
+            write_buf.set_len(DATA.len());
+
+            let (res, _) = socket_client.write_all(write_buf).await;
+            res.expect("Client write_all failed");
+
+            server_h.await;
+        });
+}

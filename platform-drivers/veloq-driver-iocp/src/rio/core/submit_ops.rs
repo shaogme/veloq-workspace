@@ -71,6 +71,7 @@ impl RioState {
             handle,
             user_data,
             generation,
+            buf_offset,
         } = target;
         let Some(dispatch) = self.kernel.dispatch else {
             return Ok(SubmissionResult::Pending);
@@ -82,9 +83,12 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let rio_buf = self
-            .registry
-            .prepare_submission(buf, buf.capacity() as u32, env)?;
+        let rio_buf = self.registry.prepare_submission(
+            buf,
+            buf_offset,
+            (buf.capacity().saturating_sub(buf_offset)) as u32,
+            env,
+        )?;
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
@@ -99,7 +103,7 @@ impl RioState {
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }
-
+ 
     pub(crate) fn try_submit_send(
         &mut self,
         target: RioTarget,
@@ -111,6 +115,7 @@ impl RioState {
             handle,
             user_data,
             generation,
+            buf_offset,
         } = target;
         let Some(dispatch) = self.kernel.dispatch else {
             return Ok(SubmissionResult::Pending);
@@ -122,9 +127,12 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         let rq = self.ensure_actor((fd, handle), env)?.rq;
-        let rio_buf = self
-            .registry
-            .prepare_submission(buf, buf.len() as u32, env)?;
+        let rio_buf = self.registry.prepare_submission(
+            buf,
+            buf_offset,
+            (buf.len().saturating_sub(buf_offset)) as u32,
+            env,
+        )?;
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);

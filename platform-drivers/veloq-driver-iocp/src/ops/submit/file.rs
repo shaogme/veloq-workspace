@@ -47,25 +47,27 @@ macro_rules! submit_io_op {
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
-            let ptr = get_ptr(&mut val.buf);
+            let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
+            let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
 
-            // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
-            unsafe { $wrapper_fn(handle, ptr as _, val.buf.len() as u32, ctx.overlapped) }.map_err(|e| {
-                crate::common::io_error(
-                    IocpErrorContext::Submission,
-                    e,
-                    format!(
-                        "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
-                        stringify!($fn_name),
-                        val.fd,
-                        handle,
-                        header.user_data,
-                        header.generation,
-                        val.offset,
-                        val.buf.len()
-                    ),
-                )
-            })
+             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
+             unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }.map_err(|e| {
+                 crate::common::io_error(
+                     IocpErrorContext::Submission,
+                     e,
+                     format!(
+                         "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
+                         stringify!($fn_name),
+                         val.fd,
+                         handle,
+                         header.user_data,
+                         header.generation,
+                         val.offset,
+                         val.buf_offset,
+                         len
+                     ),
+                 )
+             })
         }
     };
 }

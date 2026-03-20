@@ -66,6 +66,16 @@ impl Socket {
         }
     }
 
+    /// Connects the socket to the given address.
+    pub fn connect(&self, addr: SocketAddr) -> std::io::Result<()> {
+        let (storage, len) = socket_addr_to_storage(addr);
+        // SAFETY: storage is a valid SOCKADDR_STORAGE and we pass its pointer and size.
+        unsafe {
+            self.inner
+                .connect(&storage.0 as *const _ as *const SOCKADDR, len)
+        }
+    }
+
     /// Listens for incoming connections.
     pub fn listen(&self, backlog: i32) -> std::io::Result<()> {
         self.inner.listen(backlog)
@@ -176,6 +186,10 @@ impl PlatformSocket for Socket {
 
     fn listen(&self, backlog: i32) -> io::Result<()> {
         Socket::listen(self, backlog)
+    }
+
+    fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        Socket::connect(self, addr)
     }
 
     fn into_raw(self) -> Self::Handle {

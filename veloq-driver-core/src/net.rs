@@ -13,6 +13,7 @@ pub trait PlatformSocket: Sized + Send + 'static {
 
     fn bind(&self, addr: SocketAddr) -> io::Result<()>;
     fn listen(&self, backlog: i32) -> io::Result<()>;
+    fn connect(&self, addr: SocketAddr) -> io::Result<()>;
 
     fn into_raw(self) -> Self::Handle;
 
