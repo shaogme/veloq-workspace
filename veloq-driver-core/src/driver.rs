@@ -145,14 +145,21 @@ impl CompletionTable {
             let current = cell.state_gen.load(Ordering::Acquire);
             let (state, cell_gen) = unpack_state_gen(current);
 
-            // Stale completion check.
-            if state != CELL_STATE_IDLE && generation < cell_gen {
-                // If it's a very old generation, just discard it.
+            // Strict Option 3:
+            // 1. Generation mismatch must be rejected if not IDLE.
+            // 2. Generation upgrade only allowed from IDLE.
+            if generation < cell_gen {
+                return;
+            }
+            if generation > cell_gen && state != CELL_STATE_IDLE {
+                // Previous generation hasn't been cleared yet.
                 return;
             }
 
             match state {
                 CELL_STATE_IDLE | CELL_STATE_READY | CELL_STATE_WAITING => {
+                    // If generation > cell_gen, it MUST be IDLE (checked above).
+                    // If generation == cell_gen, we can proceed from any of these.
                     if cell
                         .state_gen
                         .compare_exchange(
@@ -192,8 +199,8 @@ impl CompletionTable {
                             return;
                         }
                     } else {
-                        // Stale completion for a slot that was orphaned but now maybe reused
-                        // (though reused would have changed gen).
+                        // generation > cell_gen but state is ORPHANED?
+                        // Strict rule says reject.
                         return;
                     }
                 }
@@ -299,22 +306,36 @@ impl CompletionTable {
             }
 
             if cell_gen < generation {
-                // Try to initial/update generation while keeping state if possible.
-                // This is needed for LocalOp which doesn't call mark_waiting.
-                if cell
-                    .state_gen
-                    .compare_exchange(
-                        current,
-                        pack_state_gen(state, generation),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-                {
-                    continue;
+                // Strict Option 3: Only upgrade generation if state is IDLE.
+                if state == CELL_STATE_IDLE {
+                    if cell
+                        .state_gen
+                        .compare_exchange(
+                            current,
+                            pack_state_gen(CELL_STATE_WAITING, generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        // Successfully initialized to new generation WAITING state.
+                        // Re-check for fast completion.
+                        let current_after = cell.state_gen.load(Ordering::Acquire);
+                        let (state_after, gen_after) = unpack_state_gen(current_after);
+                        if state_after == CELL_STATE_READY && gen_after == generation {
+                            waker.wake_by_ref();
+                        }
+                        return;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    // Slot not yet IDLE, cannot upgrade.
+                    return;
                 }
             }
 
+            // cell_gen == generation path.
             // Check for fast completion.
             let current_after = cell.state_gen.load(Ordering::Acquire);
             let (state_after, gen_after) = unpack_state_gen(current_after);
@@ -342,49 +363,50 @@ impl CompletionTable {
                 return;
             }
 
-            if state == CELL_STATE_READY && cell_generation == generation {
-                // Fast completion happened, leave as READY.
-                return;
-            }
+            if cell_generation < generation {
+                // Strict Option 3: Only upgrade generation if state is IDLE.
+                if state == CELL_STATE_IDLE {
+                    if cell
+                        .state_gen
+                        .compare_exchange(
+                            current,
+                            pack_state_gen(CELL_STATE_WAITING, generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                } else {
+                    // Cannot upgrade yet.
+                    return;
+                }
+            } else {
+                // cell_generation == generation
+                if state == CELL_STATE_READY {
+                    // Fast completion happened, leave as READY.
+                    return;
+                }
 
-            match state {
-                CELL_STATE_IDLE | CELL_STATE_ORPHANED | CELL_STATE_WAITING => {
-                    if cell
-                        .state_gen
-                        .compare_exchange(
-                            current,
-                            pack_state_gen(CELL_STATE_WAITING, generation),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        return;
-                    }
-                }
-                CELL_STATE_READY => {
-                    // Stale data or different operation, clear and wait.
-                    if cell
-                        .state_gen
-                        .compare_exchange(
-                            current,
-                            pack_state_gen(CELL_STATE_WAITING, generation),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        unsafe {
-                            cell.with_data_unchecked(|payload, detail| {
-                                let _ = payload.take();
-                                let _ = detail.take();
-                            });
+                match state {
+                    CELL_STATE_IDLE | CELL_STATE_ORPHANED | CELL_STATE_WAITING => {
+                        if cell
+                            .state_gen
+                            .compare_exchange(
+                                current,
+                                pack_state_gen(CELL_STATE_WAITING, generation),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            return;
                         }
-                        return;
                     }
+                    CELL_STATE_BUSY => hint::spin_loop(),
+                    _ => unreachable!(),
                 }
-                CELL_STATE_BUSY => hint::spin_loop(),
-                _ => unreachable!(),
             }
         }
     }
