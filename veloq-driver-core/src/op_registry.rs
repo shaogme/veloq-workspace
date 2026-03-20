@@ -86,7 +86,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
             self.local_free_head = self.shared.slots[idx].next_free.load(Ordering::Relaxed);
 
             let slot = &self.shared.slots[idx];
-            let new_gen = slot.generation.load(Ordering::Relaxed).wrapping_add(1);
+            let new_gen = slot.generation(Ordering::Relaxed).wrapping_add(1);
             slot.reset(new_gen);
             slot.set_state(crate::slot::SlotState::Pending, Ordering::Release);
 

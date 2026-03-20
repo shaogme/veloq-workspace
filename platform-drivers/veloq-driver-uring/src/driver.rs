@@ -374,7 +374,7 @@ impl UringDriver {
                         slot.platform_mut().timer_id = None;
                         let mut completed = slot.complete();
 
-                        let generation = completed.entry.generation.load(Ordering::Acquire);
+                        let generation = completed.entry.generation(Ordering::Acquire);
                         let _ = completed.take_op();
                         let (payload, detail) = completed.take_completion_data();
 
@@ -457,7 +457,7 @@ impl UringDriver {
                         });
 
                     let mut completed = slot.complete();
-                    let generation = completed.entry.generation.load(Ordering::Acquire);
+                    let generation = completed.entry.generation(Ordering::Acquire);
                     let res_code = io_result_to_event_res(&final_res);
 
                     let (payload, mut detail) = completed.take_completion_data();
@@ -476,7 +476,7 @@ impl UringDriver {
                     })
                 }
                 SlotView::Cancelled(slot) => {
-                    let generation = slot.entry.generation.load(Ordering::Acquire);
+                    let generation = slot.entry.generation(Ordering::Acquire);
                     let mut completed = slot.complete();
                     let (payload, detail) = completed.take_completion_data();
                     let _ = completed.take_op();

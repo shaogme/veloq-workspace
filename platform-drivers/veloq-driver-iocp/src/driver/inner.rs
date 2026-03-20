@@ -272,7 +272,7 @@ impl IocpDriver {
             _ => return,
         };
 
-        let generation = guard.entry.generation.load(Ordering::Acquire);
+        let generation = guard.entry.generation(Ordering::Acquire);
         let _ = guard.take_op();
         let (payload_erased, detail) = guard.take_completion_data();
         pending_events.push(CompletionSidecar {
@@ -306,7 +306,7 @@ impl IocpDriver {
                 {
                     let slot = &self.ops.shared.slots[user_data];
                     let op = &mut self.ops.local[user_data];
-                    slot_generation = slot.generation.load(Ordering::Acquire);
+                    slot_generation = slot.generation(Ordering::Acquire);
 
                     if op.entry.platform_data.generation != slot_generation {
                         debug!(user_data, "Ignoring stale completion");
@@ -321,7 +321,7 @@ impl IocpDriver {
                 Self::emit_event_inner(ctx, &mut self.ops, user_data, slot_generation, io_result);
             }
             Some(SlotView::Cancelled(slot)) => {
-                let slot_generation = slot.entry.generation.load(Ordering::Acquire);
+                let slot_generation = slot.entry.generation(Ordering::Acquire);
                 let mut completed = slot.complete();
                 let (payload, detail) = completed.take_completion_data();
                 let _ = completed.take_op();
@@ -549,9 +549,7 @@ impl IocpDriver {
         user_data: usize,
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
     ) {
-        let generation = ops.shared.slots[user_data]
-            .generation
-            .load(Ordering::Acquire);
+        let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
         let inflight = Self::with_inflight_slot(ops, user_data, |guard| {
             let mut guard = guard.complete();
             let _ = guard.take_op();

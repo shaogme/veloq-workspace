@@ -42,7 +42,7 @@ impl UringDriver {
 
                     timer_id.map(|tid| {
                         let mut completed = cancelled.complete();
-                        let generation = completed.entry.generation.load(Ordering::Acquire);
+                        let generation = completed.entry.generation(Ordering::Acquire);
                         let _ = completed.take_op();
                         let (payload, detail) = completed.take_completion_data();
 
@@ -173,7 +173,7 @@ fn cancel_slot_immediate<'a, S: SlotState>(
     slot: Slot<'a, S>,
     user_data: usize,
 ) -> CompletionSidecar {
-    let generation = slot.entry.generation.load(Ordering::Acquire);
+    let generation = slot.entry.generation(Ordering::Acquire);
     let (payload, detail) = slot.storage.with_mut(
         |_op: &mut Option<crate::op::UringOp>,
          result: &mut Option<io::Result<usize>>,

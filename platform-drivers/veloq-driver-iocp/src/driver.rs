@@ -78,7 +78,7 @@ impl IocpDriver {
         op: IocpOp,
     ) -> io::Result<Slot<'_, Initialized>> {
         let mut guard = ops.slot_init_pending(user_data);
-        let generation = guard.entry.generation.load(Ordering::Acquire);
+        let generation = guard.entry.generation(Ordering::Acquire);
         guard.platform_mut().generation = generation;
         let mut guard = guard.init_op_with(op, |sidecar| {
             sidecar.user_data = user_data;
@@ -114,7 +114,7 @@ impl IocpDriver {
                 let _ = guard.take_op();
                 let sidecar = CompletionSidecar {
                     user_data,
-                    generation: guard.entry.generation.load(Ordering::Acquire),
+                    generation: guard.entry.generation(Ordering::Acquire),
                     res: -err.raw_os_error().unwrap_or(1).abs(),
                     flags: 0,
                     payload,
