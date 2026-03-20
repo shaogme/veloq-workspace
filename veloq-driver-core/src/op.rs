@@ -367,10 +367,10 @@ where
         if let Some(cancel_signal) = self.cancel_signal.as_ref() {
             cancel_signal.request_cancel(self.token);
         }
-        if let Some(cancel_waker) = self.cancel_waker.as_ref() {
-            if let Err(e) = cancel_waker.wake() {
-                trace!("DetachedOp cancel wake failed: {}", e);
-            }
+        if let Some(cancel_waker) = self.cancel_waker.as_ref()
+            && let Err(e) = cancel_waker.wake()
+        {
+            trace!("DetachedOp cancel wake failed: {}", e);
         }
     }
 }
@@ -420,10 +420,7 @@ where
             PollRecordResult::Stale => {
                 return Poll::Ready(OpResult::ResourceLost(OpError::new(
                     LostReason::GenerationMismatch,
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "operation lost: slot recycled (generation mismatch)",
-                    ),
+                    std::io::Error::other("operation lost: slot recycled (generation mismatch)"),
                 )));
             }
             PollRecordResult::Pending => {}
@@ -555,7 +552,9 @@ where
                     let Some(payload_any) = payload_any else {
                         return Poll::Ready(OpResult::ResourceLost(OpError::new(
                             LostReason::PayloadMissing,
-                            std::io::Error::other("operation payload lost: completion sidecar missing"),
+                            std::io::Error::other(
+                                "operation payload lost: completion sidecar missing",
+                            ),
                         )));
                     };
                     if payload_any.kind != T::PAYLOAD_KIND as u16 {
@@ -573,8 +572,7 @@ where
                     op.state = State::Completed;
                     Poll::Ready(OpResult::ResourceLost(OpError::new(
                         LostReason::GenerationMismatch,
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        std::io::Error::other(
                             "operation lost: slot recycled (generation mismatch)",
                         ),
                     )))
@@ -847,7 +845,6 @@ impl<H: Handle + From<usize>, A: SockAddr> OpLifecycle for Accept<H, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::CompletionTable;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -886,10 +883,10 @@ mod tests {
 
         fn payload_into_erased(_: Self::UserPayload) -> crate::slot::ErasedPayload {
             unsafe fn drop_payload(ptr: *mut ()) {
-                let _ = unsafe { Box::from_raw(ptr as *mut ()) };
+                let _ = unsafe { Box::from_raw(ptr) };
             }
 
-            let ptr = Box::into_raw(Box::new(())) as *mut ();
+            let ptr = Box::into_raw(Box::new(()));
             crate::slot::ErasedPayload {
                 ptr,
                 kind: 1,
@@ -898,14 +895,15 @@ mod tests {
         }
 
         unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
-            let _ = unsafe { Box::from_raw(ptr as *mut ()) };
+            let _ = unsafe { Box::from_raw(ptr) };
             DummyPayload
         }
     }
 
     #[test]
     fn detached_op_drop_triggers_cancel_wake() {
-        let completion_table = Arc::new(CompletionTable::new(1));
+        let completion_table: SharedCompletionTable =
+            Arc::new(crate::slot::SlotTable::<DummyPlatformOp, ()>::new(1));
         let cancel_signal = Arc::new(DetachedCancelTable::new(1));
         let wake_count = Arc::new(AtomicUsize::new(0));
         let cancel_waker: Arc<dyn RemoteWaker> = Arc::new(CountingWaker {

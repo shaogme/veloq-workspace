@@ -103,12 +103,12 @@ impl AsyncBufWrite for MockIo {
         self.write(buf)
     }
 
-    fn flush(&self) -> impl Future<Output = io::Result<()>> {
-        async { Ok(()) }
+    async fn flush(&self) -> io::Result<()> {
+        Ok(())
     }
 
-    fn shutdown(&self) -> impl Future<Output = io::Result<()>> {
-        async { Ok(()) }
+    async fn shutdown(&self) -> io::Result<()> {
+        Ok(())
     }
 }
 

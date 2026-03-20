@@ -4,9 +4,12 @@ use crate::op_registry::OpRegistry;
 use crossbeam_utils::CachePadded;
 use std::io;
 use std::marker::PhantomData;
-use veloq_shim::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use veloq_atomic_waker::AtomicWaker;
+use veloq_shim::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use veloq_shim::cell::UnsafeCell;
 
 /// Manual payload container: raw pointer + static kind + drop fn.
+#[derive(Debug)]
 pub struct ErasedPayload {
     pub ptr: *mut (),
     pub kind: u16,
@@ -113,6 +116,14 @@ fn decode_slot_state(raw: u8) -> SlotState {
     }
 }
 
+const COMPLETION_GEN_SHIFT: u32 = 32;
+const COMPLETION_STATE_IDLE: u8 = 0;
+
+#[inline]
+pub(crate) const fn pack_completion_state_gen(state: u8, generation: u32) -> u64 {
+    ((state as u64) << COMPLETION_GEN_SHIFT) | (generation as u64)
+}
+
 pub struct SlotStorage<Op, S: SlotSidecar> {
     op: Option<Op>,
     result: Option<std::io::Result<usize>>,
@@ -167,6 +178,12 @@ pub struct SlotData<Op, S: SlotSidecar> {
     pub generation: AtomicU32,
     pub next_free: AtomicUsize,
     state: AtomicSlotState,
+    pub(crate) completion_state_gen: AtomicU64,
+    pub(crate) completion_res: AtomicI32,
+    pub(crate) completion_flags: AtomicU32,
+    pub(crate) completion_payload: UnsafeCell<Option<ErasedPayload>>,
+    pub(crate) completion_detail: UnsafeCell<Option<io::Result<usize>>>,
+    pub(crate) completion_waker: AtomicWaker,
     _marker: PhantomData<fn() -> (Op, S)>,
 }
 
@@ -178,6 +195,15 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
             generation: AtomicU32::new(0),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             state: AtomicSlotState::new(SlotState::Free),
+            completion_state_gen: AtomicU64::new(pack_completion_state_gen(
+                COMPLETION_STATE_IDLE,
+                0,
+            )),
+            completion_res: AtomicI32::new(0),
+            completion_flags: AtomicU32::new(0),
+            completion_payload: UnsafeCell::new(None),
+            completion_detail: UnsafeCell::new(None),
+            completion_waker: AtomicWaker::new(),
             _marker: PhantomData,
         }
     }
@@ -199,6 +225,20 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
 
     pub(crate) fn free(&self) {
         self.set_state(SlotState::Free, Ordering::Release);
+    }
+
+    /// # Safety
+    ///
+    /// The caller must guarantee exclusive mutable access to completion payload/detail.
+    #[inline]
+    pub(crate) unsafe fn completion_with_data_unchecked<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Option<ErasedPayload>, &mut Option<io::Result<usize>>) -> R,
+    {
+        unsafe {
+            self.completion_payload
+                .with_mut(|payload| self.completion_detail.with_mut(|detail| f(payload, detail)))
+        }
     }
 }
 
@@ -282,8 +322,7 @@ pub struct SlotTable<Op, S: SlotSidecar> {
     pub remote_free_head: AtomicUsize,
 }
 
-unsafe impl<Op: Send, S: SlotSidecar> Sync for SlotTable<Op, S> {}
-unsafe impl<Op: Send, S: SlotSidecar> Send for SlotTable<Op, S> {}
+unsafe impl<Op, S: SlotSidecar> Sync for SlotTable<Op, S> {}
 
 impl<Op, S: SlotSidecar> SlotTable<Op, S> {
     pub const NULL_INDEX: usize = usize::MAX;
@@ -460,7 +499,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Initialized, Op, P, S> {
 
     pub fn start_submission_with(
         self,
-        rollback: Option<fn(&mut Slot<'a, Initialized, Op, P, S>)>,
+        rollback: Option<SubmissionRollback<'a, Op, P, S>>,
     ) -> SubmissionGuard<'a, Op, P, S> {
         assert!(
             self.op.is_some(),
@@ -627,9 +666,11 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Cancelled, Op, P, S> {
     }
 }
 
+type SubmissionRollback<'a, Op, P, S> = fn(&mut Slot<'a, Initialized, Op, P, S>);
+
 pub struct SubmissionGuard<'a, Op: PlatformOp, P, S: SlotSidecar> {
     pub slot: Option<Slot<'a, Initialized, Op, P, S>>,
-    rollback: Option<fn(&mut Slot<'a, Initialized, Op, P, S>)>,
+    rollback: Option<SubmissionRollback<'a, Op, P, S>>,
     persisted: bool,
 }
 

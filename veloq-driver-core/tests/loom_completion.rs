@@ -1,12 +1,17 @@
 #![cfg(feature = "loom")]
 use std::sync::Arc;
 use veloq_driver_core::driver::*;
+use veloq_driver_core::slot::SlotTable;
 use veloq_shim::thread;
+
+struct DummyPlatformOp;
+
+impl PlatformOp for DummyPlatformOp {}
 
 #[test]
 fn test_completion_table_loom() {
     loom::model(|| {
-        let table = Arc::new(CompletionTable::new(1));
+        let table: SharedCompletionTable = Arc::new(SlotTable::<DummyPlatformOp, ()>::new(1));
         let token = encode_completion_token(0, 1);
 
         let table_cloned = table.clone();
@@ -27,10 +32,11 @@ fn test_completion_table_loom() {
         let consumer = thread::spawn(move || {
             // Mock consumer: mark waiting, then either poll or drop
             table_cloned2.mark_waiting(token);
-            if let Some(record) = table_cloned2.try_take_record(token) {
-                assert_eq!(record.event.user_data, token);
-            } else {
-                table_cloned2.mark_orphaned(token);
+            match table_cloned2.try_take_record(token) {
+                PollRecordResult::Ready(record) => assert_eq!(record.event.user_data, token),
+                PollRecordResult::Pending | PollRecordResult::Stale => {
+                    table_cloned2.mark_orphaned(token);
+                }
             }
         });
 
@@ -42,7 +48,7 @@ fn test_completion_table_loom() {
 #[test]
 fn test_detached_drop_race_loom() {
     loom::model(|| {
-        let table = Arc::new(CompletionTable::new(1));
+        let table: SharedCompletionTable = Arc::new(SlotTable::<DummyPlatformOp, ()>::new(1));
         let token = encode_completion_token(0, 1);
 
         let table_cloned = table.clone();

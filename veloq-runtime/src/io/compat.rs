@@ -1,4 +1,3 @@
-#![cfg(feature = "compat")]
 use std::future::Future;
 use std::io;
 use std::mem;
@@ -9,6 +8,11 @@ use futures::{AsyncRead, AsyncWrite};
 use veloq_buf::FixedBuf;
 
 use crate::io::{AsyncBufRead, AsyncBufWrite};
+
+type BufIoResult = io::Result<(usize, FixedBuf)>;
+type BufIoFuture<'a> = Pin<Box<dyn Future<Output = BufIoResult> + 'a>>;
+type BoxBufIoFuture = Pin<Box<dyn Future<Output = BufIoResult>>>;
+type BoxIoFuture = Pin<Box<dyn Future<Output = io::Result<()>>>>;
 
 /// A compatibility layer to adapt `AsyncBufRead` / `AsyncBufWrite` to `futures::io::AsyncRead` / `futures::io::AsyncWrite`.
 ///
@@ -25,10 +29,10 @@ pub struct Compat<T> {
     // Futures for async operations.
     // We erase the lifetime to store them, as they borrow `inner` (which is stable on heap).
     // We must ensure they are dropped before `inner` (the Box) is dropped.
-    read_future: Option<Pin<Box<dyn Future<Output = io::Result<(usize, FixedBuf)>>>>>,
-    write_future: Option<Pin<Box<dyn Future<Output = io::Result<(usize, FixedBuf)>>>>>,
-    flush_future: Option<Pin<Box<dyn Future<Output = io::Result<()>>>>>,
-    shutdown_future: Option<Pin<Box<dyn Future<Output = io::Result<()>>>>>,
+    read_future: Option<BoxBufIoFuture>,
+    write_future: Option<BoxBufIoFuture>,
+    flush_future: Option<BoxIoFuture>,
+    shutdown_future: Option<BoxIoFuture>,
 
     read_pos: usize,
     read_cap: usize,
@@ -75,15 +79,13 @@ impl<T> Drop for Compat<T> {
 }
 
 // Helper to erase lifetime of future.
-unsafe fn erase_lifetime_read(
-    fut: Pin<Box<dyn Future<Output = io::Result<(usize, FixedBuf)>> + '_>>,
-) -> Pin<Box<dyn Future<Output = io::Result<(usize, FixedBuf)>>>> {
+unsafe fn erase_lifetime_read(fut: BufIoFuture<'_>) -> BoxBufIoFuture {
     unsafe { mem::transmute(fut) }
 }
 
 unsafe fn erase_lifetime_void(
     fut: Pin<Box<dyn Future<Output = io::Result<()>> + '_>>,
-) -> Pin<Box<dyn Future<Output = io::Result<()>>>> {
+) -> BoxIoFuture {
     unsafe { mem::transmute(fut) }
 }
 
@@ -137,10 +139,7 @@ impl<T: AsyncBufRead> AsyncRead for Compat<T> {
             let mut buf = match this.buf.take() {
                 Some(b) => b,
                 None => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Buffer missing for read",
-                    )));
+                    return Poll::Ready(Err(io::Error::other("Buffer missing for read")));
                 }
             };
 
@@ -181,10 +180,7 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
             let buf = match this.buf.as_mut() {
                 Some(b) => b,
                 None => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Buffer missing for write",
-                    )));
+                    return Poll::Ready(Err(io::Error::other("Buffer missing for write")));
                 }
             };
 
@@ -203,10 +199,7 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
             }
 
             if this.write_len == 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Buffer has zero capacity",
-                )));
+                return Poll::Ready(Err(io::Error::other("Buffer has zero capacity")));
             }
 
             let mut buf = this.buf.take().unwrap();
@@ -236,15 +229,15 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
                 }
             }
 
-            if this.write_len > 0 {
-                if let Some(mut buf) = this.buf.take() {
-                    buf.set_len(this.write_len);
+            if this.write_len > 0
+                && let Some(mut buf) = this.buf.take()
+            {
+                buf.set_len(this.write_len);
 
-                    let inner = this.inner.as_ref().expect("Compat polled after into_inner");
-                    let fut = inner.write_all(buf);
-                    this.write_future = Some(unsafe { erase_lifetime_read(Box::pin(fut)) });
-                    continue;
-                }
+                let inner = this.inner.as_ref().expect("Compat polled after into_inner");
+                let fut = inner.write_all(buf);
+                this.write_future = Some(unsafe { erase_lifetime_read(Box::pin(fut)) });
+                continue;
             }
 
             if let Some(mut fut) = this.flush_future.take() {
@@ -281,15 +274,15 @@ impl<T: AsyncBufWrite> AsyncWrite for Compat<T> {
                 }
             }
 
-            if this.write_len > 0 {
-                if let Some(mut buf) = this.buf.take() {
-                    buf.set_len(this.write_len);
+            if this.write_len > 0
+                && let Some(mut buf) = this.buf.take()
+            {
+                buf.set_len(this.write_len);
 
-                    let inner = this.inner.as_ref().expect("Compat polled after into_inner");
-                    let fut = inner.write_all(buf);
-                    this.write_future = Some(unsafe { erase_lifetime_read(Box::pin(fut)) });
-                    continue;
-                }
+                let inner = this.inner.as_ref().expect("Compat polled after into_inner");
+                let fut = inner.write_all(buf);
+                this.write_future = Some(unsafe { erase_lifetime_read(Box::pin(fut)) });
+                continue;
             }
 
             if let Some(mut fut) = this.shutdown_future.take() {

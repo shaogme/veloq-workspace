@@ -12,9 +12,8 @@ use tracing::{debug, trace};
 use crate::config::{BufferRegistrationMode, IoFd, IoMode, RawHandle, UringConfig};
 use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionSidecar, CompletionTable, Driver, Outcome, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
-    encode_completion_token,
+    CompletionEvent, CompletionSidecar, Driver, Outcome, RemoteWaker, SharedCompletionQueue,
+    SharedCompletionTable, SubmitBinder, SubmitStatus, encode_completion_token,
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 use veloq_driver_core::op_registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
@@ -115,6 +114,7 @@ impl UringDriver {
         })?;
 
         let ops = OpRegistry::new(entries as usize);
+        let completion_table: SharedCompletionTable = ops.shared.clone();
 
         let waker_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if waker_fd < 0 {
@@ -131,7 +131,7 @@ impl UringDriver {
             backlog: VecDeque::new(),
             pending_cancellations: VecDeque::new(),
             completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
-            completion_table: std::sync::Arc::new(CompletionTable::new(entries as usize)),
+            completion_table,
             detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
             waker_fd: Arc::new(EventFd { fd: waker_fd }),
             waker_token: None,

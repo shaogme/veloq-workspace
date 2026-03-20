@@ -3,8 +3,7 @@ use crate::slot::is_runnable_state;
 use crate::{Handle, IoFd, SlotSidecar};
 use crossbeam_queue::SegQueue;
 
-use veloq_shim::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
-use veloq_shim::cell::UnsafeCell;
+use veloq_shim::atomic::Ordering;
 use veloq_shim::hint;
 
 use std::io;
@@ -12,7 +11,6 @@ use std::sync::Arc;
 
 use std::task::Poll;
 use std::task::Waker;
-use veloq_atomic_waker::AtomicWaker;
 
 pub const CELL_STATE_IDLE: u8 = 0;
 pub const CELL_STATE_WAITING: u8 = 1;
@@ -56,46 +54,7 @@ pub struct CompletionEvent {
 }
 
 pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
-pub type SharedCompletionTable = Arc<CompletionTable>;
-
-pub struct CompletionCell {
-    state_gen: AtomicU64,
-    res: AtomicI32,
-    flags: AtomicU32,
-    payload: UnsafeCell<Option<slot::ErasedPayload>>,
-    detail: UnsafeCell<Option<io::Result<usize>>>,
-    waker: AtomicWaker,
-}
-
-unsafe impl Sync for CompletionCell {}
-
-impl CompletionCell {
-    fn new() -> Self {
-        Self {
-            state_gen: AtomicU64::new(pack_state_gen(CELL_STATE_IDLE, 0)),
-            res: AtomicI32::new(0),
-            flags: AtomicU32::new(0),
-            payload: UnsafeCell::new(None),
-            detail: UnsafeCell::new(None),
-            waker: AtomicWaker::new(),
-        }
-    }
-
-    /// # Safety
-    ///
-    /// Caller must ensure exclusive access to completion payload/detail for this cell.
-    #[inline]
-    unsafe fn with_data_unchecked<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut Option<slot::ErasedPayload>, &mut Option<io::Result<usize>>) -> R,
-    {
-        // SAFETY: Caller guarantees exclusive mutable access to these fields.
-        unsafe {
-            self.payload
-                .with_mut(|payload| self.detail.with_mut(|detail| f(payload, detail)))
-        }
-    }
-}
+pub type SharedCompletionTable = Arc<dyn CompletionAccess>;
 
 pub struct CompletionRecord {
     pub event: CompletionEvent,
@@ -113,36 +72,47 @@ pub enum PollRecordResult {
     Stale,
 }
 
-pub struct CompletionTable {
-    cells: Box<[CompletionCell]>,
-}
-
-impl CompletionTable {
-    pub fn new(capacity: usize) -> Self {
-        let mut cells = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            cells.push(CompletionCell::new());
-        }
-        Self {
-            cells: cells.into_boxed_slice(),
-        }
-    }
-
-    #[inline]
-    pub fn record_completion_with_data(
+pub trait CompletionAccess: Send + Sync {
+    fn record_completion_with_data(
         &self,
         event: CompletionEvent,
         payload: Option<slot::ErasedPayload>,
         detail: Option<io::Result<usize>>,
+    );
+
+    fn try_take_record(&self, token: u64) -> PollRecordResult;
+
+    #[inline]
+    fn try_take(&self, token: u64) -> PollRecordResult {
+        self.try_take_record(token)
+    }
+
+    fn register_waker(&self, token: u64, waker: &Waker);
+
+    fn mark_waiting(&self, token: u64);
+
+    fn mark_orphaned(&self, token: u64);
+
+    #[cfg(any(test, feature = "loom"))]
+    fn debug_get_state(&self, idx: usize) -> u8;
+}
+
+impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S> {
+    #[inline]
+    fn record_completion_with_data(
+        &self,
+        event: CompletionEvent,
+        mut payload: Option<slot::ErasedPayload>,
+        mut detail: Option<io::Result<usize>>,
     ) {
         let (idx, generation) = decode_completion_token(event.user_data);
-        if idx >= self.cells.len() {
+        if idx >= self.slots.len() {
             return;
         }
-        let cell = &self.cells[idx];
+        let cell = &self.slots[idx];
 
         loop {
-            let current = cell.state_gen.load(Ordering::Acquire);
+            let current = cell.completion_state_gen.load(Ordering::Acquire);
             let (state, cell_gen) = unpack_state_gen(current);
 
             // Strict Option 3:
@@ -161,7 +131,7 @@ impl CompletionTable {
                     // If generation > cell_gen, it MUST be IDLE (checked above).
                     // If generation == cell_gen, we can proceed from any of these.
                     if cell
-                        .state_gen
+                        .completion_state_gen
                         .compare_exchange(
                             current,
                             pack_state_gen(CELL_STATE_BUSY, generation),
@@ -172,7 +142,7 @@ impl CompletionTable {
                     {
                         if state == CELL_STATE_READY {
                             unsafe {
-                                cell.with_data_unchecked(|payload_cell, detail_cell| {
+                                cell.completion_with_data_unchecked(|payload_cell, detail_cell| {
                                     let _ = payload_cell.take();
                                     let _ = detail_cell.take();
                                 });
@@ -184,7 +154,7 @@ impl CompletionTable {
                 CELL_STATE_ORPHANED => {
                     if cell_gen == generation {
                         if cell
-                            .state_gen
+                            .completion_state_gen
                             .compare_exchange(
                                 current,
                                 pack_state_gen(CELL_STATE_IDLE, generation),
@@ -194,8 +164,8 @@ impl CompletionTable {
                             .is_ok()
                         {
                             // Abandoned by consumer, drop incoming data
-                            drop(payload);
-                            drop(detail);
+                            let _ = payload.take();
+                            let _ = detail.take();
                             return;
                         }
                     } else {
@@ -212,39 +182,31 @@ impl CompletionTable {
         }
 
         unsafe {
-            cell.with_data_unchecked(|payload_cell, detail_cell| {
-                *payload_cell = payload;
-                *detail_cell = detail;
+            cell.completion_with_data_unchecked(|payload_cell, detail_cell| {
+                *payload_cell = payload.take();
+                *detail_cell = detail.take();
             });
         }
-        cell.res.store(event.res, Ordering::Release);
-        cell.flags.store(event.flags, Ordering::Release);
+        cell.completion_res.store(event.res, Ordering::Release);
+        cell.completion_flags.store(event.flags, Ordering::Release);
 
-        cell.state_gen.store(
+        cell.completion_state_gen.store(
             pack_state_gen(CELL_STATE_READY, generation),
             Ordering::Release,
         );
 
-        cell.waker.wake();
+        cell.completion_waker.wake();
     }
 
     #[inline]
-    pub fn try_take(&self, token: u64) -> PollRecordResult {
-        match self.try_take_record(token) {
-            PollRecordResult::Ready(record) => PollRecordResult::Ready(record),
-            other => other,
-        }
-    }
-
-    #[inline]
-    pub fn try_take_record(&self, token: u64) -> PollRecordResult {
+    fn try_take_record(&self, token: u64) -> PollRecordResult {
         let (idx, generation) = decode_completion_token(token);
-        if idx >= self.cells.len() {
+        if idx >= self.slots.len() {
             return PollRecordResult::Pending;
         }
-        let cell = &self.cells[idx];
+        let cell = &self.slots[idx];
 
-        let current = cell.state_gen.load(Ordering::Acquire);
+        let current = cell.completion_state_gen.load(Ordering::Acquire);
         let (state, cell_gen) = unpack_state_gen(current);
 
         // If the cell's generation is strictly greater than ours, we are stale.
@@ -257,7 +219,7 @@ impl CompletionTable {
         }
 
         if cell
-            .state_gen
+            .completion_state_gen
             .compare_exchange(
                 current,
                 pack_state_gen(CELL_STATE_IDLE, generation),
@@ -270,15 +232,15 @@ impl CompletionTable {
         }
 
         let (payload, detail) = unsafe {
-            cell.with_data_unchecked(|payload_cell, detail_cell| {
+            cell.completion_with_data_unchecked(|payload_cell, detail_cell| {
                 (payload_cell.take(), detail_cell.take())
             })
         };
         PollRecordResult::Ready(CompletionRecord {
             event: CompletionEvent {
                 user_data: token,
-                res: cell.res.load(Ordering::Acquire),
-                flags: cell.flags.load(Ordering::Acquire),
+                res: cell.completion_res.load(Ordering::Acquire),
+                flags: cell.completion_flags.load(Ordering::Acquire),
             },
             payload,
             detail,
@@ -286,19 +248,19 @@ impl CompletionTable {
     }
 
     #[inline]
-    pub fn register_waker(&self, token: u64, waker: &Waker) {
+    fn register_waker(&self, token: u64, waker: &Waker) {
         let (idx, generation) = decode_completion_token(token);
-        if idx >= self.cells.len() {
+        if idx >= self.slots.len() {
             return;
         }
-        let cell = &self.cells[idx];
+        let cell = &self.slots[idx];
 
         loop {
-            let current = cell.state_gen.load(Ordering::Acquire);
+            let current = cell.completion_state_gen.load(Ordering::Acquire);
             let (state, cell_gen) = unpack_state_gen(current);
 
             // Register waker first to avoid missing a race.
-            cell.waker.register(waker);
+            cell.completion_waker.register(waker);
 
             if cell_gen > generation {
                 // Already stale, no point in waiting or updating.
@@ -309,7 +271,7 @@ impl CompletionTable {
                 // Strict Option 3: Only upgrade generation if state is IDLE.
                 if state == CELL_STATE_IDLE {
                     if cell
-                        .state_gen
+                        .completion_state_gen
                         .compare_exchange(
                             current,
                             pack_state_gen(CELL_STATE_WAITING, generation),
@@ -320,7 +282,7 @@ impl CompletionTable {
                     {
                         // Successfully initialized to new generation WAITING state.
                         // Re-check for fast completion.
-                        let current_after = cell.state_gen.load(Ordering::Acquire);
+                        let current_after = cell.completion_state_gen.load(Ordering::Acquire);
                         let (state_after, gen_after) = unpack_state_gen(current_after);
                         if state_after == CELL_STATE_READY && gen_after == generation {
                             waker.wake_by_ref();
@@ -337,7 +299,7 @@ impl CompletionTable {
 
             // cell_gen == generation path.
             // Check for fast completion.
-            let current_after = cell.state_gen.load(Ordering::Acquire);
+            let current_after = cell.completion_state_gen.load(Ordering::Acquire);
             let (state_after, gen_after) = unpack_state_gen(current_after);
             if state_after == CELL_STATE_READY && gen_after == generation {
                 waker.wake_by_ref();
@@ -347,15 +309,15 @@ impl CompletionTable {
     }
 
     #[inline]
-    pub fn mark_waiting(&self, token: u64) {
+    fn mark_waiting(&self, token: u64) {
         let (idx, generation) = decode_completion_token(token);
-        if idx >= self.cells.len() {
+        if idx >= self.slots.len() {
             return;
         }
-        let cell = &self.cells[idx];
+        let cell = &self.slots[idx];
 
         loop {
-            let current = cell.state_gen.load(Ordering::Acquire);
+            let current = cell.completion_state_gen.load(Ordering::Acquire);
             let (state, cell_generation) = unpack_state_gen(current);
 
             if cell_generation > generation {
@@ -367,7 +329,7 @@ impl CompletionTable {
                 // Strict Option 3: Only upgrade generation if state is IDLE.
                 if state == CELL_STATE_IDLE {
                     if cell
-                        .state_gen
+                        .completion_state_gen
                         .compare_exchange(
                             current,
                             pack_state_gen(CELL_STATE_WAITING, generation),
@@ -392,7 +354,7 @@ impl CompletionTable {
                 match state {
                     CELL_STATE_IDLE | CELL_STATE_ORPHANED | CELL_STATE_WAITING => {
                         if cell
-                            .state_gen
+                            .completion_state_gen
                             .compare_exchange(
                                 current,
                                 pack_state_gen(CELL_STATE_WAITING, generation),
@@ -412,15 +374,15 @@ impl CompletionTable {
     }
 
     #[inline]
-    pub fn mark_orphaned(&self, token: u64) {
+    fn mark_orphaned(&self, token: u64) {
         let (idx, generation) = decode_completion_token(token);
-        if idx >= self.cells.len() {
+        if idx >= self.slots.len() {
             return;
         }
-        let cell = &self.cells[idx];
+        let cell = &self.slots[idx];
 
         loop {
-            let current = cell.state_gen.load(Ordering::Acquire);
+            let current = cell.completion_state_gen.load(Ordering::Acquire);
             let (state, cell_gen) = unpack_state_gen(current);
 
             match state {
@@ -429,7 +391,7 @@ impl CompletionTable {
                         return;
                     }
                     if cell
-                        .state_gen
+                        .completion_state_gen
                         .compare_exchange(
                             current,
                             pack_state_gen(CELL_STATE_ORPHANED, generation),
@@ -444,7 +406,7 @@ impl CompletionTable {
                 CELL_STATE_READY => {
                     if cell_gen == generation {
                         if cell
-                            .state_gen
+                            .completion_state_gen
                             .compare_exchange(
                                 current,
                                 pack_state_gen(CELL_STATE_IDLE, generation),
@@ -454,7 +416,7 @@ impl CompletionTable {
                             .is_ok()
                         {
                             unsafe {
-                                cell.with_data_unchecked(|payload_cell, detail_cell| {
+                                cell.completion_with_data_unchecked(|payload_cell, detail_cell| {
                                     let _ = payload_cell.take();
                                     let _ = detail_cell.take();
                                 });
@@ -475,8 +437,9 @@ impl CompletionTable {
     }
 
     #[inline]
-    pub fn debug_get_state(&self, idx: usize) -> u8 {
-        let current = self.cells[idx].state_gen.load(Ordering::Acquire);
+    #[cfg(any(test, feature = "loom"))]
+    fn debug_get_state(&self, idx: usize) -> u8 {
+        let current = self.slots[idx].completion_state_gen.load(Ordering::Acquire);
         unpack_state_gen(current).0
     }
 }

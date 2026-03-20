@@ -9,7 +9,7 @@ use windows_sys::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
 
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
 use veloq_driver_core::driver::{
-    CompletionTable, Driver, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    Driver, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
 };
 use veloq_driver_core::op_registry::OpRegistry;
 use veloq_wheel::{Wheel, WheelConfig};
@@ -106,9 +106,11 @@ impl IocpDriver {
                     ),
                 )
             })?;
+        let ops = OpRegistry::new(entries as usize);
+        let completion_table: SharedCompletionTable = ops.shared.clone();
         Ok(Self {
             port: Arc::new(port_val),
-            ops: OpRegistry::new(entries as usize),
+            ops,
             extensions,
             wheel: Wheel::new(WheelConfig::default()),
             timer_buffer: Vec::new(),
@@ -116,7 +118,7 @@ impl IocpDriver {
             free_slots: Vec::new(),
             is_notified: Arc::new(AtomicBool::new(false)),
             completion_events: Arc::new(SegQueue::new()),
-            completion_table: Arc::new(CompletionTable::new(entries as usize)),
+            completion_table,
             detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
             rio_state,
             registrar: Box::new(NoopRegistrar),
@@ -471,7 +473,7 @@ impl IocpDriver {
 
         let state = self.ops.slot_view(user_data);
         match state {
-            Some(SlotView::Cancelled(_)) => return,
+            Some(SlotView::Cancelled(_)) => {}
             Some(SlotView::InFlight(_)) => {
                 let ctx = CancelContext {
                     registered_files: &self.registered_files,
