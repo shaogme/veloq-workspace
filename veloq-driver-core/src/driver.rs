@@ -1,15 +1,37 @@
 use crate::slot;
 use crate::{Handle, IoFd, SlotSidecar};
 use crossbeam_queue::SegQueue;
-use std::cell::UnsafeCell;
+
+use veloq_shim::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use veloq_shim::cell::UnsafeCell;
+use veloq_shim::hint;
+
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+
 use std::task::Poll;
 use std::task::Waker;
 use veloq_atomic_waker::AtomicWaker;
 
+pub const CELL_STATE_IDLE: u8 = 0;
+pub const CELL_STATE_WAITING: u8 = 1;
+pub const CELL_STATE_READY: u8 = 2;
+pub const CELL_STATE_ORPHANED: u8 = 3;
+pub const CELL_STATE_BUSY: u8 = 4;
+
 /// Platform-specific operation trait
+const STATE_GEN_SHIFT: u32 = 32;
+
+#[inline]
+fn pack_state_gen(state: u8, generation: u32) -> u64 {
+    ((state as u64) << STATE_GEN_SHIFT) | (generation as u64)
+}
+
+#[inline]
+fn unpack_state_gen(val: u64) -> (u8, u32) {
+    ((val >> STATE_GEN_SHIFT) as u8, (val & 0xffff_ffff) as u32)
+}
+
 pub trait PlatformOp: 'static {}
 
 pub struct CompletionSidecar {
@@ -36,9 +58,7 @@ pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
 pub type SharedCompletionTable = Arc<CompletionTable>;
 
 pub struct CompletionCell {
-    expected_generation: AtomicU32,
-    ready_generation: AtomicU32,
-    ready: AtomicBool,
+    state_gen: AtomicU64,
     res: AtomicI32,
     flags: AtomicU32,
     payload: UnsafeCell<Option<slot::ErasedPayload>>,
@@ -51,9 +71,7 @@ unsafe impl Sync for CompletionCell {}
 impl CompletionCell {
     fn new() -> Self {
         Self {
-            expected_generation: AtomicU32::new(0),
-            ready_generation: AtomicU32::new(0),
-            ready: AtomicBool::new(false),
+            state_gen: AtomicU64::new(pack_state_gen(CELL_STATE_IDLE, u32::MAX)),
             res: AtomicI32::new(0),
             flags: AtomicU32::new(0),
             payload: UnsafeCell::new(None),
@@ -71,10 +89,10 @@ impl CompletionCell {
         F: FnOnce(&mut Option<slot::ErasedPayload>, &mut Option<io::Result<usize>>) -> R,
     {
         // SAFETY: Caller guarantees exclusive mutable access to these fields.
-        let payload = unsafe { &mut *self.payload.get() };
-        // SAFETY: Caller guarantees exclusive mutable access to these fields.
-        let detail = unsafe { &mut *self.detail.get() };
-        f(payload, detail)
+        unsafe {
+            self.payload
+                .with_mut(|payload| self.detail.with_mut(|detail| f(payload, detail)))
+        }
     }
 }
 
@@ -111,14 +129,70 @@ impl CompletionTable {
             return;
         }
         let cell = &self.cells[idx];
-        if cell.ready.swap(false, Ordering::AcqRel) {
-            unsafe {
-                cell.with_data_unchecked(|payload_cell, detail_cell| {
-                    let _ = payload_cell.take();
-                    let _ = detail_cell.take();
-                });
+
+        loop {
+            let current = cell.state_gen.load(Ordering::Acquire);
+            let (state, cell_gen) = unpack_state_gen(current);
+
+            // Stale completion check.
+            if state != CELL_STATE_IDLE && generation < cell_gen {
+                // If it's a very old generation, just discard it.
+                return;
+            }
+
+            match state {
+                CELL_STATE_IDLE | CELL_STATE_READY | CELL_STATE_WAITING => {
+                    if cell
+                        .state_gen
+                        .compare_exchange(
+                            current,
+                            pack_state_gen(CELL_STATE_BUSY, generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        if state == CELL_STATE_READY {
+                            unsafe {
+                                cell.with_data_unchecked(|payload_cell, detail_cell| {
+                                    let _ = payload_cell.take();
+                                    let _ = detail_cell.take();
+                                });
+                            }
+                        }
+                        break;
+                    }
+                }
+                CELL_STATE_ORPHANED => {
+                    if cell_gen == generation {
+                        if cell
+                            .state_gen
+                            .compare_exchange(
+                                current,
+                                pack_state_gen(CELL_STATE_IDLE, generation),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            // Abandoned by consumer, drop incoming data
+                            drop(payload);
+                            drop(detail);
+                            return;
+                        }
+                    } else {
+                        // Stale completion for a slot that was orphaned but now maybe reused
+                        // (though reused would have changed gen).
+                        return;
+                    }
+                }
+                CELL_STATE_BUSY => {
+                    hint::spin_loop();
+                }
+                _ => unreachable!(),
             }
         }
+
         unsafe {
             cell.with_data_unchecked(|payload_cell, detail_cell| {
                 *payload_cell = payload;
@@ -127,11 +201,13 @@ impl CompletionTable {
         }
         cell.res.store(event.res, Ordering::Release);
         cell.flags.store(event.flags, Ordering::Release);
-        cell.ready_generation.store(generation, Ordering::Release);
-        cell.ready.store(true, Ordering::Release);
-        if cell.expected_generation.load(Ordering::Acquire) == generation {
-            cell.waker.wake();
-        }
+
+        cell.state_gen.store(
+            pack_state_gen(CELL_STATE_READY, generation),
+            Ordering::Release,
+        );
+
+        cell.waker.wake();
     }
 
     #[inline]
@@ -146,19 +222,27 @@ impl CompletionTable {
             return None;
         }
         let cell = &self.cells[idx];
-        if !cell.ready.load(Ordering::Acquire) {
+
+        let current = cell.state_gen.load(Ordering::Acquire);
+        let (state, cell_gen) = unpack_state_gen(current);
+
+        if state != CELL_STATE_READY || cell_gen != generation {
             return None;
         }
-        if cell.ready_generation.load(Ordering::Acquire) != generation {
-            return None;
-        }
+
         if cell
-            .ready
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .state_gen
+            .compare_exchange(
+                current,
+                pack_state_gen(CELL_STATE_IDLE, generation),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_err()
         {
             return None;
         }
+
         let (payload, detail) = unsafe {
             cell.with_data_unchecked(|payload_cell, detail_cell| {
                 (payload_cell.take(), detail_cell.take())
@@ -182,14 +266,167 @@ impl CompletionTable {
             return;
         }
         let cell = &self.cells[idx];
-        cell.expected_generation
-            .store(generation, Ordering::Release);
-        cell.waker.register(waker);
-        if cell.ready.load(Ordering::Acquire)
-            && cell.ready_generation.load(Ordering::Acquire) == generation
-        {
-            waker.wake_by_ref();
+
+        loop {
+            let current = cell.state_gen.load(Ordering::Acquire);
+            let (state, cell_gen) = unpack_state_gen(current);
+
+            // Register waker first to avoid missing a race.
+            cell.waker.register(waker);
+
+            if cell_gen != generation {
+                // Try to initial/update generation while keeping state if possible.
+                // This is needed for LocalOp which doesn't call mark_waiting.
+                if cell
+                    .state_gen
+                    .compare_exchange(
+                        current,
+                        pack_state_gen(state, generation),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+
+            // Check for fast completion.
+            let current_after = cell.state_gen.load(Ordering::Acquire);
+            let (state_after, gen_after) = unpack_state_gen(current_after);
+            if state_after == CELL_STATE_READY && gen_after == generation {
+                waker.wake_by_ref();
+            }
+            return;
         }
+    }
+
+    #[inline]
+    pub fn mark_waiting(&self, token: u64) {
+        let (idx, generation) = decode_completion_token(token);
+        if idx >= self.cells.len() {
+            return;
+        }
+        let cell = &self.cells[idx];
+
+        loop {
+            let current = cell.state_gen.load(Ordering::Acquire);
+            let (state, cell_generation) = unpack_state_gen(current);
+
+            if state == CELL_STATE_READY && cell_generation == generation {
+                // Fast completion happened, leave as READY.
+                return;
+            }
+
+            match state {
+                CELL_STATE_IDLE | CELL_STATE_ORPHANED | CELL_STATE_WAITING => {
+                    if cell
+                        .state_gen
+                        .compare_exchange(
+                            current,
+                            pack_state_gen(CELL_STATE_WAITING, generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                CELL_STATE_READY => {
+                    // Stale data or different operation, clear and wait.
+                    if cell
+                        .state_gen
+                        .compare_exchange(
+                            current,
+                            pack_state_gen(CELL_STATE_WAITING, generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        unsafe {
+                            cell.with_data_unchecked(|payload, detail| {
+                                let _ = payload.take();
+                                let _ = detail.take();
+                            });
+                        }
+                        return;
+                    }
+                }
+                CELL_STATE_BUSY => hint::spin_loop(),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn mark_orphaned(&self, token: u64) {
+        let (idx, generation) = decode_completion_token(token);
+        if idx >= self.cells.len() {
+            return;
+        }
+        let cell = &self.cells[idx];
+
+        loop {
+            let current = cell.state_gen.load(Ordering::Acquire);
+            let (state, cell_gen) = unpack_state_gen(current);
+
+            match state {
+                CELL_STATE_WAITING => {
+                    if cell_gen != generation {
+                        return;
+                    }
+                    if cell
+                        .state_gen
+                        .compare_exchange(
+                            current,
+                            pack_state_gen(CELL_STATE_ORPHANED, generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                CELL_STATE_READY => {
+                    if cell_gen == generation {
+                        if cell
+                            .state_gen
+                            .compare_exchange(
+                                current,
+                                pack_state_gen(CELL_STATE_IDLE, generation),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            unsafe {
+                                cell.with_data_unchecked(|payload_cell, detail_cell| {
+                                    let _ = payload_cell.take();
+                                    let _ = detail_cell.take();
+                                });
+                            }
+                            return;
+                        }
+                    } else {
+                        // Stale READY record, ignore.
+                        return;
+                    }
+                }
+                CELL_STATE_BUSY => {
+                    hint::spin_loop();
+                }
+                _ => return,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn debug_get_state(&self, idx: usize) -> u8 {
+        let current = self.cells[idx].state_gen.load(Ordering::Acquire);
+        unpack_state_gen(current).0
     }
 }
 

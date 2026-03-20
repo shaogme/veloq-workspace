@@ -224,6 +224,7 @@ impl<T> Op<T> {
                             _phantom: std::marker::PhantomData,
                         }
                     } else {
+                        completion_table.mark_waiting(token);
                         DetachedOp {
                             completion_table: Some(completion_table),
                             token,
@@ -232,6 +233,7 @@ impl<T> Op<T> {
                         }
                     }
                 } else {
+                    completion_table.mark_waiting(token);
                     DetachedOp {
                         completion_table: Some(completion_table),
                         token,
@@ -285,6 +287,18 @@ where
 unsafe impl<T: IntoPlatformOp<O> + std::marker::Send, O: PlatformOp> std::marker::Send
     for DetachedOp<T, O>
 {
+}
+
+impl<T, O> Drop for DetachedOp<T, O>
+where
+    O: PlatformOp,
+    T: IntoPlatformOp<O>,
+{
+    fn drop(&mut self) {
+        if let Some(table) = self.completion_table.as_ref() {
+            table.mark_orphaned(self.token);
+        }
+    }
 }
 
 impl<T, O> Future for DetachedOp<T, O>

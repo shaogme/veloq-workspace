@@ -4,7 +4,7 @@ use crate::op_registry::OpRegistry;
 use crossbeam_utils::CachePadded;
 use std::io;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use veloq_shim::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 /// Manual payload container: raw pointer + static kind + drop fn.
 pub struct ErasedPayload {
@@ -47,7 +47,14 @@ pub struct AtomicSlotState(AtomicU8);
 
 impl AtomicSlotState {
     #[inline]
+    #[cfg(not(feature = "loom"))]
     pub const fn new(state: SlotState) -> Self {
+        Self(AtomicU8::new(encode_slot_state(state)))
+    }
+
+    #[inline]
+    #[cfg(feature = "loom")]
+    pub fn new(state: SlotState) -> Self {
         Self(AtomicU8::new(encode_slot_state(state)))
     }
 

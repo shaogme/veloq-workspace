@@ -3,6 +3,7 @@ use crate::driver::PlatformOp;
 use crate::slot::{ErasedPayload, SlotEntry, SlotStorage, SlotTable};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
+use veloq_shim::atomic::Ordering;
 
 pub struct OpEntry<P> {
     pub platform_data: P,
@@ -84,12 +85,12 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
             let idx = self.local_free_head;
             self.local_free_head = self.shared.slots[idx]
                 .next_free
-                .load(std::sync::atomic::Ordering::Relaxed);
+                .load(Ordering::Relaxed);
 
             let slot = &self.shared.slots[idx];
             let new_gen = slot
                 .generation
-                .load(std::sync::atomic::Ordering::Relaxed)
+                .load(Ordering::Relaxed)
                 .wrapping_add(1);
             slot.reset(new_gen);
 

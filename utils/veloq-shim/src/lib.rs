@@ -9,7 +9,6 @@ pub mod atomic {
         AtomicU32 as CoreAtomicU32, AtomicU64 as CoreAtomicU64, AtomicUsize as CoreAtomicUsize,
         Ordering, fence,
     };
-
     macro_rules! impl_atomic {
         ($name:ident, $inner:ty, $std_name:ident) => {
             #[derive(Debug, Default)]
@@ -205,6 +204,13 @@ pub mod atomic {
 #[cfg(feature = "loom")]
 pub mod atomic {
     pub use loom::sync::atomic::*;
+}
+
+pub mod hint {
+    #[cfg(not(feature = "loom"))]
+    pub use core::hint::spin_loop;
+    #[cfg(feature = "loom")]
+    pub use loom::hint::spin_loop;
 }
 
 #[cfg(feature = "alloc")]

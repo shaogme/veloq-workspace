@@ -1275,9 +1275,11 @@ dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
  "libc",
+ "loom",
  "tracing",
  "veloq-atomic-waker",
  "veloq-buf",
+ "veloq-shim",
  "windows-sys 0.61.2",
 ]
 
