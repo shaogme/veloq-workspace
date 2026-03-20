@@ -88,6 +88,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
             let slot = &self.shared.slots[idx];
             let new_gen = slot.generation.load(Ordering::Relaxed).wrapping_add(1);
             slot.reset(new_gen);
+            slot.set_state(crate::slot::SlotState::Pending, Ordering::Release);
 
             self.local[idx].op = None;
             self.local[idx].entry.platform_data = data;

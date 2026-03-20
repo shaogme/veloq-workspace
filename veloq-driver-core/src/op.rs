@@ -47,6 +47,54 @@ pub enum OpKind {
     Timeout = 16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostReason {
+    /// 槽位已被回收，用于新一代操作 (Generation Mismatch)。
+    /// 调用方应当认为关联的 IO 后端（如 Socket 或 Buffer）已处于不确定状态。
+    GenerationMismatch,
+    /// 内部错误：操作负载丢失 (Completion sidecar missing)。
+    PayloadMissing,
+    /// 内部错误：操作负载类型不匹配。
+    PayloadKindMismatch,
+    /// 其它未知原因造成的资源丢失。
+    Other,
+}
+
+impl std::fmt::Display for LostReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GenerationMismatch => write!(f, "generation mismatch (slot recycled)"),
+            Self::PayloadMissing => write!(f, "payload missing"),
+            Self::PayloadKindMismatch => write!(f, "payload kind mismatch"),
+            Self::Other => write!(f, "unknown resource loss"),
+        }
+    }
+}
+
+/// 描述 IO 操作丢失及其原因的结构化错误。
+#[derive(Debug)]
+pub struct OpError {
+    pub reason: LostReason,
+    pub source: std::io::Error,
+}
+
+impl OpError {
+    pub fn new(reason: LostReason, source: std::io::Error) -> Self {
+        Self { reason, source }
+    }
+
+    /// 如果原因为 GenerationMismatch，则认为该错误是致命的（资源状态不确定）。
+    pub fn is_lethal(&self) -> bool {
+        matches!(self.reason, LostReason::GenerationMismatch)
+    }
+}
+
+impl std::fmt::Display for OpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.source)
+    }
+}
+
 // ============================================================================
 // OpResult
 // ============================================================================
@@ -62,9 +110,9 @@ pub enum OpResult<T> {
     /// Operation completed (successfully or with IO error).
     /// Returns the result of the operation and the original resource.
     Completed(std::io::Result<usize>, T),
-    /// Operation failed because the submitter/driver slot was recycled (Generation Mismatch).
-    /// The resource `T` is lost (polled too late, driver reset slot).
-    Lost(std::io::Error),
+    /// Operation failed because the resource ownership was lost.
+    /// Includes structured error information about the loss.
+    ResourceLost(OpError),
 }
 
 impl<T> OpResult<T> {
@@ -73,7 +121,7 @@ impl<T> OpResult<T> {
         match self {
             OpResult::Completed(Ok(res), data) => (res, data),
             OpResult::Completed(Err(e), _) => panic!("OpResult::Completed(Err({}))", e),
-            OpResult::Lost(e) => panic!("OpResult::Lost({})", e),
+            OpResult::ResourceLost(e) => panic!("OpResult::ResourceLost({})", e),
         }
     }
 
@@ -81,7 +129,7 @@ impl<T> OpResult<T> {
     pub fn into_inner(self) -> (std::io::Result<usize>, Option<T>) {
         match self {
             OpResult::Completed(res, data) => (res, Some(data)),
-            OpResult::Lost(err) => (Err(err), None),
+            OpResult::ResourceLost(err) => (Err(err.source), None),
         }
     }
 }
@@ -353,13 +401,15 @@ where
                     detail,
                 } = record;
                 let Some(payload_any) = payload_any else {
-                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                        "operation payload lost: completion sidecar missing",
+                    return Poll::Ready(OpResult::ResourceLost(OpError::new(
+                        LostReason::PayloadMissing,
+                        std::io::Error::other("operation payload lost: completion sidecar missing"),
                     )));
                 };
                 if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                        "operation payload lost: kind mismatch",
+                    return Poll::Ready(OpResult::ResourceLost(OpError::new(
+                        LostReason::PayloadKindMismatch,
+                        std::io::Error::other("operation payload lost: kind mismatch"),
                     )));
                 }
                 let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
@@ -368,9 +418,12 @@ where
                 return Poll::Ready(OpResult::Completed(res, data));
             }
             PollRecordResult::Stale => {
-                return Poll::Ready(OpResult::Lost(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "operation lost: slot recycled (generation mismatch)",
+                return Poll::Ready(OpResult::ResourceLost(OpError::new(
+                    LostReason::GenerationMismatch,
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "operation lost: slot recycled (generation mismatch)",
+                    ),
                 )));
             }
             PollRecordResult::Pending => {}
@@ -500,13 +553,15 @@ where
                         detail,
                     } = record;
                     let Some(payload_any) = payload_any else {
-                        return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                            "operation payload lost: completion sidecar missing",
+                        return Poll::Ready(OpResult::ResourceLost(OpError::new(
+                            LostReason::PayloadMissing,
+                            std::io::Error::other("operation payload lost: completion sidecar missing"),
                         )));
                     };
                     if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                        return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                            "operation payload lost: kind mismatch",
+                        return Poll::Ready(OpResult::ResourceLost(OpError::new(
+                            LostReason::PayloadKindMismatch,
+                            std::io::Error::other("operation payload lost: kind mismatch"),
                         )));
                     }
                     let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
@@ -516,9 +571,12 @@ where
                 }
                 PollRecordResult::Stale => {
                     op.state = State::Completed;
-                    Poll::Ready(OpResult::Lost(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "operation lost: slot recycled (generation mismatch)",
+                    Poll::Ready(OpResult::ResourceLost(OpError::new(
+                        LostReason::GenerationMismatch,
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "operation lost: slot recycled (generation mismatch)",
+                        ),
                     )))
                 }
                 PollRecordResult::Pending => {
