@@ -45,6 +45,8 @@ pub enum OpKind {
     Open = 14,
     Wakeup = 15,
     Timeout = 16,
+    UdpRecv = 17,
+    UdpSend = 18,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -697,6 +699,20 @@ pub struct Recv<H: Handle> {
 
 /// Send data from a fixed buffer to a socket.
 pub struct Send<H: Handle> {
+    pub fd: IoFd<H>,
+    pub buf: FixedBuf,
+    pub buf_offset: usize,
+}
+
+/// Receive data from a UDP socket into a fixed buffer.
+pub struct UdpRecv<H: Handle> {
+    pub fd: IoFd<H>,
+    pub buf: FixedBuf,
+    pub buf_offset: usize,
+}
+
+/// Send data from a fixed buffer to a UDP socket.
+pub struct UdpSend<H: Handle> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,

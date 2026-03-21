@@ -213,6 +213,14 @@ make_buf_op!(make_sqe_send, Send, opcode::Send::new, send_args);
 impl_default_completion!(on_complete_send);
 impl_lifecycle!(drop_send, Send, direct_fd);
 
+make_buf_op!(make_sqe_udp_recv, UdpRecv, opcode::Recv::new, recv_args);
+impl_default_completion!(on_complete_udp_recv);
+impl_lifecycle!(drop_udp_recv, UdpRecv, direct_fd);
+
+make_buf_op!(make_sqe_udp_send, UdpSend, opcode::Send::new, send_args);
+impl_default_completion!(on_complete_udp_send);
+impl_lifecycle!(drop_udp_send, UdpSend, direct_fd);
+
 pub(crate) unsafe fn make_sqe_connect(
     op: &mut UringOp,
     _driver: &mut UringDriver,

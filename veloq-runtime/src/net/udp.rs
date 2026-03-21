@@ -7,8 +7,8 @@ use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
-    DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, Recv as OpRecv, Send as OpSend,
-    SendTo, UdpRecvDatagram, UdpRecvStream, UdpRefill,
+    DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, SendTo, UdpRecv as OpUdpRecv,
+    UdpRecvDatagram, UdpRecvStream, UdpRefill, UdpSend as OpUdpSend,
 };
 
 // ============================================================================
@@ -184,7 +184,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
-        let op = OpSend {
+        let op = OpUdpSend {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
             buf_offset,
@@ -201,7 +201,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
-        let op = OpRecv {
+        let op = OpUdpRecv {
             fd: IoFd::Raw(self.inner.raw()),
             buf,
             buf_offset,

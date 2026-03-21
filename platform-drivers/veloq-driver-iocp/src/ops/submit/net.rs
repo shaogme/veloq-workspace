@@ -4,8 +4,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use veloq_pod::{bytes_of_mut, from_bytes_mut};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_DGRAM,
-    SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, getsockopt,
+    AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET,
 };
 
 use crate::common::{IocpErrorContext, io_error};
@@ -17,7 +17,7 @@ use crate::ops::submit::common::{
 };
 use crate::ops::{
     AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv, SendToPayload, SubmitContext,
-    UdpRecvStream, UdpRefill,
+    UdpRecv, UdpRecvStream, UdpRefill, UdpSend,
 };
 use crate::rio::RioTarget;
 use crate::win32::SafeSocket;
@@ -34,25 +34,6 @@ fn with_borrowed_socket<T>(
     f(&socket)
 }
 
-fn is_udp_socket(handle: HANDLE) -> io::Result<bool> {
-    let mut socket_type: i32 = 0;
-    let mut opt_len = std::mem::size_of::<i32>() as i32;
-    // SAFETY: `socket_type` and `opt_len` are valid writable pointers.
-    let ret = unsafe {
-        getsockopt(
-            handle as SOCKET,
-            SOL_SOCKET,
-            SO_TYPE,
-            (&mut socket_type as *mut i32).cast::<u8>(),
-            &mut opt_len,
-        )
-    };
-    if ret != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(socket_type == SOCK_DGRAM)
-}
-
 pub(crate) fn submit_recv(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Recv>,
@@ -63,18 +44,6 @@ pub(crate) fn submit_recv(
     overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
-
-    if is_udp_socket(handle)? {
-        return ctx.rio.try_submit_pool_recv_for_recv(
-            crate::rio::RioUdpRecvArgs {
-                fd: val.fd,
-                handle,
-                recv_op: val,
-                sidecar: header,
-            },
-            ctx.registrar,
-        );
-    }
 
     // Try RIO path first.
     let rio_res = ctx.rio.try_submit_recv(
@@ -117,6 +86,27 @@ pub(crate) fn submit_recv(
             ),
         )),
     }
+}
+
+pub(crate) fn submit_udp_recv(
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<UdpRecv>,
+    ctx: &mut SubmitContext,
+) -> io::Result<SubmissionResult> {
+    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
+    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    overlapped.set_offset(0);
+
+    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    ctx.rio.try_submit_pool_recv_for_recv(
+        crate::rio::RioUdpRecvArgs {
+            fd: val.fd,
+            handle,
+            recv_op: val,
+            sidecar: header,
+        },
+        ctx.registrar,
+    )
 }
 
 pub(crate) fn submit_send(
@@ -167,6 +157,60 @@ pub(crate) fn submit_send(
             e,
             format!(
                 "RIO send submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, header.user_data, header.generation
+            ),
+        )),
+    }
+}
+
+pub(crate) fn submit_udp_send(
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<UdpSend>,
+    ctx: &mut SubmitContext,
+) -> io::Result<SubmissionResult> {
+    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
+    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    overlapped.set_offset(0);
+
+    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+
+    // Try RIO path first.
+    let rio_res = ctx.rio.try_submit_send(
+        RioTarget {
+            fd: val.fd,
+            handle,
+            user_data: header.user_data,
+            generation: header.generation,
+            buf_offset: val.buf_offset,
+        },
+        &val.buf,
+        ctx.registrar,
+    );
+
+    match rio_res {
+        Ok(res) => Ok(res),
+        Err(_) if ctx.rio.registration_mode == crate::BufferRegistrationMode::Compatible => {
+            // Fallback to standard IOCP for socket send.
+            ensure_iocp_association(
+                handle,
+                ctx.port,
+                format!("RIO fallback udp_send association failed: fd={:?}", val.fd),
+            )?;
+            // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
+            unsafe {
+                iocp_submit_write(
+                    handle,
+                    val.buf.as_ptr().add(val.buf_offset),
+                    (val.buf.len().saturating_sub(val.buf_offset)) as u32,
+                    ctx.overlapped,
+                )
+            }
+        }
+        Err(e) => Err(io_error(
+            IocpErrorContext::Submission,
+            e,
+            format!(
+                "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, header.user_data, header.generation
             ),
         )),

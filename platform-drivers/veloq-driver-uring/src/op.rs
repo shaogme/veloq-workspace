@@ -14,7 +14,7 @@ mod submit;
 pub(crate) use payload::UringOpPayload;
 pub(crate) use payload::{
     Accept, Close, Connect, Fallocate, Fsync, OpSend, Open, ReadFixed, Recv, SendTo, SyncFileRange,
-    Timeout, UdpRecvStream, UdpRefill, Wakeup, WriteFixed,
+    Timeout, UdpRecv, UdpRecvStream, UdpRefill, UdpSend, Wakeup, WriteFixed,
 };
 
 // ============================================================================
@@ -197,6 +197,20 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_send,
         on_complete: submit::on_complete_send,
         drop: submit::drop_send,
+    },
+    UdpRecv {
+        field: UdpRecv,
+        kind: OpKind::UdpRecv,
+        make_sqe: submit::make_sqe_udp_recv,
+        on_complete: submit::on_complete_udp_recv,
+        drop: submit::drop_udp_recv,
+    },
+    UdpSend {
+        field: UdpSend,
+        kind: OpKind::UdpSend,
+        make_sqe: submit::make_sqe_udp_send,
+        on_complete: submit::on_complete_udp_send,
+        drop: submit::drop_udp_send,
     },
     Connect {
         field: Connect,

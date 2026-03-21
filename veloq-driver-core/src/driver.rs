@@ -116,12 +116,7 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                 | slot::SlotState::ReservedValue => {
                     if cell
                         .core_state
-                        .compare_exchange(
-                            current,
-                            current,
-                            Ordering::Acquire,
-                            Ordering::Acquire,
-                        )
+                        .compare_exchange(current, current, Ordering::Acquire, Ordering::Acquire)
                         .is_err()
                     {
                         continue;
@@ -140,7 +135,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                             .core_state
                             .compare_exchange(
                                 current,
-                                current.with_state(slot::SlotState::Idle).with_generation(generation),
+                                current
+                                    .with_state(slot::SlotState::Idle)
+                                    .with_generation(generation),
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
                             )
@@ -170,7 +167,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
 
         match cell.core_state.compare_exchange(
             ready_from,
-            ready_from.with_state(slot::SlotState::InFlightReady).with_generation(generation),
+            ready_from
+                .with_state(slot::SlotState::InFlightReady)
+                .with_generation(generation),
             Ordering::Release,
             Ordering::Acquire,
         ) {
@@ -178,20 +177,21 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
             Err(next) => {
                 let next_gen = next.generation();
                 let next_state = next.state();
-                if next_gen == generation && next_state == slot::SlotState::InFlightWaiting {
-                    if cell
+                if next_gen == generation
+                    && next_state == slot::SlotState::InFlightWaiting
+                    && cell
                         .core_state
                         .compare_exchange(
                             next,
-                            next.with_state(slot::SlotState::InFlightReady).with_generation(generation),
+                            next.with_state(slot::SlotState::InFlightReady)
+                                .with_generation(generation),
                             Ordering::Release,
                             Ordering::Acquire,
                         )
                         .is_ok()
-                    {
-                        cell.completion_waker.wake();
-                        return;
-                    }
+                {
+                    cell.completion_waker.wake();
+                    return;
                 }
 
                 cell.completion_with_data(|payload_cell, detail_cell| {
@@ -204,7 +204,8 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                 {
                     let _ = cell.core_state.compare_exchange(
                         cur,
-                        cur.with_state(slot::SlotState::Idle).with_generation(generation),
+                        cur.with_state(slot::SlotState::Idle)
+                            .with_generation(generation),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     );
@@ -241,7 +242,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
             .core_state
             .compare_exchange(
                 current,
-                current.with_state(slot::SlotState::Idle).with_generation(generation),
+                current
+                    .with_state(slot::SlotState::Idle)
+                    .with_generation(generation),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -291,7 +294,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                         .core_state
                         .compare_exchange(
                             current,
-                            current.with_state(slot::SlotState::InFlightWaiting).with_generation(generation),
+                            current
+                                .with_state(slot::SlotState::InFlightWaiting)
+                                .with_generation(generation),
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
@@ -352,7 +357,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                         .core_state
                         .compare_exchange(
                             current,
-                            current.with_state(slot::SlotState::InFlightWaiting).with_generation(generation),
+                            current
+                                .with_state(slot::SlotState::InFlightWaiting)
+                                .with_generation(generation),
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
@@ -380,7 +387,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                             .core_state
                             .compare_exchange(
                                 current,
-                                current.with_state(slot::SlotState::InFlightWaiting).with_generation(generation),
+                                current
+                                    .with_state(slot::SlotState::InFlightWaiting)
+                                    .with_generation(generation),
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
                             )
@@ -420,7 +429,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                         .core_state
                         .compare_exchange(
                             current,
-                            current.with_state(slot::SlotState::InFlightOrphaned).with_generation(generation),
+                            current
+                                .with_state(slot::SlotState::InFlightOrphaned)
+                                .with_generation(generation),
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
@@ -435,7 +446,9 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
                             .core_state
                             .compare_exchange(
                                 current,
-                                current.with_state(slot::SlotState::Idle).with_generation(generation),
+                                current
+                                    .with_state(slot::SlotState::Idle)
+                                    .with_generation(generation),
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
                             )

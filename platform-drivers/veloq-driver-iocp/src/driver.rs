@@ -227,7 +227,7 @@ impl IocpDriver {
                 matches!(
                     op.payload,
                     crate::ops::IocpOpPayload::UdpRecvStream(_)
-                        | crate::ops::IocpOpPayload::Recv(_)
+                        | crate::ops::IocpOpPayload::UdpRecv(_)
                 )
             })
             .unwrap_or(false);

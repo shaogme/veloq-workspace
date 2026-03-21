@@ -9,7 +9,7 @@ use crate::ops::SubmissionResult;
 use crate::rio::{RioEnv, RioState};
 use std::io;
 use veloq_buf::FixedBuf;
-use veloq_driver_core::op::{Recv, UdpRecvStream};
+use veloq_driver_core::op::{UdpRecv, UdpRecvStream};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, RIO_BUF, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
@@ -46,7 +46,7 @@ pub(crate) struct RioUdpStreamArgs<'a> {
 pub(crate) struct RioUdpRecvArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: HANDLE,
-    pub(crate) recv_op: &'a mut Recv<crate::config::RawHandle>,
+    pub(crate) recv_op: &'a mut UdpRecv<crate::config::RawHandle>,
     pub(crate) sidecar: &'a mut crate::ops::OverlappedEntry,
 }
 

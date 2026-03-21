@@ -3,8 +3,9 @@ use std::ptr::NonNull;
 use veloq_driver_core::op::{
     Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
     Fsync as CoreFsync, ReadFixed as CoreReadFixed, Recv as CoreRecv, Send as CoreSend,
-    SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange, UdpRecvStream as CoreUdpRecvStream,
-    UdpRefill as CoreUdpRefill, Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
+    SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange, UdpRecv as CoreUdpRecv,
+    UdpRecvStream as CoreUdpRecvStream, UdpRefill as CoreUdpRefill, UdpSend as CoreUdpSend,
+    Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
 };
 
 pub(crate) use veloq_driver_core::op::{Open, Timeout};
@@ -15,6 +16,8 @@ pub(crate) type ReadFixed = CoreReadFixed<RawHandle>;
 pub(crate) type WriteFixed = CoreWriteFixed<RawHandle>;
 pub(crate) type Recv = CoreRecv<RawHandle>;
 pub(crate) type OpSend = CoreSend<RawHandle>;
+pub(crate) type UdpRecv = CoreUdpRecv<RawHandle>;
+pub(crate) type UdpSend = CoreUdpSend<RawHandle>;
 pub(crate) type Connect = CoreConnect<RawHandle, SockAddrStorage>;
 pub(crate) type Close = CoreClose<RawHandle>;
 pub(crate) type Fsync = CoreFsync<RawHandle>;
@@ -68,6 +71,8 @@ pub(crate) enum UringOpPayload {
     Write(KernelRef<WriteFixed>),
     Recv(KernelRef<Recv>),
     Send(KernelRef<OpSend>),
+    UdpRecv(KernelRef<UdpRecv>),
+    UdpSend(KernelRef<UdpSend>),
     Connect(KernelRef<Connect>),
     Close(KernelRef<Close>),
     Fsync(KernelRef<Fsync>),

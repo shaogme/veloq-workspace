@@ -25,8 +25,8 @@ use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
     Fsync as FsyncBase, IntoPlatformOp, OpKind, Open, ReadFixed as ReadFixedBase, Recv as RecvBase,
     Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase, Timeout,
-    UdpRecvStream as UdpRecvStreamBase, UdpRefill as UdpRefillBase, Wakeup as WakeupBase,
-    WriteFixed as WriteFixedBase,
+    UdpRecv as UdpRecvBase, UdpRecvStream as UdpRecvStreamBase, UdpRefill as UdpRefillBase,
+    UdpSend as UdpSendBase, Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
 };
 
 use windows_sys::Win32::Foundation::HANDLE;
@@ -43,6 +43,8 @@ pub(crate) type ReadFixed = ReadFixedBase<RawHandle>;
 pub(crate) type WriteFixed = WriteFixedBase<RawHandle>;
 pub(crate) type Recv = RecvBase<RawHandle>;
 pub(crate) type OpSend = OpSendBase<RawHandle>;
+pub(crate) type UdpRecv = UdpRecvBase<RawHandle>;
+pub(crate) type UdpSend = UdpSendBase<RawHandle>;
 pub(crate) type Close = CloseBase<RawHandle>;
 pub(crate) type Fsync = FsyncBase<RawHandle>;
 pub(crate) type Connect = ConnectBase<RawHandle, SockAddrStorage>;
@@ -284,6 +286,18 @@ define_iocp_ops! {
         kind: OpKind::Send,
         submit: submit::submit_send,
         get_fd: submit::get_fd_send,
+    },
+    UdpRecv {
+        variant: UdpRecv,
+        kind: OpKind::UdpRecv,
+        submit: submit::submit_udp_recv,
+        get_fd: submit::get_fd_udp_recv,
+    },
+    UdpSend {
+        variant: UdpSend,
+        kind: OpKind::UdpSend,
+        submit: submit::submit_udp_send,
+        get_fd: submit::get_fd_udp_send,
     },
     Close {
         variant: Close,

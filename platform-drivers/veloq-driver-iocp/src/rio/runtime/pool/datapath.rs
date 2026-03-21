@@ -14,7 +14,9 @@ use std::collections::{VecDeque, hash_map};
 use std::io;
 use veloq_buf::FixedBuf;
 use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
-use veloq_driver_core::op::{Recv as OpRecv, UdpRecvDatagram as OpUdpRecvDatagram, UdpRecvStream};
+use veloq_driver_core::op::{
+    UdpRecv as OpUdpRecv, UdpRecvDatagram as OpUdpRecvDatagram, UdpRecvStream,
+};
 use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -346,7 +348,7 @@ impl UdpPoolManager {
     }
 
     fn copy_datagram_to_recv_op(
-        recv_op: &mut OpRecv<crate::RawHandle>,
+        recv_op: &mut OpUdpRecv<crate::RawHandle>,
         datagram: &UdpRecvDatagram,
     ) -> usize {
         let src = datagram.buf.as_slice();
@@ -431,7 +433,7 @@ impl UdpPoolManager {
         }
 
         let copied_opt = slot.with_op_mut(|iocp_op| {
-            if let IocpOpPayload::Recv(ref mut kernel) = iocp_op.payload {
+            if let IocpOpPayload::UdpRecv(ref mut kernel) = iocp_op.payload {
                 let datagram_ref = datagram.as_ref()?;
                 // SAFETY: `kernel.user` is valid while the op is in-flight.
                 let recv_op = unsafe { kernel.user.as_mut() };
@@ -602,7 +604,7 @@ impl UdpPoolManager {
     pub(crate) fn try_submit_pool_recv_recv(
         &mut self,
         mailbox: &mut UdpMailbox,
-        recv_op: &mut OpRecv<crate::RawHandle>,
+        recv_op: &mut OpUdpRecv<crate::RawHandle>,
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> io::Result<(SubmissionResult, usize, Option<usize>)> {
