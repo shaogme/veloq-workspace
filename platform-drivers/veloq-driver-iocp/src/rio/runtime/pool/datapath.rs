@@ -1,6 +1,6 @@
 use super::{
-    POOL_CTX_TAG, PoolCompletionEvent, UDP_RECV_POOL_QUEUE_CAP, UdpMailbox, UdpPoolState,
-    UdpRecvDatagram, UdpRecvPool, UdpRecvPoolSlot, UdpWaiter, UdpWaiterKind,
+    POOL_CTX_TAG, UDP_RECV_POOL_QUEUE_CAP, UdpMailbox, UdpPoolState, UdpRecvDatagram, UdpRecvPool,
+    UdpRecvPoolSlot, UdpWaiter, UdpWaiterKind,
 };
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::net::addr::{SockAddrStorage, to_socket_addr};
@@ -347,11 +347,7 @@ impl UdpPoolManager {
         self.grow_pool_to(initial, ctx)
     }
 
-    fn copy_datagram_to_recv_op(
-        recv_op: &mut OpUdpRecv<crate::RawHandle>,
-        datagram: &UdpRecvDatagram,
-    ) -> usize {
-        let src = datagram.buf.as_slice();
+    fn copy_data_to_recv_op(recv_op: &mut OpUdpRecv<crate::RawHandle>, src: &[u8]) -> usize {
         let start = recv_op.buf_offset.min(recv_op.buf.len());
         let dst_len = recv_op.buf.len().saturating_sub(start);
         let copied = dst_len.min(src.len());
@@ -361,37 +357,41 @@ impl UdpPoolManager {
         copied
     }
 
-    fn deliver_to_stream_waiter(
+    fn parse_rio_address(addr: &SockAddrStorage, len: i32) -> std::net::SocketAddr {
+        let s = unsafe { std::slice::from_raw_parts(addr as *const _ as *const u8, len as usize) };
+        to_socket_addr(s).map_err(|_| ()).unwrap_or_else(|_| {
+            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                0,
+            ))
+        })
+    }
+
+    fn deliver_to_stream_waiter_raw(
         comp: &mut RioCompletionContext<'_>,
         waiter: UdpWaiter,
-        datagram: &mut Option<UdpRecvDatagram>,
-    ) -> bool {
+        buf: FixedBuf,
+        addr: std::net::SocketAddr,
+    ) -> Result<(), FixedBuf> {
         let user_data = waiter.user_data;
         let generation = waiter.generation;
         let ops = &mut comp.ops;
         if user_data >= ops.local.len() {
-            return false;
+            return Err(buf);
         }
         let Some(SlotView::InFlightWaiting(mut slot)) = ops.slot_view(user_data) else {
-            return false;
+            return Err(buf);
         };
         if slot.platform_mut().generation != generation {
-            return false;
+            return Err(buf);
         }
 
         let mut guard = slot;
-        let d = match datagram.as_ref() {
-            Some(d) => d,
-            None => return false,
-        };
-        let d_len = d.buf.len();
+        let d_len = buf.len();
 
         let stream_op = Self::get_stream_op_mut(&mut guard);
         if let Some(stream_op) = stream_op {
-            let Some(owned_d) = datagram.take() else {
-                return false;
-            };
-            stream_op.result = Some(Self::into_op_datagram(owned_d));
+            stream_op.result = Some(OpUdpRecvDatagram { buf, addr });
             guard.platform_mut().rio_pool_waiting = false;
 
             let event = CompletionEvent {
@@ -408,16 +408,38 @@ impl UdpPoolManager {
             let _ = guard.take_op();
             let _ = std::mem::take(guard.platform_mut());
             comp.ops.shared.push_free(user_data);
-            true
+            Ok(())
         } else {
-            false
+            Err(buf)
         }
     }
 
-    fn deliver_to_recv_waiter(
+    fn deliver_to_stream_waiter(
         comp: &mut RioCompletionContext<'_>,
         waiter: UdpWaiter,
         datagram: &mut Option<UdpRecvDatagram>,
+    ) -> bool {
+        let Some(d) = datagram.take() else {
+            return false;
+        };
+        let addr = Self::parse_rio_address(&d.addr, d.addr_len);
+        match Self::deliver_to_stream_waiter_raw(comp, waiter, d.buf, addr) {
+            Ok(()) => true,
+            Err(buf) => {
+                *datagram = Some(UdpRecvDatagram {
+                    buf,
+                    addr: d.addr,
+                    addr_len: d.addr_len,
+                });
+                false
+            }
+        }
+    }
+
+    fn deliver_to_recv_waiter_raw(
+        comp: &mut RioCompletionContext<'_>,
+        waiter: UdpWaiter,
+        data: &[u8],
     ) -> bool {
         let user_data = waiter.user_data;
         let generation = waiter.generation;
@@ -434,10 +456,9 @@ impl UdpPoolManager {
 
         let copied_opt = slot.with_op_mut(|iocp_op| {
             if let IocpOpPayload::UdpRecv(ref mut kernel) = iocp_op.payload {
-                let datagram_ref = datagram.as_ref()?;
                 // SAFETY: `kernel.user` is valid while the op is in-flight.
                 let recv_op = unsafe { kernel.user.as_mut() };
-                Some(Self::copy_datagram_to_recv_op(recv_op, datagram_ref))
+                Some(Self::copy_data_to_recv_op(recv_op, data))
             } else {
                 None
             }
@@ -445,7 +466,6 @@ impl UdpPoolManager {
         let Some(copied) = copied_opt.flatten() else {
             return false;
         };
-        let _ = datagram.take();
 
         slot.platform_mut().rio_pool_waiting = false;
         let event = CompletionEvent {
@@ -465,6 +485,23 @@ impl UdpPoolManager {
         true
     }
 
+    fn deliver_to_recv_waiter(
+        comp: &mut RioCompletionContext<'_>,
+        waiter: UdpWaiter,
+        datagram: &mut Option<UdpRecvDatagram>,
+    ) -> bool {
+        let data = match datagram.as_ref() {
+            Some(d) => d.buf.as_slice(),
+            None => return false,
+        };
+        if Self::deliver_to_recv_waiter_raw(comp, waiter, data) {
+            let _ = datagram.take();
+            true
+        } else {
+            false
+        }
+    }
+
     fn get_stream_op_mut<'a>(
         guard: &'a mut Slot<'_, InFlightWaiting>,
     ) -> Option<&'a mut UdpRecvStream<crate::RawHandle>> {
@@ -481,20 +518,7 @@ impl UdpPoolManager {
     }
 
     fn into_op_datagram(datagram: UdpRecvDatagram) -> OpUdpRecvDatagram {
-        // SAFETY: addr and addr_len are provided by RIO completion.
-        let addr = unsafe {
-            let s = std::slice::from_raw_parts(
-                &datagram.addr as *const _ as *const u8,
-                datagram.addr_len as usize,
-            );
-            to_socket_addr(s).map_err(|_| ()).unwrap_or_else(|_| {
-                std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                    std::net::Ipv4Addr::UNSPECIFIED,
-                    0,
-                ))
-            })
-        };
-
+        let addr = Self::parse_rio_address(&datagram.addr, datagram.addr_len);
         OpUdpRecvDatagram {
             buf: datagram.buf,
             addr,
@@ -620,7 +644,7 @@ impl UdpPoolManager {
             }
 
             if let Some(datagram) = mailbox.queue.pop_front() {
-                let copied = Self::copy_datagram_to_recv_op(recv_op, &datagram);
+                let copied = Self::copy_data_to_recv_op(recv_op, datagram.buf.as_slice());
                 total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
                 return Ok((
                     SubmissionResult::PostToQueue,
@@ -673,13 +697,81 @@ impl UdpPoolManager {
         self.udp_ctx_map.remove(&completion_generation)
     }
 
-    pub(super) fn update_pool_state(
-        pool: &mut UdpRecvPool,
+    fn try_fast_deliver(
+        &mut self,
         mailbox: &mut UdpMailbox,
+        waiter: UdpWaiter,
         slot_idx: usize,
         res: &RIORESULT,
-    ) -> PoolCompletionEvent {
-        pool.update_state(mailbox, slot_idx, res)
+        comp: &mut RioCompletionContext<'_>,
+        ctx: &mut RioContext,
+    ) -> Option<usize> {
+        let (delivered, resubmit) = {
+            let pool = self.pool.as_mut()?;
+            let slot = pool.slots.get_mut(slot_idx)?;
+            let mut delivered = false;
+
+            match waiter.kind {
+                UdpWaiterKind::Recv => {
+                    let data = &slot.buf.as_slice()[..res.BytesTransferred as usize];
+                    if Self::deliver_to_recv_waiter_raw(comp, waiter, data) {
+                        slot.in_flight = false;
+                        delivered = true;
+                    }
+                }
+                UdpWaiterKind::Stream => {
+                    let replacement_buf = pool.spare_bufs.pop_front().or_else(|| {
+                        std::num::NonZeroUsize::new(slot.buf.capacity())
+                            .and_then(|cap| FixedBuf::alloc_heap(cap).ok())
+                    });
+                    if let Some(new_buf) = replacement_buf {
+                        let mut old_buf = std::mem::replace(&mut slot.buf, new_buf);
+                        old_buf.set_len(res.BytesTransferred as usize);
+                        let addr = Self::parse_rio_address(
+                            &slot.addr,
+                            std::mem::size_of::<SockAddrStorage>() as i32,
+                        );
+                        match Self::deliver_to_stream_waiter_raw(comp, waiter, old_buf, addr) {
+                            Ok(()) => {
+                                slot.in_flight = false;
+                                delivered = true;
+                            }
+                            Err(returned_buf) => {
+                                mailbox.queue.push_back(UdpRecvDatagram {
+                                    buf: returned_buf,
+                                    addr: *slot.addr,
+                                    addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
+                                });
+                                slot.in_flight = false;
+                                delivered = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if delivered {
+                let resubmit = !slot.stop_requested && slot_idx < pool.target_credits;
+                slot.stop_requested = false;
+                (true, resubmit)
+            } else {
+                (false, false)
+            }
+        };
+
+        if delivered {
+            let mut submissions = 0;
+            if resubmit {
+                let token = self.alloc_udp_ctx_token(slot_idx);
+                if let Ok(n) = self.submit_pool_slot((slot_idx, token), ctx) {
+                    submissions += n;
+                }
+            }
+            Some(submissions)
+        } else {
+            mailbox.waiters.push_front(waiter);
+            None
+        }
     }
 
     pub(crate) fn handle_completion(
@@ -690,10 +782,20 @@ impl UdpPoolManager {
         ctx: &mut RioContext,
     ) -> usize {
         let (slot_idx, res) = completion;
-        let Some(pool) = self.pool.as_mut() else {
-            return 0;
+
+        if res.Status == 0 && res.BytesTransferred > 0 {
+            if let Some(waiter) = mailbox.waiters.pop_front() {
+                if let Some(n) = self.try_fast_deliver(mailbox, waiter, slot_idx, res, comp, ctx) {
+                    return n;
+                }
+            }
+        }
+
+        let pool = match self.pool.as_mut() {
+            Some(p) => p,
+            None => return 0,
         };
-        let event = Self::update_pool_state(pool, mailbox, slot_idx, res);
+        let event = pool.update_state(mailbox, slot_idx, res);
 
         let mut submissions = 0;
         let actions = UdpRecvPool::plan_actions(event, slot_idx);
