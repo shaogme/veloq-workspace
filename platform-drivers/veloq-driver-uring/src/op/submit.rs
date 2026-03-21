@@ -3,6 +3,7 @@ use crate::driver::UringDriver;
 use crate::op::{UringOp, UringOpPayload};
 use io_uring::{opcode, squeue, types};
 use std::io;
+use veloq_buf::PoolKind;
 
 macro_rules! impl_lifecycle {
     ($drop_fn:ident, $variant:ident, direct_fd) => {
@@ -48,7 +49,7 @@ macro_rules! make_rw_fixed {
             let ptr = unsafe { rw_op.buf.as_mut_ptr().add(rw_op.buf_offset) };
             let len = (rw_op.buf.capacity() - rw_op.buf_offset) as u32;
 
-            let is_registered = if region_info.id != u16::MAX {
+            let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
                 driver
                     .registered_chunks
                     .get(region_info.id as usize)
@@ -100,7 +101,7 @@ macro_rules! make_rw_fixed {
             let ptr = unsafe { rw_op.buf.as_slice().as_ptr().add(rw_op.buf_offset) };
             let len = (rw_op.buf.len() - rw_op.buf_offset) as u32;
 
-            let is_registered = if region_info.id != u16::MAX {
+            let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
                 driver
                     .registered_chunks
                     .get(region_info.id as usize)
@@ -659,7 +660,7 @@ pub(crate) unsafe fn resolve_chunks_read_fixed(op: &UringOp, chunks: &mut [u16])
     };
     let rw_op = unsafe { kernel.user.as_ref() };
     let info = rw_op.buf.resolve_region_info();
-    if info.id != u16::MAX {
+    if info.pool_kind == PoolKind::SlotBased {
         chunks[0] = info.id;
         1
     } else {
@@ -674,7 +675,7 @@ pub(crate) unsafe fn resolve_chunks_write_fixed(op: &UringOp, chunks: &mut [u16]
     };
     let rw_op = unsafe { kernel.user.as_ref() };
     let info = rw_op.buf.resolve_region_info();
-    if info.id != u16::MAX {
+    if info.pool_kind == PoolKind::SlotBased {
         chunks[0] = info.id;
         1
     } else {

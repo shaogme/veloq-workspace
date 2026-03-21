@@ -16,7 +16,7 @@ use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig}
 use rustc_hash::FxHashMap;
 use std::io;
 use std::time::{Duration, Instant};
-use veloq_buf::FixedBuf;
+use veloq_buf::{FixedBuf, PoolKind};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, WSAGetLastError};
 
@@ -74,7 +74,7 @@ impl RioRegistry {
     ) -> io::Result<(RioBufferId, u32)> {
         let info = buf.resolve_region_info();
 
-        if info.id == u16::MAX {
+        if info.pool_kind == PoolKind::Heap {
             return self.resolve_heap_id(buf, info.offset, env);
         }
 
@@ -243,7 +243,7 @@ impl RioRegistry {
 
     pub(crate) fn deregister_heap_buf(&mut self, buf: &FixedBuf, _env: RioEnv<'_>) {
         let info = buf.resolve_region_info();
-        if info.id != u16::MAX {
+        if info.pool_kind != PoolKind::Heap {
             return;
         }
         let key = (buf.as_ptr() as usize, buf.capacity(), info.cookie);

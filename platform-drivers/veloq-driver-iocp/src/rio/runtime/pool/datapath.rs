@@ -620,7 +620,11 @@ impl UdpPoolManager {
             if let Some(datagram) = mailbox.queue.pop_front() {
                 let copied = Self::copy_datagram_to_recv_op(recv_op, &datagram);
                 total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
-                return Ok((SubmissionResult::PostToQueue, total_submissions, Some(copied)));
+                return Ok((
+                    SubmissionResult::PostToQueue,
+                    total_submissions,
+                    Some(copied),
+                ));
             }
 
             mailbox.waiters.push_back(UdpWaiter {

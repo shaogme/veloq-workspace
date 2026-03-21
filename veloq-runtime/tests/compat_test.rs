@@ -1,42 +1,19 @@
 #![cfg(feature = "compat")]
 use futures::{AsyncReadExt, AsyncWriteExt};
-use std::alloc::{Layout, alloc, dealloc};
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
-use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
-use veloq_buf::{DeallocParams, FixedBuf, PoolVTable, RegionInfo};
+use veloq_buf::FixedBuf;
 use veloq_runtime::io::{AsyncBufRead, AsyncBufWrite, Compat};
 
 // --- Mock Pool ---
 struct MockPool;
 
-static MOCK_VTABLE: PoolVTable = PoolVTable {
-    dealloc: mock_dealloc,
-    resolve_region_info: mock_resolve,
-};
-
-unsafe fn mock_dealloc(_pool_data: NonNull<()>, params: DeallocParams) {
-    let layout = Layout::from_size_align(params.cap.get(), 1).unwrap();
-    unsafe { dealloc(params.ptr.as_ptr(), layout) };
-}
-
-unsafe fn mock_resolve(_pool_data: NonNull<()>, _buf: &FixedBuf) -> RegionInfo {
-    RegionInfo {
-        id: 0,
-        offset: 0,
-        cookie: 0,
-    }
-}
-
 impl MockPool {
     fn alloc(size: usize) -> FixedBuf {
         let size = NonZeroUsize::new(size).unwrap();
-        let layout = Layout::from_size_align(size.get(), 1).unwrap();
-        let ptr = unsafe { alloc(layout) };
-        let ptr = NonNull::new(ptr).unwrap();
-        unsafe { FixedBuf::new(ptr, size, NonNull::dangling(), &MOCK_VTABLE, 0) }
+        FixedBuf::alloc_heap(size).expect("alloc heap buffer for compat tests")
     }
 }
 

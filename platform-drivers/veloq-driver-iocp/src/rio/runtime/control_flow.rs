@@ -8,9 +8,9 @@ use crate::rio::core::RioOpCtxGuard;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
-use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager};
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
+use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager};
 use crate::rio::{RioCompletionContext, RioContext, RioEnv, RioState};
 use rustc_hash::FxHashMap;
 use std::io;
@@ -88,8 +88,12 @@ impl<'a> RioCompletionRouter<'a> {
                 rq: actor.rq,
             };
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-            let submissions =
-                pool_manager.handle_completion(udp_mailbox, (slot_idx, res), &mut self.comp, &mut ctx);
+            let submissions = pool_manager.handle_completion(
+                udp_mailbox,
+                (slot_idx, res),
+                &mut self.comp,
+                &mut ctx,
+            );
             let remove = pool_manager.cleanup_drained_pool(&mut ctx);
             (submissions, remove)
         };
