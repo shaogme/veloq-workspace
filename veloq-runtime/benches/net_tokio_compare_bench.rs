@@ -1,6 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::io;
 use std::num::NonZeroUsize;
+use std::time::Instant;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{
@@ -283,12 +284,19 @@ fn benchmark_tcp(c: &mut Criterion) {
         BenchmarkId::new("veloq", PAYLOAD_SIZE),
         &PAYLOAD_SIZE,
         |b, _| {
-            b.iter(|| {
+            b.iter_custom(|iters| {
                 let runtime = Runtime::builder()
                     .config(Config::default().worker_threads(1))
                     .build()
                     .expect("build veloq runtime failed");
-                runtime.block_on(run_veloq_tcp_roundtrip(payload_nz, ROUNDS));
+
+                let start = Instant::now();
+                runtime.block_on(async {
+                    for _ in 0..iters {
+                        run_veloq_tcp_roundtrip(payload_nz, ROUNDS).await;
+                    }
+                });
+                start.elapsed()
             });
         },
     );
@@ -323,12 +331,19 @@ fn benchmark_udp(c: &mut Criterion) {
         BenchmarkId::new("veloq", PAYLOAD_SIZE),
         &PAYLOAD_SIZE,
         |b, _| {
-            b.iter(|| {
+            b.iter_custom(|iters| {
                 let runtime = Runtime::builder()
                     .config(Config::default().worker_threads(1))
                     .build()
                     .expect("build veloq runtime failed");
-                runtime.block_on(run_veloq_udp_roundtrip(payload_nz, ROUNDS));
+
+                let start = Instant::now();
+                runtime.block_on(async {
+                    for _ in 0..iters {
+                        run_veloq_udp_roundtrip(payload_nz, ROUNDS).await;
+                    }
+                });
+                start.elapsed()
             });
         },
     );

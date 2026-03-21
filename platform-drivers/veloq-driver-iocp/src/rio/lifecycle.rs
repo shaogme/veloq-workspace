@@ -4,7 +4,7 @@ use crate::rio::RioState;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
 use crate::rio::runtime::control_flow::RioSocketActor;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
 use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -16,8 +16,10 @@ pub(crate) struct DeferredRioCleanup {
     kernel: RioKernel,
     registry: RioRegistry,
     registration_mode: crate::BufferRegistrationMode,
-    actors: FxHashMap<HANDLE, RioSocketActor>,
+    active_actors: FxHashMap<HANDLE, RioSocketActor>,
+    draining_actors: FxHashMap<u32, RioSocketActor>,
     actor_routes: FxHashMap<u32, HANDLE>,
+    udp_iocp_fallback_handles: FxHashSet<HANDLE>,
     outstanding_count: usize,
 }
 
@@ -30,8 +32,10 @@ impl DeferredRioCleanup {
             kernel: self.kernel,
             registry: self.registry,
             registration_mode: self.registration_mode,
-            actors: self.actors,
+            active_actors: self.active_actors,
+            draining_actors: self.draining_actors,
             actor_routes: self.actor_routes,
+            udp_iocp_fallback_handles: self.udp_iocp_fallback_handles,
             next_actor_id: 1,
             outstanding_count: self.outstanding_count,
         };
@@ -141,8 +145,10 @@ impl RioState {
             kernel,
             registry,
             registration_mode: self.registration_mode,
-            actors: std::mem::take(&mut self.actors),
+            active_actors: std::mem::take(&mut self.active_actors),
+            draining_actors: std::mem::take(&mut self.draining_actors),
             actor_routes: std::mem::take(&mut self.actor_routes),
+            udp_iocp_fallback_handles: std::mem::take(&mut self.udp_iocp_fallback_handles),
             outstanding_count: std::mem::take(&mut self.outstanding_count),
         })
     }

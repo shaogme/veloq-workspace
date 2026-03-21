@@ -13,7 +13,8 @@ use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
 use crate::ops::submit::common::{
     AcceptExArgs, ConnectExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex,
-    iocp_submit_connect_ex, iocp_submit_read, iocp_submit_write, resolve_fd, unpack_kernel_ref,
+    iocp_submit_connect_ex, iocp_submit_read, iocp_submit_socket_recv, iocp_submit_socket_send,
+    iocp_submit_write, resolve_fd, unpack_kernel_ref,
 };
 use crate::ops::{
     AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv, SendToPayload, SubmitContext,
@@ -98,7 +99,8 @@ pub(crate) fn submit_udp_recv(
     overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
-    ctx.rio.try_submit_pool_recv_for_recv(
+    let socket = handle as SOCKET;
+    match ctx.rio.try_submit_pool_recv_for_recv(
         crate::rio::RioUdpRecvArgs {
             fd: val.fd,
             handle,
@@ -106,7 +108,40 @@ pub(crate) fn submit_udp_recv(
             sidecar: header,
         },
         ctx.registrar,
-    )
+    ) {
+        Ok(res) => Ok(res),
+        Err(e) => {
+            ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
+            if ctx.rio.is_udp_iocp_fallback(handle) {
+                ensure_iocp_association(
+                    handle,
+                    ctx.port,
+                    format!("UDP recv fallback association failed: fd={:?}", val.fd),
+                )?;
+                // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
+                unsafe {
+                    iocp_submit_socket_recv(
+                        socket,
+                        val.buf.as_mut_ptr().add(val.buf_offset),
+                        (val.buf.len().saturating_sub(val.buf_offset)) as u32,
+                        ctx.overlapped,
+                    )
+                }
+                .map_err(|err| {
+                    io_error(
+                        IocpErrorContext::Submission,
+                        err,
+                        format!(
+                            "UDP recv fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                            val.fd, handle, header.user_data, header.generation
+                        ),
+                    )
+                })
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 pub(crate) fn submit_send(
@@ -173,6 +208,7 @@ pub(crate) fn submit_udp_send(
     overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let socket = handle as SOCKET;
 
     // Try RIO path first.
     let rio_res = ctx.rio.try_submit_send(
@@ -189,22 +225,34 @@ pub(crate) fn submit_udp_send(
 
     match rio_res {
         Ok(res) => Ok(res),
-        Err(_) if ctx.rio.registration_mode == crate::BufferRegistrationMode::Compatible => {
-            // Fallback to standard IOCP for socket send.
+        Err(e) if {
+            ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
+            ctx.rio.is_udp_iocp_fallback(handle)
+        } => {
             ensure_iocp_association(
                 handle,
                 ctx.port,
-                format!("RIO fallback udp_send association failed: fd={:?}", val.fd),
+                format!("UDP send fallback association failed: fd={:?}", val.fd),
             )?;
             // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
             unsafe {
-                iocp_submit_write(
-                    handle,
+                iocp_submit_socket_send(
+                    socket,
                     val.buf.as_ptr().add(val.buf_offset),
                     (val.buf.len().saturating_sub(val.buf_offset)) as u32,
                     ctx.overlapped,
                 )
             }
+            .map_err(|err| {
+                io_error(
+                    IocpErrorContext::Submission,
+                    err,
+                    format!(
+                        "UDP send fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                        val.fd, handle, header.user_data, header.generation
+                    ),
+                )
+            })
         }
         Err(e) => Err(io_error(
             IocpErrorContext::Submission,
@@ -504,8 +552,11 @@ pub(crate) fn submit_udp_recv_stream(
     ctx: &mut SubmitContext,
 ) -> io::Result<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-    let (val, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    overlapped.set_offset(0);
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let socket = handle as SOCKET;
+
     let args = crate::rio::RioUdpStreamArgs {
         fd: val.fd,
         handle,
@@ -513,18 +564,51 @@ pub(crate) fn submit_udp_recv_stream(
         user_data: header.user_data,
         generation: header.generation,
     };
-    ctx.rio
-        .try_submit_pool_recv(args, ctx.registrar)
-        .map_err(|e| {
-            io_error(
-                IocpErrorContext::Submission,
-                e,
-                format!(
-                    "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, header.user_data, header.generation
-                ),
-            )
-        })
+    match ctx.rio.try_submit_pool_recv(args, ctx.registrar) {
+        Ok(res) => Ok(res),
+        Err(e) => {
+            ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
+            if ctx.rio.is_udp_iocp_fallback(handle) {
+                ensure_iocp_association(
+                    handle,
+                    ctx.port,
+                    format!("UDP recv_stream fallback association failed: fd={:?}", val.fd),
+                )?;
+                let buf = val
+                    .buf
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("udp recv_stream buffer missing"))?;
+                // SAFETY: socket/buffer/overlapped are valid for overlapped socket recv.
+                unsafe {
+                    iocp_submit_socket_recv(
+                        socket,
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                        ctx.overlapped,
+                    )
+                }
+                .map_err(|err| {
+                    io_error(
+                        IocpErrorContext::Submission,
+                        err,
+                        format!(
+                            "UDP recv_stream fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                            val.fd, handle, header.user_data, header.generation
+                        ),
+                    )
+                })
+            } else {
+                Err(io_error(
+                    IocpErrorContext::Submission,
+                    e,
+                    format!(
+                        "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
+                        val.fd, header.user_data, header.generation
+                    ),
+                ))
+            }
+        }
+    }
 }
 
 /// # Safety
@@ -538,6 +622,25 @@ pub(crate) unsafe fn on_udp_stream_complete(
 ) -> io::Result<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let val = unsafe { payload.user.as_mut() };
+    if val.result.is_none() && val.addr.is_none()
+        && let Some(raw) = val.fd.raw()
+    {
+        let mut storage = SockAddrStorage::default();
+        let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
+        let _ = with_borrowed_socket(raw.handle as SOCKET, |socket| {
+            // SAFETY: storage and namelen are valid output pointers.
+            unsafe { socket.getpeername(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
+        });
+        if namelen > 0 {
+            // SAFETY: storage was initialized by getpeername when namelen > 0.
+            let buf = unsafe {
+                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
+            };
+            if let Ok(addr) = addr::to_socket_addr(buf) {
+                val.addr = Some(addr);
+            }
+        }
+    }
     if result == 0
         && let Some(datagram) = val.result.as_ref()
     {
@@ -554,9 +657,17 @@ pub(crate) fn submit_udp_refill(
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (val, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    if ctx.rio.is_udp_iocp_fallback(handle) {
+        let _ = val.buf.take();
+        return Ok(SubmissionResult::PostToQueue);
+    }
     if let Some(buf) = val.buf.take() {
-        ctx.rio
-            .try_refill_udp_pool((val.fd, handle), buf, ctx.registrar)?;
+        if let Err(e) = ctx.rio.try_refill_udp_pool((val.fd, handle), buf, ctx.registrar) {
+            ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
+            if !ctx.rio.is_udp_iocp_fallback(handle) {
+                return Err(e);
+            }
+        }
     }
 
     // Refill is not an async IO op that completes via IOCP,

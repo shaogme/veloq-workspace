@@ -16,7 +16,7 @@ pub struct Socket {
 }
 
 impl Socket {
-    fn new(af: u16, ty: i32, protocol: i32) -> std::io::Result<Self> {
+    fn new_with_flags(af: u16, ty: i32, protocol: i32, flags: u32) -> std::io::Result<Self> {
         // SAFETY: Calling WSASocketW with valid arguments.
         let s = unsafe {
             WSASocketW(
@@ -25,7 +25,7 @@ impl Socket {
                 protocol,
                 std::ptr::null(),
                 0,
-                WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
+                flags,
             )
         };
         if s == INVALID_SOCKET {
@@ -34,6 +34,15 @@ impl Socket {
         Ok(Self {
             inner: SafeSocket(s),
         })
+    }
+
+    fn new(af: u16, ty: i32, protocol: i32) -> std::io::Result<Self> {
+        Self::new_with_flags(
+            af,
+            ty,
+            protocol,
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
+        )
     }
 
     /// Creates a new TCP v4 socket.

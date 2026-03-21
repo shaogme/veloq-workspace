@@ -51,6 +51,23 @@ pub(crate) struct RioUdpRecvArgs<'a> {
 }
 
 impl RioState {
+    #[inline]
+    pub(crate) fn is_udp_iocp_fallback(&self, handle: HANDLE) -> bool {
+        self.udp_iocp_fallback_handles.contains(&handle)
+    }
+
+    #[inline]
+    fn should_demote_udp_socket(err: &io::Error) -> bool {
+        err.raw_os_error() == Some(10055) || err.to_string().contains("os_error=10055")
+    }
+
+    #[inline]
+    pub(crate) fn maybe_mark_udp_iocp_fallback(&mut self, handle: HANDLE, err: &io::Error) {
+        if Self::should_demote_udp_socket(err) {
+            self.udp_iocp_fallback_handles.insert(handle);
+        }
+    }
+
     fn validate_rio_addr(
         addr_ptr: *const std::ffi::c_void,
         addr_len: i32,
@@ -186,7 +203,7 @@ impl RioState {
         };
         let _ = self.ensure_actor((fd, handle), env)?;
         let actor = self
-            .actors
+            .active_actors
             .get_mut(&handle)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
@@ -227,7 +244,7 @@ impl RioState {
         };
         let _ = self.ensure_actor((fd, handle), env)?;
         let actor = self
-            .actors
+            .active_actors
             .get_mut(&handle)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
@@ -269,7 +286,7 @@ impl RioState {
         let (fd, handle) = target;
         let _ = self.ensure_actor((fd, handle), env)?;
         let actor = self
-            .actors
+            .active_actors
             .get_mut(&handle)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor missing"))?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));

@@ -35,8 +35,10 @@ impl RioState {
             kernel,
             registry: RioRegistry::new(rq_depth),
             registration_mode,
-            actors: rustc_hash::FxHashMap::default(),
+            active_actors: rustc_hash::FxHashMap::default(),
+            draining_actors: rustc_hash::FxHashMap::default(),
             actor_routes: rustc_hash::FxHashMap::default(),
+            udp_iocp_fallback_handles: rustc_hash::FxHashSet::default(),
             next_actor_id: 1,
             outstanding_count: 0,
         })

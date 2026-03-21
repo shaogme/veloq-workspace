@@ -1,6 +1,8 @@
 use std::io;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
-use windows_sys::Win32::Networking::WinSock::SOCKET;
+use windows_sys::Win32::Networking::WinSock::{
+    SOCKET, SOCKET_ERROR, WSABUF, WSAGetLastError, WSARecv, WSASend,
+};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -107,6 +109,83 @@ pub(crate) unsafe fn iocp_submit_write(
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return Err(io::Error::from_raw_os_error(err as i32));
+        }
+    }
+    Ok(SubmissionResult::Pending)
+}
+
+/// Safe wrapper for WSARecv (socket overlapped receive).
+///
+/// # Safety
+///
+/// The caller must ensure that the socket, buf, and overlapped pointers are valid.
+pub(crate) unsafe fn iocp_submit_socket_recv(
+    socket: SOCKET,
+    buf: *mut u8,
+    len: u32,
+    overlapped: *mut Overlapped,
+) -> io::Result<SubmissionResult> {
+    let mut wsabuf = WSABUF {
+        len,
+        buf,
+    };
+    let mut bytes = 0u32;
+    let mut flags = 0u32;
+    // SAFETY: WSARecv is called with valid pointers and overlapped state.
+    let ret = unsafe {
+        WSARecv(
+            socket,
+            &mut wsabuf,
+            1,
+            &mut bytes,
+            &mut flags,
+            overlapped as *mut OVERLAPPED,
+            None,
+        )
+    };
+    if ret == SOCKET_ERROR {
+        // SAFETY: WSAGetLastError is safe to call.
+        let err = unsafe { WSAGetLastError() };
+        if err != ERROR_IO_PENDING as i32 {
+            return Err(io::Error::from_raw_os_error(err));
+        }
+    }
+    Ok(SubmissionResult::Pending)
+}
+
+/// Safe wrapper for WSASend (socket overlapped send).
+///
+/// # Safety
+///
+/// The caller must ensure that the socket, buf, and overlapped pointers are valid.
+pub(crate) unsafe fn iocp_submit_socket_send(
+    socket: SOCKET,
+    buf: *const u8,
+    len: u32,
+    overlapped: *mut Overlapped,
+) -> io::Result<SubmissionResult> {
+    let mut wsabuf = WSABUF {
+        len,
+        buf: buf as *mut u8,
+    };
+    let mut bytes = 0u32;
+    // SAFETY: WSASend is called with valid pointers and overlapped state.
+    let ret = unsafe {
+        WSASend(
+            socket,
+            &mut wsabuf,
+            1,
+            &mut bytes,
+            0,
+            overlapped as *mut OVERLAPPED,
+            None,
+        )
+    };
+    if ret == SOCKET_ERROR {
+        // SAFETY: WSAGetLastError is safe to call.
+        let err = unsafe { WSAGetLastError() };
+        if err != ERROR_IO_PENDING as i32 {
+            return Err(io::Error::from_raw_os_error(err));
         }
     }
     Ok(SubmissionResult::Pending)

@@ -5,7 +5,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, connect, getsockname, listen, setsockopt,
+    INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, connect, getpeername, getsockname,
+    listen, setsockopt,
 };
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
@@ -169,6 +170,20 @@ impl SafeSocket {
     pub unsafe fn getsockname(&self, addr: *mut SOCKADDR, len: *mut i32) -> io::Result<()> {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { getsockname(self.0, addr, len) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Retrieves the peer address of the socket.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `addr` and `len` are valid pointers.
+    pub unsafe fn getpeername(&self, addr: *mut SOCKADDR, len: *mut i32) -> io::Result<()> {
+        // SAFETY: The caller ensures that `addr` and `len` are valid.
+        let ret = unsafe { getpeername(self.0, addr, len) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }

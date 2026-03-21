@@ -275,7 +275,12 @@ impl<T> Op<T> {
                         if status == SubmitStatus::Void {
                             let payload_any = driver
                                 .slot_take_payload(user_data)
-                                .expect("Payload missing while recovering submit failure");
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
+                                        user_data, status, e
+                                    )
+                                });
                             if payload_any.kind != T::PAYLOAD_KIND as u16 {
                                 panic!("DetachedOp payload kind mismatch on submit recovery");
                             }
@@ -524,7 +529,12 @@ where
                         }
                         let payload_any = driver
                             .slot_take_payload(user_data)
-                            .expect("Payload missing while recovering submit failure");
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
+                                    user_data, status, e
+                                )
+                            });
                         if payload_any.kind != T::PAYLOAD_KIND as u16 {
                             panic!("LocalOp payload kind mismatch on submit recovery");
                         }
