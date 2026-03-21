@@ -50,10 +50,56 @@ use std::{
     cell::Cell,
     num::{NonZeroU16, NonZeroUsize},
     ptr::NonNull,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 const NO_REGISTRATION_INDEX: u16 = u16::MAX;
+const CONTEXT_PAYLOAD_MASK: u64 = (1u64 << 56) - 1;
+const VTABLE_IDX_SLOT_BASED: u8 = 0;
+const VTABLE_IDX_HEAP: u8 = 1;
+
+#[inline(always)]
+fn pack_context(vtable_idx: u8, payload: u64) -> u64 {
+    assert!(
+        payload <= CONTEXT_PAYLOAD_MASK,
+        "Context payload exceeds 56 bits"
+    );
+    ((vtable_idx as u64) << 56) | payload
+}
+
+#[inline(always)]
+fn context_vtable_idx(context_packed: u64) -> u8 {
+    (context_packed >> 56) as u8
+}
+
+#[inline(always)]
+fn context_payload(context_packed: u64) -> u64 {
+    context_packed & CONTEXT_PAYLOAD_MASK
+}
+
+#[inline(always)]
+fn pack_slot_context_payload(chunk_id: u16, order: usize, slot_idx: usize) -> u64 {
+    assert!(order <= u8::MAX as usize, "Order exceeds 8 bits");
+    assert!(
+        slot_idx <= u32::MAX as usize,
+        "SlotIndex exceeded 32 bits in FixedBuf handle"
+    );
+    ((chunk_id as u64) << 40) | ((order as u64) << 32) | (slot_idx as u64)
+}
+
+#[inline(always)]
+fn unpack_slot_context_payload(payload: u64) -> (u16, usize, crate::heap::slot::SlotIndex) {
+    let chunk_id = ((payload >> 40) & 0xFFFF) as u16;
+    let order = ((payload >> 32) & 0xFF) as usize;
+    let slot_idx = crate::heap::slot::SlotIndex((payload & 0xFFFF_FFFF) as usize);
+    (chunk_id, order, slot_idx)
+}
+
+#[inline(always)]
+fn slot_capacity_from_payload(payload: u64) -> usize {
+    let order = ((payload >> 32) & 0xFF) as usize;
+    crate::heap::buddy::BuddyAllocator::capacity_of(order)
+}
 
 /// A wrapper for `u16` that guarantees it never equals `S`.
 /// This enables `Option<NotU16<S>>` to have the same size as `u16`.
@@ -311,7 +357,7 @@ impl PoolTopology for UniformSlot {
     fn build(
         &self,
         pool: &Self::State,
-        _worker_idx: usize,
+        worker_idx: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool {
         // 在 Slot 架构中，所有线程共享一个大的连续区域
@@ -324,15 +370,7 @@ impl PoolTopology for UniformSlot {
             .register(&[region])
             .expect("Failed to register global buffer region (check 'ulimit -l' / RLIMIT_MEMLOCK)");
 
-        // Build mapping: ChunkID (Index) -> RegionIndex (Value)
-        // Since we only registered Chunk 0, the first ID corresponds to Chunk 0.
-        // Even if registration happens here, SlotBasedPool no longer tracks it.
-        // It's up to the Driver to verify registration.
-
-        // We still call register for now to keep existing behavior until Driver is updated,
-        // but we ignore the returned IDs in SlotBasedPool.
-
-        let slot_pool = SlotBasedPool::with_seed(pool.clone(), _worker_idx);
+        let slot_pool = SlotBasedPool::with_seed(pool.clone(), worker_idx);
         AnyBufPool::new(slot_pool)
     }
 
@@ -346,20 +384,43 @@ impl PoolTopology for UniformSlot {
 }
 
 #[derive(Debug)]
+#[repr(C, align(32))]
 pub struct FixedBuf {
     ptr: NonNull<u8>,
-    len: usize,
-    cap: NonZeroUsize,
     // Metadata moved from Heap Header to Handle
     pool_data: NonNull<()>,
-    vtable: &'static PoolVTable,
-    context: u64,
+    context_packed: u64, // [vtable_idx:8 | context_payload:56]
+    len: u32,
+    // For non-slot buffers, stores capacity in bytes (u32).
+    // For slot buffers, currently unused (reserved for future flags).
+    flags: u32,
 }
+
+const _: [(); 32] = [(); std::mem::size_of::<FixedBuf>()];
+const _: [(); 32] = [(); std::mem::align_of::<FixedBuf>()];
 
 // Safety: FixedBuf 拥有其底层内存的所有权。
 unsafe impl Send for FixedBuf {}
 
 impl FixedBuf {
+    #[inline(always)]
+    fn vtable_idx(&self) -> u8 {
+        context_vtable_idx(self.context_packed)
+    }
+
+    #[inline(always)]
+    fn context_raw(&self) -> u64 {
+        context_payload(self.context_packed)
+    }
+
+    #[inline(always)]
+    fn capacity_usize(&self) -> usize {
+        match self.vtable_idx() {
+            VTABLE_IDX_SLOT_BASED => slot_capacity_from_payload(self.context_raw()),
+            _ => self.flags as usize,
+        }
+    }
+
     /// # Safety
     /// `ptr` must be valid and allocated by the pool associated with `vtable`.
     #[inline(always)]
@@ -370,13 +431,28 @@ impl FixedBuf {
         vtable: &'static PoolVTable,
         context: u64,
     ) -> Self {
+        assert!(
+            cap.get() <= u32::MAX as usize,
+            "FixedBuf only supports capacity <= u32::MAX"
+        );
+
+        let vtable_idx = vtable_to_index(vtable);
+        let payload = context & CONTEXT_PAYLOAD_MASK;
+        let context_packed = pack_context(vtable_idx, payload);
+
+        let flags = if vtable_idx == VTABLE_IDX_SLOT_BASED {
+            debug_assert_eq!(cap.get(), slot_capacity_from_payload(payload));
+            0
+        } else {
+            cap.get() as u32
+        };
+
         Self {
             ptr,
-            len: cap.get(),
-            cap,
             pool_data,
-            vtable,
-            context,
+            context_packed,
+            len: cap.get() as u32,
+            flags,
         }
     }
 
@@ -386,23 +462,24 @@ impl FixedBuf {
     /// The interpretation of the region index is pool-dependent.
     #[inline(always)]
     pub fn resolve_region_info(&self) -> RegionInfo {
-        unsafe { (self.vtable.resolve_region_info)(self.pool_data, self) }
+        let vtable = vtable_from_index(self.vtable_idx());
+        unsafe { (vtable.resolve_region_info)(self.pool_data, self) }
     }
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
     }
 
     #[inline(always)]
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }
     }
 
     /// Access the full capacity as a mutable slice for writing data before set_len is called.
     #[inline(always)]
     pub fn spare_capacity_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap.get()) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity_usize()) }
     }
 
     #[inline(always)]
@@ -418,23 +495,27 @@ impl FixedBuf {
 
     #[inline(always)]
     pub fn capacity(&self) -> usize {
-        self.cap.get()
+        self.capacity_usize()
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        false
+        self.len == 0
     }
 
     #[inline(always)]
     pub fn set_len(&mut self, len: usize) {
-        assert!(len <= self.cap.get());
-        self.len = len;
+        assert!(
+            len <= self.capacity_usize(),
+            "len must be <= buffer capacity"
+        );
+        assert!(len <= u32::MAX as usize, "len exceeds u32::MAX");
+        self.len = len as u32;
     }
 
     /// Allocate a buffer from the system heap (not from a pool).
@@ -456,7 +537,8 @@ impl FixedBuf {
 
         static HEAP_BUF_COOKIE_GEN: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
-        let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            & CONTEXT_PAYLOAD_MASK;
 
         Ok(unsafe {
             Self::new(
@@ -474,14 +556,16 @@ impl Drop for FixedBuf {
     #[inline(always)]
     fn drop(&mut self) {
         unsafe {
+            let cap = NonZeroUsize::new_unchecked(self.capacity_usize());
             let params = DeallocParams {
                 ptr: self.ptr,
-                cap: self.cap,
-                context: self.context,
+                cap,
+                context: self.context_raw(),
             };
 
-            // Call dealloc via vtable stored in handle
-            (self.vtable.dealloc)(self.pool_data, params);
+            // Call dealloc via vtable resolved from compact index
+            let vtable = vtable_from_index(self.vtable_idx());
+            (vtable.dealloc)(self.pool_data, params);
         }
     }
 }
@@ -756,24 +840,7 @@ impl BackingPool for SlotBasedPool {
 
         if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order, self.seed) {
             let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
-
-            // Pack Metadata into Context (64-bit)
-            // Layout: [ChunkID 16b] [Reserved 16b] [Order 8b] [SlotIndex 24b]
-            // Constraint: SlotIndex must fit in 24 bits (16 Million slots = 64GB @ 4KB).
-
-            let chunk_id_val = chunk_id as u64;
-            // Reserved: 0
-            let s_idx = slot_idx.0 as u64;
-
-            assert!(
-                s_idx < (1 << 24),
-                "SlotIndex exceeded 24 bits (Chunk size > 64GB not supported by 24-bit addressing in FixedBuf handle)"
-            );
-
-            let context = (chunk_id_val << 48)
-                // | (0 << 32) // Reserved
-                | ((order as u64 & 0xFF) << 24)
-                | (s_idx & 0xFFFFFF);
+            let context = pack_slot_context_payload(chunk_id, order, slot_idx.0);
 
             let cap = unsafe { NonZeroUsize::new_unchecked(capacity) };
 
@@ -854,6 +921,56 @@ static HEAP_POOL_VTABLE: PoolVTable = PoolVTable {
     resolve_region_info: heap_resolve_region_info_shim,
 };
 
+fn custom_vtable_registry() -> &'static Mutex<Vec<&'static PoolVTable>> {
+    static REGISTRY: OnceLock<Mutex<Vec<&'static PoolVTable>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(vec![&SLOT_BASED_POOL_VTABLE, &HEAP_POOL_VTABLE]))
+}
+
+#[inline(always)]
+fn vtable_to_index(vtable: &'static PoolVTable) -> u8 {
+    if std::ptr::eq(vtable, &SLOT_BASED_POOL_VTABLE) {
+        return VTABLE_IDX_SLOT_BASED;
+    }
+    if std::ptr::eq(vtable, &HEAP_POOL_VTABLE) {
+        return VTABLE_IDX_HEAP;
+    }
+
+    let mut registry = custom_vtable_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if let Some(index) = registry
+        .iter()
+        .position(|entry| std::ptr::eq(*entry, vtable))
+    {
+        return index as u8;
+    }
+
+    assert!(
+        registry.len() < (u8::MAX as usize + 1),
+        "PoolVTable registry exceeded u8 index space"
+    );
+    registry.push(vtable);
+    (registry.len() - 1) as u8
+}
+
+#[inline(always)]
+fn vtable_from_index(index: u8) -> &'static PoolVTable {
+    match index {
+        VTABLE_IDX_SLOT_BASED => &SLOT_BASED_POOL_VTABLE,
+        VTABLE_IDX_HEAP => &HEAP_POOL_VTABLE,
+        _ => {
+            let registry = custom_vtable_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry
+                .get(index as usize)
+                .copied()
+                .expect("Invalid PoolVTable index in FixedBuf handle")
+        }
+    }
+}
+
 unsafe fn heap_dealloc_shim(_pool_data: NonNull<()>, params: DeallocParams) {
     let layout = std::alloc::Layout::from_size_align(params.cap.get(), 4096).unwrap();
     unsafe {
@@ -863,23 +980,18 @@ unsafe fn heap_dealloc_shim(_pool_data: NonNull<()>, params: DeallocParams) {
 
 unsafe fn heap_resolve_region_info_shim(_pool_data: NonNull<()>, buf: &FixedBuf) -> RegionInfo {
     // Return NO_REGISTRATION_INDEX to indicate this buffer is not registered.
-    // Usebuf.context as the cookie for heap buffers.
+    // Use context payload as the heap cookie.
     RegionInfo {
         id: NO_REGISTRATION_INDEX,
         offset: 0,
-        cookie: buf.context,
+        cookie: buf.context_raw(),
     }
 }
 
 unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
     let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
 
-    // Unpack context (u64)
-    // Layout: [ChunkID 16b] [RegionIndex 16b] [Order 8b] [SlotIndex 24b]
-    let chunk_id = ((params.context >> 48) & 0xFFFF) as u16;
-    let order = ((params.context >> 24) & 0xFF) as usize;
-    let slot_idx_val = (params.context & 0xFFFFFF) as usize;
-    let slot_idx = crate::heap::slot::SlotIndex(slot_idx_val);
+    let (chunk_id, order, slot_idx) = unpack_slot_context_payload(params.context);
 
     // Try recycle
     let recycled = with_pool_cache(|cache| {
@@ -917,8 +1029,7 @@ unsafe fn slot_based_resolve_region_info_shim(
     let pool = unsafe { &*(pool_data.as_ptr() as *const crate::heap::GlobalSlotPool) };
 
     // 2. Unpack ChunkID
-    // Layout: [ChunkID 16b] [Reserved 16b] [Order 8b] [SlotIndex 24b]
-    let chunk_id = ((buf.context >> 48) & 0xFFFF) as u16;
+    let (chunk_id, _order, _slot_idx) = unpack_slot_context_payload(buf.context_raw());
 
     // 3. Get base address from ChunkInfo
     let chunk_info = pool
