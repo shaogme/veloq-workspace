@@ -26,6 +26,8 @@ crossbeam-queue.workspace = true
 tracing.workspace = true
 veloq-shim.workspace = true
 
+bilge.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 

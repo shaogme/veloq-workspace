@@ -8,6 +8,8 @@ use veloq_atomic_waker::AtomicWaker;
 use veloq_shim::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use veloq_shim::sync::Mutex;
 
+use bilge::prelude::*;
+
 /// Manual payload container: raw pointer + static kind + drop fn.
 #[derive(Debug)]
 pub struct ErasedPayload {
@@ -35,7 +37,8 @@ impl Drop for ErasedPayload {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[bitsize(8)]
+#[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
     Idle,
     Reserved,
@@ -43,67 +46,77 @@ pub enum SlotState {
     InFlightReady,
     InFlightOrphaned,
     Finalizing,
+    #[fallback]
+    ReservedValue,
 }
 
-#[inline]
-const fn encode_slot_state(state: SlotState) -> u8 {
-    match state {
-        SlotState::Idle => 0,
-        SlotState::Reserved => 1,
-        SlotState::InFlightWaiting => 2,
-        SlotState::InFlightReady => 3,
-        SlotState::InFlightOrphaned => 4,
-        SlotState::Finalizing => 5,
+#[bitsize(64)]
+#[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
+pub struct PackedCoreState {
+    pub generation: u32,
+    pub state: SlotState,
+    pub flags: u24,
+}
+
+impl PackedCoreState {
+    #[inline]
+    pub fn with_state(mut self, state: SlotState) -> Self {
+        self.set_state(state);
+        self
+    }
+
+    #[inline]
+    pub fn with_generation(mut self, generation: u32) -> Self {
+        self.set_generation(generation);
+        self
     }
 }
 
-#[inline]
-fn decode_slot_state(raw: u8) -> SlotState {
-    match raw {
-        0 => SlotState::Idle,
-        1 => SlotState::Reserved,
-        2 => SlotState::InFlightWaiting,
-        3 => SlotState::InFlightReady,
-        4 => SlotState::InFlightOrphaned,
-        5 => SlotState::Finalizing,
-        _ => panic!("invalid SlotState encoding: {raw}"),
+pub struct AtomicPackedCoreState(AtomicU64);
+
+impl AtomicPackedCoreState {
+    #[inline]
+    pub fn new(state: PackedCoreState) -> Self {
+        Self(AtomicU64::new(u64::from(state)))
     }
-}
 
-const CORE_GENERATION_SHIFT: u32 = 0;
-const CORE_STATE_SHIFT: u32 = 32;
-const CORE_FLAGS_SHIFT: u32 = 40;
+    #[inline]
+    pub fn load(&self, order: Ordering) -> PackedCoreState {
+        PackedCoreState::from(self.0.load(order))
+    }
 
-const CORE_GENERATION_MASK: u64 = 0xffff_ffff;
-const CORE_STATE_MASK: u64 = 0xff << CORE_STATE_SHIFT;
+    #[inline]
+    pub fn store(&self, state: PackedCoreState, order: Ordering) {
+        self.0.store(u64::from(state), order);
+    }
 
-#[inline]
-pub(crate) const fn pack_core_state(generation: u32, state: SlotState, flags: u32) -> u64 {
-    ((generation as u64) << CORE_GENERATION_SHIFT)
-        | (((encode_slot_state(state) as u64) & 0xff) << CORE_STATE_SHIFT)
-        | (((flags as u64) & 0x00ff_ffff) << CORE_FLAGS_SHIFT)
-}
+    #[inline]
+    pub fn compare_exchange(
+        &self,
+        current: PackedCoreState,
+        new: PackedCoreState,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<PackedCoreState, PackedCoreState> {
+        self.0
+            .compare_exchange(u64::from(current), u64::from(new), success, failure)
+            .map(PackedCoreState::from)
+            .map_err(PackedCoreState::from)
+    }
 
-#[inline]
-pub(crate) const fn core_generation(raw: u64) -> u32 {
-    (raw & CORE_GENERATION_MASK) as u32
-}
-
-#[inline]
-pub(crate) fn core_state(raw: u64) -> SlotState {
-    decode_slot_state(((raw & CORE_STATE_MASK) >> CORE_STATE_SHIFT) as u8)
-}
-
-#[inline]
-pub(crate) const fn core_with_state(raw: u64, state: SlotState) -> u64 {
-    (raw & !CORE_STATE_MASK) | (((encode_slot_state(state) as u64) & 0xff) << CORE_STATE_SHIFT)
-}
-
-#[inline]
-pub(crate) const fn core_with_state_generation(raw: u64, state: SlotState, generation: u32) -> u64 {
-    (raw & !(CORE_STATE_MASK | CORE_GENERATION_MASK))
-        | (((encode_slot_state(state) as u64) & 0xff) << CORE_STATE_SHIFT)
-        | ((generation as u64) << CORE_GENERATION_SHIFT)
+    #[inline]
+    pub fn compare_exchange_weak(
+        &self,
+        current: PackedCoreState,
+        new: PackedCoreState,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<PackedCoreState, PackedCoreState> {
+        self.0
+            .compare_exchange_weak(u64::from(current), u64::from(new), success, failure)
+            .map(PackedCoreState::from)
+            .map_err(PackedCoreState::from)
+    }
 }
 
 pub struct SlotStorage<Op, S: SlotSidecar> {
@@ -155,9 +168,8 @@ impl<Op, S: SlotSidecar> Default for SlotStorage<Op, S> {
     }
 }
 
-#[derive(Debug)]
 pub struct SlotData<Op, S: SlotSidecar> {
-    core_state: AtomicU64,
+    pub(crate) core_state: AtomicPackedCoreState,
     pub next_free: AtomicUsize,
     pub(crate) completion_res: AtomicI32,
     pub(crate) completion_flags: AtomicU32,
@@ -177,7 +189,11 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
 
     pub fn new() -> Self {
         Self {
-            core_state: AtomicU64::new(pack_core_state(0, SlotState::Idle, 0)),
+            core_state: AtomicPackedCoreState::new(PackedCoreState::new(
+                0,
+                SlotState::Idle,
+                u24::new(0),
+            )),
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             completion_res: AtomicI32::new(0),
             completion_flags: AtomicU32::new(0),
@@ -189,36 +205,24 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
 
     #[inline]
     pub(crate) fn state(&self, ordering: Ordering) -> SlotState {
-        core_state(self.core_state.load(ordering))
+        self.core_state.load(ordering).state()
     }
 
     #[inline]
     pub fn generation(&self, ordering: Ordering) -> u32 {
-        core_generation(self.core_state.load(ordering))
+        self.core_state.load(ordering).generation()
     }
 
     #[inline]
-    pub(crate) fn core_state(&self, ordering: Ordering) -> u64 {
+    pub(crate) fn load_core_state(&self, ordering: Ordering) -> PackedCoreState {
         self.core_state.load(ordering)
-    }
-
-    #[inline]
-    pub(crate) fn compare_exchange_core_state(
-        &self,
-        current: u64,
-        new: u64,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<u64, u64> {
-        self.core_state
-            .compare_exchange(current, new, success, failure)
     }
 
     #[inline]
     pub(crate) fn set_state(&self, state: SlotState, ordering: Ordering) {
         let mut current = self.core_state.load(Ordering::Acquire);
         loop {
-            let new = core_with_state(current, state);
+            let new = current.with_state(state);
             match self
                 .core_state
                 .compare_exchange_weak(current, new, ordering, Ordering::Acquire)
@@ -231,7 +235,7 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
 
     pub(crate) fn reset(&self, generation: u32) {
         self.core_state.store(
-            pack_core_state(generation, SlotState::Idle, 0),
+            PackedCoreState::new(generation, SlotState::Idle, u24::new(0)),
             Ordering::Release,
         );
     }
@@ -239,14 +243,13 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     pub(crate) fn free(&self) {
         let mut current = self.core_state.load(Ordering::Acquire);
         loop {
-            let state = core_state(current);
             // Preserve READY state so detached completion can still be consumed.
-            let target = if state == SlotState::InFlightReady {
+            let target = if current.state() == SlotState::InFlightReady {
                 SlotState::InFlightReady
             } else {
                 SlotState::Idle
             };
-            let new = core_with_state(current, target);
+            let new = current.with_state(target);
             match self.core_state.compare_exchange_weak(
                 current,
                 new,
@@ -391,8 +394,8 @@ impl<Op, S: SlotSidecar> SlotTable<Op, S> {
     #[inline]
     pub(crate) fn slot_snapshot(&self, idx: usize) -> Option<(u32, SlotState)> {
         self.slots.get(idx).map(|slot| {
-            let core = slot.core_state(Ordering::Acquire);
-            (core_generation(core), core_state(core))
+            let core = slot.load_core_state(Ordering::Acquire);
+            (core.generation(), core.state())
         })
     }
 }
@@ -733,7 +736,10 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
                 index,
             )
             .map(SlotView::InFlightOrphaned),
-            SlotState::Idle | SlotState::InFlightReady | SlotState::Finalizing => None,
+            SlotState::Idle
+            | SlotState::InFlightReady
+            | SlotState::Finalizing
+            | SlotState::ReservedValue => None,
         }
     }
 

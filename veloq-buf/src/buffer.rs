@@ -53,51 +53,30 @@ use std::{
     sync::Arc,
 };
 
-const CONTEXT_PAYLOAD_MASK: u64 = (1u64 << 56) - 1;
-const POOL_KIND_SLOT_BASED: u8 = 0;
-const POOL_KIND_HEAP: u8 = 1;
+use bilge::prelude::*;
 
-#[inline(always)]
-fn pack_context(pool_kind: u8, payload: u64) -> u64 {
-    assert!(
-        payload <= CONTEXT_PAYLOAD_MASK,
-        "Context payload exceeds 56 bits"
-    );
-    ((pool_kind as u64) << 56) | payload
+#[bitsize(1)]
+#[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolKind {
+    SlotBased,
+    Heap,
 }
 
-#[inline(always)]
-fn context_pool_kind(context_packed: u64) -> u8 {
-    (context_packed >> 56) as u8
+#[bitsize(64)]
+#[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
+pub struct PackedContext {
+    pub slot_idx: u32,
+    pub order: u8,
+    pub chunk_id: u16,
+    pub reserved: u7,
+    pub pool_kind: PoolKind,
 }
 
-#[inline(always)]
-fn context_payload(context_packed: u64) -> u64 {
-    context_packed & CONTEXT_PAYLOAD_MASK
-}
-
-#[inline(always)]
-fn pack_slot_context_payload(chunk_id: u16, order: usize, slot_idx: usize) -> u64 {
-    assert!(order <= u8::MAX as usize, "Order exceeds 8 bits");
-    assert!(
-        slot_idx <= u32::MAX as usize,
-        "SlotIndex exceeded 32 bits in FixedBuf handle"
-    );
-    ((chunk_id as u64) << 40) | ((order as u64) << 32) | (slot_idx as u64)
-}
-
-#[inline(always)]
-fn unpack_slot_context_payload(payload: u64) -> (u16, usize, crate::heap::slot::SlotIndex) {
-    let chunk_id = ((payload >> 40) & 0xFFFF) as u16;
-    let order = ((payload >> 32) & 0xFF) as usize;
-    let slot_idx = crate::heap::slot::SlotIndex((payload & 0xFFFF_FFFF) as usize);
-    (chunk_id, order, slot_idx)
-}
-
-#[inline(always)]
-fn slot_capacity_from_payload(payload: u64) -> usize {
-    let order = ((payload >> 32) & 0xFF) as usize;
-    crate::heap::buddy::BuddyAllocator::capacity_of(order)
+impl PackedContext {
+    #[inline(always)]
+    pub fn raw_payload(&self) -> u64 {
+        u64::from(*self) & 0x00FFFFFFFFFFFFFF
+    }
 }
 
 /// A wrapper for `u16` that guarantees it never equals `S`.
@@ -137,24 +116,6 @@ impl<const S: u16> NotU16<S> {
 impl<const S: u16> std::fmt::Debug for NotU16<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.get())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PoolKind {
-    SlotBased = POOL_KIND_SLOT_BASED,
-    Heap = POOL_KIND_HEAP,
-}
-
-impl PoolKind {
-    #[inline(always)]
-    fn from_u8(v: u8) -> Self {
-        match v {
-            POOL_KIND_SLOT_BASED => Self::SlotBased,
-            POOL_KIND_HEAP => Self::Heap,
-            _ => panic!("Invalid PoolKind value in FixedBuf handle"),
-        }
     }
 }
 
@@ -392,7 +353,7 @@ pub struct FixedBuf {
     ptr: NonNull<u8>,
     // Metadata moved from Heap Header to Handle
     pool_data: NonNull<()>,
-    context_packed: u64, // [pool_kind:8 | context_payload:56]
+    context: PackedContext, // [pool_kind:1 | reserved:7 | context_payload:56]
     len: u32,
     // For non-slot buffers, stores capacity in bytes (u32).
     // For slot buffers, currently unused (reserved for future flags).
@@ -408,18 +369,20 @@ unsafe impl Send for FixedBuf {}
 impl FixedBuf {
     #[inline(always)]
     fn pool_kind(&self) -> PoolKind {
-        PoolKind::from_u8(context_pool_kind(self.context_packed))
+        self.context.pool_kind()
     }
 
     #[inline(always)]
     fn context_raw(&self) -> u64 {
-        context_payload(self.context_packed)
+        self.context.raw_payload()
     }
 
     #[inline(always)]
     fn capacity_usize(&self) -> usize {
         match self.pool_kind() {
-            PoolKind::SlotBased => slot_capacity_from_payload(self.context_raw()),
+            PoolKind::SlotBased => {
+                crate::heap::buddy::BuddyAllocator::capacity_of(self.context.order() as usize)
+            }
             PoolKind::Heap => self.flags as usize,
         }
     }
@@ -439,12 +402,15 @@ impl FixedBuf {
             "FixedBuf only supports capacity <= u32::MAX"
         );
 
-        let payload = context & CONTEXT_PAYLOAD_MASK;
-        let context_packed = pack_context(pool_kind as u8, payload);
+        let mut context = PackedContext::from(context);
+        context.set_pool_kind(pool_kind);
 
         let flags = match pool_kind {
             PoolKind::SlotBased => {
-                debug_assert_eq!(cap.get(), slot_capacity_from_payload(payload));
+                debug_assert_eq!(
+                    cap.get(),
+                    crate::heap::buddy::BuddyAllocator::capacity_of(context.order() as usize)
+                );
                 0
             }
             PoolKind::Heap => cap.get() as u32,
@@ -453,7 +419,7 @@ impl FixedBuf {
         Self {
             ptr,
             pool_data,
-            context_packed,
+            context,
             len: cap.get() as u32,
             flags,
         }
@@ -543,7 +509,7 @@ impl FixedBuf {
         static HEAP_BUF_COOKIE_GEN: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
         let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            & CONTEXT_PAYLOAD_MASK;
+            & 0x00FFFFFFFFFFFFFF;
 
         Ok(unsafe {
             Self::new(
@@ -843,7 +809,13 @@ impl BackingPool for SlotBasedPool {
 
         if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order, self.seed) {
             let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
-            let context = pack_slot_context_payload(chunk_id, order, slot_idx.0);
+            let context_data = PackedContext::new(
+                slot_idx.0 as u32,
+                order as u8,
+                chunk_id,
+                PoolKind::SlotBased,
+            );
+            let context = u64::from(context_data);
 
             let cap = unsafe { NonZeroUsize::new_unchecked(capacity) };
 
@@ -939,7 +911,10 @@ fn heap_resolve_region_info(buf: &FixedBuf) -> RegionInfo {
 unsafe fn slot_based_dealloc(pool_data: NonNull<()>, context: u64) {
     let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
 
-    let (chunk_id, order, slot_idx) = unpack_slot_context_payload(context);
+    let ctx = PackedContext::from(context);
+    let chunk_id = ctx.chunk_id();
+    let order = ctx.order() as usize;
+    let slot_idx = crate::heap::slot::SlotIndex(ctx.slot_idx() as usize);
 
     // Try recycle
     let recycled = with_pool_cache(|cache| {
@@ -974,7 +949,8 @@ unsafe fn slot_based_resolve_region_info(pool_data: NonNull<()>, buf: &FixedBuf)
     let pool = unsafe { &*(pool_data.as_ptr() as *const crate::heap::GlobalSlotPool) };
 
     // 2. Unpack ChunkID
-    let (chunk_id, _order, _slot_idx) = unpack_slot_context_payload(buf.context_raw());
+    let ctx = PackedContext::from(buf.context_raw());
+    let chunk_id = ctx.chunk_id();
 
     // 3. Get base address from ChunkInfo
     let chunk_info = pool
