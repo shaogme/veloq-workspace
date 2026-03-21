@@ -223,7 +223,13 @@ impl IocpDriver {
         let mut guard = Self::prep_op_slot(&mut self.ops, user_data, op)?;
 
         let is_rio_pool_waiting = guard
-            .with_op_mut(|op| matches!(op.payload, crate::ops::IocpOpPayload::UdpRecvStream(_)))
+            .with_op_mut(|op| {
+                matches!(
+                    op.payload,
+                    crate::ops::IocpOpPayload::UdpRecvStream(_)
+                        | crate::ops::IocpOpPayload::Recv(_)
+                )
+            })
             .unwrap_or(false);
         let overlapped = guard.storage.with_mut(|_op, _result, _payload, sidecar| {
             &mut sidecar.inner as *mut crate::win32::Overlapped

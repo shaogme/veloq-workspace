@@ -1,6 +1,6 @@
 use super::{
-    POOL_CTX_TAG, PoolCompletionEvent, UDP_RECV_POOL_QUEUE_CAP, UdpPoolState, UdpRecvDatagram,
-    UdpRecvPool, UdpRecvPoolSlot, UdpWaiter, UdpWaiterKind,
+    POOL_CTX_TAG, PoolCompletionEvent, UDP_RECV_POOL_QUEUE_CAP, UdpMailbox, UdpPoolState,
+    UdpRecvDatagram, UdpRecvPool, UdpRecvPoolSlot, UdpWaiter, UdpWaiterKind,
 };
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::net::addr::{SockAddrStorage, to_socket_addr};
@@ -95,8 +95,6 @@ impl UdpPoolManager {
             pool.state = UdpPoolState::Draining;
         }
         pool.target_credits = 0;
-        pool.queue.clear();
-        pool.waiters.clear();
         pool.spare_bufs.clear();
         for slot in &mut pool.slots {
             if slot.in_flight {
@@ -280,7 +278,11 @@ impl UdpPoolManager {
         }
     }
 
-    pub(crate) fn rebalance_udp_pool(&mut self, ctx: &mut RioContext) -> io::Result<usize> {
+    pub(crate) fn rebalance_udp_pool(
+        &mut self,
+        mailbox: &UdpMailbox,
+        ctx: &mut RioContext,
+    ) -> io::Result<usize> {
         let (desired, state) = {
             let pool = self
                 .pool
@@ -290,11 +292,11 @@ impl UdpPoolManager {
             if !matches!(pool.state, UdpPoolState::Running) {
                 (0, pool.state)
             } else {
-                if !pool.waiters.is_empty() {
-                    let bump = pool.waiters.len().clamp(1, 4);
+                if !mailbox.waiters.is_empty() {
+                    let bump = mailbox.waiters.len().clamp(1, 4);
                     pool.target_credits = (pool.target_credits + bump).min(pool.max_credits);
                     pool.idle_hits = 0;
-                } else if pool.queue.is_empty() {
+                } else if mailbox.queue.is_empty() {
                     pool.idle_hits = pool.idle_hits.saturating_add(1);
                     if pool.idle_hits >= 64 && pool.target_credits > pool.min_credits {
                         pool.target_credits -= 1;
@@ -332,8 +334,6 @@ impl UdpPoolManager {
 
         self.pool = Some(UdpRecvPool {
             slots: Vec::with_capacity(max),
-            queue: VecDeque::with_capacity(initial),
-            waiters: VecDeque::new(),
             spare_bufs: VecDeque::with_capacity(initial),
             min_credits: min,
             max_credits: max,
@@ -499,17 +499,18 @@ impl UdpPoolManager {
         }
     }
 
-    pub(super) fn dispatch_waiters(&mut self, comp: &mut RioCompletionContext<'_>) {
+    pub(super) fn dispatch_waiters(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        comp: &mut RioCompletionContext<'_>,
+    ) {
         loop {
             let (waiter, mut datagram) = {
-                let Some(pool) = self.pool.as_mut() else {
+                let Some(waiter) = mailbox.waiters.pop_front() else {
                     return;
                 };
-                let Some(waiter) = pool.waiters.pop_front() else {
-                    return;
-                };
-                let Some(datagram) = pool.queue.pop_front() else {
-                    pool.waiters.push_front(waiter);
+                let Some(datagram) = mailbox.queue.pop_front() else {
+                    mailbox.waiters.push_front(waiter);
                     return;
                 };
                 (waiter, Some(datagram))
@@ -522,20 +523,45 @@ impl UdpPoolManager {
                 UdpWaiterKind::Recv => Self::deliver_to_recv_waiter(comp, waiter, &mut datagram),
             };
 
-            if !delivered
-                && let Some(pool) = self.pool.as_mut()
-                && let Some(returned_datagram) = datagram
-            {
-                pool.queue.push_front(returned_datagram);
-                if pool.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
-                    let _ = pool.queue.pop_back();
+            if !delivered && let Some(returned_datagram) = datagram {
+                mailbox.queue.push_front(returned_datagram);
+                if mailbox.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
+                    let _ = mailbox.queue.pop_back();
                 }
             }
         }
     }
 
+    fn maybe_prime_waiter_credit(
+        &mut self,
+        mailbox: &UdpMailbox,
+        preferred_capacity: usize,
+        ctx: &mut RioContext,
+    ) -> io::Result<()> {
+        let Some(pool) = self.pool.as_mut() else {
+            return Ok(());
+        };
+        if !matches!(pool.state, UdpPoolState::Running) {
+            return Ok(());
+        }
+        if mailbox.waiters.is_empty() || !mailbox.queue.is_empty() {
+            return Ok(());
+        }
+        if !pool.spare_bufs.is_empty() || !pool.slots.is_empty() {
+            return Ok(());
+        }
+        let Some(cap) = std::num::NonZeroUsize::new(preferred_capacity.max(1)) else {
+            return Ok(());
+        };
+        let buf = FixedBuf::alloc_heap(cap)?;
+        pool.spare_bufs.push_back(buf);
+        let _ = self.rebalance_udp_pool(mailbox, ctx)?;
+        Ok(())
+    }
+
     pub(crate) fn try_submit_pool_recv(
         &mut self,
+        mailbox: &mut UdpMailbox,
         stream_op: &mut UdpRecvStream<crate::RawHandle>,
         uid: (usize, u32),
         ctx: &mut RioContext,
@@ -551,28 +577,35 @@ impl UdpPoolManager {
                 return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
             }
 
-            if let Some(datagram) = pool.queue.pop_front() {
+            if let Some(datagram) = mailbox.queue.pop_front() {
                 stream_op.result = Some(Self::into_op_datagram(datagram));
-                total_submissions += self.rebalance_udp_pool(ctx)?;
+                total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
                 return Ok((SubmissionResult::PostToQueue, total_submissions));
             }
 
-            pool.waiters.push_back(UdpWaiter {
+            mailbox.waiters.push_back(UdpWaiter {
                 user_data: uid.0,
                 generation: uid.1,
                 kind: UdpWaiterKind::Stream,
             });
         }
-        total_submissions += self.rebalance_udp_pool(ctx)?;
+        let preferred_capacity = stream_op
+            .buf
+            .as_ref()
+            .map(FixedBuf::capacity)
+            .unwrap_or(2048);
+        self.maybe_prime_waiter_credit(mailbox, preferred_capacity, ctx)?;
+        total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
         Ok((SubmissionResult::Pending, total_submissions))
     }
 
     pub(crate) fn try_submit_pool_recv_recv(
         &mut self,
+        mailbox: &mut UdpMailbox,
         recv_op: &mut OpRecv<crate::RawHandle>,
         uid: (usize, u32),
         ctx: &mut RioContext,
-    ) -> io::Result<(SubmissionResult, usize)> {
+    ) -> io::Result<(SubmissionResult, usize, Option<usize>)> {
         let mut total_submissions = self.ensure_pool(ctx)?;
         {
             let pool = self
@@ -584,25 +617,26 @@ impl UdpPoolManager {
                 return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
             }
 
-            if let Some(datagram) = pool.queue.pop_front() {
+            if let Some(datagram) = mailbox.queue.pop_front() {
                 let copied = Self::copy_datagram_to_recv_op(recv_op, &datagram);
-                let _ = copied;
-                total_submissions += self.rebalance_udp_pool(ctx)?;
-                return Ok((SubmissionResult::PostToQueue, total_submissions));
+                total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
+                return Ok((SubmissionResult::PostToQueue, total_submissions, Some(copied)));
             }
 
-            pool.waiters.push_back(UdpWaiter {
+            mailbox.waiters.push_back(UdpWaiter {
                 user_data: uid.0,
                 generation: uid.1,
                 kind: UdpWaiterKind::Recv,
             });
         }
-        total_submissions += self.rebalance_udp_pool(ctx)?;
-        Ok((SubmissionResult::Pending, total_submissions))
+        self.maybe_prime_waiter_credit(mailbox, recv_op.buf.capacity(), ctx)?;
+        total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
+        Ok((SubmissionResult::Pending, total_submissions, None))
     }
 
     pub(crate) fn try_refill_pool(
         &mut self,
+        mailbox: &UdpMailbox,
         buf: FixedBuf,
         ctx: &mut RioContext,
     ) -> io::Result<usize> {
@@ -612,17 +646,21 @@ impl UdpPoolManager {
         };
 
         pool.spare_bufs.push_back(buf);
-        total_submissions += self.rebalance_udp_pool(ctx)?;
+        total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
         Ok(total_submissions)
     }
 
-    pub(crate) fn cancel_waiter(&mut self, uid: (usize, u32), ctx: &mut RioContext) {
+    pub(crate) fn cancel_waiter(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        uid: (usize, u32),
+        ctx: &mut RioContext,
+    ) {
         let (user_data, generation) = uid;
-        if let Some(pool) = self.pool.as_mut() {
-            pool.waiters
-                .retain(|w| !(w.user_data == user_data && w.generation == generation));
-        }
-        let _ = self.rebalance_udp_pool(ctx);
+        mailbox
+            .waiters
+            .retain(|w| !(w.user_data == user_data && w.generation == generation));
+        let _ = self.rebalance_udp_pool(mailbox, ctx);
     }
 
     pub(crate) fn ack_pool_done(&mut self, completion_generation: u32) -> Option<usize> {
@@ -631,14 +669,16 @@ impl UdpPoolManager {
 
     pub(super) fn update_pool_state(
         pool: &mut UdpRecvPool,
+        mailbox: &mut UdpMailbox,
         slot_idx: usize,
         res: &RIORESULT,
     ) -> PoolCompletionEvent {
-        pool.update_state(slot_idx, res)
+        pool.update_state(mailbox, slot_idx, res)
     }
 
     pub(crate) fn handle_completion(
         &mut self,
+        mailbox: &mut UdpMailbox,
         completion: (usize, &RIORESULT),
         comp: &mut RioCompletionContext<'_>,
         ctx: &mut RioContext,
@@ -647,7 +687,7 @@ impl UdpPoolManager {
         let Some(pool) = self.pool.as_mut() else {
             return 0;
         };
-        let event = Self::update_pool_state(pool, slot_idx, res);
+        let event = Self::update_pool_state(pool, mailbox, slot_idx, res);
 
         let mut submissions = 0;
         let actions = UdpRecvPool::plan_actions(event, slot_idx);
@@ -659,11 +699,11 @@ impl UdpPoolManager {
             }
         }
         if actions.dispatch_waiters {
-            self.dispatch_waiters(comp);
+            self.dispatch_waiters(mailbox, comp);
         }
         if actions.rebalance_pool {
             self.trim_pool_tail(ctx);
-            if let Ok(n) = self.rebalance_udp_pool(ctx) {
+            if let Ok(n) = self.rebalance_udp_pool(mailbox, ctx) {
                 submissions += n;
             }
         }
@@ -674,10 +714,12 @@ impl UdpPoolManager {
         // Pure side effect to satisfy RIO requirements
     }
 
-    pub(crate) fn shutdown_pool(&mut self) {
+    pub(crate) fn shutdown_pool(&mut self, mailbox: &mut UdpMailbox) {
         if let Some(pool) = self.pool.as_mut() {
             Self::begin_draining(pool);
         }
+        mailbox.queue.clear();
+        mailbox.waiters.clear();
     }
 
     pub(crate) fn cleanup_drained_pool(&mut self, ctx: &mut RioContext) -> bool {
@@ -701,7 +743,7 @@ impl UdpPoolManager {
         true
     }
 
-    pub(crate) fn forget_and_cleanup(&mut self, ctx: &mut RioContext) {
+    pub(crate) fn forget_and_cleanup(&mut self, mailbox: &mut UdpMailbox, ctx: &mut RioContext) {
         if let Some(pool) = self.pool.take() {
             for slot in pool.slots {
                 if slot.in_flight {
@@ -712,15 +754,20 @@ impl UdpPoolManager {
             }
         }
         self.udp_ctx_map.clear();
+        mailbox.queue.clear();
+        mailbox.waiters.clear();
     }
 
     #[cfg(test)]
-    pub(crate) fn udp_pool_debug_stats(&self) -> Option<super::UdpRecvPoolDebugStats> {
+    pub(crate) fn udp_pool_debug_stats(
+        &self,
+        mailbox: &UdpMailbox,
+    ) -> Option<super::UdpRecvPoolDebugStats> {
         self.pool.as_ref().map(|pool| super::UdpRecvPoolDebugStats {
             min_credits: pool.min_credits,
             max_credits: pool.max_credits,
             target_credits: pool.target_credits,
-            waiters_len: pool.waiters.len(),
+            waiters_len: mailbox.waiters.len(),
         })
     }
 }

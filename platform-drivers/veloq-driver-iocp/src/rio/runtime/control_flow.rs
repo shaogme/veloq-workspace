@@ -8,7 +8,7 @@ use crate::rio::core::RioOpCtxGuard;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
-use crate::rio::runtime::pool::UdpPoolManager;
+use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager};
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::{RioCompletionContext, RioContext, RioEnv, RioState};
@@ -26,6 +26,7 @@ pub(crate) struct RioSocketActor {
     pub(crate) actor_id: u32,
     pub(crate) rq: RioRq,
     pub(crate) pool_manager: UdpPoolManager,
+    pub(crate) udp_mailbox: UdpMailbox,
 }
 
 impl RioSocketActor {
@@ -34,6 +35,7 @@ impl RioSocketActor {
             actor_id,
             rq,
             pool_manager: UdpPoolManager::new(),
+            udp_mailbox: UdpMailbox::new(),
         }
     }
 }
@@ -85,11 +87,10 @@ impl<'a> RioCompletionRouter<'a> {
                 actor_id: actor.actor_id,
                 rq: actor.rq,
             };
+            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
             let submissions =
-                actor
-                    .pool_manager
-                    .handle_completion((slot_idx, res), &mut self.comp, &mut ctx);
-            let remove = actor.pool_manager.cleanup_drained_pool(&mut ctx);
+                pool_manager.handle_completion(udp_mailbox, (slot_idx, res), &mut self.comp, &mut ctx);
+            let remove = pool_manager.cleanup_drained_pool(&mut ctx);
             (submissions, remove)
         };
         if remove_actor {
@@ -236,8 +237,9 @@ impl RioState {
         let mut remove_actor = None;
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-            actor.pool_manager.shutdown_pool();
-            if actor.pool_manager.cleanup_drained_pool(&mut ctx) {
+            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
+            pool_manager.shutdown_pool(udp_mailbox);
+            if pool_manager.cleanup_drained_pool(&mut ctx) {
                 remove_actor = Some(actor.actor_id);
             }
         }
@@ -249,7 +251,8 @@ impl RioState {
 
     pub(crate) fn begin_shutdown(&mut self) {
         for actor in self.actors.values_mut() {
-            actor.pool_manager.shutdown_pool();
+            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
+            pool_manager.shutdown_pool(udp_mailbox);
         }
     }
 
@@ -264,7 +267,8 @@ impl RioState {
         };
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-            actor.pool_manager.cancel_waiter(uid, &mut ctx);
+            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
+            pool_manager.cancel_waiter(udp_mailbox, uid, &mut ctx);
         }
     }
 
@@ -272,7 +276,7 @@ impl RioState {
     pub(crate) fn udp_pool_debug_stats(&self, handle: HANDLE) -> Option<UdpRecvPoolDebugStats> {
         self.actors
             .get(&handle)
-            .and_then(|actor| actor.pool_manager.udp_pool_debug_stats())
+            .and_then(|actor| actor.pool_manager.udp_pool_debug_stats(&actor.udp_mailbox))
     }
 
     #[cfg(test)]
@@ -287,8 +291,9 @@ impl RioState {
         };
         if let Some(actor) = self.actors.get_mut(&handle) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
+            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &actor.udp_mailbox);
             for _ in 0..ticks {
-                actor.pool_manager.rebalance_udp_pool(&mut ctx)?;
+                pool_manager.rebalance_udp_pool(udp_mailbox, &mut ctx)?;
             }
         }
         Ok(())
@@ -308,7 +313,8 @@ impl RioState {
         };
         for actor in self.actors.values_mut() {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-            actor.pool_manager.forget_and_cleanup(&mut ctx);
+            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
+            pool_manager.forget_and_cleanup(udp_mailbox, &mut ctx);
         }
         self.actors.clear();
         self.actor_routes.clear();

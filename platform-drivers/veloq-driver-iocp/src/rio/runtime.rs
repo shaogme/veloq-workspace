@@ -47,8 +47,7 @@ pub(crate) struct RioUdpRecvArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: HANDLE,
     pub(crate) recv_op: &'a mut Recv<crate::config::RawHandle>,
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
+    pub(crate) sidecar: &'a mut crate::ops::OverlappedEntry,
 }
 
 impl RioState {
@@ -191,7 +190,9 @@ impl RioState {
             .get_mut(&handle)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-        let (res, pool_submissions) = actor.pool_manager.try_submit_pool_recv(
+        let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
+        let (res, pool_submissions) = pool_manager.try_submit_pool_recv(
+            udp_mailbox,
             stream_op,
             (user_data, generation),
             &mut ctx,
@@ -212,8 +213,7 @@ impl RioState {
             fd,
             handle,
             recv_op,
-            user_data,
-            generation,
+            sidecar,
         } = args;
         let dispatch = self
             .kernel
@@ -231,11 +231,18 @@ impl RioState {
             .get_mut(&handle)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-        let (res, pool_submissions) = actor.pool_manager.try_submit_pool_recv_recv(
+        let user_data = sidecar.user_data;
+        let generation = sidecar.generation;
+        let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
+        let (res, pool_submissions, immediate_copied) = pool_manager.try_submit_pool_recv_recv(
+            udp_mailbox,
             recv_op,
             (user_data, generation),
             &mut ctx,
         )?;
+        if let Some(copied) = immediate_copied {
+            sidecar.blocking_result = Some(Ok(copied));
+        }
         self.outstanding_count += pool_submissions;
         if matches!(res, SubmissionResult::Pending) {
             self.outstanding_count += 1;
@@ -266,7 +273,8 @@ impl RioState {
             .get_mut(&handle)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor missing"))?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-        let pool_submissions = actor.pool_manager.try_refill_pool(buf, &mut ctx)?;
+        let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &actor.udp_mailbox);
+        let pool_submissions = pool_manager.try_refill_pool(udp_mailbox, buf, &mut ctx)?;
         self.outstanding_count += pool_submissions;
         Ok(())
     }

@@ -26,6 +26,20 @@ pub(crate) struct UdpRecvDatagram {
     pub(crate) addr_len: i32,
 }
 
+pub(crate) struct UdpMailbox {
+    pub(crate) queue: VecDeque<UdpRecvDatagram>,
+    pub(crate) waiters: VecDeque<UdpWaiter>,
+}
+
+impl UdpMailbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: VecDeque::with_capacity(UDP_RECV_POOL_QUEUE_CAP),
+            waiters: VecDeque::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UdpWaiterKind {
     Stream,
@@ -49,8 +63,6 @@ pub(crate) struct UdpRecvPoolSlot {
 
 pub(crate) struct UdpRecvPool {
     pub(crate) slots: Vec<UdpRecvPoolSlot>,
-    pub(crate) queue: VecDeque<UdpRecvDatagram>,
-    pub(crate) waiters: VecDeque<UdpWaiter>,
     pub(crate) spare_bufs: VecDeque<FixedBuf>,
     pub(crate) min_credits: usize,
     pub(crate) max_credits: usize,
@@ -82,7 +94,12 @@ pub(super) struct CompletionActions {
 }
 
 impl UdpRecvPool {
-    pub(super) fn update_state(&mut self, slot_idx: usize, res: &RIORESULT) -> PoolCompletionEvent {
+    pub(super) fn update_state(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        slot_idx: usize,
+        res: &RIORESULT,
+    ) -> PoolCompletionEvent {
         let Some(slot) = self.slots.get_mut(slot_idx) else {
             return PoolCompletionEvent::SlotMissing;
         };
@@ -99,8 +116,8 @@ impl UdpRecvPool {
             return PoolCompletionEvent::ReceivedNoDatagram;
         }
 
-        if self.queue.len() >= UDP_RECV_POOL_QUEUE_CAP {
-            let _ = self.queue.pop_front();
+        if mailbox.queue.len() >= UDP_RECV_POOL_QUEUE_CAP {
+            let _ = mailbox.queue.pop_front();
         }
 
         let replacement_buf = self.spare_bufs.pop_front().or_else(|| {
@@ -112,7 +129,7 @@ impl UdpRecvPool {
             let mut old_buf = std::mem::replace(&mut slot.buf, new_buf);
             old_buf.set_len(res.BytesTransferred as usize);
 
-            self.queue.push_back(UdpRecvDatagram {
+            mailbox.queue.push_back(UdpRecvDatagram {
                 buf: old_buf,
                 addr: *slot.addr,
                 addr_len: std::mem::size_of::<SockAddrStorage>() as i32,

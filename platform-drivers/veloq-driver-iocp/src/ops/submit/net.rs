@@ -70,8 +70,7 @@ pub(crate) fn submit_recv(
                 fd: val.fd,
                 handle,
                 recv_op: val,
-                user_data: header.user_data,
-                generation: header.generation,
+                sidecar: header,
             },
             ctx.registrar,
         );
