@@ -29,6 +29,7 @@ pub(crate) const POOL_CTX_TAG: usize = 1;
 
 pub(crate) struct UdpPoolPacket {
     pub(crate) buf: FixedBuf,
+    pub(crate) idx: u32,
     pub(crate) addr: SockAddrStorage,
     pub(crate) addr_len: i32,
 }
@@ -190,6 +191,7 @@ impl UdpRecvPool {
         if let Some(buf) = slab.chunk_view(completed_idx, bytes) {
             mailbox.queue.push_back(UdpPoolPacket {
                 buf,
+                idx: completed_idx,
                 addr: *slot.addr,
                 addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
             });

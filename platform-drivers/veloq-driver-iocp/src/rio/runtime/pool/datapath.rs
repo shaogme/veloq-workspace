@@ -740,6 +740,10 @@ impl UdpRecvPool {
         }
 
         if delivered {
+            if matches!(waiter.kind, UdpWaiterKind::Recv) {
+                slab.free_indices.push_back(completed_idx);
+            }
+
             let resubmit = !slot.stop_requested && slots_len <= self.target_credits;
             slot.stop_requested = false;
 
@@ -932,6 +936,7 @@ impl UdpPoolManager {
             Err(buf) => {
                 *datagram = Some(UdpPoolPacket {
                     buf,
+                    idx: d.idx,
                     addr: d.addr,
                     addr_len: d.addr_len,
                 });
@@ -960,7 +965,7 @@ impl UdpPoolManager {
     // pub(crate) fn dispatch_waiters(...) is moved to dispatch_waiters_static
 
     fn dispatch_waiters_static(
-        _pool: &mut UdpRecvPool,
+        pool: &mut UdpRecvPool,
         mailbox: &mut UdpMailbox,
         comp: &mut RioCompletionContext<'_>,
     ) {
@@ -976,18 +981,31 @@ impl UdpPoolManager {
                 (waiter, Some(datagram))
             };
 
-            let delivered = match waiter.kind {
+            let kind = waiter.kind;
+            let idx = datagram.as_ref().map(|d| d.idx);
+
+            let delivered = match kind {
                 UdpWaiterKind::Stream => {
                     Self::deliver_to_stream_waiter(comp, waiter, &mut datagram)
                 }
                 UdpWaiterKind::Recv => Self::deliver_to_recv_waiter(comp, waiter, &mut datagram),
             };
 
-            if !delivered && let Some(returned_datagram) = datagram {
+            if delivered {
+                if matches!(kind, UdpWaiterKind::Recv) {
+                    if let Some(idx) = idx {
+                        if let Some(slab) = pool.slab.as_mut() {
+                            slab.free_indices.push_back(idx);
+                        }
+                    }
+                }
+            } else if let Some(returned_datagram) = datagram {
                 mailbox.queue.push_front(returned_datagram);
+                mailbox.waiters.push_front(waiter);
                 if mailbox.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
                     let _ = mailbox.queue.pop_back();
                 }
+                return;
             }
         }
     }
