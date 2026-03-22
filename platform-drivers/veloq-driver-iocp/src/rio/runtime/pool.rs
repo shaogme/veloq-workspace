@@ -7,9 +7,14 @@ pub(crate) mod datapath;
 
 use crate::net::addr::SockAddrStorage;
 use crate::rio::core::submit_ops::RioBufferId;
+use slotmap::{new_key_type, SlotMap};
 use std::collections::VecDeque;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Networking::WinSock::RIORESULT;
+
+new_key_type! {
+    pub(crate) struct SlotKey;
+}
 
 pub(crate) use datapath::UdpPoolManager;
 
@@ -62,7 +67,7 @@ pub(crate) struct UdpRecvPoolSlot {
 }
 
 pub(crate) struct UdpRecvPool {
-    pub(crate) slots: Vec<UdpRecvPoolSlot>,
+    pub(crate) slots: SlotMap<SlotKey, UdpRecvPoolSlot>,
     pub(crate) spare_bufs: VecDeque<FixedBuf>,
     pub(crate) min_credits: usize,
     pub(crate) max_credits: usize,
@@ -89,7 +94,7 @@ pub(super) enum PoolCompletionEvent {
 
 #[derive(Default, Debug, Clone, Copy)]
 pub(super) struct CompletionActions {
-    pub(super) resubmit_slot: Option<usize>,
+    pub(super) resubmit_slot: Option<SlotKey>,
     pub(super) dispatch_waiters: bool,
     pub(super) rebalance_pool: bool,
 }
@@ -97,7 +102,7 @@ pub(super) struct CompletionActions {
 impl UdpRecvPool {
     pub(crate) fn uninit() -> Self {
         Self {
-            slots: Vec::new(),
+            slots: SlotMap::with_key(),
             spare_bufs: VecDeque::new(),
             min_credits: 0,
             max_credits: 0,
@@ -110,10 +115,10 @@ impl UdpRecvPool {
     pub(super) fn update_state(
         &mut self,
         mailbox: &mut UdpMailbox,
-        slot_idx: usize,
+        slot_key: SlotKey,
         res: &RIORESULT,
     ) -> PoolCompletionEvent {
-        let Some(slot) = self.slots.get_mut(slot_idx) else {
+        let Some(slot) = self.slots.get_mut(slot_key) else {
             return PoolCompletionEvent::SlotMissing;
         };
 
@@ -149,17 +154,17 @@ impl UdpRecvPool {
             });
 
             return PoolCompletionEvent::DatagramQueued {
-                resubmit: !stopping && slot_idx < self.target_credits,
+                resubmit: !stopping && self.slots.len() <= self.target_credits,
             };
         }
 
         PoolCompletionEvent::ReceivedNoDatagram
     }
 
-    pub(super) fn plan_actions(event: PoolCompletionEvent, slot_idx: usize) -> CompletionActions {
+    pub(super) fn plan_actions(event: PoolCompletionEvent, slot_key: SlotKey) -> CompletionActions {
         match event {
             PoolCompletionEvent::DatagramQueued { resubmit } => CompletionActions {
-                resubmit_slot: resubmit.then_some(slot_idx),
+                resubmit_slot: resubmit.then_some(slot_key),
                 dispatch_waiters: true,
                 rebalance_pool: true,
             },

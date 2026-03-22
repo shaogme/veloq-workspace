@@ -98,7 +98,7 @@ impl<'a> RioCompletionRouter<'a> {
             let Some(actor) = self.actors.get_mut(actor_key) else {
                 return Ok(());
             };
-            let Some(slot_idx) = actor.pool_manager.ack_pool_done(generation) else {
+            let Some(slot_key) = actor.pool_manager.ack_pool_done(generation) else {
                 return Ok(());
             };
             let mut ctx = RioContext {
@@ -110,7 +110,7 @@ impl<'a> RioCompletionRouter<'a> {
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
             let submissions = pool_manager.handle_completion(
                 udp_mailbox,
-                (slot_idx, res),
+                (slot_key, res),
                 &mut self.comp,
                 &mut ctx,
             ).attach("failed to handle pool completion")?;

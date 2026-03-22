@@ -1,5 +1,5 @@
-use std::fmt;
 use error_stack::Report;
+use std::fmt;
 
 /// RIO 模块特定的错误上下文
 #[derive(Debug)]
