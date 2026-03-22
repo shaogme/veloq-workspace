@@ -2,8 +2,10 @@
 
 use crate::rio::ActorKey;
 use crate::rio::RioState;
+use crate::rio::core::RioCompletionKind;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
+use crate::rio::core::{RioOpCtxGuard, RioPoolCtxGuard};
 use crate::rio::runtime::control_flow::RioSocketActor;
 use rustc_hash::{FxHashMap, FxHashSet};
 use slotmap::SlotMap;
@@ -20,8 +22,6 @@ pub(crate) struct DeferredRioCleanup {
     registration_mode: crate::BufferRegistrationMode,
     actors: SlotMap<ActorKey, RioSocketActor>,
     actor_by_handle: FxHashMap<HANDLE, ActorKey>,
-    actor_id_index: Vec<Option<ActorKey>>,
-    free_actor_ids: Vec<u32>,
     udp_iocp_fallback_handles: FxHashSet<HANDLE>,
     outstanding_count: usize,
 }
@@ -37,10 +37,7 @@ impl DeferredRioCleanup {
             registration_mode: self.registration_mode,
             actors: self.actors,
             actor_by_handle: self.actor_by_handle,
-            actor_id_index: self.actor_id_index,
-            free_actor_ids: self.free_actor_ids,
             udp_iocp_fallback_handles: self.udp_iocp_fallback_handles,
-            next_actor_id: 1,
             outstanding_count: self.outstanding_count,
         };
         state.begin_shutdown();
@@ -74,12 +71,19 @@ fn reaper_sender() -> Option<&'static std::sync::mpsc::Sender<DeferredRioCleanup
 
 impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) {
-        if let Some((actor_id, completion_generation)) =
-            Self::decode_pool_context(res.RequestContext)
-        {
-            let _ = self.mark_pool_done(actor_id, completion_generation);
-        } else {
-            Self::free_op_req_ctx(res.RequestContext);
+        match Self::decode_req_ctx(res.RequestContext) {
+            Some(RioCompletionKind::Pool {
+                actor_key,
+                generation,
+                ctx_ptr,
+            }) => {
+                let _ctx_guard = RioPoolCtxGuard(ctx_ptr);
+                let _ = self.mark_pool_done(actor_key, generation);
+            }
+            Some(RioCompletionKind::Op { ctx_ptr, .. }) => {
+                let _ctx_guard = RioOpCtxGuard(ctx_ptr);
+            }
+            None => {}
         }
         if self.outstanding_count > 0 {
             self.outstanding_count -= 1;
@@ -151,8 +155,6 @@ impl RioState {
             registration_mode: self.registration_mode,
             actors: std::mem::take(&mut self.actors),
             actor_by_handle: std::mem::take(&mut self.actor_by_handle),
-            actor_id_index: std::mem::take(&mut self.actor_id_index),
-            free_actor_ids: std::mem::take(&mut self.free_actor_ids),
             udp_iocp_fallback_handles: std::mem::take(&mut self.udp_iocp_fallback_handles),
             outstanding_count: std::mem::take(&mut self.outstanding_count),
         })

@@ -211,7 +211,7 @@ impl RioState {
             .actors
             .get_mut(key)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
-        let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
+        let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
         let (res, pool_submissions) = pool_manager.try_submit_pool_recv(
             udp_mailbox,
@@ -257,7 +257,7 @@ impl RioState {
             .actors
             .get_mut(key)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
-        let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
+        let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
         let user_data = sidecar.user_data;
         let generation = sidecar.generation;
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
@@ -304,7 +304,7 @@ impl RioState {
             .actors
             .get_mut(key)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor missing"))?;
-        let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
+        let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &actor.udp_mailbox);
         let pool_submissions = pool_manager.try_refill_pool(udp_mailbox, buf, &mut ctx)?;
         self.outstanding_count += pool_submissions;

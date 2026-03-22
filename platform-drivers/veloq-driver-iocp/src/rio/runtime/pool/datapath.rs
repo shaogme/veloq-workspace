@@ -1,7 +1,7 @@
 use super::{
-    POOL_CTX_TAG, UDP_RECV_POOL_INITIAL_CREDITS, UDP_RECV_POOL_MAX_CREDITS,
-    UDP_RECV_POOL_MIN_CREDITS, UDP_RECV_POOL_QUEUE_CAP, UdpMailbox, UdpPoolState, UdpRecvDatagram,
-    UdpRecvPool, UdpRecvPoolSlot, UdpWaiter, UdpWaiterKind,
+    UDP_RECV_POOL_INITIAL_CREDITS, UDP_RECV_POOL_MAX_CREDITS, UDP_RECV_POOL_MIN_CREDITS,
+    UDP_RECV_POOL_QUEUE_CAP, UdpMailbox, UdpPoolState, UdpRecvDatagram, UdpRecvPool,
+    UdpRecvPoolSlot, UdpWaiter, UdpWaiterKind,
 };
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::net::addr::{SockAddrStorage, to_socket_addr};
@@ -9,7 +9,7 @@ use crate::ops::IocpOpPayload;
 use crate::ops::slot::Slot;
 use crate::ops::submit::SubmissionResult;
 use crate::rio::core::submit_ops::{RioDispatch, RioExConfig, RioProvider, RioRq};
-use crate::rio::{RioCompletionContext, RioContext};
+use crate::rio::{RioCompletionContext, RioContext, RioState};
 use rustc_hash::FxHashMap;
 use std::collections::{VecDeque, hash_map};
 use std::io;
@@ -74,9 +74,11 @@ impl UdpPoolManager {
     }
 
     #[inline]
-    pub(crate) fn encode_pool_context(actor_id: u32, token: u32) -> *const std::ffi::c_void {
-        (((actor_id as usize) << 33) | ((token as usize) << 1) | POOL_CTX_TAG)
-            as *const std::ffi::c_void
+    pub(crate) fn encode_pool_context(
+        actor_key: crate::rio::ActorKey,
+        token: u32,
+    ) -> *const std::ffi::c_void {
+        RioState::encode_pool_req_ctx(actor_key, token)
     }
 
     pub(crate) fn ensure_pool(&mut self, ctx: &mut RioContext) -> io::Result<usize> {
@@ -304,7 +306,7 @@ impl UdpRecvPool {
             control_buf: std::ptr::null(),
             flags_buf: std::ptr::null(),
             flags: 0,
-            context: UdpPoolManager::encode_pool_context(ctx.actor_id, completion_token),
+            context: UdpPoolManager::encode_pool_context(ctx.actor_key, completion_token),
         }) {
             self.on_submit_fail(slot_idx, completion_token, e, ctx.rq, registry)
         } else {

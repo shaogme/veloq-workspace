@@ -3,15 +3,16 @@
 pub(crate) mod registry;
 pub(crate) mod submit_ops;
 
-use crate::rio::RioState;
 use crate::rio::runtime::pool::POOL_CTX_TAG;
+use crate::rio::{ActorKey, RioState};
 use std::io;
 
 #[derive(Clone, Copy)]
 pub(crate) enum RioCompletionKind {
     Pool {
-        actor_id: u32,
+        actor_key: ActorKey,
         generation: u32,
+        ctx_ptr: *mut RioPoolRequestContext,
     },
     Op {
         user_data: usize,
@@ -26,12 +27,29 @@ pub(crate) struct RioOpRequestContext {
     pub(crate) generation: u32,
 }
 
+#[repr(C)]
+pub(crate) struct RioPoolRequestContext {
+    pub(crate) actor_key: ActorKey,
+    pub(crate) generation: u32,
+}
+
 pub(crate) struct RioOpCtxGuard(pub(crate) *mut RioOpRequestContext);
+pub(crate) struct RioPoolCtxGuard(pub(crate) *mut RioPoolRequestContext);
 
 impl Drop for RioOpCtxGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
             // SAFETY: self.0 was created from Box::into_raw in encode_req_ctx.
+            unsafe { drop(Box::from_raw(self.0)) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+impl Drop for RioPoolCtxGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: self.0 was created from Box::into_raw in encode_pool_req_ctx.
             unsafe { drop(Box::from_raw(self.0)) };
             self.0 = std::ptr::null_mut();
         }
@@ -65,14 +83,16 @@ impl RioState {
         }
         let raw = ctx as usize;
         if (raw & POOL_CTX_TAG) == POOL_CTX_TAG {
-            let token = ((raw >> 1) & 0xffff_ffff) as u32;
-            let actor_id = ((raw >> 33) & 0xffff_ffff) as u32;
-            if token == 0 || actor_id == 0 {
+            let ctx_ptr = (raw & !POOL_CTX_TAG) as *mut RioPoolRequestContext;
+            if ctx_ptr.is_null() {
                 return None;
             }
+            // SAFETY: ctx_ptr is a valid pointer to RioPoolRequestContext if pool tagged.
+            let pool_ctx = unsafe { &*ctx_ptr };
             return Some(RioCompletionKind::Pool {
-                actor_id,
-                generation: token,
+                actor_key: pool_ctx.actor_key,
+                generation: pool_ctx.generation,
+                ctx_ptr,
             });
         }
         let ctx_ptr = raw as *mut RioOpRequestContext;
@@ -105,20 +125,17 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn decode_pool_context(ctx: u64) -> Option<(u32, u32)> {
-        if ctx == 0 {
-            return None;
-        }
-        let raw = ctx as usize;
-        if (raw & POOL_CTX_TAG) != POOL_CTX_TAG {
-            return None;
-        }
-        let token = ((raw >> 1) & 0xffff_ffff) as u32;
-        let actor_id = ((raw >> 33) & 0xffff_ffff) as u32;
-        if token == 0 || actor_id == 0 {
-            return None;
-        }
-        Some((actor_id, token))
+    pub(crate) fn encode_pool_req_ctx(
+        actor_key: ActorKey,
+        generation: u32,
+    ) -> *const std::ffi::c_void {
+        let ctx = Box::new(RioPoolRequestContext {
+            actor_key,
+            generation,
+        });
+        let raw = Box::into_raw(ctx) as usize;
+        debug_assert_eq!(raw & POOL_CTX_TAG, 0);
+        (raw | POOL_CTX_TAG) as *const std::ffi::c_void
     }
 
     pub(crate) fn last_wsa_error() -> io::Error {
@@ -151,26 +168,21 @@ mod tests {
     #[test]
     fn pool_ctx_decode_valid() {
         let token = 7_u32;
-        let actor_id = 9_u32;
-        let raw = (((actor_id as usize) << 33) | ((token as usize) << 1) | POOL_CTX_TAG) as u64;
-        assert_eq!(RioState::decode_pool_context(raw), Some((actor_id, token)));
-        assert!(matches!(
-            RioState::decode_req_ctx(raw),
+        let actor_key = ActorKey::default();
+        let raw = RioState::encode_pool_req_ctx(actor_key, token) as u64;
+        let decoded = RioState::decode_req_ctx(raw);
+        match decoded {
             Some(RioCompletionKind::Pool {
-                actor_id: 9,
-                generation: 7,
-            })
-        ));
-    }
-
-    #[test]
-    fn pool_ctx_decode_rejects_invalid_zero_fields() {
-        let zero_token = (((9_usize) << 33) | POOL_CTX_TAG) as u64;
-        let zero_actor = (((7_usize) << 1) | POOL_CTX_TAG) as u64;
-        assert!(RioState::decode_pool_context(zero_token).is_none());
-        assert!(RioState::decode_pool_context(zero_actor).is_none());
-        assert!(RioState::decode_req_ctx(zero_token).is_none());
-        assert!(RioState::decode_req_ctx(zero_actor).is_none());
+                actor_key: k,
+                generation,
+                ctx_ptr,
+            }) => {
+                assert_eq!(k, actor_key);
+                assert_eq!(generation, token);
+                let _guard = RioPoolCtxGuard(ctx_ptr);
+            }
+            _ => panic!("pool context should decode"),
+        }
     }
 
     #[test]
@@ -186,7 +198,7 @@ mod tests {
 
     #[test]
     fn free_pool_tagged_context_is_noop() {
-        let tagged = (((1_usize) << 33) | ((1_usize) << 1) | POOL_CTX_TAG) as u64;
+        let tagged = 1_u64;
         RioState::free_op_req_ctx(tagged);
     }
 }

@@ -45,7 +45,7 @@ pub(crate) struct RioEnv<'a> {
 pub(crate) struct RioContext<'a> {
     pub(crate) registry: &'a mut RioRegistry,
     pub(crate) env: RioEnv<'a>,
-    pub(crate) actor_id: u32,
+    pub(crate) actor_key: ActorKey,
     pub(crate) rq: RioRq,
 }
 
@@ -61,9 +61,6 @@ pub(crate) struct RioState {
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
     pub(crate) actor_by_handle: FxHashMap<HANDLE, ActorKey>,
-    pub(crate) actor_id_index: Vec<Option<ActorKey>>,
-    pub(crate) free_actor_ids: Vec<u32>,
     pub(crate) udp_iocp_fallback_handles: FxHashSet<HANDLE>,
-    pub(crate) next_actor_id: u32,
     pub(crate) outstanding_count: usize,
 }
