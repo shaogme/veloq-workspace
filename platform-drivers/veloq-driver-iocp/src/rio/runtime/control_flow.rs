@@ -10,7 +10,7 @@ use crate::rio::core::submit_ops::RioRq;
 use crate::rio::core::{RioOpCtxGuard, RioPoolCtxGuard};
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
-use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager};
+use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager, UdpPoolState};
 use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState};
 use slotmap::SlotMap;
 use std::io;
@@ -267,10 +267,14 @@ impl RioState {
                 return;
             };
             actor.state = RioActorState::Draining;
-            let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
-            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-            pool_manager.shutdown_pool(udp_mailbox);
-            pool_manager.cleanup_drained_pool(&mut ctx)
+            if actor.pool_manager.pool.state == UdpPoolState::Uninitialized {
+                true
+            } else {
+                let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
+                let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
+                pool_manager.shutdown_pool(udp_mailbox);
+                pool_manager.cleanup_drained_pool(&mut ctx)
+            }
         };
 
         self.actor_by_handle.remove(&handle);
