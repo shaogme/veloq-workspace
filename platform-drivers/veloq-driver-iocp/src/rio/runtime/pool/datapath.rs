@@ -23,6 +23,11 @@ use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
 
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIORESULT};
 
+enum FastDeliverPayload {
+    Recv(FixedBuf),
+    Stream(FixedBuf),
+}
+
 pub(crate) struct TokenRegistry {
     pub(crate) map: FxHashMap<u32, SlotKey>,
     pub(crate) next_ctx: u32,
@@ -211,7 +216,8 @@ impl UdpPoolManager {
 }
 
 impl UdpRecvPool {
-    fn create_slot(&self, buf: FixedBuf, dispatch: &RioDispatch) -> RioResult<UdpRecvPoolSlot> {
+    fn create_slot(&self, mut buf: FixedBuf, dispatch: &RioDispatch) -> RioResult<UdpRecvPoolSlot> {
+        buf.set_len(buf.capacity());
         let mut addr = Box::new(SockAddrStorage::default());
 
         let addr_buf_id = dispatch
@@ -543,13 +549,14 @@ impl UdpRecvPool {
     pub(crate) fn try_refill(
         &mut self,
         mailbox: &UdpMailbox,
-        buf: FixedBuf,
+        mut buf: FixedBuf,
         ctx: &mut RioContext,
         registry: &mut TokenRegistry,
     ) -> RioResult<usize> {
         if self.state != UdpPoolState::Running {
             return Ok(0);
         }
+        buf.set_len(buf.capacity());
         self.spare_bufs.push_back(buf);
         self.rebalance(mailbox, ctx, registry)
     }
@@ -622,30 +629,41 @@ impl UdpRecvPool {
             error_stack::Report::new(RioError::Internal)
                 .attach("UDP recv pool slot missing in try_fast_deliver")
         })?;
-        let mut delivered = false;
 
-        match waiter.kind {
-            UdpWaiterKind::Recv => {
-                let data = &slot.buf.as_slice()[..res.BytesTransferred as usize];
-                if UdpPoolManager::deliver_to_recv_waiter_raw(comp, waiter, data) {
-                    slot.in_flight = false;
-                    delivered = true;
+        let bytes = res.BytesTransferred as usize;
+        if bytes > slot.buf.capacity() {
+            mailbox.waiters.push_front(waiter);
+            return Err(error_stack::Report::new(RioError::Internal)).attach(format!(
+                "UDP recv completion exceeded slot capacity in try_fast_deliver: bytes={}, cap={}",
+                bytes,
+                slot.buf.capacity()
+            ));
+        }
+
+        let mut delivered = false;
+        let mut payload = match waiter.kind {
+            UdpWaiterKind::Recv => Some(FastDeliverPayload::Recv(slot.buf.slice(0..bytes))),
+            UdpWaiterKind::Stream => self.spare_bufs.pop_front().map(|new_buf| {
+                let mut old_buf = std::mem::replace(&mut slot.buf, new_buf);
+                old_buf.set_len(bytes);
+                FastDeliverPayload::Stream(old_buf)
+            }),
+        };
+
+        if let Some(payload) = payload.take() {
+            match payload {
+                FastDeliverPayload::Recv(buf) => {
+                    if UdpPoolManager::deliver_to_recv_waiter_raw(comp, waiter, buf.as_slice()) {
+                        slot.in_flight = false;
+                        delivered = true;
+                    }
                 }
-            }
-            UdpWaiterKind::Stream => {
-                let replacement_buf = self.spare_bufs.pop_front().or_else(|| {
-                    std::num::NonZeroUsize::new(slot.buf.capacity())
-                        .and_then(|cap| FixedBuf::alloc_heap(cap).ok())
-                });
-                if let Some(new_buf) = replacement_buf {
-                    let mut old_buf = std::mem::replace(&mut slot.buf, new_buf);
-                    old_buf.set_len(res.BytesTransferred as usize);
+                FastDeliverPayload::Stream(buf) => {
                     let addr = UdpPoolManager::parse_rio_address(
                         &slot.addr,
                         std::mem::size_of::<SockAddrStorage>() as i32,
                     );
-                    match UdpPoolManager::deliver_to_stream_waiter_raw(comp, waiter, old_buf, addr)
-                    {
+                    match UdpPoolManager::deliver_to_stream_waiter_raw(comp, waiter, buf, addr) {
                         Ok(()) => {
                             slot.in_flight = false;
                             delivered = true;

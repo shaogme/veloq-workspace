@@ -72,6 +72,12 @@ pub struct PackedContext {
     pub pool_kind: PoolKind,
 }
 
+#[repr(C, align(4096))]
+struct HeapControlBlock {
+    ref_count: std::sync::atomic::AtomicU32,
+    total_size: NonZeroUsize,
+}
+
 impl PackedContext {
     #[inline(always)]
     pub fn raw_payload(&self) -> u64 {
@@ -355,9 +361,28 @@ pub struct FixedBuf {
     pool_data: NonNull<()>,
     context: PackedContext, // [pool_kind:1 | reserved:7 | context_payload:56]
     len: u32,
-    // For non-slot buffers, stores capacity in bytes (u32).
-    // For slot buffers, currently unused (reserved for future flags).
-    flags: u32,
+    /// The actual capacity of this specific handle/view.
+    cap: u32,
+}
+
+impl Clone for FixedBuf {
+    fn clone(&self) -> Self {
+        match self.pool_kind() {
+            PoolKind::SlotBased => unsafe {
+                slot_based_increment(self.pool_data, self.context.raw_payload());
+            },
+            PoolKind::Heap => unsafe {
+                heap_increment(self.pool_data);
+            },
+        }
+        Self {
+            ptr: self.ptr,
+            pool_data: self.pool_data,
+            context: self.context,
+            len: self.len,
+            cap: self.cap,
+        }
+    }
 }
 
 const _: [(); 32] = [(); std::mem::size_of::<FixedBuf>()];
@@ -379,12 +404,7 @@ impl FixedBuf {
 
     #[inline(always)]
     fn capacity_usize(&self) -> usize {
-        match self.pool_kind() {
-            PoolKind::SlotBased => {
-                crate::heap::buddy::BuddyAllocator::capacity_of(self.context.order() as usize)
-            }
-            PoolKind::Heap => self.flags as usize,
-        }
+        self.cap as usize
     }
 
     /// # Safety
@@ -405,23 +425,12 @@ impl FixedBuf {
         let mut context = PackedContext::from(context);
         context.set_pool_kind(pool_kind);
 
-        let flags = match pool_kind {
-            PoolKind::SlotBased => {
-                debug_assert_eq!(
-                    cap.get(),
-                    crate::heap::buddy::BuddyAllocator::capacity_of(context.order() as usize)
-                );
-                0
-            }
-            PoolKind::Heap => cap.get() as u32,
-        };
-
         Self {
             ptr,
             pool_data,
             context,
             len: cap.get() as u32,
-            flags,
+            cap: cap.get() as u32,
         }
     }
 
@@ -495,16 +504,20 @@ impl FixedBuf {
     /// Note: Heap-allocated buffers may not be registered with the I/O driver
     /// and thus may incur overhead for direct I/O operations.
     pub fn alloc_heap(len: NonZeroUsize) -> Result<Self, AllocError> {
-        // Use 4KB alignment for general compatibility
-        let layout =
-            std::alloc::Layout::from_size_align(len.get(), 4096).map_err(AllocError::Layout)?;
+        // Allocate space for the metadata block plus the payload.
+        // We use os::alloc_pages to ensure page alignment for both.
+        let total_size = len.get().checked_add(4096).ok_or(AllocError::Oom)?;
+        let total_size_nz = unsafe { NonZeroUsize::new_unchecked(total_size) };
 
-        let ptr = unsafe { std::alloc::alloc(layout) };
-        if ptr.is_null() {
-            return Err(AllocError::Oom);
-        }
+        let base_ptr =
+            unsafe { crate::os::alloc_pages(total_size_nz) }.map_err(|_| AllocError::Oom)?;
 
-        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        // Initialize the control block in the first page
+        let control = unsafe { &mut *(base_ptr as *mut HeapControlBlock) };
+        control.ref_count = std::sync::atomic::AtomicU32::new(1);
+        control.total_size = total_size_nz;
+
+        let ptr = unsafe { NonNull::new_unchecked(base_ptr.add(4096)) };
 
         static HEAP_BUF_COOKIE_GEN: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
@@ -515,11 +528,29 @@ impl FixedBuf {
             Self::new(
                 ptr,
                 len,
-                NonNull::dangling(), // No pool context for heap buffers
+                NonNull::new_unchecked(base_ptr as *mut ()),
                 PoolKind::Heap,
                 cookie,
             )
         })
+    }
+
+    /// Create a new sub-view of the buffer that shares the same underlying memory.
+    ///
+    /// The new buffer will have its own length and offset, but it will keep the
+    /// original allocation alive until all views are dropped.
+    #[inline(always)]
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
+        let mut new_buf = self.clone();
+        let start = range.start;
+        let end = range.end;
+        assert!(start <= end, "slice start must be <= end");
+        assert!(end <= self.len as usize, "slice end must be <= buffer len");
+
+        new_buf.ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(start)) };
+        new_buf.len = (end - start) as u32;
+        new_buf.cap = (end - start) as u32; // Slice has its own independent capacity
+        new_buf
     }
 }
 
@@ -532,7 +563,7 @@ impl Drop for FixedBuf {
                     slot_based_dealloc(self.pool_data, self.context_raw());
                 }
                 PoolKind::Heap => {
-                    heap_dealloc(self.ptr, self.capacity_usize());
+                    heap_dealloc(self.pool_data);
                 }
             }
         }
@@ -892,19 +923,75 @@ impl BufPool for SlotBasedPool {
 }
 
 #[inline(always)]
-unsafe fn heap_dealloc(ptr: NonNull<u8>, cap: usize) {
-    let layout = std::alloc::Layout::from_size_align(cap, 4096).unwrap();
-    unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+unsafe fn heap_increment(pool_data: NonNull<()>) {
+    let control_ptr = pool_data.as_ptr() as *const HeapControlBlock;
+    unsafe {
+        (*control_ptr)
+            .ref_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+unsafe fn heap_dealloc(pool_data: NonNull<()>) {
+    let base_ptr = pool_data.as_ptr() as *mut u8;
+    let control_ptr = base_ptr as *const HeapControlBlock;
+
+    if unsafe {
+        (*control_ptr)
+            .ref_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Release)
+    } == 1
+    {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let total_size = unsafe { (*control_ptr).total_size };
+        unsafe {
+            crate::os::free_pages(NonNull::new_unchecked(base_ptr), total_size);
+        }
+    }
 }
 
 #[inline(always)]
 fn heap_resolve_region_info(buf: &FixedBuf) -> RegionInfo {
-    // Heap buffers are represented explicitly by `pool_kind` instead of a sentinel id.
+    // Heap-allocated payload starts after the 4KB control block.
+    let base = buf.pool_data.as_ptr() as usize + 4096;
+    let ptr = buf.as_ptr() as usize;
+
     RegionInfo {
         pool_kind: PoolKind::Heap,
         id: 0,
-        offset: 0,
+        offset: ptr.saturating_sub(base),
         cookie: buf.context_raw(),
+    }
+}
+
+unsafe fn slot_based_increment(pool_data: NonNull<()>, context: u64) {
+    let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
+
+    let ctx = PackedContext::from(context);
+    let chunk_id = ctx.chunk_id();
+    let slot_idx = crate::heap::slot::SlotIndex(ctx.slot_idx() as usize);
+
+    // 1. Increment slot ref count
+    let pool = unsafe { &*raw_ptr };
+    pool.increment_ref_count(chunk_id, slot_idx, std::sync::atomic::Ordering::Relaxed);
+
+    // 2. Increment Arc ref count (using cache if possible)
+    let used_cache = with_pool_cache(|cache| {
+        let mut inner = cache.0.get();
+        if inner.ptr == raw_ptr && inner.balance > 0 {
+            inner.balance -= 1;
+            cache.0.set(inner);
+            true
+        } else {
+            false
+        }
+    });
+
+    if !used_cache {
+        unsafe {
+            Arc::increment_strong_count(raw_ptr);
+        }
     }
 }
 
