@@ -52,20 +52,27 @@ pub(crate) struct RioUdpRecvArgs<'a> {
 
 impl RioState {
     #[inline]
-    pub(crate) fn is_udp_iocp_fallback(&self, handle: HANDLE) -> bool {
+    pub(crate) fn is_iocp_fallback(&self, handle: HANDLE) -> bool {
         self.udp_iocp_fallback_handles.contains(&handle)
     }
 
     #[inline]
-    fn should_demote_udp_socket(err: &io::Error) -> bool {
-        err.raw_os_error() == Some(10055) || err.to_string().contains("os_error=10055")
+    fn should_demote_socket(err: &io::Error) -> bool {
+        err.raw_os_error() == Some(10055)
+            || err.to_string().contains("os_error=10055")
+            || err.to_string().contains("os error 10055")
     }
 
     #[inline]
-    pub(crate) fn maybe_mark_udp_iocp_fallback(&mut self, handle: HANDLE, err: &io::Error) {
-        if Self::should_demote_udp_socket(err) {
+    pub(crate) fn maybe_mark_iocp_fallback(&mut self, handle: HANDLE, err: &io::Error) {
+        if Self::should_demote_socket(err) {
             self.udp_iocp_fallback_handles.insert(handle);
         }
+    }
+
+    #[inline]
+    pub(crate) fn clear_iocp_fallback(&mut self, handle: HANDLE) {
+        self.udp_iocp_fallback_handles.remove(&handle);
     }
 
     fn validate_rio_addr(

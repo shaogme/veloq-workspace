@@ -45,6 +45,40 @@ pub(crate) fn submit_recv(
     overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let socket = handle as SOCKET;
+
+    if ctx.rio.is_iocp_fallback(handle) {
+        ensure_iocp_association(
+            handle,
+            ctx.port,
+            format!("TCP recv fallback association failed: fd={:?}", val.fd),
+        )?;
+        // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
+        let fallback_res = unsafe {
+            iocp_submit_socket_recv(
+                socket,
+                val.buf.as_mut_ptr().add(val.buf_offset),
+                (val.buf.len().saturating_sub(val.buf_offset)) as u32,
+                ctx.overlapped,
+            )
+        };
+        match fallback_res {
+            Ok(res) => return Ok(res),
+            Err(err) if err.raw_os_error() == Some(10038) => {
+                ctx.rio.clear_iocp_fallback(handle);
+            }
+            Err(err) => {
+                return Err(io_error(
+                    IocpErrorContext::Submission,
+                    err,
+                    format!(
+                        "TCP recv fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                        val.fd, handle, header.user_data, header.generation
+                    ),
+                ));
+            }
+        }
+    }
 
     // Try RIO path first.
     let rio_res = ctx.rio.try_submit_recv(
@@ -61,6 +95,62 @@ pub(crate) fn submit_recv(
 
     match rio_res {
         Ok(res) => Ok(res),
+        Err(e)
+            if {
+                ctx.rio.maybe_mark_iocp_fallback(handle, &e);
+                ctx.rio.is_iocp_fallback(handle)
+            } =>
+        {
+            ensure_iocp_association(
+                handle,
+                ctx.port,
+                format!("TCP recv fallback association failed: fd={:?}", val.fd),
+            )?;
+            // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
+            let fallback_res = unsafe {
+                iocp_submit_socket_recv(
+                    socket,
+                    val.buf.as_mut_ptr().add(val.buf_offset),
+                    (val.buf.len().saturating_sub(val.buf_offset)) as u32,
+                    ctx.overlapped,
+                )
+            };
+            match fallback_res {
+                Ok(res) => Ok(res),
+                Err(err) if err.raw_os_error() == Some(10038) => {
+                    ctx.rio.clear_iocp_fallback(handle);
+                    let retry = ctx.rio.try_submit_recv(
+                        RioTarget {
+                            fd: val.fd,
+                            handle,
+                            user_data: header.user_data,
+                            generation: header.generation,
+                            buf_offset: val.buf_offset,
+                        },
+                        &mut val.buf,
+                        ctx.registrar,
+                    );
+                    retry.map_err(|retry_err| {
+                        io_error(
+                            IocpErrorContext::Submission,
+                            retry_err,
+                            format!(
+                                "TCP recv fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                                val.fd, handle, header.user_data, header.generation
+                            ),
+                        )
+                    })
+                }
+                Err(err) => Err(io_error(
+                    IocpErrorContext::Submission,
+                    err,
+                    format!(
+                        "TCP recv fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                        val.fd, handle, header.user_data, header.generation
+                    ),
+                )),
+            }
+        }
         Err(e) => Err(io_error(
             IocpErrorContext::Submission,
             e,
@@ -94,32 +184,55 @@ pub(crate) fn submit_udp_recv(
     ) {
         Ok(res) => Ok(res),
         Err(e) => {
-            ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
-            if ctx.rio.is_udp_iocp_fallback(handle) {
+            ctx.rio.maybe_mark_iocp_fallback(handle, &e);
+            if ctx.rio.is_iocp_fallback(handle) {
                 ensure_iocp_association(
                     handle,
                     ctx.port,
                     format!("UDP recv fallback association failed: fd={:?}", val.fd),
                 )?;
                 // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
-                unsafe {
+                let fallback_res = unsafe {
                     iocp_submit_socket_recv(
                         socket,
                         val.buf.as_mut_ptr().add(val.buf_offset),
                         (val.buf.len().saturating_sub(val.buf_offset)) as u32,
                         ctx.overlapped,
                     )
-                }
-                .map_err(|err| {
-                    io_error(
+                };
+                match fallback_res {
+                    Ok(res) => Ok(res),
+                    Err(err) if err.raw_os_error() == Some(10038) => {
+                        ctx.rio.clear_iocp_fallback(handle);
+                        let retry = ctx.rio.try_submit_pool_recv_for_recv(
+                            crate::rio::RioUdpRecvArgs {
+                                fd: val.fd,
+                                handle,
+                                recv_op: val,
+                                sidecar: header,
+                            },
+                            ctx.registrar,
+                        );
+                        retry.map_err(|retry_err| {
+                            io_error(
+                                IocpErrorContext::Submission,
+                                retry_err,
+                                format!(
+                                    "UDP recv fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                                    val.fd, handle, header.user_data, header.generation
+                                ),
+                            )
+                        })
+                    }
+                    Err(err) => Err(io_error(
                         IocpErrorContext::Submission,
                         err,
                         format!(
                             "UDP recv fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
                             val.fd, handle, header.user_data, header.generation
                         ),
-                    )
-                })
+                    )),
+                }
             } else {
                 Err(e)
             }
@@ -137,6 +250,40 @@ pub(crate) fn submit_send(
     overlapped.set_offset(0);
 
     let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let socket = handle as SOCKET;
+
+    if ctx.rio.is_iocp_fallback(handle) {
+        ensure_iocp_association(
+            handle,
+            ctx.port,
+            format!("TCP send fallback association failed: fd={:?}", val.fd),
+        )?;
+        // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
+        let fallback_res = unsafe {
+            iocp_submit_socket_send(
+                socket,
+                val.buf.as_ptr().add(val.buf_offset),
+                (val.buf.len().saturating_sub(val.buf_offset)) as u32,
+                ctx.overlapped,
+            )
+        };
+        match fallback_res {
+            Ok(res) => return Ok(res),
+            Err(err) if err.raw_os_error() == Some(10038) => {
+                ctx.rio.clear_iocp_fallback(handle);
+            }
+            Err(err) => {
+                return Err(io_error(
+                    IocpErrorContext::Submission,
+                    err,
+                    format!(
+                        "TCP send fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                        val.fd, handle, header.user_data, header.generation
+                    ),
+                ));
+            }
+        }
+    }
 
     // Try RIO path first.
     let rio_res = ctx.rio.try_submit_send(
@@ -153,6 +300,62 @@ pub(crate) fn submit_send(
 
     match rio_res {
         Ok(res) => Ok(res),
+        Err(e)
+            if {
+                ctx.rio.maybe_mark_iocp_fallback(handle, &e);
+                ctx.rio.is_iocp_fallback(handle)
+            } =>
+        {
+            ensure_iocp_association(
+                handle,
+                ctx.port,
+                format!("TCP send fallback association failed: fd={:?}", val.fd),
+            )?;
+            // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
+            let fallback_res = unsafe {
+                iocp_submit_socket_send(
+                    socket,
+                    val.buf.as_ptr().add(val.buf_offset),
+                    (val.buf.len().saturating_sub(val.buf_offset)) as u32,
+                    ctx.overlapped,
+                )
+            };
+            match fallback_res {
+                Ok(res) => Ok(res),
+                Err(err) if err.raw_os_error() == Some(10038) => {
+                    ctx.rio.clear_iocp_fallback(handle);
+                    let retry = ctx.rio.try_submit_send(
+                        RioTarget {
+                            fd: val.fd,
+                            handle,
+                            user_data: header.user_data,
+                            generation: header.generation,
+                            buf_offset: val.buf_offset,
+                        },
+                        &val.buf,
+                        ctx.registrar,
+                    );
+                    retry.map_err(|retry_err| {
+                        io_error(
+                            IocpErrorContext::Submission,
+                            retry_err,
+                            format!(
+                                "TCP send fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                                val.fd, handle, header.user_data, header.generation
+                            ),
+                        )
+                    })
+                }
+                Err(err) => Err(io_error(
+                    IocpErrorContext::Submission,
+                    err,
+                    format!(
+                        "TCP send fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                        val.fd, handle, header.user_data, header.generation
+                    ),
+                )),
+            }
+        }
         Err(e) => Err(io_error(
             IocpErrorContext::Submission,
             e,
@@ -193,8 +396,8 @@ pub(crate) fn submit_udp_send(
         Ok(res) => Ok(res),
         Err(e)
             if {
-                ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
-                ctx.rio.is_udp_iocp_fallback(handle)
+                ctx.rio.maybe_mark_iocp_fallback(handle, &e);
+                ctx.rio.is_iocp_fallback(handle)
             } =>
         {
             ensure_iocp_association(
@@ -203,24 +406,49 @@ pub(crate) fn submit_udp_send(
                 format!("UDP send fallback association failed: fd={:?}", val.fd),
             )?;
             // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
-            unsafe {
+            let fallback_res = unsafe {
                 iocp_submit_socket_send(
                     socket,
                     val.buf.as_ptr().add(val.buf_offset),
                     (val.buf.len().saturating_sub(val.buf_offset)) as u32,
                     ctx.overlapped,
                 )
-            }
-            .map_err(|err| {
-                io_error(
+            };
+            match fallback_res {
+                Ok(res) => Ok(res),
+                Err(err) if err.raw_os_error() == Some(10038) => {
+                    ctx.rio.clear_iocp_fallback(handle);
+                    let retry = ctx.rio.try_submit_send(
+                        RioTarget {
+                            fd: val.fd,
+                            handle,
+                            user_data: header.user_data,
+                            generation: header.generation,
+                            buf_offset: val.buf_offset,
+                        },
+                        &val.buf,
+                        ctx.registrar,
+                    );
+                    retry.map_err(|retry_err| {
+                        io_error(
+                            IocpErrorContext::Submission,
+                            retry_err,
+                            format!(
+                                "UDP send fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                                val.fd, handle, header.user_data, header.generation
+                            ),
+                        )
+                    })
+                }
+                Err(err) => Err(io_error(
                     IocpErrorContext::Submission,
                     err,
                     format!(
                         "UDP send fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
                         val.fd, handle, header.user_data, header.generation
                     ),
-                )
-            })
+                )),
+            }
         }
         Err(e) => Err(io_error(
             IocpErrorContext::Submission,
@@ -535,8 +763,8 @@ pub(crate) fn submit_udp_recv_stream(
     match ctx.rio.try_submit_pool_recv(args, ctx.registrar) {
         Ok(res) => Ok(res),
         Err(e) => {
-            ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
-            if ctx.rio.is_udp_iocp_fallback(handle) {
+            ctx.rio.maybe_mark_iocp_fallback(handle, &e);
+            if ctx.rio.is_iocp_fallback(handle) {
                 ensure_iocp_association(
                     handle,
                     ctx.port,
@@ -550,24 +778,48 @@ pub(crate) fn submit_udp_recv_stream(
                     .as_mut()
                     .ok_or_else(|| io::Error::other("udp recv_stream buffer missing"))?;
                 // SAFETY: socket/buffer/overlapped are valid for overlapped socket recv.
-                unsafe {
+                let fallback_res = unsafe {
                     iocp_submit_socket_recv(
                         socket,
                         buf.as_mut_ptr(),
                         buf.len() as u32,
                         ctx.overlapped,
                     )
-                }
-                .map_err(|err| {
-                    io_error(
+                };
+                match fallback_res {
+                    Ok(res) => Ok(res),
+                    Err(err) if err.raw_os_error() == Some(10038) => {
+                        ctx.rio.clear_iocp_fallback(handle);
+                        let retry = ctx.rio.try_submit_pool_recv(
+                            crate::rio::RioUdpStreamArgs {
+                                fd: val.fd,
+                                handle,
+                                stream_op: val,
+                                user_data: header.user_data,
+                                generation: header.generation,
+                            },
+                            ctx.registrar,
+                        );
+                        retry.map_err(|retry_err| {
+                            io_error(
+                                IocpErrorContext::Submission,
+                                retry_err,
+                                format!(
+                                    "UDP recv_stream fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
+                                    val.fd, handle, header.user_data, header.generation
+                                ),
+                            )
+                        })
+                    }
+                    Err(err) => Err(io_error(
                         IocpErrorContext::Submission,
                         err,
                         format!(
                             "UDP recv_stream fallback syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}",
                             val.fd, handle, header.user_data, header.generation
                         ),
-                    )
-                })
+                    )),
+                }
             } else {
                 Err(io_error(
                     IocpErrorContext::Submission,
