@@ -18,7 +18,7 @@ use crate::ops::submit::common::{
 };
 use crate::ops::{
     AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv, SendToPayload, SubmitContext,
-    UdpRecv, UdpRecvStream, UdpRefill, UdpSend,
+    UdpRecv, UdpRecvStream, UdpSend,
 };
 use crate::rio::RioTarget;
 use crate::win32::SafeSocket;
@@ -619,32 +619,4 @@ pub(crate) unsafe fn on_udp_stream_complete(
         return Ok(datagram.buf.len());
     }
     Ok(result)
-}
-
-pub(crate) fn submit_udp_refill(
-    _header: &mut OverlappedEntry,
-    payload: &mut KernelRef<UdpRefill>,
-    ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
-    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-    let (val, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
-    let handle = resolve_fd(val.fd, ctx.registered_files)?;
-    if ctx.rio.is_udp_iocp_fallback(handle) {
-        let _ = val.buf.take();
-        return Ok(SubmissionResult::PostToQueue);
-    }
-    if let Some(buf) = val.buf.take()
-        && let Err(e) = ctx
-            .rio
-            .try_refill_udp_pool((val.fd, handle), buf, ctx.registrar)
-    {
-        ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
-        if !ctx.rio.is_udp_iocp_fallback(handle) {
-            return Err(e);
-        }
-    }
-
-    // Refill is not an async IO op that completes via IOCP,
-    // it just updates the internal pool. We post a completion to notify success.
-    Ok(SubmissionResult::PostToQueue)
 }

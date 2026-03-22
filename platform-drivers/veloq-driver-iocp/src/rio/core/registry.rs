@@ -234,19 +234,6 @@ impl RioRegistry {
             ))
     }
 
-    pub(crate) fn deregister_heap_buf(&mut self, buf: &FixedBuf, _env: RioEnv<'_>) {
-        let info = buf.resolve_region_info();
-        if info.pool_kind != PoolKind::Heap {
-            return;
-        }
-        let key = (buf.as_ptr() as usize, buf.capacity(), info.cookie);
-        if let Some(id) = self.heap_rio_bufs.remove(&key)
-            && !id.is_invalid()
-        {
-            self.pending_deregistrations.push(id);
-        }
-    }
-
     pub(crate) fn flush_deregs(&mut self, env: RioEnv<'_>) {
         if self.pending_deregistrations.is_empty() {
             return;

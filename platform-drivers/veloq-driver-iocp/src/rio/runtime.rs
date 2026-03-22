@@ -9,7 +9,6 @@ use crate::rio::error::{RioError, RioReportExt, RioResult};
 use crate::rio::{RioEnv, RioState};
 use error_stack::ResultExt;
 use std::io;
-use veloq_buf::FixedBuf;
 use veloq_driver_core::op::{UdpRecv, UdpRecvStream};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
@@ -300,51 +299,5 @@ impl RioState {
             self.outstanding_count += 1;
         }
         Ok(res)
-    }
-
-    pub(crate) fn try_refill_udp_pool(
-        &mut self,
-        target: (IoFd, HANDLE),
-        buf: FixedBuf,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<()> {
-        let dispatch = self
-            .kernel
-            .dispatch
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("lost RIO context")
-            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
-        let env = RioEnv {
-            registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
-            registration_mode: self.registration_mode,
-        };
-        let (fd, handle) = target;
-        let _ = self
-            .ensure_actor((fd, handle), env)
-            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
-        let key = self
-            .actor_by_handle
-            .get(&handle)
-            .copied()
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("actor missing")
-            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
-        let actor = self
-            .actors
-            .get_mut(key)
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("actor missing")
-            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
-        let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
-        let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &actor.udp_mailbox);
-        let pool_submissions = pool_manager
-            .try_refill_pool(udp_mailbox, buf, &mut ctx)
-            .map_err(|e| io::Error::other(e.to_string()))
-            .map_err(|e| error_stack::Report::new(RioError::Internal).attach(e.to_string()))
-            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
-        self.outstanding_count += pool_submissions;
-        Ok(())
     }
 }

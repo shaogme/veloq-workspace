@@ -67,7 +67,6 @@ impl IocpDriver {
                 | IocpOpPayload::UdpSend(_)
                 | IocpOpPayload::SendTo(_)
                 | IocpOpPayload::UdpRecvStream(_)
-                | IocpOpPayload::UdpRefill(_)
         )
     }
 

@@ -44,7 +44,6 @@ pub(crate) struct RioEnv<'a> {
 }
 
 pub(crate) struct RioContext<'a> {
-    pub(crate) registry: &'a mut RioRegistry,
     pub(crate) env: RioEnv<'a>,
     pub(crate) actor_key: ActorKey,
     pub(crate) rq: RioRq,

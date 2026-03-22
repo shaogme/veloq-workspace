@@ -21,11 +21,10 @@ pub type SendTo = veloq_driver_core::op::SendTo<RawHandle>;
 pub type SyncFileRange = veloq_driver_core::op::SyncFileRange<RawHandle>;
 pub type Fallocate = veloq_driver_core::op::Fallocate<RawHandle>;
 pub type UdpRecvStream = veloq_driver_core::op::UdpRecvStream<RawHandle>;
-pub type UdpRefill = veloq_driver_core::op::UdpRefill<RawHandle>;
 
 pub use veloq_driver_core::op::{
     DetachedOp, DetachedSubmitter, IntoPlatformOp, LocalSubmitter, Op, OpKind, OpLifecycle,
-    OpResult, Open, Timeout, UdpRecvDatagram,
+    OpResult, Open, Timeout, UdpRecvPacket,
 };
 
 pub type LocalOp<T> = veloq_driver_core::op::LocalOp<T, PlatformDriver>;

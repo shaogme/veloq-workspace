@@ -107,7 +107,6 @@ impl<'a> RioCompletionRouter<'a> {
                 return Ok(());
             };
             let mut ctx = RioContext {
-                registry: self.registry,
                 env: self.env,
                 actor_key,
                 rq: actor.rq,
@@ -218,17 +217,12 @@ impl<'a> RioCompletionRouter<'a> {
 impl RioState {
     #[inline]
     pub(crate) fn build_ctx<'a>(
-        registry: &'a mut RioRegistry,
+        _registry: &'a mut RioRegistry,
         env: RioEnv<'a>,
         actor: (ActorKey, RioRq),
     ) -> RioContext<'a> {
         let (actor_key, rq) = actor;
-        RioContext {
-            registry,
-            env,
-            actor_key,
-            rq,
-        }
+        RioContext { env, actor_key, rq }
     }
 
     fn remove_actor_by_key(&mut self, key: ActorKey) -> Option<RioSocketActor> {

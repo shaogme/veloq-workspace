@@ -4,8 +4,7 @@ pub(crate) mod net;
 
 use crate::ops::{
     AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend, OpenPayload, Recv,
-    SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpRecv, UdpRecvStream, UdpRefill,
-    UdpSend, Wakeup,
+    SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpRecv, UdpRecvStream, UdpSend, Wakeup,
 };
 use std::io;
 
@@ -48,7 +47,6 @@ impl_get_fd!(get_fd_accept, AcceptPayload, direct_fd);
 impl_get_fd!(get_fd_send_to, SendToPayload, direct_fd);
 impl_get_fd!(get_fd_open, OpenPayload, no_fd); // Open does not have a direct fd in payload
 impl_get_fd!(get_fd_udp_recv_stream, KernelRef<UdpRecvStream>, direct_fd);
-impl_get_fd!(get_fd_udp_refill, KernelRef<UdpRefill>, direct_fd);
 
 impl_get_fd!(get_fd_close, KernelRef<Close>, direct_fd);
 impl_get_fd!(get_fd_fsync, KernelRef<Fsync>, direct_fd);

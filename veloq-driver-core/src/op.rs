@@ -41,12 +41,11 @@ pub enum OpKind {
     Accept = 10,
     SendTo = 11,
     UdpRecvStream = 12,
-    UdpRefill = 13,
-    Open = 14,
-    Wakeup = 15,
-    Timeout = 16,
-    UdpRecv = 17,
-    UdpSend = 18,
+    Open = 13,
+    Wakeup = 14,
+    Timeout = 15,
+    UdpRecv = 16,
+    UdpSend = 17,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -816,19 +815,13 @@ pub struct UdpRecvStream<H: Handle> {
     /// Unix io_uring path: source address parsed from recvmsg.
     pub addr: Option<std::net::SocketAddr>,
     /// Windows RIO path: resulting datagram, populated on completion.
-    pub result: Option<UdpRecvDatagram>,
+    pub result: Option<UdpRecvPacket>,
 }
 
 /// A received UDP datagram.
-pub struct UdpRecvDatagram {
+pub struct UdpRecvPacket {
     pub buf: FixedBuf,
     pub addr: std::net::SocketAddr,
-}
-
-/// Provide a buffer to the driver's internal RIO UDP pool.
-pub struct UdpRefill<H: Handle> {
-    pub fd: IoFd<H>,
-    pub buf: Option<FixedBuf>,
 }
 
 // ============================================================================

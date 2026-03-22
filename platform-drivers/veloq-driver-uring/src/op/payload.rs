@@ -4,8 +4,8 @@ use veloq_driver_core::op::{
     Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
     Fsync as CoreFsync, ReadFixed as CoreReadFixed, Recv as CoreRecv, Send as CoreSend,
     SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange, UdpRecv as CoreUdpRecv,
-    UdpRecvStream as CoreUdpRecvStream, UdpRefill as CoreUdpRefill, UdpSend as CoreUdpSend,
-    Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
+    UdpRecvStream as CoreUdpRecvStream, UdpSend as CoreUdpSend, Wakeup as CoreWakeup,
+    WriteFixed as CoreWriteFixed,
 };
 
 pub(crate) use veloq_driver_core::op::{Open, Timeout};
@@ -26,7 +26,6 @@ pub(crate) type Fallocate = CoreFallocate<RawHandle>;
 pub(crate) type Accept = CoreAccept<RawHandle, SockAddrStorage>;
 pub(crate) type SendTo = CoreSendTo<RawHandle>;
 pub(crate) type UdpRecvStream = CoreUdpRecvStream<RawHandle>;
-pub(crate) type UdpRefill = CoreUdpRefill<RawHandle>;
 pub(crate) type Wakeup = CoreWakeup<RawHandle>;
 
 pub(crate) struct KernelRef<T> {
@@ -81,7 +80,6 @@ pub(crate) enum UringOpPayload {
     Accept(AcceptPayload),
     SendTo(SendToPayload),
     UdpRecvStream(UdpRecvStreamPayload),
-    UdpRefill(KernelRef<UdpRefill>),
     Open(OpenPayload),
     Wakeup(WakeupPayload),
     Timeout(TimeoutPayload),

@@ -25,8 +25,8 @@ use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
     Fsync as FsyncBase, IntoPlatformOp, OpKind, Open, ReadFixed as ReadFixedBase, Recv as RecvBase,
     Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase, Timeout,
-    UdpRecv as UdpRecvBase, UdpRecvStream as UdpRecvStreamBase, UdpRefill as UdpRefillBase,
-    UdpSend as UdpSendBase, Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
+    UdpRecv as UdpRecvBase, UdpRecvStream as UdpRecvStreamBase, UdpSend as UdpSendBase,
+    Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
 };
 
 use windows_sys::Win32::Foundation::HANDLE;
@@ -53,7 +53,6 @@ pub(crate) type SendTo = SendToBase<RawHandle>;
 pub(crate) type SyncFileRange = SyncFileRangeBase<RawHandle>;
 pub(crate) type Fallocate = FallocateBase<RawHandle>;
 pub(crate) type UdpRecvStream = UdpRecvStreamBase<RawHandle>;
-pub(crate) type UdpRefill = UdpRefillBase<RawHandle>;
 pub(crate) type Wakeup = WakeupBase<RawHandle>;
 
 // ============================================================================
@@ -403,12 +402,6 @@ define_iocp_ops! {
         submit: submit::submit_udp_recv_stream,
         on_complete: submit::on_udp_stream_complete,
         get_fd: submit::get_fd_udp_recv_stream,
-    },
-    UdpRefill {
-        variant: UdpRefill,
-        kind: OpKind::UdpRefill,
-        submit: submit::submit_udp_refill,
-        get_fd: submit::get_fd_udp_refill,
     },
     Open {
         variant: Open,

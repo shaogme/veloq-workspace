@@ -22,17 +22,50 @@ pub(crate) const UDP_RECV_POOL_MIN_CREDITS: usize = 2;
 pub(crate) const UDP_RECV_POOL_INITIAL_CREDITS: usize = 4;
 pub(crate) const UDP_RECV_POOL_MAX_CREDITS: usize = 16;
 pub(crate) const UDP_RECV_POOL_QUEUE_CAP: usize = 256;
+pub(crate) const UDP_RECV_POOL_CHUNK_SIZE: usize = 2048;
+pub(crate) const UDP_RECV_POOL_SLAB_CHUNKS: usize = 512;
 
 pub(crate) const POOL_CTX_TAG: usize = 1;
 
-pub(crate) struct UdpRecvDatagram {
+pub(crate) struct UdpPoolPacket {
     pub(crate) buf: FixedBuf,
     pub(crate) addr: SockAddrStorage,
     pub(crate) addr_len: i32,
 }
 
+pub(crate) struct UdpBufferSlab {
+    pub(crate) _backing: FixedBuf,
+    pub(crate) rio_id: RioBufferId,
+    pub(crate) chunk_size: usize,
+    pub(crate) chunks: Vec<FixedBuf>,
+    pub(crate) free_indices: VecDeque<u32>,
+}
+
+impl UdpBufferSlab {
+    #[inline]
+    pub(crate) fn chunk_offset(&self, idx: u32) -> u32 {
+        (idx as usize)
+            .saturating_mul(self.chunk_size)
+            .min(u32::MAX as usize) as u32
+    }
+
+    #[inline]
+    pub(crate) fn chunk_capacity(&self) -> usize {
+        self.chunk_size
+    }
+
+    #[inline]
+    pub(crate) fn chunk_view(&self, idx: u32, len: usize) -> Option<FixedBuf> {
+        let chunk = self.chunks.get(idx as usize)?;
+        if len > chunk.capacity() {
+            return None;
+        }
+        Some(chunk.slice(0..len))
+    }
+}
+
 pub(crate) struct UdpMailbox {
-    pub(crate) queue: VecDeque<UdpRecvDatagram>,
+    pub(crate) queue: VecDeque<UdpPoolPacket>,
     pub(crate) waiters: VecDeque<UdpWaiter>,
 }
 
@@ -59,7 +92,7 @@ pub(crate) struct UdpWaiter {
 }
 
 pub(crate) struct UdpRecvPoolSlot {
-    pub(crate) buf: FixedBuf,
+    pub(crate) current_idx: u32,
     pub(crate) addr: Box<SockAddrStorage>,
     pub(crate) addr_buf_id: RioBufferId,
     pub(crate) in_flight: bool,
@@ -68,7 +101,7 @@ pub(crate) struct UdpRecvPoolSlot {
 
 pub(crate) struct UdpRecvPool {
     pub(crate) slots: SlotMap<SlotKey, UdpRecvPoolSlot>,
-    pub(crate) spare_bufs: VecDeque<FixedBuf>,
+    pub(crate) slab: Option<UdpBufferSlab>,
     pub(crate) min_credits: usize,
     pub(crate) max_credits: usize,
     pub(crate) target_credits: usize,
@@ -103,7 +136,7 @@ impl UdpRecvPool {
     pub(crate) fn uninit() -> Self {
         Self {
             slots: SlotMap::with_key(),
-            spare_bufs: VecDeque::new(),
+            slab: None,
             min_credits: 0,
             max_credits: 0,
             target_credits: 0,
@@ -138,21 +171,23 @@ impl UdpRecvPool {
             let _ = mailbox.queue.pop_front();
         }
 
-        let replacement_buf = self.spare_bufs.pop_front().or_else(|| {
-            std::num::NonZeroUsize::new(slot.buf.capacity())
-                .and_then(|cap| FixedBuf::alloc_heap(cap).ok())
-        });
-
-        if let Some(new_buf) = replacement_buf {
-            let mut old_buf = std::mem::replace(&mut slot.buf, new_buf);
-            old_buf.set_len(res.BytesTransferred as usize);
-
-            mailbox.queue.push_back(UdpRecvDatagram {
-                buf: old_buf,
+        let Some(slab) = self.slab.as_mut() else {
+            return PoolCompletionEvent::ReceivedNoDatagram;
+        };
+        let bytes = res.BytesTransferred as usize;
+        if bytes > slab.chunk_capacity() {
+            return PoolCompletionEvent::ReceivedNoDatagram;
+        }
+        let Some(next_idx) = slab.free_indices.pop_front() else {
+            return PoolCompletionEvent::ReceivedNoDatagram;
+        };
+        let completed_idx = std::mem::replace(&mut slot.current_idx, next_idx);
+        if let Some(buf) = slab.chunk_view(completed_idx, bytes) {
+            mailbox.queue.push_back(UdpPoolPacket {
+                buf,
                 addr: *slot.addr,
                 addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
             });
-
             return PoolCompletionEvent::DatagramQueued {
                 resubmit: !stopping && self.slots.len() <= self.target_credits,
             };

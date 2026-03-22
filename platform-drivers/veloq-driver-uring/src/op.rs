@@ -14,7 +14,7 @@ mod submit;
 pub(crate) use payload::UringOpPayload;
 pub(crate) use payload::{
     Accept, Close, Connect, Fallocate, Fsync, OpSend, Open, ReadFixed, Recv, SendTo, SyncFileRange,
-    Timeout, UdpRecv, UdpRecvStream, UdpRefill, UdpSend, Wakeup, WriteFixed,
+    Timeout, UdpRecv, UdpRecvStream, UdpSend, Wakeup, WriteFixed,
 };
 
 // ============================================================================
@@ -292,13 +292,6 @@ define_uring_ops! {
             msghdr: unsafe { std::mem::zeroed() },
         },
         destruct: |user: Box<UdpRecvStream>| *user,
-    },
-    UdpRefill {
-        field: UdpRefill,
-        kind: OpKind::UdpRefill,
-        make_sqe: submit::make_sqe_udp_refill,
-        on_complete: submit::on_complete_udp_refill,
-        drop: submit::drop_udp_refill,
     },
     Open {
         field: Open,

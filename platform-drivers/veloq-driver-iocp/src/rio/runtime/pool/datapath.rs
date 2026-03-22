@@ -1,7 +1,8 @@
 use super::{
-    SlotKey, UDP_RECV_POOL_INITIAL_CREDITS, UDP_RECV_POOL_MAX_CREDITS, UDP_RECV_POOL_MIN_CREDITS,
-    UDP_RECV_POOL_QUEUE_CAP, UdpMailbox, UdpPoolState, UdpRecvDatagram, UdpRecvPool,
-    UdpRecvPoolSlot, UdpWaiter, UdpWaiterKind,
+    SlotKey, UDP_RECV_POOL_CHUNK_SIZE, UDP_RECV_POOL_INITIAL_CREDITS, UDP_RECV_POOL_MAX_CREDITS,
+    UDP_RECV_POOL_MIN_CREDITS, UDP_RECV_POOL_QUEUE_CAP, UDP_RECV_POOL_SLAB_CHUNKS, UdpBufferSlab,
+    UdpMailbox, UdpPoolPacket, UdpPoolState, UdpRecvPool, UdpRecvPoolSlot, UdpWaiter,
+    UdpWaiterKind,
 };
 use crate::net::addr::{SockAddrStorage, to_socket_addr};
 use crate::ops::IocpOpPayload;
@@ -17,15 +18,15 @@ use std::collections::{VecDeque, hash_map};
 use veloq_buf::FixedBuf;
 use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
 use veloq_driver_core::op::{
-    UdpRecv as OpUdpRecv, UdpRecvDatagram as OpUdpRecvDatagram, UdpRecvStream,
+    UdpRecv as OpUdpRecv, UdpRecvPacket as OpUdpRecvPacket, UdpRecvStream,
 };
 use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
 
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIORESULT};
 
 enum FastDeliverPayload {
-    Recv(FixedBuf),
-    Stream(FixedBuf),
+    Recv { idx: u32, len: usize },
+    Stream { idx: u32, len: usize },
 }
 
 pub(crate) struct TokenRegistry {
@@ -91,7 +92,11 @@ impl UdpPoolManager {
         let initial = UDP_RECV_POOL_INITIAL_CREDITS.clamp(min, max);
 
         self.pool.slots = SlotMap::with_capacity_and_key(max);
-        self.pool.spare_bufs = VecDeque::with_capacity(initial);
+        self.pool.slab = Some(Self::init_slab(
+            ctx,
+            UDP_RECV_POOL_CHUNK_SIZE,
+            UDP_RECV_POOL_SLAB_CHUNKS,
+        )?);
         self.pool.min_credits = min;
         self.pool.max_credits = max;
         self.pool.target_credits = initial;
@@ -99,6 +104,48 @@ impl UdpPoolManager {
         self.pool.state = UdpPoolState::Running;
 
         self.pool.grow_to(initial, ctx, &mut self.registry)
+    }
+
+    fn init_slab(
+        ctx: &mut RioContext,
+        chunk_size: usize,
+        chunk_count: usize,
+    ) -> RioResult<UdpBufferSlab> {
+        let total = chunk_size
+            .checked_mul(chunk_count)
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("UDP slab size overflow")?;
+        let total_nz = std::num::NonZeroUsize::new(total)
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("UDP slab total size must be > 0")?;
+        let backing = FixedBuf::alloc_heap(total_nz)
+            .map_err(|e| error_stack::Report::new(RioError::Internal).attach(e.to_string()))?;
+
+        let rio_id = ctx
+            .env
+            .dispatch
+            .register_buffer(backing.as_ptr(), backing.capacity() as u32)
+            .attach("RIORegisterBuffer failed for UDP slab backing")?;
+
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for idx in 0..chunk_count {
+            let start = idx * chunk_size;
+            let end = start + chunk_size;
+            chunks.push(backing.slice(start..end));
+        }
+
+        let mut free_indices = VecDeque::with_capacity(chunk_count);
+        for idx in 0..chunk_count {
+            free_indices.push_back(idx as u32);
+        }
+
+        Ok(UdpBufferSlab {
+            _backing: backing,
+            rio_id,
+            chunk_size,
+            chunks,
+            free_indices,
+        })
     }
 
     pub(crate) fn try_submit_pool_recv(
@@ -127,19 +174,6 @@ impl UdpPoolManager {
             self.pool
                 .try_submit_recv_recv(mailbox, recv_op, uid, ctx, &mut self.registry)?;
         Ok((res, total_submissions + subs, copied))
-    }
-
-    pub(crate) fn try_refill_pool(
-        &mut self,
-        mailbox: &UdpMailbox,
-        buf: FixedBuf,
-        ctx: &mut RioContext,
-    ) -> RioResult<usize> {
-        let mut total_submissions = self.ensure_pool(ctx)?;
-        total_submissions += self
-            .pool
-            .try_refill(mailbox, buf, ctx, &mut self.registry)?;
-        Ok(total_submissions)
     }
 
     pub(crate) fn cancel_waiter(
@@ -216,8 +250,7 @@ impl UdpPoolManager {
 }
 
 impl UdpRecvPool {
-    fn create_slot(&self, mut buf: FixedBuf, dispatch: &RioDispatch) -> RioResult<UdpRecvPoolSlot> {
-        buf.set_len(buf.capacity());
+    fn create_slot(&self, current_idx: u32, dispatch: &RioDispatch) -> RioResult<UdpRecvPoolSlot> {
         let mut addr = Box::new(SockAddrStorage::default());
 
         let addr_buf_id = dispatch
@@ -228,7 +261,7 @@ impl UdpRecvPool {
             .attach("RIORegisterBuffer failed for UDP recv pool addr buffer")?;
 
         Ok(UdpRecvPoolSlot {
-            buf,
+            current_idx,
             addr,
             addr_buf_id,
             in_flight: false,
@@ -241,7 +274,9 @@ impl UdpRecvPool {
             self.state = UdpPoolState::Draining;
         }
         self.target_credits = 0;
-        self.spare_bufs.clear();
+        if let Some(slab) = self.slab.as_mut() {
+            slab.free_indices.clear();
+        }
         for (_, slot) in &mut self.slots {
             if slot.in_flight {
                 slot.stop_requested = true;
@@ -256,7 +291,6 @@ impl UdpRecvPool {
     }
 
     fn free_slot(&self, slot: UdpRecvPoolSlot, ctx: &mut RioContext) {
-        ctx.registry.deregister_heap_buf(&slot.buf, ctx.env);
         self.deregister_slot(slot, ctx.env.dispatch);
     }
 
@@ -278,15 +312,19 @@ impl UdpRecvPool {
             .get_mut(slot_key)
             .ok_or_else(|| error_stack::Report::new(RioError::Internal))
             .attach("UDP recv pool slot missing")?;
-        let (data_buf_id, offset) = ctx.registry.resolve_buffer_id(&slot.buf, ctx.env)?;
+        let slab = self
+            .slab
+            .as_ref()
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("UDP slab missing during submit_slot")?;
 
         slot.in_flight = true;
         slot.stop_requested = false;
 
         let data_buf = RIO_BUF {
-            BufferId: data_buf_id.0,
-            Offset: offset,
-            Length: slot.buf.capacity() as u32,
+            BufferId: slab.rio_id.0,
+            Offset: slab.chunk_offset(slot.current_idx),
+            Length: slab.chunk_capacity() as u32,
         };
         let addr_buf = RIO_BUF {
             BufferId: slot.addr_buf_id.0,
@@ -338,14 +376,17 @@ impl UdpRecvPool {
     ) -> RioResult<usize> {
         let mut submissions = 0;
         while self.state == UdpPoolState::Running && self.slots.len() < target {
-            let slot_buf = match self.spare_bufs.pop_front() {
-                Some(b) => b,
+            let idx = match self.slab.as_mut().and_then(|s| s.free_indices.pop_front()) {
+                Some(i) => i,
                 None => break,
             };
 
-            let slot = match self.create_slot(slot_buf, ctx.env.dispatch) {
+            let slot = match self.create_slot(idx, ctx.env.dispatch) {
                 Ok(s) => s,
                 Err(e) => {
+                    if let Some(slab) = self.slab.as_mut() {
+                        slab.free_indices.push_front(idx);
+                    }
                     return Err(e);
                 }
             };
@@ -364,12 +405,13 @@ impl UdpRecvPool {
         let popped_slot = self.slots.remove(key);
 
         if let Some(s) = popped_slot {
-            let buf = s.buf;
             if !s.addr_buf_id.is_invalid() {
                 ctx.env.dispatch.deregister_buffer(s.addr_buf_id);
             }
-            if self.state == UdpPoolState::Running {
-                self.spare_bufs.push_front(buf);
+            if self.state == UdpPoolState::Running
+                && let Some(slab) = self.slab.as_mut()
+            {
+                slab.free_indices.push_front(s.current_idx);
             }
         }
     }
@@ -436,7 +478,7 @@ impl UdpRecvPool {
     fn maybe_prime_credit(
         &mut self,
         mailbox: &UdpMailbox,
-        preferred_capacity: usize,
+        _preferred_capacity: usize,
         ctx: &mut RioContext,
         registry: &mut TokenRegistry,
     ) -> RioResult<()> {
@@ -446,15 +488,9 @@ impl UdpRecvPool {
         if mailbox.waiters.is_empty() || !mailbox.queue.is_empty() {
             return Ok(());
         }
-        if !self.spare_bufs.is_empty() || !self.slots.is_empty() {
+        if !self.slots.is_empty() {
             return Ok(());
         }
-        let Some(cap) = std::num::NonZeroUsize::new(preferred_capacity.max(1)) else {
-            return Ok(());
-        };
-        let buf = FixedBuf::alloc_heap(cap)
-            .map_err(|e| error_stack::Report::new(RioError::Internal).attach(e.to_string()))?;
-        self.spare_bufs.push_back(buf);
         let _ = self.rebalance(mailbox, ctx, registry)?;
         Ok(())
     }
@@ -546,21 +582,6 @@ impl UdpRecvPool {
         Ok((SubmissionResult::Pending, total_submissions, None))
     }
 
-    pub(crate) fn try_refill(
-        &mut self,
-        mailbox: &UdpMailbox,
-        mut buf: FixedBuf,
-        ctx: &mut RioContext,
-        registry: &mut TokenRegistry,
-    ) -> RioResult<usize> {
-        if self.state != UdpPoolState::Running {
-            return Ok(0);
-        }
-        buf.set_len(buf.capacity());
-        self.spare_bufs.push_back(buf);
-        self.rebalance(mailbox, ctx, registry)
-    }
-
     pub(crate) fn cancel_waiter(
         &mut self,
         mailbox: &mut UdpMailbox,
@@ -629,36 +650,61 @@ impl UdpRecvPool {
             error_stack::Report::new(RioError::Internal)
                 .attach("UDP recv pool slot missing in try_fast_deliver")
         })?;
+        let slab = self.slab.as_mut().ok_or_else(|| {
+            error_stack::Report::new(RioError::Internal)
+                .attach("UDP slab missing in try_fast_deliver")
+        })?;
 
         let bytes = res.BytesTransferred as usize;
-        if bytes > slot.buf.capacity() {
+        if bytes > slab.chunk_capacity() {
             mailbox.waiters.push_front(waiter);
             return Err(error_stack::Report::new(RioError::Internal)).attach(format!(
                 "UDP recv completion exceeded slot capacity in try_fast_deliver: bytes={}, cap={}",
                 bytes,
-                slot.buf.capacity()
+                slab.chunk_capacity()
             ));
         }
 
+        let Some(next_idx) = slab.free_indices.pop_front() else {
+            mailbox.waiters.push_front(waiter);
+            return Ok(None);
+        };
+        let completed_idx = std::mem::replace(&mut slot.current_idx, next_idx);
+
         let mut delivered = false;
         let mut payload = match waiter.kind {
-            UdpWaiterKind::Recv => Some(FastDeliverPayload::Recv(slot.buf.slice(0..bytes))),
-            UdpWaiterKind::Stream => self.spare_bufs.pop_front().map(|new_buf| {
-                let mut old_buf = std::mem::replace(&mut slot.buf, new_buf);
-                old_buf.set_len(bytes);
-                FastDeliverPayload::Stream(old_buf)
+            UdpWaiterKind::Recv => Some(FastDeliverPayload::Recv {
+                idx: completed_idx,
+                len: bytes,
+            }),
+            UdpWaiterKind::Stream => Some(FastDeliverPayload::Stream {
+                idx: completed_idx,
+                len: bytes,
             }),
         };
 
         if let Some(payload) = payload.take() {
             match payload {
-                FastDeliverPayload::Recv(buf) => {
+                FastDeliverPayload::Recv { idx, len } => {
+                    let Some(buf) = slab.chunk_view(idx, len) else {
+                        mailbox.waiters.push_front(waiter);
+                        slab.free_indices.push_front(slot.current_idx);
+                        slot.current_idx = idx;
+                        return Ok(None);
+                    };
                     if UdpPoolManager::deliver_to_recv_waiter_raw(comp, waiter, buf.as_slice()) {
                         slot.in_flight = false;
                         delivered = true;
                     }
                 }
-                FastDeliverPayload::Stream(buf) => {
+                FastDeliverPayload::Stream { idx, len } => {
+                    let Some(mut buf) = slab.chunk_view(idx, len) else {
+                        mailbox.waiters.push_front(waiter);
+                        slab.free_indices.push_front(slot.current_idx);
+                        slot.current_idx = idx;
+                        return Ok(None);
+                    };
+                    buf.set_len(len);
                     let addr = UdpPoolManager::parse_rio_address(
                         &slot.addr,
                         std::mem::size_of::<SockAddrStorage>() as i32,
@@ -669,7 +715,7 @@ impl UdpRecvPool {
                             delivered = true;
                         }
                         Err(returned_buf) => {
-                            mailbox.queue.push_back(UdpRecvDatagram {
+                            mailbox.queue.push_back(UdpPoolPacket {
                                 buf: returned_buf,
                                 addr: *slot.addr,
                                 addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
@@ -710,6 +756,11 @@ impl UdpRecvPool {
             for slot in slots {
                 self.free_slot(slot, ctx);
             }
+            if let Some(slab) = self.slab.take()
+                && !slab.rio_id.is_invalid()
+            {
+                ctx.env.dispatch.deregister_buffer(slab.rio_id);
+            }
             return true;
         }
         false
@@ -737,9 +788,9 @@ impl UdpPoolManager {
         })
     }
 
-    fn into_op_datagram(datagram: UdpRecvDatagram) -> OpUdpRecvDatagram {
+    fn into_op_datagram(datagram: UdpPoolPacket) -> OpUdpRecvPacket {
         let addr = Self::parse_rio_address(&datagram.addr, datagram.addr_len);
-        OpUdpRecvDatagram {
+        OpUdpRecvPacket {
             buf: datagram.buf,
             addr,
         }
@@ -769,7 +820,7 @@ impl UdpPoolManager {
 
         let stream_op = Self::get_stream_op_mut(&mut guard);
         if let Some(stream_op) = stream_op {
-            stream_op.result = Some(OpUdpRecvDatagram { buf, addr });
+            stream_op.result = Some(OpUdpRecvPacket { buf, addr });
             guard.platform_mut().rio_pool_waiting = false;
 
             let event = CompletionEvent {
@@ -859,7 +910,7 @@ impl UdpPoolManager {
     fn deliver_to_stream_waiter(
         comp: &mut RioCompletionContext<'_>,
         waiter: UdpWaiter,
-        datagram: &mut Option<UdpRecvDatagram>,
+        datagram: &mut Option<UdpPoolPacket>,
     ) -> bool {
         let Some(d) = datagram.take() else {
             return false;
@@ -868,7 +919,7 @@ impl UdpPoolManager {
         match Self::deliver_to_stream_waiter_raw(comp, waiter, d.buf, addr) {
             Ok(()) => true,
             Err(buf) => {
-                *datagram = Some(UdpRecvDatagram {
+                *datagram = Some(UdpPoolPacket {
                     buf,
                     addr: d.addr,
                     addr_len: d.addr_len,
@@ -881,7 +932,7 @@ impl UdpPoolManager {
     fn deliver_to_recv_waiter(
         comp: &mut RioCompletionContext<'_>,
         waiter: UdpWaiter,
-        datagram: &mut Option<UdpRecvDatagram>,
+        datagram: &mut Option<UdpPoolPacket>,
     ) -> bool {
         let data = match datagram.as_ref() {
             Some(d) => d.buf.as_slice(),

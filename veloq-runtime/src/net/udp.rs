@@ -8,7 +8,7 @@ use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
     DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, SendTo, UdpRecv as OpUdpRecv,
-    UdpRecvDatagram, UdpRecvStream, UdpRefill, UdpSend as OpUdpSend,
+    UdpRecvPacket, UdpRecvStream, UdpSend as OpUdpSend,
 };
 
 // ============================================================================
@@ -67,17 +67,7 @@ impl UdpSocket {
 // ============================================================================
 
 impl<S: OpSubmitter> GenericUdpSocket<S> {
-    pub async fn recv_ready(&self, buf_capacity: NonZeroUsize, credits: usize) -> io::Result<()> {
-        let target = credits.max(1);
-        for _ in 0..target {
-            let buf = FixedBuf::alloc_heap(buf_capacity)?;
-            let refill = UdpRefill {
-                fd: IoFd::Raw(self.inner.raw()),
-                buf: Some(buf),
-            };
-            let (res, _op_back) = submit(&self.submitter, Op::new(refill)).await.into_inner();
-            res?;
-        }
+    pub async fn recv_ready(&self, _buf_capacity: NonZeroUsize, _credits: usize) -> io::Result<()> {
         Ok(())
     }
 
@@ -103,42 +93,10 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         Ok((res?, buf))
     }
 
-    pub async fn recv_stream(&self, buf: FixedBuf) -> io::Result<UdpRecvDatagram> {
-        const UDP_PREFILL_CREDITS: usize = 4;
-        let refill_capacity = buf.capacity();
-
-        let refill_op = UdpRefill {
-            fd: IoFd::Raw(self.inner.raw()),
-            buf: Some(buf),
-        };
-        let (refill_res, refill_back_opt) = submit(&self.submitter, Op::new(refill_op))
-            .await
-            .into_inner();
-        let refill_back = refill_back_opt.ok_or_else(|| io::Error::other("UdpRefill op lost"))?;
-        refill_res?;
-
-        // Best-effort top-up to absorb burst packets on RIO pooled recv path.
-        for _ in 1..UDP_PREFILL_CREDITS {
-            let Some(extra_cap) = std::num::NonZeroUsize::new(refill_capacity) else {
-                break;
-            };
-            let Ok(extra_buf) = FixedBuf::alloc_heap(extra_cap) else {
-                break;
-            };
-
-            let top_up = UdpRefill {
-                fd: IoFd::Raw(self.inner.raw()),
-                buf: Some(extra_buf),
-            };
-            let (top_up_res, _top_up_back) =
-                submit(&self.submitter, Op::new(top_up)).await.into_inner();
-            // Non-fatal: main recv path still proceeds with at least one refill buffer.
-            let _ = top_up_res;
-        }
-
+    pub async fn recv_stream(&self, buf: FixedBuf) -> io::Result<UdpRecvPacket> {
         let op = UdpRecvStream {
             fd: IoFd::Raw(self.inner.raw()),
-            buf: refill_back.buf,
+            buf: Some(buf),
             addr: None,
             result: None,
         };
@@ -161,7 +119,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
                 "driver must populate UdpRecvStream::addr before completion",
             )
         })?;
-        Ok(UdpRecvDatagram {
+        Ok(UdpRecvPacket {
             buf: recv_buf,
             addr,
         })

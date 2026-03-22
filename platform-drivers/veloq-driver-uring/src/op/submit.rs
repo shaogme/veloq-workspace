@@ -422,25 +422,6 @@ pub(crate) unsafe fn on_complete_udp_recv_stream(
 
 impl_lifecycle!(drop_udp_recv_stream, UdpRecvStream, direct_fd);
 
-pub(crate) unsafe fn make_sqe_udp_refill(
-    op: &mut UringOp,
-    _driver: &mut UringDriver,
-) -> io::Result<squeue::Entry> {
-    let _ = match &mut op.payload {
-        UringOpPayload::UdpRefill(kernel) => Some(kernel),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "UringOpPayload variant mismatch",
-            ));
-        }
-    };
-    Ok(opcode::Nop::new().build())
-}
-
-impl_default_completion!(on_complete_udp_refill);
-impl_lifecycle!(drop_udp_refill, UdpRefill, direct_fd);
-
 pub(crate) unsafe fn make_sqe_close(
     op: &mut UringOp,
     _driver: &mut UringDriver,

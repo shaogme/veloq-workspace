@@ -8,12 +8,10 @@ use veloq_buf::BufPool;
 use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_driver_core::driver::{Driver, SubmitBinder};
 use veloq_driver_core::op::UdpRecvStream as UdpRecvStreamBase;
-use veloq_driver_core::op::UdpRefill as UdpRefillBase;
 use veloq_driver_core::op::{IntoPlatformOp, SendTo as SendToBase};
 
 type SendTo = SendToBase<RawHandle>;
 type UdpRecvStream = UdpRecvStreamBase<RawHandle>;
-type UdpRefill = UdpRefillBase<RawHandle>;
 
 #[test]
 fn test_rio_udp_send_to_recv_from_address_path() {
@@ -47,10 +45,6 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
     send_buf.set_len(test_data.len());
 
-    let recv_buf = reg_pool
-        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
-        .expect("recv alloc failed");
-
     let send_region = send_buf.resolve_region_info();
     let send_chunk = global_pool
         .chunk_info(send_region.id)
@@ -62,36 +56,6 @@ fn test_rio_udp_send_to_recv_from_address_path() {
             send_chunk.len.get(),
         )
         .expect("register send chunk failed");
-
-    let recv_region = recv_buf.resolve_region_info();
-    if recv_region.id != send_region.id {
-        let recv_chunk = global_pool
-            .chunk_info(recv_region.id)
-            .expect("recv chunk not found");
-        driver
-            .register_chunk(
-                recv_region.id,
-                recv_chunk.ptr.as_ptr(),
-                recv_chunk.len.get(),
-            )
-            .expect("register recv chunk failed");
-    }
-
-    let refill_op = UdpRefill {
-        fd: IoFd::Raw(server_handle),
-        buf: Some(recv_buf),
-    };
-    let (refill_kernel, _refill_payload) =
-        IntoPlatformOp::<IocpOp>::into_kernel_and_payload(refill_op);
-    let mut refill_iocp = Some(refill_kernel);
-    let (refill_ud, refill_gen) = driver.reserve_op().expect("reserve refill op failed");
-    let _ = driver
-        .submit(refill_ud, &mut refill_iocp, SubmitBinder::new())
-        .into_inner()
-        .expect("submit refill failed");
-
-    wait_completion(&mut driver, refill_ud, refill_gen, Duration::from_secs(5))
-        .expect("refill failed");
 
     let recv_op = UdpRecvStream {
         fd: IoFd::Raw(server_handle),
@@ -180,10 +144,6 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
     send_buf.set_len(test_data.len());
 
-    let recv_buf = reg_pool
-        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
-        .expect("recv alloc failed");
-
     let send_region = send_buf.resolve_region_info();
     let send_chunk = global_pool
         .chunk_info(send_region.id)
@@ -195,37 +155,6 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
             send_chunk.len.get(),
         )
         .expect("register send chunk failed");
-
-    let recv_region = recv_buf.resolve_region_info();
-    if recv_region.id != send_region.id {
-        let recv_chunk = global_pool
-            .chunk_info(recv_region.id)
-            .expect("recv chunk not found");
-        driver
-            .register_chunk(
-                recv_region.id,
-                recv_chunk.ptr.as_ptr(),
-                recv_chunk.len.get(),
-            )
-            .expect("register recv chunk failed");
-    }
-
-    // Provide initial buffer to pool via UdpRefill
-    let refill_op = UdpRefill {
-        fd: IoFd::Raw(server_handle),
-        buf: Some(recv_buf),
-    };
-    let (refill_kernel, _refill_payload) =
-        IntoPlatformOp::<IocpOp>::into_kernel_and_payload(refill_op);
-    let mut refill_iocp = Some(refill_kernel);
-    let (refill_ud, refill_gen) = driver.reserve_op().expect("reserve refill op failed");
-    let _ = driver
-        .submit(refill_ud, &mut refill_iocp, SubmitBinder::new())
-        .into_inner()
-        .expect("submit refill failed");
-
-    wait_completion(&mut driver, refill_ud, refill_gen, Duration::from_secs(5))
-        .expect("refill failed");
 
     let recv_op = UdpRecvStream {
         fd: IoFd::Raw(server_handle),
