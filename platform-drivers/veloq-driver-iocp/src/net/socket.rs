@@ -18,16 +18,7 @@ pub struct Socket {
 impl Socket {
     fn new_with_flags(af: u16, ty: i32, protocol: i32, flags: u32) -> std::io::Result<Self> {
         // SAFETY: Calling WSASocketW with valid arguments.
-        let s = unsafe {
-            WSASocketW(
-                af as i32,
-                ty,
-                protocol,
-                std::ptr::null(),
-                0,
-                flags,
-            )
-        };
+        let s = unsafe { WSASocketW(af as i32, ty, protocol, std::ptr::null(), 0, flags) };
         if s == INVALID_SOCKET {
             return Err(std::io::Error::last_os_error());
         }

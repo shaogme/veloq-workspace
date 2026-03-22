@@ -361,10 +361,10 @@ impl RioState {
 
     pub(crate) fn forget_udp_contexts(&mut self) {
         for actor in self.active_actors.values_mut() {
-            actor.pool_manager.udp_ctx_map.clear();
+            actor.pool_manager.registry.map.clear();
         }
         for actor in self.draining_actors.values_mut() {
-            actor.pool_manager.udp_ctx_map.clear();
+            actor.pool_manager.registry.map.clear();
         }
     }
 

@@ -125,17 +125,14 @@ pub(crate) unsafe fn iocp_submit_socket_recv(
     len: u32,
     overlapped: *mut Overlapped,
 ) -> io::Result<SubmissionResult> {
-    let mut wsabuf = WSABUF {
-        len,
-        buf,
-    };
+    let wsabuf = WSABUF { len, buf };
     let mut bytes = 0u32;
     let mut flags = 0u32;
     // SAFETY: WSARecv is called with valid pointers and overlapped state.
     let ret = unsafe {
         WSARecv(
             socket,
-            &mut wsabuf,
+            &wsabuf,
             1,
             &mut bytes,
             &mut flags,
@@ -164,7 +161,7 @@ pub(crate) unsafe fn iocp_submit_socket_send(
     len: u32,
     overlapped: *mut Overlapped,
 ) -> io::Result<SubmissionResult> {
-    let mut wsabuf = WSABUF {
+    let wsabuf = WSABUF {
         len,
         buf: buf as *mut u8,
     };
@@ -173,7 +170,7 @@ pub(crate) unsafe fn iocp_submit_socket_send(
     let ret = unsafe {
         WSASend(
             socket,
-            &mut wsabuf,
+            &wsabuf,
             1,
             &mut bytes,
             0,

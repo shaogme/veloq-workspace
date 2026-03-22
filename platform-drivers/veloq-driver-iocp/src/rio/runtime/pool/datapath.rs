@@ -1,6 +1,7 @@
 use super::{
-    POOL_CTX_TAG, UDP_RECV_POOL_QUEUE_CAP, UdpMailbox, UdpPoolState, UdpRecvDatagram, UdpRecvPool,
-    UdpRecvPoolSlot, UdpWaiter, UdpWaiterKind,
+    POOL_CTX_TAG, UDP_RECV_POOL_INITIAL_CREDITS, UDP_RECV_POOL_MAX_CREDITS,
+    UDP_RECV_POOL_MIN_CREDITS, UDP_RECV_POOL_QUEUE_CAP, UdpMailbox, UdpPoolState, UdpRecvDatagram,
+    UdpRecvPool, UdpRecvPoolSlot, UdpWaiter, UdpWaiterKind,
 };
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::net::addr::{SockAddrStorage, to_socket_addr};
@@ -22,22 +23,52 @@ use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, RIORESULT, WSAGetLastError};
 
+pub(crate) struct TokenRegistry {
+    pub(crate) map: FxHashMap<u32, usize>,
+    pub(crate) next_ctx: u32,
+}
+
+impl TokenRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: FxHashMap::default(),
+            next_ctx: 1,
+        }
+    }
+
+    pub(crate) fn alloc(&mut self, slot_idx: usize) -> u32 {
+        loop {
+            let token = self.next_ctx;
+            self.next_ctx = self.next_ctx.wrapping_add(1);
+            if token == 0 {
+                continue;
+            }
+            if let hash_map::Entry::Vacant(e) = self.map.entry(token) {
+                e.insert(slot_idx);
+                return token;
+            }
+        }
+    }
+
+    pub(crate) fn reclaim(&mut self, token: u32) {
+        self.map.remove(&token);
+    }
+}
+
 pub(crate) struct UdpPoolManager {
-    pub(crate) pool: Option<UdpRecvPool>,
-    pub(crate) udp_ctx_map: FxHashMap<u32, usize>,
-    pub(crate) udp_next_ctx: u32,
+    pub(crate) pool: UdpRecvPool,
+    pub(crate) registry: TokenRegistry,
 }
 
 impl UdpPoolManager {
     pub(crate) fn new() -> Self {
         Self {
-            pool: None,
-            udp_ctx_map: FxHashMap::default(),
-            udp_next_ctx: 1,
+            pool: UdpRecvPool::uninit(),
+            registry: TokenRegistry::new(),
         }
     }
 
-    fn last_wsa_error() -> io::Error {
+    pub(crate) fn last_wsa_error() -> io::Error {
         // SAFETY: WSAGetLastError is a thread-safe getter with no side effects.
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
@@ -48,25 +79,142 @@ impl UdpPoolManager {
             as *const std::ffi::c_void
     }
 
-    fn alloc_udp_ctx_token(&mut self, slot_idx: usize) -> u32 {
-        loop {
-            let token = self.udp_next_ctx;
-            self.udp_next_ctx = self.udp_next_ctx.wrapping_add(1);
-            if token == 0 {
-                continue;
-            }
-            if let hash_map::Entry::Vacant(e) = self.udp_ctx_map.entry(token) {
-                e.insert(slot_idx);
-                return token;
-            }
+    pub(crate) fn ensure_pool(&mut self, ctx: &mut RioContext) -> io::Result<usize> {
+        if self.pool.state != UdpPoolState::Uninitialized {
+            return Ok(0);
         }
+
+        let min = UDP_RECV_POOL_MIN_CREDITS;
+        let max = UDP_RECV_POOL_MAX_CREDITS.max(min);
+        let initial = UDP_RECV_POOL_INITIAL_CREDITS.clamp(min, max);
+
+        self.pool.slots = Vec::with_capacity(max);
+        self.pool.spare_bufs = VecDeque::with_capacity(initial);
+        self.pool.min_credits = min;
+        self.pool.max_credits = max;
+        self.pool.target_credits = initial;
+        self.pool.idle_hits = 0;
+        self.pool.state = UdpPoolState::Running;
+
+        self.pool.grow_to(initial, ctx, &mut self.registry)
     }
 
-    fn create_pool_slot(
-        &self,
+    pub(crate) fn try_submit_pool_recv(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        stream_op: &mut UdpRecvStream<crate::RawHandle>,
+        uid: (usize, u32),
+        ctx: &mut RioContext,
+    ) -> io::Result<(SubmissionResult, usize)> {
+        let total_submissions = self.ensure_pool(ctx)?;
+        let (res, subs) =
+            self.pool
+                .try_submit_recv(mailbox, stream_op, uid, ctx, &mut self.registry)?;
+        Ok((res, total_submissions + subs))
+    }
+
+    pub(crate) fn try_submit_pool_recv_recv(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        recv_op: &mut OpUdpRecv<crate::RawHandle>,
+        uid: (usize, u32),
+        ctx: &mut RioContext,
+    ) -> io::Result<(SubmissionResult, usize, Option<usize>)> {
+        let total_submissions = self.ensure_pool(ctx)?;
+        let (res, subs, copied) =
+            self.pool
+                .try_submit_recv_recv(mailbox, recv_op, uid, ctx, &mut self.registry)?;
+        Ok((res, total_submissions + subs, copied))
+    }
+
+    pub(crate) fn try_refill_pool(
+        &mut self,
+        mailbox: &UdpMailbox,
         buf: FixedBuf,
-        dispatch: &RioDispatch,
-    ) -> io::Result<UdpRecvPoolSlot> {
+        ctx: &mut RioContext,
+    ) -> io::Result<usize> {
+        let mut total_submissions = self.ensure_pool(ctx)?;
+        total_submissions += self
+            .pool
+            .try_refill(mailbox, buf, ctx, &mut self.registry)?;
+        Ok(total_submissions)
+    }
+
+    pub(crate) fn cancel_waiter(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        uid: (usize, u32),
+        ctx: &mut RioContext,
+    ) {
+        self.pool
+            .cancel_waiter(mailbox, uid, ctx, &mut self.registry);
+    }
+
+    pub(crate) fn ack_pool_done(&mut self, completion_generation: u32) -> Option<usize> {
+        self.registry.map.remove(&completion_generation)
+    }
+
+    pub(crate) fn handle_completion(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        completion: (usize, &RIORESULT),
+        comp: &mut RioCompletionContext<'_>,
+        ctx: &mut RioContext,
+    ) -> usize {
+        self.pool
+            .handle_completion(mailbox, completion, comp, ctx, &mut self.registry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rebalance_udp_pool(
+        &mut self,
+        mailbox: &UdpMailbox,
+        ctx: &mut RioContext,
+    ) -> io::Result<usize> {
+        self.pool.rebalance(mailbox, ctx, &mut self.registry)
+    }
+
+    pub(crate) fn shutdown_pool(&mut self, _mailbox: &UdpMailbox) {
+        self.pool.begin_draining();
+    }
+
+    pub(crate) fn cleanup_drained_pool(&mut self, ctx: &mut RioContext) -> bool {
+        self.pool.cleanup_drained(ctx)
+    }
+
+    pub(crate) fn forget_and_cleanup(
+        &mut self,
+        mailbox: &UdpMailbox,
+        ctx: &mut RioContext,
+    ) -> bool {
+        self.registry.map.clear();
+        self.shutdown_pool(mailbox);
+        self.cleanup_drained_pool(ctx)
+    }
+
+    pub(crate) fn handle_drain_comp(&mut self) {
+        self.pool.handle_drain_comp();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn udp_pool_debug_stats(
+        &self,
+        mailbox: &UdpMailbox,
+    ) -> Option<super::UdpRecvPoolDebugStats> {
+        if self.pool.state == UdpPoolState::Uninitialized {
+            return None;
+        }
+        Some(super::UdpRecvPoolDebugStats {
+            min_credits: self.pool.min_credits,
+            max_credits: self.pool.max_credits,
+            target_credits: self.pool.target_credits,
+            waiters_len: mailbox.waiters.len(),
+        })
+    }
+}
+
+impl UdpRecvPool {
+    fn create_slot(&self, buf: FixedBuf, dispatch: &RioDispatch) -> io::Result<UdpRecvPoolSlot> {
         let mut addr = Box::new(SockAddrStorage::default());
 
         let addr_buf_id = dispatch
@@ -77,7 +225,7 @@ impl UdpPoolManager {
             .map_err(|e| {
                 io_error(
                     IocpErrorContext::Rio,
-                    Self::last_wsa_error(),
+                    UdpPoolManager::last_wsa_error(),
                     format!("RIORegisterBuffer failed for UDP recv pool addr buffer: {e}"),
                 )
             })?;
@@ -91,14 +239,13 @@ impl UdpPoolManager {
         })
     }
 
-    #[inline]
-    pub(super) fn begin_draining(pool: &mut UdpRecvPool) {
-        if matches!(pool.state, UdpPoolState::Running) {
-            pool.state = UdpPoolState::Draining;
+    pub(crate) fn begin_draining(&mut self) {
+        if matches!(self.state, UdpPoolState::Running) {
+            self.state = UdpPoolState::Draining;
         }
-        pool.target_credits = 0;
-        pool.spare_bufs.clear();
-        for slot in &mut pool.slots {
+        self.target_credits = 0;
+        self.spare_bufs.clear();
+        for slot in &mut self.slots {
             if slot.in_flight {
                 slot.stop_requested = true;
             }
@@ -116,22 +263,19 @@ impl UdpPoolManager {
         self.deregister_slot(slot, ctx.env.dispatch);
     }
 
-    fn submit_pool_slot(
+    fn submit_slot(
         &mut self,
         target: (usize, u32),
         ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
     ) -> io::Result<usize> {
         let (slot_idx, completion_token) = target;
-        let pool = self
-            .pool
-            .as_mut()
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
 
-        if !matches!(pool.state, UdpPoolState::Running) {
+        if !matches!(self.state, UdpPoolState::Running) {
             return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
         }
 
-        let slot = pool
+        let slot = self
             .slots
             .get_mut(slot_idx)
             .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool slot missing"))?;
@@ -160,31 +304,30 @@ impl UdpPoolManager {
             control_buf: std::ptr::null(),
             flags_buf: std::ptr::null(),
             flags: 0,
-            context: Self::encode_pool_context(ctx.actor_id, completion_token),
+            context: UdpPoolManager::encode_pool_context(ctx.actor_id, completion_token),
         }) {
-            self.on_recv_submit_fail(slot_idx, completion_token, e, ctx.rq)
+            self.on_submit_fail(slot_idx, completion_token, e, ctx.rq, registry)
         } else {
             Ok(1)
         }
     }
 
-    fn on_recv_submit_fail(
+    fn on_submit_fail(
         &mut self,
         slot_idx: usize,
         token: u32,
         e: io::Error,
         rq: RioRq,
+        registry: &mut TokenRegistry,
     ) -> io::Result<usize> {
-        self.udp_ctx_map.remove(&token);
-        if let Some(pool) = self.pool.as_mut()
-            && let Some(slot) = pool.slots.get_mut(slot_idx)
-        {
+        registry.reclaim(token);
+        if let Some(slot) = self.slots.get_mut(slot_idx) {
             slot.in_flight = false;
             slot.stop_requested = false;
         }
         Err(io_error(
             IocpErrorContext::Rio,
-            Self::last_wsa_error(),
+            UdpPoolManager::last_wsa_error(),
             format!(
                 "RIOReceiveEx submit failed: slot={}, rq=0x{:x}, error={e}",
                 slot_idx, rq.0 as usize
@@ -192,27 +335,30 @@ impl UdpPoolManager {
         ))
     }
 
-    fn grow_pool_to(&mut self, target: usize, ctx: &mut RioContext) -> io::Result<usize> {
+    pub(crate) fn grow_to(
+        &mut self,
+        target: usize,
+        ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
+    ) -> io::Result<usize> {
         let mut submissions = 0;
-        while self.should_grow(target) {
-            let slot_buf = match self.pool.as_mut() {
-                Some(p) => match p.spare_bufs.pop_front() {
-                    Some(b) => b,
-                    None => break,
-                },
+        while self.state == UdpPoolState::Running && self.slots.len() < target {
+            let slot_buf = match self.spare_bufs.pop_front() {
+                Some(b) => b,
                 None => break,
             };
 
-            let slot = self.create_pool_slot(slot_buf, ctx.env.dispatch)?;
-            let idx = if let Some(p) = self.pool.as_mut() {
-                p.slots.push(slot);
-                p.slots.len() - 1
-            } else {
-                return Ok(submissions);
+            let slot = match self.create_slot(slot_buf, ctx.env.dispatch) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(e);
+                }
             };
+            self.slots.push(slot);
+            let idx = self.slots.len() - 1;
 
-            let token = self.alloc_udp_ctx_token(idx);
-            if let Err(e) = self.submit_pool_slot((idx, token), ctx) {
+            let token = registry.alloc(idx);
+            if let Err(e) = self.submit_slot((idx, token), ctx, registry) {
                 self.undo_failed_growth(idx, ctx);
                 return Err(e);
             }
@@ -221,28 +367,11 @@ impl UdpPoolManager {
         Ok(submissions)
     }
 
-    fn should_grow(&self, target: usize) -> bool {
-        if let Some(pool) = &self.pool {
-            pool.state == UdpPoolState::Running && pool.slots.len() < target
-        } else {
-            false
-        }
-    }
-
     fn undo_failed_growth(&mut self, idx: usize, ctx: &mut RioContext) {
-        let (popped_slot, is_running) = {
-            let mut pool = self.pool.as_mut();
-            (
-                pool.as_mut().and_then(|p| {
-                    if p.slots.len() > idx {
-                        Some(p.slots.remove(idx))
-                    } else {
-                        None
-                    }
-                }),
-                pool.as_ref()
-                    .is_some_and(|p| matches!(p.state, UdpPoolState::Running)),
-            )
+        let popped_slot = if self.slots.len() > idx {
+            Some(self.slots.remove(idx))
+        } else {
+            None
         };
 
         if let Some(s) = popped_slot {
@@ -250,103 +379,333 @@ impl UdpPoolManager {
             if !s.addr_buf_id.is_invalid() {
                 ctx.env.dispatch.deregister_buffer(s.addr_buf_id);
             }
-            if is_running && let Some(pool) = self.pool.as_mut() {
-                pool.spare_bufs.push_front(buf);
+            if self.state == UdpPoolState::Running {
+                self.spare_bufs.push_front(buf);
             }
         }
     }
 
-    fn trim_pool_tail(&mut self, ctx: &mut RioContext) {
+    fn trim_tail(&mut self, ctx: &mut RioContext) {
         loop {
-            let maybe_slot = {
-                let Some(pool) = self.pool.as_mut() else {
-                    return;
-                };
-                if matches!(pool.state, UdpPoolState::Running)
-                    && pool.slots.len() <= pool.target_credits
-                {
-                    return;
+            if matches!(self.state, UdpPoolState::Running)
+                && self.slots.len() <= self.target_credits
+            {
+                return;
+            }
+            if self.slots.last().is_some_and(|slot| slot.in_flight) {
+                return;
+            }
+
+            if let Some(slot) = self.slots.pop() {
+                ctx.registry.deregister_heap_buf(&slot.buf, ctx.env);
+                if !slot.addr_buf_id.is_invalid() {
+                    ctx.env.dispatch.deregister_buffer(slot.addr_buf_id);
                 }
-                if pool.slots.last().is_some_and(|slot| slot.in_flight) {
-                    return;
-                }
-                pool.slots.pop()
-            };
-            if let Some(slot) = maybe_slot {
-                self.free_slot(slot, ctx);
             } else {
                 return;
             }
         }
     }
 
-    pub(crate) fn rebalance_udp_pool(
+    pub(crate) fn rebalance(
         &mut self,
         mailbox: &UdpMailbox,
         ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
     ) -> io::Result<usize> {
-        let (desired, state) = {
-            let pool = self
-                .pool
-                .as_mut()
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
-
-            if !matches!(pool.state, UdpPoolState::Running) {
-                (0, pool.state)
-            } else {
-                if !mailbox.waiters.is_empty() {
-                    let bump = mailbox.waiters.len().clamp(1, 4);
-                    pool.target_credits = (pool.target_credits + bump).min(pool.max_credits);
-                    pool.idle_hits = 0;
-                } else if mailbox.queue.is_empty() {
-                    pool.idle_hits = pool.idle_hits.saturating_add(1);
-                    if pool.idle_hits >= 64 && pool.target_credits > pool.min_credits {
-                        pool.target_credits -= 1;
-                        pool.idle_hits = 0;
-                    }
-                } else {
-                    pool.idle_hits = 0;
+        let (desired, is_running) = if !matches!(self.state, UdpPoolState::Running) {
+            (0, false)
+        } else {
+            if !mailbox.waiters.is_empty() {
+                let bump = mailbox.waiters.len().clamp(1, 4);
+                self.target_credits = (self.target_credits + bump).min(self.max_credits);
+                self.idle_hits = 0;
+            } else if mailbox.queue.is_empty() {
+                self.idle_hits = self.idle_hits.saturating_add(1);
+                if self.idle_hits >= 64 && self.target_credits > self.min_credits {
+                    self.target_credits -= 1;
+                    self.idle_hits = 0;
                 }
-                (pool.target_credits, pool.state)
+            } else {
+                self.idle_hits = 0;
             }
+            (self.target_credits, true)
         };
 
-        if !matches!(state, UdpPoolState::Running) {
-            self.trim_pool_tail(ctx);
+        if !is_running {
+            self.trim_tail(ctx);
             return Ok(0);
         }
 
-        let submissions = self.grow_pool_to(desired, ctx)?;
-        self.trim_pool_tail(ctx);
+        let submissions = self.grow_to(desired, ctx, registry)?;
+        self.trim_tail(ctx);
         Ok(submissions)
     }
 
-    fn ensure_pool(&mut self, ctx: &mut RioContext) -> io::Result<usize> {
-        use super::{
-            UDP_RECV_POOL_INITIAL_CREDITS, UDP_RECV_POOL_MAX_CREDITS, UDP_RECV_POOL_MIN_CREDITS,
-        };
-
-        if self.pool.is_some() {
-            return Ok(0);
+    fn maybe_prime_credit(
+        &mut self,
+        mailbox: &UdpMailbox,
+        preferred_capacity: usize,
+        ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
+    ) -> io::Result<()> {
+        if !matches!(self.state, UdpPoolState::Running) {
+            return Ok(());
         }
-
-        let min = UDP_RECV_POOL_MIN_CREDITS;
-        let max = UDP_RECV_POOL_MAX_CREDITS.max(min);
-        let initial = UDP_RECV_POOL_INITIAL_CREDITS.clamp(min, max);
-
-        self.pool = Some(UdpRecvPool {
-            slots: Vec::with_capacity(max),
-            spare_bufs: VecDeque::with_capacity(initial),
-            min_credits: min,
-            max_credits: max,
-            target_credits: initial,
-            idle_hits: 0,
-            state: UdpPoolState::Running,
-        });
-
-        self.grow_pool_to(initial, ctx)
+        if mailbox.waiters.is_empty() || !mailbox.queue.is_empty() {
+            return Ok(());
+        }
+        if !self.spare_bufs.is_empty() || !self.slots.is_empty() {
+            return Ok(());
+        }
+        let Some(cap) = std::num::NonZeroUsize::new(preferred_capacity.max(1)) else {
+            return Ok(());
+        };
+        let buf = FixedBuf::alloc_heap(cap)?;
+        self.spare_bufs.push_back(buf);
+        let _ = self.rebalance(mailbox, ctx, registry)?;
+        Ok(())
     }
 
+    pub(crate) fn try_submit_recv(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        stream_op: &mut UdpRecvStream<crate::RawHandle>,
+        uid: (usize, u32),
+        ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
+    ) -> io::Result<(SubmissionResult, usize)> {
+        match self.state {
+            UdpPoolState::Running => {}
+            UdpPoolState::Uninitialized => {
+                return Err(io_msg(IocpErrorContext::Rio, "UDP recv pool uninitialized"));
+            }
+            _ => return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32)),
+        }
+
+        let mut total_submissions = 0;
+
+        if let Some(datagram) = mailbox.queue.pop_front() {
+            stream_op.result = Some(UdpPoolManager::into_op_datagram(datagram));
+            total_submissions += self.rebalance(mailbox, ctx, registry)?;
+            return Ok((SubmissionResult::PostToQueue, total_submissions));
+        }
+
+        mailbox.waiters.push_back(UdpWaiter {
+            user_data: uid.0,
+            generation: uid.1,
+            kind: UdpWaiterKind::Stream,
+        });
+
+        let preferred_capacity = stream_op
+            .buf
+            .as_ref()
+            .map(FixedBuf::capacity)
+            .unwrap_or(2048);
+        self.maybe_prime_credit(mailbox, preferred_capacity, ctx, registry)?;
+        total_submissions += self.rebalance(mailbox, ctx, registry)?;
+        Ok((SubmissionResult::Pending, total_submissions))
+    }
+
+    pub(crate) fn try_submit_recv_recv(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        recv_op: &mut OpUdpRecv<crate::RawHandle>,
+        uid: (usize, u32),
+        ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
+    ) -> io::Result<(SubmissionResult, usize, Option<usize>)> {
+        match self.state {
+            UdpPoolState::Running => {}
+            UdpPoolState::Uninitialized => {
+                return Err(io_msg(IocpErrorContext::Rio, "UDP recv pool uninitialized"));
+            }
+            _ => return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32)),
+        }
+
+        let mut total_submissions = 0;
+
+        if let Some(datagram) = mailbox.queue.pop_front() {
+            let copied = UdpPoolManager::copy_data_to_recv_op(recv_op, datagram.buf.as_slice());
+            total_submissions += self.rebalance(mailbox, ctx, registry)?;
+            return Ok((
+                SubmissionResult::PostToQueue,
+                total_submissions,
+                Some(copied),
+            ));
+        }
+
+        mailbox.waiters.push_back(UdpWaiter {
+            user_data: uid.0,
+            generation: uid.1,
+            kind: UdpWaiterKind::Recv,
+        });
+
+        self.maybe_prime_credit(mailbox, recv_op.buf.capacity(), ctx, registry)?;
+        total_submissions += self.rebalance(mailbox, ctx, registry)?;
+        Ok((SubmissionResult::Pending, total_submissions, None))
+    }
+
+    pub(crate) fn try_refill(
+        &mut self,
+        mailbox: &UdpMailbox,
+        buf: FixedBuf,
+        ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
+    ) -> io::Result<usize> {
+        if self.state != UdpPoolState::Running {
+            return Ok(0);
+        }
+        self.spare_bufs.push_back(buf);
+        self.rebalance(mailbox, ctx, registry)
+    }
+
+    pub(crate) fn cancel_waiter(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        uid: (usize, u32),
+        ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
+    ) {
+        let (user_data, generation) = uid;
+        mailbox
+            .waiters
+            .retain(|w| !(w.user_data == user_data && w.generation == generation));
+        let _ = self.rebalance(mailbox, ctx, registry);
+    }
+
+    pub(crate) fn handle_completion(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        completion: (usize, &RIORESULT),
+        comp: &mut RioCompletionContext<'_>,
+        ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
+    ) -> usize {
+        let (slot_idx, res) = completion;
+
+        if res.Status == 0
+            && res.BytesTransferred > 0
+            && let Some(waiter) = mailbox.waiters.pop_front()
+            && let Some(n) =
+                self.try_fast_deliver(mailbox, waiter, (slot_idx, res), comp, ctx, registry)
+        {
+            return n;
+        }
+
+        let event = self.update_state(mailbox, slot_idx, res);
+        let actions = Self::plan_actions(event, slot_idx);
+
+        let mut submissions = 0;
+        if let Some(idx) = actions.resubmit_slot {
+            let token = registry.alloc(idx);
+            if let Ok(n) = self.submit_slot((idx, token), ctx, registry) {
+                submissions += n;
+            }
+        }
+
+        if actions.dispatch_waiters {
+            UdpPoolManager::dispatch_waiters_static(self, mailbox, comp);
+        }
+
+        if actions.rebalance_pool
+            && let Ok(n) = self.rebalance(mailbox, ctx, registry)
+        {
+            submissions += n;
+        }
+
+        submissions
+    }
+
+    fn try_fast_deliver(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        waiter: UdpWaiter,
+        completion: (usize, &RIORESULT),
+        comp: &mut RioCompletionContext<'_>,
+        ctx: &mut RioContext,
+        registry: &mut TokenRegistry,
+    ) -> Option<usize> {
+        let (slot_idx, res) = completion;
+        let slot = self.slots.get_mut(slot_idx)?;
+        let mut delivered = false;
+
+        match waiter.kind {
+            UdpWaiterKind::Recv => {
+                let data = &slot.buf.as_slice()[..res.BytesTransferred as usize];
+                if UdpPoolManager::deliver_to_recv_waiter_raw(comp, waiter, data) {
+                    slot.in_flight = false;
+                    delivered = true;
+                }
+            }
+            UdpWaiterKind::Stream => {
+                let replacement_buf = self.spare_bufs.pop_front().or_else(|| {
+                    std::num::NonZeroUsize::new(slot.buf.capacity())
+                        .and_then(|cap| FixedBuf::alloc_heap(cap).ok())
+                });
+                if let Some(new_buf) = replacement_buf {
+                    let mut old_buf = std::mem::replace(&mut slot.buf, new_buf);
+                    old_buf.set_len(res.BytesTransferred as usize);
+                    let addr = UdpPoolManager::parse_rio_address(
+                        &slot.addr,
+                        std::mem::size_of::<SockAddrStorage>() as i32,
+                    );
+                    match UdpPoolManager::deliver_to_stream_waiter_raw(comp, waiter, old_buf, addr)
+                    {
+                        Ok(()) => {
+                            slot.in_flight = false;
+                            delivered = true;
+                        }
+                        Err(returned_buf) => {
+                            mailbox.queue.push_back(UdpRecvDatagram {
+                                buf: returned_buf,
+                                addr: *slot.addr,
+                                addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
+                            });
+                            slot.in_flight = false;
+                            delivered = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if delivered {
+            let resubmit = !slot.stop_requested && slot_idx < self.target_credits;
+            slot.stop_requested = false;
+
+            let mut submissions = 0;
+            if resubmit {
+                let token = registry.alloc(slot_idx);
+                if let Ok(n) = self.submit_slot((slot_idx, token), ctx, registry) {
+                    submissions += n;
+                }
+            }
+            Some(submissions)
+        } else {
+            mailbox.waiters.push_front(waiter);
+            None
+        }
+    }
+
+    pub(crate) fn handle_drain_comp(&mut self) {
+        if self.state == UdpPoolState::Draining && self.slots.iter().all(|s| !s.in_flight) {
+            self.state = UdpPoolState::Closed;
+        }
+    }
+
+    pub(crate) fn cleanup_drained(&mut self, ctx: &mut RioContext) -> bool {
+        if self.state == UdpPoolState::Closed {
+            while let Some(slot) = self.slots.pop() {
+                self.free_slot(slot, ctx);
+            }
+            return true;
+        }
+        false
+    }
+}
+
+impl UdpPoolManager {
     fn copy_data_to_recv_op(recv_op: &mut OpUdpRecv<crate::RawHandle>, src: &[u8]) -> usize {
         let start = recv_op.buf_offset.min(recv_op.buf.len());
         let dst_len = recv_op.buf.len().saturating_sub(start);
@@ -365,6 +724,14 @@ impl UdpPoolManager {
                 0,
             ))
         })
+    }
+
+    fn into_op_datagram(datagram: UdpRecvDatagram) -> OpUdpRecvDatagram {
+        let addr = Self::parse_rio_address(&datagram.addr, datagram.addr_len);
+        OpUdpRecvDatagram {
+            buf: datagram.buf,
+            addr,
+        }
     }
 
     fn deliver_to_stream_waiter_raw(
@@ -411,28 +778,6 @@ impl UdpPoolManager {
             Ok(())
         } else {
             Err(buf)
-        }
-    }
-
-    fn deliver_to_stream_waiter(
-        comp: &mut RioCompletionContext<'_>,
-        waiter: UdpWaiter,
-        datagram: &mut Option<UdpRecvDatagram>,
-    ) -> bool {
-        let Some(d) = datagram.take() else {
-            return false;
-        };
-        let addr = Self::parse_rio_address(&d.addr, d.addr_len);
-        match Self::deliver_to_stream_waiter_raw(comp, waiter, d.buf, addr) {
-            Ok(()) => true,
-            Err(buf) => {
-                *datagram = Some(UdpRecvDatagram {
-                    buf,
-                    addr: d.addr,
-                    addr_len: d.addr_len,
-                });
-                false
-            }
         }
     }
 
@@ -485,6 +830,43 @@ impl UdpPoolManager {
         true
     }
 
+    fn get_stream_op_mut<'a>(
+        guard: &'a mut Slot<'_, InFlightWaiting>,
+    ) -> Option<&'a mut UdpRecvStream<crate::RawHandle>> {
+        guard
+            .with_op_mut(|iocp_op| {
+                if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
+                    // SAFETY: `kernel.user` is a live `NonNull` while the op is in-flight.
+                    Some(unsafe { kernel.user.as_mut() })
+                } else {
+                    None
+                }
+            })
+            .flatten()
+    }
+
+    fn deliver_to_stream_waiter(
+        comp: &mut RioCompletionContext<'_>,
+        waiter: UdpWaiter,
+        datagram: &mut Option<UdpRecvDatagram>,
+    ) -> bool {
+        let Some(d) = datagram.take() else {
+            return false;
+        };
+        let addr = Self::parse_rio_address(&d.addr, d.addr_len);
+        match Self::deliver_to_stream_waiter_raw(comp, waiter, d.buf, addr) {
+            Ok(()) => true,
+            Err(buf) => {
+                *datagram = Some(UdpRecvDatagram {
+                    buf,
+                    addr: d.addr,
+                    addr_len: d.addr_len,
+                });
+                false
+            }
+        }
+    }
+
     fn deliver_to_recv_waiter(
         comp: &mut RioCompletionContext<'_>,
         waiter: UdpWaiter,
@@ -502,31 +884,10 @@ impl UdpPoolManager {
         }
     }
 
-    fn get_stream_op_mut<'a>(
-        guard: &'a mut Slot<'_, InFlightWaiting>,
-    ) -> Option<&'a mut UdpRecvStream<crate::RawHandle>> {
-        guard
-            .with_op_mut(|iocp_op| {
-                if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
-                    // SAFETY: `kernel.user` is a live `NonNull` while the op is in-flight.
-                    Some(unsafe { kernel.user.as_mut() })
-                } else {
-                    None
-                }
-            })
-            .flatten()
-    }
+    // pub(crate) fn dispatch_waiters(...) is moved to dispatch_waiters_static
 
-    fn into_op_datagram(datagram: UdpRecvDatagram) -> OpUdpRecvDatagram {
-        let addr = Self::parse_rio_address(&datagram.addr, datagram.addr_len);
-        OpUdpRecvDatagram {
-            buf: datagram.buf,
-            addr,
-        }
-    }
-
-    pub(super) fn dispatch_waiters(
-        &mut self,
+    fn dispatch_waiters_static(
+        _pool: &mut UdpRecvPool,
         mailbox: &mut UdpMailbox,
         comp: &mut RioCompletionContext<'_>,
     ) {
@@ -556,326 +917,5 @@ impl UdpPoolManager {
                 }
             }
         }
-    }
-
-    fn maybe_prime_waiter_credit(
-        &mut self,
-        mailbox: &UdpMailbox,
-        preferred_capacity: usize,
-        ctx: &mut RioContext,
-    ) -> io::Result<()> {
-        let Some(pool) = self.pool.as_mut() else {
-            return Ok(());
-        };
-        if !matches!(pool.state, UdpPoolState::Running) {
-            return Ok(());
-        }
-        if mailbox.waiters.is_empty() || !mailbox.queue.is_empty() {
-            return Ok(());
-        }
-        if !pool.spare_bufs.is_empty() || !pool.slots.is_empty() {
-            return Ok(());
-        }
-        let Some(cap) = std::num::NonZeroUsize::new(preferred_capacity.max(1)) else {
-            return Ok(());
-        };
-        let buf = FixedBuf::alloc_heap(cap)?;
-        pool.spare_bufs.push_back(buf);
-        let _ = self.rebalance_udp_pool(mailbox, ctx)?;
-        Ok(())
-    }
-
-    pub(crate) fn try_submit_pool_recv(
-        &mut self,
-        mailbox: &mut UdpMailbox,
-        stream_op: &mut UdpRecvStream<crate::RawHandle>,
-        uid: (usize, u32),
-        ctx: &mut RioContext,
-    ) -> io::Result<(SubmissionResult, usize)> {
-        let mut total_submissions = self.ensure_pool(ctx)?;
-        {
-            let pool = self
-                .pool
-                .as_mut()
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
-
-            if !matches!(pool.state, UdpPoolState::Running) {
-                return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
-            }
-
-            if let Some(datagram) = mailbox.queue.pop_front() {
-                stream_op.result = Some(Self::into_op_datagram(datagram));
-                total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
-                return Ok((SubmissionResult::PostToQueue, total_submissions));
-            }
-
-            mailbox.waiters.push_back(UdpWaiter {
-                user_data: uid.0,
-                generation: uid.1,
-                kind: UdpWaiterKind::Stream,
-            });
-        }
-        let preferred_capacity = stream_op
-            .buf
-            .as_ref()
-            .map(FixedBuf::capacity)
-            .unwrap_or(2048);
-        self.maybe_prime_waiter_credit(mailbox, preferred_capacity, ctx)?;
-        total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
-        Ok((SubmissionResult::Pending, total_submissions))
-    }
-
-    pub(crate) fn try_submit_pool_recv_recv(
-        &mut self,
-        mailbox: &mut UdpMailbox,
-        recv_op: &mut OpUdpRecv<crate::RawHandle>,
-        uid: (usize, u32),
-        ctx: &mut RioContext,
-    ) -> io::Result<(SubmissionResult, usize, Option<usize>)> {
-        let mut total_submissions = self.ensure_pool(ctx)?;
-        {
-            let pool = self
-                .pool
-                .as_mut()
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "UDP recv pool missing"))?;
-
-            if !matches!(pool.state, UdpPoolState::Running) {
-                return Err(io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32));
-            }
-
-            if let Some(datagram) = mailbox.queue.pop_front() {
-                let copied = Self::copy_data_to_recv_op(recv_op, datagram.buf.as_slice());
-                total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
-                return Ok((
-                    SubmissionResult::PostToQueue,
-                    total_submissions,
-                    Some(copied),
-                ));
-            }
-
-            mailbox.waiters.push_back(UdpWaiter {
-                user_data: uid.0,
-                generation: uid.1,
-                kind: UdpWaiterKind::Recv,
-            });
-        }
-        self.maybe_prime_waiter_credit(mailbox, recv_op.buf.capacity(), ctx)?;
-        total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
-        Ok((SubmissionResult::Pending, total_submissions, None))
-    }
-
-    pub(crate) fn try_refill_pool(
-        &mut self,
-        mailbox: &UdpMailbox,
-        buf: FixedBuf,
-        ctx: &mut RioContext,
-    ) -> io::Result<usize> {
-        let mut total_submissions = self.ensure_pool(ctx)?;
-        let Some(pool) = self.pool.as_mut() else {
-            return Ok(total_submissions);
-        };
-
-        pool.spare_bufs.push_back(buf);
-        total_submissions += self.rebalance_udp_pool(mailbox, ctx)?;
-        Ok(total_submissions)
-    }
-
-    pub(crate) fn cancel_waiter(
-        &mut self,
-        mailbox: &mut UdpMailbox,
-        uid: (usize, u32),
-        ctx: &mut RioContext,
-    ) {
-        let (user_data, generation) = uid;
-        mailbox
-            .waiters
-            .retain(|w| !(w.user_data == user_data && w.generation == generation));
-        let _ = self.rebalance_udp_pool(mailbox, ctx);
-    }
-
-    pub(crate) fn ack_pool_done(&mut self, completion_generation: u32) -> Option<usize> {
-        self.udp_ctx_map.remove(&completion_generation)
-    }
-
-    fn try_fast_deliver(
-        &mut self,
-        mailbox: &mut UdpMailbox,
-        waiter: UdpWaiter,
-        slot_idx: usize,
-        res: &RIORESULT,
-        comp: &mut RioCompletionContext<'_>,
-        ctx: &mut RioContext,
-    ) -> Option<usize> {
-        let (delivered, resubmit) = {
-            let pool = self.pool.as_mut()?;
-            let slot = pool.slots.get_mut(slot_idx)?;
-            let mut delivered = false;
-
-            match waiter.kind {
-                UdpWaiterKind::Recv => {
-                    let data = &slot.buf.as_slice()[..res.BytesTransferred as usize];
-                    if Self::deliver_to_recv_waiter_raw(comp, waiter, data) {
-                        slot.in_flight = false;
-                        delivered = true;
-                    }
-                }
-                UdpWaiterKind::Stream => {
-                    let replacement_buf = pool.spare_bufs.pop_front().or_else(|| {
-                        std::num::NonZeroUsize::new(slot.buf.capacity())
-                            .and_then(|cap| FixedBuf::alloc_heap(cap).ok())
-                    });
-                    if let Some(new_buf) = replacement_buf {
-                        let mut old_buf = std::mem::replace(&mut slot.buf, new_buf);
-                        old_buf.set_len(res.BytesTransferred as usize);
-                        let addr = Self::parse_rio_address(
-                            &slot.addr,
-                            std::mem::size_of::<SockAddrStorage>() as i32,
-                        );
-                        match Self::deliver_to_stream_waiter_raw(comp, waiter, old_buf, addr) {
-                            Ok(()) => {
-                                slot.in_flight = false;
-                                delivered = true;
-                            }
-                            Err(returned_buf) => {
-                                mailbox.queue.push_back(UdpRecvDatagram {
-                                    buf: returned_buf,
-                                    addr: *slot.addr,
-                                    addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
-                                });
-                                slot.in_flight = false;
-                                delivered = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if delivered {
-                let resubmit = !slot.stop_requested && slot_idx < pool.target_credits;
-                slot.stop_requested = false;
-                (true, resubmit)
-            } else {
-                (false, false)
-            }
-        };
-
-        if delivered {
-            let mut submissions = 0;
-            if resubmit {
-                let token = self.alloc_udp_ctx_token(slot_idx);
-                if let Ok(n) = self.submit_pool_slot((slot_idx, token), ctx) {
-                    submissions += n;
-                }
-            }
-            Some(submissions)
-        } else {
-            mailbox.waiters.push_front(waiter);
-            None
-        }
-    }
-
-    pub(crate) fn handle_completion(
-        &mut self,
-        mailbox: &mut UdpMailbox,
-        completion: (usize, &RIORESULT),
-        comp: &mut RioCompletionContext<'_>,
-        ctx: &mut RioContext,
-    ) -> usize {
-        let (slot_idx, res) = completion;
-
-        if res.Status == 0 && res.BytesTransferred > 0 {
-            if let Some(waiter) = mailbox.waiters.pop_front() {
-                if let Some(n) = self.try_fast_deliver(mailbox, waiter, slot_idx, res, comp, ctx) {
-                    return n;
-                }
-            }
-        }
-
-        let pool = match self.pool.as_mut() {
-            Some(p) => p,
-            None => return 0,
-        };
-        let event = pool.update_state(mailbox, slot_idx, res);
-
-        let mut submissions = 0;
-        let actions = UdpRecvPool::plan_actions(event, slot_idx);
-
-        if let Some(idx) = actions.resubmit_slot {
-            let token = self.alloc_udp_ctx_token(idx);
-            if let Ok(n) = self.submit_pool_slot((idx, token), ctx) {
-                submissions += n;
-            }
-        }
-        if actions.dispatch_waiters {
-            self.dispatch_waiters(mailbox, comp);
-        }
-        if actions.rebalance_pool {
-            self.trim_pool_tail(ctx);
-            if let Ok(n) = self.rebalance_udp_pool(mailbox, ctx) {
-                submissions += n;
-            }
-        }
-        submissions
-    }
-
-    pub(crate) fn handle_drain_comp(&mut self) {
-        // Pure side effect to satisfy RIO requirements
-    }
-
-    pub(crate) fn shutdown_pool(&mut self, mailbox: &mut UdpMailbox) {
-        if let Some(pool) = self.pool.as_mut() {
-            Self::begin_draining(pool);
-        }
-        mailbox.queue.clear();
-        mailbox.waiters.clear();
-    }
-
-    pub(crate) fn cleanup_drained_pool(&mut self, ctx: &mut RioContext) -> bool {
-        let drained = self.pool.as_ref().is_some_and(|pool| {
-            !matches!(pool.state, UdpPoolState::Running)
-                && pool.slots.iter().all(|slot| !slot.in_flight)
-        });
-        if !drained {
-            return false;
-        }
-
-        if let Some(pool) = self.pool.as_mut() {
-            pool.state = UdpPoolState::Closed;
-        }
-        if let Some(pool) = self.pool.take() {
-            for slot in pool.slots {
-                self.free_slot(slot, ctx);
-            }
-        }
-        self.udp_ctx_map.clear();
-        true
-    }
-
-    pub(crate) fn forget_and_cleanup(&mut self, mailbox: &mut UdpMailbox, ctx: &mut RioContext) {
-        if let Some(pool) = self.pool.take() {
-            for slot in pool.slots {
-                if slot.in_flight {
-                    std::mem::forget(slot);
-                    continue;
-                }
-                self.free_slot(slot, ctx);
-            }
-        }
-        self.udp_ctx_map.clear();
-        mailbox.queue.clear();
-        mailbox.waiters.clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn udp_pool_debug_stats(
-        &self,
-        mailbox: &UdpMailbox,
-    ) -> Option<super::UdpRecvPoolDebugStats> {
-        self.pool.as_ref().map(|pool| super::UdpRecvPoolDebugStats {
-            min_credits: pool.min_credits,
-            max_credits: pool.max_credits,
-            target_credits: pool.target_credits,
-            waiters_len: mailbox.waiters.len(),
-        })
     }
 }

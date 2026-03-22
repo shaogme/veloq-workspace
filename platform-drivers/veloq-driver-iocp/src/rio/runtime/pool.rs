@@ -1,7 +1,7 @@
 //! UDP receive-pool implementation for RIO.
 //!
 //! This module provides a pool of pre-registered buffers for efficient UDP reception.
-//! The core datapath logic is located in the `datapath` submodule.
+//! The core datapath logic is located in the `datapath submodule.
 
 pub(crate) mod datapath;
 
@@ -73,6 +73,7 @@ pub(crate) struct UdpRecvPool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UdpPoolState {
+    Uninitialized,
     Running,
     Draining,
     Closed,
@@ -94,6 +95,18 @@ pub(super) struct CompletionActions {
 }
 
 impl UdpRecvPool {
+    pub(crate) fn uninit() -> Self {
+        Self {
+            slots: Vec::new(),
+            spare_bufs: VecDeque::new(),
+            min_credits: 0,
+            max_credits: 0,
+            target_credits: 0,
+            idle_hits: 0,
+            state: UdpPoolState::Uninitialized,
+        }
+    }
+
     pub(super) fn update_state(
         &mut self,
         mailbox: &mut UdpMailbox,

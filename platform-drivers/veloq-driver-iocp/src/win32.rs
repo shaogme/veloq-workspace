@@ -5,8 +5,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, connect, getpeername, getsockname,
-    listen, setsockopt,
+    INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, connect, getpeername, getsockname, listen,
+    setsockopt,
 };
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,

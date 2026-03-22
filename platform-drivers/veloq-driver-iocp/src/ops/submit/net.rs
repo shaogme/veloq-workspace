@@ -13,8 +13,8 @@ use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
 use crate::ops::submit::common::{
     AcceptExArgs, ConnectExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex,
-    iocp_submit_connect_ex, iocp_submit_read, iocp_submit_socket_recv, iocp_submit_socket_send,
-    iocp_submit_write, resolve_fd, unpack_kernel_ref,
+    iocp_submit_connect_ex, iocp_submit_socket_recv, iocp_submit_socket_send, resolve_fd,
+    unpack_kernel_ref,
 };
 use crate::ops::{
     AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv, SendToPayload, SubmitContext,
@@ -61,23 +61,6 @@ pub(crate) fn submit_recv(
 
     match rio_res {
         Ok(res) => Ok(res),
-        Err(_) if ctx.rio.registration_mode == crate::BufferRegistrationMode::Compatible => {
-            // Fallback to standard IOCP for socket recv.
-            ensure_iocp_association(
-                handle,
-                ctx.port,
-                format!("RIO fallback recv association failed: fd={:?}", val.fd),
-            )?;
-            // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
-            unsafe {
-                iocp_submit_read(
-                    handle,
-                    val.buf.as_mut_ptr().add(val.buf_offset),
-                    (val.buf.len().saturating_sub(val.buf_offset)) as u32,
-                    ctx.overlapped,
-                )
-            }
-        }
         Err(e) => Err(io_error(
             IocpErrorContext::Submission,
             e,
@@ -170,23 +153,6 @@ pub(crate) fn submit_send(
 
     match rio_res {
         Ok(res) => Ok(res),
-        Err(_) if ctx.rio.registration_mode == crate::BufferRegistrationMode::Compatible => {
-            // Fallback to standard IOCP for socket send.
-            ensure_iocp_association(
-                handle,
-                ctx.port,
-                format!("RIO fallback send association failed: fd={:?}", val.fd),
-            )?;
-            // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
-            unsafe {
-                iocp_submit_write(
-                    handle,
-                    val.buf.as_ptr().add(val.buf_offset),
-                    (val.buf.len().saturating_sub(val.buf_offset)) as u32,
-                    ctx.overlapped,
-                )
-            }
-        }
         Err(e) => Err(io_error(
             IocpErrorContext::Submission,
             e,
@@ -225,10 +191,12 @@ pub(crate) fn submit_udp_send(
 
     match rio_res {
         Ok(res) => Ok(res),
-        Err(e) if {
-            ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
-            ctx.rio.is_udp_iocp_fallback(handle)
-        } => {
+        Err(e)
+            if {
+                ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
+                ctx.rio.is_udp_iocp_fallback(handle)
+            } =>
+        {
             ensure_iocp_association(
                 handle,
                 ctx.port,
@@ -572,7 +540,10 @@ pub(crate) fn submit_udp_recv_stream(
                 ensure_iocp_association(
                     handle,
                     ctx.port,
-                    format!("UDP recv_stream fallback association failed: fd={:?}", val.fd),
+                    format!(
+                        "UDP recv_stream fallback association failed: fd={:?}",
+                        val.fd
+                    ),
                 )?;
                 let buf = val
                     .buf
@@ -622,7 +593,8 @@ pub(crate) unsafe fn on_udp_stream_complete(
 ) -> io::Result<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let val = unsafe { payload.user.as_mut() };
-    if val.result.is_none() && val.addr.is_none()
+    if val.result.is_none()
+        && val.addr.is_none()
         && let Some(raw) = val.fd.raw()
     {
         let mut storage = SockAddrStorage::default();
@@ -661,12 +633,14 @@ pub(crate) fn submit_udp_refill(
         let _ = val.buf.take();
         return Ok(SubmissionResult::PostToQueue);
     }
-    if let Some(buf) = val.buf.take() {
-        if let Err(e) = ctx.rio.try_refill_udp_pool((val.fd, handle), buf, ctx.registrar) {
-            ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
-            if !ctx.rio.is_udp_iocp_fallback(handle) {
-                return Err(e);
-            }
+    if let Some(buf) = val.buf.take()
+        && let Err(e) = ctx
+            .rio
+            .try_refill_udp_pool((val.fd, handle), buf, ctx.registrar)
+    {
+        ctx.rio.maybe_mark_udp_iocp_fallback(handle, &e);
+        if !ctx.rio.is_udp_iocp_fallback(handle) {
+            return Err(e);
         }
     }
 
