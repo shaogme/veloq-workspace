@@ -1343,6 +1343,7 @@ dependencies = [
  "crossbeam-utils",
  "error-stack",
  "rustc-hash",
+ "slotmap",
  "tracing",
  "veloq-bitset",
  "veloq-blocking",

@@ -89,6 +89,7 @@ loom = "0.7.2"
 criterion = { version = "0.8", features = ["async_tokio"] }
 
 tokio = { version = "1", features = ["full"] }
+slotmap = "1.1.1"
 
 [workspace.lints.rust]
 warnings = "deny"

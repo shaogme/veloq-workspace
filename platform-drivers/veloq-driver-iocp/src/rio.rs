@@ -16,6 +16,7 @@ use crate::BufferRegistrationMode;
 use crate::IocpOpState;
 use crate::ops::IocpOp;
 use rustc_hash::{FxHashMap, FxHashSet};
+use slotmap::{SlotMap, new_key_type};
 use veloq_driver_core::driver::{SharedCompletionQueue, SharedCompletionTable};
 use veloq_driver_core::op_registry::OpRegistry;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -28,6 +29,10 @@ pub(crate) use self::runtime::RioSendToArgs;
 pub(crate) use self::runtime::RioTarget;
 pub(crate) use self::runtime::RioUdpRecvArgs;
 pub(crate) use self::runtime::RioUdpStreamArgs;
+
+new_key_type! {
+    pub(crate) struct ActorKey;
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioEnv<'a> {
@@ -54,9 +59,10 @@ pub(crate) struct RioState {
     pub(crate) kernel: RioKernel,
     pub(crate) registry: RioRegistry,
     pub(crate) registration_mode: BufferRegistrationMode,
-    pub(crate) active_actors: FxHashMap<HANDLE, RioSocketActor>,
-    pub(crate) draining_actors: FxHashMap<u32, RioSocketActor>,
-    pub(crate) actor_routes: FxHashMap<u32, HANDLE>,
+    pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
+    pub(crate) actor_by_handle: FxHashMap<HANDLE, ActorKey>,
+    pub(crate) actor_id_index: Vec<Option<ActorKey>>,
+    pub(crate) free_actor_ids: Vec<u32>,
     pub(crate) udp_iocp_fallback_handles: FxHashSet<HANDLE>,
     pub(crate) next_actor_id: u32,
     pub(crate) outstanding_count: usize,

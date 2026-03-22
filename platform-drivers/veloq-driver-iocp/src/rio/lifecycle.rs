@@ -1,10 +1,12 @@
 //! Shutdown and deferred cleanup orchestration for `RioState`.
 
+use crate::rio::ActorKey;
 use crate::rio::RioState;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
 use crate::rio::runtime::control_flow::RioSocketActor;
 use rustc_hash::{FxHashMap, FxHashSet};
+use slotmap::SlotMap;
 use std::io;
 use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -16,9 +18,10 @@ pub(crate) struct DeferredRioCleanup {
     kernel: RioKernel,
     registry: RioRegistry,
     registration_mode: crate::BufferRegistrationMode,
-    active_actors: FxHashMap<HANDLE, RioSocketActor>,
-    draining_actors: FxHashMap<u32, RioSocketActor>,
-    actor_routes: FxHashMap<u32, HANDLE>,
+    actors: SlotMap<ActorKey, RioSocketActor>,
+    actor_by_handle: FxHashMap<HANDLE, ActorKey>,
+    actor_id_index: Vec<Option<ActorKey>>,
+    free_actor_ids: Vec<u32>,
     udp_iocp_fallback_handles: FxHashSet<HANDLE>,
     outstanding_count: usize,
 }
@@ -32,9 +35,10 @@ impl DeferredRioCleanup {
             kernel: self.kernel,
             registry: self.registry,
             registration_mode: self.registration_mode,
-            active_actors: self.active_actors,
-            draining_actors: self.draining_actors,
-            actor_routes: self.actor_routes,
+            actors: self.actors,
+            actor_by_handle: self.actor_by_handle,
+            actor_id_index: self.actor_id_index,
+            free_actor_ids: self.free_actor_ids,
             udp_iocp_fallback_handles: self.udp_iocp_fallback_handles,
             next_actor_id: 1,
             outstanding_count: self.outstanding_count,
@@ -145,9 +149,10 @@ impl RioState {
             kernel,
             registry,
             registration_mode: self.registration_mode,
-            active_actors: std::mem::take(&mut self.active_actors),
-            draining_actors: std::mem::take(&mut self.draining_actors),
-            actor_routes: std::mem::take(&mut self.actor_routes),
+            actors: std::mem::take(&mut self.actors),
+            actor_by_handle: std::mem::take(&mut self.actor_by_handle),
+            actor_id_index: std::mem::take(&mut self.actor_id_index),
+            free_actor_ids: std::mem::take(&mut self.free_actor_ids),
             udp_iocp_fallback_handles: std::mem::take(&mut self.udp_iocp_fallback_handles),
             outstanding_count: std::mem::take(&mut self.outstanding_count),
         })

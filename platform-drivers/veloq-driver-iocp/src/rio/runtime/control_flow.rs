@@ -11,8 +11,8 @@ use crate::rio::core::submit_ops::RioRq;
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager};
-use crate::rio::{RioCompletionContext, RioContext, RioEnv, RioState};
-use rustc_hash::FxHashMap;
+use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState};
+use slotmap::SlotMap;
 use std::io;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
@@ -22,12 +22,19 @@ use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RioActorState {
+    Active,
+    Draining,
+}
+
 pub(crate) struct RioSocketActor {
     pub(crate) actor_id: u32,
     pub(crate) handle: HANDLE,
     pub(crate) rq: RioRq,
     pub(crate) pool_manager: UdpPoolManager,
     pub(crate) udp_mailbox: UdpMailbox,
+    pub(crate) state: RioActorState,
 }
 
 impl RioSocketActor {
@@ -38,14 +45,16 @@ impl RioSocketActor {
             rq,
             pool_manager: UdpPoolManager::new(),
             udp_mailbox: UdpMailbox::new(),
+            state: RioActorState::Active,
         }
     }
 }
 
 struct RioCompletionRouter<'a> {
-    active_actors: &'a mut FxHashMap<HANDLE, RioSocketActor>,
-    draining_actors: &'a mut FxHashMap<u32, RioSocketActor>,
-    actor_routes: &'a mut FxHashMap<u32, HANDLE>,
+    actors: &'a mut SlotMap<ActorKey, RioSocketActor>,
+    actor_by_handle: &'a mut rustc_hash::FxHashMap<HANDLE, ActorKey>,
+    actor_id_index: &'a mut Vec<Option<ActorKey>>,
+    free_actor_ids: &'a mut Vec<u32>,
     outstanding_count: &'a mut usize,
     comp: RioCompletionContext<'a>,
     registry: &'a mut RioRegistry,
@@ -53,23 +62,26 @@ struct RioCompletionRouter<'a> {
     completed_count: usize,
 }
 
+struct ActorStoreRefs<'a> {
+    actors: &'a mut SlotMap<ActorKey, RioSocketActor>,
+    actor_by_handle: &'a mut rustc_hash::FxHashMap<HANDLE, ActorKey>,
+    actor_id_index: &'a mut Vec<Option<ActorKey>>,
+    free_actor_ids: &'a mut Vec<u32>,
+}
+
 impl<'a> RioCompletionRouter<'a> {
     fn new(
-        actors: (
-            &'a mut FxHashMap<HANDLE, RioSocketActor>,
-            &'a mut FxHashMap<u32, RioSocketActor>,
-        ),
-        router_ctx: (&'a mut FxHashMap<u32, HANDLE>, &'a mut usize),
+        actor_store: ActorStoreRefs<'a>,
+        outstanding_count: &'a mut usize,
         comp: RioCompletionContext<'a>,
         env: (&'a mut RioRegistry, RioEnv<'a>),
     ) -> Self {
-        let (active_actors, draining_actors) = actors;
-        let (actor_routes, outstanding_count) = router_ctx;
         let (registry, env) = env;
         Self {
-            active_actors,
-            draining_actors,
-            actor_routes,
+            actors: actor_store.actors,
+            actor_by_handle: actor_store.actor_by_handle,
+            actor_id_index: actor_store.actor_id_index,
+            free_actor_ids: actor_store.free_actor_ids,
             outstanding_count,
             comp,
             registry,
@@ -78,39 +90,39 @@ impl<'a> RioCompletionRouter<'a> {
         }
     }
 
-    fn resolve_actor_location(&self, actor_id: u32) -> Option<(Option<HANDLE>, bool)> {
-        if let Some(&handle) = self.actor_routes.get(&actor_id)
-            && self
-                .active_actors
-                .get(&handle)
-                .is_some_and(|actor| actor.actor_id == actor_id)
-        {
-            return Some((Some(handle), true));
+    fn actor_key_for_id(&self, actor_id: u32) -> Option<ActorKey> {
+        self.actor_id_index
+            .get(actor_id as usize)
+            .and_then(|entry| *entry)
+    }
+
+    fn unregister_actor_id(&mut self, actor_id: u32, key: ActorKey) {
+        let Some(entry) = self.actor_id_index.get_mut(actor_id as usize) else {
+            return;
+        };
+        if entry.is_some_and(|stored| stored == key) {
+            *entry = None;
+            self.free_actor_ids.push(actor_id);
         }
-        if self.draining_actors.contains_key(&actor_id) {
-            return Some((None, false));
+    }
+
+    fn remove_actor_by_key(&mut self, key: ActorKey) {
+        let Some(actor) = self.actors.remove(key) else {
+            return;
+        };
+        if self.actor_by_handle.get(&actor.handle).copied() == Some(key) {
+            self.actor_by_handle.remove(&actor.handle);
         }
-        None
+        self.unregister_actor_id(actor.actor_id, key);
     }
 
     fn on_pool_completion(&mut self, actor_id: u32, generation: u32, res: &RIORESULT) {
-        let Some((active_handle, is_active)) = self.resolve_actor_location(actor_id) else {
+        let Some(key) = self.actor_key_for_id(actor_id) else {
             return;
         };
         let (pool_submissions, remove_actor) = {
-            let actor = if is_active {
-                let Some(handle) = active_handle else {
-                    return;
-                };
-                let Some(actor) = self.active_actors.get_mut(&handle) else {
-                    return;
-                };
-                actor
-            } else {
-                let Some(actor) = self.draining_actors.get_mut(&actor_id) else {
-                    return;
-                };
-                actor
+            let Some(actor) = self.actors.get_mut(key) else {
+                return;
             };
             let Some(slot_idx) = actor.pool_manager.ack_pool_done(generation) else {
                 return;
@@ -132,14 +144,7 @@ impl<'a> RioCompletionRouter<'a> {
             (submissions, remove)
         };
         if remove_actor {
-            if is_active {
-                if let Some(handle) = active_handle {
-                    self.active_actors.remove(&handle);
-                }
-                self.actor_routes.remove(&actor_id);
-            } else {
-                self.draining_actors.remove(&actor_id);
-            }
+            self.remove_actor_by_key(key);
         }
         *self.outstanding_count -= 1;
         *self.outstanding_count += pool_submissions;
@@ -237,14 +242,46 @@ impl RioState {
         }
     }
 
+    fn actor_key_from_id(&self, actor_id: u32) -> Option<ActorKey> {
+        self.actor_id_index
+            .get(actor_id as usize)
+            .and_then(|entry| *entry)
+    }
+
+    fn unregister_actor_id(&mut self, actor_id: u32, key: ActorKey) {
+        let Some(entry) = self.actor_id_index.get_mut(actor_id as usize) else {
+            return;
+        };
+        if entry.is_some_and(|stored| stored == key) {
+            *entry = None;
+            self.free_actor_ids.push(actor_id);
+        }
+    }
+
+    fn remove_actor_by_key(&mut self, key: ActorKey) -> Option<RioSocketActor> {
+        let actor = self.actors.remove(key)?;
+        if self.actor_by_handle.get(&actor.handle).copied() == Some(key) {
+            self.actor_by_handle.remove(&actor.handle);
+        }
+        self.unregister_actor_id(actor.actor_id, key);
+        Some(actor)
+    }
+
     pub(crate) fn alloc_actor_id(&mut self) -> u32 {
+        if let Some(id) = self.free_actor_ids.pop() {
+            return id;
+        }
+
         loop {
             let id = self.next_actor_id;
             self.next_actor_id = self.next_actor_id.wrapping_add(1);
             if id == 0 {
                 continue;
             }
-            if !self.actor_routes.contains_key(&id) && !self.draining_actors.contains_key(&id) {
+            if id as usize >= self.actor_id_index.len() {
+                self.actor_id_index.resize(id as usize + 1, None);
+            }
+            if self.actor_id_index[id as usize].is_none() {
                 return id;
             }
         }
@@ -256,49 +293,65 @@ impl RioState {
         env: RioEnv<'_>,
     ) -> io::Result<&mut RioSocketActor> {
         let (fd, handle) = target;
-        if !self.active_actors.contains_key(&handle) {
-            let rq = self.registry.create_rq((handle, fd), env)?;
-            let actor_id = self.alloc_actor_id();
-            self.actor_routes.insert(actor_id, handle);
-            self.active_actors
-                .insert(handle, RioSocketActor::new(actor_id, handle, rq));
+        if let Some(key) = self.actor_by_handle.get(&handle).copied() {
+            return self
+                .actors
+                .get_mut(key)
+                .ok_or_else(|| io::Error::other("failed to retrieve indexed actor"));
         }
-        self.active_actors
-            .get_mut(&handle)
+
+        let rq = self.registry.create_rq((handle, fd), env)?;
+        let actor_id = self.alloc_actor_id();
+        let key = self
+            .actors
+            .insert(RioSocketActor::new(actor_id, handle, rq));
+        self.actor_by_handle.insert(handle, key);
+        if actor_id as usize >= self.actor_id_index.len() {
+            self.actor_id_index.resize(actor_id as usize + 1, None);
+        }
+        self.actor_id_index[actor_id as usize] = Some(key);
+        self.actors
+            .get_mut(key)
             .ok_or_else(|| io::Error::other("failed to retrieve inserted actor"))
     }
 
     pub(crate) fn shutdown_udp_pool(&mut self, handle: HANDLE) {
         self.udp_iocp_fallback_handles.remove(&handle);
+        let Some(key) = self.actor_by_handle.get(&handle).copied() else {
+            return;
+        };
         let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)
         else {
-            if let Some(actor) = self.active_actors.remove(&handle) {
-                self.actor_routes.remove(&actor.actor_id);
-            }
+            let _ = self.remove_actor_by_key(key);
             return;
         };
-        if let Some(mut actor) = self.active_actors.remove(&handle) {
-            self.actor_routes.remove(&actor.actor_id);
+
+        let should_remove = {
+            let Some(actor) = self.actors.get_mut(key) else {
+                return;
+            };
+            actor.state = RioActorState::Draining;
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
             pool_manager.shutdown_pool(udp_mailbox);
-            if !pool_manager.cleanup_drained_pool(&mut ctx) {
-                self.draining_actors.insert(actor.actor_id, actor);
-            }
+            pool_manager.cleanup_drained_pool(&mut ctx)
+        };
+
+        self.actor_by_handle.remove(&handle);
+        if should_remove {
+            let _ = self.remove_actor_by_key(key);
         }
     }
 
     pub(crate) fn begin_shutdown(&mut self) {
-        for actor in self.active_actors.values_mut() {
+        for actor in self.actors.values_mut() {
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
             pool_manager.shutdown_pool(udp_mailbox);
+            actor.state = RioActorState::Draining;
         }
-        for actor in self.draining_actors.values_mut() {
-            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-            pool_manager.shutdown_pool(udp_mailbox);
-        }
+        self.actor_by_handle.clear();
     }
 
     pub(crate) fn cancel_udp_waiter(
@@ -310,15 +363,18 @@ impl RioState {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             return;
         };
-        if let Some(actor) = self.active_actors.get_mut(&handle) {
+        if let Some(key) = self.actor_by_handle.get(&handle).copied()
+            && let Some(actor) = self.actors.get_mut(key)
+        {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
             pool_manager.cancel_waiter(udp_mailbox, uid, &mut ctx);
         }
+
         for actor in self
-            .draining_actors
+            .actors
             .values_mut()
-            .filter(|actor| actor.handle == handle)
+            .filter(|actor| actor.state == RioActorState::Draining && actor.handle == handle)
         {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
@@ -328,13 +384,14 @@ impl RioState {
 
     #[cfg(test)]
     pub(crate) fn udp_pool_debug_stats(&self, handle: HANDLE) -> Option<UdpRecvPoolDebugStats> {
-        self.active_actors
+        self.actor_by_handle
             .get(&handle)
+            .and_then(|&key| self.actors.get(key))
             .and_then(|actor| actor.pool_manager.udp_pool_debug_stats(&actor.udp_mailbox))
             .or_else(|| {
-                self.draining_actors
+                self.actors
                     .values()
-                    .find(|actor| actor.handle == handle)
+                    .find(|actor| actor.state == RioActorState::Draining && actor.handle == handle)
                     .and_then(|actor| actor.pool_manager.udp_pool_debug_stats(&actor.udp_mailbox))
             })
     }
@@ -349,7 +406,9 @@ impl RioState {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             return Ok(());
         };
-        if let Some(actor) = self.active_actors.get_mut(&handle) {
+        if let Some(key) = self.actor_by_handle.get(&handle).copied()
+            && let Some(actor) = self.actors.get_mut(key)
+        {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &actor.udp_mailbox);
             for _ in 0..ticks {
@@ -360,122 +419,65 @@ impl RioState {
     }
 
     pub(crate) fn forget_udp_contexts(&mut self) {
-        for actor in self.active_actors.values_mut() {
-            actor.pool_manager.registry.map.clear();
-        }
-        for actor in self.draining_actors.values_mut() {
+        for actor in self.actors.values_mut() {
             actor.pool_manager.registry.map.clear();
         }
     }
 
     pub(crate) fn shutdown_rio_actors(&mut self, registrar: &dyn veloq_buf::BufferRegistrar) {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
-            self.active_actors.clear();
-            self.draining_actors.clear();
-            self.actor_routes.clear();
+            self.actors.clear();
+            self.actor_by_handle.clear();
+            self.actor_id_index.clear();
+            self.actor_id_index.push(None);
+            self.free_actor_ids.clear();
             self.udp_iocp_fallback_handles.clear();
             return;
         };
-        for actor in self.active_actors.values_mut() {
+        for actor in self.actors.values_mut() {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
             pool_manager.forget_and_cleanup(udp_mailbox, &mut ctx);
         }
-        for actor in self.draining_actors.values_mut() {
-            let mut ctx = Self::build_ctx(&mut self.registry, env, (actor.actor_id, actor.rq));
-            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-            pool_manager.forget_and_cleanup(udp_mailbox, &mut ctx);
-        }
-        self.active_actors.clear();
-        self.draining_actors.clear();
-        self.actor_routes.clear();
+        self.actors.clear();
+        self.actor_by_handle.clear();
+        self.actor_id_index.clear();
+        self.actor_id_index.push(None);
+        self.free_actor_ids.clear();
         self.udp_iocp_fallback_handles.clear();
     }
 
     pub(crate) fn mark_pool_done(&mut self, actor_id: u32, completion_generation: u32) -> bool {
-        enum ActorKind {
-            Active(HANDLE),
-            Draining,
-        }
-        let kind = if let Some(handle) = self.actor_routes.get(&actor_id).copied() {
-            if self
-                .active_actors
-                .get(&handle)
-                .is_some_and(|actor| actor.actor_id == actor_id)
-            {
-                ActorKind::Active(handle)
-            } else if self.draining_actors.contains_key(&actor_id) {
-                ActorKind::Draining
-            } else {
-                return false;
-            }
-        } else if self.draining_actors.contains_key(&actor_id) {
-            ActorKind::Draining
-        } else {
+        let Some(key) = self.actor_key_from_id(actor_id) else {
             return false;
         };
 
         {
-            let actor = match kind {
-                ActorKind::Active(handle) => {
-                    let Some(actor) = self.active_actors.get_mut(&handle) else {
-                        return false;
-                    };
-                    actor
-                }
-                ActorKind::Draining => {
-                    let Some(actor) = self.draining_actors.get_mut(&actor_id) else {
-                        return false;
-                    };
-                    actor
-                }
+            let Some(actor) = self.actors.get_mut(key) else {
+                return false;
             };
             let _ = actor.pool_manager.ack_pool_done(completion_generation);
             actor.pool_manager.handle_drain_comp();
         }
+
         let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)
         else {
-            match kind {
-                ActorKind::Active(handle) => {
-                    self.actor_routes.remove(&actor_id);
-                    self.active_actors.remove(&handle);
-                }
-                ActorKind::Draining => {
-                    self.draining_actors.remove(&actor_id);
-                }
-            }
+            let _ = self.remove_actor_by_key(key);
             return true;
         };
+
         let should_remove = {
-            let actor = match kind {
-                ActorKind::Active(handle) => {
-                    let Some(actor) = self.active_actors.get_mut(&handle) else {
-                        return false;
-                    };
-                    actor
-                }
-                ActorKind::Draining => {
-                    let Some(actor) = self.draining_actors.get_mut(&actor_id) else {
-                        return false;
-                    };
-                    actor
-                }
+            let Some(actor) = self.actors.get_mut(key) else {
+                return false;
             };
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor_id, actor.rq));
             actor.pool_manager.cleanup_drained_pool(&mut ctx)
         };
+
         if should_remove {
-            match kind {
-                ActorKind::Active(handle) => {
-                    self.actor_routes.remove(&actor_id);
-                    self.active_actors.remove(&handle);
-                }
-                ActorKind::Draining => {
-                    self.draining_actors.remove(&actor_id);
-                }
-            }
+            let _ = self.remove_actor_by_key(key);
         }
         true
     }
@@ -494,8 +496,13 @@ impl RioState {
             return Ok(0);
         };
         let mut router = RioCompletionRouter::new(
-            (&mut self.active_actors, &mut self.draining_actors),
-            (&mut self.actor_routes, &mut self.outstanding_count),
+            ActorStoreRefs {
+                actors: &mut self.actors,
+                actor_by_handle: &mut self.actor_by_handle,
+                actor_id_index: &mut self.actor_id_index,
+                free_actor_ids: &mut self.free_actor_ids,
+            },
+            &mut self.outstanding_count,
             RioCompletionContext {
                 ops,
                 events: completion_events,
