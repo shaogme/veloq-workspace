@@ -250,41 +250,48 @@ impl RioState {
                 .attach("failed to retrieve indexed actor");
         }
 
-        let rq = self.registry.create_rq((handle, fd), env).map_err(|e| {
-            let source = e.to_string();
-            let wsa_class = RioDiag::wsa_class_from_text(&source);
-            let diag = RioDiag::new("ensure_actor_create_rq")
-                .field("fd", format!("{fd:?}"))
-                .field("handle", format!("{handle:?}"))
-                .field("socket_raw", format!("0x{:x}", handle as usize))
-                .field("rq_depth", self.registry.rq_depth)
-                .field("max_outstanding_recvs", self.registry.rq_depth)
-                .field("max_outstanding_sends", self.registry.rq_depth)
-                .field("max_receive_data_buffers", 1_u32)
-                .field("max_send_data_buffers", 1_u32)
-                .field("outstanding_count", self.outstanding_count)
-                .field("actors_len", self.actors.len())
-                .field("actor_index_hit", self.actor_by_handle.contains_key(&handle))
-                .field("wsa_class", wsa_class);
-            error!(
-                fd = ?fd,
-                handle = ?handle,
-                socket_raw = handle as usize,
-                rq_depth = self.registry.rq_depth,
-                max_outstanding_recvs = self.registry.rq_depth,
-                max_outstanding_sends = self.registry.rq_depth,
-                max_receive_data_buffers = 1_u32,
-                max_send_data_buffers = 1_u32,
-                outstanding_count = self.outstanding_count,
-                actors_len = self.actors.len(),
-                actor_index_hit = self.actor_by_handle.contains_key(&handle),
-                wsa_class = wsa_class,
-                rio_error = %e,
-                "RIOCreateRequestQueue failed diagnostics"
-            );
-            e.attach(diag.to_string())
-        })?;
-        let key = self.actors.insert(RioSocketActor::new(handle, rq));
+        let rq_res = self.registry.create_rq((handle, fd), env);
+        let (rq, is_fallback) = match rq_res {
+            Ok(rq) => (rq, false),
+            Err(e) if e.has_wsa_error(10055) => {
+                // If RIO resources are exhausted, create a dummy RQ and mark for IOCP fallback.
+                (RioRq(0), true)
+            }
+            Err(e) => {
+                let diag = RioDiag::new("ensure_actor_create_rq")
+                    .field("fd", format!("{fd:?}"))
+                    .field("handle", format!("{handle:?}"))
+                    .field("socket_raw", format!("0x{:x}", handle as usize))
+                    .field("rq_depth", self.registry.rq_depth)
+                    .field("max_outstanding_recvs", self.registry.rq_depth)
+                    .field("max_outstanding_sends", self.registry.rq_depth)
+                    .field("max_receive_data_buffers", 1_u32)
+                    .field("max_send_data_buffers", 1_u32)
+                    .field("outstanding_count", self.outstanding_count)
+                    .field("actors_len", self.actors.len())
+                    .field("actor_index_hit", self.actor_by_handle.contains_key(&handle));
+                error!(
+                    fd = ?fd,
+                    handle = ?handle,
+                    socket_raw = handle as usize,
+                    rq_depth = self.registry.rq_depth,
+                    max_outstanding_recvs = self.registry.rq_depth,
+                    max_outstanding_sends = self.registry.rq_depth,
+                    max_receive_data_buffers = 1_u32,
+                    max_send_data_buffers = 1_u32,
+                    outstanding_count = self.outstanding_count,
+                    actors_len = self.actors.len(),
+                    actor_index_hit = self.actor_by_handle.contains_key(&handle),
+                    rio_error = %e,
+                    "RIOCreateRequestQueue failed diagnostics"
+                );
+                return Err(e).attach(diag);
+            }
+        };
+
+        let mut actor = RioSocketActor::new(handle, rq);
+        actor.is_iocp_fallback = is_fallback;
+        let key = self.actors.insert(actor);
         self.actor_by_handle.insert(handle, key);
         self.actors
             .get_mut(key)

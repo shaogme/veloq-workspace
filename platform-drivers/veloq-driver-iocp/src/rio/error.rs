@@ -1,38 +1,46 @@
 use error_stack::Report;
 use std::fmt;
 
+/// RIO 诊断信息，用于携带结构化的上下文
 #[derive(Debug, Clone)]
 pub struct RioDiag {
-    scope: &'static str,
-    fields: Vec<(&'static str, String)>,
+    pub scope: &'static str,
+    pub error_code: Option<u32>,
+    pub original_message: Option<String>,
+    pub fields: Vec<(&'static str, String)>,
 }
 
 impl RioDiag {
     pub fn new(scope: &'static str) -> Self {
         Self {
             scope,
+            error_code: None,
+            original_message: None,
             fields: Vec::new(),
         }
+    }
+
+    pub fn with_error(mut self, code: u32, msg: impl ToString) -> Self {
+        self.error_code = Some(code);
+        self.original_message = Some(msg.to_string());
+        self
     }
 
     pub fn field(mut self, key: &'static str, value: impl ToString) -> Self {
         self.fields.push((key, value.to_string()));
         self
     }
-
-    #[inline]
-    pub fn wsa_class_from_text(text: &str) -> &'static str {
-        if text.contains("wsa_class=zero_wsa") || text.contains("WSAGetLastError=0") {
-            "zero_wsa"
-        } else {
-            "nonzero_or_unknown_wsa"
-        }
-    }
 }
 
 impl fmt::Display for RioDiag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "rio_diag(scope={}", self.scope)?;
+        if let Some(code) = self.error_code {
+            write!(f, ", error_code={}", code)?;
+        }
+        if let Some(ref msg) = self.original_message {
+            write!(f, ", original_error={}", msg)?;
+        }
         for (k, v) in &self.fields {
             write!(f, ", {}={}", k, v)?;
         }
@@ -41,7 +49,7 @@ impl fmt::Display for RioDiag {
 }
 
 /// RIO 模块特定的错误上下文
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RioError {
     /// RIO 库 or 函数指针加载失败 (如 GetExtensionFunctionPointer 失败)
     LibraryLoad,
@@ -81,18 +89,60 @@ impl std::error::Error for RioError {}
 /// RIO 模块专用的 Result 类型
 pub type RioResult<T> = Result<T, Report<RioError>>;
 
+#[derive(Debug)]
+pub struct RioIoError {
+    pub report: Report<RioError>,
+    pub detail: String,
+}
+
+impl fmt::Display for RioIoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RIO error ({}): {:#}", self.detail, self.report)
+    }
+}
+
+impl std::error::Error for RioIoError {}
+
 /// 提供将 RioResult 转换为外部 io::Error 的扩展能力
 pub trait RioReportExt {
     fn to_io_error(self, detail: impl Into<String>) -> std::io::Error;
+    fn has_wsa_error(&self, code: u32) -> bool;
 }
 
 impl RioReportExt for Report<RioError> {
     fn to_io_error(self, detail: impl Into<String>) -> std::io::Error {
-        use crate::common::{IocpErrorContext, io_error};
+        use crate::common::IocpErrorContext;
         let detail = detail.into();
-        // 保持与 common.rs 的结构化日志兼容
-        let io_err = std::io::Error::other(format!("{self:#}"));
-        io_error(IocpErrorContext::Rio, io_err, detail)
+        
+        // 我们在这里模拟 common::io_error 的逻辑，但保留 RioIoError 类型
+        let os_code = self.frames().find_map(|f| {
+            f.downcast_ref::<RioDiag>().and_then(|d| d.error_code)
+        });
+        
+        tracing::error!(
+            context = %IocpErrorContext::Rio,
+            detail = %detail,
+            os_error = ?os_code,
+            report = ?&self,
+            "RIO error report"
+        );
+        
+        let rio_io_err = RioIoError {
+            report: self,
+            detail: detail.clone(),
+        };
+        
+        std::io::Error::new(std::io::ErrorKind::Other, rio_io_err)
+    }
+
+    fn has_wsa_error(&self, code: u32) -> bool {
+        self.frames().any(|f| {
+            if let Some(diag) = f.downcast_ref::<RioDiag>() {
+                diag.error_code == Some(code)
+            } else {
+                false
+            }
+        })
     }
 }
 

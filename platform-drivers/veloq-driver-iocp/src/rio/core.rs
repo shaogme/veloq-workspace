@@ -5,6 +5,8 @@ pub(crate) mod submit_ops;
 
 use crate::rio::runtime::pool::POOL_CTX_TAG;
 use crate::rio::{ActorKey, RioState};
+use crate::rio::error::{RioError, RioDiag};
+use error_stack::Report;
 use std::io;
 
 #[derive(Clone, Copy)]
@@ -137,14 +139,24 @@ impl RioState {
         debug_assert_eq!(raw & POOL_CTX_TAG, 0);
         (raw | POOL_CTX_TAG) as *const std::ffi::c_void
     }
-
+    
+    #[inline]
     pub(crate) fn last_wsa_error() -> io::Error {
         // SAFETY: WSAGetLastError is safe to call.
         io::Error::from_raw_os_error(unsafe {
             windows_sys::Win32::Networking::WinSock::WSAGetLastError()
         })
     }
+
+    pub(crate) fn last_wsa_report(context: RioError, scope: &'static str) -> Report<RioError> {
+        let err = Self::last_wsa_error();
+        let code = err.raw_os_error().map(|c| c as u32).unwrap_or(0);
+        let diag = RioDiag::new(scope)
+            .with_error(code, &err);
+        error_stack::Report::new(context).attach(diag)
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

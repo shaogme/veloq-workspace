@@ -94,10 +94,14 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let rq = self
+        let actor = self
             .ensure_actor((fd, handle), env)
-            .attach("failed to ensure RIO actor")?
-            .rq;
+            .attach("failed to ensure RIO actor")?;
+        if actor.is_iocp_fallback {
+            return Err(error_stack::Report::new(RioError::NotSupported))
+                .attach("Socket is marked for IOCP fallback");
+        }
+        let rq = actor.rq;
         let rio_buf = self.registry.prepare_submission(
             buf,
             buf_offset,
@@ -107,9 +111,15 @@ impl RioState {
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
-            return Err(e).attach(format!(
-                "RIOReceive submission failed: fd={fd:?}, handle={handle:?}"
-            ));
+            let diag = RioDiag::new("submit_recv_internal")
+                .field("fd", format!("{fd:?}"))
+                .field("handle", format!("{handle:?}"))
+                .field("rq_raw", format!("0x{:x}", rq.0 as usize))
+                .field("buffer_id", format!("0x{:x}", rio_buf.BufferId as usize))
+                .field("buffer_offset", rio_buf.Offset)
+                .field("buffer_length", rio_buf.Length)
+                .field("outstanding_count", self.outstanding_count);
+            return Err(e).attach(diag);
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
@@ -121,44 +131,8 @@ impl RioState {
         buf: &veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<SubmissionResult> {
-        let RioTarget {
-            fd,
-            handle,
-            user_data,
-            generation,
-            buf_offset,
-        } = target;
-        let buf_len = buf.len();
-        self.try_submit_send_internal(
-            RioTarget {
-                fd,
-                handle,
-                user_data,
-                generation,
-                buf_offset,
-            },
-            buf,
-            registrar,
-        )
-            .map_err(|e| {
-                let source = e.to_string();
-                let wsa_class = RioDiag::wsa_class_from_text(&source);
-                let diag_submit = RioDiag::new("submit_send")
-                    .field("fd", format!("{fd:?}"))
-                    .field("handle", format!("{handle:?}"))
-                    .field("user_data", user_data)
-                    .field("generation", generation)
-                    .field("buf_offset", buf_offset)
-                    .field("buf_len", buf_len)
-                    .field("wsa_class", wsa_class);
-                let diag_source = RioDiag::new("submit_send_source")
-                    .field("source_kind", "rio_report")
-                    .field("source", source);
-                e.to_io_error(format!(
-                    "RIOSend submission failed; {}; {}",
-                    diag_submit, diag_source
-                ))
-            })
+        self.try_submit_send_internal(target, buf, registrar)
+            .map_err(|e| e.to_io_error("RIOSend submission failed"))
     }
 
     fn try_submit_send_internal(
@@ -189,16 +163,19 @@ impl RioState {
             let actor = self
                 .ensure_actor((fd, handle), env)
                 .map_err(|e| {
-                    let source = e.to_string();
-                    let wsa_class = RioDiag::wsa_class_from_text(&source);
                     let diag = RioDiag::new("submit_send_ensure_actor")
                         .field("fd", format!("{fd:?}"))
                         .field("handle", format!("{handle:?}"))
-                        .field("outstanding_count", outstanding_snapshot)
-                        .field("wsa_class", wsa_class);
-                    e.attach(diag.to_string())
+                        .field("outstanding_count", outstanding_snapshot);
+                    e.attach(diag)
                 })
                 .attach("failed to ensure RIO actor")?;
+
+            if actor.is_iocp_fallback {
+                return Err(error_stack::Report::new(RioError::NotSupported))
+                    .attach("Socket is marked for IOCP fallback");
+            }
+
             (actor.rq, format!("{:?}", actor.state))
         };
         let rio_buf = self.registry.prepare_submission(
@@ -210,8 +187,6 @@ impl RioState {
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
-            let source = e.to_string();
-            let wsa_class = RioDiag::wsa_class_from_text(&source);
             let diag = RioDiag::new("submit_send_internal")
                 .field("fd", format!("{fd:?}"))
                 .field("handle", format!("{handle:?}"))
@@ -220,8 +195,7 @@ impl RioState {
                 .field("buffer_offset", rio_buf.Offset)
                 .field("buffer_length", rio_buf.Length)
                 .field("outstanding_count", self.outstanding_count)
-                .field("actor_state", actor_state.clone())
-                .field("wsa_class", wsa_class);
+                .field("actor_state", actor_state.clone());
             error!(
                 fd = ?fd,
                 handle = ?handle,
@@ -231,11 +205,10 @@ impl RioState {
                 buffer_length = rio_buf.Length,
                 outstanding_count = self.outstanding_count,
                 actor_state = %actor_state,
-                wsa_class = wsa_class,
-                rio_error = %source,
+                rio_error = %e,
                 "RIOSend submit failed diagnostics"
             );
-            return Err(e).attach(diag.to_string());
+            return Err(e).attach(diag);
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)

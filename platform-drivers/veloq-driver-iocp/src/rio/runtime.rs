@@ -61,9 +61,23 @@ impl RioState {
 
     #[inline]
     fn should_demote_socket(err: &io::Error) -> bool {
-        err.raw_os_error() == Some(10055)
-            || err.to_string().contains("os_error=10055")
-            || err.to_string().contains("os error 10055")
+        if err.raw_os_error() == Some(10055) {
+            return true;
+        }
+
+        if let Some(rio_io_err) = err.get_ref().and_then(|r| r.downcast_ref::<crate::rio::error::RioIoError>()) {
+            if rio_io_err.report.has_wsa_error(10055) {
+                return true;
+            }
+            let &rio_err = rio_io_err.report.current_context();
+            if rio_err == crate::rio::error::RioError::NotSupported {
+                // Check if it's the specific "fallback" case.
+                // Instead of string searching, we just assume NotSupported in this context
+                // means it's already mark for fallback or RIO is not supported.
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]
@@ -156,7 +170,12 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let rq = self.ensure_actor((fd, handle), env)?.rq;
+        let actor = self.ensure_actor((fd, handle), env)?;
+        if actor.is_iocp_fallback {
+            return Err(error_stack::Report::new(RioError::NotSupported))
+                .attach("Socket is marked for IOCP fallback");
+        }
+        let rq = actor.rq;
         let data_buf = self.registry.prepare_submission(
             buf,
             buf_offset,
@@ -222,7 +241,11 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let _ = self.ensure_actor((fd, handle), env)?;
+        let actor = self.ensure_actor((fd, handle), env)?;
+        if actor.is_iocp_fallback {
+            return Err(error_stack::Report::new(RioError::NotSupported))
+                .attach("Socket is marked for IOCP fallback");
+        }
         let key = self
             .actor_by_handle
             .get(&handle)
@@ -277,7 +300,11 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let _ = self.ensure_actor((fd, handle), env)?;
+        let actor = self.ensure_actor((fd, handle), env)?;
+        if actor.is_iocp_fallback {
+            return Err(error_stack::Report::new(RioError::NotSupported))
+                .attach("Socket is marked for IOCP fallback");
+        }
         let key = self
             .actor_by_handle
             .get(&handle)
