@@ -10,15 +10,15 @@
 //! intentionally avoids actor scheduling or completion routing policy.
 
 use crate::IoFd;
-use crate::common::{IocpErrorContext, io_error, io_msg};
+use crate::rio::error::{RioError, RioResult};
 use crate::rio::RioEnv;
 use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
+use error_stack::ResultExt;
 use rustc_hash::FxHashMap;
-use std::io;
 use std::time::{Duration, Instant};
 use veloq_buf::{FixedBuf, PoolKind};
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::{RIO_BUF, WSAGetLastError};
+use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
 const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
 
@@ -62,16 +62,11 @@ impl RioRegistry {
         }
     }
 
-    fn last_wsa_error() -> io::Error {
-        // SAFETY: WSAGetLastError is a simple getter with no side effects.
-        io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
-    }
-
     pub(crate) fn resolve_buffer_id(
         &mut self,
         buf: &FixedBuf,
         env: RioEnv<'_>,
-    ) -> io::Result<(RioBufferId, u32)> {
+    ) -> RioResult<(RioBufferId, u32)> {
         let info = buf.resolve_region_info();
 
         if info.pool_kind == PoolKind::Heap {
@@ -96,10 +91,8 @@ impl RioRegistry {
 
         match buffer_id {
             Some(id) => Ok((id, info.offset as u32)),
-            None => Err(io_msg(
-                IocpErrorContext::Rio,
-                format!("RIO chunk not registered: chunk_id={}", info.id),
-            )),
+            None => Err(error_stack::Report::new(RioError::Internal))
+                .attach(format!("RIO chunk not registered: chunk_id={}", info.id)),
         }
     }
 
@@ -109,7 +102,7 @@ impl RioRegistry {
         buf_offset: usize,
         len: u32,
         env: RioEnv<'_>,
-    ) -> io::Result<RIO_BUF> {
+    ) -> RioResult<RIO_BUF> {
         let (buffer_id, offset) = self.resolve_buffer_id(buf, env)?;
         let rio_buf = RIO_BUF {
             BufferId: buffer_id.0,
@@ -128,7 +121,7 @@ impl RioRegistry {
         id: u16,
         mem: (*const u8, usize),
         env: RioEnv<'_>,
-    ) -> io::Result<()> {
+    ) -> RioResult<()> {
         if let Some(last_fail) = self.chunk_register_failures_recent.get(&id)
             && last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN
         {
@@ -137,10 +130,8 @@ impl RioRegistry {
                 .registration_stats
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!("RIO chunk registration skipped due to recent failure: chunk_id={id}"),
-            ));
+            return Err(error_stack::Report::new(RioError::ResourceExhaustion))
+                .attach(format!("RIO chunk registration skipped due to recent failure: chunk_id={id}"));
         }
 
         let (ptr, len) = mem;
@@ -163,7 +154,16 @@ impl RioRegistry {
 
         let buf_id = match env.dispatch.register_buffer(ptr, len as u32) {
             Ok(id) => id,
-            Err(e) => return Err(self.on_chunk_reg_fail(id, len, e)),
+            Err(e) => {
+                self.registration_stats.chunk_register_failures = self
+                    .registration_stats
+                    .chunk_register_failures
+                    .saturating_add(1);
+                self.chunk_register_failures_recent
+                    .insert(id, Instant::now());
+                return Err(e).change_context(RioError::BufferRegistration)
+                    .attach(format!("RIORegisterBuffer failed: chunk_id={id}, len={len}"));
+            }
         };
 
         self.chunk_registry[id_idx] = buf_id;
@@ -180,31 +180,19 @@ impl RioRegistry {
         page_idx: usize,
         resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
         env: RioEnv<'_>,
-    ) -> io::Result<()> {
+    ) -> RioResult<()> {
         if page_idx >= self.slab_rio_pages.len() {
             self.slab_rio_pages.resize(page_idx + 1, None);
         }
 
         if self.slab_rio_pages[page_idx].is_none() {
             if let Some((ptr, len)) = resolver(page_idx) {
-                let id = match env.dispatch.register_buffer(ptr, len as u32) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        return Err(io_error(
-                            IocpErrorContext::Rio,
-                            Self::last_wsa_error(),
-                            format!(
-                                "RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}, original_error={e}"
-                            ),
-                        ));
-                    }
-                };
+                let id = env.dispatch.register_buffer(ptr, len as u32)
+                    .attach(format!("RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"))?;
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize, len));
             } else {
-                return Err(io_msg(
-                    IocpErrorContext::Rio,
-                    format!("RIO slab page not found in registry: page_idx={page_idx}"),
-                ));
+                return Err(error_stack::Report::new(RioError::Internal))
+                    .attach(format!("RIO slab page not found in registry: page_idx={page_idx}"));
             }
         }
         Ok(())
@@ -214,7 +202,7 @@ impl RioRegistry {
         &mut self,
         target: (HANDLE, IoFd),
         env: RioEnv<'_>,
-    ) -> io::Result<RioRq> {
+    ) -> RioResult<RioRq> {
         let (handle, fd) = target;
 
         let max_outstanding_recvs = self.rq_depth;
@@ -229,16 +217,10 @@ impl RioRegistry {
             recv_cq: env.cq,
             send_cq: env.cq,
             context: std::ptr::null(),
-        }).map_err(|e| {
-            io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!(
-                    "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}, original_error={e}",
-                    self.rq_depth
-                ),
-            )
-        })
+        }).attach(format!(
+            "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",
+            self.rq_depth
+        ))
     }
 
     pub(crate) fn deregister_heap_buf(&mut self, buf: &FixedBuf, _env: RioEnv<'_>) {
@@ -300,7 +282,7 @@ impl RioRegistry {
         buf: &FixedBuf,
         offset: usize,
         env: RioEnv<'_>,
-    ) -> io::Result<(RioBufferId, u32)> {
+    ) -> RioResult<(RioBufferId, u32)> {
         let key = (
             buf.as_ptr() as usize,
             buf.capacity(),
@@ -317,13 +299,11 @@ impl RioRegistry {
                 .registration_stats
                 .heap_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!(
+            return Err(error_stack::Report::new(RioError::ResourceExhaustion))
+                .attach(format!(
                     "RIO heap registration skipped due to recent failure (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
                     env.registration_mode, key.0, key.1, key.2
-                ),
-            ));
+                ));
         }
 
         if self.heap_rio_bufs.len() >= 1024 {
@@ -342,7 +322,7 @@ impl RioRegistry {
         buf: &FixedBuf,
         key: (usize, usize, u64),
         env: RioEnv<'_>,
-    ) -> io::Result<RioBufferId> {
+    ) -> RioResult<RioBufferId> {
         self.registration_stats.heap_register_attempts = self
             .registration_stats
             .heap_register_attempts
@@ -360,14 +340,11 @@ impl RioRegistry {
                     .saturating_add(1);
                 self.heap_register_failures_recent
                     .insert(key, Instant::now());
-                return Err(io_error(
-                    IocpErrorContext::Rio,
-                    Self::last_wsa_error(),
-                    format!(
-                        "RIORegisterBuffer failed for heap buffer (mode={:?}): ptr=0x{:x}, cap={}, cookie={}, original_error={e}",
+                return Err(e)
+                    .attach(format!(
+                        "RIORegisterBuffer failed for heap buffer (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
                         env.registration_mode, key.0, key.1, key.2
-                    ),
-                ));
+                    ));
             }
         };
 
@@ -378,19 +355,5 @@ impl RioRegistry {
             .heap_register_success
             .saturating_add(1);
         Ok(id)
-    }
-
-    fn on_chunk_reg_fail(&mut self, id: u16, len: usize, e: std::io::Error) -> std::io::Error {
-        self.registration_stats.chunk_register_failures = self
-            .registration_stats
-            .chunk_register_failures
-            .saturating_add(1);
-        self.chunk_register_failures_recent
-            .insert(id, Instant::now());
-        io_error(
-            IocpErrorContext::Rio,
-            Self::last_wsa_error(),
-            format!("RIORegisterBuffer failed: chunk_id={id}, len={len}, original_error={e}"),
-        )
     }
 }

@@ -12,11 +12,12 @@ pub(crate) mod dispatch;
 pub(crate) use dispatch::*;
 
 use crate::BufferRegistrationMode;
-use crate::common::{IocpErrorContext, io_error};
 use crate::ext::Extensions;
 use crate::ops::submit::SubmissionResult;
 use crate::rio::core::registry::RioRegistry;
+use crate::rio::error::{RioError, RioReportExt, RioResult};
 use crate::rio::{RioEnv, RioState, RioTarget};
+use error_stack::ResultExt;
 use std::io;
 use windows_sys::Win32::Foundation::HANDLE;
 
@@ -26,7 +27,7 @@ impl RioState {
         entries: u32,
         ext: &Extensions,
         registration_mode: BufferRegistrationMode,
-    ) -> io::Result<Self> {
+    ) -> RioResult<Self> {
         let kernel = RioKernel::from_extensions(port, entries, ext)?;
 
         let rq_depth = entries.clamp(32, 256);
@@ -50,7 +51,7 @@ impl RioState {
         self.registry.clear_registered_rq(idx);
     }
 
-    pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
+    pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> RioResult<()> {
         let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)
@@ -66,6 +67,16 @@ impl RioState {
         buf: &mut veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<SubmissionResult> {
+        self.try_submit_recv_internal(target, buf, registrar)
+            .map_err(|e| e.to_io_error("RIOReceive submission failed"))
+    }
+
+    fn try_submit_recv_internal(
+        &mut self,
+        target: RioTarget,
+        buf: &mut veloq_buf::FixedBuf,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+    ) -> RioResult<SubmissionResult> {
         let RioTarget {
             fd,
             handle,
@@ -82,7 +93,11 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let rq = self.ensure_actor((fd, handle), env)?.rq;
+        let rq = self.ensure_actor((fd, handle), env)
+            .map_err(|e| io::Error::other(e.to_string()))
+            .change_context(RioError::Internal)
+            .attach("failed to ensure RIO actor")?
+            .rq;
         let rio_buf = self.registry.prepare_submission(
             buf,
             buf_offset,
@@ -92,13 +107,8 @@ impl RioState {
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!(
-                    "RIOReceive submission failed: fd={fd:?}, handle={handle:?}, original_error={e}"
-                ),
-            ));
+            return Err(e)
+                .attach(format!("RIOReceive submission failed: fd={fd:?}, handle={handle:?}"));
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
@@ -110,6 +120,16 @@ impl RioState {
         buf: &veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<SubmissionResult> {
+        self.try_submit_send_internal(target, buf, registrar)
+            .map_err(|e| e.to_io_error("RIOSend submission failed"))
+    }
+
+    fn try_submit_send_internal(
+        &mut self,
+        target: RioTarget,
+        buf: &veloq_buf::FixedBuf,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+    ) -> RioResult<SubmissionResult> {
         let RioTarget {
             fd,
             handle,
@@ -126,7 +146,11 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let rq = self.ensure_actor((fd, handle), env)?.rq;
+        let rq = self.ensure_actor((fd, handle), env)
+            .map_err(|e| io::Error::other(e.to_string()))
+            .change_context(RioError::Internal)
+            .attach("failed to ensure RIO actor")?
+            .rq;
         let rio_buf = self.registry.prepare_submission(
             buf,
             buf_offset,
@@ -136,13 +160,8 @@ impl RioState {
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!(
-                    "RIOSend submission failed: fd={fd:?}, handle={handle:?}, original_error={e}"
-                ),
-            ));
+            return Err(e)
+                .attach(format!("RIOSend submission failed: fd={fd:?}, handle={handle:?}"));
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)

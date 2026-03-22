@@ -8,10 +8,12 @@ use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
 use crate::rio::core::{RioOpCtxGuard, RioPoolCtxGuard};
+use crate::rio::error::{RioError, RioReportExt, RioResult};
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager, UdpPoolState};
 use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState};
+use error_stack::ResultExt;
 use slotmap::SlotMap;
 use std::io;
 use veloq_driver_core::driver::{
@@ -91,13 +93,13 @@ impl<'a> RioCompletionRouter<'a> {
         }
     }
 
-    fn on_pool_completion(&mut self, actor_key: ActorKey, generation: u32, res: &RIORESULT) {
+    fn on_pool_completion(&mut self, actor_key: ActorKey, generation: u32, res: &RIORESULT) -> RioResult<()> {
         let (pool_submissions, remove_actor) = {
             let Some(actor) = self.actors.get_mut(actor_key) else {
-                return;
+                return Ok(());
             };
             let Some(slot_idx) = actor.pool_manager.ack_pool_done(generation) else {
-                return;
+                return Ok(());
             };
             let mut ctx = RioContext {
                 registry: self.registry,
@@ -111,7 +113,7 @@ impl<'a> RioCompletionRouter<'a> {
                 (slot_idx, res),
                 &mut self.comp,
                 &mut ctx,
-            );
+            ).attach("failed to handle pool completion")?;
             let remove = pool_manager.cleanup_drained_pool(&mut ctx);
             (submissions, remove)
         };
@@ -123,16 +125,17 @@ impl<'a> RioCompletionRouter<'a> {
         }
         *self.outstanding_count += pool_submissions;
         self.completed_count += 1;
+        Ok(())
     }
 
-    fn handle_op_completion(&mut self, user_data: usize, generation: u32, res: &RIORESULT) {
+    fn handle_op_completion(&mut self, user_data: usize, generation: u32, res: &RIORESULT) -> RioResult<()> {
         let ops = &mut self.comp.ops;
 
         if user_data < ops.local.len() {
             match ops.slot_view(user_data) {
                 Some(SlotView::InFlightWaiting(mut slot)) => {
                     if slot.platform_mut().generation != generation {
-                        return;
+                        return Ok(());
                     }
 
                     let mut guard = slot.complete();
@@ -159,7 +162,7 @@ impl<'a> RioCompletionRouter<'a> {
                 }
                 Some(SlotView::InFlightOrphaned(mut slot)) => {
                     if slot.platform_mut().generation != generation {
-                        return;
+                        return Ok(());
                     }
 
                     let mut guard = slot.complete();
@@ -176,11 +179,12 @@ impl<'a> RioCompletionRouter<'a> {
             *self.outstanding_count -= 1;
         }
         self.completed_count += 1;
+        Ok(())
     }
 
-    fn handle_one(&mut self, res: &RIORESULT) {
+    fn handle_one(&mut self, res: &RIORESULT) -> RioResult<()> {
         let Some(kind) = RioState::decode_req_ctx(res.RequestContext) else {
-            return;
+            return Ok(());
         };
 
         match kind {
@@ -198,7 +202,7 @@ impl<'a> RioCompletionRouter<'a> {
                 ctx_ptr,
             } => {
                 let _ctx_guard = RioOpCtxGuard(ctx_ptr);
-                self.handle_op_completion(user_data, generation, res);
+                self.handle_op_completion(user_data, generation, res)
             }
         }
     }
@@ -232,13 +236,14 @@ impl RioState {
         &mut self,
         target: (IoFd, HANDLE),
         env: RioEnv<'_>,
-    ) -> io::Result<&mut RioSocketActor> {
+    ) -> RioResult<&mut RioSocketActor> {
         let (fd, handle) = target;
         if let Some(key) = self.actor_by_handle.get(&handle).copied() {
             return self
                 .actors
                 .get_mut(key)
-                .ok_or_else(|| io::Error::other("failed to retrieve indexed actor"));
+                .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+                .attach("failed to retrieve indexed actor");
         }
 
         let rq = self.registry.create_rq((handle, fd), env)?;
@@ -246,7 +251,8 @@ impl RioState {
         self.actor_by_handle.insert(handle, key);
         self.actors
             .get_mut(key)
-            .ok_or_else(|| io::Error::other("failed to retrieve inserted actor"))
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("failed to retrieve inserted actor")
     }
 
     pub(crate) fn shutdown_udp_pool(&mut self, handle: HANDLE) {
@@ -340,7 +346,7 @@ impl RioState {
         handle: HANDLE,
         ticks: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<()> {
+    ) -> RioResult<()> {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             return Ok(());
         };
@@ -421,6 +427,17 @@ impl RioState {
         completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable,
     ) -> io::Result<usize> {
+        self.process_completions_internal(ops, registrar, completion_events, completion_table)
+            .map_err(|e| e.to_io_error("RIO completion processing failed"))
+    }
+
+    fn process_completions_internal(
+        &mut self,
+        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::ops::OverlappedEntry>,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+        completion_events: &SharedCompletionQueue,
+        completion_table: &SharedCompletionTable,
+    ) -> RioResult<usize> {
         const MAX_RIO_RESULTS: usize = 128;
         // SAFETY: RIORESULT is a POD struct and safe to zero-initialize.
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
@@ -444,16 +461,15 @@ impl RioState {
             let count = self.kernel.dequeue(&mut results);
 
             if count == RIO_CORRUPT_CQ {
-                return Err(io::Error::other(
-                    "RIO completion queue is corrupt (RIO_CORRUPT_CQ)",
-                ));
+                return Err(error_stack::Report::new(RioError::Internal))
+                    .attach("RIO completion queue is corrupt (RIO_CORRUPT_CQ)");
             }
             if count == 0 {
                 break;
             }
 
             for res in results.iter().take(count as usize) {
-                router.handle_one(res);
+                router.handle_one(res)?;
             }
 
             if count < MAX_RIO_RESULTS as u32 {

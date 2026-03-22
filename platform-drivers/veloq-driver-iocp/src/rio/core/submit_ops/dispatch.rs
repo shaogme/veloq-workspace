@@ -1,9 +1,9 @@
 use crate::BufferRegistrationMode;
-use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::ext::Extensions;
+use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState};
 use crate::win32::Overlapped;
-use std::io;
+use error_stack::ResultExt;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION, RIO_RQ,
@@ -68,17 +68,17 @@ pub(crate) trait RioProvider: Send + Sync {
         &self,
         entries: u32,
         notification: &RIO_NOTIFICATION_COMPLETION,
-    ) -> io::Result<RioCq>;
+    ) -> RioResult<RioCq>;
 
-    fn create_rq(&self, config: RioRqConfig) -> io::Result<RioRq>;
+    fn create_rq(&self, config: RioRqConfig) -> RioResult<RioRq>;
 
-    fn register_buffer(&self, ptr: *const u8, len: u32) -> io::Result<RioBufferId>;
+    fn register_buffer(&self, ptr: *const u8, len: u32) -> RioResult<RioBufferId>;
 
     fn deregister_buffer(&self, id: RioBufferId);
 
     fn dequeue(&self, cq: RioCq, results: &mut [RIORESULT]) -> u32;
 
-    fn notify(&self, cq: RioCq) -> io::Result<()>;
+    fn notify(&self, cq: RioCq) -> RioResult<()>;
 
     fn close_cq(&self, cq: RioCq);
 
@@ -89,7 +89,7 @@ pub(crate) trait RioProvider: Send + Sync {
         num_bufs: u32,
         flags: u32,
         context: *const std::ffi::c_void,
-    ) -> io::Result<()>;
+    ) -> RioResult<()>;
 
     fn send(
         &self,
@@ -98,11 +98,11 @@ pub(crate) trait RioProvider: Send + Sync {
         num_bufs: u32,
         flags: u32,
         context: *const std::ffi::c_void,
-    ) -> io::Result<()>;
+    ) -> RioResult<()>;
 
-    fn send_ex(&self, config: RioExConfig<'_>) -> io::Result<()>;
+    fn send_ex(&self, config: RioExConfig<'_>) -> RioResult<()>;
 
-    fn receive_ex(&self, config: RioExConfig<'_>) -> io::Result<()>;
+    fn receive_ex(&self, config: RioExConfig<'_>) -> RioResult<()>;
 }
 
 #[derive(Clone, Copy)]
@@ -158,21 +158,19 @@ impl RioProvider for RioDispatch {
         &self,
         entries: u32,
         notification: &RIO_NOTIFICATION_COMPLETION,
-    ) -> io::Result<RioCq> {
+    ) -> RioResult<RioCq> {
         // SAFETY: Function pointer is verified at startup.
         let cq = unsafe { (self.create_cq)(entries, notification as *const _) };
         if cq == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIOCreateCompletionQueue failed",
-            ));
+            return Err(RioState::last_wsa_error())
+                .change_context(RioError::CqCreation)
+                .attach("RIOCreateCompletionQueue failed");
         }
         Ok(RioCq(cq))
     }
 
     #[inline]
-    fn create_rq(&self, cfg: RioRqConfig) -> io::Result<RioRq> {
+    fn create_rq(&self, cfg: RioRqConfig) -> RioResult<RioRq> {
         // SAFETY: Function pointer is verified at startup.
         let rq = unsafe {
             (self.create_rq)(
@@ -187,25 +185,21 @@ impl RioProvider for RioDispatch {
             )
         };
         if rq == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIOCreateRequestQueue failed",
-            ));
+            return Err(RioState::last_wsa_error())
+                .change_context(RioError::RqCreation)
+                .attach("RIOCreateRequestQueue failed");
         }
         Ok(RioRq(rq))
     }
 
     #[inline]
-    fn register_buffer(&self, ptr: *const u8, len: u32) -> io::Result<RioBufferId> {
+    fn register_buffer(&self, ptr: *const u8, len: u32) -> RioResult<RioBufferId> {
         // SAFETY: Function pointer is verified at startup.
         let id = unsafe { (self.register_buffer)(ptr, len) };
         if id == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIORegisterBuffer failed",
-            ));
+            return Err(RioState::last_wsa_error())
+                .change_context(RioError::BufferRegistration)
+                .attach("RIORegisterBuffer failed");
         }
         Ok(RioBufferId(id))
     }
@@ -225,15 +219,13 @@ impl RioProvider for RioDispatch {
     }
 
     #[inline]
-    fn notify(&self, cq: RioCq) -> io::Result<()> {
+    fn notify(&self, cq: RioCq) -> RioResult<()> {
         // SAFETY: Function pointer is verified at startup.
         let ret = unsafe { (self.notify)(cq.0) };
         if ret == SOCKET_ERROR {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIONotify failed",
-            ));
+            return Err(RioState::last_wsa_error())
+                .change_context(RioError::Internal)
+                .attach("RIONotify failed");
         }
         Ok(())
     }
@@ -254,15 +246,13 @@ impl RioProvider for RioDispatch {
         num_bufs: u32,
         flags: u32,
         context: *const std::ffi::c_void,
-    ) -> io::Result<()> {
+    ) -> RioResult<()> {
         // SAFETY: Function pointer is verified at startup.
         let ret = unsafe { (self.receive)(rq.0, buf as *const _, num_bufs, flags, context) };
         if ret == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIOReceive failed",
-            ));
+            return Err(RioState::last_wsa_error())
+                .change_context(RioError::Datapath)
+                .attach("RIOReceive failed");
         }
         Ok(())
     }
@@ -275,21 +265,19 @@ impl RioProvider for RioDispatch {
         num_bufs: u32,
         flags: u32,
         context: *const std::ffi::c_void,
-    ) -> io::Result<()> {
+    ) -> RioResult<()> {
         // SAFETY: Function pointer is verified at startup.
         let ret = unsafe { (self.send)(rq.0, buf as *const _, num_bufs, flags, context) };
         if ret == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIOSend failed",
-            ));
+            return Err(RioState::last_wsa_error())
+                .change_context(RioError::Datapath)
+                .attach("RIOSend failed");
         }
         Ok(())
     }
 
     #[inline]
-    fn send_ex(&self, cfg: RioExConfig<'_>) -> io::Result<()> {
+    fn send_ex(&self, cfg: RioExConfig<'_>) -> RioResult<()> {
         // SAFETY: Function pointer is verified at startup.
         let ret = unsafe {
             (self.send_ex)(
@@ -305,17 +293,15 @@ impl RioProvider for RioDispatch {
             )
         };
         if ret == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIOSendEx failed",
-            ));
+            return Err(RioState::last_wsa_error())
+                .change_context(RioError::Datapath)
+                .attach("RIOSendEx failed");
         }
         Ok(())
     }
 
     #[inline]
-    fn receive_ex(&self, cfg: RioExConfig<'_>) -> io::Result<()> {
+    fn receive_ex(&self, cfg: RioExConfig<'_>) -> RioResult<()> {
         // SAFETY: Function pointer is verified at startup.
         let ret = unsafe {
             (self.receive_ex)(
@@ -331,11 +317,9 @@ impl RioProvider for RioDispatch {
             )
         };
         if ret == 0 {
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                RioState::last_wsa_error(),
-                "RIOReceiveEx failed",
-            ));
+            return Err(RioState::last_wsa_error())
+                .change_context(RioError::Datapath)
+                .attach("RIOReceiveEx failed");
         }
         Ok(())
     }
@@ -352,47 +336,58 @@ impl RioKernel {
         port: HANDLE,
         entries: u32,
         ext: &Extensions,
-    ) -> io::Result<Self> {
+    ) -> RioResult<Self> {
         let table = &ext.rio_table;
         let dispatch = RioDispatch {
             create_cq: table
                 .RIOCreateCompletionQueue
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOCreateCompletionQueue missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIOCreateCompletionQueue missing")?,
             create_rq: table
                 .RIOCreateRequestQueue
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOCreateRequestQueue missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIOCreateRequestQueue missing")?,
             register_buffer: table
                 .RIORegisterBuffer
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIORegisterBuffer missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIORegisterBuffer missing")?,
             deregister_buffer: table
                 .RIODeregisterBuffer
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIODeregisterBuffer missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIODeregisterBuffer missing")?,
             dequeue: table
                 .RIODequeueCompletion
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIODequeueCompletion missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIODequeueCompletion missing")?,
             notify: table
                 .RIONotify
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIONotify missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIONotify missing")?,
             close_cq: table
                 .RIOCloseCompletionQueue
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOCloseCompletionQueue missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIOCloseCompletionQueue missing")?,
             receive: table
                 .RIOReceive
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOReceive missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIOReceive missing")?,
             send: table
                 .RIOSend
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSend missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIOSend missing")?,
             send_ex: table
                 .RIOSendEx
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOSendEx missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIOSendEx missing")?,
             receive_ex: table
                 .RIOReceiveEx
-                .ok_or_else(|| io_msg(IocpErrorContext::Rio, "RIOReceiveEx missing"))?,
+                .ok_or_else(|| error_stack::Report::new(RioError::LibraryLoad))
+                .attach("RIOReceiveEx missing")?,
         };
         Self::new(port, entries, dispatch)
     }
 
-    fn new(port: HANDLE, entries: u32, dispatch: RioDispatch) -> io::Result<Self> {
+    fn new(port: HANDLE, entries: u32, dispatch: RioDispatch) -> RioResult<Self> {
         const RIO_EVENT_KEY: usize = usize::MAX - 1;
         let mut notify_ov = Box::new(Overlapped::zeroed());
         let notification = RIO_NOTIFICATION_COMPLETION {
@@ -445,7 +440,7 @@ impl RioKernel {
     }
 
     #[inline]
-    pub(crate) fn rearm_notify(&self) -> io::Result<()> {
+    pub(crate) fn rearm_notify(&self) -> RioResult<()> {
         self.dispatch.map_or(Ok(()), |d| d.notify(self.cq))
     }
 
@@ -454,10 +449,11 @@ impl RioKernel {
         rq: RioRq,
         buf: &RIO_BUF,
         ctx: *const std::ffi::c_void,
-    ) -> io::Result<()> {
+    ) -> RioResult<()> {
         self.dispatch
             .as_ref()
-            .ok_or_else(|| io::Error::other("RIO dispatch context lost"))?
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("RIO dispatch context lost")?
             .receive(rq, buf, 1, 0, ctx)
     }
 
@@ -466,10 +462,11 @@ impl RioKernel {
         rq: RioRq,
         buf: &RIO_BUF,
         ctx: *const std::ffi::c_void,
-    ) -> io::Result<()> {
+    ) -> RioResult<()> {
         self.dispatch
             .as_ref()
-            .ok_or_else(|| io::Error::other("RIO dispatch context lost"))?
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("RIO dispatch context lost")?
             .send(rq, buf, 1, 0, ctx)
     }
 
@@ -479,11 +476,12 @@ impl RioKernel {
         data_buf: &RIO_BUF,
         addr_buf: &RIO_BUF,
         ctx: *const std::ffi::c_void,
-    ) -> io::Result<()> {
+    ) -> RioResult<()> {
         let dispatch = self
             .dispatch
             .as_ref()
-            .ok_or_else(|| io::Error::other("RIO dispatch context lost"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("RIO dispatch context lost")?;
         dispatch.send_ex(RioExConfig {
             rq,
             data_buf,

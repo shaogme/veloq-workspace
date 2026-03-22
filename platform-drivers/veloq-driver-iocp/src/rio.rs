@@ -9,6 +9,7 @@
 //! - `lifecycle`: shutdown sequencing and deferred cleanup semantics.
 
 pub(crate) mod core;
+pub(crate) mod error;
 pub(crate) mod lifecycle;
 pub(crate) mod runtime;
 

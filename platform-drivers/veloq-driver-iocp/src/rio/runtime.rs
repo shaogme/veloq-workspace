@@ -4,9 +4,10 @@ pub(crate) mod control_flow;
 pub(crate) mod pool;
 
 use crate::IoFd;
-use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::ops::SubmissionResult;
+use crate::rio::error::{RioError, RioReportExt, RioResult};
 use crate::rio::{RioEnv, RioState};
+use error_stack::ResultExt;
 use std::io;
 use veloq_buf::FixedBuf;
 use veloq_driver_core::op::{UdpRecv, UdpRecvStream};
@@ -74,12 +75,10 @@ impl RioState {
         base_addr: usize,
         slab_len: usize,
         page_idx: usize,
-    ) -> io::Result<(u32, usize)> {
+    ) -> RioResult<(u32, usize)> {
         if addr_ptr.is_null() {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                "RIO send_to received null address",
-            ));
+            return Err(error_stack::Report::new(RioError::Internal))
+                .attach("RIO send_to received null address");
         }
         // SAFETY: addr_ptr is checked for null, and sa_family is a standard field in SOCKADDR.
         let family = unsafe { (*(addr_ptr as *const SOCKADDR)).sa_family };
@@ -87,27 +86,21 @@ impl RioState {
             AF_INET => std::mem::size_of::<SOCKADDR_IN>(),
             AF_INET6 => std::mem::size_of::<SOCKADDR_IN6>(),
             _ => {
-                return Err(io_msg(
-                    IocpErrorContext::Rio,
-                    format!("RIO unsupported family: {family}"),
-                ));
+                return Err(error_stack::Report::new(RioError::Internal))
+                    .attach(format!("RIO unsupported family: {family}"));
             }
         };
         if (addr_len as usize) < min_len {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                "RIO send_to invalid address length",
-            ));
+            return Err(error_stack::Report::new(RioError::Internal))
+                .attach("RIO send_to invalid address length");
         }
 
         let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>();
         let addr_addr = addr_ptr as usize;
         let slab_end = base_addr.saturating_add(slab_len);
         if addr_addr < base_addr || addr_addr.saturating_add(rio_addr_len) > slab_end {
-            return Err(io_msg(
-                IocpErrorContext::Rio,
-                format!("RIO address outside slab: page={page_idx}"),
-            ));
+            return Err(error_stack::Report::new(RioError::Internal))
+                .attach(format!("RIO address outside slab: page={page_idx}"));
         }
 
         Ok((rio_addr_len as u32, (addr_addr - base_addr) as u32 as usize))
@@ -119,6 +112,16 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> io::Result<SubmissionResult> {
+        self.try_submit_send_to_internal(args, registrar, slab_resolver)
+            .map_err(|e| e.to_io_error("RIOSendEx submission failed"))
+    }
+
+    fn try_submit_send_to_internal(
+        &mut self,
+        args: RioSendToArgs<'_>,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
+    ) -> RioResult<SubmissionResult> {
         let RioSendToArgs {
             fd,
             handle,
@@ -135,7 +138,8 @@ impl RioState {
         let dispatch = self
             .kernel
             .dispatch
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "lost RIO context"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("lost RIO context")?;
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -153,7 +157,8 @@ impl RioState {
             .ensure_page_reg(page_idx, slab_resolver, env)?;
 
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx]
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "missing slab page"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("missing slab page")?;
 
         let (rio_addr_len, addr_offset) =
             Self::validate_rio_addr(addr_ptr, addr_len, base_addr, slab_len, page_idx)?;
@@ -169,11 +174,8 @@ impl RioState {
             .submit_send_ex(rq, &data_buf, &addr_buf, request_context)
         {
             Self::free_op_req_ctx(request_context as u64);
-            return Err(io_error(
-                IocpErrorContext::Rio,
-                Self::last_wsa_error(),
-                format!("RIOSendEx failed for fd={fd:?}: {e}"),
-            ));
+            return Err(e)
+                .attach(format!("RIOSendEx failed for fd={fd:?}"));
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
@@ -184,6 +186,15 @@ impl RioState {
         args: RioUdpStreamArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<SubmissionResult> {
+        self.try_submit_pool_recv_internal(args, registrar)
+            .map_err(|e| e.to_io_error("RIO pool recv submission failed"))
+    }
+
+    fn try_submit_pool_recv_internal(
+        &mut self,
+        args: RioUdpStreamArgs<'_>,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+    ) -> RioResult<SubmissionResult> {
         let RioUdpStreamArgs {
             fd,
             handle,
@@ -194,7 +205,8 @@ impl RioState {
         let dispatch = self
             .kernel
             .dispatch
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "lost RIO context"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("lost RIO context")?;
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -206,11 +218,13 @@ impl RioState {
             .actor_by_handle
             .get(&handle)
             .copied()
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("actor not found")?;
         let actor = self
             .actors
             .get_mut(key)
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("actor not found")?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
         let (res, pool_submissions) = pool_manager.try_submit_pool_recv(
@@ -218,7 +232,10 @@ impl RioState {
             stream_op,
             (user_data, generation),
             &mut ctx,
-        )?;
+        ).map_err(|e| io::Error::other(e.to_string()))
+            .change_context(RioError::Internal)
+            .attach("pool submission failed")?;
+
         self.outstanding_count += pool_submissions;
         if matches!(res, SubmissionResult::Pending) {
             self.outstanding_count += 1;
@@ -231,6 +248,15 @@ impl RioState {
         args: RioUdpRecvArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> io::Result<SubmissionResult> {
+        self.try_submit_pool_recv_for_recv_internal(args, registrar)
+            .map_err(|e| e.to_io_error("RIO pool recv for recv submission failed"))
+    }
+
+    fn try_submit_pool_recv_for_recv_internal(
+        &mut self,
+        args: RioUdpRecvArgs<'_>,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+    ) -> RioResult<SubmissionResult> {
         let RioUdpRecvArgs {
             fd,
             handle,
@@ -240,7 +266,8 @@ impl RioState {
         let dispatch = self
             .kernel
             .dispatch
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "lost RIO context"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("lost RIO context")?;
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -252,11 +279,13 @@ impl RioState {
             .actor_by_handle
             .get(&handle)
             .copied()
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("actor not found")?;
         let actor = self
             .actors
             .get_mut(key)
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor not found"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("actor not found")?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
         let user_data = sidecar.user_data;
         let generation = sidecar.generation;
@@ -266,7 +295,10 @@ impl RioState {
             recv_op,
             (user_data, generation),
             &mut ctx,
-        )?;
+        ).map_err(|e| io::Error::other(e.to_string()))
+            .change_context(RioError::Internal)
+            .attach("pool submission failed")?;
+
         if let Some(copied) = immediate_copied {
             sidecar.blocking_result = Some(Ok(copied));
         }
@@ -286,7 +318,9 @@ impl RioState {
         let dispatch = self
             .kernel
             .dispatch
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "lost RIO context"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("lost RIO context")
+            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -294,19 +328,27 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         let (fd, handle) = target;
-        let _ = self.ensure_actor((fd, handle), env)?;
+        let _ = self.ensure_actor((fd, handle), env)
+            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
         let key = self
             .actor_by_handle
             .get(&handle)
             .copied()
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor missing"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("actor missing")
+            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
         let actor = self
             .actors
             .get_mut(key)
-            .ok_or_else(|| io_msg(IocpErrorContext::Rio, "actor missing"))?;
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("actor missing")
+            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &actor.udp_mailbox);
-        let pool_submissions = pool_manager.try_refill_pool(udp_mailbox, buf, &mut ctx)?;
+        let pool_submissions = pool_manager.try_refill_pool(udp_mailbox, buf, &mut ctx)
+            .map_err(|e| io::Error::other(e.to_string()))
+            .map_err(|e| error_stack::Report::new(RioError::Internal).attach(e.to_string()))
+            .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
         self.outstanding_count += pool_submissions;
         Ok(())
     }

@@ -265,7 +265,8 @@ impl IocpDriver {
 
     /// Registers a chunk of memory for RIO operations.
     pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
-        self.rio_state.register_chunk(id, ptr, len)?;
+        use crate::rio::error::RioResultExt;
+        self.rio_state.register_chunk(id, ptr, len).to_io_result("failed to register RIO chunk")?;
         Ok(())
     }
 
@@ -389,7 +390,10 @@ impl IocpDriver {
         let pending = self.shutdown_ops();
         if let CloseMode::Strict { timeout } = mode {
             self.drain_pending_iocp(pending, timeout)?;
-            self.rio_state.drain_outstanding(timeout)?;
+            self.rio_state.drain_outstanding(timeout).map_err(|e| {
+                use crate::rio::error::RioReportExt;
+                e.to_io_error("failed to drain RIO outstanding requests")
+            })?;
         }
         self.closed = true;
         Ok(())
