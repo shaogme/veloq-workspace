@@ -22,7 +22,7 @@ pub(crate) const UDP_RECV_POOL_MIN_CREDITS: usize = 2;
 pub(crate) const UDP_RECV_POOL_INITIAL_CREDITS: usize = 4;
 pub(crate) const UDP_RECV_POOL_MAX_CREDITS: usize = 16;
 pub(crate) const UDP_RECV_POOL_QUEUE_CAP: usize = 256;
-pub(crate) const UDP_RECV_POOL_CHUNK_SIZE: usize = 2048;
+pub(crate) const UDP_RECV_POOL_CHUNK_SIZE: usize = 8192;
 pub(crate) const UDP_RECV_POOL_SLAB_CHUNKS: usize = 512;
 
 pub(crate) const POOL_CTX_TAG: usize = 1;

@@ -239,9 +239,6 @@ impl RioState {
             .attach("pool submission failed")?;
 
         self.outstanding_count += pool_submissions;
-        if matches!(res, SubmissionResult::Pending) {
-            self.outstanding_count += 1;
-        }
         Ok(res)
     }
 
@@ -302,9 +299,6 @@ impl RioState {
             sidecar.blocking_result = Some(Ok(copied));
         }
         self.outstanding_count += pool_submissions;
-        if matches!(res, SubmissionResult::Pending) {
-            self.outstanding_count += 1;
-        }
         Ok(res)
     }
 }

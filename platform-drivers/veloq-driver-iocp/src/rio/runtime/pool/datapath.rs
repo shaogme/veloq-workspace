@@ -82,7 +82,11 @@ impl UdpPoolManager {
         RioState::encode_pool_req_ctx(actor_key, token)
     }
 
-    pub(crate) fn ensure_pool(&mut self, ctx: &mut RioContext) -> RioResult<usize> {
+    pub(crate) fn ensure_pool(
+        &mut self,
+        ctx: &mut RioContext,
+        requested_chunk_size: usize,
+    ) -> RioResult<usize> {
         if self.pool.state != UdpPoolState::Uninitialized {
             return Ok(0);
         }
@@ -91,10 +95,11 @@ impl UdpPoolManager {
         let max = UDP_RECV_POOL_MAX_CREDITS.max(min);
         let initial = UDP_RECV_POOL_INITIAL_CREDITS.clamp(min, max);
 
+        let chunk_size = requested_chunk_size.max(UDP_RECV_POOL_CHUNK_SIZE).max(1);
         self.pool.slots = SlotMap::with_capacity_and_key(max);
         self.pool.slab = Some(Self::init_slab(
             ctx,
-            UDP_RECV_POOL_CHUNK_SIZE,
+            chunk_size,
             UDP_RECV_POOL_SLAB_CHUNKS,
         )?);
         self.pool.min_credits = min;
@@ -155,7 +160,12 @@ impl UdpPoolManager {
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> RioResult<(SubmissionResult, usize)> {
-        let total_submissions = self.ensure_pool(ctx)?;
+        let requested_chunk_size = stream_op
+            .buf
+            .as_ref()
+            .map(|buf| buf.len().max(buf.capacity()))
+            .unwrap_or(UDP_RECV_POOL_CHUNK_SIZE);
+        let total_submissions = self.ensure_pool(ctx, requested_chunk_size)?;
         let (res, subs) =
             self.pool
                 .try_submit_recv(mailbox, stream_op, uid, ctx, &mut self.registry)?;
@@ -169,7 +179,12 @@ impl UdpPoolManager {
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> RioResult<(SubmissionResult, usize, Option<usize>)> {
-        let total_submissions = self.ensure_pool(ctx)?;
+        let requested_chunk_size = recv_op
+            .buf
+            .len()
+            .saturating_sub(recv_op.buf_offset)
+            .max(1);
+        let total_submissions = self.ensure_pool(ctx, requested_chunk_size)?;
         let (res, subs, copied) =
             self.pool
                 .try_submit_recv_recv(mailbox, recv_op, uid, ctx, &mut self.registry)?;
