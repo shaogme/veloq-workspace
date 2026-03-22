@@ -332,11 +332,7 @@ pub(crate) struct RioKernel {
 }
 
 impl RioKernel {
-    pub(super) fn from_extensions(
-        port: HANDLE,
-        entries: u32,
-        ext: &Extensions,
-    ) -> RioResult<Self> {
+    pub(super) fn from_extensions(port: HANDLE, entries: u32, ext: &Extensions) -> RioResult<Self> {
         let table = &ext.rio_table;
         let dispatch = RioDispatch {
             create_cq: table

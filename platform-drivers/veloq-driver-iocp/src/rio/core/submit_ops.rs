@@ -93,7 +93,8 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let rq = self.ensure_actor((fd, handle), env)
+        let rq = self
+            .ensure_actor((fd, handle), env)
             .map_err(|e| io::Error::other(e.to_string()))
             .change_context(RioError::Internal)
             .attach("failed to ensure RIO actor")?
@@ -107,8 +108,9 @@ impl RioState {
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
-            return Err(e)
-                .attach(format!("RIOReceive submission failed: fd={fd:?}, handle={handle:?}"));
+            return Err(e).attach(format!(
+                "RIOReceive submission failed: fd={fd:?}, handle={handle:?}"
+            ));
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
@@ -146,7 +148,8 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let rq = self.ensure_actor((fd, handle), env)
+        let rq = self
+            .ensure_actor((fd, handle), env)
             .map_err(|e| io::Error::other(e.to_string()))
             .change_context(RioError::Internal)
             .attach("failed to ensure RIO actor")?
@@ -160,8 +163,9 @@ impl RioState {
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
-            return Err(e)
-                .attach(format!("RIOSend submission failed: fd={fd:?}, handle={handle:?}"));
+            return Err(e).attach(format!(
+                "RIOSend submission failed: fd={fd:?}, handle={handle:?}"
+            ));
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)

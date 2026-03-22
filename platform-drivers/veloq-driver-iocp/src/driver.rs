@@ -266,7 +266,9 @@ impl IocpDriver {
     /// Registers a chunk of memory for RIO operations.
     pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
         use crate::rio::error::RioResultExt;
-        self.rio_state.register_chunk(id, ptr, len).to_io_result("failed to register RIO chunk")?;
+        self.rio_state
+            .register_chunk(id, ptr, len)
+            .to_io_result("failed to register RIO chunk")?;
         Ok(())
     }
 

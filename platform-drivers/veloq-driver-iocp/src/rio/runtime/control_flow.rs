@@ -93,7 +93,12 @@ impl<'a> RioCompletionRouter<'a> {
         }
     }
 
-    fn on_pool_completion(&mut self, actor_key: ActorKey, generation: u32, res: &RIORESULT) -> RioResult<()> {
+    fn on_pool_completion(
+        &mut self,
+        actor_key: ActorKey,
+        generation: u32,
+        res: &RIORESULT,
+    ) -> RioResult<()> {
         let (pool_submissions, remove_actor) = {
             let Some(actor) = self.actors.get_mut(actor_key) else {
                 return Ok(());
@@ -108,12 +113,9 @@ impl<'a> RioCompletionRouter<'a> {
                 rq: actor.rq,
             };
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-            let submissions = pool_manager.handle_completion(
-                udp_mailbox,
-                (slot_key, res),
-                &mut self.comp,
-                &mut ctx,
-            ).attach("failed to handle pool completion")?;
+            let submissions = pool_manager
+                .handle_completion(udp_mailbox, (slot_key, res), &mut self.comp, &mut ctx)
+                .attach("failed to handle pool completion")?;
             let remove = pool_manager.cleanup_drained_pool(&mut ctx);
             (submissions, remove)
         };
@@ -128,7 +130,12 @@ impl<'a> RioCompletionRouter<'a> {
         Ok(())
     }
 
-    fn handle_op_completion(&mut self, user_data: usize, generation: u32, res: &RIORESULT) -> RioResult<()> {
+    fn handle_op_completion(
+        &mut self,
+        user_data: usize,
+        generation: u32,
+        res: &RIORESULT,
+    ) -> RioResult<()> {
         let ops = &mut self.comp.ops;
 
         if user_data < ops.local.len() {

@@ -7,7 +7,7 @@ pub(crate) mod datapath;
 
 use crate::net::addr::SockAddrStorage;
 use crate::rio::core::submit_ops::RioBufferId;
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{SlotMap, new_key_type};
 use std::collections::VecDeque;
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Networking::WinSock::RIORESULT;

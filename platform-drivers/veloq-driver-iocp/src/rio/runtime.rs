@@ -174,8 +174,7 @@ impl RioState {
             .submit_send_ex(rq, &data_buf, &addr_buf, request_context)
         {
             Self::free_op_req_ctx(request_context as u64);
-            return Err(e)
-                .attach(format!("RIOSendEx failed for fd={fd:?}"));
+            return Err(e).attach(format!("RIOSendEx failed for fd={fd:?}"));
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
@@ -227,12 +226,9 @@ impl RioState {
             .attach("actor not found")?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-        let (res, pool_submissions) = pool_manager.try_submit_pool_recv(
-            udp_mailbox,
-            stream_op,
-            (user_data, generation),
-            &mut ctx,
-        ).map_err(|e| io::Error::other(e.to_string()))
+        let (res, pool_submissions) = pool_manager
+            .try_submit_pool_recv(udp_mailbox, stream_op, (user_data, generation), &mut ctx)
+            .map_err(|e| io::Error::other(e.to_string()))
             .change_context(RioError::Internal)
             .attach("pool submission failed")?;
 
@@ -290,12 +286,9 @@ impl RioState {
         let user_data = sidecar.user_data;
         let generation = sidecar.generation;
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-        let (res, pool_submissions, immediate_copied) = pool_manager.try_submit_pool_recv_recv(
-            udp_mailbox,
-            recv_op,
-            (user_data, generation),
-            &mut ctx,
-        ).map_err(|e| io::Error::other(e.to_string()))
+        let (res, pool_submissions, immediate_copied) = pool_manager
+            .try_submit_pool_recv_recv(udp_mailbox, recv_op, (user_data, generation), &mut ctx)
+            .map_err(|e| io::Error::other(e.to_string()))
             .change_context(RioError::Internal)
             .attach("pool submission failed")?;
 
@@ -328,7 +321,8 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         let (fd, handle) = target;
-        let _ = self.ensure_actor((fd, handle), env)
+        let _ = self
+            .ensure_actor((fd, handle), env)
             .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
         let key = self
             .actor_by_handle
@@ -345,7 +339,8 @@ impl RioState {
             .map_err(|e| e.to_io_error("RIO refill pool failed"))?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &actor.udp_mailbox);
-        let pool_submissions = pool_manager.try_refill_pool(udp_mailbox, buf, &mut ctx)
+        let pool_submissions = pool_manager
+            .try_refill_pool(udp_mailbox, buf, &mut ctx)
             .map_err(|e| io::Error::other(e.to_string()))
             .map_err(|e| error_stack::Report::new(RioError::Internal).attach(e.to_string()))
             .map_err(|e| e.to_io_error("RIO refill pool failed"))?;

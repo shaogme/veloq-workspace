@@ -10,9 +10,9 @@
 //! intentionally avoids actor scheduling or completion routing policy.
 
 use crate::IoFd;
-use crate::rio::error::{RioError, RioResult};
 use crate::rio::RioEnv;
 use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
+use crate::rio::error::{RioError, RioResult};
 use error_stack::ResultExt;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
@@ -130,8 +130,9 @@ impl RioRegistry {
                 .registration_stats
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(error_stack::Report::new(RioError::ResourceExhaustion))
-                .attach(format!("RIO chunk registration skipped due to recent failure: chunk_id={id}"));
+            return Err(error_stack::Report::new(RioError::ResourceExhaustion)).attach(format!(
+                "RIO chunk registration skipped due to recent failure: chunk_id={id}"
+            ));
         }
 
         let (ptr, len) = mem;
@@ -161,8 +162,11 @@ impl RioRegistry {
                     .saturating_add(1);
                 self.chunk_register_failures_recent
                     .insert(id, Instant::now());
-                return Err(e).change_context(RioError::BufferRegistration)
-                    .attach(format!("RIORegisterBuffer failed: chunk_id={id}, len={len}"));
+                return Err(e)
+                    .change_context(RioError::BufferRegistration)
+                    .attach(format!(
+                        "RIORegisterBuffer failed: chunk_id={id}, len={len}"
+                    ));
             }
         };
 
@@ -187,12 +191,17 @@ impl RioRegistry {
 
         if self.slab_rio_pages[page_idx].is_none() {
             if let Some((ptr, len)) = resolver(page_idx) {
-                let id = env.dispatch.register_buffer(ptr, len as u32)
-                    .attach(format!("RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"))?;
+                let id = env
+                    .dispatch
+                    .register_buffer(ptr, len as u32)
+                    .attach(format!(
+                        "RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"
+                    ))?;
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize, len));
             } else {
-                return Err(error_stack::Report::new(RioError::Internal))
-                    .attach(format!("RIO slab page not found in registry: page_idx={page_idx}"));
+                return Err(error_stack::Report::new(RioError::Internal)).attach(format!(
+                    "RIO slab page not found in registry: page_idx={page_idx}"
+                ));
             }
         }
         Ok(())
@@ -208,19 +217,21 @@ impl RioRegistry {
         let max_outstanding_recvs = self.rq_depth;
         let max_outstanding_sends = self.rq_depth;
 
-        env.dispatch.create_rq(RioRqConfig {
-            socket: handle as usize,
-            max_outstanding_recvs,
-            max_receive_data_buffers: 1,
-            max_outstanding_sends,
-            max_send_data_buffers: 1,
-            recv_cq: env.cq,
-            send_cq: env.cq,
-            context: std::ptr::null(),
-        }).attach(format!(
-            "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",
-            self.rq_depth
-        ))
+        env.dispatch
+            .create_rq(RioRqConfig {
+                socket: handle as usize,
+                max_outstanding_recvs,
+                max_receive_data_buffers: 1,
+                max_outstanding_sends,
+                max_send_data_buffers: 1,
+                recv_cq: env.cq,
+                send_cq: env.cq,
+                context: std::ptr::null(),
+            })
+            .attach(format!(
+                "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",
+                self.rq_depth
+            ))
     }
 
     pub(crate) fn deregister_heap_buf(&mut self, buf: &FixedBuf, _env: RioEnv<'_>) {
