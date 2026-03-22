@@ -55,6 +55,8 @@ pub enum RioError {
     Datapath,
     /// 资源分配失败（如超出 RIO 限制）
     ResourceExhaustion,
+    /// 操作不支持 (如 RIO 未能初始化)
+    NotSupported,
     /// 内部逻辑一致性错误
     Internal,
 }
@@ -68,6 +70,7 @@ impl fmt::Display for RioError {
             Self::RqCreation => write!(f, "failed to create RIO request queue"),
             Self::Datapath => write!(f, "RIO datapath operation error"),
             Self::ResourceExhaustion => write!(f, "RIO resource limit reached"),
+            Self::NotSupported => write!(f, "RIO not supported or initialized"),
             Self::Internal => write!(f, "RIO internal inconsistency"),
         }
     }

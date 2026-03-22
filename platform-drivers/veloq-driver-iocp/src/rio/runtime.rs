@@ -70,11 +70,6 @@ impl RioState {
         }
     }
 
-    #[inline]
-    pub(crate) fn clear_iocp_fallback(&mut self, handle: HANDLE) {
-        self.udp_iocp_fallback_handles.remove(&handle);
-    }
-
     fn validate_rio_addr(
         addr_ptr: *const std::ffi::c_void,
         addr_len: i32,

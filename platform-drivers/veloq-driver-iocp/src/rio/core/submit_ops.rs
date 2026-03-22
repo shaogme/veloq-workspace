@@ -15,7 +15,7 @@ use crate::BufferRegistrationMode;
 use crate::ext::Extensions;
 use crate::ops::submit::SubmissionResult;
 use crate::rio::core::registry::RioRegistry;
-use crate::rio::error::{RioDiag, RioReportExt, RioResult};
+use crate::rio::error::{RioDiag, RioError, RioReportExt, RioResult};
 use crate::rio::{RioEnv, RioState, RioTarget};
 use error_stack::ResultExt;
 use std::io;
@@ -85,9 +85,10 @@ impl RioState {
             generation,
             buf_offset,
         } = target;
-        let Some(dispatch) = self.kernel.dispatch else {
-            return Ok(SubmissionResult::Pending);
-        };
+        let dispatch = self.kernel.dispatch.ok_or_else(|| {
+            error_stack::Report::new(RioError::NotSupported)
+                .attach("RIO not supported or dispatch table missing")
+        })?;
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -174,9 +175,10 @@ impl RioState {
             generation,
             buf_offset,
         } = target;
-        let Some(dispatch) = self.kernel.dispatch else {
-            return Ok(SubmissionResult::Pending);
-        };
+        let dispatch = self.kernel.dispatch.ok_or_else(|| {
+            error_stack::Report::new(RioError::NotSupported)
+                .attach("RIO not supported or dispatch table missing")
+        })?;
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,

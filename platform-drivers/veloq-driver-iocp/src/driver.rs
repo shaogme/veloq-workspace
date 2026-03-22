@@ -397,6 +397,7 @@ impl IocpDriver {
                 e.to_io_error("failed to drain RIO outstanding requests")
             })?;
         }
+        self.rio_state.kernel.close();
         self.closed = true;
         Ok(())
     }

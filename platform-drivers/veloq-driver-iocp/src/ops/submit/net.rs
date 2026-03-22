@@ -64,9 +64,6 @@ pub(crate) fn submit_recv(
         };
         match fallback_res {
             Ok(res) => return Ok(res),
-            Err(err) if err.raw_os_error() == Some(10038) => {
-                ctx.rio.clear_iocp_fallback(handle);
-            }
             Err(err) => {
                 return Err(io_error(
                     IocpErrorContext::Submission,
@@ -117,30 +114,6 @@ pub(crate) fn submit_recv(
             };
             match fallback_res {
                 Ok(res) => Ok(res),
-                Err(err) if err.raw_os_error() == Some(10038) => {
-                    ctx.rio.clear_iocp_fallback(handle);
-                    let retry = ctx.rio.try_submit_recv(
-                        RioTarget {
-                            fd: val.fd,
-                            handle,
-                            user_data: header.user_data,
-                            generation: header.generation,
-                            buf_offset: val.buf_offset,
-                        },
-                        &mut val.buf,
-                        ctx.registrar,
-                    );
-                    retry.map_err(|retry_err| {
-                        io_error(
-                            IocpErrorContext::Submission,
-                            retry_err,
-                            format!(
-                                "TCP recv fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-                                val.fd, handle, header.user_data, header.generation
-                            ),
-                        )
-                    })
-                }
                 Err(err) => Err(io_error(
                     IocpErrorContext::Submission,
                     err,
@@ -202,28 +175,6 @@ pub(crate) fn submit_udp_recv(
                 };
                 match fallback_res {
                     Ok(res) => Ok(res),
-                    Err(err) if err.raw_os_error() == Some(10038) => {
-                        ctx.rio.clear_iocp_fallback(handle);
-                        let retry = ctx.rio.try_submit_pool_recv_for_recv(
-                            crate::rio::RioUdpRecvArgs {
-                                fd: val.fd,
-                                handle,
-                                recv_op: val,
-                                sidecar: header,
-                            },
-                            ctx.registrar,
-                        );
-                        retry.map_err(|retry_err| {
-                            io_error(
-                                IocpErrorContext::Submission,
-                                retry_err,
-                                format!(
-                                    "UDP recv fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-                                    val.fd, handle, header.user_data, header.generation
-                                ),
-                            )
-                        })
-                    }
                     Err(err) => Err(io_error(
                         IocpErrorContext::Submission,
                         err,
@@ -269,9 +220,6 @@ pub(crate) fn submit_send(
         };
         match fallback_res {
             Ok(res) => return Ok(res),
-            Err(err) if err.raw_os_error() == Some(10038) => {
-                ctx.rio.clear_iocp_fallback(handle);
-            }
             Err(err) => {
                 return Err(io_error(
                     IocpErrorContext::Submission,
@@ -322,30 +270,6 @@ pub(crate) fn submit_send(
             };
             match fallback_res {
                 Ok(res) => Ok(res),
-                Err(err) if err.raw_os_error() == Some(10038) => {
-                    ctx.rio.clear_iocp_fallback(handle);
-                    let retry = ctx.rio.try_submit_send(
-                        RioTarget {
-                            fd: val.fd,
-                            handle,
-                            user_data: header.user_data,
-                            generation: header.generation,
-                            buf_offset: val.buf_offset,
-                        },
-                        &val.buf,
-                        ctx.registrar,
-                    );
-                    retry.map_err(|retry_err| {
-                        io_error(
-                            IocpErrorContext::Submission,
-                            retry_err,
-                            format!(
-                                "TCP send fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-                                val.fd, handle, header.user_data, header.generation
-                            ),
-                        )
-                    })
-                }
                 Err(err) => Err(io_error(
                     IocpErrorContext::Submission,
                     err,
@@ -416,30 +340,6 @@ pub(crate) fn submit_udp_send(
             };
             match fallback_res {
                 Ok(res) => Ok(res),
-                Err(err) if err.raw_os_error() == Some(10038) => {
-                    ctx.rio.clear_iocp_fallback(handle);
-                    let retry = ctx.rio.try_submit_send(
-                        RioTarget {
-                            fd: val.fd,
-                            handle,
-                            user_data: header.user_data,
-                            generation: header.generation,
-                            buf_offset: val.buf_offset,
-                        },
-                        &val.buf,
-                        ctx.registrar,
-                    );
-                    retry.map_err(|retry_err| {
-                        io_error(
-                            IocpErrorContext::Submission,
-                            retry_err,
-                            format!(
-                                "UDP send fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-                                val.fd, handle, header.user_data, header.generation
-                            ),
-                        )
-                    })
-                }
                 Err(err) => Err(io_error(
                     IocpErrorContext::Submission,
                     err,
@@ -788,29 +688,6 @@ pub(crate) fn submit_udp_recv_stream(
                 };
                 match fallback_res {
                     Ok(res) => Ok(res),
-                    Err(err) if err.raw_os_error() == Some(10038) => {
-                        ctx.rio.clear_iocp_fallback(handle);
-                        let retry = ctx.rio.try_submit_pool_recv(
-                            crate::rio::RioUdpStreamArgs {
-                                fd: val.fd,
-                                handle,
-                                stream_op: val,
-                                user_data: header.user_data,
-                                generation: header.generation,
-                            },
-                            ctx.registrar,
-                        );
-                        retry.map_err(|retry_err| {
-                            io_error(
-                                IocpErrorContext::Submission,
-                                retry_err,
-                                format!(
-                                    "UDP recv_stream fallback got 10038; RIO retry failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-                                    val.fd, handle, header.user_data, header.generation
-                                ),
-                            )
-                        })
-                    }
                     Err(err) => Err(io_error(
                         IocpErrorContext::Submission,
                         err,
