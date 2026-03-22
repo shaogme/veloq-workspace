@@ -7,7 +7,7 @@ use error_stack::ResultExt;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION, RIO_RQ,
-    RIORESULT, SOCKET_ERROR,
+    RIORESULT, SOCKET_ERROR, WSAGetLastError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,9 +185,16 @@ impl RioProvider for RioDispatch {
             )
         };
         if rq == 0 {
-            return Err(RioState::last_wsa_error())
+            // SAFETY: WSAGetLastError is safe to call here.
+            let wsa_err = unsafe { WSAGetLastError() };
+            if wsa_err == 0 {
+                return Err(error_stack::Report::new(RioError::Internal))
+                    .attach("RIOCreateRequestQueue failed with WSAGetLastError=0")
+                    .attach("wsa_class=zero_wsa");
+            }
+            return Err(std::io::Error::from_raw_os_error(wsa_err))
                 .change_context(RioError::RqCreation)
-                .attach("RIOCreateRequestQueue failed");
+                .attach(format!("RIOCreateRequestQueue failed: wsa_error={wsa_err}"));
         }
         Ok(RioRq(rq))
     }
@@ -269,9 +276,16 @@ impl RioProvider for RioDispatch {
         // SAFETY: Function pointer is verified at startup.
         let ret = unsafe { (self.send)(rq.0, buf as *const _, num_bufs, flags, context) };
         if ret == 0 {
-            return Err(RioState::last_wsa_error())
+            // SAFETY: WSAGetLastError is safe to call here.
+            let wsa_err = unsafe { WSAGetLastError() };
+            if wsa_err == 0 {
+                return Err(error_stack::Report::new(RioError::Internal))
+                    .attach("RIOSend failed with WSAGetLastError=0")
+                    .attach("wsa_class=zero_wsa");
+            }
+            return Err(std::io::Error::from_raw_os_error(wsa_err))
                 .change_context(RioError::Datapath)
-                .attach("RIOSend failed");
+                .attach(format!("RIOSend failed: wsa_error={wsa_err}"));
         }
         Ok(())
     }

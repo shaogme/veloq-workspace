@@ -165,7 +165,6 @@ impl IocpDriver {
                     let mut guard = slot.complete();
                     *op_in = guard.take_op();
                 }
-                ops.remove(user_data);
                 binder.err(e, SubmitStatus::Void)
             }
         }
@@ -272,9 +271,10 @@ impl IocpDriver {
         Ok(())
     }
 
-    /// Shuts down the UDP buffer pool associated with the specified handle.
-    pub fn shutdown_udp_pool(&mut self, handle: RawHandle) {
-        self.rio_state.shutdown_udp_pool(handle.handle);
+    /// Shuts down the RIO actor associated with the specified socket handle.
+    /// This is used by both TCP and UDP teardown paths.
+    pub fn shutdown_actor(&mut self, handle: RawHandle) {
+        self.rio_state.shutdown_actor(handle.handle);
     }
 
     /// Registers a set of file/socket handles for use with the driver.
@@ -438,11 +438,14 @@ impl Driver for IocpDriver {
     }
 
     fn slot_take_payload(&mut self, user_data: usize) -> Option<ErasedPayload> {
-        self.ops
+        let payload = self
+            .ops
             .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
                 payload_cell.take()
             })
-            .flatten()
+            .flatten();
+        self.ops.remove(user_data);
+        payload
     }
 
     fn submit(

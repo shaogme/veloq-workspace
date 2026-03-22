@@ -606,8 +606,7 @@ impl UdpRecvPool {
     ) -> RioResult<usize> {
         let (slot_key, res) = completion;
 
-        if res.Status == 0
-            && res.BytesTransferred > 0
+        if Self::is_datagram_completion(res)
             && let Some(waiter) = mailbox.waiters.pop_front()
             && let Some(n) =
                 self.try_fast_deliver(mailbox, waiter, (slot_key, res), comp, ctx, registry)?
@@ -714,14 +713,11 @@ impl UdpRecvPool {
                             slot.in_flight = false;
                             delivered = true;
                         }
-                        Err(returned_buf) => {
-                            mailbox.queue.push_back(UdpPoolPacket {
-                                buf: returned_buf,
-                                addr: *slot.addr,
-                                addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
-                            });
+                        Err(_returned_buf) => {
+                            slab.free_indices.push_front(slot.current_idx);
+                            slot.current_idx = idx;
                             slot.in_flight = false;
-                            delivered = true;
+                            delivered = false;
                         }
                     }
                 }

@@ -10,7 +10,7 @@ use crate::rio::core::submit_ops::RioBufferId;
 use slotmap::{SlotMap, new_key_type};
 use std::collections::VecDeque;
 use veloq_buf::FixedBuf;
-use windows_sys::Win32::Networking::WinSock::RIORESULT;
+use windows_sys::Win32::Networking::WinSock::{RIORESULT, WSAEMSGSIZE};
 
 new_key_type! {
     pub(crate) struct SlotKey;
@@ -133,6 +133,11 @@ pub(super) struct CompletionActions {
 }
 
 impl UdpRecvPool {
+    #[inline]
+    pub(super) fn is_datagram_completion(res: &RIORESULT) -> bool {
+        (res.Status == 0 || res.Status == WSAEMSGSIZE as i32) && res.BytesTransferred > 0
+    }
+
     pub(crate) fn uninit() -> Self {
         Self {
             slots: SlotMap::with_key(),
@@ -163,7 +168,7 @@ impl UdpRecvPool {
             return PoolCompletionEvent::DrainingAck;
         }
 
-        if !(res.Status == 0 && res.BytesTransferred > 0) {
+        if !Self::is_datagram_completion(res) {
             return PoolCompletionEvent::ReceivedNoDatagram;
         }
 

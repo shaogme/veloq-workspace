@@ -8,7 +8,7 @@ use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
 use crate::rio::core::{RioOpCtxGuard, RioPoolCtxGuard};
-use crate::rio::error::{RioError, RioReportExt, RioResult};
+use crate::rio::error::{RioDiag, RioError, RioReportExt, RioResult};
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager, UdpPoolState};
@@ -16,6 +16,7 @@ use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState};
 use error_stack::ResultExt;
 use slotmap::SlotMap;
 use std::io;
+use tracing::error;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
@@ -247,7 +248,40 @@ impl RioState {
                 .attach("failed to retrieve indexed actor");
         }
 
-        let rq = self.registry.create_rq((handle, fd), env)?;
+        let rq = self.registry.create_rq((handle, fd), env).map_err(|e| {
+            let source = e.to_string();
+            let wsa_class = RioDiag::wsa_class_from_text(&source);
+            let diag = RioDiag::new("ensure_actor_create_rq")
+                .field("fd", format!("{fd:?}"))
+                .field("handle", format!("{handle:?}"))
+                .field("socket_raw", format!("0x{:x}", handle as usize))
+                .field("rq_depth", self.registry.rq_depth)
+                .field("max_outstanding_recvs", self.registry.rq_depth)
+                .field("max_outstanding_sends", self.registry.rq_depth)
+                .field("max_receive_data_buffers", 1_u32)
+                .field("max_send_data_buffers", 1_u32)
+                .field("outstanding_count", self.outstanding_count)
+                .field("actors_len", self.actors.len())
+                .field("actor_index_hit", self.actor_by_handle.contains_key(&handle))
+                .field("wsa_class", wsa_class);
+            error!(
+                fd = ?fd,
+                handle = ?handle,
+                socket_raw = handle as usize,
+                rq_depth = self.registry.rq_depth,
+                max_outstanding_recvs = self.registry.rq_depth,
+                max_outstanding_sends = self.registry.rq_depth,
+                max_receive_data_buffers = 1_u32,
+                max_send_data_buffers = 1_u32,
+                outstanding_count = self.outstanding_count,
+                actors_len = self.actors.len(),
+                actor_index_hit = self.actor_by_handle.contains_key(&handle),
+                wsa_class = wsa_class,
+                rio_error = %e,
+                "RIOCreateRequestQueue failed diagnostics"
+            );
+            e.attach(diag.to_string())
+        })?;
         let key = self.actors.insert(RioSocketActor::new(handle, rq));
         self.actor_by_handle.insert(handle, key);
         self.actors
@@ -256,7 +290,7 @@ impl RioState {
             .attach("failed to retrieve inserted actor")
     }
 
-    pub(crate) fn shutdown_udp_pool(&mut self, handle: HANDLE) {
+    pub(crate) fn shutdown_actor(&mut self, handle: HANDLE) {
         self.udp_iocp_fallback_handles.remove(&handle);
         let Some(key) = self.actor_by_handle.get(&handle).copied() else {
             return;

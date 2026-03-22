@@ -18,7 +18,9 @@ impl Drop for InnerSocket {
             if let Some(ctx) = crate::runtime::context::try_current()
                 && let Some(driver) = ctx.driver().upgrade()
             {
-                driver.borrow_mut().shutdown_udp_pool(self.0);
+                // Socket teardown must clear the RIO actor for both TCP and UDP
+                // to avoid stale actor state when handle values are reused.
+                driver.borrow_mut().shutdown_actor(self.0);
             }
         }
         let _ = unsafe { Socket::from_raw(self.0) };

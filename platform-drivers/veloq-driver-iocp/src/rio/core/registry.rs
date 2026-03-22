@@ -12,7 +12,7 @@
 use crate::IoFd;
 use crate::rio::RioEnv;
 use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
-use crate::rio::error::{RioError, RioResult};
+use crate::rio::error::{RioDiag, RioError, RioResult};
 use error_stack::ResultExt;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
@@ -227,6 +227,19 @@ impl RioRegistry {
                 recv_cq: env.cq,
                 send_cq: env.cq,
                 context: std::ptr::null(),
+            })
+            .map_err(|e| {
+                let source = e.to_string();
+                let wsa_class = RioDiag::wsa_class_from_text(&source);
+                let diag = RioDiag::new("create_rq")
+                    .field("socket_raw", format!("0x{:x}", handle as usize))
+                    .field("rq_depth", self.rq_depth)
+                    .field("max_outstanding_recvs", max_outstanding_recvs)
+                    .field("max_outstanding_sends", max_outstanding_sends)
+                    .field("max_receive_data_buffers", 1_u32)
+                    .field("max_send_data_buffers", 1_u32)
+                    .field("wsa_class", wsa_class);
+                e.attach(diag.to_string())
             })
             .attach(format!(
                 "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",

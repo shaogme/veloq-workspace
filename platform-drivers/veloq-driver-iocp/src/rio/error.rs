@@ -1,6 +1,45 @@
 use error_stack::Report;
 use std::fmt;
 
+#[derive(Debug, Clone)]
+pub struct RioDiag {
+    scope: &'static str,
+    fields: Vec<(&'static str, String)>,
+}
+
+impl RioDiag {
+    pub fn new(scope: &'static str) -> Self {
+        Self {
+            scope,
+            fields: Vec::new(),
+        }
+    }
+
+    pub fn field(mut self, key: &'static str, value: impl ToString) -> Self {
+        self.fields.push((key, value.to_string()));
+        self
+    }
+
+    #[inline]
+    pub fn wsa_class_from_text(text: &str) -> &'static str {
+        if text.contains("wsa_class=zero_wsa") || text.contains("WSAGetLastError=0") {
+            "zero_wsa"
+        } else {
+            "nonzero_or_unknown_wsa"
+        }
+    }
+}
+
+impl fmt::Display for RioDiag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "rio_diag(scope={}", self.scope)?;
+        for (k, v) in &self.fields {
+            write!(f, ", {}={}", k, v)?;
+        }
+        write!(f, ")")
+    }
+}
+
 /// RIO 模块特定的错误上下文
 #[derive(Debug)]
 pub enum RioError {
@@ -49,7 +88,7 @@ impl RioReportExt for Report<RioError> {
         use crate::common::{IocpErrorContext, io_error};
         let detail = detail.into();
         // 保持与 common.rs 的结构化日志兼容
-        let io_err = std::io::Error::other(self.to_string());
+        let io_err = std::io::Error::other(format!("{self:#}"));
         io_error(IocpErrorContext::Rio, io_err, detail)
     }
 }
