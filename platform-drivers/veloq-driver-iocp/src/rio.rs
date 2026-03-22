@@ -16,7 +16,7 @@ pub(crate) mod runtime;
 use crate::BufferRegistrationMode;
 use crate::IocpOpState;
 use crate::ops::IocpOp;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
 use veloq_driver_core::driver::{SharedCompletionQueue, SharedCompletionTable};
 use veloq_driver_core::op_registry::OpRegistry;
@@ -61,6 +61,5 @@ pub(crate) struct RioState {
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
     pub(crate) actor_by_handle: FxHashMap<HANDLE, ActorKey>,
-    pub(crate) udp_iocp_fallback_handles: FxHashSet<HANDLE>,
     pub(crate) outstanding_count: usize,
 }

@@ -36,6 +36,7 @@ pub(crate) struct RioSocketActor {
     pub(crate) rq: RioRq,
     pub(crate) pool_manager: UdpPoolManager,
     pub(crate) udp_mailbox: UdpMailbox,
+    pub(crate) is_iocp_fallback: bool,
     pub(crate) state: RioActorState,
 }
 
@@ -46,6 +47,7 @@ impl RioSocketActor {
             rq,
             pool_manager: UdpPoolManager::new(),
             udp_mailbox: UdpMailbox::new(),
+            is_iocp_fallback: false,
             state: RioActorState::Active,
         }
     }
@@ -291,7 +293,6 @@ impl RioState {
     }
 
     pub(crate) fn shutdown_actor(&mut self, handle: HANDLE) {
-        self.udp_iocp_fallback_handles.remove(&handle);
         let Some(key) = self.actor_by_handle.get(&handle).copied() else {
             return;
         };
@@ -407,7 +408,6 @@ impl RioState {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             self.actors.clear();
             self.actor_by_handle.clear();
-            self.udp_iocp_fallback_handles.clear();
             return;
         };
         for (key, actor) in self.actors.iter_mut() {
@@ -417,7 +417,6 @@ impl RioState {
         }
         self.actors.clear();
         self.actor_by_handle.clear();
-        self.udp_iocp_fallback_handles.clear();
     }
 
     pub(crate) fn mark_pool_done(

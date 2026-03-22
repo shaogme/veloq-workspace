@@ -53,7 +53,10 @@ pub(crate) struct RioUdpRecvArgs<'a> {
 impl RioState {
     #[inline]
     pub(crate) fn is_iocp_fallback(&self, handle: HANDLE) -> bool {
-        self.udp_iocp_fallback_handles.contains(&handle)
+        self.actor_by_handle
+            .get(&handle)
+            .and_then(|&key| self.actors.get(key))
+            .map_or(false, |actor| actor.is_iocp_fallback)
     }
 
     #[inline]
@@ -66,7 +69,13 @@ impl RioState {
     #[inline]
     pub(crate) fn maybe_mark_iocp_fallback(&mut self, handle: HANDLE, err: &io::Error) {
         if Self::should_demote_socket(err) {
-            self.udp_iocp_fallback_handles.insert(handle);
+            if let Some(actor) = self
+                .actor_by_handle
+                .get(&handle)
+                .and_then(|&key| self.actors.get_mut(key))
+            {
+                actor.is_iocp_fallback = true;
+            }
         }
     }
 

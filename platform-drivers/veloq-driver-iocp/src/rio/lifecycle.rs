@@ -9,7 +9,7 @@ use crate::rio::core::{RioOpCtxGuard, RioPoolCtxGuard};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::control_flow::RioSocketActor;
 use error_stack::ResultExt;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -23,7 +23,6 @@ pub(crate) struct DeferredRioCleanup {
     registration_mode: crate::BufferRegistrationMode,
     actors: SlotMap<ActorKey, RioSocketActor>,
     actor_by_handle: FxHashMap<HANDLE, ActorKey>,
-    udp_iocp_fallback_handles: FxHashSet<HANDLE>,
     outstanding_count: usize,
 }
 
@@ -38,7 +37,6 @@ impl DeferredRioCleanup {
             registration_mode: self.registration_mode,
             actors: self.actors,
             actor_by_handle: self.actor_by_handle,
-            udp_iocp_fallback_handles: self.udp_iocp_fallback_handles,
             outstanding_count: self.outstanding_count,
         };
         state.begin_shutdown();
@@ -152,7 +150,6 @@ impl RioState {
             registration_mode: self.registration_mode,
             actors: std::mem::take(&mut self.actors),
             actor_by_handle: std::mem::take(&mut self.actor_by_handle),
-            udp_iocp_fallback_handles: std::mem::take(&mut self.udp_iocp_fallback_handles),
             outstanding_count: std::mem::take(&mut self.outstanding_count),
         })
     }

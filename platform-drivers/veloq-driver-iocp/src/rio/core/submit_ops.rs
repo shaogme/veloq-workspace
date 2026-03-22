@@ -39,7 +39,6 @@ impl RioState {
             registration_mode,
             actors: slotmap::SlotMap::with_key(),
             actor_by_handle: rustc_hash::FxHashMap::default(),
-            udp_iocp_fallback_handles: rustc_hash::FxHashSet::default(),
             outstanding_count: 0,
         })
     }
