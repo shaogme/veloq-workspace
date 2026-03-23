@@ -6,7 +6,9 @@ pub(crate) mod pool;
 use crate::IoFd;
 use crate::ops::SubmissionResult;
 use crate::rio::error::{RioError, RioReportExt, RioResult};
-use crate::rio::{RioEnv, RioState};
+use crate::rio::{
+    RioEnv, RioState, SocketActorKey, SocketLifecycleState, SocketRuntimeMode, SocketRuntimeState,
+};
 use error_stack::ResultExt;
 use std::io;
 use veloq_driver_core::op::{UdpRecv, UdpRecvStream};
@@ -56,30 +58,73 @@ pub(crate) struct RioUdpRecvArgs<'a> {
 
 impl RioState {
     #[inline]
-    pub(crate) fn is_iocp_fallback(&self, actor_key: (HANDLE, u32)) -> bool {
-        self.actor_by_handle
-            .get(&actor_key)
-            .and_then(|&key| self.actors.get(key))
-            .is_some_and(|actor| actor.is_iocp_fallback)
+    fn socket_runtime_mut(&mut self, actor_key: SocketActorKey) -> &mut SocketRuntimeState {
+        self.socket_runtime.entry(actor_key).or_default()
     }
 
     #[inline]
-    pub(crate) fn needs_iocp_fallback_association(&self, actor_key: (HANDLE, u32)) -> bool {
-        self.actor_by_handle
-            .get(&actor_key)
-            .and_then(|&key| self.actors.get(key))
-            .is_some_and(|actor| actor.is_iocp_fallback && !actor.is_iocp_associated)
+    pub(crate) fn mark_socket_registered(&mut self, actor_key: SocketActorKey) {
+        let state = self.socket_runtime_mut(actor_key);
+        state.lifecycle = SocketLifecycleState::Open;
     }
 
     #[inline]
-    pub(crate) fn mark_iocp_fallback_associated(&mut self, actor_key: (HANDLE, u32)) {
-        if let Some(actor) = self
-            .actor_by_handle
-            .get(&actor_key)
-            .and_then(|&key| self.actors.get_mut(key))
-            && actor.is_iocp_fallback
+    pub(crate) fn mark_socket_closing(&mut self, actor_key: SocketActorKey) {
+        let state = self.socket_runtime_mut(actor_key);
+        state.lifecycle = SocketLifecycleState::Closing;
+    }
+
+    #[inline]
+    pub(crate) fn try_acquire_socket_inflight(&mut self, actor_key: SocketActorKey) -> bool {
+        let state = self.socket_runtime_mut(actor_key);
+        if state.lifecycle == SocketLifecycleState::Closing {
+            return false;
+        }
+        state.inflight = state.inflight.saturating_add(1);
+        true
+    }
+
+    #[inline]
+    pub(crate) fn release_socket_inflight(&mut self, actor_key: SocketActorKey) {
+        if let Some(state) = self.socket_runtime.get_mut(&actor_key)
+            && state.inflight > 0
         {
-            actor.is_iocp_associated = true;
+            state.inflight -= 1;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn socket_ready_for_cleanup(&self, actor_key: SocketActorKey) -> bool {
+        self.socket_runtime.get(&actor_key).is_none_or(|state| {
+            state.lifecycle == SocketLifecycleState::Closing && state.inflight == 0
+        })
+    }
+
+    #[inline]
+    pub(crate) fn forget_socket_runtime(&mut self, actor_key: SocketActorKey) {
+        self.socket_runtime.remove(&actor_key);
+    }
+
+    #[inline]
+    pub(crate) fn is_iocp_fallback(&self, actor_key: SocketActorKey) -> bool {
+        self.socket_runtime
+            .get(&actor_key)
+            .is_some_and(|state| state.mode == SocketRuntimeMode::IocpFallback)
+    }
+
+    #[inline]
+    pub(crate) fn needs_iocp_fallback_association(&self, actor_key: SocketActorKey) -> bool {
+        self.socket_runtime.get(&actor_key).is_some_and(|state| {
+            state.mode == SocketRuntimeMode::IocpFallback && !state.iocp_associated
+        })
+    }
+
+    #[inline]
+    pub(crate) fn mark_iocp_fallback_associated(&mut self, actor_key: SocketActorKey) {
+        if let Some(state) = self.socket_runtime.get_mut(&actor_key)
+            && state.mode == SocketRuntimeMode::IocpFallback
+        {
+            state.iocp_associated = true;
         }
     }
 
@@ -108,15 +153,11 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn maybe_mark_iocp_fallback(&mut self, actor_key: (HANDLE, u32), err: &io::Error) {
-        if Self::should_demote_socket(err)
-            && let Some(actor) = self
-                .actor_by_handle
-                .get(&actor_key)
-                .and_then(|&key| self.actors.get_mut(key))
-        {
-            actor.is_iocp_fallback = true;
-            actor.is_iocp_associated = false;
+    pub(crate) fn maybe_mark_iocp_fallback(&mut self, actor_key: SocketActorKey, err: &io::Error) {
+        if Self::should_demote_socket(err) {
+            let state = self.socket_runtime_mut(actor_key);
+            state.mode = SocketRuntimeMode::IocpFallback;
+            state.iocp_associated = false;
         }
     }
 
@@ -198,12 +239,15 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let actor = self.ensure_actor((fd, handle, socket_generation), env)?;
-        if actor.is_iocp_fallback {
+        let rq = {
+            let actor = self.ensure_actor((fd, handle, socket_generation), env)?;
+            actor.rq
+        };
+        let socket_key = SocketActorKey::new(handle, socket_generation);
+        if self.is_iocp_fallback(socket_key) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }
-        let rq = actor.rq;
         let data_buf = self.registry.prepare_submission(
             buf,
             buf_offset,
@@ -270,14 +314,15 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let actor = self.ensure_actor((fd, handle, socket_generation), env)?;
-        if actor.is_iocp_fallback {
+        self.ensure_actor((fd, handle, socket_generation), env)?;
+        let socket_key = SocketActorKey::new(handle, socket_generation);
+        if self.is_iocp_fallback(socket_key) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }
         let key = self
             .actor_by_handle
-            .get(&(handle, socket_generation))
+            .get(&socket_key)
             .copied()
             .ok_or_else(|| error_stack::Report::new(RioError::Internal))
             .attach("actor not found")?;
@@ -330,14 +375,15 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let actor = self.ensure_actor((fd, handle, socket_generation), env)?;
-        if actor.is_iocp_fallback {
+        self.ensure_actor((fd, handle, socket_generation), env)?;
+        let socket_key = SocketActorKey::new(handle, socket_generation);
+        if self.is_iocp_fallback(socket_key) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }
         let key = self
             .actor_by_handle
-            .get(&(handle, socket_generation))
+            .get(&socket_key)
             .copied()
             .ok_or_else(|| error_stack::Report::new(RioError::Internal))
             .attach("actor not found")?;

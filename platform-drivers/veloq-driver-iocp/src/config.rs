@@ -1,3 +1,4 @@
+use crate::rio::SocketActorKey;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use veloq_buf::nz;
@@ -112,8 +113,8 @@ impl RawHandle {
     }
 
     #[inline]
-    pub const fn actor_key(self) -> (HANDLE, u32) {
-        (self.handle, self.generation)
+    pub(crate) const fn actor_key(self) -> SocketActorKey {
+        SocketActorKey::new(self.handle, self.generation)
     }
 }
 

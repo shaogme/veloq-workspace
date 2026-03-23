@@ -12,7 +12,9 @@ use crate::rio::error::{RioDiag, RioError, RioReportExt, RioResult};
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager, UdpPoolState};
-use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState, SocketActorKey};
+use crate::rio::{
+    ActorKey, RioCompletionContext, RioContext, RioEnv, RioState, SocketActorKey, SocketRuntimeMode,
+};
 use error_stack::ResultExt;
 use slotmap::SlotMap;
 use std::io;
@@ -37,8 +39,6 @@ pub(crate) struct RioSocketActor {
     pub(crate) rq: RioRq,
     pub(crate) pool_manager: UdpPoolManager,
     pub(crate) udp_mailbox: UdpMailbox,
-    pub(crate) is_iocp_fallback: bool,
-    pub(crate) is_iocp_associated: bool,
     pub(crate) is_explicit_shutdown: bool,
     pub(crate) state: RioActorState,
 }
@@ -51,8 +51,6 @@ impl RioSocketActor {
             rq,
             pool_manager: UdpPoolManager::new(),
             udp_mailbox: UdpMailbox::new(),
-            is_iocp_fallback: false,
-            is_iocp_associated: false,
             is_explicit_shutdown: false,
             state: RioActorState::Active,
         }
@@ -60,7 +58,7 @@ impl RioSocketActor {
 
     #[inline]
     pub(crate) const fn socket_key(&self) -> SocketActorKey {
-        (self.handle, self.socket_generation)
+        SocketActorKey::new(self.handle, self.socket_generation)
     }
 }
 
@@ -255,7 +253,7 @@ impl RioState {
         env: RioEnv<'_>,
     ) -> RioResult<&mut RioSocketActor> {
         let (fd, handle, socket_generation) = target;
-        let socket_key = (handle, socket_generation);
+        let socket_key = SocketActorKey::new(handle, socket_generation);
         if let Some(key) = self.actor_by_handle.get(&socket_key).copied() {
             return self
                 .actors
@@ -306,10 +304,16 @@ impl RioState {
             }
         };
 
-        let mut actor = RioSocketActor::new(handle, socket_generation, rq);
-        actor.is_iocp_fallback = is_fallback;
+        let actor = RioSocketActor::new(handle, socket_generation, rq);
         let key = self.actors.insert(actor);
         self.actor_by_handle.insert(socket_key, key);
+        let state = self.socket_runtime.entry(socket_key).or_default();
+        state.mode = if is_fallback {
+            SocketRuntimeMode::IocpFallback
+        } else {
+            SocketRuntimeMode::RioPreferred
+        };
+        state.iocp_associated = false;
         self.actors
             .get_mut(key)
             .ok_or_else(|| error_stack::Report::new(RioError::Internal))
@@ -355,6 +359,7 @@ impl RioState {
 
     pub(crate) fn begin_shutdown(&mut self) {
         self.actor_by_handle.clear();
+        self.socket_runtime.clear();
         let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)
@@ -461,6 +466,7 @@ impl RioState {
             // when the socket is closed (which happens in veloq-runtime).
         }
         self.actor_by_handle.clear();
+        self.socket_runtime.clear();
     }
 
     pub(crate) fn mark_pool_done(
@@ -491,8 +497,8 @@ impl RioState {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor_key, actor.rq));
             if actor.pool_manager.cleanup_drained_pool(&mut ctx) {
                 // We ONLY remove the actor from the store if it's explicitly shutting down.
-                // If it's just a pool drain due to fallback, we keep the actor (and its is_iocp_fallback=true state)
-                // until the socket itself is dropped.
+                // If it's just a pool drain due to fallback, we keep the actor state until the
+                // socket itself is dropped.
                 actor.is_explicit_shutdown
             } else {
                 false

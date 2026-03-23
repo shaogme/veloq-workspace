@@ -16,7 +16,7 @@ use crate::ext::Extensions;
 use crate::ops::submit::SubmissionResult;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::error::{RioDiag, RioError, RioReportExt, RioResult};
-use crate::rio::{RioEnv, RioState, RioTarget};
+use crate::rio::{RioEnv, RioState, RioTarget, SocketActorKey};
 use error_stack::ResultExt;
 use std::io;
 use tracing::error;
@@ -39,6 +39,7 @@ impl RioState {
             registration_mode,
             actors: slotmap::SlotMap::with_key(),
             actor_by_handle: rustc_hash::FxHashMap::default(),
+            socket_runtime: rustc_hash::FxHashMap::default(),
             outstanding_count: 0,
         })
     }
@@ -95,14 +96,16 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        let actor = self
-            .ensure_actor((fd, handle, socket_generation), env)
-            .attach("failed to ensure RIO actor")?;
-        if actor.is_iocp_fallback {
+        let rq = {
+            let actor = self
+                .ensure_actor((fd, handle, socket_generation), env)
+                .attach("failed to ensure RIO actor")?;
+            actor.rq
+        };
+        if self.is_iocp_fallback(SocketActorKey::new(handle, socket_generation)) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }
-        let rq = actor.rq;
         let rio_buf = self.registry.prepare_submission(
             buf,
             buf_offset,
@@ -173,13 +176,12 @@ impl RioState {
                 })
                 .attach("failed to ensure RIO actor")?;
 
-            if actor.is_iocp_fallback {
-                return Err(error_stack::Report::new(RioError::NotSupported))
-                    .attach("Socket is marked for IOCP fallback");
-            }
-
             (actor.rq, format!("{:?}", actor.state))
         };
+        if self.is_iocp_fallback(SocketActorKey::new(handle, socket_generation)) {
+            return Err(error_stack::Report::new(RioError::NotSupported))
+                .attach("Socket is marked for IOCP fallback");
+        }
         let rio_buf = self.registry.prepare_submission(
             buf,
             buf_offset,

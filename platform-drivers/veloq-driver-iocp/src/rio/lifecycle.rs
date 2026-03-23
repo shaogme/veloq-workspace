@@ -23,6 +23,7 @@ pub(crate) struct DeferredRioCleanup {
     registration_mode: crate::BufferRegistrationMode,
     actors: SlotMap<ActorKey, RioSocketActor>,
     actor_by_handle: FxHashMap<SocketActorKey, ActorKey>,
+    socket_runtime: FxHashMap<SocketActorKey, crate::rio::SocketRuntimeState>,
     outstanding_count: usize,
 }
 
@@ -37,6 +38,7 @@ impl DeferredRioCleanup {
             registration_mode: self.registration_mode,
             actors: self.actors,
             actor_by_handle: self.actor_by_handle,
+            socket_runtime: self.socket_runtime,
             outstanding_count: self.outstanding_count,
         };
         state.begin_shutdown();
@@ -150,6 +152,7 @@ impl RioState {
             registration_mode: self.registration_mode,
             actors: std::mem::take(&mut self.actors),
             actor_by_handle: std::mem::take(&mut self.actor_by_handle),
+            socket_runtime: std::mem::take(&mut self.socket_runtime),
             outstanding_count: std::mem::take(&mut self.outstanding_count),
         })
     }

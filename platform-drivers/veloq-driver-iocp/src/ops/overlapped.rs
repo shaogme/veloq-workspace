@@ -1,5 +1,5 @@
-use crate::win32::Overlapped;
 use crate::RawHandle;
+use crate::win32::Overlapped;
 use std::io;
 
 /// A wrapper for the Windows OVERLAPPED structure with additional metadata.

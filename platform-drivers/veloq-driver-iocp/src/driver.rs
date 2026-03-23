@@ -28,7 +28,7 @@ use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 use crate::rio::SocketActorKey;
 pub use inner::IocpDriver;
-use inner::{CONTROL_EVENT_KEY, RIO_EVENT_KEY, SocketLifecycleState};
+use inner::{CONTROL_EVENT_KEY, RIO_EVENT_KEY};
 
 // ============================================================================
 // State & Lifecycle Types
@@ -47,8 +47,6 @@ pub struct IocpOpState {
     pub(crate) rio_drained: bool,
     // recv_from served by internal RIO UDP pre-post pool; no per-op kernel I/O in flight.
     pub(crate) rio_pool_waiting: bool,
-    // Socket actor key tracked for per-socket in-flight lifecycle counting.
-    pub(crate) socket_key: Option<SocketActorKey>,
 }
 
 /// Closing mode for the driver or operations.
@@ -122,43 +120,35 @@ impl IocpDriver {
         SocketLifecycleHandle::new(self.port.clone())
     }
 
-    fn socket_lifecycle_cell_mut(
-        &mut self,
-        socket_key: (windows_sys::Win32::Foundation::HANDLE, u32),
-    ) -> &mut inner::SocketLifecycleCell {
-        self.socket_lifecycle
-            .entry(socket_key)
-            .or_insert_with(inner::SocketLifecycleCell::default)
-    }
-
-    fn track_socket_submit_pending(&mut self, user_data: usize, key: (windows_sys::Win32::Foundation::HANDLE, u32)) {
-        let cell = self.socket_lifecycle_cell_mut(key);
-        cell.in_flight = cell.in_flight.saturating_add(1);
-        if let Some((_, op_entry)) = self.ops.get_slot_and_entry_mut(user_data) {
-            op_entry.platform_data.socket_key = Some(key);
-        }
+    fn track_socket_submit_pending(&mut self, key: SocketActorKey) {
+        let _ = self.rio_state.try_acquire_socket_inflight(key);
     }
 
     pub(crate) fn release_socket_inflight_for_op(&mut self, user_data: usize) {
         let socket_key = self
             .ops
-            .get_slot_and_entry_mut(user_data)
-            .and_then(|(_, op_entry)| op_entry.platform_data.socket_key.take());
+            .get_slot_entry_op_storage_and_entry_mut(user_data)
+            .and_then(|(_, _, op_opt, _)| {
+                let op = op_opt.as_mut()?;
+                if !op.header.in_flight {
+                    return None;
+                }
+                op.header.in_flight = false;
+                op.header
+                    .resolved_handle
+                    .filter(|h| h.generation != 0)
+                    .map(RawHandle::actor_key)
+            });
 
         if let Some(key) = socket_key {
-            if let Some(cell) = self.socket_lifecycle.get_mut(&key)
-                && cell.in_flight > 0
-            {
-                cell.in_flight -= 1;
-            }
+            self.rio_state.release_socket_inflight(key);
             self.drain_deferred_socket_cleanup();
         }
     }
 
     fn schedule_deferred_socket_cleanup(&mut self, handle: RawHandle, registered_fd: Option<IoFd>) {
         let key = handle.actor_key();
-        let cell = self.socket_lifecycle_cell_mut(key);
-        cell.state = SocketLifecycleState::Closing;
+        self.rio_state.mark_socket_closing(key);
         self.deferred_socket_cleanup
             .push_back(inner::DeferredSocketCleanup {
                 handle,
@@ -176,19 +166,14 @@ impl IocpDriver {
             };
 
             let key = pending.handle.actor_key();
-            let ready = self
-                .socket_lifecycle
-                .get(&key)
-                .is_none_or(|cell| {
-                    cell.state == SocketLifecycleState::Closing && cell.in_flight == 0
-                });
+            let ready = self.rio_state.socket_ready_for_cleanup(key);
 
             if ready {
                 self.rio_state.shutdown_actor(key);
                 if let Some(fd) = pending.registered_fd {
                     let _ = self.unregister_files(vec![fd]);
                 }
-                self.socket_lifecycle.remove(&key);
+                self.rio_state.forget_socket_runtime(key);
             } else {
                 self.deferred_socket_cleanup.push_back(pending);
             }
@@ -220,7 +205,6 @@ impl IocpDriver {
         let mut guard = ops.slot_reserve(user_data);
         let generation = guard.entry.generation(Ordering::Acquire);
         guard.platform_mut().generation = generation;
-        guard.platform_mut().socket_key = None;
         let mut guard = guard.init_op_with(op, |sidecar| {
             sidecar.user_data = user_data;
             sidecar.generation = generation;
@@ -419,14 +403,15 @@ impl IocpDriver {
 
         let mut sub_guard_opt = Some(sub_guard);
         if result.is_ok() {
-            let _ = sub_guard_opt.take().expect("submission guard missing").persist();
+            let _ = sub_guard_opt
+                .take()
+                .expect("submission guard missing")
+                .persist();
         }
         drop(sub_guard_opt);
 
         if let Some(socket_key) = pending_socket_key {
-            self.track_socket_submit_pending(user_data, socket_key);
-        } else if let Some((_, op_entry)) = self.ops.get_slot_and_entry_mut(user_data) {
-            op_entry.platform_data.socket_key = None;
+            self.track_socket_submit_pending(socket_key);
         }
 
         Ok((is_rio_pool_waiting, result))
@@ -452,8 +437,7 @@ impl IocpDriver {
         let mut registered = Vec::with_capacity(files.len());
         for &handle in files {
             if handle.generation != 0 {
-                let cell = self.socket_lifecycle_cell_mut(handle.actor_key());
-                cell.state = SocketLifecycleState::Open;
+                self.rio_state.mark_socket_registered(handle.actor_key());
             }
             let idx = if let Some(idx) = self.free_slots.pop() {
                 self.registered_files[idx] = Some(handle);

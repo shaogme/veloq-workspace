@@ -5,8 +5,8 @@ use veloq_buf::FixedBuf;
 
 use crate::common::IocpErrorContext;
 use crate::ops::submit::common::{
-    SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write, resolve_fd,
-    unpack_kernel_ref,
+    SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write,
+    mark_header_in_flight, resolve_fd, unpack_kernel_ref,
 };
 use crate::ops::{
     Close, Fallocate, Fsync, KernelRef, OpenPayload, OverlappedEntry, ReadFixed, SubmitContext,
@@ -51,26 +51,25 @@ macro_rules! submit_io_op {
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
             let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
-            header.in_flight = true;
-
-             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
-             unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }.map_err(|e| {
-                 crate::common::io_error(
-                     IocpErrorContext::Submission,
-                     e,
-                     format!(
-                         "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
-                         stringify!($fn_name),
-                         val.fd,
-                         handle,
-                         header.user_data,
-                         header.generation,
-                         val.offset,
-                         val.buf_offset,
-                         len
-                     ),
-                 )
-             })
+            // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
+            let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }.map_err(|e| {
+                crate::common::io_error(
+                    IocpErrorContext::Submission,
+                    e,
+                    format!(
+                        "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
+                        stringify!($fn_name),
+                        val.fd,
+                        handle,
+                        header.user_data,
+                        header.generation,
+                        val.offset,
+                        val.buf_offset,
+                        len
+                    ),
+                )
+            });
+            mark_header_in_flight(header, submit_res)
         }
     };
 }

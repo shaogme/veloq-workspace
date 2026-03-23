@@ -35,7 +35,49 @@ new_key_type! {
     pub(crate) struct ActorKey;
 }
 
-pub(crate) type SocketActorKey = (HANDLE, u32);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SocketActorKey {
+    pub(crate) handle: HANDLE,
+    pub(crate) generation: u32,
+}
+
+impl SocketActorKey {
+    #[inline]
+    pub(crate) const fn new(handle: HANDLE, generation: u32) -> Self {
+        Self { handle, generation }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SocketRuntimeMode {
+    RioPreferred,
+    IocpFallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SocketLifecycleState {
+    Open,
+    Closing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SocketRuntimeState {
+    pub(crate) mode: SocketRuntimeMode,
+    pub(crate) lifecycle: SocketLifecycleState,
+    pub(crate) inflight: u32,
+    pub(crate) iocp_associated: bool,
+}
+
+impl Default for SocketRuntimeState {
+    fn default() -> Self {
+        Self {
+            mode: SocketRuntimeMode::RioPreferred,
+            lifecycle: SocketLifecycleState::Open,
+            inflight: 0,
+            iocp_associated: false,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioEnv<'a> {
@@ -63,5 +105,6 @@ pub(crate) struct RioState {
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
     pub(crate) actor_by_handle: FxHashMap<SocketActorKey, ActorKey>,
+    pub(crate) socket_runtime: FxHashMap<SocketActorKey, SocketRuntimeState>,
     pub(crate) outstanding_count: usize,
 }

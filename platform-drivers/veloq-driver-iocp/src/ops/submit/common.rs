@@ -9,7 +9,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::config::{IoFd, RawHandle};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
-use crate::ops::KernelRef;
+use crate::ops::{KernelRef, OverlappedEntry};
 use crate::win32::Overlapped;
 
 // ============================================================================
@@ -295,4 +295,15 @@ pub(crate) fn ensure_iocp_association(
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
     unsafe { port.associate(handle, 0) }
         .map_err(|e| io_error(IocpErrorContext::Submission, e, detail))
+}
+
+#[inline]
+pub(crate) fn mark_header_in_flight(
+    header: &mut OverlappedEntry,
+    res: io::Result<SubmissionResult>,
+) -> io::Result<SubmissionResult> {
+    if matches!(res, Ok(SubmissionResult::Pending)) {
+        header.in_flight = true;
+    }
+    res
 }

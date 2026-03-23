@@ -1,5 +1,5 @@
-use std::io;
 use std::collections::VecDeque;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -30,31 +30,11 @@ use veloq_driver_core::slot::{DetachedCancelTable, InFlightWaiting, SlotRegistry
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 pub(crate) const CONTROL_EVENT_KEY: usize = usize::MAX - 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SocketLifecycleState {
-    Open,
-    Closing,
-}
-
 pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
 struct EmitContext<'a> {
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable,
-}
-
-pub(crate) struct SocketLifecycleCell {
-    pub(crate) state: SocketLifecycleState,
-    pub(crate) in_flight: u32,
-}
-
-impl Default for SocketLifecycleCell {
-    fn default() -> Self {
-        Self {
-            state: SocketLifecycleState::Open,
-            in_flight: 0,
-        }
-    }
 }
 
 pub(crate) struct DeferredSocketCleanup {
@@ -81,7 +61,6 @@ pub struct IocpDriver {
     pub(crate) registrar: Box<dyn BufferRegistrar>,
     pub(crate) shutting_down: bool,
     pub(crate) closed: bool,
-    pub(crate) socket_lifecycle: rustc_hash::FxHashMap<SocketActorKey, SocketLifecycleCell>,
     pub(crate) deferred_socket_cleanup: VecDeque<DeferredSocketCleanup>,
 }
 
@@ -151,7 +130,6 @@ impl IocpDriver {
             registrar: Box::new(NoopRegistrar),
             shutting_down: false,
             closed: false,
-            socket_lifecycle: rustc_hash::FxHashMap::default(),
             deferred_socket_cleanup: VecDeque::new(),
         })
     }
@@ -347,15 +325,20 @@ impl IocpDriver {
                     }
                 }
 
+                self.release_socket_inflight_for_op(user_data);
                 let ctx = EmitContext {
                     completion_events: &self.completion_events,
                     completion_table: &self.completion_table,
                 };
                 Self::emit_event_inner(ctx, &mut self.ops, user_data, slot_generation, io_result);
-                self.release_socket_inflight_for_op(user_data);
             }
-            Some(SlotView::InFlightOrphaned(slot)) => {
-                let slot_generation = slot.entry.generation(Ordering::Acquire);
+            Some(SlotView::InFlightOrphaned(_)) => {
+                let slot_generation =
+                    self.ops.shared.slots[user_data].generation(Ordering::Acquire);
+                self.release_socket_inflight_for_op(user_data);
+                let Some(SlotView::InFlightOrphaned(slot)) = self.ops.slot_view(user_data) else {
+                    return;
+                };
                 let mut completed = slot.complete();
                 let (payload, detail) = completed.take_completion_data();
                 let _ = completed.take_op();
@@ -371,7 +354,6 @@ impl IocpDriver {
                         detail,
                     }),
                 );
-                self.release_socket_inflight_for_op(user_data);
                 self.ops.remove(user_data);
             }
             _ => {
@@ -517,8 +499,9 @@ impl IocpDriver {
                     completion_events: &self.completion_events,
                     completion_table: &self.completion_table,
                 };
-                if Self::perform_cancel(ctx, user_data, &mut self.ops) {
-                    self.release_socket_inflight_for_op(user_data);
+                if let Some(key) = Self::perform_cancel(ctx, user_data, &mut self.ops) {
+                    self.rio_state.release_socket_inflight(key);
+                    self.drain_deferred_socket_cleanup();
                 }
             }
             _ => {
@@ -531,8 +514,9 @@ impl IocpDriver {
         ctx: CancelContext<'_>,
         user_data: usize,
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-    ) -> bool {
+    ) -> Option<SocketActorKey> {
         let mut should_emit_aborted = false;
+        let mut aborted_socket_key = None;
         let handled = match ops.slot_view(user_data) {
             Some(SlotView::InFlightWaiting(mut guard)) => {
                 let raw_handle = guard
@@ -558,6 +542,8 @@ impl IocpDriver {
                             );
                         }
                         should_emit_aborted = true;
+                        aborted_socket_key =
+                            (raw_handle.generation != 0).then_some(raw_handle.actor_key());
                     } else {
                         // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
                         let overlapped_ptr =
@@ -583,9 +569,9 @@ impl IocpDriver {
                 completion_table: ctx.completion_table,
             };
             Self::emit_aborted_inner(emit_ctx, user_data, ops);
-            return true;
+            return aborted_socket_key;
         }
-        false
+        None
     }
 
     fn emit_aborted_inner(
