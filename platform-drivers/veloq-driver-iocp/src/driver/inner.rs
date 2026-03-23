@@ -19,7 +19,7 @@ use crate::common::{
     IocpErrorContext, IocpWaker, WAKEUP_USER_DATA, completion_record, io_error, io_msg,
     io_result_to_event_res, push_completion_shared,
 };
-use crate::config::{BufferRegistrationMode, IocpConfig, RawHandle};
+use crate::config::{BufferRegistrationMode, IocpConfig, OwnedRawHandle, RawHandle};
 use crate::driver::{CompletionSidecar, IocpOpState};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
@@ -49,7 +49,7 @@ pub struct IocpDriver {
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
-    pub(crate) registered_files: Vec<Option<RawHandle>>,
+    pub(crate) registered_files: Vec<Option<OwnedRawHandle>>,
     pub(crate) free_slots: Vec<usize>,
     pub(crate) is_notified: Arc<AtomicBool>,
     pub(crate) completion_events: SharedCompletionQueue,
@@ -533,7 +533,7 @@ impl IocpDriver {
                     });
 
                 if let Some(raw_handle) = raw_handle {
-                    let handle = raw_handle.handle;
+                    let handle = raw_handle.as_handle();
                     let is_rio = guard
                         .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                         .unwrap_or(false);
@@ -548,7 +548,7 @@ impl IocpDriver {
                         }
                         should_emit_aborted = true;
                         aborted_socket_key =
-                            (raw_handle.generation != 0).then_some(raw_handle.actor_key());
+                            raw_handle.is_socket().then_some(raw_handle.actor_key());
                     } else {
                         // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
                         let overlapped_ptr =
@@ -637,7 +637,7 @@ impl IocpDriver {
 }
 
 struct CancelContext<'a> {
-    registered_files: &'a [Option<RawHandle>],
+    registered_files: &'a [Option<OwnedRawHandle>],
     rio_state: &'a mut RioState,
     registrar: &'a dyn BufferRegistrar,
     completion_events: &'a SharedCompletionQueue,

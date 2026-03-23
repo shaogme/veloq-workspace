@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
+use windows_sys::Win32::Networking::WinSock::{
+    SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
+};
 
 use veloq_blocking::{BlockingTask, get_blocking_pool};
 #[cfg(feature = "test-hooks")]
@@ -23,7 +26,7 @@ use veloq_driver_core::slot::{
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
-use crate::config::{IoFd, RawHandle};
+use crate::config::{IoFd, RawHandle, RawHandleKind};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 use crate::rio::SocketActorKey;
@@ -116,6 +119,37 @@ struct SubmitContextInternal<'a> {
 }
 
 impl IocpDriver {
+    /// Fallback probe for potentially untrusted external raw handles.
+    ///
+    /// We trust `RawHandle` enum semantics by default. Probe is only used when
+    /// callers provide a `File`-tagged handle that may actually be a socket
+    /// (for example, legacy/raw trait boundaries that still pass plain HANDLE).
+    fn detect_socket_from_file_handle(handle: RawHandle) -> io::Result<bool> {
+        let socket = handle.as_socket();
+        let mut ty = 0i32;
+        let mut len = std::mem::size_of::<i32>() as i32;
+        // SAFETY: buffer pointers are valid for getsockopt call.
+        let ret = unsafe {
+            getsockopt(
+                socket as SOCKET,
+                SOL_SOCKET,
+                SO_TYPE,
+                &mut ty as *mut i32 as *mut u8,
+                &mut len,
+            )
+        };
+        if ret == 0 {
+            return Ok(true);
+        }
+        // SAFETY: reads last winsock error after getsockopt failure.
+        let err = unsafe { WSAGetLastError() };
+        if err == WSAENOTSOCK {
+            Ok(false)
+        } else {
+            Err(io::Error::from_raw_os_error(err))
+        }
+    }
+
     pub fn socket_lifecycle_handle(&self) -> SocketLifecycleHandle {
         SocketLifecycleHandle::new(self.port.clone())
     }
@@ -136,7 +170,7 @@ impl IocpDriver {
                 op.header.in_flight = false;
                 op.header
                     .resolved_handle
-                    .filter(|h| h.generation != 0)
+                    .filter(|h| h.is_socket())
                     .map(RawHandle::actor_key)
             });
 
@@ -395,7 +429,7 @@ impl IocpDriver {
                     })
                 })
                 .flatten()
-                .filter(|h| h.generation != 0)
+                .filter(|h| h.is_socket())
                 .map(RawHandle::actor_key)
         } else {
             None
@@ -436,15 +470,29 @@ impl IocpDriver {
     pub(crate) fn register_files(&mut self, files: &[RawHandle]) -> io::Result<Vec<IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for &handle in files {
-            if handle.generation != 0 {
-                self.rio_state.mark_socket_registered(handle.actor_key());
+            // Trust enum semantics first; only probe file-tagged handles as fallback.
+            let canonical = match handle.kind() {
+                RawHandleKind::Socket => handle,
+                RawHandleKind::File => {
+                    if Self::detect_socket_from_file_handle(handle)? {
+                        RawHandle::for_socket(handle.as_handle())
+                    } else {
+                        handle
+                    }
+                }
+            };
+            let kind = canonical.kind();
+            // SAFETY: register_files treats caller-provided handles as ownership transfer.
+            let owned = unsafe { canonical.into_owned() };
+            if kind == RawHandleKind::Socket {
+                self.rio_state.mark_socket_registered(canonical.actor_key());
             }
             let idx = if let Some(idx) = self.free_slots.pop() {
-                self.registered_files[idx] = Some(handle);
+                self.registered_files[idx] = Some(owned);
                 self.rio_state.clear_registered_rq(idx);
                 idx
             } else {
-                self.registered_files.push(Some(handle));
+                self.registered_files.push(Some(owned));
                 self.rio_state.resize_rqs(self.registered_files.len());
                 self.registered_files.len() - 1
             };

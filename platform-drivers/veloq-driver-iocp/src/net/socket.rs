@@ -1,5 +1,5 @@
 use super::addr::{socket_addr_to_storage, to_socket_addr};
-use crate::config::RawHandle;
+use crate::config::{OwnedRawHandle, RawHandle};
 use crate::win32::SafeSocket;
 use std::io;
 use std::net::SocketAddr;
@@ -86,6 +86,13 @@ impl Socket {
         let h = self.inner.0;
         std::mem::forget(self);
         RawHandle::for_socket(h as _)
+    }
+
+    /// Consumes the Socket and returns an owned handle.
+    pub fn into_owned_raw(self) -> OwnedRawHandle {
+        let raw = self.into_raw();
+        // SAFETY: this socket originates from `self` and ownership is uniquely transferred.
+        unsafe { raw.into_owned() }
     }
 
     /// Creates a Socket from a raw handle.

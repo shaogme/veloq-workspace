@@ -40,7 +40,7 @@ impl Drop for InnerFile {
         }
         #[cfg(windows)]
         unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0.handle);
+            windows_sys::Win32::Foundation::CloseHandle(self.0.as_handle());
         }
     }
 }

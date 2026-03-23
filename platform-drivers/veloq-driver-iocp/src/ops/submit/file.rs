@@ -139,7 +139,7 @@ pub(crate) fn submit_close(
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
+    let handle = raw_handle.borrow();
 
     let user_data = header.user_data;
 
@@ -150,7 +150,7 @@ pub(crate) fn submit_close(
     };
 
     let op = BlockingOps::Close {
-        handle: handle as usize,
+        handle: handle.as_handle() as usize,
         completion,
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
@@ -168,7 +168,7 @@ pub(crate) fn submit_fsync(
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
+    let handle = raw_handle.borrow();
 
     let user_data = header.user_data;
 
@@ -179,7 +179,7 @@ pub(crate) fn submit_fsync(
     };
 
     let op = BlockingOps::Fsync {
-        handle: handle as usize,
+        handle: handle.as_handle() as usize,
         completion,
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
@@ -197,7 +197,7 @@ pub(crate) fn submit_sync_range(
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
+    let handle = raw_handle.borrow();
 
     let user_data = header.user_data;
 
@@ -208,7 +208,7 @@ pub(crate) fn submit_sync_range(
     };
 
     let op = BlockingOps::SyncFileRange {
-        handle: handle as usize,
+        handle: handle.as_handle() as usize,
         completion,
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
@@ -226,7 +226,7 @@ pub(crate) fn submit_fallocate(
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
+    let handle = raw_handle.borrow();
 
     let user_data = header.user_data;
 
@@ -237,7 +237,7 @@ pub(crate) fn submit_fallocate(
     };
 
     let op = BlockingOps::Fallocate {
-        handle: handle as usize,
+        handle: handle.as_handle() as usize,
         mode: user.mode,
         offset: user.offset,
         len: user.len,

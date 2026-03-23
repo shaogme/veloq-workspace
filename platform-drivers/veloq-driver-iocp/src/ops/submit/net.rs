@@ -486,7 +486,10 @@ pub(crate) fn submit_accept(
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.borrow();
-    let accept_socket = payload.accept_socket;
+    let accept_socket = payload
+        .accept_socket
+        .as_ref()
+        .ok_or_else(|| io::Error::other("accept socket not initialized"))?;
     let accept_socket_raw = accept_socket.as_socket();
 
     ensure_iocp_association(
@@ -560,7 +563,10 @@ pub(crate) unsafe fn on_complete_accept(
 ) -> io::Result<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
-    let accept_socket = payload.accept_socket;
+    let accept_socket = payload
+        .accept_socket
+        .as_ref()
+        .ok_or_else(|| io::Error::other("accept socket not initialized"))?;
     let listen_handle = user.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
     let listen_socket = listen_handle.as_socket();
     let accept_socket_raw = accept_socket.as_socket();
