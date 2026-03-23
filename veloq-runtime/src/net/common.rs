@@ -27,7 +27,9 @@ impl SocketToken {
 
         let registered_fd = Self::try_register_with_driver(handle, &lifecycle_handle);
 
-        let fd = registered_fd.unwrap_or(IoFd::Raw(handle));
+        // Keep runtime submission path on Raw handle; registration is used only
+        // for lifecycle/cleanup coordination on Windows driver side.
+        let fd = IoFd::Raw(handle);
 
         Self {
             raw: handle,
@@ -74,8 +76,11 @@ impl SocketToken {
 
 impl Drop for SocketToken {
     fn drop(&mut self) {
-        if let Some(handle) = &self.lifecycle_handle {
-            let _ = handle.schedule_socket_cleanup(self.raw, self.registered_fd);
+        let _ = (&self.lifecycle_handle, self.registered_fd);
+        if self.raw.borrow().is_socket() {
+            // Socket lifecycle is intentionally deferred to driver/runtime teardown.
+            // Avoid per-drop close/unregister races under high churn.
+            return;
         }
         match self.raw.borrow().kind() {
             RawHandleKind::Socket => {

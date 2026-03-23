@@ -565,7 +565,7 @@ pub(crate) unsafe fn on_complete_accept(
     let user = unsafe { payload.user.as_mut() };
     let accept_socket = payload
         .accept_socket
-        .as_ref()
+        .take()
         .ok_or_else(|| io::Error::other("accept socket not initialized"))?;
     let listen_handle = user.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
     let listen_socket = listen_handle.as_socket();
@@ -617,7 +617,9 @@ pub(crate) unsafe fn on_complete_accept(
             user.remote_addr = Some(addr);
         }
     }
-    Ok(accept_socket_raw as usize)
+    // Transfer ownership to upper layer completion; payload must not close this socket again.
+    let accepted_raw = accept_socket.into_raw();
+    Ok(accepted_raw.as_handle() as usize)
 }
 
 pub(crate) fn submit_send_to(
