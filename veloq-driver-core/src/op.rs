@@ -176,6 +176,8 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     type UserPayload: std::marker::Send + 'static;
     /// Completion value exposed to caller for this op.
     type Completion;
+    /// Raw completion value delivered by the bound driver.
+    type DriverCompletion: crate::driver::CompletionValue;
     const PAYLOAD_KIND: OpKind;
 
     /// Split into kernel-facing op and user payload.
@@ -196,7 +198,7 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     /// Map kernel completion integer into typed completion value.
     fn map_completion_result(
         &self,
-        res: std::io::Result<usize>,
+        res: std::io::Result<Self::DriverCompletion>,
     ) -> std::io::Result<Self::Completion>;
 
     /// Compatibility helper for transitional callsites.
@@ -247,10 +249,10 @@ impl<T> Op<T> {
 
     /// Submit this operation manually to a specific driver instance.
     /// The operation is submitted synchronously, but completion is awaited asynchronously via the returned future.
-    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op>
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Completion>
     where
-        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
-        D: Driver<Completion = usize>,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+        D: Driver,
     {
         let data = self.data;
         trace!("Submitting detached op");
@@ -342,7 +344,7 @@ impl<T> Op<T> {
     /// Returns a `LocalOp` future that resolves when the operation completes.
     pub fn submit_local<D>(self, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
     where
-        T: IntoPlatformOp<D::Op> + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
         D: Driver,
     {
         LocalOp::new(self.data, driver)
@@ -355,29 +357,36 @@ impl<T> Op<T> {
 
 /// A Future representing a detached operation.
 /// It polls a shared completion event queue by token.
-pub struct DetachedOp<T, O>
+pub struct DetachedOp<T, O, C>
 where
     O: PlatformOp,
-    T: IntoPlatformOp<O>,
+    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
 {
-    completion_table: Option<SharedCompletionTable<usize>>,
+    completion_table: Option<SharedCompletionTable<C>>,
     cancel_signal: Option<std::sync::Arc<DetachedCancelTable>>,
     cancel_waker: Option<Arc<dyn RemoteWaker>>,
     token: u64,
     immediate_failure: Option<(std::io::Error, T)>,
-    _phantom: std::marker::PhantomData<(T, fn() -> O)>,
+    _phantom: DetachedPhantom<T, O, C>,
 }
 
+type DetachedPhantom<T, O, C> = std::marker::PhantomData<(T, C, fn() -> O)>;
+
 // DetachedOp is Send/Sync if the Op data is Send and the Driver Op is Send (implied by SlotTable<Op> bound).
-unsafe impl<T: IntoPlatformOp<O> + std::marker::Send, O: PlatformOp> std::marker::Send
-    for DetachedOp<T, O>
+unsafe impl<
+    T: IntoPlatformOp<O, DriverCompletion = C> + std::marker::Send,
+    O: PlatformOp,
+    C: crate::driver::CompletionValue,
+> std::marker::Send for DetachedOp<T, O, C>
 {
 }
 
-impl<T, O> Drop for DetachedOp<T, O>
+impl<T, O, C> Drop for DetachedOp<T, O, C>
 where
     O: PlatformOp,
-    T: IntoPlatformOp<O>,
+    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
 {
     fn drop(&mut self) {
         if let Some(table) = self.completion_table.as_ref() {
@@ -394,10 +403,11 @@ where
     }
 }
 
-impl<T, O> Future for DetachedOp<T, O>
+impl<T, O, C> Future for DetachedOp<T, O, C>
 where
     O: PlatformOp,
-    T: IntoPlatformOp<O>,
+    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
 {
     type Output = OpResult<T, T::Completion>;
 
@@ -433,7 +443,7 @@ where
                 }
                 let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                 let data = T::from_user_payload(payload);
-                let res = detail.unwrap_or_else(|| event_res_to_io::<usize>(event.res));
+                let res = detail.unwrap_or_else(|| event_res_to_io::<C>(event.res));
                 let completion = data.map_completion_result(res);
                 return Poll::Ready(OpResult::Completed(completion, data));
             }
@@ -468,7 +478,7 @@ enum State {
 pub struct LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
 {
     state: State,
     data: Option<T>,
@@ -480,7 +490,7 @@ where
 impl<T, D> LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
 {
     /// Create a new local operation future.
     pub fn new(data: T, driver: Rc<RefCell<D>>) -> Self {
@@ -496,8 +506,8 @@ where
 
 impl<T, D> Future for LocalOp<T, D>
 where
-    D: Driver<Completion = usize>,
-    T: IntoPlatformOp<D::Op> + 'static,
+    D: Driver,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
 {
     type Output = OpResult<T, T::Completion>;
 
@@ -590,7 +600,7 @@ where
                     }
                     let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                     let data = T::from_user_payload(payload);
-                    let res = detail.unwrap_or_else(|| event_res_to_io::<usize>(event.res));
+                    let res = detail.unwrap_or_else(|| event_res_to_io::<D::Completion>(event.res));
                     let completion = data.map_completion_result(res);
                     Poll::Ready(OpResult::Completed(completion, data))
                 }
@@ -617,7 +627,7 @@ where
 impl<T, D> Drop for LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
 {
     fn drop(&mut self) {
         if let State::Submitted = self.state {
@@ -632,13 +642,15 @@ where
 // ============================================================================
 
 pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
-    type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static>: Future<
+    type Future<
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+    >: Future<
         Output = OpResult<T, <T as IntoPlatformOp<D::Op>>::Completion>,
     >;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static;
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static;
 
     fn from_current_context() -> std::io::Result<Self>;
 }
@@ -650,12 +662,14 @@ pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
 #[derive(Clone, Copy)]
 pub struct LocalSubmitter;
 
-impl<D: Driver<Completion = usize>> OpSubmitter<D> for LocalSubmitter {
-    type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static> = LocalOp<T, D>;
+impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
+    type Future<
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+    > = LocalOp<T, D>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
     where
-        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
     {
         trace!("Submitting local op");
         op.submit_local(driver)
@@ -679,12 +693,14 @@ impl DetachedSubmitter {
     }
 }
 
-impl<D: Driver<Completion = usize>> OpSubmitter<D> for DetachedSubmitter {
-    type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static> = DetachedOp<T, D::Op>;
+impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
+    type Future<
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+    > = DetachedOp<T, D::Op, D::Completion>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
     {
         op.submit_detached(&mut *driver.borrow_mut())
     }
@@ -910,6 +926,7 @@ mod tests {
     impl IntoPlatformOp<DummyPlatformOp> for DummyOp {
         type UserPayload = DummyPayload;
         type Completion = usize;
+        type DriverCompletion = usize;
         const PAYLOAD_KIND: OpKind = OpKind::Wakeup;
 
         fn into_kernel_and_payload(self) -> (DummyPlatformOp, Self::UserPayload) {
@@ -940,7 +957,7 @@ mod tests {
 
         fn map_completion_result(
             &self,
-            res: std::io::Result<usize>,
+            res: std::io::Result<Self::DriverCompletion>,
         ) -> std::io::Result<Self::Completion> {
             res
         }
@@ -956,7 +973,7 @@ mod tests {
             wakes: wake_count.clone(),
         });
 
-        let op = DetachedOp::<DummyOp, DummyPlatformOp> {
+        let op = DetachedOp::<DummyOp, DummyPlatformOp, usize> {
             completion_table: Some(completion_table),
             cancel_signal: Some(cancel_signal),
             cancel_waker: Some(cancel_waker),

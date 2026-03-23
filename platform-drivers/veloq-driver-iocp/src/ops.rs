@@ -142,6 +142,7 @@ macro_rules! define_iocp_ops {
             impl IntoPlatformOp<IocpOp> for $OpType {
                 type UserPayload = Box<$OpType>;
                 type Completion = define_iocp_ops!(@completion_type $($completion)?);
+                type DriverCompletion = usize;
                 const PAYLOAD_KIND: OpKind = $kind;
 
                 fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {

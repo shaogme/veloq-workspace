@@ -99,6 +99,7 @@ macro_rules! define_uring_ops {
             impl IntoPlatformOp<UringOp> for $OpType {
                 type UserPayload = Box<$OpType>;
                 type Completion = define_uring_ops!(@completion_type $($completion)?);
+                type DriverCompletion = usize;
                 const PAYLOAD_KIND: OpKind = $kind;
 
                 fn into_kernel_and_payload(self) -> (UringKernelOp, Self::UserPayload) {

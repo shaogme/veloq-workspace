@@ -71,7 +71,10 @@ pub fn try_current() -> Option<RuntimeContext> {
 pub fn submit<T, S>(submitter: &S, op: Op<T>) -> S::Future<T>
 where
     S: OpSubmitter,
-    T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + 'static,
+    T: IntoPlatformOp<
+            <PlatformDriver as Driver>::Op,
+            DriverCompletion = <PlatformDriver as Driver>::Completion,
+        > + 'static,
 {
     let driver = CONTEXT
         .with(|ctx| {
