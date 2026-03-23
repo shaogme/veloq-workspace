@@ -38,6 +38,7 @@ pub(crate) struct RioSocketActor {
     pub(crate) pool_manager: UdpPoolManager,
     pub(crate) udp_mailbox: UdpMailbox,
     pub(crate) is_iocp_fallback: bool,
+    pub(crate) is_iocp_associated: bool,
     pub(crate) is_explicit_shutdown: bool,
     pub(crate) state: RioActorState,
 }
@@ -51,6 +52,7 @@ impl RioSocketActor {
             pool_manager: UdpPoolManager::new(),
             udp_mailbox: UdpMailbox::new(),
             is_iocp_fallback: false,
+            is_iocp_associated: false,
             is_explicit_shutdown: false,
             state: RioActorState::Active,
         }

@@ -30,6 +30,7 @@ macro_rules! submit_io_op {
             overlapped.set_offset(val.offset);
 
             let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+            header.resolved_handle = Some(raw_handle);
             let handle = raw_handle.handle;
             ensure_iocp_association(
                 handle,
@@ -50,6 +51,7 @@ macro_rules! submit_io_op {
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
             let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
+            header.in_flight = true;
 
              // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
              unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }.map_err(|e| {
@@ -137,6 +139,7 @@ pub(crate) fn submit_close(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
 
     let user_data = header.user_data;
@@ -165,6 +168,7 @@ pub(crate) fn submit_fsync(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
 
     let user_data = header.user_data;
@@ -193,6 +197,7 @@ pub(crate) fn submit_sync_range(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
 
     let user_data = header.user_data;
@@ -221,6 +226,7 @@ pub(crate) fn submit_fallocate(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
 
     let user_data = header.user_data;

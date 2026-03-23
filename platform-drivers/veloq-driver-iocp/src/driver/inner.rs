@@ -1,4 +1,5 @@
 use std::io;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -22,18 +23,43 @@ use crate::config::{BufferRegistrationMode, IocpConfig, RawHandle};
 use crate::driver::{CompletionSidecar, IocpOpState};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
-use crate::rio::RioState;
+use crate::rio::{RioState, SocketActorKey};
 use crate::win32::Overlapped;
 use veloq_driver_core::slot::{DetachedCancelTable, InFlightWaiting, SlotRegistryExt, SlotView};
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 pub(crate) const CONTROL_EVENT_KEY: usize = usize::MAX - 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SocketLifecycleState {
+    Open,
+    Closing,
+}
+
 pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
 struct EmitContext<'a> {
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable,
+}
+
+pub(crate) struct SocketLifecycleCell {
+    pub(crate) state: SocketLifecycleState,
+    pub(crate) in_flight: u32,
+}
+
+impl Default for SocketLifecycleCell {
+    fn default() -> Self {
+        Self {
+            state: SocketLifecycleState::Open,
+            in_flight: 0,
+        }
+    }
+}
+
+pub(crate) struct DeferredSocketCleanup {
+    pub(crate) handle: RawHandle,
+    pub(crate) registered_fd: Option<crate::config::IoFd>,
 }
 
 /// The IOCP driver implementation that manages I/O completion ports and operations.
@@ -55,6 +81,8 @@ pub struct IocpDriver {
     pub(crate) registrar: Box<dyn BufferRegistrar>,
     pub(crate) shutting_down: bool,
     pub(crate) closed: bool,
+    pub(crate) socket_lifecycle: rustc_hash::FxHashMap<SocketActorKey, SocketLifecycleCell>,
+    pub(crate) deferred_socket_cleanup: VecDeque<DeferredSocketCleanup>,
 }
 
 impl IocpDriver {
@@ -123,6 +151,8 @@ impl IocpDriver {
             registrar: Box::new(NoopRegistrar),
             shutting_down: false,
             closed: false,
+            socket_lifecycle: rustc_hash::FxHashMap::default(),
+            deferred_socket_cleanup: VecDeque::new(),
         })
     }
 
@@ -322,6 +352,7 @@ impl IocpDriver {
                     completion_table: &self.completion_table,
                 };
                 Self::emit_event_inner(ctx, &mut self.ops, user_data, slot_generation, io_result);
+                self.release_socket_inflight_for_op(user_data);
             }
             Some(SlotView::InFlightOrphaned(slot)) => {
                 let slot_generation = slot.entry.generation(Ordering::Acquire);
@@ -340,6 +371,7 @@ impl IocpDriver {
                         detail,
                     }),
                 );
+                self.release_socket_inflight_for_op(user_data);
                 self.ops.remove(user_data);
             }
             _ => {
@@ -485,7 +517,9 @@ impl IocpDriver {
                     completion_events: &self.completion_events,
                     completion_table: &self.completion_table,
                 };
-                Self::perform_cancel(ctx, user_data, &mut self.ops);
+                if Self::perform_cancel(ctx, user_data, &mut self.ops) {
+                    self.release_socket_inflight_for_op(user_data);
+                }
             }
             _ => {
                 Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
@@ -497,15 +531,19 @@ impl IocpDriver {
         ctx: CancelContext<'_>,
         user_data: usize,
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-    ) {
+    ) -> bool {
         let mut should_emit_aborted = false;
         let handled = match ops.slot_view(user_data) {
             Some(SlotView::InFlightWaiting(mut guard)) => {
-                let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten();
+                let raw_handle = guard
+                    .with_op_mut(|iocp_op| iocp_op.header.resolved_handle)
+                    .flatten()
+                    .or_else(|| {
+                        let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten()?;
+                        submit::resolve_fd(fd, ctx.registered_files).ok()
+                    });
 
-                if let Some(fd) = fd
-                    && let Ok(raw_handle) = submit::resolve_fd(fd, ctx.registered_files)
-                {
+                if let Some(raw_handle) = raw_handle {
                     let handle = raw_handle.handle;
                     let is_rio = guard
                         .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
@@ -545,7 +583,9 @@ impl IocpDriver {
                 completion_table: ctx.completion_table,
             };
             Self::emit_aborted_inner(emit_ctx, user_data, ops);
+            return true;
         }
+        false
     }
 
     fn emit_aborted_inner(

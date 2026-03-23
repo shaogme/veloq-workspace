@@ -35,6 +35,20 @@ fn with_borrowed_socket<T>(
     f(&socket)
 }
 
+#[inline]
+fn ensure_sticky_fallback_association(
+    ctx: &mut SubmitContext,
+    socket_key: (HANDLE, u32),
+    handle: HANDLE,
+    detail: impl FnOnce() -> String,
+) -> io::Result<()> {
+    if ctx.rio.needs_iocp_fallback_association(socket_key) {
+        ensure_iocp_association(handle, ctx.port, detail())?;
+        ctx.rio.mark_iocp_fallback_associated(socket_key);
+    }
+    Ok(())
+}
+
 pub(crate) fn submit_recv(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Recv>,
@@ -45,16 +59,19 @@ pub(crate) fn submit_recv(
     overlapped.set_offset(0);
 
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
     let socket = handle as SOCKET;
     let socket_key = (handle, raw_handle.generation);
 
     if ctx.rio.is_iocp_fallback(socket_key) {
-        ensure_iocp_association(
+        ensure_sticky_fallback_association(
+            ctx,
+            socket_key,
             handle,
-            ctx.port,
-            format!("TCP recv fallback association failed: fd={:?}", val.fd),
+            || format!("TCP recv fallback association failed: fd={:?}", val.fd),
         )?;
+        header.in_flight = true;
         // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
         let fallback_res = unsafe {
             iocp_submit_socket_recv(
@@ -101,11 +118,13 @@ pub(crate) fn submit_recv(
                 ctx.rio.is_iocp_fallback(socket_key)
             } =>
         {
-            ensure_iocp_association(
+            ensure_sticky_fallback_association(
+                ctx,
+                socket_key,
                 handle,
-                ctx.port,
-                format!("TCP recv fallback association failed: fd={:?}", val.fd),
+                || format!("TCP recv fallback association failed: fd={:?}", val.fd),
             )?;
+            header.in_flight = true;
             // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
             let fallback_res = unsafe {
                 iocp_submit_socket_recv(
@@ -148,16 +167,19 @@ pub(crate) fn submit_udp_recv(
     overlapped.set_offset(0);
 
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
     let socket = handle as SOCKET;
     let socket_key = (handle, raw_handle.generation);
 
     if ctx.rio.is_iocp_fallback(socket_key) {
-        ensure_iocp_association(
+        ensure_sticky_fallback_association(
+            ctx,
+            socket_key,
             handle,
-            ctx.port,
-            format!("UDP recv fallback association failed: fd={:?}", val.fd),
+            || format!("UDP recv fallback association failed: fd={:?}", val.fd),
         )?;
+        header.in_flight = true;
         // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
         let fallback_res = unsafe {
             iocp_submit_socket_recv(
@@ -196,11 +218,13 @@ pub(crate) fn submit_udp_recv(
         Err(e) => {
             ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
             if ctx.rio.is_iocp_fallback(socket_key) {
-                ensure_iocp_association(
+                ensure_sticky_fallback_association(
+                    ctx,
+                    socket_key,
                     handle,
-                    ctx.port,
-                    format!("UDP recv fallback association failed: fd={:?}", val.fd),
+                    || format!("UDP recv fallback association failed: fd={:?}", val.fd),
                 )?;
+                header.in_flight = true;
                 // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
                 let fallback_res = unsafe {
                     iocp_submit_socket_recv(
@@ -238,16 +262,19 @@ pub(crate) fn submit_send(
     overlapped.set_offset(0);
 
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
     let socket = handle as SOCKET;
     let socket_key = (handle, raw_handle.generation);
 
     if ctx.rio.is_iocp_fallback(socket_key) {
-        ensure_iocp_association(
+        ensure_sticky_fallback_association(
+            ctx,
+            socket_key,
             handle,
-            ctx.port,
-            format!("TCP send fallback association failed: fd={:?}", val.fd),
+            || format!("TCP send fallback association failed: fd={:?}", val.fd),
         )?;
+        header.in_flight = true;
         // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
         let fallback_res = unsafe {
             iocp_submit_socket_send(
@@ -294,11 +321,13 @@ pub(crate) fn submit_send(
                 ctx.rio.is_iocp_fallback(socket_key)
             } =>
         {
-            ensure_iocp_association(
+            ensure_sticky_fallback_association(
+                ctx,
+                socket_key,
                 handle,
-                ctx.port,
-                format!("TCP send fallback association failed: fd={:?}", val.fd),
+                || format!("TCP send fallback association failed: fd={:?}", val.fd),
             )?;
+            header.in_flight = true;
             // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
             let fallback_res = unsafe {
                 iocp_submit_socket_send(
@@ -341,16 +370,19 @@ pub(crate) fn submit_udp_send(
     overlapped.set_offset(0);
 
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
     let socket = handle as SOCKET;
     let socket_key = (handle, raw_handle.generation);
 
     if ctx.rio.is_iocp_fallback(socket_key) {
-        ensure_iocp_association(
+        ensure_sticky_fallback_association(
+            ctx,
+            socket_key,
             handle,
-            ctx.port,
-            format!("UDP send fallback association failed: fd={:?}", val.fd),
+            || format!("UDP send fallback association failed: fd={:?}", val.fd),
         )?;
+        header.in_flight = true;
         // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
         let fallback_res = unsafe {
             iocp_submit_socket_send(
@@ -397,11 +429,13 @@ pub(crate) fn submit_udp_send(
                 ctx.rio.is_iocp_fallback(socket_key)
             } =>
         {
-            ensure_iocp_association(
+            ensure_sticky_fallback_association(
+                ctx,
+                socket_key,
                 handle,
-                ctx.port,
-                format!("UDP send fallback association failed: fd={:?}", val.fd),
+                || format!("UDP send fallback association failed: fd={:?}", val.fd),
             )?;
+            header.in_flight = true;
             // SAFETY: handle/buffer/overlapped are guaranteed valid by submit contract.
             let fallback_res = unsafe {
                 iocp_submit_socket_send(
@@ -441,7 +475,9 @@ pub(crate) fn submit_connect(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
-    let handle = resolve_fd(connect_op.fd, ctx.registered_files)?.handle;
+    let raw_handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
+    let handle = raw_handle.handle;
     ensure_iocp_association(
         handle,
         ctx.port,
@@ -450,6 +486,7 @@ pub(crate) fn submit_connect(
             connect_op.fd, handle, header.user_data, header.generation
         ),
     )?;
+    header.in_flight = true;
 
     ensure_socket_bound(handle, connect_op)?;
 
@@ -531,15 +568,15 @@ fn ensure_socket_bound(handle: HANDLE, connect_op: &Connect) -> io::Result<()> {
 ///
 /// The caller must ensure that header and payload are valid.
 pub(crate) unsafe fn on_complete_connect(
-    _header: &mut OverlappedEntry,
+    header: &mut OverlappedEntry,
     payload: &mut KernelRef<Connect>,
     result: usize,
     _ext: &Extensions,
 ) -> io::Result<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let connect_op = unsafe { payload.user.as_ref() };
-    if let Some(fd) = connect_op.fd.raw() {
-        with_borrowed_socket(fd.handle as SOCKET, |socket| {
+    if let Some(raw_handle) = header.resolved_handle.or_else(|| connect_op.fd.raw()) {
+        with_borrowed_socket(raw_handle.handle as SOCKET, |socket| {
             socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
         })?;
     }
@@ -553,7 +590,9 @@ pub(crate) fn submit_accept(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
-    let handle = resolve_fd(user.fd, ctx.registered_files)?.handle;
+    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
+    let handle = raw_handle.handle;
     let accept_socket = payload.accept_socket;
     let accept_socket_raw = accept_socket.handle as SOCKET;
 
@@ -579,6 +618,7 @@ pub(crate) fn submit_accept(
     const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
     let split = MIN_ADDR_LEN;
     let mut bytes_received = 0;
+    header.in_flight = true;
 
     // SAFETY: iocp_submit_accept_ex is a safe wrapper for the WinSock extension.
     unsafe {
@@ -683,6 +723,7 @@ pub(crate) fn submit_send_to(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
 
     // RIO path is mandatory for socket send_to.
@@ -726,6 +767,7 @@ pub(crate) fn submit_udp_recv_stream(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.handle;
     let socket = handle as SOCKET;
     let socket_key = (handle, raw_handle.generation);
@@ -743,14 +785,16 @@ pub(crate) fn submit_udp_recv_stream(
         Err(e) => {
             ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
             if ctx.rio.is_iocp_fallback(socket_key) {
-                ensure_iocp_association(
+                ensure_sticky_fallback_association(
+                    ctx,
+                    socket_key,
                     handle,
-                    ctx.port,
-                    format!(
+                    || format!(
                         "UDP recv_stream fallback association failed: fd={:?}",
                         val.fd
                     ),
                 )?;
+                header.in_flight = true;
                 let buf = val
                     .buf
                     .as_mut()

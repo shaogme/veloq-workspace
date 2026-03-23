@@ -1,4 +1,5 @@
 use crate::win32::Overlapped;
+use crate::RawHandle;
 use std::io;
 
 /// A wrapper for the Windows OVERLAPPED structure with additional metadata.
@@ -14,6 +15,8 @@ pub struct OverlappedEntry {
     pub(crate) in_flight: bool,
     /// Result of an offloaded blocking operation.
     pub(crate) blocking_result: Option<io::Result<usize>>,
+    /// Resolved raw handle captured during submission to avoid re-resolving Fixed fd on hot paths.
+    pub(crate) resolved_handle: Option<RawHandle>,
 }
 
 impl OverlappedEntry {
@@ -25,6 +28,7 @@ impl OverlappedEntry {
             generation: 0,
             in_flight: false,
             blocking_result: None,
+            resolved_handle: None,
         }
     }
 }

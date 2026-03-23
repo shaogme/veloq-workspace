@@ -64,6 +64,26 @@ impl RioState {
     }
 
     #[inline]
+    pub(crate) fn needs_iocp_fallback_association(&self, actor_key: (HANDLE, u32)) -> bool {
+        self.actor_by_handle
+            .get(&actor_key)
+            .and_then(|&key| self.actors.get(key))
+            .is_some_and(|actor| actor.is_iocp_fallback && !actor.is_iocp_associated)
+    }
+
+    #[inline]
+    pub(crate) fn mark_iocp_fallback_associated(&mut self, actor_key: (HANDLE, u32)) {
+        if let Some(actor) = self
+            .actor_by_handle
+            .get(&actor_key)
+            .and_then(|&key| self.actors.get_mut(key))
+            && actor.is_iocp_fallback
+        {
+            actor.is_iocp_associated = true;
+        }
+    }
+
+    #[inline]
     fn should_demote_socket(err: &io::Error) -> bool {
         if err.raw_os_error() == Some(10055) {
             return true;
@@ -96,6 +116,7 @@ impl RioState {
                 .and_then(|&key| self.actors.get_mut(key))
         {
             actor.is_iocp_fallback = true;
+            actor.is_iocp_associated = false;
         }
     }
 
