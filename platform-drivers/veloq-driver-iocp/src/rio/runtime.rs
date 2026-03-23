@@ -108,55 +108,6 @@ impl RioState {
             .is_some_and(|state| state.mode == SocketRuntimeMode::IocpFallback)
     }
 
-    #[inline]
-    pub(crate) fn needs_iocp_fallback_association(&self, actor_key: SocketActorKey) -> bool {
-        self.socket_runtime.get(&actor_key).is_some_and(|state| {
-            state.mode == SocketRuntimeMode::IocpFallback && !state.iocp_associated
-        })
-    }
-
-    #[inline]
-    pub(crate) fn mark_iocp_fallback_associated(&mut self, actor_key: SocketActorKey) {
-        if let Some(state) = self.socket_runtime.get_mut(&actor_key)
-            && state.mode == SocketRuntimeMode::IocpFallback
-        {
-            state.iocp_associated = true;
-        }
-    }
-
-    #[inline]
-    fn should_demote_socket(err: &io::Error) -> bool {
-        if err.raw_os_error() == Some(10055) {
-            return true;
-        }
-
-        if let Some(rio_io_err) = err
-            .get_ref()
-            .and_then(|r| r.downcast_ref::<crate::rio::error::RioIoError>())
-        {
-            if rio_io_err.report.has_wsa_error(10055) {
-                return true;
-            }
-            let &rio_err = rio_io_err.report.current_context();
-            if rio_err == crate::rio::error::RioError::NotSupported {
-                // Check if it's the specific "fallback" case.
-                // Instead of string searching, we just assume NotSupported in this context
-                // means it's already mark for fallback or RIO is not supported.
-                return true;
-            }
-        }
-        false
-    }
-
-    #[inline]
-    pub(crate) fn maybe_mark_iocp_fallback(&mut self, actor_key: SocketActorKey, err: &io::Error) {
-        if Self::should_demote_socket(err) {
-            let state = self.socket_runtime_mut(actor_key);
-            state.mode = SocketRuntimeMode::IocpFallback;
-            state.iocp_associated = false;
-        }
-    }
-
     fn validate_rio_addr(
         addr_ptr: *const std::ffi::c_void,
         addr_len: i32,

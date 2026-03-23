@@ -106,7 +106,6 @@ impl std::error::Error for RioIoError {}
 /// 提供将 RioResult 转换为外部 io::Error 的扩展能力
 pub trait RioReportExt {
     fn to_io_error(self, detail: impl Into<String>) -> std::io::Error;
-    fn has_wsa_error(&self, code: u32) -> bool;
 }
 
 impl RioReportExt for Report<RioError> {
@@ -133,16 +132,6 @@ impl RioReportExt for Report<RioError> {
         };
 
         std::io::Error::other(rio_io_err)
-    }
-
-    fn has_wsa_error(&self, code: u32) -> bool {
-        self.frames().any(|f| {
-            if let Some(diag) = f.downcast_ref::<RioDiag>() {
-                diag.error_code == Some(code)
-            } else {
-                false
-            }
-        })
     }
 }
 

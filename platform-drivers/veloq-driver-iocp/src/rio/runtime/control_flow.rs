@@ -260,13 +260,8 @@ impl RioState {
                 .attach("failed to retrieve indexed actor");
         }
 
-        let rq_res = self.registry.create_rq((handle, fd), env);
-        let (rq, is_fallback) = match rq_res {
-            Ok(rq) => (rq, false),
-            Err(e) if e.has_wsa_error(10055) => {
-                // If RIO resources are exhausted, create a dummy RQ and mark for IOCP fallback.
-                (RioRq(0), true)
-            }
+        let rq = match self.registry.create_rq((handle, fd), env) {
+            Ok(rq) => rq,
             Err(e) => {
                 let diag = RioDiag::new("ensure_actor_create_rq")
                     .field("fd", format!("{fd:?}"))
@@ -306,11 +301,7 @@ impl RioState {
         let key = self.actors.insert(actor);
         self.actor_by_handle.insert(socket_key, key);
         let state = self.socket_runtime.entry(socket_key).or_default();
-        state.mode = if is_fallback {
-            SocketRuntimeMode::IocpFallback
-        } else {
-            SocketRuntimeMode::RioPreferred
-        };
+        state.mode = SocketRuntimeMode::RioPreferred;
         state.iocp_associated = false;
         self.actors
             .get_mut(key)

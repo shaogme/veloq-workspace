@@ -13,14 +13,13 @@ use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
 use crate::ops::submit::common::{
     AcceptExArgs, ConnectExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex,
-    iocp_submit_connect_ex, iocp_submit_socket_recv, iocp_submit_socket_send,
-    mark_header_in_flight, resolve_fd, unpack_kernel_ref,
+    iocp_submit_connect_ex, mark_header_in_flight, resolve_fd, unpack_kernel_ref,
 };
 use crate::ops::{
     AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv, SendToPayload, SubmitContext,
     UdpRecv, UdpRecvStream, UdpSend,
 };
-use crate::rio::{RioTarget, SocketActorKey};
+use crate::rio::RioTarget;
 use crate::win32::SafeSocket;
 
 // ============================================================================
@@ -35,109 +34,6 @@ fn with_borrowed_socket<T>(
     f(&socket)
 }
 
-#[inline]
-fn ensure_sticky_fallback_association(
-    ctx: &mut SubmitContext,
-    socket_key: SocketActorKey,
-    handle: BorrowedRawHandle<'_>,
-    detail: impl FnOnce() -> String,
-) -> io::Result<()> {
-    if ctx.rio.needs_iocp_fallback_association(socket_key) {
-        ensure_iocp_association(handle, ctx.port, detail())?;
-        ctx.rio.mark_iocp_fallback_associated(socket_key);
-    }
-    Ok(())
-}
-
-fn submit_iocp_recv_fallback(
-    header: &mut OverlappedEntry,
-    ctx: &mut SubmitContext,
-    socket_key: SocketActorKey,
-    handle: BorrowedRawHandle<'_>,
-    fd: impl std::fmt::Debug,
-    buf: *mut u8,
-    len: u32,
-    op_name: &str,
-) -> io::Result<SubmissionResult> {
-    ensure_sticky_fallback_association(ctx, socket_key, handle, || {
-        format!("{op_name} fallback association failed: fd={fd:?}")
-    })?;
-    let socket = handle.as_socket();
-    // SAFETY: socket/buffer/overlapped are guaranteed valid by submit contract.
-    mark_header_in_flight(header, unsafe { iocp_submit_socket_recv(socket, buf, len, ctx.overlapped) })
-        .map_err(|err| {
-            io_error(
-                IocpErrorContext::Submission,
-                err,
-                format!(
-                    "{op_name} fallback syscall failed: fd={fd:?}, handle={:?}, user_data={}, generation={}",
-                    handle.as_handle(),
-                    header.user_data,
-                    header.generation
-                ),
-            )
-        })
-}
-
-fn submit_iocp_send_fallback(
-    header: &mut OverlappedEntry,
-    ctx: &mut SubmitContext,
-    socket_key: SocketActorKey,
-    handle: BorrowedRawHandle<'_>,
-    fd: impl std::fmt::Debug,
-    buf: *const u8,
-    len: u32,
-    op_name: &str,
-) -> io::Result<SubmissionResult> {
-    ensure_sticky_fallback_association(ctx, socket_key, handle, || {
-        format!("{op_name} fallback association failed: fd={fd:?}")
-    })?;
-    let socket = handle.as_socket();
-    // SAFETY: socket/buffer/overlapped are guaranteed valid by submit contract.
-    mark_header_in_flight(header, unsafe { iocp_submit_socket_send(socket, buf, len, ctx.overlapped) })
-        .map_err(|err| {
-            io_error(
-                IocpErrorContext::Submission,
-                err,
-                format!(
-                    "{op_name} fallback syscall failed: fd={fd:?}, handle={:?}, user_data={}, generation={}",
-                    handle.as_handle(),
-                    header.user_data,
-                    header.generation
-                ),
-            )
-        })
-}
-
-fn submit_rio_then_fallback_wrapped(
-    header: &mut OverlappedEntry,
-    ctx: &mut SubmitContext,
-    socket_key: SocketActorKey,
-    rio_submit: impl FnOnce(&mut SubmitContext) -> io::Result<SubmissionResult>,
-    fallback_submit: impl FnOnce(
-        &mut OverlappedEntry,
-        &mut SubmitContext,
-    ) -> io::Result<SubmissionResult>,
-    rio_err_detail: impl FnOnce() -> String,
-) -> io::Result<SubmissionResult> {
-    let mut fallback_submit = Some(fallback_submit);
-    if ctx.rio.is_iocp_fallback(socket_key) {
-        return fallback_submit.take().expect("fallback closure missing")(header, ctx);
-    }
-
-    match rio_submit(ctx) {
-        Ok(res) => Ok(res),
-        Err(e) => {
-            ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
-            if ctx.rio.is_iocp_fallback(socket_key) {
-                fallback_submit.take().expect("fallback closure missing")(header, ctx)
-            } else {
-                Err(io_error(IocpErrorContext::Submission, e, rio_err_detail()))
-            }
-        }
-    }
-}
-
 pub(crate) fn submit_recv(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Recv>,
@@ -150,42 +46,30 @@ pub(crate) fn submit_recv(
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.borrow();
-    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
     let user_data = header.user_data;
     let generation = header.generation;
-    // SAFETY: pointer/len are derived from valid buffer and used only for fallback submit.
-    let buf_ptr = unsafe { val.buf.as_mut_ptr().add(val.buf_offset) };
-    let buf_len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
-
-    submit_rio_then_fallback_wrapped(
-        header,
-        ctx,
-        socket_key,
-        |ctx| {
-            ctx.rio.try_submit_recv(
-                RioTarget {
-                    fd: val.fd,
-                    handle,
-                    user_data,
-                    generation,
-                    buf_offset: val.buf_offset,
-                },
-                &mut val.buf,
-                ctx.registrar,
+    ctx.rio
+        .try_submit_recv(
+            RioTarget {
+                fd: val.fd,
+                handle,
+                user_data,
+                generation,
+                buf_offset: val.buf_offset,
+            },
+            &mut val.buf,
+            ctx.registrar,
+        )
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, user_data, generation
+                ),
             )
-        },
-        |header, ctx| {
-            submit_iocp_recv_fallback(
-                header, ctx, socket_key, handle, val.fd, buf_ptr, buf_len, "TCP recv",
-            )
-        },
-        || {
-            format!(
-                "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, user_data, generation
-            )
-        },
-    )
+        })
 }
 
 pub(crate) fn submit_udp_recv(
@@ -200,54 +84,26 @@ pub(crate) fn submit_udp_recv(
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.borrow();
-    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
-
-    if ctx.rio.is_iocp_fallback(socket_key) {
-        return submit_iocp_recv_fallback(
-            header,
-            ctx,
-            socket_key,
-            handle,
-            val.fd,
-            // SAFETY: buf pointer and length are valid for this operation.
-            unsafe { val.buf.as_mut_ptr().add(val.buf_offset) },
-            (val.buf.len().saturating_sub(val.buf_offset)) as u32,
-            "UDP recv",
-        );
-    }
-
-    match ctx.rio.try_submit_pool_recv_for_recv(
-        crate::rio::RioUdpRecvArgs {
-            fd: val.fd,
-            handle,
-            recv_op: val,
-            sidecar: header,
-        },
-        ctx.registrar,
-    ) {
-        Ok(res) => Ok(res),
-        Err(e) => {
-            ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
-            if ctx.rio.is_iocp_fallback(socket_key) {
-                ensure_sticky_fallback_association(ctx, socket_key, handle, || {
-                    format!("UDP recv fallback association failed: fd={:?}", val.fd)
-                })?;
-                submit_iocp_recv_fallback(
-                    header,
-                    ctx,
-                    socket_key,
-                    handle,
-                    val.fd,
-                    // SAFETY: buf pointer and length are valid for this operation.
-                    unsafe { val.buf.as_mut_ptr().add(val.buf_offset) },
-                    (val.buf.len().saturating_sub(val.buf_offset)) as u32,
-                    "UDP recv",
-                )
-            } else {
-                Err(e)
-            }
-        }
-    }
+    ctx.rio
+        .try_submit_pool_recv_for_recv(
+            crate::rio::RioUdpRecvArgs {
+                fd: val.fd,
+                handle,
+                recv_op: val,
+                sidecar: header,
+            },
+            ctx.registrar,
+        )
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, header.user_data, header.generation
+                ),
+            )
+        })
 }
 
 pub(crate) fn submit_send(
@@ -262,47 +118,30 @@ pub(crate) fn submit_send(
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.borrow();
-    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
     let user_data = header.user_data;
     let generation = header.generation;
-
-    submit_rio_then_fallback_wrapped(
-        header,
-        ctx,
-        socket_key,
-        |ctx| {
-            ctx.rio.try_submit_send(
-                RioTarget {
-                    fd: val.fd,
-                    handle,
-                    user_data,
-                    generation,
-                    buf_offset: val.buf_offset,
-                },
-                &val.buf,
-                ctx.registrar,
-            )
-        },
-        |header, ctx| {
-            submit_iocp_send_fallback(
-                header,
-                ctx,
-                socket_key,
+    ctx.rio
+        .try_submit_send(
+            RioTarget {
+                fd: val.fd,
                 handle,
-                val.fd,
-                // SAFETY: buf pointer and length are valid for this operation.
-                unsafe { val.buf.as_ptr().add(val.buf_offset) },
-                (val.buf.len().saturating_sub(val.buf_offset)) as u32,
-                "TCP send",
+                user_data,
+                generation,
+                buf_offset: val.buf_offset,
+            },
+            &val.buf,
+            ctx.registrar,
+        )
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO send submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, user_data, generation
+                ),
             )
-        },
-        || {
-            format!(
-                "RIO send submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, user_data, generation
-            )
-        },
-    )
+        })
 }
 
 pub(crate) fn submit_udp_send(
@@ -317,47 +156,30 @@ pub(crate) fn submit_udp_send(
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.borrow();
-    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
     let user_data = header.user_data;
     let generation = header.generation;
-
-    submit_rio_then_fallback_wrapped(
-        header,
-        ctx,
-        socket_key,
-        |ctx| {
-            ctx.rio.try_submit_send(
-                RioTarget {
-                    fd: val.fd,
-                    handle,
-                    user_data,
-                    generation,
-                    buf_offset: val.buf_offset,
-                },
-                &val.buf,
-                ctx.registrar,
-            )
-        },
-        |header, ctx| {
-            submit_iocp_send_fallback(
-                header,
-                ctx,
-                socket_key,
+    ctx.rio
+        .try_submit_send(
+            RioTarget {
+                fd: val.fd,
                 handle,
-                val.fd,
-                // SAFETY: buf pointer and length are valid for this operation.
-                unsafe { val.buf.as_ptr().add(val.buf_offset) },
-                (val.buf.len().saturating_sub(val.buf_offset)) as u32,
-                "UDP send",
+                user_data,
+                generation,
+                buf_offset: val.buf_offset,
+            },
+            &val.buf,
+            ctx.registrar,
+        )
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, user_data, generation
+                ),
             )
-        },
-        || {
-            format!(
-                "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, user_data, generation
-            )
-        },
-    )
+        })
 }
 
 pub(crate) fn submit_connect(
@@ -675,7 +497,6 @@ pub(crate) fn submit_udp_recv_stream(
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.borrow();
-    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
 
     let args = crate::rio::RioUdpStreamArgs {
         fd: val.fd,
@@ -684,37 +505,16 @@ pub(crate) fn submit_udp_recv_stream(
         user_data: header.user_data,
         generation: header.generation,
     };
-    match ctx.rio.try_submit_pool_recv(args, ctx.registrar) {
-        Ok(res) => Ok(res),
-        Err(e) => {
-            ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
-            if ctx.rio.is_iocp_fallback(socket_key) {
-                let buf = val
-                    .buf
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("udp recv_stream buffer missing"))?;
-                submit_iocp_recv_fallback(
-                    header,
-                    ctx,
-                    socket_key,
-                    handle,
-                    val.fd,
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    "UDP recv_stream",
-                )
-            } else {
-                Err(io_error(
-                    IocpErrorContext::Submission,
-                    e,
-                    format!(
-                        "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
-                        val.fd, header.user_data, header.generation
-                    ),
-                ))
-            }
-        }
-    }
+    ctx.rio.try_submit_pool_recv(args, ctx.registrar).map_err(|e| {
+        io_error(
+            IocpErrorContext::Submission,
+            e,
+            format!(
+                "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, header.user_data, header.generation
+            ),
+        )
+    })
 }
 
 /// # Safety
