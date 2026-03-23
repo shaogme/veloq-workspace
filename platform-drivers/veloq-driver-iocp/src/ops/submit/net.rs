@@ -16,8 +16,8 @@ use crate::ops::submit::common::{
     iocp_submit_connect_ex, mark_header_in_flight, resolve_fd, unpack_kernel_ref,
 };
 use crate::ops::{
-    AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv, SendToPayload, SubmitContext,
-    UdpRecv, UdpRecvStream, UdpSend,
+    ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv,
+    SendToPayload, SubmitContext, UdpRecv, UdpRecvStream, UdpSend,
 };
 use crate::rio::RioTarget;
 use crate::win32::SafeSocket;
@@ -279,6 +279,21 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> i
     })
 }
 
+fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> io::Result<u16> {
+    let mut storage = SockAddrStorage::default();
+    let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
+    with_borrowed_socket(handle.as_socket(), |socket| {
+        // SAFETY: storage and namelen are valid output pointers.
+        unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
+    })?;
+    match storage.family() {
+        AF_INET | AF_INET6 => Ok(storage.family()),
+        family => Err(io::Error::other(format!(
+            "unsupported listen socket family for accept: {family}"
+        ))),
+    }
+}
+
 /// # Safety
 ///
 /// The caller must ensure that header and payload are valid.
@@ -308,6 +323,27 @@ pub(crate) fn submit_accept(
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
     let handle = raw_handle.borrow();
+    if payload.accept_socket.is_none() {
+        let family = socket_family_from_handle(handle)?;
+        let accept_socket = if family == AF_INET {
+            crate::Socket::new_tcp_v4()
+        } else {
+            crate::Socket::new_tcp_v6()
+        }
+        .map(|s| s.into_owned_raw())
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
+                    handle.as_handle() as usize,
+                    family
+                ),
+            )
+        })?;
+        payload.accept_socket = Some(accept_socket);
+    }
     let accept_socket = payload
         .accept_socket
         .as_ref()
@@ -325,22 +361,7 @@ pub(crate) fn submit_accept(
         ),
     )?;
 
-    // Ensure the pre-allocated accept socket is also associated with the same IOCP.
-    let accept_socket_handle = crate::config::RawHandle::for_socket(accept_socket_raw as _);
-    ensure_iocp_association(
-        accept_socket_handle.borrow(),
-        ctx.port,
-        format!(
-            "submit_accept: associate accept socket failed: accept=0x{:x}, listen=0x{:x}, user_data={}, generation={}",
-            accept_socket_raw,
-            handle.as_handle() as usize,
-            header.user_data,
-            header.generation
-        ),
-    )?;
-
-    const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
-    let split = MIN_ADDR_LEN;
+    let split = ACCEPT_EX_ADDR_SECTION_LEN;
     let mut bytes_received = 0;
     // SAFETY: iocp_submit_accept_ex is a safe wrapper for the WinSock extension.
     let submit_res = unsafe {
@@ -378,7 +399,7 @@ pub(crate) fn submit_accept(
 ///
 /// The caller must ensure that header and payload are valid.
 pub(crate) unsafe fn on_complete_accept(
-    _header: &mut OverlappedEntry,
+    header: &mut OverlappedEntry,
     payload: &mut AcceptPayload,
     _result: usize,
     ext: &Extensions,
@@ -389,7 +410,10 @@ pub(crate) unsafe fn on_complete_accept(
         .accept_socket
         .take()
         .ok_or_else(|| io::Error::other("accept socket not initialized"))?;
-    let listen_handle = user.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
+    let listen_handle = header
+        .resolved_handle
+        .or_else(|| user.fd.raw())
+        .ok_or(io::Error::from_raw_os_error(0))?;
     let listen_socket = listen_handle.as_socket();
     let accept_socket_raw = accept_socket.as_socket();
 
@@ -408,8 +432,7 @@ pub(crate) unsafe fn on_complete_accept(
         ));
     }
 
-    const MIN_ADDR_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
-    let split = MIN_ADDR_LEN;
+    let split = ACCEPT_EX_ADDR_SECTION_LEN;
 
     let mut local_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
     let mut remote_sockaddr: *mut SOCKADDR = std::ptr::null_mut();

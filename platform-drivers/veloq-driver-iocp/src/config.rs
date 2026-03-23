@@ -82,6 +82,15 @@ pub struct OwnedRawHandle {
     raw: RawHandle,
 }
 
+/// Registered descriptor entry used by driver-side fixed-file table.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegisteredHandle {
+    /// Driver owns lifecycle (used for file handles).
+    Owned(OwnedRawHandle),
+    /// Driver only keeps a weak/raw view (used for socket handles).
+    Weak(RawHandle),
+}
+
 /// Borrowed handle view tied to a caller-controlled lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BorrowedRawHandle<'a> {
@@ -297,6 +306,16 @@ impl<'a> BorrowedRawHandle<'a> {
 impl From<OwnedRawHandle> for RawHandle {
     fn from(value: OwnedRawHandle) -> Self {
         value.into_raw()
+    }
+}
+
+impl RegisteredHandle {
+    #[inline]
+    pub fn as_raw(&self) -> RawHandle {
+        match self {
+            Self::Owned(h) => h.as_raw(),
+            Self::Weak(h) => *h,
+        }
     }
 }
 

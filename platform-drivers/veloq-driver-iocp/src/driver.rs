@@ -26,7 +26,7 @@ use veloq_driver_core::slot::{
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
-use crate::config::{IoFd, RawHandle, RawHandleKind};
+use crate::config::{IoFd, RawHandle, RawHandleKind, RegisteredHandle};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 use crate::rio::SocketActorKey;
@@ -482,17 +482,19 @@ impl IocpDriver {
                 }
             };
             let kind = canonical.kind();
-            // SAFETY: register_files treats caller-provided handles as ownership transfer.
-            let owned = unsafe { canonical.into_owned() };
-            if kind == RawHandleKind::Socket {
+            let entry = if kind == RawHandleKind::Socket {
                 self.rio_state.mark_socket_registered(canonical.actor_key());
-            }
+                RegisteredHandle::Weak(canonical)
+            } else {
+                // SAFETY: file registration transfers ownership to the driver slot.
+                RegisteredHandle::Owned(unsafe { canonical.into_owned() })
+            };
             let idx = if let Some(idx) = self.free_slots.pop() {
-                self.registered_files[idx] = Some(owned);
+                self.registered_files[idx] = Some(entry);
                 self.rio_state.clear_registered_rq(idx);
                 idx
             } else {
-                self.registered_files.push(Some(owned));
+                self.registered_files.push(Some(entry));
                 self.rio_state.resize_rqs(self.registered_files.len());
                 self.registered_files.len() - 1
             };

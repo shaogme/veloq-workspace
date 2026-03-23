@@ -15,7 +15,7 @@ pub(crate) use submit::SubmissionResult;
 use std::io;
 use std::ptr::NonNull;
 
-use crate::config::{IoFd, OwnedRawHandle, RawHandle};
+use crate::config::{IoFd, OwnedRawHandle, RawHandle, RegisteredHandle};
 use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioState;
@@ -29,10 +29,8 @@ use veloq_driver_core::op::{
     Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
 };
 
-use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
-    INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR_IN, SOCKADDR_IN6, WSA_FLAG_OVERLAPPED,
-    WSA_FLAG_REGISTERED_IO, WSASocketW,
+    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
 };
 
 // ============================================================================
@@ -64,7 +62,7 @@ pub(crate) struct SubmitContext<'a> {
     pub(crate) port: &'a crate::win32::IoCompletionPort,
     pub(crate) overlapped: *mut crate::win32::Overlapped,
     pub(crate) ext: &'a Extensions,
-    pub(crate) registered_files: &'a [Option<OwnedRawHandle>],
+    pub(crate) registered_files: &'a [Option<RegisteredHandle>],
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
 
     // RIO Support
@@ -250,9 +248,12 @@ pub(crate) struct KernelRef<T> {
 }
 
 /// Payload for the socket accept operation.
+pub(crate) const ACCEPT_EX_ADDR_SECTION_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
+pub(crate) const ACCEPT_EX_OUTPUT_BUFFER_LEN: usize = ACCEPT_EX_ADDR_SECTION_LEN * 2;
+
 pub(crate) struct AcceptPayload {
     pub(crate) user: NonNull<Accept>,
-    pub(crate) accept_buffer: [u8; 288],
+    pub(crate) accept_buffer: [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN],
     pub(crate) accept_socket: Option<OwnedRawHandle>,
 }
 
@@ -359,31 +360,10 @@ define_iocp_ops! {
         map_completion: |_op: &Accept, res: io::Result<usize>| res.map(|raw| RawHandle::for_socket(raw as _)),
         get_fd: submit::get_fd_accept,
         construct: |user: std::ptr::NonNull<Accept>| {
-            // SAFETY: user pointer is valid and points to a valid Accept.
-            let op = unsafe { user.as_ref() };
-            let family = op.addr.family();
-            // SAFETY: WSASocketW is called with valid parameters for IOCP.
-            let socket = unsafe {
-                WSASocketW(
-                    family as i32,
-                    SOCK_STREAM,
-                    IPPROTO_TCP,
-                    std::ptr::null(),
-                    0,
-                    WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
-                )
-            };
-            let accept_socket = if socket == INVALID_SOCKET {
-                None
-            } else {
-                let raw = RawHandle::for_socket(socket as HANDLE);
-                // SAFETY: this socket is newly created here and uniquely owned.
-                Some(unsafe { raw.into_owned() })
-            };
             AcceptPayload {
                 user,
-                accept_buffer: [0; 288],
-                accept_socket,
+                accept_buffer: [0; ACCEPT_EX_OUTPUT_BUFFER_LEN],
+                accept_socket: None,
             }
         },
         destruct: |user: Box<Accept>| *user,

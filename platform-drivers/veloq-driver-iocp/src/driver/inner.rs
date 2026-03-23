@@ -19,7 +19,7 @@ use crate::common::{
     IocpErrorContext, IocpWaker, WAKEUP_USER_DATA, completion_record, io_error, io_msg,
     io_result_to_event_res, push_completion_shared,
 };
-use crate::config::{BufferRegistrationMode, IocpConfig, OwnedRawHandle, RawHandle};
+use crate::config::{BufferRegistrationMode, IocpConfig, RawHandle, RegisteredHandle};
 use crate::driver::{CompletionSidecar, IocpOpState};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
@@ -49,7 +49,7 @@ pub struct IocpDriver {
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
-    pub(crate) registered_files: Vec<Option<OwnedRawHandle>>,
+    pub(crate) registered_files: Vec<Option<RegisteredHandle>>,
     pub(crate) free_slots: Vec<usize>,
     pub(crate) is_notified: Arc<AtomicBool>,
     pub(crate) completion_events: SharedCompletionQueue,
@@ -637,7 +637,7 @@ impl IocpDriver {
 }
 
 struct CancelContext<'a> {
-    registered_files: &'a [Option<OwnedRawHandle>],
+    registered_files: &'a [Option<RegisteredHandle>],
     rio_state: &'a mut RioState,
     registrar: &'a dyn BufferRegistrar,
     completion_events: &'a SharedCompletionQueue,

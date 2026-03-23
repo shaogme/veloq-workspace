@@ -5,7 +5,7 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::common::{IocpErrorContext, io_error, io_msg};
-use crate::config::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandle};
+use crate::config::{BorrowedRawHandle, IoFd, RawHandle, RegisteredHandle};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
 use crate::ops::{KernelRef, OverlappedEntry};
 use crate::win32::Overlapped;
@@ -175,7 +175,7 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> io::Result<Sub
 
 pub(crate) fn resolve_fd(
     fd: IoFd,
-    registered_files: &[Option<OwnedRawHandle>],
+    registered_files: &[Option<RegisteredHandle>],
 ) -> io::Result<RawHandle> {
     match fd {
         IoFd::Raw(h) => Ok(h),
