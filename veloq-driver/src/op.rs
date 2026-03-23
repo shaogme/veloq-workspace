@@ -31,7 +31,7 @@ pub type LocalOp<T> = veloq_driver_core::op::LocalOp<T, PlatformDriver>;
 
 pub trait OpSubmitter: Clone + std::marker::Send + Sync + 'static {
     type Future<T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + std::marker::Send + 'static>:
-        Future<Output = OpResult<T>>;
+        Future<Output = OpResult<T, <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion>>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
     where

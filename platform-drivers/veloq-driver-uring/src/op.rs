@@ -1,5 +1,6 @@
 //! io_uring Platform-Specific Operation Definitions
 
+use crate::RawHandle;
 use crate::driver::UringDriver;
 use io_uring::squeue;
 use std::io;
@@ -82,7 +83,9 @@ macro_rules! define_uring_ops {
                 $(payload: $Payload:ty,)?
                 kind: $kind:expr,
                 make_sqe: $make_sqe:path,
-                on_complete: $complete:path,
+                $(on_complete: $complete:path,)?
+                $(completion: $completion:ty,)?
+                $(map_completion: $map_completion:expr,)?
                 drop: $drop:path,
                 $(strategy: $strategy:expr,)?
                 $(get_timeout: $get_timeout:expr,)?
@@ -95,12 +98,13 @@ macro_rules! define_uring_ops {
         $(
             impl IntoPlatformOp<UringOp> for $OpType {
                 type UserPayload = Box<$OpType>;
+                type Completion = define_uring_ops!(@completion_type $($completion)?);
                 const PAYLOAD_KIND: OpKind = $kind;
 
                 fn into_kernel_and_payload(self) -> (UringKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
                         make_sqe: $make_sqe,
-                        on_complete: $complete,
+                        on_complete: define_uring_ops!(@on_complete $($complete)?),
                         drop: $drop,
                         strategy: define_uring_ops!(@strategy $($strategy)?),
                         get_timeout: define_uring_ops!(@get_timeout $($get_timeout)?),
@@ -133,6 +137,10 @@ macro_rules! define_uring_ops {
                 unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
                     unsafe { Box::from_raw(ptr as *mut $OpType) }
                 }
+
+                fn map_completion_result(&self, res: io::Result<usize>) -> io::Result<Self::Completion> {
+                    define_uring_ops!(@map_completion self, res, $($map_completion)?)
+                }
             }
         )+
     };
@@ -161,6 +169,15 @@ macro_rules! define_uring_ops {
         }
         drop_raw
     }};
+
+    (@on_complete ) => { crate::op::submit::on_complete_default };
+    (@on_complete $func:path) => { $func };
+
+    (@completion_type ) => { usize };
+    (@completion_type $ty:ty) => { $ty };
+
+    (@map_completion $this:ident, $res:ident, ) => { $res };
+    (@map_completion $this:ident, $res:ident, $expr:expr) => { ($expr)($this, $res) };
 }
 
 // ============================================================================
@@ -254,6 +271,8 @@ define_uring_ops! {
         kind: OpKind::Accept,
         make_sqe: submit::make_sqe_accept,
         on_complete: submit::on_complete_accept,
+        completion: RawHandle,
+        map_completion: |_op: &Accept, res: io::Result<usize>| res.map(|raw| RawHandle::for_socket(raw as i32)),
         drop: submit::drop_accept,
         construct: |user| payload::AcceptPayload { user },
         destruct: |user: Box<Accept>| *user,
@@ -298,7 +317,8 @@ define_uring_ops! {
         payload: payload::OpenPayload,
         kind: OpKind::Open,
         make_sqe: submit::make_sqe_open,
-        on_complete: submit::on_complete_open,
+        completion: RawHandle,
+        map_completion: |_op: &Open, res: io::Result<usize>| res.map(|raw| RawHandle::for_file(raw as i32)),
         drop: submit::drop_open,
         construct: |user| payload::OpenPayload { user },
         destruct: |user: Box<Open>| *user,

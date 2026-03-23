@@ -15,13 +15,13 @@ impl<P> OpEntry<P> {
     }
 }
 
-pub struct LocalSlot<Op, P, S: SlotSidecar> {
+pub struct LocalSlot<Op, P, S: SlotSidecar, R = usize> {
     op: Option<Op>,
     pub entry: OpEntry<P>,
-    pub storage: SlotStorage<Op, S>,
+    pub storage: SlotStorage<Op, S, R>,
 }
 
-impl<Op, P: Default, S: SlotSidecar> LocalSlot<Op, P, S> {
+impl<Op, P: Default, S: SlotSidecar, R> LocalSlot<Op, P, S, R> {
     #[inline]
     fn new() -> Self {
         Self {
@@ -34,9 +34,9 @@ impl<Op, P: Default, S: SlotSidecar> LocalSlot<Op, P, S> {
     }
 }
 
-pub struct OpRegistry<Op: PlatformOp, P, S: SlotSidecar> {
-    pub shared: Arc<SlotTable<Op, S>>,
-    pub local: Box<[LocalSlot<Op, P, S>]>,
+pub struct OpRegistry<Op: PlatformOp, P, S: SlotSidecar, R = usize> {
+    pub shared: Arc<SlotTable<Op, S, R>>,
+    pub local: Box<[LocalSlot<Op, P, S, R>]>,
     local_free_head: usize,
 }
 
@@ -50,14 +50,14 @@ pub struct AllocResult {
     pub handle: OpHandle,
 }
 
-type SlotEntryOpBundle<'a, Op, P, S> = (
-    &'a SlotEntry<Op, S>,
+type SlotEntryOpBundle<'a, Op, P, S, R = usize> = (
+    &'a SlotEntry<Op, S, R>,
     &'a mut OpEntry<P>,
     &'a mut Option<Op>,
-    &'a mut SlotStorage<Op, S>,
+    &'a mut SlotStorage<Op, S, R>,
 );
 
-impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
+impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
     pub fn new(capacity: usize) -> Self {
         let shared = Arc::new(SlotTable::new(capacity));
         let mut local = Vec::with_capacity(capacity);
@@ -138,7 +138,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
     pub fn get_slot_and_entry_mut(
         &mut self,
         user_data: usize,
-    ) -> Option<(&SlotEntry<Op, S>, &mut OpEntry<P>)> {
+    ) -> Option<(&SlotEntry<Op, S, R>, &mut OpEntry<P>)> {
         if user_data < self.local.len() {
             Some((
                 &self.shared.slots[user_data],
@@ -152,7 +152,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
     pub fn get_slot_entry_op_storage_and_entry_mut(
         &mut self,
         user_data: usize,
-    ) -> Option<SlotEntryOpBundle<'_, Op, P, S>> {
+    ) -> Option<SlotEntryOpBundle<'_, Op, P, S, R>> {
         if user_data < self.local.len() {
             let local = &mut self.local[user_data];
             Some((
@@ -167,21 +167,21 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
     }
 
     #[inline]
-    pub fn with_slot_storage_mut<F, R>(&mut self, user_data: usize, f: F) -> Option<R>
+    pub fn with_slot_storage_mut<F, X>(&mut self, user_data: usize, f: F) -> Option<X>
     where
         F: FnOnce(
             &mut Option<Op>,
-            &mut Option<std::io::Result<usize>>,
+            &mut Option<std::io::Result<R>>,
             &mut Option<ErasedPayload>,
             &mut S,
-        ) -> R,
+        ) -> X,
     {
         self.local
             .get_mut(user_data)
             .map(|local| local.storage.with_mut(f))
     }
 
-    pub fn slot_storage_mut(&mut self, user_data: usize) -> Option<&mut SlotStorage<Op, S>> {
+    pub fn slot_storage_mut(&mut self, user_data: usize) -> Option<&mut SlotStorage<Op, S, R>> {
         if user_data < self.local.len() {
             Some(&mut self.local[user_data].storage)
         } else {
@@ -234,7 +234,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> OpRegistry<Op, P, S> {
     }
 }
 
-impl<Op: PlatformOp, P, S: SlotSidecar> Index<usize> for OpRegistry<Op, P, S> {
+impl<Op: PlatformOp, P, S: SlotSidecar, R> Index<usize> for OpRegistry<Op, P, S, R> {
     type Output = OpEntry<P>;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -242,7 +242,7 @@ impl<Op: PlatformOp, P, S: SlotSidecar> Index<usize> for OpRegistry<Op, P, S> {
     }
 }
 
-impl<Op: PlatformOp, P, S: SlotSidecar> IndexMut<usize> for OpRegistry<Op, P, S> {
+impl<Op: PlatformOp, P, S: SlotSidecar, R> IndexMut<usize> for OpRegistry<Op, P, S, R> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.local[index].entry
     }

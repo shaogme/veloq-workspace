@@ -107,18 +107,18 @@ impl std::fmt::Display for OpError {
 /// is polled after the driver has reclaimed the slot (Generation Mismatch).
 /// In such cases, the ownership of the resource `T` is lost.
 #[derive(Debug)]
-pub enum OpResult<T> {
+pub enum OpResult<T, R = usize> {
     /// Operation completed (successfully or with IO error).
     /// Returns the result of the operation and the original resource.
-    Completed(std::io::Result<usize>, T),
+    Completed(std::io::Result<R>, T),
     /// Operation failed because the resource ownership was lost.
     /// Includes structured error information about the loss.
     ResourceLost(OpError),
 }
 
-impl<T> OpResult<T> {
+impl<T, R> OpResult<T, R> {
     /// Unwraps the result, assuming the operation completed (panics if Lost).
-    pub fn unwrap(self) -> (usize, T) {
+    pub fn unwrap(self) -> (R, T) {
         match self {
             OpResult::Completed(Ok(res), data) => (res, data),
             OpResult::Completed(Err(e), _) => panic!("OpResult::Completed(Err({}))", e),
@@ -127,7 +127,7 @@ impl<T> OpResult<T> {
     }
 
     /// Returns the result and the resource implementation (if available).
-    pub fn into_inner(self) -> (std::io::Result<usize>, Option<T>) {
+    pub fn into_inner(self) -> (std::io::Result<R>, Option<T>) {
         match self {
             OpResult::Completed(res, data) => (res, Some(data)),
             OpResult::ResourceLost(err) => (Err(err.source), None),
@@ -148,6 +148,8 @@ pub trait OpLifecycle: Sized {
     type Output;
     /// Driver-defined raw handle token type.
     type Handle: Handle;
+    /// Completion value type delivered by driver.
+    type CompletionValue;
 
     /// Pre-allocate any resources needed (e.g., accept socket on Windows).
     fn pre_alloc(fd: Self::Handle) -> std::io::Result<Self::PreAlloc>;
@@ -156,7 +158,10 @@ pub trait OpLifecycle: Sized {
     fn into_op(fd: Self::Handle, pre: Self::PreAlloc) -> Self;
 
     /// Convert the completed operation result to the final output type.
-    fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output>;
+    fn into_output(
+        self,
+        res: std::io::Result<Self::CompletionValue>,
+    ) -> std::io::Result<Self::Output>;
 
     /// Helper: Pre-allocate and construct the operation in one step.
     fn prepare_op(fd: Self::Handle) -> std::io::Result<Self> {
@@ -169,6 +174,8 @@ pub trait OpLifecycle: Sized {
 pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     /// User payload detached from kernel op.
     type UserPayload: std::marker::Send + 'static;
+    /// Completion value exposed to caller for this op.
+    type Completion;
     const PAYLOAD_KIND: OpKind;
 
     /// Split into kernel-facing op and user payload.
@@ -185,6 +192,12 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     /// `ptr` must originate from the matching `Self::payload_into_erased` implementation
     /// of the same concrete operation type and must not have been consumed before.
     unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload;
+
+    /// Map kernel completion integer into typed completion value.
+    fn map_completion_result(
+        &self,
+        res: std::io::Result<usize>,
+    ) -> std::io::Result<Self::Completion>;
 
     /// Compatibility helper for transitional callsites.
     #[inline]
@@ -237,7 +250,7 @@ impl<T> Op<T> {
     pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op>
     where
         T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
-        D: Driver,
+        D: Driver<Completion = usize>,
     {
         let data = self.data;
         trace!("Submitting detached op");
@@ -347,7 +360,7 @@ where
     O: PlatformOp,
     T: IntoPlatformOp<O>,
 {
-    completion_table: Option<SharedCompletionTable>,
+    completion_table: Option<SharedCompletionTable<usize>>,
     cancel_signal: Option<std::sync::Arc<DetachedCancelTable>>,
     cancel_waker: Option<Arc<dyn RemoteWaker>>,
     token: u64,
@@ -386,7 +399,7 @@ where
     O: PlatformOp,
     T: IntoPlatformOp<O>,
 {
-    type Output = OpResult<T>;
+    type Output = OpResult<T, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -420,8 +433,9 @@ where
                 }
                 let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                 let data = T::from_user_payload(payload);
-                let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
-                return Poll::Ready(OpResult::Completed(res, data));
+                let res = detail.unwrap_or_else(|| event_res_to_io::<usize>(event.res));
+                let completion = data.map_completion_result(res);
+                return Poll::Ready(OpResult::Completed(completion, data));
             }
             PollRecordResult::Stale => {
                 return Poll::Ready(OpResult::ResourceLost(OpError::new(
@@ -482,10 +496,10 @@ where
 
 impl<T, D> Future for LocalOp<T, D>
 where
-    D: Driver,
+    D: Driver<Completion = usize>,
     T: IntoPlatformOp<D::Op> + 'static,
 {
-    type Output = OpResult<T>;
+    type Output = OpResult<T, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let op = unsafe { self.get_unchecked_mut() };
@@ -576,8 +590,9 @@ where
                     }
                     let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                     let data = T::from_user_payload(payload);
-                    let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
-                    Poll::Ready(OpResult::Completed(res, data))
+                    let res = detail.unwrap_or_else(|| event_res_to_io::<usize>(event.res));
+                    let completion = data.map_completion_result(res);
+                    Poll::Ready(OpResult::Completed(completion, data))
                 }
                 PollRecordResult::Stale => {
                     op.state = State::Completed;
@@ -618,7 +633,7 @@ where
 
 pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
     type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static>: Future<
-        Output = OpResult<T>,
+        Output = OpResult<T, <T as IntoPlatformOp<D::Op>>::Completion>,
     >;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
@@ -635,7 +650,7 @@ pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
 #[derive(Clone, Copy)]
 pub struct LocalSubmitter;
 
-impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
+impl<D: Driver<Completion = usize>> OpSubmitter<D> for LocalSubmitter {
     type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static> = LocalOp<T, D>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
@@ -664,7 +679,7 @@ impl DetachedSubmitter {
     }
 }
 
-impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
+impl<D: Driver<Completion = usize>> OpSubmitter<D> for DetachedSubmitter {
     type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static> = DetachedOp<T, D::Op>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
@@ -828,10 +843,11 @@ pub struct UdpRecvPacket {
 // OpLifecycle Implementations
 // ============================================================================
 
-impl<H: Handle + From<usize>, A: SockAddr> OpLifecycle for Accept<H, A> {
+impl<H: Handle, A: SockAddr> OpLifecycle for Accept<H, A> {
     type PreAlloc = ();
     type Output = (H, std::net::SocketAddr);
     type Handle = H;
+    type CompletionValue = H;
 
     fn pre_alloc(_fd: H) -> std::io::Result<Self::PreAlloc> {
         Ok(())
@@ -849,8 +865,11 @@ impl<H: Handle + From<usize>, A: SockAddr> OpLifecycle for Accept<H, A> {
         }
     }
 
-    fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output> {
-        let fd = res?.into();
+    fn into_output(
+        self,
+        res: std::io::Result<Self::CompletionValue>,
+    ) -> std::io::Result<Self::Output> {
+        let fd = res?;
         let addr = self.remote_addr.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -890,6 +909,7 @@ mod tests {
 
     impl IntoPlatformOp<DummyPlatformOp> for DummyOp {
         type UserPayload = DummyPayload;
+        type Completion = usize;
         const PAYLOAD_KIND: OpKind = OpKind::Wakeup;
 
         fn into_kernel_and_payload(self) -> (DummyPlatformOp, Self::UserPayload) {
@@ -916,6 +936,13 @@ mod tests {
         unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
             let _ = unsafe { Box::from_raw(ptr) };
             DummyPayload
+        }
+
+        fn map_completion_result(
+            &self,
+            res: std::io::Result<usize>,
+        ) -> std::io::Result<Self::Completion> {
+            res
         }
     }
 

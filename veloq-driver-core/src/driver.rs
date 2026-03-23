@@ -19,13 +19,30 @@ pub const CELL_STATE_BUSY: u8 = 4;
 
 pub trait PlatformOp: 'static {}
 
-pub struct CompletionSidecar {
+pub trait CompletionValue: Send + 'static {
+    fn from_event_res(res: i32) -> io::Result<Self>
+    where
+        Self: Sized;
+}
+
+impl CompletionValue for usize {
+    #[inline]
+    fn from_event_res(res: i32) -> io::Result<Self> {
+        if res >= 0 {
+            Ok(res as usize)
+        } else {
+            Err(io::Error::from_raw_os_error(-res))
+        }
+    }
+}
+
+pub struct CompletionSidecar<R = usize> {
     pub user_data: usize,
     pub generation: u32,
     pub res: i32,
     pub flags: u32,
     pub payload: Option<slot::ErasedPayload>,
-    pub detail: Option<io::Result<usize>>,
+    pub detail: Option<io::Result<R>>,
 }
 
 /// Unified completion event produced by platform drivers.
@@ -40,36 +57,36 @@ pub struct CompletionEvent {
 }
 
 pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
-pub type SharedCompletionTable = Arc<dyn CompletionAccess>;
+pub type SharedCompletionTable<R = usize> = Arc<dyn CompletionAccess<R>>;
 
-pub struct CompletionRecord {
+pub struct CompletionRecord<R = usize> {
     pub event: CompletionEvent,
     pub payload: Option<slot::ErasedPayload>,
-    pub detail: Option<io::Result<usize>>,
+    pub detail: Option<io::Result<R>>,
 }
 
 /// Result of a completion poll, enabling detection of recycled slots.
-pub enum PollRecordResult {
+pub enum PollRecordResult<R = usize> {
     /// Operation completed successfully or with an error.
-    Ready(CompletionRecord),
+    Ready(CompletionRecord<R>),
     /// Operation is still in flight.
     Pending,
     /// Operation lost because the slot has been recycled for a newer generation.
     Stale,
 }
 
-pub trait CompletionAccess: Send + Sync {
+pub trait CompletionAccess<R = usize>: Send + Sync {
     fn record_completion_with_data(
         &self,
         event: CompletionEvent,
         payload: Option<slot::ErasedPayload>,
-        detail: Option<io::Result<usize>>,
+        detail: Option<io::Result<R>>,
     );
 
-    fn try_take_record(&self, token: u64) -> PollRecordResult;
+    fn try_take_record(&self, token: u64) -> PollRecordResult<R>;
 
     #[inline]
-    fn try_take(&self, token: u64) -> PollRecordResult {
+    fn try_take(&self, token: u64) -> PollRecordResult<R> {
         self.try_take_record(token)
     }
 
@@ -83,13 +100,15 @@ pub trait CompletionAccess: Send + Sync {
     fn debug_get_state(&self, idx: usize) -> u8;
 }
 
-impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S> {
+impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
+    for slot::SlotTable<Op, S, R>
+{
     #[inline]
     fn record_completion_with_data(
         &self,
         event: CompletionEvent,
         mut payload: Option<slot::ErasedPayload>,
-        mut detail: Option<io::Result<usize>>,
+        mut detail: Option<io::Result<R>>,
     ) {
         let (idx, generation) = decode_completion_token(event.user_data);
         if idx >= self.slots.len() {
@@ -218,7 +237,7 @@ impl<Op: PlatformOp, S: SlotSidecar> CompletionAccess for slot::SlotTable<Op, S>
     }
 
     #[inline]
-    fn try_take_record(&self, token: u64) -> PollRecordResult {
+    fn try_take_record(&self, token: u64) -> PollRecordResult<R> {
         let (idx, generation) = decode_completion_token(token);
         if idx >= self.slots.len() {
             return PollRecordResult::Pending;
@@ -500,22 +519,21 @@ pub fn decode_completion_token(token: u64) -> (usize, u32) {
 }
 
 #[inline]
-pub fn event_res_to_io(res: i32) -> io::Result<usize> {
-    if res >= 0 {
-        Ok(res as usize)
-    } else {
-        Err(io::Error::from_raw_os_error(-res))
-    }
+pub fn event_res_to_io<R: CompletionValue>(res: i32) -> io::Result<R> {
+    R::from_event_res(res)
 }
 
 pub trait Driver: 'static {
     type Op: PlatformOp;
     type Handle: Handle;
     type Sidecar: SlotSidecar;
+    type Completion: CompletionValue;
 
     fn reserve_op(&mut self) -> io::Result<(usize, u32)>;
 
-    fn slot_table(&self) -> std::sync::Arc<slot::SlotTable<Self::Op, Self::Sidecar>>;
+    fn slot_table(
+        &self,
+    ) -> std::sync::Arc<slot::SlotTable<Self::Op, Self::Sidecar, Self::Completion>>;
 
     fn detached_cancel_table(&self) -> std::sync::Arc<slot::DetachedCancelTable>;
 
@@ -561,7 +579,7 @@ pub trait Driver: 'static {
 
     fn completion_queue(&self) -> SharedCompletionQueue;
 
-    fn completion_table(&self) -> SharedCompletionTable;
+    fn completion_table(&self) -> SharedCompletionTable<Self::Completion>;
 
     fn try_pop_completion(&mut self) -> Option<CompletionEvent> {
         self.completion_queue().pop()
@@ -582,11 +600,11 @@ pub trait Driver: 'static {
         Ok(self.drain_completions(out))
     }
 
-    fn try_take_completion(&mut self, token: u64) -> PollRecordResult {
+    fn try_take_completion(&mut self, token: u64) -> PollRecordResult<Self::Completion> {
         self.completion_table().try_take(token)
     }
 
-    fn try_take_completion_record(&mut self, token: u64) -> PollRecordResult {
+    fn try_take_completion_record(&mut self, token: u64) -> PollRecordResult<Self::Completion> {
         self.completion_table().try_take_record(token)
     }
 

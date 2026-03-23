@@ -119,14 +119,14 @@ impl AtomicPackedCoreState {
     }
 }
 
-pub struct SlotStorage<Op, S: SlotSidecar> {
+pub struct SlotStorage<Op, S: SlotSidecar, R = usize> {
     op: Option<Op>,
-    result: Option<std::io::Result<usize>>,
+    result: Option<std::io::Result<R>>,
     payload: Option<ErasedPayload>,
     sidecar: S,
 }
 
-impl<Op, S: SlotSidecar> SlotStorage<Op, S> {
+impl<Op, S: SlotSidecar, R> SlotStorage<Op, S, R> {
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -143,14 +143,14 @@ impl<Op, S: SlotSidecar> SlotStorage<Op, S> {
     }
 
     #[inline]
-    pub fn with_mut<F, R>(&mut self, f: F) -> R
+    pub fn with_mut<F, X>(&mut self, f: F) -> X
     where
         F: FnOnce(
             &mut Option<Op>,
-            &mut Option<std::io::Result<usize>>,
+            &mut Option<std::io::Result<R>>,
             &mut Option<ErasedPayload>,
             &mut S,
-        ) -> R,
+        ) -> X,
     {
         f(
             &mut self.op,
@@ -161,30 +161,39 @@ impl<Op, S: SlotSidecar> SlotStorage<Op, S> {
     }
 }
 
-impl<Op, S: SlotSidecar> Default for SlotStorage<Op, S> {
+impl<Op, S: SlotSidecar, R> Default for SlotStorage<Op, S, R> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub struct SlotData<Op, S: SlotSidecar> {
+pub struct SlotData<Op, S: SlotSidecar, R = usize> {
     pub(crate) core_state: AtomicPackedCoreState,
     pub next_free: AtomicUsize,
     pub(crate) completion_res: AtomicI32,
     pub(crate) completion_flags: AtomicU32,
-    pub(crate) completion_data: Mutex<CompletionData>,
+    pub(crate) completion_data: Mutex<CompletionData<R>>,
     pub(crate) completion_waker: AtomicWaker,
     _marker: PhantomData<fn() -> (Op, S)>,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct CompletionData {
+#[derive(Debug)]
+pub(crate) struct CompletionData<R = usize> {
     pub payload: Option<ErasedPayload>,
-    pub detail: Option<io::Result<usize>>,
+    pub detail: Option<io::Result<R>>,
 }
 
-impl<Op, S: SlotSidecar> SlotData<Op, S> {
+impl<R> Default for CompletionData<R> {
+    fn default() -> Self {
+        Self {
+            payload: None,
+            detail: None,
+        }
+    }
+}
+
+impl<Op, S: SlotSidecar, R> SlotData<Op, S, R> {
     const NULL_INDEX: usize = usize::MAX;
 
     pub fn new() -> Self {
@@ -263,9 +272,9 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     }
 
     #[inline]
-    pub(crate) fn completion_with_data<F, R>(&self, f: F) -> R
+    pub(crate) fn completion_with_data<F, X>(&self, f: F) -> X
     where
-        F: FnOnce(&mut Option<ErasedPayload>, &mut Option<io::Result<usize>>) -> R,
+        F: FnOnce(&mut Option<ErasedPayload>, &mut Option<io::Result<R>>) -> X,
     {
         let mut data = self.completion_data.lock();
         let CompletionData { payload, detail } = &mut *data;
@@ -273,13 +282,13 @@ impl<Op, S: SlotSidecar> SlotData<Op, S> {
     }
 }
 
-impl<Op, S: SlotSidecar> Default for SlotData<Op, S> {
+impl<Op, S: SlotSidecar, R> Default for SlotData<Op, S, R> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub type SlotEntry<Op, S> = CachePadded<SlotData<Op, S>>;
+pub type SlotEntry<Op, S, R = usize> = CachePadded<SlotData<Op, S, R>>;
 
 pub struct DetachedCancelTable {
     slot_count: usize,
@@ -348,14 +357,14 @@ impl DetachedCancelTable {
     }
 }
 
-pub struct SlotTable<Op, S: SlotSidecar> {
-    pub slots: Box<[SlotEntry<Op, S>]>,
+pub struct SlotTable<Op, S: SlotSidecar, R = usize> {
+    pub slots: Box<[SlotEntry<Op, S, R>]>,
     pub remote_free_head: AtomicUsize,
 }
 
-unsafe impl<Op, S: SlotSidecar> Sync for SlotTable<Op, S> {}
+unsafe impl<Op, S: SlotSidecar, R> Sync for SlotTable<Op, S, R> {}
 
-impl<Op, S: SlotSidecar> SlotTable<Op, S> {
+impl<Op, S: SlotSidecar, R> SlotTable<Op, S, R> {
     pub const NULL_INDEX: usize = usize::MAX;
 
     pub fn new(capacity: usize) -> Self {
@@ -421,21 +430,21 @@ impl SlotMarker for InFlightWaiting {}
 impl SlotMarker for InFlightOrphaned {}
 impl SlotMarker for Completed {}
 
-pub struct Slot<'a, State: SlotMarker, Op: PlatformOp, P, S: SlotSidecar> {
-    pub entry: &'a SlotEntry<Op, S>,
+pub struct Slot<'a, State: SlotMarker, Op: PlatformOp, P, S: SlotSidecar, R = usize> {
+    pub entry: &'a SlotEntry<Op, S, R>,
     pub op: &'a mut Option<Op>,
-    pub storage: &'a mut SlotStorage<Op, S>,
+    pub storage: &'a mut SlotStorage<Op, S, R>,
     platform: &'a mut P,
     index: usize,
     _state: PhantomData<State>,
 }
 
-impl<'a, State: SlotMarker, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, State, Op, P, S> {
+impl<'a, State: SlotMarker, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, State, Op, P, S, R> {
     #[inline]
     fn new_internal(
-        entry: &'a SlotEntry<Op, S>,
+        entry: &'a SlotEntry<Op, S, R>,
         op: &'a mut Option<Op>,
-        storage: &'a mut SlotStorage<Op, S>,
+        storage: &'a mut SlotStorage<Op, S, R>,
         platform: &'a mut P,
         index: usize,
     ) -> Self {
@@ -460,12 +469,12 @@ pub fn is_runnable_state(state: SlotState) -> bool {
     matches!(state, SlotState::Reserved | SlotState::InFlightWaiting)
 }
 
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Reserved, Op, P, S> {
+impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, Reserved, Op, P, S, R> {
     #[inline]
     fn try_bind(
-        entry: &'a SlotEntry<Op, S>,
+        entry: &'a SlotEntry<Op, S, R>,
         op: &'a mut Option<Op>,
-        storage: &'a mut SlotStorage<Op, S>,
+        storage: &'a mut SlotStorage<Op, S, R>,
         platform: &'a mut P,
         index: usize,
     ) -> Option<Self> {
@@ -481,7 +490,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Reserved, Op, P, S> {
         self.op.is_some()
     }
 
-    pub fn init_op_with<F>(self, op: Op, init_sidecar: F) -> Slot<'a, Reserved, Op, P, S>
+    pub fn init_op_with<F>(self, op: Op, init_sidecar: F) -> Slot<'a, Reserved, Op, P, S, R>
     where
         F: FnOnce(&mut S),
     {
@@ -499,8 +508,8 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Reserved, Op, P, S> {
 
     pub fn start_submission_with(
         self,
-        rollback: Option<SubmissionRollback<'a, Op, P, S>>,
-    ) -> SubmissionGuard<'a, Op, P, S> {
+        rollback: Option<SubmissionRollback<'a, Op, P, S, R>>,
+    ) -> SubmissionGuard<'a, Op, P, S, R> {
         assert!(
             self.op.is_some(),
             "slot {} in Reserved state must contain an op",
@@ -517,9 +526,9 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Reserved, Op, P, S> {
     }
 
     #[inline]
-    pub fn with_op_mut<F, R>(&mut self, f: F) -> Option<R>
+    pub fn with_op_mut<F, X>(&mut self, f: F) -> Option<X>
     where
-        F: FnOnce(&mut Op) -> R,
+        F: FnOnce(&mut Op) -> X,
     {
         assert!(
             self.op.is_some(),
@@ -537,12 +546,12 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Reserved, Op, P, S> {
     }
 }
 
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlightWaiting, Op, P, S> {
+impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, InFlightWaiting, Op, P, S, R> {
     #[inline]
     fn try_bind(
-        entry: &'a SlotEntry<Op, S>,
+        entry: &'a SlotEntry<Op, S, R>,
         op: &'a mut Option<Op>,
-        storage: &'a mut SlotStorage<Op, S>,
+        storage: &'a mut SlotStorage<Op, S, R>,
         platform: &'a mut P,
         index: usize,
     ) -> Option<Self> {
@@ -557,7 +566,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlightWaiting, Op, P, S> 
         }
     }
 
-    pub fn complete(self) -> Slot<'a, Completed, Op, P, S> {
+    pub fn complete(self) -> Slot<'a, Completed, Op, P, S, R> {
         assert!(
             self.op.is_some(),
             "slot {} in InFlight state must contain an op",
@@ -566,7 +575,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlightWaiting, Op, P, S> 
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
-    pub fn cancel(self) -> Slot<'a, InFlightOrphaned, Op, P, S> {
+    pub fn cancel(self) -> Slot<'a, InFlightOrphaned, Op, P, S, R> {
         assert!(
             self.op.is_some(),
             "slot {} in InFlight state must contain an op",
@@ -578,9 +587,9 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlightWaiting, Op, P, S> 
     }
 
     #[inline]
-    pub fn with_op_mut<F, R>(&mut self, f: F) -> Option<R>
+    pub fn with_op_mut<F, X>(&mut self, f: F) -> Option<X>
     where
-        F: FnOnce(&mut Op) -> R,
+        F: FnOnce(&mut Op) -> X,
     {
         assert!(
             self.op.is_some(),
@@ -602,17 +611,17 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlightWaiting, Op, P, S> 
     /// # Safety
     ///
     /// The caller must ensure that the slot is in a valid state for sidecar access.
-    pub unsafe fn sidecar_unchecked<F, R>(&mut self, f: F) -> R
+    pub unsafe fn sidecar_unchecked<F, X>(&mut self, f: F) -> X
     where
-        F: FnOnce(&mut S) -> R,
+        F: FnOnce(&mut S) -> X,
     {
         self.storage
             .with_mut(|_op, _result, _payload, sidecar| f(sidecar))
     }
 }
 
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Completed, Op, P, S> {
-    pub fn reset(self) -> Slot<'a, Reserved, Op, P, S> {
+impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, Completed, Op, P, S, R> {
+    pub fn reset(self) -> Slot<'a, Reserved, Op, P, S, R> {
         let _ = self.op.take();
         let generation = self.entry.generation(Ordering::Acquire);
         self.storage.reset();
@@ -631,18 +640,18 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, Completed, Op, P, S> {
         self.op.take()
     }
 
-    pub fn take_completion_data(&mut self) -> (Option<ErasedPayload>, Option<io::Result<usize>>) {
+    pub fn take_completion_data(&mut self) -> (Option<ErasedPayload>, Option<io::Result<R>>) {
         self.storage
             .with_mut(|_op, result, payload, _sidecar| (payload.take(), result.take()))
     }
 }
 
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlightOrphaned, Op, P, S> {
+impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, InFlightOrphaned, Op, P, S, R> {
     #[inline]
     fn try_bind(
-        entry: &'a SlotEntry<Op, S>,
+        entry: &'a SlotEntry<Op, S, R>,
         op: &'a mut Option<Op>,
-        storage: &'a mut SlotStorage<Op, S>,
+        storage: &'a mut SlotStorage<Op, S, R>,
         platform: &'a mut P,
         index: usize,
     ) -> Option<Self> {
@@ -657,21 +666,21 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Slot<'a, InFlightOrphaned, Op, P, S>
         }
     }
 
-    pub fn complete(self) -> Slot<'a, Completed, Op, P, S> {
+    pub fn complete(self) -> Slot<'a, Completed, Op, P, S, R> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 }
 
-type SubmissionRollback<'a, Op, P, S> = fn(&mut Slot<'a, Reserved, Op, P, S>);
+type SubmissionRollback<'a, Op, P, S, R> = fn(&mut Slot<'a, Reserved, Op, P, S, R>);
 
-pub struct SubmissionGuard<'a, Op: PlatformOp, P, S: SlotSidecar> {
-    pub slot: Option<Slot<'a, Reserved, Op, P, S>>,
-    rollback: Option<SubmissionRollback<'a, Op, P, S>>,
+pub struct SubmissionGuard<'a, Op: PlatformOp, P, S: SlotSidecar, R = usize> {
+    pub slot: Option<Slot<'a, Reserved, Op, P, S, R>>,
+    rollback: Option<SubmissionRollback<'a, Op, P, S, R>>,
     persisted: bool,
 }
 
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> SubmissionGuard<'a, Op, P, S> {
-    pub fn persist(mut self) -> Slot<'a, InFlightWaiting, Op, P, S> {
+impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> SubmissionGuard<'a, Op, P, S, R> {
+    pub fn persist(mut self) -> Slot<'a, InFlightWaiting, Op, P, S, R> {
         self.persisted = true;
         let slot = self
             .slot
@@ -681,7 +690,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> SubmissionGuard<'a, Op, P, S> {
     }
 }
 
-impl<'a, Op: PlatformOp, P, S: SlotSidecar> Drop for SubmissionGuard<'a, Op, P, S> {
+impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Drop for SubmissionGuard<'a, Op, P, S, R> {
     fn drop(&mut self) {
         if !self.persisted
             && let Some(slot) = self.slot.as_mut()
@@ -694,25 +703,25 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar> Drop for SubmissionGuard<'a, Op, P, 
     }
 }
 
-pub enum SlotView<'a, Op: PlatformOp, P, S: SlotSidecar> {
-    Reserved(Slot<'a, Reserved, Op, P, S>),
-    InFlightWaiting(Slot<'a, InFlightWaiting, Op, P, S>),
-    InFlightOrphaned(Slot<'a, InFlightOrphaned, Op, P, S>),
+pub enum SlotView<'a, Op: PlatformOp, P, S: SlotSidecar, R = usize> {
+    Reserved(Slot<'a, Reserved, Op, P, S, R>),
+    InFlightWaiting(Slot<'a, InFlightWaiting, Op, P, S, R>),
+    InFlightOrphaned(Slot<'a, InFlightOrphaned, Op, P, S, R>),
 }
 
-pub trait SlotRegistryExt<Op: PlatformOp, P, S: SlotSidecar> {
-    fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Op, P, S>>;
-    fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Op, P, S>;
+pub trait SlotRegistryExt<Op: PlatformOp, P, S: SlotSidecar, R = usize> {
+    fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Op, P, S, R>>;
+    fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Op, P, S, R>;
 }
 
-impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
-    for OpRegistry<Op, P, S>
+impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> SlotRegistryExt<Op, P, S, R>
+    for OpRegistry<Op, P, S, R>
 {
     #[inline]
-    fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Op, P, S>> {
+    fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Op, P, S, R>> {
         let (entry, op_entry, op, storage) = self.get_slot_entry_op_storage_and_entry_mut(index)?;
         match entry.state(Ordering::Acquire) {
-            SlotState::Reserved => Slot::<Reserved, Op, P, S>::try_bind(
+            SlotState::Reserved => Slot::<Reserved, Op, P, S, R>::try_bind(
                 entry,
                 op,
                 storage,
@@ -720,7 +729,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
                 index,
             )
             .map(SlotView::Reserved),
-            SlotState::InFlightWaiting => Slot::<InFlightWaiting, Op, P, S>::try_bind(
+            SlotState::InFlightWaiting => Slot::<InFlightWaiting, Op, P, S, R>::try_bind(
                 entry,
                 op,
                 storage,
@@ -728,7 +737,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
                 index,
             )
             .map(SlotView::InFlightWaiting),
-            SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Op, P, S>::try_bind(
+            SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Op, P, S, R>::try_bind(
                 entry,
                 op,
                 storage,
@@ -744,7 +753,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar> SlotRegistryExt<Op, P, S>
     }
 
     #[inline]
-    fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Op, P, S> {
+    fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Op, P, S, R> {
         let (entry, op_entry, op, storage) = self
             .get_slot_entry_op_storage_and_entry_mut(index)
             .expect("slot missing in registry during reserve");

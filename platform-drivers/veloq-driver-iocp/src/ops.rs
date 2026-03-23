@@ -86,6 +86,8 @@ macro_rules! define_iocp_ops {
                 kind: $kind:expr,
                 submit: $submit:path,
                 $(on_complete: $complete:path,)?
+                $(completion: $completion:ty,)?
+                $(map_completion: $map_completion:expr,)?
                 get_fd: $get_fd:path,
                 $(construct: $construct:expr,)?
                 $(destruct: $destruct:expr,)?
@@ -139,6 +141,7 @@ macro_rules! define_iocp_ops {
         $(
             impl IntoPlatformOp<IocpOp> for $OpType {
                 type UserPayload = Box<$OpType>;
+                type Completion = define_iocp_ops!(@completion_type $($completion)?);
                 const PAYLOAD_KIND: OpKind = $kind;
 
                 fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
@@ -189,6 +192,10 @@ macro_rules! define_iocp_ops {
                     // SAFETY: ptr is guaranteed to be a valid pointer to $OpType.
                     unsafe { Box::from_raw(ptr as *mut $OpType) }
                 }
+
+                fn map_completion_result(&self, res: io::Result<usize>) -> io::Result<Self::Completion> {
+                    define_iocp_ops!(@map_completion self, res, $($map_completion)?)
+                }
             }
         )+
     };
@@ -224,6 +231,12 @@ macro_rules! define_iocp_ops {
         }
         drop_raw
     }};
+
+    (@completion_type ) => { usize };
+    (@completion_type $ty:ty) => { $ty };
+
+    (@map_completion $this:ident, $res:ident, ) => { $res };
+    (@map_completion $this:ident, $res:ident, $expr:expr) => { ($expr)($this, $res) };
 }
 
 // ============================================================================
@@ -341,6 +354,8 @@ define_iocp_ops! {
         kind: OpKind::Accept,
         submit: submit::submit_accept,
         on_complete: submit::on_complete_accept,
+        completion: RawHandle,
+        map_completion: |_op: &Accept, res: io::Result<usize>| res.map(|raw| RawHandle::for_socket(raw as _)),
         get_fd: submit::get_fd_accept,
         construct: |user: std::ptr::NonNull<Accept>| {
             // SAFETY: user pointer is valid and points to a valid Accept.
@@ -406,6 +421,8 @@ define_iocp_ops! {
         payload: OpenPayload,
         kind: OpKind::Open,
         submit: submit::submit_open,
+        completion: RawHandle,
+        map_completion: |_op: &Open, res: io::Result<usize>| res.map(|raw| RawHandle::for_file(raw as _)),
         get_fd: submit::get_fd_open,
         construct: |user| OpenPayload { user },
         destruct: |user: Box<Open>| *user,

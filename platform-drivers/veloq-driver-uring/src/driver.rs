@@ -604,6 +604,7 @@ impl Driver for UringDriver {
     type Op = UringOp;
     type Handle = RawHandle;
     type Sidecar = ();
+    type Completion = usize;
 
     fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
         match self.ops.insert(OpEntry::new(UringOpState::new())) {

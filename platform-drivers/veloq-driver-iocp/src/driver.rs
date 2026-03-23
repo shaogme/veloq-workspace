@@ -617,6 +617,7 @@ impl Driver for IocpDriver {
     type Op = IocpOp;
     type Handle = RawHandle;
     type Sidecar = OverlappedEntry;
+    type Completion = usize;
 
     fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::default())) {

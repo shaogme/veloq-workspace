@@ -29,6 +29,14 @@ macro_rules! impl_default_completion {
     };
 }
 
+pub(crate) unsafe fn on_complete_default(_op: &mut UringOp, result: i32) -> io::Result<usize> {
+    if result >= 0 {
+        Ok(result as usize)
+    } else {
+        Err(io::Error::from_raw_os_error(-result))
+    }
+}
+
 macro_rules! make_rw_fixed {
     ($fn_name:ident, $variant:ident, $type_raw:path, $type_fixed:path) => {
         pub(crate) unsafe fn $fn_name(
@@ -573,7 +581,6 @@ pub(crate) unsafe fn make_sqe_open(
         .build())
 }
 
-impl_default_completion!(on_complete_open);
 impl_lifecycle!(drop_open, Open, no_fd);
 
 pub(crate) unsafe fn make_sqe_timeout(
