@@ -314,7 +314,7 @@ impl UringDriver {
 
         let fd = self.waker_fd.fd;
         let op = Wakeup {
-            fd: IoFd::Raw(RawHandle { fd }),
+            fd: IoFd::Raw(RawHandle::for_file(fd)),
         };
         let (uring_op, payload) =
             <Wakeup<RawHandle> as IntoPlatformOp<UringOp>>::into_kernel_and_payload(op);
@@ -746,7 +746,7 @@ impl Driver for UringDriver {
     }
 
     fn register_files(&mut self, files: &[RawHandle]) -> io::Result<Vec<IoFd>> {
-        let fds: Vec<i32> = files.iter().map(|h| h.fd).collect();
+        let fds: Vec<i32> = files.iter().map(|h| h.as_fd()).collect();
         self.ring.submitter().register_files(&fds)?;
 
         let mut fixed_fds = Vec::with_capacity(files.len());
@@ -774,9 +774,7 @@ impl Driver for UringDriver {
     }
 
     fn inner_handle(&self) -> RawHandle {
-        RawHandle {
-            fd: self.ring.as_raw_fd(),
-        }
+        RawHandle::for_file(self.ring.as_raw_fd())
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {

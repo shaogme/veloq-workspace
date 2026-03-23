@@ -33,6 +33,18 @@ impl Default for OpenOptions {
 }
 
 impl OpenOptions {
+    #[inline]
+    fn raw_file_from_open_result(raw: usize) -> veloq_driver::RawHandle {
+        #[cfg(unix)]
+        {
+            veloq_driver::RawHandle::for_file(raw as i32)
+        }
+        #[cfg(windows)]
+        {
+            veloq_driver::RawHandle::for_file(raw as _)
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             read: false,
@@ -108,12 +120,12 @@ impl OpenOptions {
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
 
         // 3. 转换结果
-        let fd = veloq_driver::RawHandle::from(res?);
+        let fd = Self::raw_file_from_open_result(res?);
         use super::file::InnerFile;
         use std::cell::Cell;
 
         Ok(super::file::LocalFile {
-            inner: InnerFile(fd),
+            inner: InnerFile::new(fd),
             submitter,
             pos: Cell::new(0),
         })
@@ -134,13 +146,13 @@ impl OpenOptions {
         // 提交执行 (Result, Op) — Op 的所有权被返还
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
 
-        let fd = veloq_driver::RawHandle::from(res?);
+        let fd = Self::raw_file_from_open_result(res?);
 
         use super::file::InnerFile;
         use std::sync::atomic::AtomicU64;
 
         Ok(super::file::File {
-            inner: InnerFile(fd),
+            inner: InnerFile::new(fd),
             submitter,
             pos: AtomicU64::new(0),
         })

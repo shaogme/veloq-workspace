@@ -2,11 +2,11 @@ use std::io;
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
 
-use veloq_driver::RawHandle;
 use veloq_driver::Socket;
 use veloq_driver::SocketLifecycleHandle;
 use veloq_driver::driver::Driver;
 use veloq_driver::op::IoFd;
+use veloq_driver::{RawHandle, RawHandleKind};
 
 // ============================================================================
 // SocketToken + InnerSocket (RAII Wrapper)
@@ -41,6 +41,9 @@ impl SocketToken {
         handle: RawHandle,
         lifecycle_handle: &Option<SocketLifecycleHandle>,
     ) -> Option<IoFd> {
+        if !handle.borrow().is_socket() {
+            return None;
+        }
         if !lifecycle_handle
             .as_ref()
             .is_some_and(SocketLifecycleHandle::supports_registration)
@@ -74,7 +77,19 @@ impl Drop for SocketToken {
         if let Some(handle) = &self.lifecycle_handle {
             let _ = handle.schedule_socket_cleanup(self.raw, self.registered_fd);
         }
-        let _ = unsafe { Socket::from_raw(self.raw) };
+        match self.raw.borrow().kind() {
+            RawHandleKind::Socket => {
+                let _ = unsafe { Socket::from_raw(self.raw) };
+            }
+            #[cfg(unix)]
+            RawHandleKind::File => unsafe {
+                libc::close(self.raw.as_fd());
+            },
+            #[cfg(windows)]
+            RawHandleKind::File => unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.raw.as_handle());
+            },
+        }
     }
 }
 
@@ -98,11 +113,19 @@ impl InnerSocket {
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        debug_assert!(
+            self.token.raw().borrow().is_socket(),
+            "InnerSocket expects socket-kind handle"
+        );
         let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.token.raw())) };
         socket.local_addr()
     }
 
     pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        debug_assert!(
+            self.token.raw().borrow().is_socket(),
+            "InnerSocket expects socket-kind handle"
+        );
         let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.token.raw())) };
         socket.connect(addr)
     }

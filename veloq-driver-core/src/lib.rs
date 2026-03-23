@@ -36,6 +36,15 @@ impl<H: Handle> IoFd<H> {
             Self::Fixed(_) => None,
         }
     }
+
+    /// Returns a borrowed raw handle view if this is a Raw variant.
+    #[inline]
+    pub const fn raw_ref(&self) -> Option<&H> {
+        match self {
+            Self::Raw(fd) => Some(fd),
+            Self::Fixed(_) => None,
+        }
+    }
 }
 
 impl<H: Handle> From<H> for IoFd<H> {

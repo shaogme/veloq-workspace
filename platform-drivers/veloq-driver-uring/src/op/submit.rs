@@ -61,7 +61,7 @@ macro_rules! make_rw_fixed {
             if is_registered {
                 let fixed_idx = region_info.id;
                 match rw_op.fd {
-                    IoFd::Raw(fd) => Ok($type_fixed(types::Fd(fd.fd), ptr, len, fixed_idx)
+                    IoFd::Raw(fd) => Ok($type_fixed(types::Fd(fd.as_fd()), ptr, len, fixed_idx)
                         .offset(rw_op.offset)
                         .build()),
                     IoFd::Fixed(fd_idx) => {
@@ -72,7 +72,7 @@ macro_rules! make_rw_fixed {
                 }
             } else {
                 match rw_op.fd {
-                    IoFd::Raw(fd) => Ok($type_raw(types::Fd(fd.fd), ptr, len)
+                    IoFd::Raw(fd) => Ok($type_raw(types::Fd(fd.as_fd()), ptr, len)
                         .offset(rw_op.offset)
                         .build()),
                     IoFd::Fixed(fd_idx) => Ok($type_raw(types::Fixed(fd_idx), ptr, len)
@@ -113,7 +113,7 @@ macro_rules! make_rw_fixed {
             if is_registered {
                 let fixed_idx = region_info.id;
                 match rw_op.fd {
-                    IoFd::Raw(fd) => Ok($type_fixed(types::Fd(fd.fd), ptr, len, fixed_idx)
+                    IoFd::Raw(fd) => Ok($type_fixed(types::Fd(fd.as_fd()), ptr, len, fixed_idx)
                         .offset(rw_op.offset)
                         .build()),
                     IoFd::Fixed(fd_idx) => {
@@ -124,7 +124,7 @@ macro_rules! make_rw_fixed {
                 }
             } else {
                 match rw_op.fd {
-                    IoFd::Raw(fd) => Ok($type_raw(types::Fd(fd.fd), ptr, len)
+                    IoFd::Raw(fd) => Ok($type_raw(types::Fd(fd.as_fd()), ptr, len)
                         .offset(rw_op.offset)
                         .build()),
                     IoFd::Fixed(fd_idx) => Ok($type_raw(types::Fixed(fd_idx), ptr, len)
@@ -175,7 +175,7 @@ macro_rules! make_buf_op {
             let ptr = unsafe { val.buf.as_mut_ptr().add(val.buf_offset) };
             let len = (val.buf.capacity() - val.buf_offset) as u32;
             match val.fd {
-                IoFd::Raw(fd) => Ok($opcode(types::Fd(fd.fd), ptr, len).build()),
+                IoFd::Raw(fd) => Ok($opcode(types::Fd(fd.as_fd()), ptr, len).build()),
                 IoFd::Fixed(idx) => Ok($opcode(types::Fixed(idx), ptr, len).build()),
             }
         }
@@ -198,7 +198,7 @@ macro_rules! make_buf_op {
             let ptr = unsafe { val.buf.as_slice().as_ptr().add(val.buf_offset) };
             let len = (val.buf.len() - val.buf_offset) as u32;
             match val.fd {
-                IoFd::Raw(fd) => Ok($opcode(types::Fd(fd.fd), ptr, len).build()),
+                IoFd::Raw(fd) => Ok($opcode(types::Fd(fd.as_fd()), ptr, len).build()),
                 IoFd::Fixed(idx) => Ok($opcode(types::Fixed(idx), ptr, len).build()),
             }
         }
@@ -237,7 +237,7 @@ pub(crate) unsafe fn make_sqe_connect(
     let val = unsafe { kernel.user.as_mut() };
     match val.fd {
         IoFd::Raw(fd) => Ok(opcode::Connect::new(
-            types::Fd(fd.fd),
+            types::Fd(fd.as_fd()),
             &val.addr.0 as *const _ as *const _,
             val.addr_len,
         )
@@ -269,7 +269,7 @@ pub(crate) unsafe fn make_sqe_accept(
     let val = unsafe { payload.user.as_mut() };
     match val.fd {
         IoFd::Raw(fd) => Ok(opcode::Accept::new(
-            types::Fd(fd.fd),
+            types::Fd(fd.as_fd()),
             &mut val.addr.0 as *mut _ as *mut _,
             &mut val.addr_len as *mut _,
         )
@@ -339,7 +339,7 @@ pub(crate) unsafe fn make_sqe_send_to(
 
     match user.fd {
         IoFd::Raw(fd) => {
-            Ok(opcode::SendMsg::new(types::Fd(fd.fd), &payload.msghdr as *const _).build())
+            Ok(opcode::SendMsg::new(types::Fd(fd.as_fd()), &payload.msghdr as *const _).build())
         }
         IoFd::Fixed(idx) => {
             Ok(opcode::SendMsg::new(types::Fixed(idx), &payload.msghdr as *const _).build())
@@ -385,7 +385,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_stream(
 
     match fd {
         IoFd::Raw(fd) => {
-            Ok(opcode::RecvMsg::new(types::Fd(fd.fd), &mut payload.msghdr as *mut _).build())
+            Ok(opcode::RecvMsg::new(types::Fd(fd.as_fd()), &mut payload.msghdr as *mut _).build())
         }
         IoFd::Fixed(idx) => {
             Ok(opcode::RecvMsg::new(types::Fixed(idx), &mut payload.msghdr as *mut _).build())
@@ -437,7 +437,7 @@ pub(crate) unsafe fn make_sqe_close(
     };
     let close_op = unsafe { kernel.user.as_mut() };
     match close_op.fd {
-        IoFd::Raw(fd) => Ok(opcode::Close::new(types::Fd(fd.fd)).build()),
+        IoFd::Raw(fd) => Ok(opcode::Close::new(types::Fd(fd.as_fd())).build()),
         IoFd::Fixed(idx) => Ok(opcode::Close::new(types::Fixed(idx)).build()),
     }
 }
@@ -466,7 +466,9 @@ pub(crate) unsafe fn make_sqe_fsync(
     };
 
     match fsync_op.fd {
-        IoFd::Raw(fd) => Ok(opcode::Fsync::new(types::Fd(fd.fd)).flags(flags).build()),
+        IoFd::Raw(fd) => Ok(opcode::Fsync::new(types::Fd(fd.as_fd()))
+            .flags(flags)
+            .build()),
         IoFd::Fixed(idx) => Ok(opcode::Fsync::new(types::Fixed(idx)).flags(flags).build()),
     }
 }
@@ -505,7 +507,7 @@ pub(crate) unsafe fn make_sqe_sync_range(
     };
 
     match sync_op.fd {
-        IoFd::Raw(fd) => Ok(opcode::SyncFileRange::new(types::Fd(fd.fd), nbytes)
+        IoFd::Raw(fd) => Ok(opcode::SyncFileRange::new(types::Fd(fd.as_fd()), nbytes)
             .offset(sync_op.offset)
             .flags(sync_op.flags)
             .build()),
@@ -534,10 +536,12 @@ pub(crate) unsafe fn make_sqe_fallocate(
     };
     let fallocate_op = unsafe { kernel.user.as_mut() };
     match fallocate_op.fd {
-        IoFd::Raw(fd) => Ok(opcode::Fallocate::new(types::Fd(fd.fd), fallocate_op.len)
-            .offset(fallocate_op.offset)
-            .mode(fallocate_op.mode)
-            .build()),
+        IoFd::Raw(fd) => Ok(
+            opcode::Fallocate::new(types::Fd(fd.as_fd()), fallocate_op.len)
+                .offset(fallocate_op.offset)
+                .mode(fallocate_op.mode)
+                .build(),
+        ),
         IoFd::Fixed(idx) => Ok(opcode::Fallocate::new(types::Fixed(idx), fallocate_op.len)
             .offset(fallocate_op.offset)
             .mode(fallocate_op.mode)
@@ -613,7 +617,7 @@ pub(crate) unsafe fn make_sqe_wakeup(
     let user = unsafe { payload.user.as_ref() };
     match user.fd {
         IoFd::Raw(fd) => {
-            Ok(opcode::Read::new(types::Fd(fd.fd), payload.buf.as_mut_ptr(), 8).build())
+            Ok(opcode::Read::new(types::Fd(fd.as_fd()), payload.buf.as_mut_ptr(), 8).build())
         }
         IoFd::Fixed(idx) => {
             Ok(opcode::Read::new(types::Fixed(idx), payload.buf.as_mut_ptr(), 8).build())

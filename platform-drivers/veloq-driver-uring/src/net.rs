@@ -99,14 +99,14 @@ impl Socket {
     pub fn into_raw(self) -> RawHandle {
         let fd = self.fd;
         std::mem::forget(self);
-        fd.into()
+        RawHandle::for_socket(fd)
     }
 
     /// # Safety
     ///
     /// `handle` 必须是有效 fd，且满足所有权语义。
     pub unsafe fn from_raw(handle: RawHandle) -> Self {
-        Self { fd: handle.fd }
+        Self { fd: handle.as_fd() }
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {

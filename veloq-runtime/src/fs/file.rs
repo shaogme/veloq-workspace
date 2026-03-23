@@ -3,11 +3,11 @@ use crate::runtime::context::submit;
 use super::open_options::OpenOptions;
 
 use veloq_buf::FixedBuf;
-use veloq_driver::RawHandle;
 use veloq_driver::op::{
     DetachedSubmitter, Fallocate, Fsync, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed,
     SyncFileRange, WriteFixed,
 };
+use veloq_driver::{RawHandle, RawHandleKind};
 
 use std::cell::Cell;
 use std::future::{Future, IntoFuture};
@@ -30,17 +30,40 @@ macro_rules! ignore {
 // Internal Helper: InnerFile (RAII Wrapper)
 // ============================================================================
 
-pub(crate) struct InnerFile(pub(crate) RawHandle);
+pub(crate) struct InnerFile {
+    raw: RawHandle,
+}
+
+impl InnerFile {
+    #[inline]
+    pub(crate) const fn new(raw: RawHandle) -> Self {
+        Self { raw }
+    }
+
+    #[inline]
+    pub(crate) const fn raw(&self) -> RawHandle {
+        self.raw
+    }
+}
 
 impl Drop for InnerFile {
     fn drop(&mut self) {
+        debug_assert!(
+            matches!(self.raw.borrow().kind(), RawHandleKind::File),
+            "InnerFile expects file-kind handle"
+        );
         #[cfg(unix)]
         unsafe {
-            libc::close(self.0.fd);
+            libc::close(self.raw.as_fd());
         }
         #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0.as_handle());
+        match self.raw.borrow().kind() {
+            RawHandleKind::File => unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.raw.as_handle());
+            },
+            RawHandleKind::Socket => {
+                let _ = unsafe { veloq_driver::Socket::from_raw(self.raw) };
+            }
         }
     }
 }
@@ -216,7 +239,7 @@ impl<'a, S: OpSubmitter, P: FilePos> IntoFuture for SyncRangeBuilder<'a, S, P> {
 
     fn into_future(self) -> Self::IntoFuture {
         let op = SyncFileRange {
-            fd: IoFd::Raw(self.file.inner.0),
+            fd: IoFd::Raw(self.file.inner.raw()),
             offset: self.offset,
             nbytes: self.nbytes,
             flags: self.flags,
@@ -258,7 +281,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
         let op = ReadFixed {
-            fd: IoFd::Raw(self.inner.0),
+            fd: IoFd::Raw(self.inner.raw()),
             buf,
             offset,
             buf_offset,
@@ -279,7 +302,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
         let op = WriteFixed {
-            fd: IoFd::Raw(self.inner.0),
+            fd: IoFd::Raw(self.inner.raw()),
             buf,
             offset,
             buf_offset,
@@ -295,7 +318,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
 
     pub async fn sync_all(&self) -> io::Result<()> {
         let op = Fsync {
-            fd: IoFd::Raw(self.inner.0),
+            fd: IoFd::Raw(self.inner.raw()),
             datasync: false,
         };
 
@@ -305,7 +328,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
 
     pub async fn sync_data(&self) -> io::Result<()> {
         let op = Fsync {
-            fd: IoFd::Raw(self.inner.0),
+            fd: IoFd::Raw(self.inner.raw()),
             datasync: true,
         };
 
@@ -325,7 +348,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
 
     pub async fn fallocate(&self, offset: u64, len: u64) -> io::Result<()> {
         let op = Fallocate {
-            fd: IoFd::Raw(self.inner.0),
+            fd: IoFd::Raw(self.inner.raw()),
             mode: 0, // Default mode
             offset,
             len,
