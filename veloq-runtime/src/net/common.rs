@@ -4,106 +4,106 @@ use std::net::SocketAddr;
 
 use veloq_driver::RawHandle;
 use veloq_driver::Socket;
-#[cfg(windows)]
+use veloq_driver::SocketLifecycleHandle;
 use veloq_driver::driver::Driver;
 use veloq_driver::op::IoFd;
 
 // ============================================================================
-// InnerSocket (RAII Wrapper)
+// SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
-#[cfg(windows)]
-struct RegisteredFd {
+pub(crate) struct SocketToken {
+    raw: RawHandle,
     fd: IoFd,
-    driver_id: usize,
+    lifecycle_handle: Option<SocketLifecycleHandle>,
+    registered_fd: Option<IoFd>,
 }
 
-#[cfg(windows)]
-impl RegisteredFd {
-    fn try_register(handle: RawHandle) -> Option<Self> {
+impl SocketToken {
+    pub(crate) fn new(handle: RawHandle) -> Self {
+        let lifecycle_handle = crate::runtime::context::try_current()
+            .and_then(|ctx| ctx.driver().upgrade())
+            .map(|driver| driver.borrow().socket_lifecycle_handle());
+
+        let registered_fd = Self::try_register_with_driver(handle, &lifecycle_handle);
+
+        let fd = registered_fd.unwrap_or(IoFd::Raw(handle));
+
+        Self {
+            raw: handle,
+            fd,
+            lifecycle_handle,
+            registered_fd,
+        }
+    }
+
+    fn try_register_with_driver(
+        handle: RawHandle,
+        lifecycle_handle: &Option<SocketLifecycleHandle>,
+    ) -> Option<IoFd> {
+        if !lifecycle_handle
+            .as_ref()
+            .is_some_and(SocketLifecycleHandle::supports_registration)
+        {
+            return None;
+        }
         let ctx = crate::runtime::context::try_current()?;
         let driver = ctx.driver().upgrade()?;
-        let driver_id = driver.borrow().driver_id();
         let fd = driver
             .borrow_mut()
             .register_files(&[handle])
             .ok()?
             .into_iter()
             .next()?;
-        if !matches!(fd, IoFd::Fixed(_)) {
-            return None;
-        }
-        Some(Self { fd, driver_id })
+        matches!(fd, IoFd::Fixed(_)).then_some(fd)
+    }
+
+    #[inline]
+    pub(crate) fn fd(&self) -> IoFd {
+        self.fd
+    }
+
+    #[inline]
+    pub(crate) fn raw(&self) -> RawHandle {
+        self.raw
     }
 }
 
-#[cfg(windows)]
-impl Drop for RegisteredFd {
+impl Drop for SocketToken {
     fn drop(&mut self) {
-        if let Some(ctx) = crate::runtime::context::try_current()
-            && let Some(driver) = ctx.driver().upgrade()
-        {
-            let mut driver = driver.borrow_mut();
-            if driver.driver_id() == self.driver_id {
-                let _ = driver.unregister_files(vec![self.fd]);
-            }
-        }
-    }
-}
-
-pub struct InnerSocket {
-    raw: RawHandle,
-    #[cfg(windows)]
-    registered: Option<RegisteredFd>,
-}
-
-impl Drop for InnerSocket {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        {
-            if let Some(ctx) = crate::runtime::context::try_current()
-                && let Some(driver) = ctx.driver().upgrade()
-            {
-                // Socket teardown must clear the RIO actor for both TCP and UDP
-                // to avoid stale actor state when handle values are reused.
-                driver.borrow_mut().shutdown_actor(self.raw);
-            }
-            let _ = self.registered.take();
+        if let Some(handle) = &self.lifecycle_handle {
+            let _ = handle.schedule_socket_cleanup(self.raw, self.registered_fd);
         }
         let _ = unsafe { Socket::from_raw(self.raw) };
     }
 }
 
+pub struct InnerSocket {
+    token: SocketToken,
+}
+
 impl InnerSocket {
     pub fn new(handle: RawHandle) -> Self {
         Self {
-            raw: handle,
-            #[cfg(windows)]
-            registered: RegisteredFd::try_register(handle),
+            token: SocketToken::new(handle),
         }
     }
 
     pub fn fd(&self) -> IoFd {
-        #[cfg(windows)]
-        {
-            if let Some(registered) = &self.registered {
-                return registered.fd;
-            }
-        }
-        IoFd::Raw(self.raw)
+        self.token.fd()
     }
 
     pub fn raw(&self) -> RawHandle {
-        self.raw
+        self.token.raw()
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.raw)) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.token.raw())) };
         socket.local_addr()
     }
 
     pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.raw)) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.token.raw())) };
         socket.connect(addr)
     }
 }

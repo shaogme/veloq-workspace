@@ -30,3 +30,28 @@ fn test_register_files() {
 fn test_rio_extensions_load() {
     let _ext = Extensions::new().expect("RIO Extensions should load");
 }
+
+#[test]
+fn test_socket_lifecycle_control_cleanup_unreg() {
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let socket = crate::Socket::new_tcp_v4().unwrap();
+    let raw = socket.into_raw();
+    let fd = driver
+        .register_files(&[raw])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let lifecycle = driver.socket_lifecycle_handle();
+    lifecycle.schedule_socket_cleanup(raw, Some(fd)).unwrap();
+    let _ = driver.poll_completion().unwrap();
+
+    match fd {
+        crate::IoFd::Fixed(idx) => {
+            assert!(driver.registered_files[idx as usize].is_none());
+            assert!(driver.free_slots.contains(&(idx as usize)));
+        }
+        crate::IoFd::Raw(_) => panic!("expected fixed descriptor"),
+    }
+}

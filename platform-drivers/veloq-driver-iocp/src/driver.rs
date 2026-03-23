@@ -27,7 +27,7 @@ use crate::config::{IoFd, RawHandle};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 pub use inner::IocpDriver;
-use inner::RIO_EVENT_KEY;
+use inner::{CONTROL_EVENT_KEY, RIO_EVENT_KEY};
 
 // ============================================================================
 // State & Lifecycle Types
@@ -63,6 +63,50 @@ pub(crate) type CompletionSidecar = CoreCompletionSidecar;
 // Driver Implementation
 // ============================================================================
 
+enum DriverControlCommand {
+    SocketCleanup {
+        handle: RawHandle,
+        registered_fd: Option<IoFd>,
+    },
+}
+
+#[derive(Clone)]
+pub struct SocketLifecycleHandle {
+    port: Arc<crate::win32::IoCompletionPort>,
+}
+
+impl SocketLifecycleHandle {
+    pub(crate) fn new(port: Arc<crate::win32::IoCompletionPort>) -> Self {
+        Self { port }
+    }
+
+    pub fn schedule_socket_cleanup(
+        &self,
+        handle: RawHandle,
+        registered_fd: Option<IoFd>,
+    ) -> io::Result<()> {
+        let cmd = DriverControlCommand::SocketCleanup {
+            handle,
+            registered_fd,
+        };
+        let ptr = Box::into_raw(Box::new(cmd)) as *mut crate::win32::Overlapped;
+        // SAFETY: `ptr` is an opaque pointer passed through IOCP and recovered in the
+        // control-event branch before any overlapped-id decoding.
+        let post_res = unsafe { self.port.post(0, CONTROL_EVENT_KEY, ptr) };
+        if let Err(err) = post_res {
+            // SAFETY: post failed, ownership of `ptr` never left this thread.
+            unsafe { drop(Box::from_raw(ptr as *mut DriverControlCommand)) };
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub const fn supports_registration(&self) -> bool {
+        true
+    }
+}
+
 struct SubmitContextInternal<'a> {
     port: &'a crate::win32::IoCompletionPort,
     wheel: &'a mut veloq_wheel::Wheel<usize>,
@@ -71,6 +115,29 @@ struct SubmitContextInternal<'a> {
 }
 
 impl IocpDriver {
+    pub fn socket_lifecycle_handle(&self) -> SocketLifecycleHandle {
+        SocketLifecycleHandle::new(self.port.clone())
+    }
+
+    pub(crate) fn handle_control_completion(&mut self, overlapped: *mut crate::win32::Overlapped) {
+        if overlapped.is_null() {
+            return;
+        }
+        // SAFETY: control events are posted with a pointer from Box<DriverControlCommand>.
+        let cmd = unsafe { Box::from_raw(overlapped as *mut DriverControlCommand) };
+        match *cmd {
+            DriverControlCommand::SocketCleanup {
+                handle,
+                registered_fd,
+            } => {
+                self.rio_state.shutdown_actor(handle.actor_key());
+                if let Some(fd) = registered_fd {
+                    let _ = self.unregister_files(vec![fd]);
+                }
+            }
+        }
+    }
+
     #[inline]
     fn prep_op_slot(
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
@@ -364,6 +431,10 @@ impl IocpDriver {
                 success,
                 error_code,
             } => {
+                if key == CONTROL_EVENT_KEY {
+                    self.handle_control_completion(overlapped);
+                    return Ok(1);
+                }
                 if key == RIO_EVENT_KEY {
                     return self.rio_state.process_completions(
                         &mut self.ops,

@@ -67,6 +67,25 @@ impl RemoteWaker for UringWaker {
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 pub(crate) const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SocketLifecycleHandle;
+
+impl SocketLifecycleHandle {
+    #[inline]
+    pub fn schedule_socket_cleanup(
+        &self,
+        _handle: RawHandle,
+        _registered_fd: Option<IoFd>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub const fn supports_registration(&self) -> bool {
+        false
+    }
+}
+
 pub struct UringDriver {
     pub(crate) ring: IoUring,
     pub(crate) ops: OpRegistry<UringOp, UringOpState, ()>,
@@ -91,6 +110,11 @@ pub struct UringDriver {
 }
 
 impl UringDriver {
+    #[inline]
+    pub const fn socket_lifecycle_handle(&self) -> SocketLifecycleHandle {
+        SocketLifecycleHandle
+    }
+
     pub fn new(config: impl AsRef<UringConfig>) -> io::Result<Self> {
         let config = config.as_ref();
         let mut builder = IoUring::builder();

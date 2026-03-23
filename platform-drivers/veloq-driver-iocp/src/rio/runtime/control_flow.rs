@@ -38,6 +38,7 @@ pub(crate) struct RioSocketActor {
     pub(crate) pool_manager: UdpPoolManager,
     pub(crate) udp_mailbox: UdpMailbox,
     pub(crate) is_iocp_fallback: bool,
+    pub(crate) is_explicit_shutdown: bool,
     pub(crate) state: RioActorState,
 }
 
@@ -50,6 +51,7 @@ impl RioSocketActor {
             pool_manager: UdpPoolManager::new(),
             udp_mailbox: UdpMailbox::new(),
             is_iocp_fallback: false,
+            is_explicit_shutdown: false,
             state: RioActorState::Active,
         }
     }
@@ -313,14 +315,7 @@ impl RioState {
     }
 
     pub(crate) fn shutdown_actor(&mut self, socket_key: SocketActorKey) {
-        let Some(key) = self.actor_by_handle.get(&socket_key).copied() else {
-            return;
-        };
-        let Some(env) = self
-            .kernel
-            .env(&veloq_buf::NoopRegistrar, self.registration_mode)
-        else {
-            let _ = self.remove_actor_by_key(key);
+        let Some(key) = self.actor_by_handle.remove(&socket_key) else {
             return;
         };
 
@@ -328,10 +323,22 @@ impl RioState {
             let Some(actor) = self.actors.get_mut(key) else {
                 return;
             };
+
+            actor.is_explicit_shutdown = true;
             actor.state = RioActorState::Draining;
+
             if actor.pool_manager.pool.state == UdpPoolState::Uninitialized {
                 true
             } else {
+                let Some(env) = self
+                    .kernel
+                    .env(&veloq_buf::NoopRegistrar, self.registration_mode)
+                else {
+                    // If we can't get an environment, we can't cleanly shutdown the pool.
+                    // This is rare and usually means the driver is already destroyed.
+                    return;
+                };
+
                 let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
                 let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
                 pool_manager.shutdown_pool(udp_mailbox);
@@ -339,19 +346,30 @@ impl RioState {
             }
         };
 
-        self.actor_by_handle.remove(&socket_key);
         if should_remove {
-            let _ = self.remove_actor_by_key(key);
+            let _ = self.actors.remove(key);
         }
     }
 
     pub(crate) fn begin_shutdown(&mut self) {
-        for actor in self.actors.values_mut() {
+        self.actor_by_handle.clear();
+        let Some(env) = self
+            .kernel
+            .env(&veloq_buf::NoopRegistrar, self.registration_mode)
+        else {
+            self.actors.clear();
+            return;
+        };
+
+        self.actors.retain(|key, actor| {
+            actor.is_explicit_shutdown = true;
+            actor.state = RioActorState::Draining;
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
             pool_manager.shutdown_pool(udp_mailbox);
-            actor.state = RioActorState::Draining;
-        }
-        self.actor_by_handle.clear();
+
+            let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
+            !pool_manager.cleanup_drained_pool(&mut ctx)
+        });
     }
 
     pub(crate) fn cancel_udp_waiter(
@@ -469,7 +487,14 @@ impl RioState {
                 return false;
             };
             let mut ctx = Self::build_ctx(&mut self.registry, env, (actor_key, actor.rq));
-            actor.pool_manager.cleanup_drained_pool(&mut ctx)
+            if actor.pool_manager.cleanup_drained_pool(&mut ctx) {
+                // We ONLY remove the actor from the store if it's explicitly shutting down.
+                // If it's just a pool drain due to fallback, we keep the actor (and its is_iocp_fallback=true state)
+                // until the socket itself is dropped.
+                actor.is_explicit_shutdown
+            } else {
+                false
+            }
         };
 
         if should_remove {
