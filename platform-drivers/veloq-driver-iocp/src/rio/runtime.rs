@@ -56,7 +56,7 @@ impl RioState {
         self.actor_by_handle
             .get(&handle)
             .and_then(|&key| self.actors.get(key))
-            .map_or(false, |actor| actor.is_iocp_fallback)
+            .is_some_and(|actor| actor.is_iocp_fallback)
     }
 
     #[inline]
@@ -65,7 +65,10 @@ impl RioState {
             return true;
         }
 
-        if let Some(rio_io_err) = err.get_ref().and_then(|r| r.downcast_ref::<crate::rio::error::RioIoError>()) {
+        if let Some(rio_io_err) = err
+            .get_ref()
+            .and_then(|r| r.downcast_ref::<crate::rio::error::RioIoError>())
+        {
             if rio_io_err.report.has_wsa_error(10055) {
                 return true;
             }
@@ -82,14 +85,13 @@ impl RioState {
 
     #[inline]
     pub(crate) fn maybe_mark_iocp_fallback(&mut self, handle: HANDLE, err: &io::Error) {
-        if Self::should_demote_socket(err) {
-            if let Some(actor) = self
+        if Self::should_demote_socket(err)
+            && let Some(actor) = self
                 .actor_by_handle
                 .get(&handle)
                 .and_then(|&key| self.actors.get_mut(key))
-            {
-                actor.is_iocp_fallback = true;
-            }
+        {
+            actor.is_iocp_fallback = true;
         }
     }
 

@@ -113,12 +113,12 @@ impl RioReportExt for Report<RioError> {
     fn to_io_error(self, detail: impl Into<String>) -> std::io::Error {
         use crate::common::IocpErrorContext;
         let detail = detail.into();
-        
+
         // 我们在这里模拟 common::io_error 的逻辑，但保留 RioIoError 类型
-        let os_code = self.frames().find_map(|f| {
-            f.downcast_ref::<RioDiag>().and_then(|d| d.error_code)
-        });
-        
+        let os_code = self
+            .frames()
+            .find_map(|f| f.downcast_ref::<RioDiag>().and_then(|d| d.error_code));
+
         tracing::error!(
             context = %IocpErrorContext::Rio,
             detail = %detail,
@@ -126,13 +126,13 @@ impl RioReportExt for Report<RioError> {
             report = ?&self,
             "RIO error report"
         );
-        
+
         let rio_io_err = RioIoError {
             report: self,
             detail: detail.clone(),
         };
-        
-        std::io::Error::new(std::io::ErrorKind::Other, rio_io_err)
+
+        std::io::Error::other(rio_io_err)
     }
 
     fn has_wsa_error(&self, code: u32) -> bool {

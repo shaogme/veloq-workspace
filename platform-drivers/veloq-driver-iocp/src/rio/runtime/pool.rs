@@ -136,7 +136,7 @@ pub(super) struct CompletionActions {
 impl UdpRecvPool {
     #[inline]
     pub(super) fn is_datagram_completion(res: &RIORESULT) -> bool {
-        (res.Status == 0 || res.Status == WSAEMSGSIZE as i32) && res.BytesTransferred > 0
+        (res.Status == 0 || res.Status == WSAEMSGSIZE) && res.BytesTransferred > 0
     }
 
     pub(crate) fn uninit() -> Self {

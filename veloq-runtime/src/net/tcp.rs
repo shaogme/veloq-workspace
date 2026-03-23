@@ -6,7 +6,7 @@ use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
-    Accept, Connect, DetachedSubmitter, IoFd, LocalSubmitter, Op, OpLifecycle, OpSubmitter, Recv,
+    Accept, Connect, DetachedSubmitter, LocalSubmitter, Op, OpLifecycle, OpSubmitter, Recv,
     Send as OpSend,
 };
 
@@ -116,7 +116,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = Connect {
-            fd: IoFd::Raw(inner.raw()),
+            fd: inner.fd(),
             addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
@@ -141,7 +141,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
         let op = Recv {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             buf,
             buf_offset,
         };
@@ -158,7 +158,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
         let op = OpSend {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             buf,
             buf_offset,
         };

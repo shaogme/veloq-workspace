@@ -7,7 +7,7 @@ use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
-    DetachedSubmitter, IoFd, LocalSubmitter, Op, OpSubmitter, SendTo, UdpRecv as OpUdpRecv,
+    DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpRecv as OpUdpRecv,
     UdpRecvPacket, UdpRecvStream, UdpSend as OpUdpSend,
 };
 
@@ -81,7 +81,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         target: SocketAddr,
     ) -> io::Result<(usize, FixedBuf)> {
         let op = SendTo {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             buf,
             buf_offset: 0,
             addr: target,
@@ -95,7 +95,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
 
     pub async fn recv_stream(&self, buf: FixedBuf) -> io::Result<UdpRecvPacket> {
         let op = UdpRecvStream {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             buf: Some(buf),
             addr: None,
             result: None,
@@ -143,7 +143,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
         let op = OpUdpSend {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             buf,
             buf_offset,
         };
@@ -160,7 +160,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
         let op = OpUdpRecv {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             buf,
             buf_offset,
         };

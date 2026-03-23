@@ -269,7 +269,10 @@ impl RioState {
                     .field("max_send_data_buffers", 1_u32)
                     .field("outstanding_count", self.outstanding_count)
                     .field("actors_len", self.actors.len())
-                    .field("actor_index_hit", self.actor_by_handle.contains_key(&handle));
+                    .field(
+                        "actor_index_hit",
+                        self.actor_by_handle.contains_key(&handle),
+                    );
                 error!(
                     fd = ?fd,
                     handle = ?handle,
@@ -412,17 +415,18 @@ impl RioState {
     }
 
     pub(crate) fn shutdown_rio_actors(&mut self, registrar: &dyn veloq_buf::BufferRegistrar) {
-        let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
-            self.actors.clear();
-            self.actor_by_handle.clear();
-            return;
-        };
-        for (key, actor) in self.actors.iter_mut() {
-            let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
-            let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-            pool_manager.forget_and_cleanup(udp_mailbox, &mut ctx);
+        let env_opt = self.kernel.env(registrar, self.registration_mode);
+
+        // Use drain to take ownership of all actors and clear the map.
+        for (key, mut actor) in self.actors.drain() {
+            if let Some(env) = &env_opt {
+                let mut ctx = Self::build_ctx(&mut self.registry, *env, (key, actor.rq));
+                let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
+                pool_manager.forget_and_cleanup(udp_mailbox, &mut ctx);
+            }
+            // Even if env is missing, the actor is now dropped and its RQ will be closed
+            // when the socket is closed (which happens in veloq-runtime).
         }
-        self.actors.clear();
         self.actor_by_handle.clear();
     }
 

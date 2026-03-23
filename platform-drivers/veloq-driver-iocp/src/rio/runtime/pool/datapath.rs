@@ -97,11 +97,7 @@ impl UdpPoolManager {
 
         let chunk_size = requested_chunk_size.max(UDP_RECV_POOL_CHUNK_SIZE).max(1);
         self.pool.slots = SlotMap::with_capacity_and_key(max);
-        self.pool.slab = Some(Self::init_slab(
-            ctx,
-            chunk_size,
-            UDP_RECV_POOL_SLAB_CHUNKS,
-        )?);
+        self.pool.slab = Some(Self::init_slab(ctx, chunk_size, UDP_RECV_POOL_SLAB_CHUNKS)?);
         self.pool.min_credits = min;
         self.pool.max_credits = max;
         self.pool.target_credits = initial;
@@ -179,11 +175,7 @@ impl UdpPoolManager {
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> RioResult<(SubmissionResult, usize, Option<usize>)> {
-        let requested_chunk_size = recv_op
-            .buf
-            .len()
-            .saturating_sub(recv_op.buf_offset)
-            .max(1);
+        let requested_chunk_size = recv_op.buf.len().saturating_sub(recv_op.buf_offset).max(1);
         let total_submissions = self.ensure_pool(ctx, requested_chunk_size)?;
         let (res, subs, copied) =
             self.pool
@@ -991,14 +983,12 @@ impl UdpPoolManager {
                 UdpWaiterKind::Recv => Self::deliver_to_recv_waiter(comp, waiter, &mut datagram),
             };
 
-            if delivered {
-                if matches!(kind, UdpWaiterKind::Recv) {
-                    if let Some(idx) = idx {
-                        if let Some(slab) = pool.slab.as_mut() {
-                            slab.free_indices.push_back(idx);
-                        }
-                    }
-                }
+            if delivered
+                && matches!(kind, UdpWaiterKind::Recv)
+                && let Some(idx) = idx
+                && let Some(slab) = pool.slab.as_mut()
+            {
+                slab.free_indices.push_back(idx);
             } else if let Some(returned_datagram) = datagram {
                 mailbox.queue.push_front(returned_datagram);
                 mailbox.waiters.push_front(waiter);

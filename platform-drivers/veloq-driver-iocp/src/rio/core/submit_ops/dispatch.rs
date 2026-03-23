@@ -162,7 +162,10 @@ impl RioProvider for RioDispatch {
         // SAFETY: Function pointer is verified at startup.
         let cq = unsafe { (self.create_cq)(entries, notification as *const _) };
         if cq == 0 {
-            return Err(RioState::last_wsa_report(RioError::CqCreation, "RIOCreateCompletionQueue"));
+            return Err(RioState::last_wsa_report(
+                RioError::CqCreation,
+                "RIOCreateCompletionQueue",
+            ));
         }
         Ok(RioCq(cq))
     }
@@ -183,7 +186,10 @@ impl RioProvider for RioDispatch {
             )
         };
         if rq == 0 {
-            return Err(RioState::last_wsa_report(RioError::RqCreation, "RIOCreateRequestQueue"));
+            return Err(RioState::last_wsa_report(
+                RioError::RqCreation,
+                "RIOCreateRequestQueue",
+            ));
         }
         Ok(RioRq(rq))
     }
@@ -193,7 +199,10 @@ impl RioProvider for RioDispatch {
         // SAFETY: Function pointer is verified at startup.
         let id = unsafe { (self.register_buffer)(ptr, len) };
         if id == 0 {
-            return Err(RioState::last_wsa_report(RioError::BufferRegistration, "RIORegisterBuffer"));
+            return Err(RioState::last_wsa_report(
+                RioError::BufferRegistration,
+                "RIORegisterBuffer",
+            ));
         }
         Ok(RioBufferId(id))
     }
@@ -303,7 +312,10 @@ impl RioProvider for RioDispatch {
             )
         };
         if ret == 0 {
-            return Err(RioState::last_wsa_report(RioError::Datapath, "RIOReceiveEx"));
+            return Err(RioState::last_wsa_report(
+                RioError::Datapath,
+                "RIOReceiveEx",
+            ));
         }
         Ok(())
     }
