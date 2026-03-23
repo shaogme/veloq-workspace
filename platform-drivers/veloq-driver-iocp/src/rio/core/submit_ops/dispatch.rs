@@ -1,10 +1,10 @@
 use crate::BufferRegistrationMode;
+use crate::config::BorrowedRawHandle;
 use crate::ext::Extensions;
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState};
 use crate::win32::Overlapped;
 use error_stack::ResultExt;
-use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION, RIO_RQ,
     RIORESULT, SOCKET_ERROR,
@@ -328,7 +328,11 @@ pub(crate) struct RioKernel {
 }
 
 impl RioKernel {
-    pub(super) fn from_extensions(port: HANDLE, entries: u32, ext: &Extensions) -> RioResult<Self> {
+    pub(super) fn from_extensions(
+        port: BorrowedRawHandle<'_>,
+        entries: u32,
+        ext: &Extensions,
+    ) -> RioResult<Self> {
         let table = &ext.rio_table;
         let dispatch = RioDispatch {
             create_cq: table
@@ -379,14 +383,14 @@ impl RioKernel {
         Self::new(port, entries, dispatch)
     }
 
-    fn new(port: HANDLE, entries: u32, dispatch: RioDispatch) -> RioResult<Self> {
+    fn new(port: BorrowedRawHandle<'_>, entries: u32, dispatch: RioDispatch) -> RioResult<Self> {
         const RIO_EVENT_KEY: usize = usize::MAX - 1;
         let mut notify_ov = Box::new(Overlapped::zeroed());
         let notification = RIO_NOTIFICATION_COMPLETION {
             Type: RIO_IOCP_COMPLETION,
             Anonymous: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0 {
                 Iocp: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
-                    IocpHandle: port,
+                    IocpHandle: port.as_handle(),
                     CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
                     Overlapped: notify_ov.as_mut_ptr().cast(),
                 },

@@ -105,13 +105,18 @@ impl IocpDriver {
                 format!("failed to load IOCP extensions, port={port_handle:?}"),
             )
         })?;
-        let rio_state = RioState::new(port_handle, entries, &extensions, registration_mode)
-            .map_err(|e| {
-                use crate::rio::error::RioReportExt;
-                e.to_io_error(format!(
-                    "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
-                ))
-            })?;
+        let rio_state = RioState::new(
+            crate::config::RawHandle::for_file(port_handle).borrow(),
+            entries,
+            &extensions,
+            registration_mode,
+        )
+        .map_err(|e| {
+            use crate::rio::error::RioReportExt;
+            e.to_io_error(format!(
+                "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
+            ))
+        })?;
         let ops = OpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable = ops.shared.clone();
         Ok(Self {

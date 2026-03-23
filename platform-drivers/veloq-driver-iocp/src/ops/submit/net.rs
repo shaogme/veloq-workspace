@@ -2,13 +2,13 @@ use std::io;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use veloq_pod::{bytes_of_mut, from_bytes_mut};
-use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN,
     SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET,
 };
 
 use crate::common::{IocpErrorContext, io_error};
+use crate::config::BorrowedRawHandle;
 use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
 use crate::ops::submit::common::{
@@ -39,7 +39,7 @@ fn with_borrowed_socket<T>(
 fn ensure_sticky_fallback_association(
     ctx: &mut SubmitContext,
     socket_key: SocketActorKey,
-    handle: HANDLE,
+    handle: BorrowedRawHandle<'_>,
     detail: impl FnOnce() -> String,
 ) -> io::Result<()> {
     if ctx.rio.needs_iocp_fallback_association(socket_key) {
@@ -53,8 +53,7 @@ fn submit_iocp_recv_fallback(
     header: &mut OverlappedEntry,
     ctx: &mut SubmitContext,
     socket_key: SocketActorKey,
-    handle: HANDLE,
-    socket: SOCKET,
+    handle: BorrowedRawHandle<'_>,
     fd: impl std::fmt::Debug,
     buf: *mut u8,
     len: u32,
@@ -63,6 +62,7 @@ fn submit_iocp_recv_fallback(
     ensure_sticky_fallback_association(ctx, socket_key, handle, || {
         format!("{op_name} fallback association failed: fd={fd:?}")
     })?;
+    let socket = handle.as_socket();
     // SAFETY: socket/buffer/overlapped are guaranteed valid by submit contract.
     mark_header_in_flight(header, unsafe { iocp_submit_socket_recv(socket, buf, len, ctx.overlapped) })
         .map_err(|err| {
@@ -71,7 +71,9 @@ fn submit_iocp_recv_fallback(
                 err,
                 format!(
                     "{op_name} fallback syscall failed: fd={fd:?}, handle={:?}, user_data={}, generation={}",
-                    handle, header.user_data, header.generation
+                    handle.as_handle(),
+                    header.user_data,
+                    header.generation
                 ),
             )
         })
@@ -81,8 +83,7 @@ fn submit_iocp_send_fallback(
     header: &mut OverlappedEntry,
     ctx: &mut SubmitContext,
     socket_key: SocketActorKey,
-    handle: HANDLE,
-    socket: SOCKET,
+    handle: BorrowedRawHandle<'_>,
     fd: impl std::fmt::Debug,
     buf: *const u8,
     len: u32,
@@ -91,6 +92,7 @@ fn submit_iocp_send_fallback(
     ensure_sticky_fallback_association(ctx, socket_key, handle, || {
         format!("{op_name} fallback association failed: fd={fd:?}")
     })?;
+    let socket = handle.as_socket();
     // SAFETY: socket/buffer/overlapped are guaranteed valid by submit contract.
     mark_header_in_flight(header, unsafe { iocp_submit_socket_send(socket, buf, len, ctx.overlapped) })
         .map_err(|err| {
@@ -99,7 +101,9 @@ fn submit_iocp_send_fallback(
                 err,
                 format!(
                     "{op_name} fallback syscall failed: fd={fd:?}, handle={:?}, user_data={}, generation={}",
-                    handle, header.user_data, header.generation
+                    handle.as_handle(),
+                    header.user_data,
+                    header.generation
                 ),
             )
         })
@@ -145,9 +149,8 @@ pub(crate) fn submit_recv(
 
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
-    let socket = handle as SOCKET;
-    let socket_key = SocketActorKey::new(handle, raw_handle.generation);
+    let handle = raw_handle.borrow();
+    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
     let user_data = header.user_data;
     let generation = header.generation;
     // SAFETY: pointer/len are derived from valid buffer and used only for fallback submit.
@@ -163,7 +166,6 @@ pub(crate) fn submit_recv(
                 RioTarget {
                     fd: val.fd,
                     handle,
-                    socket_generation: raw_handle.generation,
                     user_data,
                     generation,
                     buf_offset: val.buf_offset,
@@ -174,7 +176,7 @@ pub(crate) fn submit_recv(
         },
         |header, ctx| {
             submit_iocp_recv_fallback(
-                header, ctx, socket_key, handle, socket, val.fd, buf_ptr, buf_len, "TCP recv",
+                header, ctx, socket_key, handle, val.fd, buf_ptr, buf_len, "TCP recv",
             )
         },
         || {
@@ -197,9 +199,8 @@ pub(crate) fn submit_udp_recv(
 
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
-    let socket = handle as SOCKET;
-    let socket_key = SocketActorKey::new(handle, raw_handle.generation);
+    let handle = raw_handle.borrow();
+    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
 
     if ctx.rio.is_iocp_fallback(socket_key) {
         return submit_iocp_recv_fallback(
@@ -207,7 +208,6 @@ pub(crate) fn submit_udp_recv(
             ctx,
             socket_key,
             handle,
-            socket,
             val.fd,
             // SAFETY: buf pointer and length are valid for this operation.
             unsafe { val.buf.as_mut_ptr().add(val.buf_offset) },
@@ -220,7 +220,6 @@ pub(crate) fn submit_udp_recv(
         crate::rio::RioUdpRecvArgs {
             fd: val.fd,
             handle,
-            socket_generation: raw_handle.generation,
             recv_op: val,
             sidecar: header,
         },
@@ -238,7 +237,6 @@ pub(crate) fn submit_udp_recv(
                     ctx,
                     socket_key,
                     handle,
-                    socket,
                     val.fd,
                     // SAFETY: buf pointer and length are valid for this operation.
                     unsafe { val.buf.as_mut_ptr().add(val.buf_offset) },
@@ -263,9 +261,8 @@ pub(crate) fn submit_send(
 
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
-    let socket = handle as SOCKET;
-    let socket_key = SocketActorKey::new(handle, raw_handle.generation);
+    let handle = raw_handle.borrow();
+    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
     let user_data = header.user_data;
     let generation = header.generation;
 
@@ -278,7 +275,6 @@ pub(crate) fn submit_send(
                 RioTarget {
                     fd: val.fd,
                     handle,
-                    socket_generation: raw_handle.generation,
                     user_data,
                     generation,
                     buf_offset: val.buf_offset,
@@ -293,7 +289,6 @@ pub(crate) fn submit_send(
                 ctx,
                 socket_key,
                 handle,
-                socket,
                 val.fd,
                 // SAFETY: buf pointer and length are valid for this operation.
                 unsafe { val.buf.as_ptr().add(val.buf_offset) },
@@ -321,9 +316,8 @@ pub(crate) fn submit_udp_send(
 
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
-    let socket = handle as SOCKET;
-    let socket_key = SocketActorKey::new(handle, raw_handle.generation);
+    let handle = raw_handle.borrow();
+    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
     let user_data = header.user_data;
     let generation = header.generation;
 
@@ -336,7 +330,6 @@ pub(crate) fn submit_udp_send(
                 RioTarget {
                     fd: val.fd,
                     handle,
-                    socket_generation: raw_handle.generation,
                     user_data,
                     generation,
                     buf_offset: val.buf_offset,
@@ -351,7 +344,6 @@ pub(crate) fn submit_udp_send(
                 ctx,
                 socket_key,
                 handle,
-                socket,
                 val.fd,
                 // SAFETY: buf pointer and length are valid for this operation.
                 unsafe { val.buf.as_ptr().add(val.buf_offset) },
@@ -377,13 +369,16 @@ pub(crate) fn submit_connect(
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let raw_handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
+    let handle = raw_handle.borrow();
     ensure_iocp_association(
         handle,
         ctx.port,
         format!(
             "submit_connect: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-            connect_op.fd, handle, header.user_data, header.generation
+            connect_op.fd,
+            handle.as_handle(),
+            header.user_data,
+            header.generation
         ),
     )?;
     ensure_socket_bound(handle, connect_op)?;
@@ -393,7 +388,7 @@ pub(crate) fn submit_connect(
     mark_header_in_flight(header, unsafe {
         iocp_submit_connect_ex(ConnectExArgs {
             connect_ex: ctx.ext.connect_ex,
-            s: handle as SOCKET,
+            s: handle.as_socket(),
             name: &connect_op.addr as *const _ as *const SOCKADDR,
             namelen: connect_op.addr_len as i32,
             lp_send_buffer: std::ptr::null(),
@@ -404,11 +399,11 @@ pub(crate) fn submit_connect(
     })
 }
 
-fn ensure_socket_bound(handle: HANDLE, connect_op: &Connect) -> io::Result<()> {
+fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> io::Result<()> {
     let mut storage = SockAddrStorage::default();
     let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
 
-    if with_borrowed_socket(handle as SOCKET, |socket| {
+    if with_borrowed_socket(handle.as_socket(), |socket| {
         // SAFETY: storage and namelen are valid for this call.
         unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
     })
@@ -456,7 +451,7 @@ fn ensure_socket_bound(handle: HANDLE, connect_op: &Connect) -> io::Result<()> {
         *sin6_ref = s;
         (storage, std::mem::size_of::<SOCKADDR_IN6>() as i32)
     };
-    with_borrowed_socket(handle as SOCKET, |socket| {
+    with_borrowed_socket(handle.as_socket(), |socket| {
         // SAFETY: storage is a valid SOCKADDR_STORAGE for this call.
         unsafe { socket.bind(&storage.0 as *const _ as *const SOCKADDR, len) }
     })
@@ -474,7 +469,7 @@ pub(crate) unsafe fn on_complete_connect(
     // SAFETY: The caller guarantees that payload is valid.
     let connect_op = unsafe { payload.user.as_ref() };
     if let Some(raw_handle) = header.resolved_handle.or_else(|| connect_op.fd.raw()) {
-        with_borrowed_socket(raw_handle.handle as SOCKET, |socket| {
+        with_borrowed_socket(raw_handle.as_socket(), |socket| {
             socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
         })?;
     }
@@ -490,26 +485,32 @@ pub(crate) fn submit_accept(
     let user = unsafe { payload.user.as_mut() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
+    let handle = raw_handle.borrow();
     let accept_socket = payload.accept_socket;
-    let accept_socket_raw = accept_socket.handle as SOCKET;
+    let accept_socket_raw = accept_socket.as_socket();
 
     ensure_iocp_association(
         handle,
         ctx.port,
         format!(
             "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
-            handle as usize, header.user_data, header.generation
+            handle.as_handle() as usize,
+            header.user_data,
+            header.generation
         ),
     )?;
 
     // Ensure the pre-allocated accept socket is also associated with the same IOCP.
+    let accept_socket_handle = crate::config::RawHandle::for_socket(accept_socket_raw as _);
     ensure_iocp_association(
-        accept_socket_raw as HANDLE,
+        accept_socket_handle.borrow(),
         ctx.port,
         format!(
             "submit_accept: associate accept socket failed: accept=0x{:x}, listen=0x{:x}, user_data={}, generation={}",
-            accept_socket_raw, handle as usize, header.user_data, header.generation
+            accept_socket_raw,
+            handle.as_handle() as usize,
+            header.user_data,
+            header.generation
         ),
     )?;
 
@@ -520,7 +521,7 @@ pub(crate) fn submit_accept(
     let submit_res = unsafe {
         iocp_submit_accept_ex(AcceptExArgs {
             accept_ex: ctx.ext.accept_ex,
-            s_listen_socket: handle as SOCKET,
+            s_listen_socket: handle.as_socket(),
             s_accept_socket: accept_socket_raw,
             lp_output_buffer: payload.accept_buffer.as_mut_ptr() as *mut _,
             dw_receive_data_length: 0,
@@ -536,7 +537,7 @@ pub(crate) fn submit_accept(
             e,
             format!(
                 "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
-                handle as usize,
+                handle.as_handle() as usize,
                 accept_socket_raw,
                 split,
                 split,
@@ -561,8 +562,8 @@ pub(crate) unsafe fn on_complete_accept(
     let user = unsafe { payload.user.as_mut() };
     let accept_socket = payload.accept_socket;
     let listen_handle = user.fd.raw().ok_or(io::Error::from_raw_os_error(0))?;
-    let listen_socket = listen_handle.handle as SOCKET;
-    let accept_socket_raw = accept_socket.handle as SOCKET;
+    let listen_socket = listen_handle.as_socket();
+    let accept_socket_raw = accept_socket.as_socket();
 
     if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
         socket.setsockopt(SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_socket)
@@ -622,14 +623,13 @@ pub(crate) fn submit_send_to(
     let user = unsafe { payload.user.as_ref() };
     let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
+    let handle = raw_handle.borrow();
 
     // RIO path is mandatory for socket send_to.
     let page_idx = header.user_data / ctx.slots_per_page;
     let args = crate::rio::RioSendToArgs {
         fd: user.fd,
         handle,
-        socket_generation: raw_handle.generation,
         buf: &user.buf,
         addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
         addr_len: payload.addr_len,
@@ -666,14 +666,12 @@ pub(crate) fn submit_udp_recv_stream(
     overlapped.set_offset(0);
     let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
     header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.handle;
-    let socket = handle as SOCKET;
-    let socket_key = SocketActorKey::new(handle, raw_handle.generation);
+    let handle = raw_handle.borrow();
+    let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
 
     let args = crate::rio::RioUdpStreamArgs {
         fd: val.fd,
         handle,
-        socket_generation: raw_handle.generation,
         stream_op: val,
         user_data: header.user_data,
         generation: header.generation,
@@ -692,7 +690,6 @@ pub(crate) fn submit_udp_recv_stream(
                     ctx,
                     socket_key,
                     handle,
-                    socket,
                     val.fd,
                     buf.as_mut_ptr(),
                     buf.len() as u32,
@@ -729,7 +726,7 @@ pub(crate) unsafe fn on_udp_stream_complete(
     {
         let mut storage = SockAddrStorage::default();
         let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
-        let _ = with_borrowed_socket(raw.handle as SOCKET, |socket| {
+        let _ = with_borrowed_socket(raw.as_socket(), |socket| {
             // SAFETY: storage and namelen are valid output pointers.
             unsafe { socket.getpeername(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
         });

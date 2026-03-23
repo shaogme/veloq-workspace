@@ -1,6 +1,7 @@
 //! Actor coordination and completion routing for the RIO runtime.
 
 use crate::IoFd;
+use crate::config::BorrowedRawHandle;
 use crate::driver::IocpOpState;
 use crate::ops::IocpOp;
 use crate::rio::core::RioCompletionKind;
@@ -24,7 +25,6 @@ use veloq_driver_core::driver::{
 };
 use veloq_driver_core::op_registry::OpRegistry;
 use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
-use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,8 +34,7 @@ pub(crate) enum RioActorState {
 }
 
 pub(crate) struct RioSocketActor {
-    pub(crate) handle: HANDLE,
-    pub(crate) socket_generation: u32,
+    pub(crate) socket_key: SocketActorKey,
     pub(crate) rq: RioRq,
     pub(crate) pool_manager: UdpPoolManager,
     pub(crate) udp_mailbox: UdpMailbox,
@@ -44,10 +43,9 @@ pub(crate) struct RioSocketActor {
 }
 
 impl RioSocketActor {
-    pub(crate) fn new(handle: HANDLE, socket_generation: u32, rq: RioRq) -> Self {
+    pub(crate) fn new(socket_key: SocketActorKey, rq: RioRq) -> Self {
         Self {
-            handle,
-            socket_generation,
+            socket_key,
             rq,
             pool_manager: UdpPoolManager::new(),
             udp_mailbox: UdpMailbox::new(),
@@ -58,7 +56,7 @@ impl RioSocketActor {
 
     #[inline]
     pub(crate) const fn socket_key(&self) -> SocketActorKey {
-        SocketActorKey::new(self.handle, self.socket_generation)
+        self.socket_key
     }
 }
 
@@ -249,11 +247,11 @@ impl RioState {
 
     pub(crate) fn ensure_actor(
         &mut self,
-        target: (IoFd, HANDLE, u32),
+        target: (IoFd, BorrowedRawHandle<'_>),
         env: RioEnv<'_>,
     ) -> RioResult<&mut RioSocketActor> {
-        let (fd, handle, socket_generation) = target;
-        let socket_key = SocketActorKey::new(handle, socket_generation);
+        let (fd, handle) = target;
+        let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
         if let Some(key) = self.actor_by_handle.get(&socket_key).copied() {
             return self
                 .actors
@@ -272,8 +270,8 @@ impl RioState {
             Err(e) => {
                 let diag = RioDiag::new("ensure_actor_create_rq")
                     .field("fd", format!("{fd:?}"))
-                    .field("handle", format!("{handle:?}"))
-                    .field("socket_raw", format!("0x{:x}", handle as usize))
+                    .field("handle", format!("{:?}", handle.as_handle()))
+                    .field("socket_raw", format!("0x{:x}", handle.as_handle() as usize))
                     .field("rq_depth", self.registry.rq_depth)
                     .field("max_outstanding_recvs", self.registry.rq_depth)
                     .field("max_outstanding_sends", self.registry.rq_depth)
@@ -287,8 +285,8 @@ impl RioState {
                     );
                 error!(
                     fd = ?fd,
-                    handle = ?handle,
-                    socket_raw = handle as usize,
+                    handle = ?handle.as_handle(),
+                    socket_raw = handle.as_handle() as usize,
                     rq_depth = self.registry.rq_depth,
                     max_outstanding_recvs = self.registry.rq_depth,
                     max_outstanding_sends = self.registry.rq_depth,
@@ -304,7 +302,7 @@ impl RioState {
             }
         };
 
-        let actor = RioSocketActor::new(handle, socket_generation, rq);
+        let actor = RioSocketActor::new(socket_key, rq);
         let key = self.actors.insert(actor);
         self.actor_by_handle.insert(socket_key, key);
         let state = self.socket_runtime.entry(socket_key).or_default();

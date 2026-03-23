@@ -1,9 +1,11 @@
 use crate::rio::SocketActorKey;
+use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use veloq_buf::nz;
 use veloq_driver_core::IoFd as CoreIoFd;
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Networking::WinSock::SOCKET;
 
 /// Specifies how buffers are registered and validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -65,6 +67,23 @@ pub struct RawHandle {
     pub generation: u32,
 }
 
+/// Owned handle wrapper for internal ownership-oriented APIs.
+///
+/// Note: this type currently models ownership at the type level only and does
+/// not perform implicit close on drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct OwnedRawHandle {
+    raw: RawHandle,
+}
+
+/// Borrowed handle view tied to a caller-controlled lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorrowedRawHandle<'a> {
+    raw: RawHandle,
+    _marker: PhantomData<&'a RawHandle>,
+}
+
 // SAFETY: Windows HANDLEs are thread-safe and can be sent across threads.
 unsafe impl Send for RawHandle {}
 // SAFETY: Windows HANDLEs can be accessed from multiple threads simultaneously.
@@ -115,6 +134,81 @@ impl RawHandle {
     #[inline]
     pub(crate) const fn actor_key(self) -> SocketActorKey {
         SocketActorKey::new(self.handle, self.generation)
+    }
+
+    #[inline]
+    pub const fn as_handle(self) -> HANDLE {
+        self.handle
+    }
+
+    #[inline]
+    pub fn as_socket(self) -> SOCKET {
+        self.handle as SOCKET
+    }
+
+    #[inline]
+    pub const fn borrow(&self) -> BorrowedRawHandle<'_> {
+        BorrowedRawHandle {
+            raw: *self,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub const fn into_owned(self) -> OwnedRawHandle {
+        OwnedRawHandle { raw: self }
+    }
+}
+
+impl OwnedRawHandle {
+    #[inline]
+    pub const fn as_raw(&self) -> RawHandle {
+        self.raw
+    }
+
+    #[inline]
+    pub const fn borrow(&self) -> BorrowedRawHandle<'_> {
+        self.raw.borrow()
+    }
+}
+
+impl<'a> BorrowedRawHandle<'a> {
+    #[inline]
+    pub const fn as_raw(self) -> RawHandle {
+        self.raw
+    }
+
+    #[inline]
+    pub const fn as_handle(self) -> HANDLE {
+        self.raw.as_handle()
+    }
+
+    #[inline]
+    pub fn as_socket(self) -> SOCKET {
+        self.raw.as_socket()
+    }
+
+    #[inline]
+    pub const fn generation(self) -> u32 {
+        self.raw.generation
+    }
+}
+
+impl From<RawHandle> for OwnedRawHandle {
+    fn from(value: RawHandle) -> Self {
+        value.into_owned()
+    }
+}
+
+impl From<OwnedRawHandle> for RawHandle {
+    fn from(value: OwnedRawHandle) -> Self {
+        value.raw
+    }
+}
+
+impl<'a> From<BorrowedRawHandle<'a>> for RawHandle {
+    fn from(value: BorrowedRawHandle<'a>) -> Self {
+        value.raw
     }
 }
 

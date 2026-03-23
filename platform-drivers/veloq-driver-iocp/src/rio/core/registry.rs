@@ -10,6 +10,7 @@
 //! intentionally avoids actor scheduling or completion routing policy.
 
 use crate::IoFd;
+use crate::config::BorrowedRawHandle;
 use crate::rio::RioEnv;
 use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
 use crate::rio::error::{RioDiag, RioError, RioResult};
@@ -17,7 +18,6 @@ use error_stack::ResultExt;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 use veloq_buf::{FixedBuf, PoolKind};
-use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
 const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
@@ -209,7 +209,7 @@ impl RioRegistry {
 
     pub(crate) fn create_rq(
         &mut self,
-        target: (HANDLE, IoFd),
+        target: (BorrowedRawHandle<'_>, IoFd),
         env: RioEnv<'_>,
     ) -> RioResult<RioRq> {
         let (handle, fd) = target;
@@ -219,7 +219,7 @@ impl RioRegistry {
 
         env.dispatch
             .create_rq(RioRqConfig {
-                socket: handle as usize,
+                socket: handle.as_socket() as usize,
                 max_outstanding_recvs,
                 max_receive_data_buffers: 1,
                 max_outstanding_sends,
@@ -230,7 +230,7 @@ impl RioRegistry {
             })
             .map_err(|e| {
                 let diag = RioDiag::new("create_rq")
-                    .field("socket_raw", format!("0x{:x}", handle as usize))
+                    .field("socket_raw", format!("0x{:x}", handle.as_handle() as usize))
                     .field("rq_depth", self.rq_depth)
                     .field("max_outstanding_recvs", max_outstanding_recvs)
                     .field("max_outstanding_sends", max_outstanding_sends)
@@ -240,7 +240,8 @@ impl RioRegistry {
             })
             .attach(format!(
                 "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",
-                self.rq_depth
+                self.rq_depth,
+                handle = handle.as_handle()
             ))
     }
 

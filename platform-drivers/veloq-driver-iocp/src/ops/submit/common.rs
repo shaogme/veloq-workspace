@@ -1,5 +1,5 @@
 use std::io;
-use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
 use windows_sys::Win32::Networking::WinSock::{
     SOCKET, SOCKET_ERROR, WSABUF, WSAGetLastError, WSARecv, WSASend,
 };
@@ -7,7 +7,7 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::common::{IocpErrorContext, io_error, io_msg};
-use crate::config::{IoFd, RawHandle};
+use crate::config::{BorrowedRawHandle, IoFd, RawHandle};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
 use crate::ops::{KernelRef, OverlappedEntry};
 use crate::win32::Overlapped;
@@ -56,7 +56,7 @@ pub(crate) struct AcceptExArgs {
 ///
 /// The caller must ensure that the handle, buf, and overlapped pointers are valid.
 pub(crate) unsafe fn iocp_submit_read(
-    handle: HANDLE,
+    handle: BorrowedRawHandle<'_>,
     buf: *mut u8,
     len: u32,
     overlapped: *mut Overlapped,
@@ -65,7 +65,7 @@ pub(crate) unsafe fn iocp_submit_read(
     // SAFETY: ReadFile is called with valid parameters.
     let ret = unsafe {
         ReadFile(
-            handle,
+            handle.as_handle(),
             buf as _,
             len,
             &mut bytes,
@@ -88,7 +88,7 @@ pub(crate) unsafe fn iocp_submit_read(
 ///
 /// The caller must ensure that the handle, buf, and overlapped pointers are valid.
 pub(crate) unsafe fn iocp_submit_write(
-    handle: HANDLE,
+    handle: BorrowedRawHandle<'_>,
     buf: *const u8,
     len: u32,
     overlapped: *mut Overlapped,
@@ -97,7 +97,7 @@ pub(crate) unsafe fn iocp_submit_write(
     // SAFETY: WriteFile is called with valid parameters.
     let ret = unsafe {
         WriteFile(
-            handle,
+            handle.as_handle(),
             buf as _,
             len,
             &mut bytes,
@@ -288,12 +288,12 @@ pub(crate) unsafe fn unpack_kernel_ref<T>(
 /// Associates a handle with an IOCP.
 ///
 pub(crate) fn ensure_iocp_association(
-    handle: HANDLE,
+    handle: BorrowedRawHandle<'_>,
     port: &crate::win32::IoCompletionPort,
     detail: impl Into<String>,
 ) -> io::Result<()> {
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
-    unsafe { port.associate(handle, 0) }
+    unsafe { port.associate(handle.as_handle(), 0) }
         .map_err(|e| io_error(IocpErrorContext::Submission, e, detail))
 }
 

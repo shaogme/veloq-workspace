@@ -31,7 +31,7 @@ macro_rules! submit_io_op {
 
             let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
             header.resolved_handle = Some(raw_handle);
-            let handle = raw_handle.handle;
+            let handle = raw_handle.borrow();
             ensure_iocp_association(
                 handle,
                 ctx.port,
@@ -39,7 +39,7 @@ macro_rules! submit_io_op {
                     "{}: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
                     stringify!($fn_name),
                     val.fd,
-                    handle,
+                    handle.as_handle(),
                     header.user_data,
                     header.generation,
                     val.offset,
@@ -60,7 +60,7 @@ macro_rules! submit_io_op {
                         "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
                         stringify!($fn_name),
                         val.fd,
-                        handle,
+                        handle.as_handle(),
                         header.user_data,
                         header.generation,
                         val.offset,
