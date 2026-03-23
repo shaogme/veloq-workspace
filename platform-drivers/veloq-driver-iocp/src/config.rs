@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use veloq_buf::nz;
 use veloq_driver_core::IoFd as CoreIoFd;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -55,10 +56,12 @@ impl IocpConfig {
 
 /// A raw Windows handle wrapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
+#[repr(C)]
 pub struct RawHandle {
     /// The underlying Windows HANDLE.
     pub handle: HANDLE,
+    /// Monotonic socket generation used to avoid HANDLE reuse aliasing in RIO actor mapping.
+    pub generation: u32,
 }
 
 // SAFETY: Windows HANDLEs are thread-safe and can be sent across threads.
@@ -68,15 +71,49 @@ unsafe impl Sync for RawHandle {}
 
 impl From<usize> for RawHandle {
     fn from(handle: usize) -> Self {
-        Self {
-            handle: handle as HANDLE,
-        }
+        Self::for_file(handle as HANDLE)
     }
 }
 
 impl From<RawHandle> for usize {
     fn from(handle: RawHandle) -> Self {
         handle.handle as usize
+    }
+}
+
+static NEXT_SOCKET_GENERATION: AtomicU32 = AtomicU32::new(1);
+
+#[inline]
+fn alloc_socket_generation() -> u32 {
+    let generation = NEXT_SOCKET_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if generation == 0 {
+        NEXT_SOCKET_GENERATION.store(1, Ordering::Relaxed);
+        1
+    } else {
+        generation
+    }
+}
+
+impl RawHandle {
+    #[inline]
+    pub const fn for_file(handle: HANDLE) -> Self {
+        Self {
+            handle,
+            generation: 0,
+        }
+    }
+
+    #[inline]
+    pub fn for_socket(handle: HANDLE) -> Self {
+        Self {
+            handle,
+            generation: alloc_socket_generation(),
+        }
+    }
+
+    #[inline]
+    pub const fn actor_key(self) -> (HANDLE, u32) {
+        (self.handle, self.generation)
     }
 }
 

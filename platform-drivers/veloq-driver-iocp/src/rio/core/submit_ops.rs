@@ -80,6 +80,7 @@ impl RioState {
         let RioTarget {
             fd,
             handle,
+            socket_generation,
             user_data,
             generation,
             buf_offset,
@@ -95,7 +96,7 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         let actor = self
-            .ensure_actor((fd, handle), env)
+            .ensure_actor((fd, handle, socket_generation), env)
             .attach("failed to ensure RIO actor")?;
         if actor.is_iocp_fallback {
             return Err(error_stack::Report::new(RioError::NotSupported))
@@ -144,6 +145,7 @@ impl RioState {
         let RioTarget {
             fd,
             handle,
+            socket_generation,
             user_data,
             generation,
             buf_offset,
@@ -161,7 +163,7 @@ impl RioState {
         let outstanding_snapshot = self.outstanding_count;
         let (rq, actor_state) = {
             let actor = self
-                .ensure_actor((fd, handle), env)
+                .ensure_actor((fd, handle, socket_generation), env)
                 .map_err(|e| {
                     let diag = RioDiag::new("submit_send_ensure_actor")
                         .field("fd", format!("{fd:?}"))

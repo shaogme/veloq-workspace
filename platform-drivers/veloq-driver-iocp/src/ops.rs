@@ -64,7 +64,7 @@ pub(crate) struct SubmitContext<'a> {
     pub(crate) port: &'a crate::win32::IoCompletionPort,
     pub(crate) overlapped: *mut crate::win32::Overlapped,
     pub(crate) ext: &'a Extensions,
-    pub(crate) registered_files: &'a [Option<HANDLE>],
+    pub(crate) registered_files: &'a [Option<RawHandle>],
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
 
     // RIO Support
@@ -358,13 +358,9 @@ define_iocp_ops! {
                 )
             };
             let accept_socket = if socket == INVALID_SOCKET {
-                RawHandle {
-                    handle: std::ptr::null_mut(),
-                }
+                RawHandle::for_file(std::ptr::null_mut())
             } else {
-                RawHandle {
-                    handle: socket as HANDLE,
-                }
+                RawHandle::for_socket(socket as HANDLE)
             };
             AcceptPayload {
                 user,

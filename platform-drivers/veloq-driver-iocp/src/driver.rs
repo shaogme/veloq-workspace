@@ -274,7 +274,7 @@ impl IocpDriver {
     /// Shuts down the RIO actor associated with the specified socket handle.
     /// This is used by both TCP and UDP teardown paths.
     pub fn shutdown_actor(&mut self, handle: RawHandle) {
-        self.rio_state.shutdown_actor(handle.handle);
+        self.rio_state.shutdown_actor(handle.actor_key());
     }
 
     /// Registers a set of file/socket handles for use with the driver.
@@ -282,11 +282,11 @@ impl IocpDriver {
         let mut registered = Vec::with_capacity(files.len());
         for &handle in files {
             let idx = if let Some(idx) = self.free_slots.pop() {
-                self.registered_files[idx] = Some(handle.handle);
+                self.registered_files[idx] = Some(handle);
                 self.rio_state.clear_registered_rq(idx);
                 idx
             } else {
-                self.registered_files.push(Some(handle.handle));
+                self.registered_files.push(Some(handle));
                 self.rio_state.resize_rqs(self.registered_files.len());
                 self.registered_files.len() - 1
             };
@@ -582,9 +582,7 @@ impl Driver for IocpDriver {
     }
 
     fn inner_handle(&self) -> RawHandle {
-        RawHandle {
-            handle: self.port.as_raw() as _,
-        }
+        RawHandle::for_file(self.port.as_raw() as _)
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {

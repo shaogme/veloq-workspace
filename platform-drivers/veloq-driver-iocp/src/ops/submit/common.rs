@@ -7,7 +7,7 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::common::{IocpErrorContext, io_error, io_msg};
-use crate::config::IoFd;
+use crate::config::{IoFd, RawHandle};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
 use crate::ops::KernelRef;
 use crate::win32::Overlapped;
@@ -249,9 +249,12 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> io::Result<Sub
 // Helper Functions
 // ============================================================================
 
-pub(crate) fn resolve_fd(fd: IoFd, registered_files: &[Option<HANDLE>]) -> io::Result<HANDLE> {
+pub(crate) fn resolve_fd(
+    fd: IoFd,
+    registered_files: &[Option<RawHandle>],
+) -> io::Result<RawHandle> {
     match fd {
-        IoFd::Raw(h) => Ok(h.handle as HANDLE),
+        IoFd::Raw(h) => Ok(h),
         IoFd::Fixed(idx) => {
             if let Some(Some(h)) = registered_files.get(idx as usize) {
                 Ok(*h)

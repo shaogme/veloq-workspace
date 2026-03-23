@@ -2,6 +2,7 @@
 
 use crate::rio::ActorKey;
 use crate::rio::RioState;
+use crate::rio::SocketActorKey;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
@@ -12,7 +13,6 @@ use error_stack::ResultExt;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::sync::OnceLock;
-use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 const RIO_REAPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -22,7 +22,7 @@ pub(crate) struct DeferredRioCleanup {
     registry: RioRegistry,
     registration_mode: crate::BufferRegistrationMode,
     actors: SlotMap<ActorKey, RioSocketActor>,
-    actor_by_handle: FxHashMap<HANDLE, ActorKey>,
+    actor_by_handle: FxHashMap<SocketActorKey, ActorKey>,
     outstanding_count: usize,
 }
 

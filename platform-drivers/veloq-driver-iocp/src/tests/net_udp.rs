@@ -216,7 +216,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("server bind failed");
     let server_handle = server.into_raw();
-    let raw_handle = server_handle.handle as windows_sys::Win32::Foundation::HANDLE;
+    let socket_key = server_handle.actor_key();
 
     let mut submitted = Vec::new();
     const BURST_WAITERS: usize = 12;
@@ -241,7 +241,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
 
     let stats = driver
         .rio_state
-        .udp_pool_debug_stats(raw_handle)
+        .udp_pool_debug_stats(socket_key)
         .expect("udp pool stats missing");
     assert!(
         stats.target_credits > 4,
@@ -283,7 +283,7 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("server bind failed");
     let server_handle = server.into_raw();
-    let raw_handle = server_handle.handle as windows_sys::Win32::Foundation::HANDLE;
+    let socket_key = server_handle.actor_key();
 
     let mut submitted = Vec::new();
     const BURST_WAITERS: usize = 12;
@@ -320,7 +320,7 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
     const MAX_IDLE_TICKS: usize = 4096;
     let mut stats = driver
         .rio_state
-        .udp_pool_debug_stats(raw_handle)
+        .udp_pool_debug_stats(socket_key)
         .expect("udp pool stats missing");
     for _ in 0..MAX_IDLE_TICKS {
         if stats.target_credits == stats.min_credits {
@@ -328,11 +328,11 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
         }
         driver
             .rio_state
-            .debug_tick_udp_pool_idle(raw_handle, 1, &*driver.registrar)
+            .debug_tick_udp_pool_idle(socket_key, 1, &*driver.registrar)
             .expect("idle tick failed");
         stats = driver
             .rio_state
-            .udp_pool_debug_stats(raw_handle)
+            .udp_pool_debug_stats(socket_key)
             .expect("udp pool stats missing");
     }
     assert_eq!(

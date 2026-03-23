@@ -85,7 +85,7 @@ impl Socket {
     pub fn into_raw(self) -> RawHandle {
         let h = self.inner.0;
         std::mem::forget(self);
-        h.into()
+        RawHandle::for_socket(h as _)
     }
 
     /// Creates a Socket from a raw handle.

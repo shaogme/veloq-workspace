@@ -35,6 +35,8 @@ new_key_type! {
     pub(crate) struct ActorKey;
 }
 
+pub(crate) type SocketActorKey = (HANDLE, u32);
+
 #[derive(Clone, Copy)]
 pub(crate) struct RioEnv<'a> {
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
@@ -60,6 +62,6 @@ pub(crate) struct RioState {
     pub(crate) registry: RioRegistry,
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
-    pub(crate) actor_by_handle: FxHashMap<HANDLE, ActorKey>,
+    pub(crate) actor_by_handle: FxHashMap<SocketActorKey, ActorKey>,
     pub(crate) outstanding_count: usize,
 }

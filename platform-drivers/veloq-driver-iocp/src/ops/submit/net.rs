@@ -44,10 +44,12 @@ pub(crate) fn submit_recv(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
     let socket = handle as SOCKET;
+    let socket_key = (handle, raw_handle.generation);
 
-    if ctx.rio.is_iocp_fallback(handle) {
+    if ctx.rio.is_iocp_fallback(socket_key) {
         ensure_iocp_association(
             handle,
             ctx.port,
@@ -82,6 +84,7 @@ pub(crate) fn submit_recv(
         RioTarget {
             fd: val.fd,
             handle,
+            socket_generation: raw_handle.generation,
             user_data: header.user_data,
             generation: header.generation,
             buf_offset: val.buf_offset,
@@ -94,8 +97,8 @@ pub(crate) fn submit_recv(
         Ok(res) => Ok(res),
         Err(e)
             if {
-                ctx.rio.maybe_mark_iocp_fallback(handle, &e);
-                ctx.rio.is_iocp_fallback(handle)
+                ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
+                ctx.rio.is_iocp_fallback(socket_key)
             } =>
         {
             ensure_iocp_association(
@@ -144,10 +147,12 @@ pub(crate) fn submit_udp_recv(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
     let socket = handle as SOCKET;
+    let socket_key = (handle, raw_handle.generation);
 
-    if ctx.rio.is_iocp_fallback(handle) {
+    if ctx.rio.is_iocp_fallback(socket_key) {
         ensure_iocp_association(
             handle,
             ctx.port,
@@ -181,6 +186,7 @@ pub(crate) fn submit_udp_recv(
         crate::rio::RioUdpRecvArgs {
             fd: val.fd,
             handle,
+            socket_generation: raw_handle.generation,
             recv_op: val,
             sidecar: header,
         },
@@ -188,8 +194,8 @@ pub(crate) fn submit_udp_recv(
     ) {
         Ok(res) => Ok(res),
         Err(e) => {
-            ctx.rio.maybe_mark_iocp_fallback(handle, &e);
-            if ctx.rio.is_iocp_fallback(handle) {
+            ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
+            if ctx.rio.is_iocp_fallback(socket_key) {
                 ensure_iocp_association(
                     handle,
                     ctx.port,
@@ -231,10 +237,12 @@ pub(crate) fn submit_send(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
     let socket = handle as SOCKET;
+    let socket_key = (handle, raw_handle.generation);
 
-    if ctx.rio.is_iocp_fallback(handle) {
+    if ctx.rio.is_iocp_fallback(socket_key) {
         ensure_iocp_association(
             handle,
             ctx.port,
@@ -269,6 +277,7 @@ pub(crate) fn submit_send(
         RioTarget {
             fd: val.fd,
             handle,
+            socket_generation: raw_handle.generation,
             user_data: header.user_data,
             generation: header.generation,
             buf_offset: val.buf_offset,
@@ -281,8 +290,8 @@ pub(crate) fn submit_send(
         Ok(res) => Ok(res),
         Err(e)
             if {
-                ctx.rio.maybe_mark_iocp_fallback(handle, &e);
-                ctx.rio.is_iocp_fallback(handle)
+                ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
+                ctx.rio.is_iocp_fallback(socket_key)
             } =>
         {
             ensure_iocp_association(
@@ -331,10 +340,12 @@ pub(crate) fn submit_udp_send(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
     let socket = handle as SOCKET;
+    let socket_key = (handle, raw_handle.generation);
 
-    if ctx.rio.is_iocp_fallback(handle) {
+    if ctx.rio.is_iocp_fallback(socket_key) {
         ensure_iocp_association(
             handle,
             ctx.port,
@@ -369,6 +380,7 @@ pub(crate) fn submit_udp_send(
         RioTarget {
             fd: val.fd,
             handle,
+            socket_generation: raw_handle.generation,
             user_data: header.user_data,
             generation: header.generation,
             buf_offset: val.buf_offset,
@@ -381,8 +393,8 @@ pub(crate) fn submit_udp_send(
         Ok(res) => Ok(res),
         Err(e)
             if {
-                ctx.rio.maybe_mark_iocp_fallback(handle, &e);
-                ctx.rio.is_iocp_fallback(handle)
+                ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
+                ctx.rio.is_iocp_fallback(socket_key)
             } =>
         {
             ensure_iocp_association(
@@ -429,7 +441,7 @@ pub(crate) fn submit_connect(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
-    let handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
+    let handle = resolve_fd(connect_op.fd, ctx.registered_files)?.handle;
     ensure_iocp_association(
         handle,
         ctx.port,
@@ -541,7 +553,7 @@ pub(crate) fn submit_accept(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
-    let handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let handle = resolve_fd(user.fd, ctx.registered_files)?.handle;
     let accept_socket = payload.accept_socket;
     let accept_socket_raw = accept_socket.handle as SOCKET;
 
@@ -670,13 +682,15 @@ pub(crate) fn submit_send_to(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
 
     // RIO path is mandatory for socket send_to.
     let page_idx = header.user_data / ctx.slots_per_page;
     let args = crate::rio::RioSendToArgs {
         fd: user.fd,
         handle,
+        socket_generation: raw_handle.generation,
         buf: &user.buf,
         addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
         addr_len: payload.addr_len,
@@ -711,12 +725,15 @@ pub(crate) fn submit_udp_recv_stream(
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
-    let handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
     let socket = handle as SOCKET;
+    let socket_key = (handle, raw_handle.generation);
 
     let args = crate::rio::RioUdpStreamArgs {
         fd: val.fd,
         handle,
+        socket_generation: raw_handle.generation,
         stream_op: val,
         user_data: header.user_data,
         generation: header.generation,
@@ -724,8 +741,8 @@ pub(crate) fn submit_udp_recv_stream(
     match ctx.rio.try_submit_pool_recv(args, ctx.registrar) {
         Ok(res) => Ok(res),
         Err(e) => {
-            ctx.rio.maybe_mark_iocp_fallback(handle, &e);
-            if ctx.rio.is_iocp_fallback(handle) {
+            ctx.rio.maybe_mark_iocp_fallback(socket_key, &e);
+            if ctx.rio.is_iocp_fallback(socket_key) {
                 ensure_iocp_association(
                     handle,
                     ctx.port,

@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
 use veloq_driver_core::driver::{
@@ -18,7 +18,7 @@ use crate::common::{
     IocpErrorContext, IocpWaker, WAKEUP_USER_DATA, completion_record, io_error, io_msg,
     io_result_to_event_res, push_completion_shared,
 };
-use crate::config::{BufferRegistrationMode, IocpConfig};
+use crate::config::{BufferRegistrationMode, IocpConfig, RawHandle};
 use crate::driver::{CompletionSidecar, IocpOpState};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
@@ -42,7 +42,7 @@ pub struct IocpDriver {
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
-    pub(crate) registered_files: Vec<Option<HANDLE>>,
+    pub(crate) registered_files: Vec<Option<RawHandle>>,
     pub(crate) free_slots: Vec<usize>,
     pub(crate) is_notified: Arc<AtomicBool>,
     pub(crate) completion_events: SharedCompletionQueue,
@@ -499,8 +499,9 @@ impl IocpDriver {
                 let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten();
 
                 if let Some(fd) = fd
-                    && let Ok(handle) = submit::resolve_fd(fd, ctx.registered_files)
+                    && let Ok(raw_handle) = submit::resolve_fd(fd, ctx.registered_files)
                 {
+                    let handle = raw_handle.handle;
                     let is_rio = guard
                         .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                         .unwrap_or(false);
@@ -508,7 +509,7 @@ impl IocpDriver {
                     if guard.platform_mut().rio_pool_waiting || is_rio {
                         if guard.platform_mut().rio_pool_waiting {
                             ctx.rio_state.cancel_udp_waiter(
-                                handle,
+                                raw_handle.actor_key(),
                                 (user_data, guard.platform_mut().generation),
                                 ctx.registrar,
                             );
@@ -600,7 +601,7 @@ impl IocpDriver {
 }
 
 struct CancelContext<'a> {
-    registered_files: &'a [Option<HANDLE>],
+    registered_files: &'a [Option<RawHandle>],
     rio_state: &'a mut RioState,
     registrar: &'a dyn BufferRegistrar,
     completion_events: &'a SharedCompletionQueue,

@@ -29,7 +29,8 @@ macro_rules! submit_io_op {
 
             overlapped.set_offset(val.offset);
 
-            let handle = resolve_fd(val.fd, ctx.registered_files)?;
+            let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
+            let handle = raw_handle.handle;
             ensure_iocp_association(
                 handle,
                 ctx.port,
@@ -135,7 +136,8 @@ pub(crate) fn submit_close(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
 
     let user_data = header.user_data;
 
@@ -162,7 +164,8 @@ pub(crate) fn submit_fsync(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
 
     let user_data = header.user_data;
 
@@ -189,7 +192,8 @@ pub(crate) fn submit_sync_range(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
 
     let user_data = header.user_data;
 
@@ -216,7 +220,8 @@ pub(crate) fn submit_fallocate(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
+    let handle = raw_handle.handle;
 
     let user_data = header.user_data;
 

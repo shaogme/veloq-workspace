@@ -12,7 +12,7 @@ use crate::rio::error::{RioDiag, RioError, RioReportExt, RioResult};
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager, UdpPoolState};
-use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState};
+use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState, SocketActorKey};
 use error_stack::ResultExt;
 use slotmap::SlotMap;
 use std::io;
@@ -33,6 +33,7 @@ pub(crate) enum RioActorState {
 
 pub(crate) struct RioSocketActor {
     pub(crate) handle: HANDLE,
+    pub(crate) socket_generation: u32,
     pub(crate) rq: RioRq,
     pub(crate) pool_manager: UdpPoolManager,
     pub(crate) udp_mailbox: UdpMailbox,
@@ -41,9 +42,10 @@ pub(crate) struct RioSocketActor {
 }
 
 impl RioSocketActor {
-    pub(crate) fn new(handle: HANDLE, rq: RioRq) -> Self {
+    pub(crate) fn new(handle: HANDLE, socket_generation: u32, rq: RioRq) -> Self {
         Self {
             handle,
+            socket_generation,
             rq,
             pool_manager: UdpPoolManager::new(),
             udp_mailbox: UdpMailbox::new(),
@@ -51,11 +53,16 @@ impl RioSocketActor {
             state: RioActorState::Active,
         }
     }
+
+    #[inline]
+    pub(crate) const fn socket_key(&self) -> SocketActorKey {
+        (self.handle, self.socket_generation)
+    }
 }
 
 struct RioCompletionRouter<'a> {
     actors: &'a mut SlotMap<ActorKey, RioSocketActor>,
-    actor_by_handle: &'a mut rustc_hash::FxHashMap<HANDLE, ActorKey>,
+    actor_by_handle: &'a mut rustc_hash::FxHashMap<SocketActorKey, ActorKey>,
     outstanding_count: &'a mut usize,
     comp: RioCompletionContext<'a>,
     registry: &'a mut RioRegistry,
@@ -65,7 +72,7 @@ struct RioCompletionRouter<'a> {
 
 struct ActorStoreRefs<'a> {
     actors: &'a mut SlotMap<ActorKey, RioSocketActor>,
-    actor_by_handle: &'a mut rustc_hash::FxHashMap<HANDLE, ActorKey>,
+    actor_by_handle: &'a mut rustc_hash::FxHashMap<SocketActorKey, ActorKey>,
 }
 
 impl<'a> RioCompletionRouter<'a> {
@@ -91,8 +98,9 @@ impl<'a> RioCompletionRouter<'a> {
         let Some(actor) = self.actors.remove(key) else {
             return;
         };
-        if self.actor_by_handle.get(&actor.handle).copied() == Some(key) {
-            self.actor_by_handle.remove(&actor.handle);
+        let socket_key = actor.socket_key();
+        if self.actor_by_handle.get(&socket_key).copied() == Some(key) {
+            self.actor_by_handle.remove(&socket_key);
         }
     }
 
@@ -230,19 +238,21 @@ impl RioState {
 
     fn remove_actor_by_key(&mut self, key: ActorKey) -> Option<RioSocketActor> {
         let actor = self.actors.remove(key)?;
-        if self.actor_by_handle.get(&actor.handle).copied() == Some(key) {
-            self.actor_by_handle.remove(&actor.handle);
+        let socket_key = actor.socket_key();
+        if self.actor_by_handle.get(&socket_key).copied() == Some(key) {
+            self.actor_by_handle.remove(&socket_key);
         }
         Some(actor)
     }
 
     pub(crate) fn ensure_actor(
         &mut self,
-        target: (IoFd, HANDLE),
+        target: (IoFd, HANDLE, u32),
         env: RioEnv<'_>,
     ) -> RioResult<&mut RioSocketActor> {
-        let (fd, handle) = target;
-        if let Some(key) = self.actor_by_handle.get(&handle).copied() {
+        let (fd, handle, socket_generation) = target;
+        let socket_key = (handle, socket_generation);
+        if let Some(key) = self.actor_by_handle.get(&socket_key).copied() {
             return self
                 .actors
                 .get_mut(key)
@@ -271,7 +281,7 @@ impl RioState {
                     .field("actors_len", self.actors.len())
                     .field(
                         "actor_index_hit",
-                        self.actor_by_handle.contains_key(&handle),
+                        self.actor_by_handle.contains_key(&socket_key),
                     );
                 error!(
                     fd = ?fd,
@@ -284,7 +294,7 @@ impl RioState {
                     max_send_data_buffers = 1_u32,
                     outstanding_count = self.outstanding_count,
                     actors_len = self.actors.len(),
-                    actor_index_hit = self.actor_by_handle.contains_key(&handle),
+                    actor_index_hit = self.actor_by_handle.contains_key(&socket_key),
                     rio_error = %e,
                     "RIOCreateRequestQueue failed diagnostics"
                 );
@@ -292,18 +302,18 @@ impl RioState {
             }
         };
 
-        let mut actor = RioSocketActor::new(handle, rq);
+        let mut actor = RioSocketActor::new(handle, socket_generation, rq);
         actor.is_iocp_fallback = is_fallback;
         let key = self.actors.insert(actor);
-        self.actor_by_handle.insert(handle, key);
+        self.actor_by_handle.insert(socket_key, key);
         self.actors
             .get_mut(key)
             .ok_or_else(|| error_stack::Report::new(RioError::Internal))
             .attach("failed to retrieve inserted actor")
     }
 
-    pub(crate) fn shutdown_actor(&mut self, handle: HANDLE) {
-        let Some(key) = self.actor_by_handle.get(&handle).copied() else {
+    pub(crate) fn shutdown_actor(&mut self, socket_key: SocketActorKey) {
+        let Some(key) = self.actor_by_handle.get(&socket_key).copied() else {
             return;
         };
         let Some(env) = self
@@ -329,7 +339,7 @@ impl RioState {
             }
         };
 
-        self.actor_by_handle.remove(&handle);
+        self.actor_by_handle.remove(&socket_key);
         if should_remove {
             let _ = self.remove_actor_by_key(key);
         }
@@ -346,14 +356,14 @@ impl RioState {
 
     pub(crate) fn cancel_udp_waiter(
         &mut self,
-        handle: HANDLE,
+        socket_key: SocketActorKey,
         uid: (usize, u32),
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             return;
         };
-        if let Some(key) = self.actor_by_handle.get(&handle).copied()
+        if let Some(key) = self.actor_by_handle.get(&socket_key).copied()
             && let Some(actor) = self.actors.get_mut(key)
         {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
@@ -361,11 +371,9 @@ impl RioState {
             pool_manager.cancel_waiter(udp_mailbox, uid, &mut ctx);
         }
 
-        for (key, actor) in self
-            .actors
-            .iter_mut()
-            .filter(|(_, actor)| actor.state == RioActorState::Draining && actor.handle == handle)
-        {
+        for (key, actor) in self.actors.iter_mut().filter(|(_, actor)| {
+            actor.state == RioActorState::Draining && actor.socket_key() == socket_key
+        }) {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
             pool_manager.cancel_waiter(udp_mailbox, uid, &mut ctx);
@@ -373,15 +381,20 @@ impl RioState {
     }
 
     #[cfg(test)]
-    pub(crate) fn udp_pool_debug_stats(&self, handle: HANDLE) -> Option<UdpRecvPoolDebugStats> {
+    pub(crate) fn udp_pool_debug_stats(
+        &self,
+        socket_key: SocketActorKey,
+    ) -> Option<UdpRecvPoolDebugStats> {
         self.actor_by_handle
-            .get(&handle)
+            .get(&socket_key)
             .and_then(|&key| self.actors.get(key))
             .and_then(|actor| actor.pool_manager.udp_pool_debug_stats(&actor.udp_mailbox))
             .or_else(|| {
                 self.actors
                     .values()
-                    .find(|actor| actor.state == RioActorState::Draining && actor.handle == handle)
+                    .find(|actor| {
+                        actor.state == RioActorState::Draining && actor.socket_key() == socket_key
+                    })
                     .and_then(|actor| actor.pool_manager.udp_pool_debug_stats(&actor.udp_mailbox))
             })
     }
@@ -389,14 +402,14 @@ impl RioState {
     #[cfg(test)]
     pub(crate) fn debug_tick_udp_pool_idle(
         &mut self,
-        handle: HANDLE,
+        socket_key: SocketActorKey,
         ticks: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> RioResult<()> {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             return Ok(());
         };
-        if let Some(key) = self.actor_by_handle.get(&handle).copied()
+        if let Some(key) = self.actor_by_handle.get(&socket_key).copied()
             && let Some(actor) = self.actors.get_mut(key)
         {
             let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));

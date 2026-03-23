@@ -20,9 +20,7 @@ fn test_driver_creation() {
 fn test_register_files() {
     let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
     let handle = std::fs::File::open("Cargo.toml").unwrap();
-    let raw = crate::config::RawHandle {
-        handle: handle.as_raw_handle() as _,
-    };
+    let raw = crate::config::RawHandle::for_file(handle.as_raw_handle() as _);
     let fds = driver.register_files(&[raw]).unwrap();
     assert_eq!(fds.len(), 1);
     driver.unregister_files(fds).unwrap();
