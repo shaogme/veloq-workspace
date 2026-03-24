@@ -1,3 +1,4 @@
+use crate::config::UringRawHandle;
 use crate::{OwnedRawHandle, RawHandle, SockAddrStorage};
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::io;
@@ -16,7 +17,9 @@ impl Socket {
         }
         Ok(Self {
             // SAFETY: newly created socket fd is uniquely owned.
-            fd: unsafe { OwnedRawHandle::from_raw_owned(RawHandle::for_socket(fd)) },
+            fd: unsafe {
+                OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_socket(fd)))
+            },
         })
     }
 
@@ -27,14 +30,16 @@ impl Socket {
         }
         Ok(Self {
             // SAFETY: newly created socket fd is uniquely owned.
-            fd: unsafe { OwnedRawHandle::from_raw_owned(RawHandle::for_socket(fd)) },
+            fd: unsafe {
+                OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_socket(fd)))
+            },
         })
     }
 
     fn setsockopt<T>(&self, level: c_int, optname: c_int, optval: T) -> io::Result<()> {
         let ret = unsafe {
             libc::setsockopt(
-                self.fd.as_fd(),
+                self.fd.raw().as_fd(),
                 level,
                 optname,
                 &optval as *const _ as *const libc::c_void,
@@ -67,7 +72,7 @@ impl Socket {
         let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
         let ret = unsafe {
             libc::bind(
-                self.fd.as_fd(),
+                self.fd.raw().as_fd(),
                 &raw_addr.0 as *const _ as *const sockaddr,
                 raw_addr_len,
             )
@@ -82,7 +87,7 @@ impl Socket {
         let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
         let ret = unsafe {
             libc::connect(
-                self.fd.as_fd(),
+                self.fd.raw().as_fd(),
                 &raw_addr.0 as *const _ as *const sockaddr,
                 raw_addr_len,
             )
@@ -94,7 +99,7 @@ impl Socket {
     }
 
     pub fn listen(&self, backlog: i32) -> io::Result<()> {
-        let ret = unsafe { libc::listen(self.fd.as_fd(), backlog as c_int) };
+        let ret = unsafe { libc::listen(self.fd.raw().as_fd(), backlog as c_int) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -120,7 +125,7 @@ impl Socket {
         let mut len = std::mem::size_of::<libc::sockaddr_storage>() as socklen_t;
         let ret = unsafe {
             libc::getsockname(
-                self.fd.as_fd(),
+                self.fd.raw().as_fd(),
                 &mut storage as *mut _ as *mut libc::sockaddr,
                 &mut len,
             )

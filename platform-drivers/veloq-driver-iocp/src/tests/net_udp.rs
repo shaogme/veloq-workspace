@@ -216,7 +216,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("server bind failed");
     let server_handle = server.into_raw();
-    let socket_key = server_handle.actor_key();
+    let socket_key = server_handle.raw().actor_key();
 
     let mut submitted = Vec::new();
     const BURST_WAITERS: usize = 12;
@@ -283,7 +283,7 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("server bind failed");
     let server_handle = server.into_raw();
-    let socket_key = server_handle.actor_key();
+    let socket_key = server_handle.raw().actor_key();
 
     let mut submitted = Vec::new();
     const BURST_WAITERS: usize = 12;

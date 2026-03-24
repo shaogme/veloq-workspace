@@ -15,7 +15,7 @@ pub(crate) use submit::SubmissionResult;
 use std::io;
 use std::ptr::NonNull;
 
-use crate::config::{IoFd, OwnedRawHandle, RawHandle, RegisteredHandle};
+use crate::config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle, RegisteredHandle};
 use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioState;
@@ -355,7 +355,9 @@ define_iocp_ops! {
         submit: submit::submit_accept,
         on_complete: submit::on_complete_accept,
         completion: RawHandle,
-        map_completion: |_op: &Accept, res: io::Result<usize>| res.map(|raw| RawHandle::for_socket(raw as _)),
+        map_completion: |_op: &Accept, res: io::Result<usize>| {
+            res.map(|raw| RawHandle::new(IocpHandle::for_socket(raw as _)))
+        },
         get_fd: submit::get_fd_accept,
         construct: |user: std::ptr::NonNull<Accept>| {
             AcceptPayload {
@@ -401,7 +403,9 @@ define_iocp_ops! {
         kind: OpKind::Open,
         submit: submit::submit_open,
         completion: RawHandle,
-        map_completion: |_op: &Open, res: io::Result<usize>| res.map(|raw| RawHandle::for_file(raw as _)),
+        map_completion: |_op: &Open, res: io::Result<usize>| {
+            res.map(|raw| RawHandle::new(IocpHandle::for_file(raw as _)))
+        },
         get_fd: submit::get_fd_open,
         construct: |user| OpenPayload { user },
         destruct: |user: Box<Open>| *user,

@@ -189,7 +189,7 @@ impl RioState {
             let actor = self.ensure_actor((fd, handle), env)?;
             actor.rq
         };
-        let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
+        let socket_key = SocketActorKey::new(handle.raw().as_handle(), handle.raw().generation());
         if self.is_iocp_fallback(socket_key) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
@@ -260,7 +260,7 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         self.ensure_actor((fd, handle), env)?;
-        let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
+        let socket_key = SocketActorKey::new(handle.raw().as_handle(), handle.raw().generation());
         if self.is_iocp_fallback(socket_key) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
@@ -320,7 +320,7 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         self.ensure_actor((fd, handle), env)?;
-        let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
+        let socket_key = SocketActorKey::new(handle.raw().as_handle(), handle.raw().generation());
         if self.is_iocp_fallback(socket_key) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");

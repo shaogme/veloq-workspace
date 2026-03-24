@@ -54,12 +54,12 @@ impl Drop for InnerFile {
         );
         #[cfg(unix)]
         unsafe {
-            libc::close(self.raw.as_fd());
+            libc::close(self.raw.raw().as_fd());
         }
         #[cfg(windows)]
         match self.raw.borrow().kind() {
             RawHandleKind::File => unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(self.raw.as_handle());
+                windows_sys::Win32::Foundation::CloseHandle(self.raw.raw().as_handle());
             },
             RawHandleKind::Socket => {
                 let _ = unsafe { veloq_driver::Socket::from_raw(self.raw) };

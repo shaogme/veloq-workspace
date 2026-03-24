@@ -39,7 +39,7 @@ macro_rules! submit_io_op {
                     "{}: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
                     stringify!($fn_name),
                     val.fd,
-                    handle.as_handle(),
+                    handle.raw().as_handle(),
                     header.user_data,
                     header.generation,
                     val.offset,
@@ -60,7 +60,7 @@ macro_rules! submit_io_op {
                         "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
                         stringify!($fn_name),
                         val.fd,
-                        handle.as_handle(),
+                        handle.raw().as_handle(),
                         header.user_data,
                         header.generation,
                         val.offset,
@@ -150,7 +150,7 @@ pub(crate) fn submit_close(
     };
 
     let op = BlockingOps::Close {
-        handle: handle.as_handle() as usize,
+        handle: handle.raw().as_handle() as usize,
         completion,
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
@@ -179,7 +179,7 @@ pub(crate) fn submit_fsync(
     };
 
     let op = BlockingOps::Fsync {
-        handle: handle.as_handle() as usize,
+        handle: handle.raw().as_handle() as usize,
         completion,
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
@@ -208,7 +208,7 @@ pub(crate) fn submit_sync_range(
     };
 
     let op = BlockingOps::SyncFileRange {
-        handle: handle.as_handle() as usize,
+        handle: handle.raw().as_handle() as usize,
         completion,
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
@@ -237,7 +237,7 @@ pub(crate) fn submit_fallocate(
     };
 
     let op = BlockingOps::Fallocate {
-        handle: handle.as_handle() as usize,
+        handle: handle.raw().as_handle() as usize,
         mode: user.mode,
         offset: user.offset,
         len: user.len,

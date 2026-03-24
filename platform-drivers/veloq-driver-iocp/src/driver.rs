@@ -26,7 +26,7 @@ use veloq_driver_core::slot::{
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
-use crate::config::{IoFd, RawHandle, RawHandleKind, RegisteredHandle};
+use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 use crate::rio::SocketActorKey;
@@ -125,7 +125,7 @@ impl IocpDriver {
     /// callers provide a `File`-tagged handle that may actually be a socket
     /// (for example, legacy/raw trait boundaries that still pass plain HANDLE).
     fn detect_socket_from_file_handle(handle: RawHandle) -> io::Result<bool> {
-        let socket = handle.as_socket();
+        let socket = handle.raw().as_socket();
         let mut ty = 0i32;
         let mut len = std::mem::size_of::<i32>() as i32;
         // SAFETY: buffer pointers are valid for getsockopt call.
@@ -171,7 +171,7 @@ impl IocpDriver {
                 op.header
                     .resolved_handle
                     .filter(|h| h.is_socket())
-                    .map(RawHandle::actor_key)
+                    .map(|h| h.raw().actor_key())
             });
 
         if let Some(key) = socket_key {
@@ -181,7 +181,7 @@ impl IocpDriver {
     }
 
     fn schedule_deferred_socket_cleanup(&mut self, handle: RawHandle, registered_fd: Option<IoFd>) {
-        let key = handle.actor_key();
+        let key = handle.raw().actor_key();
         self.rio_state.mark_socket_closing(key);
         self.deferred_socket_cleanup
             .push_back(inner::DeferredSocketCleanup {
@@ -199,7 +199,7 @@ impl IocpDriver {
                 break;
             };
 
-            let key = pending.handle.actor_key();
+            let key = pending.handle.raw().actor_key();
             let ready = self.rio_state.socket_ready_for_cleanup(key);
 
             if ready {
@@ -430,7 +430,7 @@ impl IocpDriver {
                 })
                 .flatten()
                 .filter(|h| h.is_socket())
-                .map(RawHandle::actor_key)
+                .map(|h| h.raw().actor_key())
         } else {
             None
         };
@@ -463,7 +463,7 @@ impl IocpDriver {
     /// Shuts down the RIO actor associated with the specified socket handle.
     /// This is used by both TCP and UDP teardown paths.
     pub fn shutdown_actor(&mut self, handle: RawHandle) {
-        self.rio_state.shutdown_actor(handle.actor_key());
+        self.rio_state.shutdown_actor(handle.raw().actor_key());
     }
 
     /// Registers a set of file/socket handles for use with the driver.
@@ -475,7 +475,7 @@ impl IocpDriver {
                 RawHandleKind::Socket => handle,
                 RawHandleKind::File => {
                     if Self::detect_socket_from_file_handle(handle)? {
-                        RawHandle::for_socket(handle.as_handle())
+                        RawHandle::new(IocpHandle::for_socket(handle.raw().as_handle()))
                     } else {
                         handle
                     }
@@ -483,11 +483,12 @@ impl IocpDriver {
             };
             let kind = canonical.kind();
             let entry = if kind == RawHandleKind::Socket {
-                self.rio_state.mark_socket_registered(canonical.actor_key());
+                self.rio_state
+                    .mark_socket_registered(canonical.raw().actor_key());
                 RegisteredHandle::Weak(canonical)
             } else {
                 // SAFETY: file registration transfers ownership to the driver slot.
-                RegisteredHandle::Owned(unsafe { canonical.into_owned() })
+                RegisteredHandle::Owned(unsafe { crate::OwnedRawHandle::from_raw_owned(canonical) })
             };
             let idx = if let Some(idx) = self.free_slots.pop() {
                 self.registered_files[idx] = Some(entry);
@@ -795,7 +796,7 @@ impl Driver for IocpDriver {
     }
 
     fn inner_handle(&self) -> RawHandle {
-        RawHandle::for_file(self.port.as_raw() as _)
+        RawHandle::new(IocpHandle::for_file(self.port.as_raw() as _))
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {

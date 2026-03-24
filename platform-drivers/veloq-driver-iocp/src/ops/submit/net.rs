@@ -198,7 +198,7 @@ pub(crate) fn submit_connect(
         format!(
             "submit_connect: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}",
             connect_op.fd,
-            handle.as_handle(),
+            handle.raw().as_handle(),
             header.user_data,
             header.generation
         ),
@@ -210,7 +210,7 @@ pub(crate) fn submit_connect(
     mark_header_in_flight(header, unsafe {
         iocp_submit_connect_ex(ConnectExArgs {
             connect_ex: ctx.ext.connect_ex,
-            s: handle.as_socket(),
+            s: handle.raw().as_socket(),
             name: &connect_op.addr as *const _ as *const SOCKADDR,
             namelen: connect_op.addr_len as i32,
             lp_send_buffer: std::ptr::null(),
@@ -225,7 +225,7 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> i
     let mut storage = SockAddrStorage::default();
     let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
 
-    if with_borrowed_socket(handle.as_socket(), |socket| {
+    if with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: storage and namelen are valid for this call.
         unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
     })
@@ -273,7 +273,7 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> i
         *sin6_ref = s;
         (storage, std::mem::size_of::<SOCKADDR_IN6>() as i32)
     };
-    with_borrowed_socket(handle.as_socket(), |socket| {
+    with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: storage is a valid SOCKADDR_STORAGE for this call.
         unsafe { socket.bind(&storage.0 as *const _ as *const SOCKADDR, len) }
     })
@@ -282,7 +282,7 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> i
 fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> io::Result<u16> {
     let mut storage = SockAddrStorage::default();
     let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
-    with_borrowed_socket(handle.as_socket(), |socket| {
+    with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: storage and namelen are valid output pointers.
         unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
     })?;
@@ -306,7 +306,7 @@ pub(crate) unsafe fn on_complete_connect(
     // SAFETY: The caller guarantees that payload is valid.
     let connect_op = unsafe { payload.user.as_ref() };
     if let Some(raw_handle) = header.resolved_handle.or_else(|| connect_op.fd.raw()) {
-        with_borrowed_socket(raw_handle.as_socket(), |socket| {
+        with_borrowed_socket(raw_handle.raw().as_socket(), |socket| {
             socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
         })?;
     }
@@ -337,7 +337,7 @@ pub(crate) fn submit_accept(
                 e,
                 format!(
                     "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
-                    handle.as_handle() as usize,
+                    handle.raw().as_handle() as usize,
                     family
                 ),
             )
@@ -348,14 +348,14 @@ pub(crate) fn submit_accept(
         .accept_socket
         .as_ref()
         .ok_or_else(|| io::Error::other("accept socket not initialized"))?;
-    let accept_socket_raw = accept_socket.as_socket();
+    let accept_socket_raw = accept_socket.raw().as_socket();
 
     ensure_iocp_association(
         handle,
         ctx.port,
         format!(
             "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
-            handle.as_handle() as usize,
+            handle.raw().as_handle() as usize,
             header.user_data,
             header.generation
         ),
@@ -367,7 +367,7 @@ pub(crate) fn submit_accept(
     let submit_res = unsafe {
         iocp_submit_accept_ex(AcceptExArgs {
             accept_ex: ctx.ext.accept_ex,
-            s_listen_socket: handle.as_socket(),
+            s_listen_socket: handle.raw().as_socket(),
             s_accept_socket: accept_socket_raw,
             lp_output_buffer: payload.accept_buffer.as_mut_ptr() as *mut _,
             dw_receive_data_length: 0,
@@ -383,7 +383,7 @@ pub(crate) fn submit_accept(
             e,
             format!(
                 "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
-                handle.as_handle() as usize,
+                handle.raw().as_handle() as usize,
                 accept_socket_raw,
                 split,
                 split,
@@ -414,8 +414,8 @@ pub(crate) unsafe fn on_complete_accept(
         .resolved_handle
         .or_else(|| user.fd.raw())
         .ok_or(io::Error::from_raw_os_error(0))?;
-    let listen_socket = listen_handle.as_socket();
-    let accept_socket_raw = accept_socket.as_socket();
+    let listen_socket = listen_handle.raw().as_socket();
+    let accept_socket_raw = accept_socket.raw().as_socket();
 
     if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
         socket.setsockopt(SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_socket)
@@ -464,7 +464,7 @@ pub(crate) unsafe fn on_complete_accept(
     }
     // Transfer ownership to upper layer completion; payload must not close this socket again.
     let accepted_raw = accept_socket.into_raw();
-    Ok(accepted_raw.as_handle() as usize)
+    Ok(accepted_raw.raw().as_handle() as usize)
 }
 
 pub(crate) fn submit_send_to(
@@ -559,7 +559,7 @@ pub(crate) unsafe fn on_udp_stream_complete(
     {
         let mut storage = SockAddrStorage::default();
         let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
-        let _ = with_borrowed_socket(raw.as_socket(), |socket| {
+        let _ = with_borrowed_socket(raw.raw().as_socket(), |socket| {
             // SAFETY: storage and namelen are valid output pointers.
             unsafe { socket.getpeername(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
         });

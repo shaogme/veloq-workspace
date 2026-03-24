@@ -1,35 +1,17 @@
 use std::num::NonZeroU32;
+pub use veloq_driver_core::RawHandleKind;
+use veloq_driver_core::{
+    BorrowedRawHandle as CoreBorrowedRawHandle, OwnedRawHandle as CoreOwnedRawHandle,
+    RawHandle as CoreRawHandle, RawHandleMeta,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RawHandleKind {
-    File,
-    Socket,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RawHandle {
+pub enum UringRawHandle {
     File { fd: i32 },
     Socket { fd: i32 },
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct OwnedRawHandle {
-    raw: RawHandle,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BorrowedRawHandle<'a> {
-    raw: RawHandle,
-    _marker: std::marker::PhantomData<&'a RawHandle>,
-}
-
-impl From<i32> for RawHandle {
-    fn from(fd: i32) -> Self {
-        Self::for_file(fd)
-    }
-}
-
-impl RawHandle {
+impl UringRawHandle {
     #[inline]
     pub const fn for_file(fd: i32) -> Self {
         Self::File { fd }
@@ -47,9 +29,11 @@ impl RawHandle {
             Self::Socket { fd, .. } => fd,
         }
     }
+}
 
+impl RawHandleMeta for UringRawHandle {
     #[inline]
-    pub const fn kind(self) -> RawHandleKind {
+    fn kind(self) -> RawHandleKind {
         match self {
             Self::File { .. } => RawHandleKind::File,
             Self::Socket { .. } => RawHandleKind::Socket,
@@ -57,75 +41,8 @@ impl RawHandle {
     }
 
     #[inline]
-    pub const fn is_file(self) -> bool {
-        matches!(self, Self::File { .. })
-    }
-
-    #[inline]
-    pub const fn is_socket(self) -> bool {
-        matches!(self, Self::Socket { .. })
-    }
-
-    #[inline]
-    pub const fn borrow(&self) -> BorrowedRawHandle<'_> {
-        BorrowedRawHandle {
-            raw: *self,
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    /// # Safety
-    ///
-    /// 调用方必须保证该句柄具有唯一所有权。
-    #[inline]
-    pub unsafe fn into_owned(self) -> OwnedRawHandle {
-        // SAFETY: forwarded from caller contract.
-        unsafe { OwnedRawHandle::from_raw_owned(self) }
-    }
-}
-
-impl OwnedRawHandle {
-    #[inline]
-    pub const fn as_raw(&self) -> RawHandle {
-        self.raw
-    }
-
-    #[inline]
-    pub const fn borrow(&self) -> BorrowedRawHandle<'_> {
-        BorrowedRawHandle {
-            raw: self.raw,
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    #[inline]
-    pub const fn kind(&self) -> RawHandleKind {
-        self.raw.kind()
-    }
-
-    #[inline]
-    pub const fn as_fd(&self) -> i32 {
-        self.raw.as_fd()
-    }
-
-    /// # Safety
-    ///
-    /// 调用方必须保证该句柄具有唯一所有权。
-    #[inline]
-    pub unsafe fn from_raw_owned(raw: RawHandle) -> Self {
-        Self { raw }
-    }
-
-    #[inline]
-    pub fn into_raw(self) -> RawHandle {
-        let this = std::mem::ManuallyDrop::new(self);
-        this.raw
-    }
-}
-
-impl Drop for OwnedRawHandle {
-    fn drop(&mut self) {
-        let fd = self.raw.as_fd();
+    fn close(self) {
+        let fd = self.as_fd();
         if fd >= 0 {
             // SAFETY: `fd` is owned by this value.
             unsafe {
@@ -135,39 +52,9 @@ impl Drop for OwnedRawHandle {
     }
 }
 
-impl<'a> BorrowedRawHandle<'a> {
-    #[inline]
-    pub const fn as_raw(self) -> RawHandle {
-        self.raw
-    }
-
-    #[inline]
-    pub const fn as_fd(self) -> i32 {
-        self.raw.as_fd()
-    }
-
-    #[inline]
-    pub const fn kind(self) -> RawHandleKind {
-        self.raw.kind()
-    }
-
-    #[inline]
-    pub const fn is_socket(self) -> bool {
-        self.raw.is_socket()
-    }
-}
-
-impl From<OwnedRawHandle> for RawHandle {
-    fn from(value: OwnedRawHandle) -> Self {
-        value.into_raw()
-    }
-}
-
-impl<'a> From<BorrowedRawHandle<'a>> for RawHandle {
-    fn from(value: BorrowedRawHandle<'a>) -> Self {
-        value.raw
-    }
-}
+pub type RawHandle = CoreRawHandle<UringRawHandle>;
+pub type OwnedRawHandle = CoreOwnedRawHandle<UringRawHandle>;
+pub type BorrowedRawHandle<'a> = CoreBorrowedRawHandle<'a, UringRawHandle>;
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]

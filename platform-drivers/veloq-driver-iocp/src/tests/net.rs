@@ -1,4 +1,4 @@
-use crate::config::{IoFd, IocpConfig, RawHandle};
+use crate::config::{IoFd, IocpConfig, IocpHandle, RawHandle};
 use crate::driver::IocpDriver;
 use crate::net::addr::{SockAddrStorage, socket_addr_to_storage};
 use crate::net::socket::Socket;
@@ -29,7 +29,10 @@ fn test_iocp_accept() {
     let listener_handle = std_listener.into_raw_socket();
 
     // Prepare Accept Op using OpLifecycle
-    let accept_op = Accept::into_op((listener_handle as usize).into(), ());
+    let accept_op = Accept::into_op(
+        RawHandle::new(IocpHandle::for_file(listener_handle as usize as _)),
+        (),
+    );
 
     let (iocp_kernel, accept_payload) =
         IntoPlatformOp::<IocpOp>::into_kernel_and_payload(accept_op);

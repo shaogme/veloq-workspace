@@ -9,7 +9,9 @@ use std::time::Instant;
 
 use tracing::{debug, trace};
 
-use crate::config::{BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig};
+use crate::config::{
+    BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig, UringRawHandle,
+};
 use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, Driver, Outcome, RemoteWaker, SharedCompletionQueue,
@@ -43,7 +45,7 @@ impl RemoteWaker for UringWaker {
         }
         if !self.is_waked.swap(true, Ordering::AcqRel) {
             let buf = 1u64.to_ne_bytes();
-            let ret = unsafe { libc::write(self.fd.fd.as_fd(), buf.as_ptr() as *const _, 8) };
+            let ret = unsafe { libc::write(self.fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EAGAIN) {
@@ -151,7 +153,11 @@ impl UringDriver {
             detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
             waker_fd: Arc::new(EventFd {
                 // SAFETY: `eventfd` returns a freshly created fd owned by this driver.
-                fd: unsafe { OwnedRawHandle::from_raw_owned(RawHandle::for_file(waker_fd)) },
+                fd: unsafe {
+                    OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(
+                        waker_fd,
+                    )))
+                },
             }),
             waker_token: None,
             waker_payload: None,
@@ -307,9 +313,9 @@ impl UringDriver {
             return;
         }
 
-        let fd = self.waker_fd.fd.as_fd();
+        let fd = self.waker_fd.fd.raw().as_fd();
         let op = Wakeup {
-            fd: IoFd::Raw(RawHandle::for_file(fd)),
+            fd: IoFd::Raw(RawHandle::new(UringRawHandle::for_file(fd))),
         };
         let (uring_op, payload) =
             <Wakeup<RawHandle> as IntoPlatformOp<UringOp>>::into_kernel_and_payload(op);
@@ -742,7 +748,7 @@ impl Driver for UringDriver {
     }
 
     fn register_files(&mut self, files: &[RawHandle]) -> io::Result<Vec<IoFd>> {
-        let fds: Vec<i32> = files.iter().map(|h| h.as_fd()).collect();
+        let fds: Vec<i32> = files.iter().map(|h| h.raw().as_fd()).collect();
         self.ring.submitter().register_files(&fds)?;
 
         let mut fixed_fds = Vec::with_capacity(files.len());
@@ -758,7 +764,8 @@ impl Driver for UringDriver {
 
     fn wake(&mut self) -> io::Result<()> {
         let buf = 1u64.to_ne_bytes();
-        let ret = unsafe { libc::write(self.waker_fd.fd.as_fd(), buf.as_ptr() as *const _, 8) };
+        let ret =
+            unsafe { libc::write(self.waker_fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EAGAIN) {
@@ -770,7 +777,7 @@ impl Driver for UringDriver {
     }
 
     fn inner_handle(&self) -> RawHandle {
-        RawHandle::for_file(self.ring.as_raw_fd())
+        RawHandle::new(UringRawHandle::for_file(self.ring.as_raw_fd()))
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
@@ -781,7 +788,7 @@ impl Driver for UringDriver {
     }
 
     fn driver_id(&self) -> usize {
-        self.waker_fd.fd.as_fd() as usize
+        self.waker_fd.fd.raw().as_fd() as usize
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {

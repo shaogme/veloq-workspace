@@ -219,7 +219,7 @@ impl RioRegistry {
 
         env.dispatch
             .create_rq(RioRqConfig {
-                socket: handle.as_socket() as usize,
+                socket: handle.raw().as_socket() as usize,
                 max_outstanding_recvs,
                 max_receive_data_buffers: 1,
                 max_outstanding_sends,
@@ -230,7 +230,10 @@ impl RioRegistry {
             })
             .map_err(|e| {
                 let diag = RioDiag::new("create_rq")
-                    .field("socket_raw", format!("0x{:x}", handle.as_handle() as usize))
+                    .field(
+                        "socket_raw",
+                        format!("0x{:x}", handle.raw().as_handle() as usize),
+                    )
                     .field("rq_depth", self.rq_depth)
                     .field("max_outstanding_recvs", max_outstanding_recvs)
                     .field("max_outstanding_sends", max_outstanding_sends)
@@ -241,7 +244,7 @@ impl RioRegistry {
             .attach(format!(
                 "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",
                 self.rq_depth,
-                handle = handle.as_handle()
+                handle = handle.raw().as_handle()
             ))
     }
 

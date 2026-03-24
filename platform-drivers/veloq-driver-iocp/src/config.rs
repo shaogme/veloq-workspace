@@ -1,11 +1,15 @@
 use crate::rio::SocketActorKey;
-use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use veloq_buf::nz;
-use veloq_driver_core::IoFd as CoreIoFd;
+use veloq_driver_core::{
+    BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
+    OwnedRawHandle as CoreOwnedRawHandle, RawHandle as CoreRawHandle, RawHandleMeta,
+};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, SOCKET, closesocket};
+
+pub use veloq_driver_core::RawHandleKind;
 
 /// Specifies how buffers are registered and validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -58,62 +62,17 @@ impl IocpConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RawHandleKind {
-    File,
-    Socket,
-}
-
-/// A raw Windows handle wrapper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RawHandle {
-    File {
-        handle: HANDLE,
-    },
-    Socket {
-        socket: SOCKET,
-        // Monotonic socket generation used to avoid HANDLE reuse aliasing in RIO actor mapping.
-        generation: u32,
-    },
-}
-
-/// Owned handle wrapper that is fully responsible for resource ownership.
-#[derive(Debug, PartialEq, Eq)]
-pub struct OwnedRawHandle {
-    raw: RawHandle,
-}
-
-/// Registered descriptor entry used by driver-side fixed-file table.
-#[derive(Debug, PartialEq, Eq)]
-pub enum RegisteredHandle {
-    /// Driver owns lifecycle (used for file handles).
-    Owned(OwnedRawHandle),
-    /// Driver only keeps a weak/raw view (used for socket handles).
-    Weak(RawHandle),
-}
-
-/// Borrowed handle view tied to a caller-controlled lifetime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BorrowedRawHandle<'a> {
-    raw: RawHandle,
-    _marker: PhantomData<&'a RawHandle>,
+pub struct IocpHandle {
+    handle: HANDLE,
+    kind: RawHandleKind,
+    // Monotonic socket generation used to avoid HANDLE reuse aliasing in RIO actor mapping.
+    generation: u32,
 }
 
 // SAFETY: Windows HANDLEs are thread-safe and can be sent across threads.
-unsafe impl Send for RawHandle {}
+unsafe impl Send for IocpHandle {}
 // SAFETY: Windows HANDLEs can be accessed from multiple threads simultaneously.
-unsafe impl Sync for RawHandle {}
-
-impl From<usize> for RawHandle {
-    fn from(handle: usize) -> Self {
-        Self::for_file(handle as HANDLE)
-    }
-}
-
-impl From<RawHandle> for usize {
-    fn from(handle: RawHandle) -> Self {
-        handle.as_handle() as usize
-    }
-}
+unsafe impl Sync for IocpHandle {}
 
 static NEXT_SOCKET_GENERATION: AtomicU32 = AtomicU32::new(1);
 
@@ -128,16 +87,21 @@ fn alloc_socket_generation() -> u32 {
     }
 }
 
-impl RawHandle {
+impl IocpHandle {
     #[inline]
     pub const fn for_file(handle: HANDLE) -> Self {
-        Self::File { handle }
+        Self {
+            handle,
+            kind: RawHandleKind::File,
+            generation: 0,
+        }
     }
 
     #[inline]
     pub fn for_socket(handle: HANDLE) -> Self {
-        Self::Socket {
-            socket: handle as SOCKET,
+        Self {
+            handle,
+            kind: RawHandleKind::Socket,
             generation: alloc_socket_generation(),
         }
     }
@@ -149,119 +113,53 @@ impl RawHandle {
 
     #[inline]
     pub const fn as_handle(self) -> HANDLE {
-        match self {
-            Self::File { handle } => handle,
-            Self::Socket { socket, .. } => socket as HANDLE,
-        }
+        self.handle
     }
 
     #[inline]
     pub const fn generation(self) -> u32 {
-        match self {
-            Self::File { .. } => 0,
-            Self::Socket { generation, .. } => generation,
-        }
+        self.generation
     }
 
     #[inline]
     pub fn as_socket(self) -> SOCKET {
-        match self {
-            Self::File { handle } => handle as SOCKET,
-            Self::Socket { socket, .. } => socket,
-        }
+        self.handle as SOCKET
     }
 
     #[inline]
     pub const fn kind(self) -> RawHandleKind {
-        match self {
-            Self::File { .. } => RawHandleKind::File,
-            Self::Socket { .. } => RawHandleKind::Socket,
-        }
+        self.kind
     }
 
     #[inline]
     pub const fn is_socket(self) -> bool {
-        matches!(self, Self::Socket { .. })
+        matches!(self.kind, RawHandleKind::Socket)
     }
 
     #[inline]
     pub const fn is_file(self) -> bool {
-        matches!(self, Self::File { .. })
-    }
-
-    #[inline]
-    pub const fn borrow(&self) -> BorrowedRawHandle<'_> {
-        BorrowedRawHandle {
-            raw: *self,
-            _marker: PhantomData,
-        }
-    }
-
-    /// # Safety
-    ///
-    /// The caller must guarantee that `self` is uniquely owned.
-    #[inline]
-    pub unsafe fn into_owned(self) -> OwnedRawHandle {
-        // SAFETY: forwarded from caller contract.
-        unsafe { OwnedRawHandle::from_raw_owned(self) }
+        matches!(self.kind, RawHandleKind::File)
     }
 }
 
-impl OwnedRawHandle {
+impl RawHandleMeta for IocpHandle {
     #[inline]
-    pub const fn as_raw(&self) -> RawHandle {
-        self.raw
+    fn kind(self) -> RawHandleKind {
+        self.kind
     }
 
     #[inline]
-    pub const fn borrow(&self) -> BorrowedRawHandle<'_> {
-        BorrowedRawHandle {
-            raw: self.as_raw(),
-            _marker: PhantomData,
-        }
-    }
-
-    #[inline]
-    pub const fn kind(&self) -> RawHandleKind {
-        self.raw.kind()
-    }
-
-    #[inline]
-    pub const fn as_handle(&self) -> HANDLE {
-        self.as_raw().as_handle()
-    }
-
-    #[inline]
-    pub fn as_socket(&self) -> SOCKET {
-        self.as_raw().as_socket()
-    }
-
-    /// # Safety
-    ///
-    /// The caller must guarantee that `raw` is uniquely owned.
-    #[inline]
-    pub unsafe fn from_raw_owned(raw: RawHandle) -> Self {
-        Self { raw }
-    }
-
-    /// Consumes ownership and returns raw handle metadata without closing it.
-    #[inline]
-    pub fn into_raw(self) -> RawHandle {
-        let this = std::mem::ManuallyDrop::new(self);
-        this.raw
-    }
-}
-
-impl Drop for OwnedRawHandle {
-    fn drop(&mut self) {
-        match self.raw {
-            RawHandle::File { handle } => {
+    fn close(self) {
+        match self.kind {
+            RawHandleKind::File => {
+                let handle = self.handle;
                 if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
                     // SAFETY: `handle` is owned by this value.
                     unsafe { CloseHandle(handle) };
                 }
             }
-            RawHandle::Socket { socket, .. } => {
+            RawHandleKind::Socket => {
+                let socket = self.handle as SOCKET;
                 if socket != INVALID_SOCKET {
                     // SAFETY: `socket` is owned by this value.
                     unsafe { closesocket(socket) };
@@ -271,57 +169,26 @@ impl Drop for OwnedRawHandle {
     }
 }
 
-impl<'a> BorrowedRawHandle<'a> {
-    #[inline]
-    pub const fn as_raw(self) -> RawHandle {
-        self.raw
-    }
+pub type RawHandle = CoreRawHandle<IocpHandle>;
+pub type OwnedRawHandle = CoreOwnedRawHandle<IocpHandle>;
+pub type BorrowedRawHandle<'a> = CoreBorrowedRawHandle<'a, IocpHandle>;
 
-    #[inline]
-    pub const fn as_handle(self) -> HANDLE {
-        self.raw.as_handle()
-    }
-
-    #[inline]
-    pub fn as_socket(self) -> SOCKET {
-        self.raw.as_socket()
-    }
-
-    #[inline]
-    pub const fn kind(self) -> RawHandleKind {
-        self.raw.kind()
-    }
-
-    #[inline]
-    pub const fn is_socket(self) -> bool {
-        self.raw.is_socket()
-    }
-
-    #[inline]
-    pub const fn generation(self) -> u32 {
-        self.raw.generation()
-    }
-}
-
-impl From<OwnedRawHandle> for RawHandle {
-    fn from(value: OwnedRawHandle) -> Self {
-        value.into_raw()
-    }
+/// Registered descriptor entry used by driver-side fixed-file table.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegisteredHandle {
+    /// Driver owns lifecycle (used for file handles).
+    Owned(OwnedRawHandle),
+    /// Driver only keeps a weak/raw view (used for socket handles).
+    Weak(RawHandle),
 }
 
 impl RegisteredHandle {
     #[inline]
     pub fn as_raw(&self) -> RawHandle {
         match self {
-            Self::Owned(h) => h.as_raw(),
+            Self::Owned(h) => RawHandle::new(h.raw()),
             Self::Weak(h) => *h,
         }
-    }
-}
-
-impl<'a> From<BorrowedRawHandle<'a>> for RawHandle {
-    fn from(value: BorrowedRawHandle<'a>) -> Self {
-        value.raw
     }
 }
 

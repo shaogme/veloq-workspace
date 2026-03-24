@@ -83,11 +83,11 @@ impl Drop for SocketToken {
             }
             #[cfg(unix)]
             RawHandleKind::File => unsafe {
-                libc::close(self.raw.as_fd());
+                libc::close(self.raw.raw().as_fd());
             },
             #[cfg(windows)]
             RawHandleKind::File => unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(self.raw.as_handle());
+                windows_sys::Win32::Foundation::CloseHandle(self.raw.raw().as_handle());
             },
         }
     }

@@ -19,7 +19,7 @@ use crate::common::{
     IocpErrorContext, IocpWaker, WAKEUP_USER_DATA, completion_record, io_error, io_msg,
     io_result_to_event_res, push_completion_shared,
 };
-use crate::config::{BufferRegistrationMode, IocpConfig, RawHandle, RegisteredHandle};
+use crate::config::{BufferRegistrationMode, IocpConfig, IocpHandle, RawHandle, RegisteredHandle};
 use crate::driver::{CompletionSidecar, IocpOpState};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
@@ -106,7 +106,7 @@ impl IocpDriver {
             )
         })?;
         let rio_state = RioState::new(
-            crate::config::RawHandle::for_file(port_handle).borrow(),
+            crate::config::RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
             &extensions,
             registration_mode,
@@ -533,7 +533,7 @@ impl IocpDriver {
                     });
 
                 if let Some(raw_handle) = raw_handle {
-                    let handle = raw_handle.as_handle();
+                    let handle = raw_handle.raw().as_handle();
                     let is_rio = guard
                         .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                         .unwrap_or(false);
@@ -541,14 +541,15 @@ impl IocpDriver {
                     if guard.platform_mut().rio_pool_waiting || is_rio {
                         if guard.platform_mut().rio_pool_waiting {
                             ctx.rio_state.cancel_udp_waiter(
-                                raw_handle.actor_key(),
+                                raw_handle.raw().actor_key(),
                                 (user_data, guard.platform_mut().generation),
                                 ctx.registrar,
                             );
                         }
                         should_emit_aborted = true;
-                        aborted_socket_key =
-                            raw_handle.is_socket().then_some(raw_handle.actor_key());
+                        aborted_socket_key = raw_handle
+                            .is_socket()
+                            .then_some(raw_handle.raw().actor_key());
                     } else {
                         // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
                         let overlapped_ptr =

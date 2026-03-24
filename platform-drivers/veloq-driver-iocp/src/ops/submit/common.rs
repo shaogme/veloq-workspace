@@ -63,7 +63,7 @@ pub(crate) unsafe fn iocp_submit_read(
     // SAFETY: ReadFile is called with valid parameters.
     let ret = unsafe {
         ReadFile(
-            handle.as_handle(),
+            handle.raw().as_handle(),
             buf as _,
             len,
             &mut bytes,
@@ -95,7 +95,7 @@ pub(crate) unsafe fn iocp_submit_write(
     // SAFETY: WriteFile is called with valid parameters.
     let ret = unsafe {
         WriteFile(
-            handle.as_handle(),
+            handle.raw().as_handle(),
             buf as _,
             len,
             &mut bytes,
@@ -217,7 +217,7 @@ pub(crate) fn ensure_iocp_association(
     detail: impl Into<String>,
 ) -> io::Result<()> {
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
-    unsafe { port.associate(handle.as_handle(), 0) }
+    unsafe { port.associate(handle.raw().as_handle(), 0) }
         .map_err(|e| io_error(IocpErrorContext::Submission, e, detail))
 }
 

@@ -1,6 +1,7 @@
 //! io_uring Platform-Specific Operation Definitions
 
 use crate::RawHandle;
+use crate::config::UringRawHandle;
 use crate::driver::UringDriver;
 use io_uring::squeue;
 use std::io;
@@ -273,7 +274,9 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_accept,
         on_complete: submit::on_complete_accept,
         completion: RawHandle,
-        map_completion: |_op: &Accept, res: io::Result<usize>| res.map(|raw| RawHandle::for_socket(raw as i32)),
+        map_completion: |_op: &Accept, res: io::Result<usize>| {
+            res.map(|raw| RawHandle::new(UringRawHandle::for_socket(raw as i32)))
+        },
         drop: submit::drop_accept,
         construct: |user| payload::AcceptPayload { user },
         destruct: |user: Box<Accept>| *user,
@@ -319,7 +322,9 @@ define_uring_ops! {
         kind: OpKind::Open,
         make_sqe: submit::make_sqe_open,
         completion: RawHandle,
-        map_completion: |_op: &Open, res: io::Result<usize>| res.map(|raw| RawHandle::for_file(raw as i32)),
+        map_completion: |_op: &Open, res: io::Result<usize>| {
+            res.map(|raw| RawHandle::new(UringRawHandle::for_file(raw as i32)))
+        },
         drop: submit::drop_open,
         construct: |user| payload::OpenPayload { user },
         destruct: |user: Box<Open>| *user,

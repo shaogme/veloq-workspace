@@ -390,7 +390,7 @@ impl RioKernel {
             Type: RIO_IOCP_COMPLETION,
             Anonymous: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0 {
                 Iocp: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
-                    IocpHandle: port.as_handle(),
+                    IocpHandle: port.raw().as_handle(),
                     CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
                     Overlapped: notify_ov.as_mut_ptr().cast(),
                 },

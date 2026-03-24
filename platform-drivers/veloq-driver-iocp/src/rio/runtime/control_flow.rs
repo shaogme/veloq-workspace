@@ -251,7 +251,7 @@ impl RioState {
         env: RioEnv<'_>,
     ) -> RioResult<&mut RioSocketActor> {
         let (fd, handle) = target;
-        let socket_key = SocketActorKey::new(handle.as_handle(), handle.generation());
+        let socket_key = SocketActorKey::new(handle.raw().as_handle(), handle.raw().generation());
         if let Some(key) = self.actor_by_handle.get(&socket_key).copied() {
             return self
                 .actors
@@ -265,8 +265,11 @@ impl RioState {
             Err(e) => {
                 let diag = RioDiag::new("ensure_actor_create_rq")
                     .field("fd", format!("{fd:?}"))
-                    .field("handle", format!("{:?}", handle.as_handle()))
-                    .field("socket_raw", format!("0x{:x}", handle.as_handle() as usize))
+                    .field("handle", format!("{:?}", handle.raw().as_handle()))
+                    .field(
+                        "socket_raw",
+                        format!("0x{:x}", handle.raw().as_handle() as usize),
+                    )
                     .field("rq_depth", self.registry.rq_depth)
                     .field("max_outstanding_recvs", self.registry.rq_depth)
                     .field("max_outstanding_sends", self.registry.rq_depth)
@@ -280,8 +283,8 @@ impl RioState {
                     );
                 error!(
                     fd = ?fd,
-                    handle = ?handle.as_handle(),
-                    socket_raw = handle.as_handle() as usize,
+                    handle = ?handle.raw().as_handle(),
+                    socket_raw = handle.raw().as_handle() as usize,
                     rq_depth = self.registry.rq_depth,
                     max_outstanding_recvs = self.registry.rq_depth,
                     max_outstanding_sends = self.registry.rq_depth,

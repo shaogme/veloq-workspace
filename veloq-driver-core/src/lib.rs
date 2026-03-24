@@ -2,7 +2,10 @@ pub mod driver;
 pub mod net;
 pub mod op;
 pub mod op_registry;
+pub mod raw_handle;
 pub mod slot;
+
+pub use raw_handle::{BorrowedRawHandle, OwnedRawHandle, RawHandle, RawHandleKind, RawHandleMeta};
 
 /// Platform-neutral handle trait implemented by driver-defined handle types.
 pub trait Handle: Copy + Send + Sync + 'static {}

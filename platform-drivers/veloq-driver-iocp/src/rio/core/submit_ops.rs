@@ -101,7 +101,10 @@ impl RioState {
                 .attach("failed to ensure RIO actor")?;
             actor.rq
         };
-        if self.is_iocp_fallback(SocketActorKey::new(handle.as_handle(), handle.generation())) {
+        if self.is_iocp_fallback(SocketActorKey::new(
+            handle.raw().as_handle(),
+            handle.raw().generation(),
+        )) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }
@@ -116,7 +119,7 @@ impl RioState {
             Self::free_op_req_ctx(request_context as u64);
             let diag = RioDiag::new("submit_recv_internal")
                 .field("fd", format!("{fd:?}"))
-                .field("handle", format!("{:?}", handle.as_handle()))
+                .field("handle", format!("{:?}", handle.raw().as_handle()))
                 .field("rq_raw", format!("0x{:x}", rq.0 as usize))
                 .field("buffer_id", format!("0x{:x}", rio_buf.BufferId as usize))
                 .field("buffer_offset", rio_buf.Offset)
@@ -168,7 +171,7 @@ impl RioState {
                 .map_err(|e| {
                     let diag = RioDiag::new("submit_send_ensure_actor")
                         .field("fd", format!("{fd:?}"))
-                        .field("handle", format!("{:?}", handle.as_handle()))
+                        .field("handle", format!("{:?}", handle.raw().as_handle()))
                         .field("outstanding_count", outstanding_snapshot);
                     e.attach(diag)
                 })
@@ -176,7 +179,10 @@ impl RioState {
 
             (actor.rq, format!("{:?}", actor.state))
         };
-        if self.is_iocp_fallback(SocketActorKey::new(handle.as_handle(), handle.generation())) {
+        if self.is_iocp_fallback(SocketActorKey::new(
+            handle.raw().as_handle(),
+            handle.raw().generation(),
+        )) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }
@@ -191,7 +197,7 @@ impl RioState {
             Self::free_op_req_ctx(request_context as u64);
             let diag = RioDiag::new("submit_send_internal")
                 .field("fd", format!("{fd:?}"))
-                .field("handle", format!("{:?}", handle.as_handle()))
+                .field("handle", format!("{:?}", handle.raw().as_handle()))
                 .field("rq_raw", format!("0x{:x}", rq.0 as usize))
                 .field("buffer_id", format!("0x{:x}", rio_buf.BufferId as usize))
                 .field("buffer_offset", rio_buf.Offset)
@@ -200,7 +206,7 @@ impl RioState {
                 .field("actor_state", actor_state.clone());
             error!(
                 fd = ?fd,
-                handle = ?handle.as_handle(),
+                handle = ?handle.raw().as_handle(),
                 rq_raw = rq.0 as usize,
                 buffer_id = rio_buf.BufferId as usize,
                 buffer_offset = rio_buf.Offset,

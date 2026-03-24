@@ -7,7 +7,7 @@ use veloq_buf::PoolKind;
 
 #[inline]
 fn io_uring_fd(handle: BorrowedRawHandle<'_>) -> types::Fd {
-    types::Fd(handle.as_fd())
+    types::Fd(handle.raw().as_fd())
 }
 
 macro_rules! impl_lifecycle {
