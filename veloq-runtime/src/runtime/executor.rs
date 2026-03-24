@@ -245,12 +245,6 @@ pub struct LocalExecutor {
 }
 
 impl LocalExecutor {
-    /// Get the raw handle (fd) of the underlying driver.
-    /// Used for Mesh initialization.
-    pub fn raw_driver_handle(&self) -> usize {
-        self.driver.borrow().inner_handle().into()
-    }
-
     pub fn driver_handle(&self) -> std::rc::Weak<RefCell<PlatformDriver>> {
         Rc::downgrade(&self.driver)
     }

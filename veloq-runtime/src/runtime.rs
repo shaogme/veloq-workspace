@@ -155,13 +155,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             }),
         );
 
-        // Initialize peer file descriptors storage (initially 0)
-        let peer_handles = Arc::new(
-            (0..worker_count)
-                .map(|_| AtomicUsize::new(0))
-                .collect::<Vec<_>>(),
-        );
-
         // Barrier for synchronizing worker startup
         let barrier = Arc::new(Barrier::new(worker_count));
 
@@ -179,7 +172,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             let worker_id = i + 1; // Iterator started from index 1 (Worker 0 detached)
 
             let registry = registry.clone();
-            let peer_handles = peer_handles.clone();
             let barrier = barrier.clone();
             let config = self.config.clone();
             let topology = self.topology.clone();
@@ -202,10 +194,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 
                 let mut executor = executor.with_registry(registry);
                 executor.set_id(worker_id);
-
-                // Publish Handle
-                // Accessing handles inside Arc<Vec<...>>
-                peer_handles[worker_id].store(executor.raw_driver_handle(), Ordering::Release);
 
                 // Wait for all workers to be ready
                 barrier.wait();
@@ -232,7 +220,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         Ok(Runtime {
             handles: thread_handles,
             registry,
-            peer_handles,
             worker_count,
             worker_0_prep: Some(worker_0_prep),
         })
@@ -242,7 +229,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 pub struct Runtime<T: PoolTopology = UniformSlot> {
     handles: Vec<thread::JoinHandle<()>>,
     registry: Arc<ExecutorRegistry>,
-    peer_handles: Arc<Vec<AtomicUsize>>,
     #[allow(dead_code)]
     worker_count: usize,
     worker_0_prep: Option<WorkerPrep<T>>,
@@ -323,10 +309,6 @@ impl<T: PoolTopology> Runtime<T> {
 
         let mut executor = executor.with_registry(self.registry.clone());
         executor.set_id(0); // Set Worker ID (Worker 0)
-
-        // Publish Handle
-        let fd = executor.raw_driver_handle();
-        self.peer_handles[0].store(fd, Ordering::Release);
 
         // Wait for all workers to be ready
         prep.barrier.wait();

@@ -528,16 +528,18 @@ pub(crate) fn submit_udp_recv_stream(
         user_data: header.user_data,
         generation: header.generation,
     };
-    ctx.rio.try_submit_pool_recv(args, ctx.registrar).map_err(|e| {
-        io_error(
-            IocpErrorContext::Submission,
-            e,
-            format!(
-                "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, header.user_data, header.generation
-            ),
-        )
-    })
+    ctx.rio
+        .try_submit_pool_recv(args, ctx.registrar)
+        .map_err(|e| {
+            io_error(
+                IocpErrorContext::Submission,
+                e,
+                format!(
+                    "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, header.user_data, header.generation
+                ),
+            )
+        })
 }
 
 /// # Safety

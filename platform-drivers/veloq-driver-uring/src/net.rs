@@ -1,12 +1,11 @@
-use crate::{RawHandle, SockAddrStorage};
+use crate::{OwnedRawHandle, RawHandle, SockAddrStorage};
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::unix::io::RawFd;
 use veloq_driver_core::net::{PlatformSocket, SocketAddrCodec};
 
 pub struct Socket {
-    fd: RawFd,
+    fd: OwnedRawHandle,
 }
 
 impl Socket {
@@ -15,7 +14,10 @@ impl Socket {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd })
+        Ok(Self {
+            // SAFETY: newly created socket fd is uniquely owned.
+            fd: unsafe { OwnedRawHandle::from_raw_owned(RawHandle::for_socket(fd)) },
+        })
     }
 
     fn new_v6(ty: c_int) -> io::Result<Self> {
@@ -23,13 +25,16 @@ impl Socket {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd })
+        Ok(Self {
+            // SAFETY: newly created socket fd is uniquely owned.
+            fd: unsafe { OwnedRawHandle::from_raw_owned(RawHandle::for_socket(fd)) },
+        })
     }
 
     fn setsockopt<T>(&self, level: c_int, optname: c_int, optval: T) -> io::Result<()> {
         let ret = unsafe {
             libc::setsockopt(
-                self.fd,
+                self.fd.as_fd(),
                 level,
                 optname,
                 &optval as *const _ as *const libc::c_void,
@@ -62,7 +67,7 @@ impl Socket {
         let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
         let ret = unsafe {
             libc::bind(
-                self.fd,
+                self.fd.as_fd(),
                 &raw_addr.0 as *const _ as *const sockaddr,
                 raw_addr_len,
             )
@@ -77,7 +82,7 @@ impl Socket {
         let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
         let ret = unsafe {
             libc::connect(
-                self.fd,
+                self.fd.as_fd(),
                 &raw_addr.0 as *const _ as *const sockaddr,
                 raw_addr_len,
             )
@@ -89,7 +94,7 @@ impl Socket {
     }
 
     pub fn listen(&self, backlog: i32) -> io::Result<()> {
-        let ret = unsafe { libc::listen(self.fd, backlog as c_int) };
+        let ret = unsafe { libc::listen(self.fd.as_fd(), backlog as c_int) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -97,16 +102,17 @@ impl Socket {
     }
 
     pub fn into_raw(self) -> RawHandle {
-        let fd = self.fd;
-        std::mem::forget(self);
-        RawHandle::for_socket(fd)
+        self.fd.into_raw()
     }
 
     /// # Safety
     ///
     /// `handle` 必须是有效 fd，且满足所有权语义。
     pub unsafe fn from_raw(handle: RawHandle) -> Self {
-        Self { fd: handle.as_fd() }
+        Self {
+            // SAFETY: forwarded from caller contract.
+            fd: unsafe { OwnedRawHandle::from_raw_owned(handle) },
+        }
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -114,7 +120,7 @@ impl Socket {
         let mut len = std::mem::size_of::<libc::sockaddr_storage>() as socklen_t;
         let ret = unsafe {
             libc::getsockname(
-                self.fd,
+                self.fd.as_fd(),
                 &mut storage as *mut _ as *mut libc::sockaddr,
                 &mut len,
             )
@@ -225,12 +231,6 @@ impl PlatformSocket for Socket {
 
     fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
         Socket::set_broadcast(self, broadcast)
-    }
-}
-
-impl Drop for Socket {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
     }
 }
 

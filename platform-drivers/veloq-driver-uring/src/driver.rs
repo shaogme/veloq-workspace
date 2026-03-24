@@ -1,7 +1,7 @@
 use io_uring::{IoUring, squeue};
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use tracing::{debug, trace};
 
-use crate::config::{BufferRegistrationMode, IoFd, IoMode, RawHandle, UringConfig};
+use crate::config::{BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig};
 use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, Driver, Outcome, RemoteWaker, SharedCompletionQueue,
@@ -28,15 +28,7 @@ pub(crate) use registration::{MAX_CHUNKS, UringRegistrationStats};
 use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
 
 pub(crate) struct EventFd {
-    pub(crate) fd: RawFd,
-}
-
-impl Drop for EventFd {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
+    pub(crate) fd: OwnedRawHandle,
 }
 
 pub(crate) struct UringWaker {
@@ -51,7 +43,7 @@ impl RemoteWaker for UringWaker {
         }
         if !self.is_waked.swap(true, Ordering::AcqRel) {
             let buf = 1u64.to_ne_bytes();
-            let ret = unsafe { libc::write(self.fd.fd, buf.as_ptr() as *const _, 8) };
+            let ret = unsafe { libc::write(self.fd.fd.as_fd(), buf.as_ptr() as *const _, 8) };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EAGAIN) {
@@ -157,7 +149,10 @@ impl UringDriver {
             completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
             completion_table,
             detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
-            waker_fd: Arc::new(EventFd { fd: waker_fd }),
+            waker_fd: Arc::new(EventFd {
+                // SAFETY: `eventfd` returns a freshly created fd owned by this driver.
+                fd: unsafe { OwnedRawHandle::from_raw_owned(RawHandle::for_file(waker_fd)) },
+            }),
             waker_token: None,
             waker_payload: None,
             registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
@@ -312,7 +307,7 @@ impl UringDriver {
             return;
         }
 
-        let fd = self.waker_fd.fd;
+        let fd = self.waker_fd.fd.as_fd();
         let op = Wakeup {
             fd: IoFd::Raw(RawHandle::for_file(fd)),
         };
@@ -763,7 +758,7 @@ impl Driver for UringDriver {
 
     fn wake(&mut self) -> io::Result<()> {
         let buf = 1u64.to_ne_bytes();
-        let ret = unsafe { libc::write(self.waker_fd.fd, buf.as_ptr() as *const _, 8) };
+        let ret = unsafe { libc::write(self.waker_fd.fd.as_fd(), buf.as_ptr() as *const _, 8) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EAGAIN) {
@@ -786,7 +781,7 @@ impl Driver for UringDriver {
     }
 
     fn driver_id(&self) -> usize {
-        self.waker_fd.fd as usize
+        self.waker_fd.fd.as_fd() as usize
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {

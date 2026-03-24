@@ -1,5 +1,4 @@
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawHandleKind {
@@ -10,7 +9,7 @@ pub enum RawHandleKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawHandle {
     File { fd: i32 },
-    Socket { fd: i32, generation: u32 },
+    Socket { fd: i32 },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,34 +23,9 @@ pub struct BorrowedRawHandle<'a> {
     _marker: std::marker::PhantomData<&'a RawHandle>,
 }
 
-static NEXT_SOCKET_GENERATION: AtomicU32 = AtomicU32::new(1);
-
-#[inline]
-fn alloc_socket_generation() -> u32 {
-    let generation = NEXT_SOCKET_GENERATION.fetch_add(1, Ordering::Relaxed);
-    if generation == 0 {
-        NEXT_SOCKET_GENERATION.store(1, Ordering::Relaxed);
-        1
-    } else {
-        generation
-    }
-}
-
 impl From<i32> for RawHandle {
     fn from(fd: i32) -> Self {
         Self::for_file(fd)
-    }
-}
-
-impl From<usize> for RawHandle {
-    fn from(fd: usize) -> Self {
-        Self::for_file(fd as i32)
-    }
-}
-
-impl From<RawHandle> for usize {
-    fn from(handle: RawHandle) -> Self {
-        handle.as_fd() as usize
     }
 }
 
@@ -63,10 +37,7 @@ impl RawHandle {
 
     #[inline]
     pub fn for_socket(fd: i32) -> Self {
-        Self::Socket {
-            fd,
-            generation: alloc_socket_generation(),
-        }
+        Self::Socket { fd }
     }
 
     #[inline]
@@ -74,14 +45,6 @@ impl RawHandle {
         match self {
             Self::File { fd } => fd,
             Self::Socket { fd, .. } => fd,
-        }
-    }
-
-    #[inline]
-    pub const fn generation(self) -> u32 {
-        match self {
-            Self::File { .. } => 0,
-            Self::Socket { generation, .. } => generation,
         }
     }
 
@@ -191,11 +154,6 @@ impl<'a> BorrowedRawHandle<'a> {
     #[inline]
     pub const fn is_socket(self) -> bool {
         self.raw.is_socket()
-    }
-
-    #[inline]
-    pub const fn generation(self) -> u32 {
-        self.raw.generation()
     }
 }
 

@@ -29,9 +29,7 @@ use veloq_driver_core::op::{
     Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
 };
 
-use windows_sys::Win32::Networking::WinSock::{
-    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
-};
+use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE};
 
 // ============================================================================
 // Type Aliases for Core Ops
