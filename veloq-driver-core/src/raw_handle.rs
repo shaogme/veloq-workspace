@@ -1,7 +1,7 @@
 use crate::Handle;
 use core::marker::PhantomData;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RawHandleKind {
     File,
     Socket,
@@ -12,7 +12,7 @@ pub trait RawHandleMeta: Handle {
     fn close(self);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RawHandle<H: Handle> {
     raw: H,
 }

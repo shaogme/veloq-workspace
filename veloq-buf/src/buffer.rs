@@ -823,8 +823,7 @@ impl Drop for ThreadLocalPoolCache {
 thread_local! {
     /// 缓存当前线程使用的全局池引用计数。
     ///
-    /// 在 Windows GNU 平台上，Clippy 会对常量初始化产生误报，
-    /// 这里通过重构为直接存储并使用 const 块来优化。
+    /// 注：在 Windows GNU 平台上，Clippy 会对常量初始化产生误报
     #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), allow(clippy::missing_const_for_thread_local))]
     static POOL_CACHE: ThreadLocalPoolCache = const { ThreadLocalPoolCache::new() };
 }

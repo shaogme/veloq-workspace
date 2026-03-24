@@ -57,6 +57,8 @@ type SlotEntryOpBundle<'a, Op, P, S, R = usize> = (
     &'a mut SlotStorage<Op, S, R>,
 );
 
+type SlotEntryAndOpEntry<'a, Op, P, S, R = usize> = (&'a SlotEntry<Op, S, R>, &'a mut OpEntry<P>);
+
 impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
     pub fn new(capacity: usize) -> Self {
         let shared = Arc::new(SlotTable::new(capacity));
@@ -138,7 +140,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
     pub fn get_slot_and_entry_mut(
         &mut self,
         user_data: usize,
-    ) -> Option<(&SlotEntry<Op, S, R>, &mut OpEntry<P>)> {
+    ) -> Option<SlotEntryAndOpEntry<'_, Op, P, S, R>> {
         if user_data < self.local.len() {
             Some((
                 &self.shared.slots[user_data],

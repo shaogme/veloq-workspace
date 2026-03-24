@@ -17,7 +17,7 @@ use crate::ext::Extensions;
 use crate::ops::submit::SubmissionResult;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::error::{RioDiag, RioError, RioReportExt, RioResult};
-use crate::rio::{RioEnv, RioState, RioTarget, SocketActorKey};
+use crate::rio::{RioEnv, RioState, RioTarget};
 use error_stack::ResultExt;
 use std::io;
 use tracing::error;
@@ -101,10 +101,7 @@ impl RioState {
                 .attach("failed to ensure RIO actor")?;
             actor.rq
         };
-        if self.is_iocp_fallback(SocketActorKey::new(
-            handle.raw().as_handle(),
-            handle.raw().generation(),
-        )) {
+        if self.is_iocp_fallback(crate::config::RawHandle::new(handle.raw())) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }
@@ -179,10 +176,7 @@ impl RioState {
 
             (actor.rq, format!("{:?}", actor.state))
         };
-        if self.is_iocp_fallback(SocketActorKey::new(
-            handle.raw().as_handle(),
-            handle.raw().generation(),
-        )) {
+        if self.is_iocp_fallback(crate::config::RawHandle::new(handle.raw())) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }

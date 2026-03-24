@@ -23,7 +23,7 @@ use crate::config::{BufferRegistrationMode, IocpConfig, IocpHandle, RawHandle, R
 use crate::driver::{CompletionSidecar, IocpOpState};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
-use crate::rio::{RioState, SocketActorKey};
+use crate::rio::RioState;
 use crate::win32::Overlapped;
 use veloq_driver_core::slot::{DetachedCancelTable, InFlightWaiting, SlotRegistryExt, SlotView};
 
@@ -519,7 +519,7 @@ impl IocpDriver {
         ctx: CancelContext<'_>,
         user_data: usize,
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-    ) -> Option<SocketActorKey> {
+    ) -> Option<RawHandle> {
         let mut should_emit_aborted = false;
         let mut aborted_socket_key = None;
         let handled = match ops.slot_view(user_data) {

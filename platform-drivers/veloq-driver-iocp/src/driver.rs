@@ -29,7 +29,6 @@ use crate::common::{completion_record, push_completion_shared};
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
-use crate::rio::SocketActorKey;
 pub use inner::IocpDriver;
 use inner::{CONTROL_EVENT_KEY, RIO_EVENT_KEY};
 
@@ -154,7 +153,7 @@ impl IocpDriver {
         SocketLifecycleHandle::new(self.port.clone())
     }
 
-    fn track_socket_submit_pending(&mut self, key: SocketActorKey) {
+    fn track_socket_submit_pending(&mut self, key: RawHandle) {
         let _ = self.rio_state.try_acquire_socket_inflight(key);
     }
 

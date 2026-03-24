@@ -1,8 +1,8 @@
 //! Shutdown and deferred cleanup orchestration for `RioState`.
 
+use crate::RawHandle;
 use crate::rio::ActorKey;
 use crate::rio::RioState;
-use crate::rio::SocketActorKey;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
@@ -22,8 +22,8 @@ pub(crate) struct DeferredRioCleanup {
     registry: RioRegistry,
     registration_mode: crate::BufferRegistrationMode,
     actors: SlotMap<ActorKey, RioSocketActor>,
-    actor_by_handle: FxHashMap<SocketActorKey, ActorKey>,
-    socket_runtime: FxHashMap<SocketActorKey, crate::rio::SocketRuntimeState>,
+    actor_by_handle: FxHashMap<RawHandle, ActorKey>,
+    socket_runtime: FxHashMap<RawHandle, crate::rio::SocketRuntimeState>,
     outstanding_count: usize,
 }
 

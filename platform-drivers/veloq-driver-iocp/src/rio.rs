@@ -15,12 +15,12 @@ pub(crate) mod runtime;
 
 use crate::BufferRegistrationMode;
 use crate::IocpOpState;
+use crate::config::RawHandle;
 use crate::ops::IocpOp;
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
 use veloq_driver_core::driver::{SharedCompletionQueue, SharedCompletionTable};
 use veloq_driver_core::op_registry::OpRegistry;
-use windows_sys::Win32::Foundation::HANDLE;
 
 use self::core::registry::RioRegistry;
 use self::core::submit_ops::{RioCq, RioDispatch, RioKernel, RioRq};
@@ -33,19 +33,6 @@ pub(crate) use self::runtime::RioUdpStreamArgs;
 
 new_key_type! {
     pub(crate) struct ActorKey;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct SocketActorKey {
-    pub(crate) handle: HANDLE,
-    pub(crate) generation: u32,
-}
-
-impl SocketActorKey {
-    #[inline]
-    pub(crate) const fn new(handle: HANDLE, generation: u32) -> Self {
-        Self { handle, generation }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,7 +91,7 @@ pub(crate) struct RioState {
     pub(crate) registry: RioRegistry,
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
-    pub(crate) actor_by_handle: FxHashMap<SocketActorKey, ActorKey>,
-    pub(crate) socket_runtime: FxHashMap<SocketActorKey, SocketRuntimeState>,
+    pub(crate) actor_by_handle: FxHashMap<RawHandle, ActorKey>,
+    pub(crate) socket_runtime: FxHashMap<RawHandle, SocketRuntimeState>,
     pub(crate) outstanding_count: usize,
 }

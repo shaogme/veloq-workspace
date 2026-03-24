@@ -219,7 +219,7 @@ impl RioRegistry {
 
         env.dispatch
             .create_rq(RioRqConfig {
-                socket: handle.raw().as_socket() as usize,
+                socket: handle.raw().as_socket(),
                 max_outstanding_recvs,
                 max_receive_data_buffers: 1,
                 max_outstanding_sends,
