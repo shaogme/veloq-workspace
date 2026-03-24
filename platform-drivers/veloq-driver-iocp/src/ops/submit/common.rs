@@ -177,18 +177,14 @@ pub(crate) fn resolve_fd_borrowed<'a>(
     fd: &'a IoFd,
     registered_files: &'a [Option<RegisteredHandle>],
 ) -> io::Result<BorrowedRawHandle<'a>> {
-    match fd {
-        IoFd::Raw(h) => Ok(h.borrow()),
-        IoFd::Fixed(idx) => {
-            if let Some(Some(h)) = registered_files.get(*idx as usize) {
-                Ok(h.as_borrowed())
-            } else {
-                Err(io_msg(
-                    IocpErrorContext::ResolveFd,
-                    format!("invalid registered file descriptor: fd={fd:?}, idx={idx}"),
-                ))
-            }
-        }
+    let idx = fd.fixed_index();
+    if let Some(Some(h)) = registered_files.get(idx as usize) {
+        Ok(h.as_borrowed())
+    } else {
+        Err(io_msg(
+            IocpErrorContext::ResolveFd,
+            format!("invalid registered file descriptor: fd={fd:?}, idx={idx}"),
+        ))
     }
 }
 

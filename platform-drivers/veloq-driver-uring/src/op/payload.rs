@@ -3,30 +3,31 @@ use std::ptr::NonNull;
 use veloq_driver_core::op::{
     Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
     Fsync as CoreFsync, ReadFixed as CoreReadFixed, Recv as CoreRecv, Send as CoreSend,
-    SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange, UdpRecv as CoreUdpRecv,
-    UdpRecvStream as CoreUdpRecvStream, UdpSend as CoreUdpSend, Wakeup as CoreWakeup,
-    WriteFixed as CoreWriteFixed,
+    SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange, UdpConnect as CoreUdpConnect,
+    UdpRecv as CoreUdpRecv, UdpRecvStream as CoreUdpRecvStream, UdpSend as CoreUdpSend,
+    Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
 };
 
 pub(crate) use veloq_driver_core::op::{Open, Timeout};
 
-use crate::config::{SockAddrStorage, UringRawHandle};
+use crate::config::SockAddrStorage;
 
-pub(crate) type ReadFixed = CoreReadFixed<UringRawHandle>;
-pub(crate) type WriteFixed = CoreWriteFixed<UringRawHandle>;
-pub(crate) type Recv = CoreRecv<UringRawHandle>;
-pub(crate) type OpSend = CoreSend<UringRawHandle>;
-pub(crate) type UdpRecv = CoreUdpRecv<UringRawHandle>;
-pub(crate) type UdpSend = CoreUdpSend<UringRawHandle>;
-pub(crate) type Connect = CoreConnect<UringRawHandle, SockAddrStorage>;
-pub(crate) type Close = CoreClose<UringRawHandle>;
-pub(crate) type Fsync = CoreFsync<UringRawHandle>;
-pub(crate) type SyncFileRange = CoreSyncFileRange<UringRawHandle>;
-pub(crate) type Fallocate = CoreFallocate<UringRawHandle>;
-pub(crate) type Accept = CoreAccept<UringRawHandle, SockAddrStorage>;
-pub(crate) type SendTo = CoreSendTo<UringRawHandle>;
-pub(crate) type UdpRecvStream = CoreUdpRecvStream<UringRawHandle>;
-pub(crate) type Wakeup = CoreWakeup<UringRawHandle>;
+pub(crate) type ReadFixed = CoreReadFixed;
+pub(crate) type WriteFixed = CoreWriteFixed;
+pub(crate) type Recv = CoreRecv;
+pub(crate) type OpSend = CoreSend;
+pub(crate) type UdpRecv = CoreUdpRecv;
+pub(crate) type UdpSend = CoreUdpSend;
+pub(crate) type Connect = CoreConnect<SockAddrStorage>;
+pub(crate) type UdpConnect = CoreUdpConnect<SockAddrStorage>;
+pub(crate) type Close = CoreClose;
+pub(crate) type Fsync = CoreFsync;
+pub(crate) type SyncFileRange = CoreSyncFileRange;
+pub(crate) type Fallocate = CoreFallocate;
+pub(crate) type Accept = CoreAccept<SockAddrStorage>;
+pub(crate) type SendTo = CoreSendTo;
+pub(crate) type UdpRecvStream = CoreUdpRecvStream;
+pub(crate) type Wakeup = CoreWakeup;
 
 pub(crate) struct KernelRef<T> {
     pub(crate) user: NonNull<T>,
@@ -73,6 +74,7 @@ pub(crate) enum UringOpPayload {
     UdpRecv(KernelRef<UdpRecv>),
     UdpSend(KernelRef<UdpSend>),
     Connect(KernelRef<Connect>),
+    UdpConnect(KernelRef<UdpConnect>),
     Close(KernelRef<Close>),
     Fsync(KernelRef<Fsync>),
     SyncRange(KernelRef<SyncFileRange>),

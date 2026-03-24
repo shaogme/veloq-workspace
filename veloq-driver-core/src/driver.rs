@@ -624,9 +624,9 @@ pub trait Driver: 'static {
     fn register_files<'a>(
         &mut self,
         files: Vec<RegisterFd<'a, Self::Raw>>,
-    ) -> io::Result<Vec<IoFd<Self::Raw>>>;
+    ) -> io::Result<Vec<IoFd>>;
 
-    fn unregister_files(&mut self, files: Vec<IoFd<Self::Raw>>) -> io::Result<()>;
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()>;
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()>;
 

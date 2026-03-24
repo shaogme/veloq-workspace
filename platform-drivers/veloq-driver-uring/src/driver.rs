@@ -65,6 +65,12 @@ const MIN_FILE_TABLE_CAPACITY: usize = 1;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SocketLifecycleHandle;
 
+#[derive(Debug)]
+pub(crate) enum RegisteredFileEntry {
+    BorrowedFd(i32),
+    OwnedHandle(OwnedRawHandle),
+}
+
 impl SocketLifecycleHandle {
     #[inline]
     pub fn schedule_socket_cleanup(
@@ -77,7 +83,7 @@ impl SocketLifecycleHandle {
 
     #[inline]
     pub const fn supports_registration(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -91,8 +97,9 @@ pub struct UringDriver {
     pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
 
     pub(crate) waker_fd: Arc<EventFd>,
+    pub(crate) waker_registered_fd: Option<IoFd>,
     pub(crate) waker_token: Option<usize>,
-    pub(crate) waker_payload: Option<Box<Wakeup<UringRawHandle>>>,
+    pub(crate) waker_payload: Option<Box<Wakeup>>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
@@ -102,7 +109,7 @@ pub struct UringDriver {
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) chunk_register_failures_recent: HashMap<u16, Instant>,
-    pub(crate) registered_files: Vec<Option<i32>>,
+    pub(crate) registered_files: Vec<Option<RegisteredFileEntry>>,
     pub(crate) free_file_slots: Vec<u32>,
     pub(crate) file_table_initialized: bool,
 }
@@ -111,6 +118,22 @@ impl UringDriver {
     #[inline]
     pub const fn socket_lifecycle_handle(&self) -> SocketLifecycleHandle {
         SocketLifecycleHandle
+    }
+
+    fn unregister_fixed_fd(&mut self, fd: IoFd) -> io::Result<()> {
+        if !self.file_table_initialized {
+            return Ok(());
+        }
+        let idx = fd.fixed_index();
+        let index = idx as usize;
+        if index < self.registered_files.len() {
+            let Some(_entry) = self.registered_files[index].take() else {
+                return Ok(());
+            };
+            self.ring.submitter().register_files_update(idx, &[-1])?;
+            self.free_file_slots.push(idx);
+        }
+        Ok(())
     }
 
     fn ensure_file_table_initialized(&mut self) -> io::Result<()> {
@@ -122,7 +145,7 @@ impl UringDriver {
         let sparse = vec![-1; capacity];
         self.ring.submitter().register_files(&sparse)?;
 
-        self.registered_files = vec![None; capacity];
+        self.registered_files = (0..capacity).map(|_| None).collect();
         self.free_file_slots = (0..capacity as u32).rev().collect();
         self.file_table_initialized = true;
         Ok(())
@@ -178,6 +201,7 @@ impl UringDriver {
                     )))
                 },
             }),
+            waker_registered_fd: None,
             waker_token: None,
             waker_payload: None,
             registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
@@ -335,12 +359,24 @@ impl UringDriver {
             return;
         }
 
-        let fd = self.waker_fd.fd.raw().as_fd();
-        let op = Wakeup {
-            fd: IoFd::Raw(RawHandle::new(UringRawHandle::for_file(fd))),
+        let fixed_fd = match self.waker_registered_fd {
+            Some(fd) => fd,
+            None => {
+                let fd = self.waker_fd.fd.raw().as_fd();
+                let raw = RawHandle::new(UringRawHandle::for_file(fd));
+                let fixed_fd = self
+                    .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
+                    .and_then(|mut fds| {
+                        fds.pop()
+                            .ok_or_else(|| io::Error::other("register_files returned empty"))
+                    })
+                    .unwrap_or_else(|e| panic!("waker fd registration failed: {e}"));
+                self.waker_registered_fd = Some(fixed_fd);
+                fixed_fd
+            }
         };
-        let (uring_op, payload) =
-            <Wakeup<UringRawHandle> as IntoPlatformOp<UringOp>>::into_kernel_and_payload(op);
+        let op = Wakeup { fd: fixed_fd };
+        let (uring_op, payload) = <Wakeup as IntoPlatformOp<UringOp>>::into_kernel_and_payload(op);
 
         let result = self.ops.alloc(UringOpState::new());
 
@@ -777,9 +813,13 @@ impl Driver for UringDriver {
 
         let mut fixed_fds = Vec::with_capacity(files.len());
         for file in files {
-            let fd = match file {
-                RegisterFd::Borrowed(b) => b.raw().as_fd(),
-                RegisterFd::Owned(o) => o.raw().as_fd(),
+            let entry = match file {
+                RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd(b.raw().as_fd()),
+                RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
+            };
+            let fd = match &entry {
+                RegisteredFileEntry::BorrowedFd(fd) => *fd,
+                RegisteredFileEntry::OwnedHandle(o) => o.raw().as_fd(),
             };
             let idx = self.free_file_slots.pop().ok_or_else(|| {
                 io::Error::new(
@@ -788,26 +828,15 @@ impl Driver for UringDriver {
                 )
             })?;
             self.ring.submitter().register_files_update(idx, &[fd])?;
-            self.registered_files[idx as usize] = Some(fd);
-            fixed_fds.push(IoFd::Fixed(idx));
+            self.registered_files[idx as usize] = Some(entry);
+            fixed_fds.push(IoFd::fixed(idx));
         }
         Ok(fixed_fds)
     }
 
     fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()> {
-        if !self.file_table_initialized {
-            return Ok(());
-        }
-
         for fd in files {
-            if let IoFd::Fixed(idx) = fd {
-                let index = idx as usize;
-                if index < self.registered_files.len() && self.registered_files[index].is_some() {
-                    self.ring.submitter().register_files_update(idx, &[-1])?;
-                    self.registered_files[index] = None;
-                    self.free_file_slots.push(idx);
-                }
-            }
+            self.unregister_fixed_fd(fd)?;
         }
         Ok(())
     }

@@ -232,4 +232,4 @@ impl RegisteredHandle {
 }
 
 /// Type alias for I/O descriptors using RawHandle.
-pub type IoFd = CoreIoFd<IocpHandle>;
+pub type IoFd = CoreIoFd;

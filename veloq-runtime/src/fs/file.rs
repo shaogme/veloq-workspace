@@ -3,6 +3,7 @@ use crate::runtime::context::submit;
 use super::open_options::OpenOptions;
 
 use veloq_buf::FixedBuf;
+use veloq_driver::driver::Driver;
 use veloq_driver::op::{
     DetachedSubmitter, Fallocate, Fsync, IoFd, LocalSubmitter, Op, OpSubmitter, ReadFixed,
     SyncFileRange, WriteFixed,
@@ -32,22 +33,28 @@ macro_rules! ignore {
 
 pub(crate) struct InnerFile {
     raw: RawHandle,
+    fd: IoFd,
 }
 
 impl InnerFile {
     #[inline]
-    pub(crate) const fn new(raw: RawHandle) -> Self {
-        Self { raw }
+    pub(crate) const fn new(raw: RawHandle, fd: IoFd) -> Self {
+        Self { raw, fd }
     }
 
     #[inline]
-    pub(crate) const fn raw(&self) -> RawHandle {
-        self.raw
+    pub(crate) const fn fd(&self) -> IoFd {
+        self.fd
     }
 }
 
 impl Drop for InnerFile {
     fn drop(&mut self) {
+        if let Some(ctx) = crate::runtime::context::try_current()
+            && let Some(driver) = ctx.driver().upgrade()
+        {
+            let _ = driver.borrow_mut().unregister_files(vec![self.fd]);
+        }
         debug_assert!(
             matches!(self.raw.borrow().kind(), RawHandleKind::File),
             "InnerFile expects file-kind handle"
@@ -239,7 +246,7 @@ impl<'a, S: OpSubmitter, P: FilePos> IntoFuture for SyncRangeBuilder<'a, S, P> {
 
     fn into_future(self) -> Self::IntoFuture {
         let op = SyncFileRange {
-            fd: IoFd::Raw(self.file.inner.raw()),
+            fd: self.file.inner.fd(),
             offset: self.offset,
             nbytes: self.nbytes,
             flags: self.flags,
@@ -281,7 +288,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
         let op = ReadFixed {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             buf,
             offset,
             buf_offset,
@@ -302,7 +309,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
         let op = WriteFixed {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             buf,
             offset,
             buf_offset,
@@ -318,7 +325,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
 
     pub async fn sync_all(&self) -> io::Result<()> {
         let op = Fsync {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             datasync: false,
         };
 
@@ -328,7 +335,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
 
     pub async fn sync_data(&self) -> io::Result<()> {
         let op = Fsync {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             datasync: true,
         };
 
@@ -348,7 +355,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
 
     pub async fn fallocate(&self, offset: u64, len: u64) -> io::Result<()> {
         let op = Fallocate {
-            fd: IoFd::Raw(self.inner.raw()),
+            fd: self.inner.fd(),
             mode: 0, // Default mode
             offset,
             len,

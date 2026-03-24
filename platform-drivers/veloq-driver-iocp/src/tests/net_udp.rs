@@ -1,4 +1,4 @@
-use crate::config::{IoFd, IocpConfig, IocpHandle};
+use crate::config::{IoFd, IocpConfig};
 use crate::driver::IocpDriver;
 use crate::net::socket::Socket;
 use crate::ops::IocpOp;
@@ -6,12 +6,18 @@ use crate::tests::wait_completion;
 use std::time::Duration;
 use veloq_buf::BufPool;
 use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
-use veloq_driver_core::driver::{Driver, SubmitBinder};
-use veloq_driver_core::op::UdpRecvStream as UdpRecvStreamBase;
-use veloq_driver_core::op::{IntoPlatformOp, SendTo as SendToBase};
+use veloq_driver_core::driver::{Driver, RegisterFd, SubmitBinder};
+use veloq_driver_core::op::{IntoPlatformOp, SendTo, UdpRecvStream};
 
-type SendTo = SendToBase<IocpHandle>;
-type UdpRecvStream = UdpRecvStreamBase<IocpHandle>;
+fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
+    let handle = socket.into_owned_raw();
+    driver
+        .register_files(vec![RegisterFd::Owned(handle)])
+        .expect("register socket failed")
+        .into_iter()
+        .next()
+        .expect("register_files returned empty")
+}
 
 #[test]
 fn test_rio_udp_send_to_recv_from_address_path() {
@@ -30,8 +36,8 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     let server_addr = server.local_addr().expect("server local_addr failed");
     let client_addr = client.local_addr().expect("client local_addr failed");
 
-    let server_handle = server.into_owned_raw();
-    let client_handle = client.into_owned_raw();
+    let server_fd = register_owned_socket(&mut driver, server);
+    let client_fd = register_owned_socket(&mut driver, client);
 
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
@@ -58,13 +64,13 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         .expect("register send chunk failed");
 
     let recv_op = UdpRecvStream {
-        fd: IoFd::Raw(crate::RawHandle::new(server_handle.raw())),
+        fd: server_fd,
         buf: None,
         addr: None,
         result: None,
     };
     let send_op = SendTo {
-        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
+        fd: client_fd,
         buf: send_buf,
         buf_offset: 0,
         addr: server_addr,
@@ -102,11 +108,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     assert_eq!(&datagram.buf.as_slice()[..bytes], test_data);
     assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
 
-    // SAFETY: Closing the socket handles is required to release OS resources.
-    unsafe {
-        drop(Socket::from_raw(client_handle.raw()));
-        drop(Socket::from_raw(server_handle.raw()));
-    }
+    driver.unregister_files(vec![client_fd, server_fd]).unwrap();
 }
 
 #[test]
@@ -129,8 +131,8 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     let server_addr = server.local_addr().expect("server local_addr failed");
     let client_addr = client.local_addr().expect("client local_addr failed");
 
-    let server_handle = server.into_owned_raw();
-    let client_handle = client.into_owned_raw();
+    let server_fd = register_owned_socket(&mut driver, server);
+    let client_fd = register_owned_socket(&mut driver, client);
 
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
@@ -157,13 +159,13 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         .expect("register send chunk failed");
 
     let recv_op = UdpRecvStream {
-        fd: IoFd::Raw(crate::RawHandle::new(server_handle.raw())),
+        fd: server_fd,
         buf: None,
         addr: None,
         result: None,
     };
     let send_op = SendTo {
-        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
+        fd: client_fd,
         buf: send_buf,
         buf_offset: 0,
         addr: server_addr,
@@ -201,11 +203,7 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     assert_eq!(&datagram.buf.as_slice()[..bytes], test_data);
     assert_eq!(datagram.addr, client_addr, "recv_from source addr mismatch");
 
-    // SAFETY: Closing the socket handles is required to release OS resources.
-    unsafe {
-        drop(Socket::from_raw(client_handle.raw()));
-        drop(Socket::from_raw(server_handle.raw()));
-    }
+    driver.unregister_files(vec![client_fd, server_fd]).unwrap();
 }
 
 #[test]
@@ -215,15 +213,19 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
     server
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("server bind failed");
-    let server_handle = server.into_owned_raw();
-    let socket_key = server_handle.raw().actor_key();
+    let server_fd = register_owned_socket(&mut driver, server);
+    let socket_key = match &driver.registered_files[server_fd.fixed_index() as usize] {
+        Some(crate::config::RegisteredHandle::Owned(h)) => h.raw().actor_key(),
+        Some(crate::config::RegisteredHandle::Weak(h)) => h.raw().actor_key(),
+        None => panic!("server fd missing after registration"),
+    };
 
     let mut submitted = Vec::new();
     const BURST_WAITERS: usize = 12;
 
     for _ in 0..BURST_WAITERS {
         let recv_op = UdpRecvStream {
-            fd: IoFd::Raw(crate::RawHandle::new(server_handle.raw())),
+            fd: server_fd,
             buf: None,
             addr: None,
             result: None,
@@ -269,10 +271,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
         );
     }
 
-    // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe {
-        drop(Socket::from_raw(server_handle.raw()));
-    }
+    driver.unregister_files(vec![server_fd]).unwrap();
 }
 
 #[test]
@@ -282,15 +281,19 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
     server
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("server bind failed");
-    let server_handle = server.into_owned_raw();
-    let socket_key = server_handle.raw().actor_key();
+    let server_fd = register_owned_socket(&mut driver, server);
+    let socket_key = match &driver.registered_files[server_fd.fixed_index() as usize] {
+        Some(crate::config::RegisteredHandle::Owned(h)) => h.raw().actor_key(),
+        Some(crate::config::RegisteredHandle::Weak(h)) => h.raw().actor_key(),
+        None => panic!("server fd missing after registration"),
+    };
 
     let mut submitted = Vec::new();
     const BURST_WAITERS: usize = 12;
 
     for _ in 0..BURST_WAITERS {
         let recv_op = UdpRecvStream {
-            fd: IoFd::Raw(crate::RawHandle::new(server_handle.raw())),
+            fd: server_fd,
             buf: None,
             addr: None,
             result: None,
@@ -341,8 +344,5 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
     );
     assert_eq!(stats.waiters_len, 0);
 
-    // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe {
-        drop(Socket::from_raw(server_handle.raw()));
-    }
+    driver.unregister_files(vec![server_fd]).unwrap();
 }

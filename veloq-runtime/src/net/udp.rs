@@ -7,7 +7,7 @@ use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
-    DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpRecv as OpUdpRecv,
+    DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpConnect, UdpRecv as OpUdpRecv,
     UdpRecvPacket, UdpRecvStream, UdpSend as OpUdpSend,
 };
 
@@ -40,8 +40,9 @@ fn bind_inner<A: ToSocketAddrs>(addr: A) -> io::Result<InnerSocket> {
     };
 
     socket.bind(addr)?;
+    let local_addr = socket.local_addr()?;
 
-    Ok(InnerSocket::new(socket.into_owned_raw().into_raw()))
+    InnerSocket::new(socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
 impl LocalUdpSocket {
@@ -126,7 +127,15 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        self.inner.connect(addr)
+        let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
+        #[allow(clippy::unnecessary_cast)]
+        let op = UdpConnect {
+            fd: self.inner.fd(),
+            addr: raw_addr,
+            addr_len: raw_addr_len as u32,
+        };
+        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        res.map(|_| ())
     }
 
     pub async fn send(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {

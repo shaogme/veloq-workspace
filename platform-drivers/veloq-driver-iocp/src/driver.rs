@@ -509,7 +509,7 @@ impl IocpDriver {
                 self.rio_state.resize_rqs(self.registered_files.len());
                 self.registered_files.len() - 1
             };
-            registered.push(IoFd::Fixed(idx as u32));
+            registered.push(IoFd::fixed(idx as u32));
         }
         Ok(registered)
     }
@@ -517,13 +517,17 @@ impl IocpDriver {
     /// Unregisters a set of previously registered files.
     pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()> {
         for fd in files {
-            if let IoFd::Fixed(idx) = fd {
-                let idx = idx as usize;
-                if idx < self.registered_files.len() && self.registered_files[idx].is_some() {
-                    self.registered_files[idx] = None;
-                    self.rio_state.clear_registered_rq(idx);
-                    self.free_slots.push(idx);
+            let idx = fd.fixed_index() as usize;
+            if idx < self.registered_files.len() {
+                let Some(entry) = self.registered_files[idx].take() else {
+                    continue;
+                };
+                if entry.as_raw().kind() == RawHandleKind::Socket {
+                    self.rio_state
+                        .shutdown_actor(entry.as_raw().raw().actor_key());
                 }
+                self.rio_state.clear_registered_rq(idx);
+                self.free_slots.push(idx);
             }
         }
         Ok(())

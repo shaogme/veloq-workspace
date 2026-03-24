@@ -45,10 +45,7 @@ fn test_register_borrowed_file_keeps_weak_ownership() {
         .next()
         .unwrap();
 
-    let idx = match fd {
-        crate::IoFd::Fixed(idx) => idx as usize,
-        crate::IoFd::Raw(_) => panic!("expected fixed descriptor"),
-    };
+    let idx = fd.fixed_index() as usize;
 
     assert!(
         matches!(
@@ -82,11 +79,7 @@ fn test_socket_lifecycle_control_cleanup_unreg() {
         .unwrap();
     let _ = driver.poll_completion().unwrap();
 
-    match fd {
-        crate::IoFd::Fixed(idx) => {
-            assert!(driver.registered_files[idx as usize].is_none());
-            assert!(driver.free_slots.contains(&(idx as usize)));
-        }
-        crate::IoFd::Raw(_) => panic!("expected fixed descriptor"),
-    }
+    let idx = fd.fixed_index() as usize;
+    assert!(driver.registered_files[idx].is_none());
+    assert!(driver.free_slots.contains(&idx));
 }

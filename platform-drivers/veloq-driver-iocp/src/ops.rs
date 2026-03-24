@@ -25,8 +25,8 @@ use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
     Fsync as FsyncBase, IntoPlatformOp, OpKind, Open, ReadFixed as ReadFixedBase, Recv as RecvBase,
     Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase, Timeout,
-    UdpRecv as UdpRecvBase, UdpRecvStream as UdpRecvStreamBase, UdpSend as UdpSendBase,
-    Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
+    UdpConnect as UdpConnectBase, UdpRecv as UdpRecvBase, UdpRecvStream as UdpRecvStreamBase,
+    UdpSend as UdpSendBase, Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
 };
 
 use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE};
@@ -35,21 +35,22 @@ use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, SOCKADD
 // Type Aliases for Core Ops
 // ============================================================================
 
-pub(crate) type ReadFixed = ReadFixedBase<IocpHandle>;
-pub(crate) type WriteFixed = WriteFixedBase<IocpHandle>;
-pub(crate) type Recv = RecvBase<IocpHandle>;
-pub(crate) type OpSend = OpSendBase<IocpHandle>;
-pub(crate) type UdpRecv = UdpRecvBase<IocpHandle>;
-pub(crate) type UdpSend = UdpSendBase<IocpHandle>;
-pub(crate) type Close = CloseBase<IocpHandle>;
-pub(crate) type Fsync = FsyncBase<IocpHandle>;
-pub(crate) type Connect = ConnectBase<IocpHandle, SockAddrStorage>;
-pub(crate) type Accept = AcceptBase<IocpHandle, SockAddrStorage>;
-pub(crate) type SendTo = SendToBase<IocpHandle>;
-pub(crate) type SyncFileRange = SyncFileRangeBase<IocpHandle>;
-pub(crate) type Fallocate = FallocateBase<IocpHandle>;
-pub(crate) type UdpRecvStream = UdpRecvStreamBase<IocpHandle>;
-pub(crate) type Wakeup = WakeupBase<IocpHandle>;
+pub(crate) type ReadFixed = ReadFixedBase;
+pub(crate) type WriteFixed = WriteFixedBase;
+pub(crate) type Recv = RecvBase;
+pub(crate) type OpSend = OpSendBase;
+pub(crate) type UdpRecv = UdpRecvBase;
+pub(crate) type UdpSend = UdpSendBase;
+pub(crate) type Close = CloseBase;
+pub(crate) type Fsync = FsyncBase;
+pub(crate) type Connect = ConnectBase<SockAddrStorage>;
+pub(crate) type UdpConnect = UdpConnectBase<SockAddrStorage>;
+pub(crate) type Accept = AcceptBase<SockAddrStorage>;
+pub(crate) type SendTo = SendToBase;
+pub(crate) type SyncFileRange = SyncFileRangeBase;
+pub(crate) type Fallocate = FallocateBase;
+pub(crate) type UdpRecvStream = UdpRecvStreamBase;
+pub(crate) type Wakeup = WakeupBase;
 
 // ============================================================================
 // SubmitContext Definition
@@ -347,6 +348,13 @@ define_iocp_ops! {
         submit: submit::submit_connect,
         on_complete: submit::on_complete_connect,
         get_fd: submit::get_fd_connect,
+    },
+    UdpConnect {
+        variant: UdpConnect,
+        kind: OpKind::UdpConnect,
+        submit: submit::submit_udp_connect,
+        on_complete: submit::on_complete_udp_connect,
+        get_fd: submit::get_fd_udp_connect,
     },
     Accept {
         variant: Accept,

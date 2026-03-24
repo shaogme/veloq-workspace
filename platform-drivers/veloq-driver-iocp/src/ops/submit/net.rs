@@ -18,7 +18,7 @@ use crate::ops::submit::common::{
 };
 use crate::ops::{
     ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv,
-    SendToPayload, SubmitContext, UdpRecv, UdpRecvStream, UdpSend,
+    SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvStream, UdpSend,
 };
 use crate::rio::RioTarget;
 use crate::win32::SafeSocket;
@@ -297,20 +297,49 @@ fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> io::Result<u16> {
 /// The caller must ensure that header and payload are valid.
 pub(crate) unsafe fn on_complete_connect(
     header: &mut OverlappedEntry,
-    payload: &mut KernelRef<Connect>,
+    _payload: &mut KernelRef<Connect>,
     result: usize,
     _ext: &Extensions,
 ) -> io::Result<usize> {
-    // SAFETY: The caller guarantees that payload is valid.
-    let connect_op = unsafe { payload.user.as_ref() };
-    if let Some(raw_handle) = header
+    let raw_handle = header
         .resolved_handle
-        .or_else(|| connect_op.fd.raw().map(|h| h.raw()))
-    {
-        with_borrowed_socket(raw_handle.as_socket(), |socket| {
-            socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
-        })?;
-    }
+        .ok_or_else(|| io::Error::other("resolved handle missing for connect completion"))?;
+    with_borrowed_socket(raw_handle.as_socket(), |socket| {
+        socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
+    })?;
+    Ok(result)
+}
+
+pub(crate) fn submit_udp_connect(
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<UdpConnect>,
+    ctx: &mut SubmitContext,
+) -> io::Result<SubmissionResult> {
+    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
+    let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&connect_op.fd, ctx.registered_files)?);
+    with_borrowed_socket(handle.raw().as_socket(), |socket| {
+        // SAFETY: address pointer/length are validated by caller and come from op payload.
+        unsafe {
+            socket.connect(
+                &connect_op.addr as *const _ as *const SOCKADDR,
+                connect_op.addr_len as i32,
+            )
+        }
+    })?;
+    Ok(SubmissionResult::PostToQueue)
+}
+
+/// # Safety
+///
+/// The caller must ensure that header and payload are valid.
+pub(crate) unsafe fn on_complete_udp_connect(
+    _header: &mut OverlappedEntry,
+    _payload: &mut KernelRef<UdpConnect>,
+    result: usize,
+    _ext: &Extensions,
+) -> io::Result<usize> {
     Ok(result)
 }
 
@@ -412,8 +441,7 @@ pub(crate) unsafe fn on_complete_accept(
         .ok_or_else(|| io::Error::other("accept socket not initialized"))?;
     let listen_handle = header
         .resolved_handle
-        .or_else(|| user.fd.raw().map(|h| h.raw()))
-        .ok_or(io::Error::from_raw_os_error(0))?;
+        .ok_or_else(|| io::Error::other("resolved listen handle missing for accept completion"))?;
     let listen_socket = listen_handle.as_socket();
     let accept_socket_raw = accept_socket.raw().as_socket();
 
@@ -552,26 +580,6 @@ pub(crate) unsafe fn on_udp_stream_complete(
 ) -> io::Result<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let val = unsafe { payload.user.as_mut() };
-    if val.result.is_none()
-        && val.addr.is_none()
-        && let Some(raw) = val.fd.raw()
-    {
-        let mut storage = SockAddrStorage::default();
-        let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
-        let _ = with_borrowed_socket(raw.raw().as_socket(), |socket| {
-            // SAFETY: storage and namelen are valid output pointers.
-            unsafe { socket.getpeername(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
-        });
-        if namelen > 0 {
-            // SAFETY: storage was initialized by getpeername when namelen > 0.
-            let buf = unsafe {
-                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
-            };
-            if let Ok(addr) = addr::to_socket_addr(buf) {
-                val.addr = Some(addr);
-            }
-        }
-    }
     if result == 0
         && let Some(datagram) = val.result.as_ref()
     {

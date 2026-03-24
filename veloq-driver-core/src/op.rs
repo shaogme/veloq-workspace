@@ -24,7 +24,7 @@ use crate::driver::{
     SubmitBinder, SubmitStatus, encode_completion_token, event_res_to_io,
 };
 use crate::slot::DetachedCancelTable;
-use crate::{IoFd, OwnedRawHandle, RawHandle, RawHandleMeta, SockAddr};
+use crate::{IoFd, RawHandleMeta, SockAddr};
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,7 @@ pub enum OpKind {
     Timeout = 15,
     UdpRecv = 16,
     UdpSend = 17,
+    UdpConnect = 18,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -715,52 +716,60 @@ impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
 // ============================================================================
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
-pub struct ReadFixed<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct ReadFixed {
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub offset: u64,
     pub buf_offset: usize,
 }
 
 /// Write to a file descriptor at a specific offset using a fixed buffer.
-pub struct WriteFixed<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct WriteFixed {
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub offset: u64,
     pub buf_offset: usize,
 }
 
 /// Receive data from a socket into a fixed buffer.
-pub struct Recv<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct Recv {
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Send data from a fixed buffer to a socket.
-pub struct Send<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct Send {
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Receive data from a UDP socket into a fixed buffer.
-pub struct UdpRecv<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct UdpRecv {
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Send data from a fixed buffer to a UDP socket.
-pub struct UdpSend<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct UdpSend {
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Connect a socket to a remote address.
-pub struct Connect<H: RawHandleMeta, A: SockAddr> {
-    pub fd: IoFd<H>,
+pub struct Connect<A: SockAddr> {
+    pub fd: IoFd,
+    /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
+    pub addr: A,
+    pub addr_len: u32,
+}
+
+/// Connect a UDP socket to a remote address.
+pub struct UdpConnect<A: SockAddr> {
+    pub fd: IoFd,
     /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
     pub addr: A,
     pub addr_len: u32,
@@ -779,13 +788,13 @@ pub struct Open {
 }
 
 /// Close a file descriptor or handle.
-pub struct Close<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct Close {
+    pub fd: IoFd,
 }
 
 /// Flush file buffers to disk.
-pub struct Fsync<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct Fsync {
+    pub fd: IoFd,
     /// If true, only sync data (not metadata).
     pub datasync: bool,
 }
@@ -796,14 +805,14 @@ pub struct Timeout {
 }
 
 /// Wake up the event loop.
-pub struct Wakeup<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct Wakeup {
+    pub fd: IoFd,
 }
 
 /// Accept a new connection on a listening socket.
 /// Result includes the new socket handle and remote address.
-pub struct Accept<H: RawHandleMeta, A: SockAddr> {
-    pub fd: IoFd<H>,
+pub struct Accept<A: SockAddr> {
+    pub fd: IoFd,
     /// Buffer for storing the remote address.
     /// On Windows, we parse the result from the AcceptEx output buffer, so we don't need this storage.
     pub addr: A,
@@ -814,8 +823,8 @@ pub struct Accept<H: RawHandleMeta, A: SockAddr> {
 }
 
 /// Send data to a specific address (UDP).
-pub struct SendTo<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct SendTo {
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub buf_offset: usize,
     /// Target address.
@@ -823,24 +832,24 @@ pub struct SendTo<H: RawHandleMeta> {
 }
 
 /// Sync file range.
-pub struct SyncFileRange<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct SyncFileRange {
+    pub fd: IoFd,
     pub offset: u64,
     pub nbytes: u64,
     pub flags: u32,
 }
 
 /// Pre-allocate file space.
-pub struct Fallocate<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct Fallocate {
+    pub fd: IoFd,
     pub mode: i32,
     pub offset: u64,
     pub len: u64,
 }
 
 /// Receive data as UDP datagram stream.
-pub struct UdpRecvStream<H: RawHandleMeta> {
-    pub fd: IoFd<H>,
+pub struct UdpRecvStream {
+    pub fd: IoFd,
     /// Unix io_uring path uses this provided buffer; Windows can leave it as None.
     pub buf: Option<FixedBuf>,
     /// Unix io_uring path: source address parsed from recvmsg.
@@ -858,43 +867,6 @@ pub struct UdpRecvPacket {
 // ============================================================================
 // OpLifecycle Implementations
 // ============================================================================
-
-impl<H: RawHandleMeta, A: SockAddr> OpLifecycle for Accept<H, A> {
-    type PreAlloc = ();
-    type Output = (OwnedRawHandle<H>, std::net::SocketAddr);
-    type Raw = H;
-    type CompletionValue = OwnedRawHandle<H>;
-
-    fn pre_alloc(_fd: H) -> std::io::Result<Self::PreAlloc> {
-        Ok(())
-    }
-
-    fn into_op(fd: H, _pre: Self::PreAlloc) -> Self {
-        // Use stack/inline storage
-        let addr_len = std::mem::size_of::<A>() as u32;
-
-        Self {
-            fd: IoFd::Raw(RawHandle::new(fd)),
-            addr: A::default(),
-            addr_len,
-            remote_addr: None,
-        }
-    }
-
-    fn into_output(
-        self,
-        res: std::io::Result<Self::CompletionValue>,
-    ) -> std::io::Result<Self::Output> {
-        let fd = res?;
-        let addr = self.remote_addr.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "driver must populate Accept::remote_addr before completion",
-            )
-        })?;
-        Ok((fd, addr))
-    }
-}
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {

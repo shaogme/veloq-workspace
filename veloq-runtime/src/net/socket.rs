@@ -80,9 +80,10 @@ impl TcpSocket {
     ///
     /// Consumes the `TcpSocket` and returns a `TcpListener`.
     pub fn listen(self, backlog: u32) -> io::Result<TcpListener> {
+        let local_addr = self.inner.local_addr()?;
         self.inner.listen(backlog as i32)?;
         Ok(GenericTcpListener {
-            inner: InnerSocket::new(self.inner.into_owned_raw().into_raw()),
+            inner: InnerSocket::new(self.inner.into_owned_raw().into_raw(), Some(local_addr))?,
             submitter: DetachedSubmitter::new()?,
         })
     }
@@ -91,7 +92,7 @@ impl TcpSocket {
     ///
     /// Consumes the `TcpSocket` and returns a `TcpStream` future.
     pub async fn connect(self, addr: SocketAddr) -> io::Result<TcpStream> {
-        let inner = InnerSocket::new(self.inner.into_owned_raw().into_raw());
+        let inner = InnerSocket::new(self.inner.into_owned_raw().into_raw(), None)?;
         TcpStream::connect_from_inner(inner, addr).await
     }
 }
@@ -154,9 +155,10 @@ impl UdpSocketBuilder {
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No address provided"))?;
         self.inner.bind(addr)?;
+        let local_addr = self.inner.local_addr()?;
 
         Ok(GenericUdpSocket {
-            inner: InnerSocket::new(self.inner.into_owned_raw().into_raw()),
+            inner: InnerSocket::new(self.inner.into_owned_raw().into_raw(), Some(local_addr))?,
             submitter: DetachedSubmitter::new()?,
         })
     }

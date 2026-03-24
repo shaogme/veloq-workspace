@@ -22,36 +22,22 @@ pub trait SlotSidecar: Default + Send + 'static {}
 
 impl<T> SlotSidecar for T where T: Default + Send + 'static {}
 
-/// Represents the source of an IO operation: either a raw handle or a registered index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoFd<H: RawHandleMeta> {
-    /// A raw system handle token interpreted by each driver.
-    Raw(RawHandle<H>),
-    /// A registered index for pre-registered file descriptors.
-    Fixed(u32),
+/// Represents the source of an IO operation as a registered descriptor index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IoFd {
+    fixed_index: u32,
 }
 
-impl<H: RawHandleMeta> IoFd<H> {
-    /// Returns the raw handle if this is a Raw variant.
-    pub fn raw(&self) -> Option<RawHandle<H>> {
-        match self {
-            Self::Raw(fd) => Some(*fd),
-            Self::Fixed(_) => None,
-        }
-    }
-
-    /// Returns a borrowed raw handle view if this is a Raw variant.
+impl IoFd {
+    /// Creates an IO descriptor from a registered descriptor index.
     #[inline]
-    pub const fn raw_ref(&self) -> Option<&RawHandle<H>> {
-        match self {
-            Self::Raw(fd) => Some(fd),
-            Self::Fixed(_) => None,
-        }
+    pub const fn fixed(index: u32) -> Self {
+        Self { fixed_index: index }
     }
-}
 
-impl<H: RawHandleMeta> From<RawHandle<H>> for IoFd<H> {
-    fn from(handle: RawHandle<H>) -> Self {
-        Self::Raw(handle)
+    /// Returns the registered descriptor index.
+    #[inline]
+    pub const fn fixed_index(self) -> u32 {
+        self.fixed_index
     }
 }

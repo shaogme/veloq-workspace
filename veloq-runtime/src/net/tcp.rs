@@ -6,8 +6,7 @@ use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
-    Accept, Connect, DetachedSubmitter, LocalSubmitter, Op, OpLifecycle, OpSubmitter, Recv,
-    Send as OpSend,
+    Accept, Connect, DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, Recv, Send as OpSend,
 };
 
 // ============================================================================
@@ -48,8 +47,9 @@ fn bind_listener_inner<A: ToSocketAddrs>(addr: A) -> io::Result<InnerSocket> {
 
     socket.bind(addr)?;
     socket.listen(1024)?; // backlog
+    let local_addr = socket.local_addr()?;
 
-    Ok(InnerSocket::new(socket.into_owned_raw().into_raw()))
+    InnerSocket::new(socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
 fn new_stream_inner(addr: &SocketAddr) -> io::Result<InnerSocket> {
@@ -58,7 +58,7 @@ fn new_stream_inner(addr: &SocketAddr) -> io::Result<InnerSocket> {
     } else {
         Socket::new_tcp_v6()?
     };
-    Ok(InnerSocket::new(socket.into_owned_raw().into_raw()))
+    InnerSocket::new(socket.into_owned_raw().into_raw(), None)
 }
 
 // ============================================================================
@@ -74,18 +74,29 @@ impl<S: OpSubmitter> GenericTcpListener<S> {
     }
 
     pub async fn accept(&self) -> io::Result<(GenericTcpStream<S>, SocketAddr)> {
-        let op = Accept::prepare_op(self.inner.raw().raw())?;
+        let op = Accept {
+            fd: self.inner.fd(),
+            addr: veloq_driver::SockAddrStorage::default(),
+            addr_len: std::mem::size_of::<veloq_driver::SockAddrStorage>() as u32,
+            remote_addr: None,
+        };
 
         // Wait for connection
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let op =
             op_back.ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Accept op lost"))?;
 
-        // Check result and get fd, addr
-        let (fd, addr) = op.into_output(res)?;
+        // Completion value is the accepted socket handle; address comes from payload sideband.
+        let accepted = res?;
+        let addr = op.remote_addr.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Accept completed without remote address",
+            )
+        })?;
 
         let stream = GenericTcpStream {
-            inner: InnerSocket::new(fd.into_raw()),
+            inner: InnerSocket::new(accepted.into_raw(), None)?,
             submitter: self.submitter.clone(),
         };
 

@@ -1,14 +1,8 @@
-use crate::config::{BorrowedRawHandle, IoFd};
 use crate::driver::UringDriver;
 use crate::op::{UringOp, UringOpPayload};
 use io_uring::{opcode, squeue, types};
 use std::io;
 use veloq_buf::PoolKind;
-
-#[inline]
-fn io_uring_fd(handle: BorrowedRawHandle<'_>) -> types::Fd {
-    types::Fd(handle.raw().as_fd())
-}
 
 macro_rules! impl_lifecycle {
     ($drop_fn:ident, $variant:ident, direct_fd) => {
@@ -73,31 +67,15 @@ macro_rules! make_rw_fixed {
 
             if is_registered {
                 let fixed_idx = region_info.id;
-                match rw_op.fd {
-                    IoFd::Raw(fd) => {
-                        let fd = fd.borrow();
-                        Ok($type_fixed(io_uring_fd(fd), ptr, len, fixed_idx)
-                            .offset(rw_op.offset)
-                            .build())
-                    }
-                    IoFd::Fixed(fd_idx) => {
-                        Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
-                            .offset(rw_op.offset)
-                            .build())
-                    }
-                }
+                let fd_idx = rw_op.fd.fixed_index();
+                Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
+                    .offset(rw_op.offset)
+                    .build())
             } else {
-                match rw_op.fd {
-                    IoFd::Raw(fd) => {
-                        let fd = fd.borrow();
-                        Ok($type_raw(io_uring_fd(fd), ptr, len)
-                            .offset(rw_op.offset)
-                            .build())
-                    }
-                    IoFd::Fixed(fd_idx) => Ok($type_raw(types::Fixed(fd_idx), ptr, len)
-                        .offset(rw_op.offset)
-                        .build()),
-                }
+                let fd_idx = rw_op.fd.fixed_index();
+                Ok($type_raw(types::Fixed(fd_idx), ptr, len)
+                    .offset(rw_op.offset)
+                    .build())
             }
         }
     };
@@ -131,31 +109,15 @@ macro_rules! make_rw_fixed {
 
             if is_registered {
                 let fixed_idx = region_info.id;
-                match rw_op.fd {
-                    IoFd::Raw(fd) => {
-                        let fd = fd.borrow();
-                        Ok($type_fixed(io_uring_fd(fd), ptr, len, fixed_idx)
-                            .offset(rw_op.offset)
-                            .build())
-                    }
-                    IoFd::Fixed(fd_idx) => {
-                        Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
-                            .offset(rw_op.offset)
-                            .build())
-                    }
-                }
+                let fd_idx = rw_op.fd.fixed_index();
+                Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
+                    .offset(rw_op.offset)
+                    .build())
             } else {
-                match rw_op.fd {
-                    IoFd::Raw(fd) => {
-                        let fd = fd.borrow();
-                        Ok($type_raw(io_uring_fd(fd), ptr, len)
-                            .offset(rw_op.offset)
-                            .build())
-                    }
-                    IoFd::Fixed(fd_idx) => Ok($type_raw(types::Fixed(fd_idx), ptr, len)
-                        .offset(rw_op.offset)
-                        .build()),
-                }
+                let fd_idx = rw_op.fd.fixed_index();
+                Ok($type_raw(types::Fixed(fd_idx), ptr, len)
+                    .offset(rw_op.offset)
+                    .build())
             }
         }
     };
@@ -199,13 +161,8 @@ macro_rules! make_buf_op {
             let val = unsafe { kernel.user.as_mut() };
             let ptr = unsafe { val.buf.as_mut_ptr().add(val.buf_offset) };
             let len = (val.buf.capacity() - val.buf_offset) as u32;
-            match val.fd {
-                IoFd::Raw(fd) => {
-                    let fd = fd.borrow();
-                    Ok($opcode(io_uring_fd(fd), ptr, len).build())
-                }
-                IoFd::Fixed(idx) => Ok($opcode(types::Fixed(idx), ptr, len).build()),
-            }
+            let idx = val.fd.fixed_index();
+            Ok($opcode(types::Fixed(idx), ptr, len).build())
         }
     };
     ($fn_name:ident, $variant:ident, $opcode:path, send_args) => {
@@ -225,13 +182,8 @@ macro_rules! make_buf_op {
             let val = unsafe { kernel.user.as_mut() };
             let ptr = unsafe { val.buf.as_slice().as_ptr().add(val.buf_offset) };
             let len = (val.buf.len() - val.buf_offset) as u32;
-            match val.fd {
-                IoFd::Raw(fd) => {
-                    let fd = fd.borrow();
-                    Ok($opcode(io_uring_fd(fd), ptr, len).build())
-                }
-                IoFd::Fixed(idx) => Ok($opcode(types::Fixed(idx), ptr, len).build()),
-            }
+            let idx = val.fd.fixed_index();
+            Ok($opcode(types::Fixed(idx), ptr, len).build())
         }
     };
 }
@@ -266,26 +218,41 @@ pub(crate) unsafe fn make_sqe_connect(
         }
     };
     let val = unsafe { kernel.user.as_mut() };
-    match val.fd {
-        IoFd::Raw(fd) => {
-            let fd = fd.borrow();
-            Ok(opcode::Connect::new(
-                io_uring_fd(fd),
-                &val.addr.0 as *const _ as *const _,
-                val.addr_len,
-            )
-            .build())
-        }
-        IoFd::Fixed(idx) => Ok(opcode::Connect::new(
-            types::Fixed(idx),
-            &val.addr.0 as *const _ as *const _,
-            val.addr_len,
-        )
-        .build()),
-    }
+    let idx = val.fd.fixed_index();
+    Ok(opcode::Connect::new(
+        types::Fixed(idx),
+        &val.addr.0 as *const _ as *const _,
+        val.addr_len,
+    )
+    .build())
 }
 impl_default_completion!(on_complete_connect);
 impl_lifecycle!(drop_connect, Connect, direct_fd);
+
+pub(crate) unsafe fn make_sqe_udp_connect(
+    op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> io::Result<squeue::Entry> {
+    let kernel = match &mut op.payload {
+        UringOpPayload::UdpConnect(kernel) => kernel,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UringOpPayload variant mismatch",
+            ));
+        }
+    };
+    let val = unsafe { kernel.user.as_mut() };
+    let idx = val.fd.fixed_index();
+    Ok(opcode::Connect::new(
+        types::Fixed(idx),
+        &val.addr.0 as *const _ as *const _,
+        val.addr_len,
+    )
+    .build())
+}
+impl_default_completion!(on_complete_udp_connect);
+impl_lifecycle!(drop_udp_connect, UdpConnect, direct_fd);
 
 pub(crate) unsafe fn make_sqe_accept(
     op: &mut UringOp,
@@ -301,23 +268,13 @@ pub(crate) unsafe fn make_sqe_accept(
         }
     };
     let val = unsafe { payload.user.as_mut() };
-    match val.fd {
-        IoFd::Raw(fd) => {
-            let fd = fd.borrow();
-            Ok(opcode::Accept::new(
-                io_uring_fd(fd),
-                &mut val.addr.0 as *mut _ as *mut _,
-                &mut val.addr_len as *mut _,
-            )
-            .build())
-        }
-        IoFd::Fixed(idx) => Ok(opcode::Accept::new(
-            types::Fixed(idx),
-            &mut val.addr.0 as *mut _ as *mut _,
-            &mut val.addr_len as *mut _,
-        )
-        .build()),
-    }
+    let idx = val.fd.fixed_index();
+    Ok(opcode::Accept::new(
+        types::Fixed(idx),
+        &mut val.addr.0 as *mut _ as *mut _,
+        &mut val.addr_len as *mut _,
+    )
+    .build())
 }
 
 pub(crate) unsafe fn on_complete_accept(op: &mut UringOp, result: i32) -> io::Result<usize> {
@@ -374,15 +331,8 @@ pub(crate) unsafe fn make_sqe_send_to(
     payload.msghdr.msg_iov = payload.iovec.as_mut_ptr();
     payload.msghdr.msg_iovlen = 1;
 
-    match user.fd {
-        IoFd::Raw(fd) => {
-            let fd = fd.borrow();
-            Ok(opcode::SendMsg::new(io_uring_fd(fd), &payload.msghdr as *const _).build())
-        }
-        IoFd::Fixed(idx) => {
-            Ok(opcode::SendMsg::new(types::Fixed(idx), &payload.msghdr as *const _).build())
-        }
-    }
+    let idx = user.fd.fixed_index();
+    Ok(opcode::SendMsg::new(types::Fixed(idx), &payload.msghdr as *const _).build())
 }
 
 impl_default_completion!(on_complete_send_to);
@@ -421,15 +371,8 @@ pub(crate) unsafe fn make_sqe_udp_recv_stream(
     payload.msghdr.msg_iov = payload.iovec.as_mut_ptr();
     payload.msghdr.msg_iovlen = 1;
 
-    match fd {
-        IoFd::Raw(fd) => {
-            let fd = fd.borrow();
-            Ok(opcode::RecvMsg::new(io_uring_fd(fd), &mut payload.msghdr as *mut _).build())
-        }
-        IoFd::Fixed(idx) => {
-            Ok(opcode::RecvMsg::new(types::Fixed(idx), &mut payload.msghdr as *mut _).build())
-        }
-    }
+    let idx = fd.fixed_index();
+    Ok(opcode::RecvMsg::new(types::Fixed(idx), &mut payload.msghdr as *mut _).build())
 }
 
 pub(crate) unsafe fn on_complete_udp_recv_stream(
@@ -475,13 +418,8 @@ pub(crate) unsafe fn make_sqe_close(
         }
     };
     let close_op = unsafe { kernel.user.as_mut() };
-    match close_op.fd {
-        IoFd::Raw(fd) => {
-            let fd = fd.borrow();
-            Ok(opcode::Close::new(io_uring_fd(fd)).build())
-        }
-        IoFd::Fixed(idx) => Ok(opcode::Close::new(types::Fixed(idx)).build()),
-    }
+    let idx = close_op.fd.fixed_index();
+    Ok(opcode::Close::new(types::Fixed(idx)).build())
 }
 
 impl_default_completion!(on_complete_close);
@@ -507,13 +445,8 @@ pub(crate) unsafe fn make_sqe_fsync(
         io_uring::types::FsyncFlags::empty()
     };
 
-    match fsync_op.fd {
-        IoFd::Raw(fd) => {
-            let fd = fd.borrow();
-            Ok(opcode::Fsync::new(io_uring_fd(fd)).flags(flags).build())
-        }
-        IoFd::Fixed(idx) => Ok(opcode::Fsync::new(types::Fixed(idx)).flags(flags).build()),
-    }
+    let idx = fsync_op.fd.fixed_index();
+    Ok(opcode::Fsync::new(types::Fixed(idx)).flags(flags).build())
 }
 
 impl_default_completion!(on_complete_fsync);
@@ -549,19 +482,11 @@ pub(crate) unsafe fn make_sqe_sync_range(
         sync_op.nbytes as u32
     };
 
-    match sync_op.fd {
-        IoFd::Raw(fd) => {
-            let fd = fd.borrow();
-            Ok(opcode::SyncFileRange::new(io_uring_fd(fd), nbytes)
-                .offset(sync_op.offset)
-                .flags(sync_op.flags)
-                .build())
-        }
-        IoFd::Fixed(idx) => Ok(opcode::SyncFileRange::new(types::Fixed(idx), nbytes)
-            .offset(sync_op.offset)
-            .flags(sync_op.flags)
-            .build()),
-    }
+    let idx = sync_op.fd.fixed_index();
+    Ok(opcode::SyncFileRange::new(types::Fixed(idx), nbytes)
+        .offset(sync_op.offset)
+        .flags(sync_op.flags)
+        .build())
 }
 
 impl_default_completion!(on_complete_sync_range);
@@ -581,18 +506,11 @@ pub(crate) unsafe fn make_sqe_fallocate(
         }
     };
     let fallocate_op = unsafe { kernel.user.as_mut() };
-    match fallocate_op.fd {
-        IoFd::Raw(fd) => Ok(
-            opcode::Fallocate::new(io_uring_fd(fd.borrow()), fallocate_op.len)
-                .offset(fallocate_op.offset)
-                .mode(fallocate_op.mode)
-                .build(),
-        ),
-        IoFd::Fixed(idx) => Ok(opcode::Fallocate::new(types::Fixed(idx), fallocate_op.len)
-            .offset(fallocate_op.offset)
-            .mode(fallocate_op.mode)
-            .build()),
-    }
+    let idx = fallocate_op.fd.fixed_index();
+    Ok(opcode::Fallocate::new(types::Fixed(idx), fallocate_op.len)
+        .offset(fallocate_op.offset)
+        .mode(fallocate_op.mode)
+        .build())
 }
 
 impl_default_completion!(on_complete_fallocate);
@@ -660,15 +578,8 @@ pub(crate) unsafe fn make_sqe_wakeup(
         }
     };
     let user = unsafe { payload.user.as_ref() };
-    match user.fd {
-        IoFd::Raw(fd) => {
-            let fd = fd.borrow();
-            Ok(opcode::Read::new(io_uring_fd(fd), payload.buf.as_mut_ptr(), 8).build())
-        }
-        IoFd::Fixed(idx) => {
-            Ok(opcode::Read::new(types::Fixed(idx), payload.buf.as_mut_ptr(), 8).build())
-        }
-    }
+    let idx = user.fd.fixed_index();
+    Ok(opcode::Read::new(types::Fixed(idx), payload.buf.as_mut_ptr(), 8).build())
 }
 
 impl_default_completion!(on_complete_wakeup);

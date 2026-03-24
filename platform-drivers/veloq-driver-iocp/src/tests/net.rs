@@ -1,4 +1,4 @@
-use crate::config::{IoFd, IocpConfig, IocpHandle};
+use crate::config::{IoFd, IocpConfig};
 use crate::driver::IocpDriver;
 use crate::net::addr::{SockAddrStorage, socket_addr_to_storage};
 use crate::net::socket::Socket;
@@ -10,13 +10,18 @@ use std::os::windows::io::IntoRawSocket;
 use std::time::Duration;
 use veloq_buf::BufPool;
 use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
-use veloq_driver_core::driver::{Driver, SubmitBinder};
-use veloq_driver_core::op::{Accept as AcceptBase, Connect as ConnectBase, Recv as RecvBase};
-use veloq_driver_core::op::{IntoPlatformOp, OpLifecycle};
+use veloq_driver_core::driver::{Driver, RegisterFd, SubmitBinder};
+use veloq_driver_core::op::{Accept, Connect, IntoPlatformOp, Recv};
 
-type Accept = AcceptBase<IocpHandle, SockAddrStorage>;
-type Connect = ConnectBase<IocpHandle, SockAddrStorage>;
-type Recv = RecvBase<IocpHandle>;
+fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
+    let handle = socket.into_owned_raw();
+    driver
+        .register_files(vec![RegisterFd::Owned(handle)])
+        .expect("register socket failed")
+        .into_iter()
+        .next()
+        .expect("register_files returned empty")
+}
 
 #[test]
 fn test_iocp_accept() {
@@ -27,9 +32,24 @@ fn test_iocp_accept() {
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = std_listener.local_addr().unwrap();
     let listener_handle = std_listener.into_raw_socket();
+    let listener_owned = unsafe {
+        crate::OwnedRawHandle::from_raw_owned(crate::RawHandle::new(
+            crate::config::IocpHandle::for_socket(listener_handle as usize as _),
+        ))
+    };
+    let listen_fd = driver
+        .register_files(vec![RegisterFd::Owned(listener_owned)])
+        .expect("register listener failed")
+        .into_iter()
+        .next()
+        .expect("register listener returned empty");
 
-    // Prepare Accept Op using OpLifecycle
-    let accept_op = Accept::into_op(IocpHandle::for_socket(listener_handle as usize as _), ());
+    let accept_op = Accept {
+        fd: listen_fd,
+        addr: SockAddrStorage::default(),
+        addr_len: std::mem::size_of::<SockAddrStorage>() as u32,
+        remote_addr: None,
+    };
 
     let (iocp_kernel, accept_payload) =
         IntoPlatformOp::<IocpOp>::into_kernel_and_payload(accept_op);
@@ -62,12 +82,7 @@ fn test_iocp_accept() {
     );
     assert!(op.remote_addr.is_some(), "Remote addr should be populated");
 
-    // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe {
-        if let Some(fd) = op.fd.raw() {
-            drop(Socket::from_raw(fd.raw()));
-        }
-    }
+    driver.unregister_files(vec![listen_fd]).unwrap();
 }
 
 #[test]
@@ -80,13 +95,13 @@ fn test_iocp_connect() {
 
     // Client Socket
     let client = Socket::new_tcp_v4().unwrap();
-    let client_handle = client.into_owned_raw();
+    let client_fd = register_owned_socket(&mut driver, client);
 
     // Create Connect Op manually as it doesn't have into_op
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
 
     let connect_op = Connect {
-        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
+        fd: client_fd,
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
@@ -108,8 +123,7 @@ fn test_iocp_connect() {
     );
     assert!(res.is_ok(), "Connect failed: {:?}", res.err());
 
-    // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe { drop(Socket::from_raw(client_handle.raw())) };
+    driver.unregister_files(vec![client_fd]).unwrap();
 }
 
 #[test]
@@ -131,10 +145,10 @@ fn test_iocp_recv_with_buffer_pool() {
 
     // Create RIO-capable client socket and connect via driver op.
     let client = Socket::new_tcp_v4().expect("client socket create failed");
-    let client_handle = client.into_owned_raw();
+    let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
-        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
+        fd: client_fd,
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
@@ -185,7 +199,7 @@ fn test_iocp_recv_with_buffer_pool() {
 
     // Create Recv Op
     let recv_op = Recv {
-        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
+        fd: client_fd,
         buf,
         buf_offset: 0,
     };
@@ -217,8 +231,7 @@ fn test_iocp_recv_with_buffer_pool() {
     op.buf.set_len(bytes_read);
     assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
-    // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe { drop(Socket::from_raw(client_handle.raw())) };
+    driver.unregister_files(vec![client_fd]).unwrap();
     server_thread.join().unwrap();
 }
 
@@ -244,10 +257,10 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     });
 
     let client = Socket::new_tcp_v4().expect("client socket create failed");
-    let client_handle = client.into_owned_raw();
+    let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
-        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
+        fd: client_fd,
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
@@ -284,7 +297,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         .expect("register chunk failed");
 
     let recv_op = Recv {
-        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
+        fd: client_fd,
         buf,
         buf_offset: 0,
     };
@@ -307,8 +320,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 
     let _ = tx_send.send(());
     server_thread.join().unwrap();
-    // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe { drop(Socket::from_raw(client_handle.raw())) };
+    driver.unregister_files(vec![client_fd]).unwrap();
 }
 
 #[test]
@@ -333,10 +345,10 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     });
 
     let client = Socket::new_tcp_v4().expect("client socket create failed");
-    let client_handle = client.into_owned_raw();
+    let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
-        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
+        fd: client_fd,
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
@@ -373,7 +385,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         .expect("register chunk failed");
 
     let recv_op = Recv {
-        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
+        fd: client_fd,
         buf,
         buf_offset: 0,
     };
@@ -415,6 +427,5 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     );
 
     server_thread.join().unwrap();
-    // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe { drop(Socket::from_raw(client_handle.raw())) };
+    driver.unregister_files(vec![client_fd]).unwrap();
 }

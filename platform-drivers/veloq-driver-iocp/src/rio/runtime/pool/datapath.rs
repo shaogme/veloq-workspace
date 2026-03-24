@@ -152,7 +152,7 @@ impl UdpPoolManager {
     pub(crate) fn try_submit_pool_recv(
         &mut self,
         mailbox: &mut UdpMailbox,
-        stream_op: &mut UdpRecvStream<crate::config::IocpHandle>,
+        stream_op: &mut UdpRecvStream,
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> RioResult<(SubmissionResult, usize)> {
@@ -171,7 +171,7 @@ impl UdpPoolManager {
     pub(crate) fn try_submit_pool_recv_recv(
         &mut self,
         mailbox: &mut UdpMailbox,
-        recv_op: &mut OpUdpRecv<crate::config::IocpHandle>,
+        recv_op: &mut OpUdpRecv,
         uid: (usize, u32),
         ctx: &mut RioContext,
     ) -> RioResult<(SubmissionResult, usize, Option<usize>)> {
@@ -505,7 +505,7 @@ impl UdpRecvPool {
     pub(crate) fn try_submit_recv(
         &mut self,
         mailbox: &mut UdpMailbox,
-        stream_op: &mut UdpRecvStream<crate::config::IocpHandle>,
+        stream_op: &mut UdpRecvStream,
         uid: (usize, u32),
         ctx: &mut RioContext,
         registry: &mut TokenRegistry,
@@ -549,7 +549,7 @@ impl UdpRecvPool {
     pub(crate) fn try_submit_recv_recv(
         &mut self,
         mailbox: &mut UdpMailbox,
-        recv_op: &mut OpUdpRecv<crate::config::IocpHandle>,
+        recv_op: &mut OpUdpRecv,
         uid: (usize, u32),
         ctx: &mut RioContext,
         registry: &mut TokenRegistry,
@@ -775,10 +775,7 @@ impl UdpRecvPool {
 }
 
 impl UdpPoolManager {
-    fn copy_data_to_recv_op(
-        recv_op: &mut OpUdpRecv<crate::config::IocpHandle>,
-        src: &[u8],
-    ) -> usize {
+    fn copy_data_to_recv_op(recv_op: &mut OpUdpRecv, src: &[u8]) -> usize {
         let start = recv_op.buf_offset.min(recv_op.buf.len());
         let dst_len = recv_op.buf.len().saturating_sub(start);
         let copied = dst_len.min(src.len());
@@ -904,7 +901,7 @@ impl UdpPoolManager {
 
     fn get_stream_op_mut<'a>(
         guard: &'a mut Slot<'_, InFlightWaiting>,
-    ) -> Option<&'a mut UdpRecvStream<crate::config::IocpHandle>> {
+    ) -> Option<&'a mut UdpRecvStream> {
         guard
             .with_op_mut(|iocp_op| {
                 if let IocpOpPayload::UdpRecvStream(ref mut kernel) = iocp_op.payload {
