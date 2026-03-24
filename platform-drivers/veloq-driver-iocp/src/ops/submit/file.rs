@@ -1,9 +1,8 @@
-use std::io;
 use veloq_blocking::BlockingTask;
 use veloq_blocking::blocking_ops::windows::{BlockingOps, CompletionInfo};
 use veloq_buf::FixedBuf;
 
-use crate::common::IocpErrorContext;
+use crate::error::{IocpError, IocpResult};
 use crate::ops::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write,
     mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle, unpack_kernel_ref,
@@ -23,7 +22,7 @@ macro_rules! submit_io_op {
             header: &mut OverlappedEntry,
             payload: &mut KernelRef<$field_type>,
             ctx: &mut SubmitContext,
-        ) -> io::Result<SubmissionResult> {
+        ) -> IocpResult<SubmissionResult> {
             // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
             let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
 
@@ -48,38 +47,30 @@ macro_rules! submit_io_op {
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             if val.buf_offset > val.buf.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "{}: buf_offset {} exceeds buffer length {}",
-                        stringify!($fn_name),
-                        val.buf_offset,
-                        val.buf.len()
-                    ),
-                ));
+                return Err(error_stack::Report::new(IocpError::InvalidInput).attach(format!(
+                    "{}: buf_offset {} exceeds buffer length {}",
+                    stringify!($fn_name),
+                    val.buf_offset,
+                    val.buf.len()
+                )));
             }
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
             // SAFETY: buf_offset <= buf.len() is verified above.
             let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
-            let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }.map_err(|e| {
-                crate::common::io_error(
-                    IocpErrorContext::Submission,
-                    e,
-                    format!(
-                        "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
-                        stringify!($fn_name),
-                        val.fd,
-                        handle.raw().as_handle(),
-                        header.user_data,
-                        header.generation,
-                        val.offset,
-                        val.buf_offset,
-                        len
-                    ),
-                )
-            });
+            let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
+                .map_err(|e| e.attach(format!(
+                    "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
+                    stringify!($fn_name),
+                    val.fd,
+                    handle.raw().as_handle(),
+                    header.user_data,
+                    header.generation,
+                    val.offset,
+                    val.buf_offset,
+                    len
+                )));
             mark_header_in_flight(header, submit_res)
         }
     };
@@ -116,7 +107,7 @@ pub(crate) fn submit_open(
     header: &mut OverlappedEntry,
     payload: &mut OpenPayload,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let path_ptr = user.path.as_slice().as_ptr() as usize;
@@ -145,7 +136,7 @@ pub(crate) fn submit_close(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Close>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
@@ -173,7 +164,7 @@ pub(crate) fn submit_fsync(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Fsync>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
@@ -201,7 +192,7 @@ pub(crate) fn submit_sync_range(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<SyncFileRange>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
@@ -229,7 +220,7 @@ pub(crate) fn submit_fallocate(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Fallocate>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;

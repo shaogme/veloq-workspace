@@ -1,3 +1,4 @@
+use crate::error::{IocpError, IocpResult, IocpResultExt};
 use std::io;
 use std::mem::offset_of;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -131,12 +132,11 @@ impl SockAddrIn6 {
 }
 
 /// Converts a byte buffer to a SocketAddr.
-pub fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
+pub fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
     if buf.len() < 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid address length",
-        ));
+        return Err(
+            error_stack::Report::new(IocpError::InvalidInput).attach("invalid address length")
+        );
     }
 
     // Use veloq_pod to cast the family safely if possible, but family is at offset 0.
@@ -145,29 +145,25 @@ pub fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
     match family {
         AF_INET => {
             if buf.len() < std::mem::size_of::<SOCKADDR_IN>() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid address length",
-                ));
+                return Err(error_stack::Report::new(IocpError::InvalidInput)
+                    .attach("invalid IPv4 sockaddr length"));
             }
             let sin_wrapped: &SockAddrIn = from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN>()]);
             Ok(SocketAddr::V4(sin_wrapped.to_std()))
         }
         AF_INET6 => {
             if buf.len() < std::mem::size_of::<SOCKADDR_IN6>() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid address length",
-                ));
+                return Err(error_stack::Report::new(IocpError::InvalidInput)
+                    .attach("invalid IPv6 sockaddr length"));
             }
             let sin6_wrapped: &SockAddrIn6 =
                 from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN6>()]);
             Ok(SocketAddr::V6(sin6_wrapped.to_std()))
         }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Unsupported address family",
-        )),
+        _ => {
+            Err(error_stack::Report::new(IocpError::InvalidInput)
+                .attach("unsupported address family"))
+        }
     }
 }
 
@@ -199,7 +195,7 @@ impl SocketAddrCodec for SockAddrStorage {
     type Len = i32;
 
     fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
-        to_socket_addr(buf)
+        to_socket_addr(buf).to_io_result("decode socket address failed")
     }
 
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {

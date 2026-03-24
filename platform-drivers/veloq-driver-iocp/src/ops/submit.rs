@@ -2,12 +2,12 @@ pub(crate) mod common;
 pub(crate) mod file;
 pub(crate) mod net;
 
+use crate::error::IocpResult;
 use crate::ops::{
     AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend, OpenPayload, Recv,
     SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecv, UdpRecvStream,
     UdpSend, Wakeup,
 };
-use std::io;
 
 pub(crate) use common::SubmissionResult;
 pub(crate) use common::resolve_fd_handle;
@@ -68,7 +68,7 @@ pub(crate) fn submit_wakeup(
     _header: &mut crate::ops::OverlappedEntry,
     _payload: &mut KernelRef<Wakeup>,
     _ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     Ok(SubmissionResult::PostToQueue)
 }
 
@@ -79,7 +79,7 @@ pub(crate) fn submit_timeout(
     _header: &mut crate::ops::OverlappedEntry,
     payload: &mut KernelRef<Timeout>,
     _ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: Dereferencing the user pointer in KernelRef.
     let u = unsafe { payload.user.as_ref() };
     Ok(SubmissionResult::Timer(u.duration))

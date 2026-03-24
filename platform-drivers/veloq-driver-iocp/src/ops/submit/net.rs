@@ -1,4 +1,3 @@
-use std::io;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use veloq_pod::{bytes_of_mut, from_bytes_mut};
@@ -7,8 +6,8 @@ use windows_sys::Win32::Networking::WinSock::{
     SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET,
 };
 
-use crate::common::{IocpErrorContext, io_error};
 use crate::config::BorrowedRawHandle;
+use crate::error::{IocpError, IocpResult, from_io_error};
 use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
 use crate::ops::submit::common::{
@@ -29,8 +28,8 @@ use crate::win32::SafeSocket;
 
 fn with_borrowed_socket<T>(
     raw: SOCKET,
-    f: impl FnOnce(&SafeSocket) -> io::Result<T>,
-) -> io::Result<T> {
+    f: impl FnOnce(&SafeSocket) -> IocpResult<T>,
+) -> IocpResult<T> {
     let socket = ManuallyDrop::new(SafeSocket(raw));
     f(&socket)
 }
@@ -39,7 +38,7 @@ pub(crate) fn submit_recv(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Recv>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
@@ -62,14 +61,10 @@ pub(crate) fn submit_recv(
             ctx.registrar,
         )
         .map_err(|e| {
-            io_error(
-                IocpErrorContext::Submission,
-                e,
-                format!(
-                    "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, user_data, generation
-                ),
-            )
+            from_io_error(IocpError::Submission, "submit_recv", e).attach(format!(
+                "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, user_data, generation
+            ))
         })
 }
 
@@ -77,7 +72,7 @@ pub(crate) fn submit_udp_recv(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<UdpRecv>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
@@ -96,14 +91,10 @@ pub(crate) fn submit_udp_recv(
             ctx.registrar,
         )
         .map_err(|e| {
-            io_error(
-                IocpErrorContext::Submission,
-                e,
-                format!(
-                    "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, header.user_data, header.generation
-                ),
-            )
+            from_io_error(IocpError::Submission, "submit_udp_recv", e).attach(format!(
+                "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, header.user_data, header.generation
+            ))
         })
 }
 
@@ -111,7 +102,7 @@ pub(crate) fn submit_send(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<OpSend>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
@@ -133,14 +124,10 @@ pub(crate) fn submit_send(
             ctx.registrar,
         )
         .map_err(|e| {
-            io_error(
-                IocpErrorContext::Submission,
-                e,
-                format!(
-                    "RIO send submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, user_data, generation
-                ),
-            )
+            from_io_error(IocpError::Submission, "submit_send", e).attach(format!(
+                "RIO send submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, user_data, generation
+            ))
         })
 }
 
@@ -148,7 +135,7 @@ pub(crate) fn submit_udp_send(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<UdpSend>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
@@ -170,14 +157,10 @@ pub(crate) fn submit_udp_send(
             ctx.registrar,
         )
         .map_err(|e| {
-            io_error(
-                IocpErrorContext::Submission,
-                e,
-                format!(
-                    "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, user_data, generation
-                ),
-            )
+            from_io_error(IocpError::Submission, "submit_udp_send", e).attach(format!(
+                "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, user_data, generation
+            ))
         })
 }
 
@@ -185,7 +168,7 @@ pub(crate) fn submit_connect(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<Connect>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files)?;
@@ -219,7 +202,7 @@ pub(crate) fn submit_connect(
     })
 }
 
-fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> io::Result<()> {
+fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> IocpResult<()> {
     let mut storage = SockAddrStorage::default();
     let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
 
@@ -277,7 +260,7 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> i
     })
 }
 
-fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> io::Result<u16> {
+fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> IocpResult<u16> {
     let mut storage = SockAddrStorage::default();
     let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
     with_borrowed_socket(handle.raw().as_socket(), |socket| {
@@ -286,9 +269,11 @@ fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> io::Result<u16> {
     })?;
     match storage.family() {
         AF_INET | AF_INET6 => Ok(storage.family()),
-        family => Err(io::Error::other(format!(
-            "unsupported listen socket family for accept: {family}"
-        ))),
+        family => Err(
+            error_stack::Report::new(IocpError::InvalidInput).attach(format!(
+                "unsupported listen socket family for accept: {family}"
+            )),
+        ),
     }
 }
 
@@ -300,10 +285,11 @@ pub(crate) unsafe fn on_complete_connect(
     _payload: &mut KernelRef<Connect>,
     result: usize,
     _ext: &Extensions,
-) -> io::Result<usize> {
-    let raw_handle = header
-        .resolved_handle
-        .ok_or_else(|| io::Error::other("resolved handle missing for connect completion"))?;
+) -> IocpResult<usize> {
+    let raw_handle = header.resolved_handle.ok_or_else(|| {
+        error_stack::Report::new(IocpError::InvalidState)
+            .attach("resolved handle missing for connect completion")
+    })?;
     with_borrowed_socket(raw_handle.as_socket(), |socket| {
         socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
     })?;
@@ -314,7 +300,7 @@ pub(crate) fn submit_udp_connect(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<UdpConnect>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files)?;
@@ -339,7 +325,7 @@ pub(crate) unsafe fn on_complete_udp_connect(
     _payload: &mut KernelRef<UdpConnect>,
     result: usize,
     _ext: &Extensions,
-) -> io::Result<usize> {
+) -> IocpResult<usize> {
     Ok(result)
 }
 
@@ -347,7 +333,7 @@ pub(crate) fn submit_accept(
     header: &mut OverlappedEntry,
     payload: &mut AcceptPayload,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
@@ -361,22 +347,17 @@ pub(crate) fn submit_accept(
         }
         .map(|s| s.into_owned_raw())
         .map_err(|e| {
-            io_error(
-                IocpErrorContext::Submission,
-                e,
-                format!(
-                    "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
-                    handle.raw().as_handle() as usize,
-                    family
-                ),
-            )
+            from_io_error(IocpError::Submission, "submit_accept.create_socket", e).attach(format!(
+                "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
+                handle.raw().as_handle() as usize,
+                family
+            ))
         })?;
         payload.accept_socket = Some(accept_socket);
     }
-    let accept_socket = payload
-        .accept_socket
-        .as_ref()
-        .ok_or_else(|| io::Error::other("accept socket not initialized"))?;
+    let accept_socket = payload.accept_socket.as_ref().ok_or_else(|| {
+        error_stack::Report::new(IocpError::InvalidState).attach("accept socket not initialized")
+    })?;
     let accept_socket_raw = accept_socket.raw().as_socket();
 
     ensure_iocp_association(
@@ -407,19 +388,15 @@ pub(crate) fn submit_accept(
         })
     }
     .map_err(|e| {
-        io_error(
-            IocpErrorContext::Submission,
-            e,
-            format!(
-                "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
-                handle.raw().as_handle() as usize,
-                accept_socket_raw,
-                split,
-                split,
-                header.user_data,
-                header.generation
-            ),
-        )
+        e.attach(format!(
+            "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
+            handle.raw().as_handle() as usize,
+            accept_socket_raw,
+            split,
+            split,
+            header.user_data,
+            header.generation
+        ))
     });
     mark_header_in_flight(header, submit_res)
 }
@@ -432,32 +409,28 @@ pub(crate) unsafe fn on_complete_accept(
     payload: &mut AcceptPayload,
     _result: usize,
     ext: &Extensions,
-) -> io::Result<usize> {
+) -> IocpResult<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
-    let accept_socket = payload
-        .accept_socket
-        .take()
-        .ok_or_else(|| io::Error::other("accept socket not initialized"))?;
-    let listen_handle = header
-        .resolved_handle
-        .ok_or_else(|| io::Error::other("resolved listen handle missing for accept completion"))?;
+    let accept_socket = payload.accept_socket.take().ok_or_else(|| {
+        error_stack::Report::new(IocpError::InvalidState).attach("accept socket not initialized")
+    })?;
+    let listen_handle = header.resolved_handle.ok_or_else(|| {
+        error_stack::Report::new(IocpError::InvalidState)
+            .attach("resolved listen handle missing for accept completion")
+    })?;
     let listen_socket = listen_handle.as_socket();
     let accept_socket_raw = accept_socket.raw().as_socket();
 
     if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
         socket.setsockopt(SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_socket)
     }) {
-        return Err(io_error(
-            IocpErrorContext::Submission,
-            e,
-            format!(
-                "on_complete_accept: setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed: accept_socket=0x{:x}, listen_socket=0x{:x}, optlen={}",
-                accept_socket_raw,
-                listen_socket,
-                std::mem::size_of::<SOCKET>()
-            ),
-        ));
+        return Err(e.attach(format!(
+            "on_complete_accept: setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed: accept_socket=0x{:x}, listen_socket=0x{:x}, optlen={}",
+            accept_socket_raw,
+            listen_socket,
+            std::mem::size_of::<SOCKET>()
+        )));
     }
 
     let split = ACCEPT_EX_ADDR_SECTION_LEN;
@@ -499,7 +472,7 @@ pub(crate) fn submit_send_to(
     header: &mut OverlappedEntry,
     payload: &mut SendToPayload,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
@@ -521,14 +494,10 @@ pub(crate) fn submit_send_to(
     ctx.rio
         .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
         .map_err(|e| {
-            io_error(
-                IocpErrorContext::Submission,
-                e,
-                format!(
-                    "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
-                    user.fd, header.user_data, header.generation, page_idx
-                ),
-            )
+            from_io_error(IocpError::Submission, "submit_send_to", e).attach(format!(
+                "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
+                user.fd, header.user_data, header.generation, page_idx
+            ))
         })
 }
 
@@ -540,7 +509,7 @@ pub(crate) fn submit_udp_recv_stream(
     header: &mut OverlappedEntry,
     payload: &mut KernelRef<UdpRecvStream>,
     ctx: &mut SubmitContext,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
@@ -558,14 +527,10 @@ pub(crate) fn submit_udp_recv_stream(
     ctx.rio
         .try_submit_pool_recv(args, ctx.registrar)
         .map_err(|e| {
-            io_error(
-                IocpErrorContext::Submission,
-                e,
-                format!(
-                    "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, header.user_data, header.generation
-                ),
-            )
+            from_io_error(IocpError::Submission, "submit_udp_recv_stream", e).attach(format!(
+                "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, header.user_data, header.generation
+            ))
         })
 }
 
@@ -577,7 +542,7 @@ pub(crate) unsafe fn on_udp_stream_complete(
     payload: &mut KernelRef<UdpRecvStream>,
     result: usize,
     _ext: &Extensions,
-) -> io::Result<usize> {
+) -> IocpResult<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let val = unsafe { payload.user.as_mut() };
     if result == 0

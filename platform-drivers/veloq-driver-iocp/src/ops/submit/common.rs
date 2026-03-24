@@ -4,8 +4,8 @@ use windows_sys::Win32::Networking::WinSock::SOCKET;
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-use crate::common::{IocpErrorContext, io_error, io_msg};
 use crate::config::{BorrowedRawHandle, IoFd, IocpHandle, RegisteredHandle};
+use crate::error::{IocpError, IocpResult, from_io_error};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
 use crate::ops::{KernelRef, OverlappedEntry};
 use crate::win32::Overlapped;
@@ -58,7 +58,7 @@ pub(crate) unsafe fn iocp_submit_read(
     buf: *mut u8,
     len: u32,
     overlapped: *mut Overlapped,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     let mut bytes = 0;
     // SAFETY: ReadFile is called with valid parameters.
     let ret = unsafe {
@@ -74,7 +74,11 @@ pub(crate) unsafe fn iocp_submit_read(
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
+            return Err(from_io_error(
+                IocpError::Submission,
+                "ReadFile",
+                io::Error::from_raw_os_error(err as i32),
+            ));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -90,7 +94,7 @@ pub(crate) unsafe fn iocp_submit_write(
     buf: *const u8,
     len: u32,
     overlapped: *mut Overlapped,
-) -> io::Result<SubmissionResult> {
+) -> IocpResult<SubmissionResult> {
     let mut bytes = 0;
     // SAFETY: WriteFile is called with valid parameters.
     let ret = unsafe {
@@ -106,7 +110,11 @@ pub(crate) unsafe fn iocp_submit_write(
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
+            return Err(from_io_error(
+                IocpError::Submission,
+                "WriteFile",
+                io::Error::from_raw_os_error(err as i32),
+            ));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -117,7 +125,7 @@ pub(crate) unsafe fn iocp_submit_write(
 /// # Safety
 ///
 /// The caller must ensure that all pointers and the socket handle are valid.
-pub(crate) unsafe fn iocp_submit_connect_ex(args: ConnectExArgs) -> io::Result<SubmissionResult> {
+pub(crate) unsafe fn iocp_submit_connect_ex(args: ConnectExArgs) -> IocpResult<SubmissionResult> {
     // SAFETY: connect_ex is called with valid parameters.
     let ret = unsafe {
         (args.connect_ex)(
@@ -134,7 +142,11 @@ pub(crate) unsafe fn iocp_submit_connect_ex(args: ConnectExArgs) -> io::Result<S
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
+            return Err(from_io_error(
+                IocpError::Submission,
+                "ConnectEx",
+                io::Error::from_raw_os_error(err as i32),
+            ));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -145,7 +157,7 @@ pub(crate) unsafe fn iocp_submit_connect_ex(args: ConnectExArgs) -> io::Result<S
 /// # Safety
 ///
 /// The caller must ensure that all pointers and the socket handles are valid.
-pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> io::Result<SubmissionResult> {
+pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> IocpResult<SubmissionResult> {
     // SAFETY: accept_ex is called with valid parameters.
     let ret = unsafe {
         (args.accept_ex)(
@@ -163,7 +175,11 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> io::Result<Sub
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
-            return Err(io::Error::from_raw_os_error(err as i32));
+            return Err(from_io_error(
+                IocpError::Submission,
+                "AcceptEx",
+                io::Error::from_raw_os_error(err as i32),
+            ));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -176,22 +192,23 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> io::Result<Sub
 pub(crate) fn resolve_fd_borrowed<'a>(
     fd: &'a IoFd,
     registered_files: &'a [Option<RegisteredHandle>],
-) -> io::Result<BorrowedRawHandle<'a>> {
+) -> IocpResult<BorrowedRawHandle<'a>> {
     let idx = fd.fixed_index();
     if let Some(Some(h)) = registered_files.get(idx as usize) {
         Ok(h.as_borrowed())
     } else {
-        Err(io_msg(
-            IocpErrorContext::ResolveFd,
-            format!("invalid registered file descriptor: fd={fd:?}, idx={idx}"),
-        ))
+        Err(
+            error_stack::Report::new(IocpError::ResolveFd).attach(format!(
+                "invalid registered file descriptor: fd={fd:?}, idx={idx}"
+            )),
+        )
     }
 }
 
 pub(crate) fn resolve_fd_handle(
     fd: &IoFd,
     registered_files: &[Option<RegisteredHandle>],
-) -> io::Result<IocpHandle> {
+) -> IocpResult<IocpHandle> {
     resolve_fd_borrowed(fd, registered_files).map(|h| h.raw())
 }
 
@@ -218,17 +235,16 @@ pub(crate) fn ensure_iocp_association(
     handle: BorrowedRawHandle<'_>,
     port: &crate::win32::IoCompletionPort,
     detail: impl Into<String>,
-) -> io::Result<()> {
+) -> IocpResult<()> {
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
-    unsafe { port.associate(handle.raw().as_handle(), 0) }
-        .map_err(|e| io_error(IocpErrorContext::Submission, e, detail))
+    unsafe { port.associate(handle.raw().as_handle(), 0) }.map_err(|e| e.attach(detail.into()))
 }
 
 #[inline]
 pub(crate) fn mark_header_in_flight(
     header: &mut OverlappedEntry,
-    res: io::Result<SubmissionResult>,
-) -> io::Result<SubmissionResult> {
+    res: IocpResult<SubmissionResult>,
+) -> IocpResult<SubmissionResult> {
     if matches!(res, Ok(SubmissionResult::Pending)) {
         header.in_flight = true;
     }

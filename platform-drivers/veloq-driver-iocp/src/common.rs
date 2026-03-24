@@ -3,9 +3,9 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use error_stack::Report;
 use tracing::error;
 
+use crate::error::{IocpError, IocpReportExt, IocpResultExt};
 use crate::win32::IoCompletionPort;
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionRecord, CompletionSidecar, RemoteWaker, SharedCompletionQueue,
@@ -18,64 +18,32 @@ use veloq_driver_core::driver::{
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum IocpErrorContext {
-    DriverInit,
     CompletionWait,
-    Submission,
     Rio,
-    ResolveFd,
 }
 
 impl fmt::Display for IocpErrorContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DriverInit => f.write_str("IOCP driver initialization failed"),
             Self::CompletionWait => f.write_str("IOCP completion wait failed"),
-            Self::Submission => f.write_str("IOCP operation submission failed"),
             Self::Rio => f.write_str("RIO operation failed"),
-            Self::ResolveFd => f.write_str("failed to resolve IO handle"),
         }
     }
 }
 
 impl std::error::Error for IocpErrorContext {}
 
+impl From<IocpErrorContext> for IocpError {
+    fn from(value: IocpErrorContext) -> Self {
+        match value {
+            IocpErrorContext::CompletionWait => IocpError::CompletionWait,
+            IocpErrorContext::Rio => IocpError::Rio,
+        }
+    }
+}
+
 fn sanitize_field(s: &str) -> String {
     s.replace('\n', "\\n").replace('\r', "\\r")
-}
-
-fn extract_structured_field<'a>(s: &'a str, key: &str) -> Option<&'a str> {
-    s.split("; ").find_map(|part| part.strip_prefix(key))
-}
-
-fn parse_nested_source(source: &str) -> (String, Option<i32>) {
-    if !source.starts_with("context=") {
-        return (source.to_string(), None);
-    }
-
-    let nested_ctx = extract_structured_field(source, "context=").unwrap_or("unknown");
-    let nested_detail = extract_structured_field(source, "detail=").unwrap_or("none");
-    let nested_source = extract_structured_field(source, "source=");
-    let nested_os = extract_structured_field(source, "os_error=").and_then(|v| {
-        if v == "none" {
-            None
-        } else {
-            v.parse::<i32>().ok()
-        }
-    });
-
-    let nested_source = match nested_source {
-        Some("none") | None => "none".to_string(),
-        Some(val) => val.to_string(),
-    };
-    (
-        format!(
-            "nested_context={}; nested_detail={}; nested_source={}",
-            sanitize_field(nested_ctx),
-            sanitize_field(nested_detail),
-            sanitize_field(&nested_source)
-        ),
-        nested_os,
-    )
 }
 
 fn structured_line(
@@ -96,31 +64,9 @@ fn structured_line(
     )
 }
 
-pub(crate) fn io_error(
-    ctx: IocpErrorContext,
-    err: io::Error,
-    detail: impl Into<String>,
-) -> io::Error {
-    let detail = detail.into();
-    let raw_source = err.to_string();
-    let (source, nested_os) = parse_nested_source(&raw_source);
-    let os_code = err.raw_os_error().or(nested_os);
-    let report = Report::new(err).change_context(ctx).attach(detail.clone());
-    let msg = structured_line(ctx, &detail, Some(&source), os_code);
-    error!(
-        context = %ctx,
-        detail = %detail,
-        source = %raw_source,
-        os_error = ?os_code,
-        report = ?report,
-        "IOCP error report"
-    );
-    io::Error::other(msg)
-}
-
 pub(crate) fn io_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> io::Error {
     let detail = detail.into();
-    let report = Report::new(ctx).attach(detail.clone());
+    let report = error_stack::Report::new(IocpError::from(ctx)).attach(detail.clone());
     let msg = structured_line(ctx, &detail, None, None);
     error!(
         context = %ctx,
@@ -128,7 +74,7 @@ pub(crate) fn io_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> io::Er
         report = ?report,
         "IOCP error report"
     );
-    io::Error::other(msg)
+    report.to_io_error(msg)
 }
 
 // ============================================================================
@@ -184,7 +130,9 @@ impl RemoteWaker for IocpWaker {
             return Ok(());
         }
         if !self.is_notified.swap(true, Ordering::AcqRel) {
-            self.port.notify(WAKEUP_USER_DATA)?;
+            self.port
+                .notify(WAKEUP_USER_DATA)
+                .to_io_result("failed to notify remote waker")?;
         }
         Ok(())
     }

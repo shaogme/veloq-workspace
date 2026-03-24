@@ -27,6 +27,7 @@ use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
+use crate::error::{IocpReportExt, IocpResultExt};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 pub use inner::IocpDriver;
@@ -99,7 +100,7 @@ impl SocketLifecycleHandle {
         if let Err(err) = post_res {
             // SAFETY: post failed, ownership of `ptr` never left this thread.
             unsafe { drop(Box::from_raw(ptr as *mut DriverControlCommand)) };
-            return Err(err);
+            return Err(err.to_io_error("failed to post socket cleanup control command"));
         }
         Ok(())
     }
@@ -343,7 +344,10 @@ impl IocpDriver {
                 *op_in = guard.take_op();
             }
             ops.remove(user_data);
-            binder.err(err, SubmitStatus::Void)
+            binder.err(
+                err.to_io_error("failed to post completion queue notification"),
+                SubmitStatus::Void,
+            )
         } else {
             if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
                 op_entry.platform_data.rio_pool_waiting = false;
@@ -413,7 +417,8 @@ impl IocpDriver {
             .slot
             .as_mut()
             .and_then(|slot| slot.with_op_mut(|op| op.submit(&mut ctx)))
-            .ok_or_else(|| io::Error::other("Op missing during submission"))?;
+            .ok_or_else(|| io::Error::other("Op missing during submission"))?
+            .map_err(|e| e.to_io_error("op submit failed"));
 
         let pending_socket_key = if matches!(result, Ok(submit::SubmissionResult::Pending)) {
             sub_guard
@@ -436,10 +441,10 @@ impl IocpDriver {
 
         let mut sub_guard_opt = Some(sub_guard);
         if result.is_ok() {
-            let _ = sub_guard_opt
+            let guard = sub_guard_opt
                 .take()
-                .expect("submission guard missing")
-                .persist();
+                .ok_or_else(|| io::Error::other("submission guard missing"))?;
+            let _ = guard.persist();
         }
         drop(sub_guard_opt);
 
@@ -577,7 +582,10 @@ impl IocpDriver {
     }
 
     pub(crate) fn poll_completion(&mut self) -> io::Result<usize> {
-        let status = self.port.get_status(10)?;
+        let status = self
+            .port
+            .get_status(10)
+            .to_io_result("failed to poll IOCP status")?;
 
         match status {
             crate::win32::CompletionStatus::Completed {

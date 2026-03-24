@@ -12,10 +12,10 @@ pub(crate) mod submit;
 pub use overlapped::OverlappedEntry;
 pub(crate) use submit::SubmissionResult;
 
-use std::io;
 use std::ptr::NonNull;
 
 use crate::config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle, RegisteredHandle};
+use crate::error::{IocpError, IocpResult};
 use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioState;
@@ -100,8 +100,8 @@ macro_rules! define_iocp_ops {
 
         /// Virtual table for dynamic dispatch of IOCP operations.
         pub(crate) struct OpVTable {
-            pub(crate) submit: fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> io::Result<SubmissionResult>,
-            pub(crate) on_complete: Option<unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> io::Result<usize>>,
+            pub(crate) submit: fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult>,
+            pub(crate) on_complete: Option<unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> IocpResult<usize>>,
             pub(crate) get_fd: unsafe fn(op: &IocpKernelOp) -> Option<IoFd>,
         }
 
@@ -121,12 +121,12 @@ macro_rules! define_iocp_ops {
             pub(crate) fn get_fd(&self) -> Option<IoFd> {
                 unsafe { (self.vtable.as_ref().get_fd)(self) }
             }
-            pub(crate) fn submit(&mut self, ctx: &mut SubmitContext) -> io::Result<SubmissionResult> {
+            pub(crate) fn submit(&mut self, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult> {
                 // SAFETY: vtable is initialized from a static TABLE and always non-null.
                 let table = unsafe { self.vtable.as_ref() };
                 (table.submit)(self, ctx)
             }
-            pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> io::Result<usize> {
+            pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> IocpResult<usize> {
                 if let Some(on_complete) = unsafe { self.vtable.as_ref().on_complete } {
                     unsafe { (on_complete)(self, result, ext) }
                 } else {
@@ -148,7 +148,10 @@ macro_rules! define_iocp_ops {
                             if let IocpOpPayload::$Variant(ref mut p) = op.payload {
                                 $submit(&mut op.header, p, ctx)
                             } else {
-                                unreachable!("Variant mismatch in IocpKernelOp dispatch for {}", stringify!($OpType));
+                                Err(error_stack::Report::new(IocpError::InvalidState).attach(format!(
+                                    "variant mismatch in IocpKernelOp dispatch for {}",
+                                    stringify!($OpType)
+                                )))
                             }
                         },
                         on_complete: define_iocp_ops!(@optional_complete_shim $OpType, $Variant, $($complete)?),
@@ -156,7 +159,7 @@ macro_rules! define_iocp_ops {
                             if let IocpOpPayload::$Variant(ref p) = op.payload {
                                 $get_fd(p)
                             } else {
-                                unreachable!("Variant mismatch in IocpKernelOp get_fd for {}", stringify!($OpType));
+                                None
                             }
                         },
                     };
@@ -191,7 +194,7 @@ macro_rules! define_iocp_ops {
                     unsafe { Box::from_raw(ptr as *mut $OpType) }
                 }
 
-                fn map_completion_result(&self, res: io::Result<usize>) -> io::Result<Self::Completion> {
+                fn map_completion_result(&self, res: std::io::Result<usize>) -> std::io::Result<Self::Completion> {
                     define_iocp_ops!(@map_completion self, res, $($map_completion)?)
                 }
             }
@@ -207,7 +210,10 @@ macro_rules! define_iocp_ops {
             if let IocpOpPayload::$Variant(ref mut p) = op.payload {
                 $fn(&mut op.header, p, result, ext)
             } else {
-                unreachable!("Variant mismatch in IocpKernelOp on_complete for {}", stringify!($OpType));
+                Err(error_stack::Report::new(IocpError::InvalidState).attach(format!(
+                    "variant mismatch in IocpKernelOp on_complete for {}",
+                    stringify!($OpType)
+                )))
             }
         })
     };
@@ -363,7 +369,7 @@ define_iocp_ops! {
         submit: submit::submit_accept,
         on_complete: submit::on_complete_accept,
         completion: OwnedRawHandle,
-        map_completion: |_op: &Accept, res: io::Result<usize>| {
+        map_completion: |_op: &Accept, res: std::io::Result<usize>| {
             res.map(|raw| unsafe {
                 OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_socket(raw as _)))
             })
@@ -413,7 +419,7 @@ define_iocp_ops! {
         kind: OpKind::Open,
         submit: submit::submit_open,
         completion: OwnedRawHandle,
-        map_completion: |_op: &Open, res: io::Result<usize>| {
+        map_completion: |_op: &Open, res: std::io::Result<usize>| {
             res.map(|raw| unsafe {
                 OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_file(raw as _)))
             })

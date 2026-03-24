@@ -1,5 +1,6 @@
-use std::io;
 use std::ptr;
+
+use crate::error::{IocpError, IocpResult, from_io_error};
 use veloq_pod::{Pod, Zeroable, bytes_of, bytes_of_mut, zeroed};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
@@ -111,6 +112,11 @@ unsafe impl Sync for OwnedHandle {}
 #[derive(Debug)]
 pub struct SafeSocket(pub SOCKET);
 
+#[inline]
+fn win32_last_error(context: IocpError, scope: &'static str) -> error_stack::Report<IocpError> {
+    from_io_error(context, scope, std::io::Error::last_os_error())
+}
+
 impl SafeSocket {
     /// Returns the raw SOCKET.
     pub fn as_raw(&self) -> SOCKET {
@@ -128,21 +134,21 @@ impl SafeSocket {
     ///
     /// The caller must ensure that `addr` is a valid pointer to a `SOCKADDR`
     /// structure and `len` is its size.
-    pub unsafe fn bind(&self, addr: *const SOCKADDR, len: i32) -> io::Result<()> {
+    pub unsafe fn bind(&self, addr: *const SOCKADDR, len: i32) -> IocpResult<()> {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { bind(self.0, addr, len) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(win32_last_error(IocpError::Socket, "bind"));
         }
         Ok(())
     }
 
     /// Listens for incoming connections.
-    pub fn listen(&self, backlog: i32) -> io::Result<()> {
+    pub fn listen(&self, backlog: i32) -> IocpResult<()> {
         // SAFETY: The socket is valid and owned by us.
         let ret = unsafe { listen(self.0, backlog) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(win32_last_error(IocpError::Socket, "listen"));
         }
         Ok(())
     }
@@ -153,11 +159,11 @@ impl SafeSocket {
     ///
     /// The caller must ensure that `addr` is a valid pointer to a `SOCKADDR`
     /// structure and `len` is its size.
-    pub unsafe fn connect(&self, addr: *const SOCKADDR, len: i32) -> io::Result<()> {
+    pub unsafe fn connect(&self, addr: *const SOCKADDR, len: i32) -> IocpResult<()> {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { connect(self.0, addr, len) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(win32_last_error(IocpError::Socket, "connect"));
         }
         Ok(())
     }
@@ -167,11 +173,11 @@ impl SafeSocket {
     /// # Safety
     ///
     /// The caller must ensure that `addr` and `len` are valid pointers.
-    pub unsafe fn getsockname(&self, addr: *mut SOCKADDR, len: *mut i32) -> io::Result<()> {
+    pub unsafe fn getsockname(&self, addr: *mut SOCKADDR, len: *mut i32) -> IocpResult<()> {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { getsockname(self.0, addr, len) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(win32_last_error(IocpError::Socket, "getsockname"));
         }
         Ok(())
     }
@@ -181,17 +187,17 @@ impl SafeSocket {
     /// # Safety
     ///
     /// The caller must ensure that `addr` and `len` are valid pointers.
-    pub unsafe fn getpeername(&self, addr: *mut SOCKADDR, len: *mut i32) -> io::Result<()> {
+    pub unsafe fn getpeername(&self, addr: *mut SOCKADDR, len: *mut i32) -> IocpResult<()> {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { getpeername(self.0, addr, len) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(win32_last_error(IocpError::Socket, "getpeername"));
         }
         Ok(())
     }
 
     /// Sets a socket option.
-    pub fn setsockopt<T>(&self, level: i32, optname: i32, optval: &T) -> io::Result<()> {
+    pub fn setsockopt<T>(&self, level: i32, optname: i32, optval: &T) -> IocpResult<()> {
         // SAFETY: `optval` is a valid reference, and its size is correctly calculated.
         let ret = unsafe {
             setsockopt(
@@ -203,17 +209,17 @@ impl SafeSocket {
             )
         };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(win32_last_error(IocpError::Socket, "setsockopt"));
         }
         Ok(())
     }
 
     /// Sets a socket option with an empty payload.
-    pub fn setsockopt_empty(&self, level: i32, optname: i32) -> io::Result<()> {
+    pub fn setsockopt_empty(&self, level: i32, optname: i32) -> IocpResult<()> {
         // SAFETY: Setting socket option with no payload is safe for valid options.
         let ret = unsafe { setsockopt(self.0, level, optname, std::ptr::null(), 0) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(win32_last_error(IocpError::Socket, "setsockopt_empty"));
         }
         Ok(())
     }
@@ -244,12 +250,15 @@ pub struct IoCompletionPort(OwnedHandle);
 
 impl IoCompletionPort {
     /// Creates a new, unconnected I/O Completion Port.
-    pub fn new(threads: u32) -> io::Result<Self> {
+    pub fn new(threads: u32) -> IocpResult<Self> {
         // SAFETY: Creating an IOCP with default parameters is safe.
         let handle =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, threads) };
         if handle.is_null() {
-            return Err(io::Error::last_os_error());
+            return Err(win32_last_error(
+                IocpError::Win32,
+                "CreateIoCompletionPort.new",
+            ));
         }
         Ok(Self(OwnedHandle(handle)))
     }
@@ -259,7 +268,7 @@ impl IoCompletionPort {
     /// # Safety
     ///
     /// The caller must ensure that `handle` is valid and not already associated.
-    pub unsafe fn associate(&self, handle: HANDLE, completion_key: usize) -> io::Result<()> {
+    pub unsafe fn associate(&self, handle: HANDLE, completion_key: usize) -> IocpResult<()> {
         // SAFETY: The caller ensures that `handle` is valid and not already associated.
         let res = unsafe { CreateIoCompletionPort(handle, self.0.as_raw(), completion_key, 0) };
         if res.is_null() {
@@ -268,7 +277,11 @@ impl IoCompletionPort {
             if err == windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER {
                 return Ok(());
             }
-            return Err(io::Error::from_raw_os_error(err as i32));
+            return Err(from_io_error(
+                IocpError::Win32,
+                "CreateIoCompletionPort.associate",
+                std::io::Error::from_raw_os_error(err as i32),
+            ));
         }
         Ok(())
     }
@@ -283,19 +296,22 @@ impl IoCompletionPort {
         bytes: u32,
         key: usize,
         overlapped: *mut Overlapped,
-    ) -> io::Result<()> {
+    ) -> IocpResult<()> {
         // SAFETY: The caller ensures that `overlapped` is valid if it is not null.
         let res = unsafe {
             PostQueuedCompletionStatus(self.0.as_raw(), bytes, key, overlapped as *mut OVERLAPPED)
         };
         if res == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(win32_last_error(
+                IocpError::Win32,
+                "PostQueuedCompletionStatus",
+            ));
         }
         Ok(())
     }
 
     /// Notifies the completion port with a user-defined completion key.
-    pub fn notify(&self, user_data: usize) -> io::Result<()> {
+    pub fn notify(&self, user_data: usize) -> IocpResult<()> {
         // SAFETY: Posting with a null overlapped is always safe.
         unsafe { self.post(0, user_data, ptr::null_mut()) }
     }
@@ -305,7 +321,7 @@ impl IoCompletionPort {
     /// # Safety
     ///
     /// The caller must ensure that `handle` and `overlapped` are valid.
-    pub unsafe fn cancel_request(handle: HANDLE, overlapped: *mut Overlapped) -> io::Result<()> {
+    pub unsafe fn cancel_request(handle: HANDLE, overlapped: *mut Overlapped) -> IocpResult<()> {
         // SAFETY: The caller ensures `handle` and `overlapped` are valid.
         let res = unsafe { CancelIoEx(handle, overlapped as *mut OVERLAPPED) };
         if res == 0 {
@@ -314,13 +330,17 @@ impl IoCompletionPort {
             if err == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
                 return Ok(());
             }
-            return Err(io::Error::from_raw_os_error(err as i32));
+            return Err(from_io_error(
+                IocpError::Win32,
+                "CancelIoEx",
+                std::io::Error::from_raw_os_error(err as i32),
+            ));
         }
         Ok(())
     }
 
     /// Retrieves a completion status from the port.
-    pub fn get_status(&self, timeout_ms: u32) -> io::Result<CompletionStatus> {
+    pub fn get_status(&self, timeout_ms: u32) -> IocpResult<CompletionStatus> {
         let mut bytes = 0;
         let mut key = 0;
         let mut overlapped = ptr::null_mut();
@@ -343,7 +363,11 @@ impl IoCompletionPort {
                 if err == WAIT_TIMEOUT {
                     return Ok(CompletionStatus::Timeout);
                 }
-                return Err(io::Error::from_raw_os_error(err as i32));
+                return Err(from_io_error(
+                    IocpError::Win32,
+                    "GetQueuedCompletionStatus",
+                    std::io::Error::from_raw_os_error(err as i32),
+                ));
             } else {
                 return Ok(CompletionStatus::Completed {
                     bytes,

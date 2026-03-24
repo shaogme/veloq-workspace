@@ -1,4 +1,4 @@
-use std::io;
+use crate::error::{IocpError, IocpResult, from_io_error};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCK_STREAM,
@@ -57,7 +57,7 @@ impl std::fmt::Debug for Extensions {
 }
 
 impl Extensions {
-    pub(crate) fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> IocpResult<Self> {
         // SAFETY: Calling `WSASocketW` to create a new TCP socket. The parameters
         // are standard for a overlapped socket.
         let socket = unsafe {
@@ -70,7 +70,11 @@ impl Extensions {
                 WSA_FLAG_OVERLAPPED,
             );
             if s == INVALID_SOCKET {
-                return Err(io::Error::last_os_error());
+                return Err(from_io_error(
+                    IocpError::DriverInit,
+                    "WSASocketW",
+                    std::io::Error::last_os_error(),
+                ));
             }
             crate::win32::SafeSocket(s)
         };
@@ -92,7 +96,7 @@ impl Extensions {
 
     fn load_traditional(
         socket: SOCKET,
-    ) -> io::Result<(LpfnAcceptEx, LpfnConnectEx, LpfnGetAcceptExSockaddrs)> {
+    ) -> IocpResult<(LpfnAcceptEx, LpfnConnectEx, LpfnGetAcceptExSockaddrs)> {
         let accept_ex_ptr = Self::get_extension(socket, WSAID_ACCEPTEX)?;
         let connect_ex_ptr = Self::get_extension(socket, WSAID_CONNECTEX)?;
         let get_accept_ex_sockaddrs_ptr = Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
@@ -112,7 +116,7 @@ impl Extensions {
         Ok(funcs)
     }
 
-    fn load_rio(socket: SOCKET) -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
+    fn load_rio(socket: SOCKET) -> IocpResult<RIO_EXTENSION_FUNCTION_TABLE> {
         // SAFETY: `RIO_EXTENSION_FUNCTION_TABLE` is a POD struct. `WSAIoctl` is
         // called to fill it. Memory layout for the struct is guaranteed to be compatible.
         unsafe {
@@ -137,7 +141,11 @@ impl Extensions {
             if ret == 0 {
                 Ok(table)
             } else {
-                Err(io::Error::last_os_error())
+                Err(from_io_error(
+                    IocpError::Rio,
+                    "WSAIoctl.load_rio",
+                    std::io::Error::last_os_error(),
+                ))
             }
         }
     }
@@ -145,7 +153,7 @@ impl Extensions {
     fn get_extension(
         socket: SOCKET,
         guid: windows_sys::core::GUID,
-    ) -> io::Result<*const std::ffi::c_void> {
+    ) -> IocpResult<*const std::ffi::c_void> {
         let mut guid = guid;
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut bytes_returned = 0;
@@ -169,7 +177,11 @@ impl Extensions {
         if ret == 0 {
             Ok(ptr)
         } else {
-            Err(io::Error::last_os_error())
+            Err(from_io_error(
+                IocpError::DriverInit,
+                "WSAIoctl.get_extension",
+                std::io::Error::last_os_error(),
+            ))
         }
     }
 }
