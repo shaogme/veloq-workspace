@@ -75,6 +75,17 @@ async fn run_veloq_tcp_roundtrip(payload_size: NonZeroUsize, rounds: usize) {
     server_h.await;
 }
 
+async fn run_veloq_tcp_roundtrip_reuse_socket(
+    payload_size: NonZeroUsize,
+    rounds_per_iter: usize,
+    iters: u64,
+) {
+    let total_rounds = rounds_per_iter
+        .checked_mul(iters as usize)
+        .expect("veloq tcp total rounds overflow");
+    run_veloq_tcp_roundtrip(payload_size, total_rounds).await;
+}
+
 async fn run_tokio_tcp_roundtrip(payload_size: usize, rounds: usize) {
     let listener = TokioTcpListener::bind("127.0.0.1:0")
         .await
@@ -117,6 +128,17 @@ async fn run_tokio_tcp_roundtrip(payload_size: usize, rounds: usize) {
     }
 
     server_h.await.expect("tokio tcp server join failed");
+}
+
+async fn run_tokio_tcp_roundtrip_reuse_socket(
+    payload_size: usize,
+    rounds_per_iter: usize,
+    iters: u64,
+) {
+    let total_rounds = rounds_per_iter
+        .checked_mul(iters as usize)
+        .expect("tokio tcp total rounds overflow");
+    run_tokio_tcp_roundtrip(payload_size, total_rounds).await;
 }
 
 async fn tokio_udp_read_exact(socket: &TokioUdpSocket, buf: &mut [u8]) -> io::Result<()> {
@@ -221,6 +243,17 @@ async fn run_veloq_udp_roundtrip(payload_size: NonZeroUsize, rounds: usize) {
     server_h.await;
 }
 
+async fn run_veloq_udp_roundtrip_reuse_socket(
+    payload_size: NonZeroUsize,
+    rounds_per_iter: usize,
+    iters: u64,
+) {
+    let total_rounds = rounds_per_iter
+        .checked_mul(iters as usize)
+        .expect("veloq udp total rounds overflow");
+    run_veloq_udp_roundtrip(payload_size, total_rounds).await;
+}
+
 async fn run_tokio_udp_roundtrip(payload_size: usize, rounds: usize) {
     let server = TokioUdpSocket::bind("127.0.0.1:0")
         .await
@@ -271,6 +304,17 @@ async fn run_tokio_udp_roundtrip(payload_size: usize, rounds: usize) {
     server_h.await.expect("tokio udp server join failed");
 }
 
+async fn run_tokio_udp_roundtrip_reuse_socket(
+    payload_size: usize,
+    rounds_per_iter: usize,
+    iters: u64,
+) {
+    let total_rounds = rounds_per_iter
+        .checked_mul(iters as usize)
+        .expect("tokio udp total rounds overflow");
+    run_tokio_udp_roundtrip(payload_size, total_rounds).await;
+}
+
 fn benchmark_tcp(c: &mut Criterion) {
     let mut group = c.benchmark_group("net_tcp_roundtrip");
     group.sample_size(20);
@@ -291,11 +335,9 @@ fn benchmark_tcp(c: &mut Criterion) {
                     .expect("build veloq runtime failed");
 
                 let start = Instant::now();
-                runtime.block_on(async {
-                    for _ in 0..iters {
-                        run_veloq_tcp_roundtrip(payload_nz, ROUNDS).await;
-                    }
-                });
+                runtime.block_on(run_veloq_tcp_roundtrip_reuse_socket(
+                    payload_nz, ROUNDS, iters,
+                ));
                 start.elapsed()
             });
         },
@@ -309,8 +351,14 @@ fn benchmark_tcp(c: &mut Criterion) {
                 .enable_all()
                 .build()
                 .expect("build tokio runtime failed");
-            b.iter(|| {
-                runtime.block_on(run_tokio_tcp_roundtrip(PAYLOAD_SIZE, ROUNDS));
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                runtime.block_on(run_tokio_tcp_roundtrip_reuse_socket(
+                    PAYLOAD_SIZE,
+                    ROUNDS,
+                    iters,
+                ));
+                start.elapsed()
             });
         },
     );
@@ -338,11 +386,9 @@ fn benchmark_udp(c: &mut Criterion) {
                     .expect("build veloq runtime failed");
 
                 let start = Instant::now();
-                runtime.block_on(async {
-                    for _ in 0..iters {
-                        run_veloq_udp_roundtrip(payload_nz, ROUNDS).await;
-                    }
-                });
+                runtime.block_on(run_veloq_udp_roundtrip_reuse_socket(
+                    payload_nz, ROUNDS, iters,
+                ));
                 start.elapsed()
             });
         },
@@ -356,8 +402,14 @@ fn benchmark_udp(c: &mut Criterion) {
                 .enable_all()
                 .build()
                 .expect("build tokio runtime failed");
-            b.iter(|| {
-                runtime.block_on(run_tokio_udp_roundtrip(PAYLOAD_SIZE, ROUNDS));
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                runtime.block_on(run_tokio_udp_roundtrip_reuse_socket(
+                    PAYLOAD_SIZE,
+                    ROUNDS,
+                    iters,
+                ));
+                start.elapsed()
             });
         },
     );
