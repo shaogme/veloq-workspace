@@ -106,17 +106,17 @@ impl Socket {
         Ok(())
     }
 
-    pub fn into_raw(self) -> RawHandle {
-        self.fd.into_raw()
+    pub fn into_owned_raw(self) -> OwnedRawHandle {
+        self.fd
     }
 
     /// # Safety
     ///
     /// `handle` 必须是有效 fd，且满足所有权语义。
-    pub unsafe fn from_raw(handle: RawHandle) -> Self {
+    pub unsafe fn from_raw(handle: UringRawHandle) -> Self {
         Self {
             // SAFETY: forwarded from caller contract.
-            fd: unsafe { OwnedRawHandle::from_raw_owned(handle) },
+            fd: unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(handle)) },
         }
     }
 
@@ -168,7 +168,7 @@ impl Socket {
 }
 
 impl PlatformSocket for Socket {
-    type Handle = RawHandle;
+    type Handle = UringRawHandle;
 
     fn new_tcp_v4() -> io::Result<Self> {
         Socket::new_tcp_v4()
@@ -198,11 +198,11 @@ impl PlatformSocket for Socket {
         Socket::connect(self, addr)
     }
 
-    fn into_raw(self) -> Self::Handle {
-        Socket::into_raw(self)
+    fn into_owned_raw(self) -> OwnedRawHandle {
+        Socket::into_owned_raw(self)
     }
 
-    unsafe fn from_raw(handle: RawHandle) -> Self {
+    unsafe fn from_raw(handle: UringRawHandle) -> Self {
         unsafe { Socket::from_raw(handle) }
     }
 

@@ -62,7 +62,7 @@ impl Drop for InnerFile {
                 windows_sys::Win32::Foundation::CloseHandle(self.raw.raw().as_handle());
             },
             RawHandleKind::Socket => {
-                let _ = unsafe { veloq_driver::Socket::from_raw(self.raw) };
+                let _ = unsafe { veloq_driver::Socket::from_raw(self.raw.raw()) };
             }
         }
     }

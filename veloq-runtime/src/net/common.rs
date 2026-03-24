@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use veloq_driver::Socket;
 use veloq_driver::SocketLifecycleHandle;
-use veloq_driver::driver::Driver;
+use veloq_driver::driver::{Driver, RegisterFd};
 use veloq_driver::op::IoFd;
 use veloq_driver::{RawHandle, RawHandleKind};
 
@@ -54,7 +54,7 @@ impl SocketToken {
         let driver = ctx.driver().upgrade()?;
         let fd = driver
             .borrow_mut()
-            .register_files(&[handle])
+            .register_files(vec![RegisterFd::Borrowed(handle.borrow())])
             .ok()?
             .into_iter()
             .next()?;
@@ -79,7 +79,7 @@ impl Drop for SocketToken {
         }
         match self.raw.borrow().kind() {
             RawHandleKind::Socket => {
-                let _ = unsafe { Socket::from_raw(self.raw) };
+                let _ = unsafe { Socket::from_raw(self.raw.raw()) };
             }
             #[cfg(unix)]
             RawHandleKind::File => unsafe {
@@ -117,7 +117,7 @@ impl InnerSocket {
             self.token.raw().borrow().is_socket(),
             "InnerSocket expects socket-kind handle"
         );
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.token.raw())) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.token.raw().raw())) };
         socket.local_addr()
     }
 
@@ -126,7 +126,7 @@ impl InnerSocket {
             self.token.raw().borrow().is_socket(),
             "InnerSocket expects socket-kind handle"
         );
-        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.token.raw())) };
+        let socket = unsafe { ManuallyDrop::new(Socket::from_raw(self.token.raw().raw())) };
         socket.connect(addr)
     }
 }

@@ -1,6 +1,6 @@
 use crate::slot;
 use crate::slot::is_runnable_state;
-use crate::{IoFd, RawHandle, RawHandleMeta, SlotSidecar};
+use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
 use crossbeam_queue::SegQueue;
 
 use veloq_shim::atomic::Ordering;
@@ -18,6 +18,11 @@ pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
 
 pub trait PlatformOp: 'static {}
+
+pub enum RegisterFd<'a, H: RawHandleMeta> {
+    Borrowed(BorrowedRawHandle<'a, H>),
+    Owned(OwnedRawHandle<H>),
+}
 
 pub trait CompletionValue: Send + 'static {
     fn from_event_res(res: i32) -> io::Result<Self>
@@ -616,9 +621,9 @@ pub trait Driver: 'static {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()>;
 
-    fn register_files(
+    fn register_files<'a>(
         &mut self,
-        files: &[RawHandle<Self::Raw>],
+        files: Vec<RegisterFd<'a, Self::Raw>>,
     ) -> io::Result<Vec<IoFd<Self::Raw>>>;
 
     fn unregister_files(&mut self, files: Vec<IoFd<Self::Raw>>) -> io::Result<()>;

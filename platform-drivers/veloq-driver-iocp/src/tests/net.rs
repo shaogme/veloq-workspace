@@ -65,7 +65,7 @@ fn test_iocp_accept() {
     // SAFETY: Closing the socket handle is required to release OS resources.
     unsafe {
         if let Some(fd) = op.fd.raw() {
-            drop(Socket::from_raw(fd));
+            drop(Socket::from_raw(fd.raw()));
         }
     }
 }
@@ -80,13 +80,13 @@ fn test_iocp_connect() {
 
     // Client Socket
     let client = Socket::new_tcp_v4().unwrap();
-    let client_handle = client.into_raw();
+    let client_handle = client.into_owned_raw();
 
     // Create Connect Op manually as it doesn't have into_op
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
 
     let connect_op = Connect {
-        fd: IoFd::Raw(client_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
@@ -109,7 +109,7 @@ fn test_iocp_connect() {
     assert!(res.is_ok(), "Connect failed: {:?}", res.err());
 
     // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe { drop(Socket::from_raw(client_handle)) };
+    unsafe { drop(Socket::from_raw(client_handle.raw())) };
 }
 
 #[test]
@@ -131,10 +131,10 @@ fn test_iocp_recv_with_buffer_pool() {
 
     // Create RIO-capable client socket and connect via driver op.
     let client = Socket::new_tcp_v4().expect("client socket create failed");
-    let client_handle = client.into_raw();
+    let client_handle = client.into_owned_raw();
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
-        fd: IoFd::Raw(client_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
@@ -185,7 +185,7 @@ fn test_iocp_recv_with_buffer_pool() {
 
     // Create Recv Op
     let recv_op = Recv {
-        fd: IoFd::Raw(client_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
         buf,
         buf_offset: 0,
     };
@@ -218,7 +218,7 @@ fn test_iocp_recv_with_buffer_pool() {
     assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 
     // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe { drop(Socket::from_raw(client_handle)) };
+    unsafe { drop(Socket::from_raw(client_handle.raw())) };
     server_thread.join().unwrap();
 }
 
@@ -244,10 +244,10 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     });
 
     let client = Socket::new_tcp_v4().expect("client socket create failed");
-    let client_handle = client.into_raw();
+    let client_handle = client.into_owned_raw();
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
-        fd: IoFd::Raw(client_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
@@ -284,7 +284,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         .expect("register chunk failed");
 
     let recv_op = Recv {
-        fd: IoFd::Raw(client_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
         buf,
         buf_offset: 0,
     };
@@ -308,7 +308,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let _ = tx_send.send(());
     server_thread.join().unwrap();
     // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe { drop(Socket::from_raw(client_handle)) };
+    unsafe { drop(Socket::from_raw(client_handle.raw())) };
 }
 
 #[test]
@@ -333,10 +333,10 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     });
 
     let client = Socket::new_tcp_v4().expect("client socket create failed");
-    let client_handle = client.into_raw();
+    let client_handle = client.into_owned_raw();
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
-        fd: IoFd::Raw(client_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
@@ -373,7 +373,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         .expect("register chunk failed");
 
     let recv_op = Recv {
-        fd: IoFd::Raw(client_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
         buf,
         buf_offset: 0,
     };
@@ -416,5 +416,5 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
 
     server_thread.join().unwrap();
     // SAFETY: Closing the socket handle is required to release OS resources.
-    unsafe { drop(Socket::from_raw(client_handle)) };
+    unsafe { drop(Socket::from_raw(client_handle.raw())) };
 }

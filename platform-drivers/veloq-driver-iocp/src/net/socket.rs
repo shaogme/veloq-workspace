@@ -81,28 +81,21 @@ impl Socket {
         self.inner.listen(backlog)
     }
 
-    /// Consumes the Socket and returns the raw handle.
-    pub fn into_raw(self) -> RawHandle {
-        let h = self.inner.0;
-        std::mem::forget(self);
-        RawHandle::new(IocpHandle::for_socket(h as _))
-    }
-
     /// Consumes the Socket and returns an owned handle.
     pub fn into_owned_raw(self) -> OwnedRawHandle {
-        let raw = self.into_raw();
+        let h = self.inner.0;
+        std::mem::forget(self);
+        let raw = RawHandle::new(IocpHandle::for_socket(h as _));
         // SAFETY: this socket originates from `self` and ownership is uniquely transferred.
         unsafe { OwnedRawHandle::from_raw_owned(raw) }
     }
 
-    /// Creates a Socket from a raw handle.
-    ///
     /// # Safety
     ///
-    /// `handle` must be a valid socket handle.
-    pub unsafe fn from_raw(handle: RawHandle) -> Self {
+    /// `handle` 必须是有效套接字句柄，且调用方转移所有权给返回值。
+    pub unsafe fn from_raw(handle: IocpHandle) -> Self {
         Self {
-            inner: SafeSocket(handle.raw().as_handle() as _),
+            inner: SafeSocket(handle.as_socket()),
         }
     }
 
@@ -169,7 +162,7 @@ impl Socket {
 }
 
 impl PlatformSocket for Socket {
-    type Handle = RawHandle;
+    type Handle = IocpHandle;
 
     fn new_tcp_v4() -> io::Result<Self> {
         Socket::new_tcp_v4()
@@ -199,15 +192,15 @@ impl PlatformSocket for Socket {
         Socket::connect(self, addr)
     }
 
-    fn into_raw(self) -> Self::Handle {
-        Socket::into_raw(self)
+    fn into_owned_raw(self) -> OwnedRawHandle {
+        Socket::into_owned_raw(self)
     }
 
     /// # Safety
     ///
-    /// Forwarding to Socket::from_raw which has the same safety requirements.
+    /// `handle` 必须是有效套接字句柄，且调用方转移所有权给返回值。
     unsafe fn from_raw(handle: Self::Handle) -> Self {
-        // SAFETY: The caller must ensure the handle is valid and the ownership is transferred.
+        // SAFETY: 由 trait 调用方保证 `handle` 有效且所有权转移。
         unsafe { Socket::from_raw(handle) }
     }
 

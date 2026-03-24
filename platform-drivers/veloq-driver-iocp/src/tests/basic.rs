@@ -3,6 +3,7 @@ use crate::driver::IocpDriver;
 use crate::ext::Extensions;
 use std::io;
 use std::os::windows::io::AsRawHandle;
+use veloq_driver_core::driver::RegisterFd;
 
 #[test]
 fn test_extensions_load() {
@@ -23,7 +24,9 @@ fn test_register_files() {
     let raw = crate::config::RawHandle::new(crate::config::IocpHandle::for_file(
         handle.as_raw_handle() as _,
     ));
-    let fds = driver.register_files(&[raw]).unwrap();
+    let fds = driver
+        .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
+        .unwrap();
     assert_eq!(fds.len(), 1);
     driver.unregister_files(fds).unwrap();
 }
@@ -37,16 +40,18 @@ fn test_rio_extensions_load() {
 fn test_socket_lifecycle_control_cleanup_unreg() {
     let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
     let socket = crate::Socket::new_tcp_v4().unwrap();
-    let raw = socket.into_raw();
+    let raw = socket.into_owned_raw();
     let fd = driver
-        .register_files(&[raw])
+        .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
 
     let lifecycle = driver.socket_lifecycle_handle();
-    lifecycle.schedule_socket_cleanup(raw, Some(fd)).unwrap();
+    lifecycle
+        .schedule_socket_cleanup(crate::RawHandle::new(raw.raw()), Some(fd))
+        .unwrap();
     let _ = driver.poll_completion().unwrap();
 
     match fd {

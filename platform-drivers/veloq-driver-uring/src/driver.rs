@@ -13,8 +13,9 @@ use crate::config::{
 };
 use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionSidecar, Driver, Outcome, RemoteWaker, SharedCompletionQueue,
-    SharedCompletionTable, SubmitBinder, SubmitStatus, encode_completion_token,
+    CompletionEvent, CompletionSidecar, Driver, Outcome, RegisterFd, RemoteWaker,
+    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    encode_completion_token,
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 use veloq_driver_core::op_registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
@@ -746,12 +747,21 @@ impl Driver for UringDriver {
         self.register_chunk_internal(id, ptr, len)
     }
 
-    fn register_files(&mut self, files: &[RawHandle]) -> io::Result<Vec<IoFd>> {
-        let fds: Vec<i32> = files.iter().map(|h| h.raw().as_fd()).collect();
+    fn register_files<'a>(
+        &mut self,
+        files: Vec<RegisterFd<'a, UringRawHandle>>,
+    ) -> io::Result<Vec<IoFd>> {
+        let fds: Vec<i32> = files
+            .into_iter()
+            .map(|h| match h {
+                RegisterFd::Borrowed(b) => b.raw().as_fd(),
+                RegisterFd::Owned(o) => o.raw().as_fd(),
+            })
+            .collect();
         self.ring.submitter().register_files(&fds)?;
 
-        let mut fixed_fds = Vec::with_capacity(files.len());
-        for i in 0..files.len() {
+        let mut fixed_fds = Vec::with_capacity(fds.len());
+        for i in 0..fds.len() {
             fixed_fds.push(IoFd::Fixed(i as u32));
         }
         Ok(fixed_fds)

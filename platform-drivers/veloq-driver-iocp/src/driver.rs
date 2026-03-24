@@ -16,8 +16,8 @@ use veloq_blocking::{BlockingTask, get_blocking_pool};
 #[cfg(feature = "test-hooks")]
 pub use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionSidecar as CoreCompletionSidecar, Driver, Outcome, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    CompletionEvent, CompletionSidecar as CoreCompletionSidecar, Driver, Outcome, RegisterFd,
+    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
 use veloq_driver_core::slot::{
@@ -466,9 +466,16 @@ impl IocpDriver {
     }
 
     /// Registers a set of file/socket handles for use with the driver.
-    pub(crate) fn register_files(&mut self, files: &[RawHandle]) -> io::Result<Vec<IoFd>> {
+    pub(crate) fn register_files<'a>(
+        &mut self,
+        files: Vec<RegisterFd<'a, IocpHandle>>,
+    ) -> io::Result<Vec<IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
-        for &handle in files {
+        for file in files {
+            let handle = match file {
+                RegisterFd::Borrowed(h) => RawHandle::new(h.raw()),
+                RegisterFd::Owned(h) => h.into_raw(),
+            };
             // Trust enum semantics first; only probe file-tagged handles as fallback.
             let canonical = match handle.kind() {
                 RawHandleKind::Socket => handle,
@@ -782,7 +789,10 @@ impl Driver for IocpDriver {
         IocpDriver::register_chunk(self, id, ptr, len)
     }
 
-    fn register_files(&mut self, files: &[RawHandle]) -> io::Result<Vec<IoFd>> {
+    fn register_files<'a>(
+        &mut self,
+        files: Vec<RegisterFd<'a, IocpHandle>>,
+    ) -> io::Result<Vec<IoFd>> {
         IocpDriver::register_files(self, files)
     }
 

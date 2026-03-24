@@ -41,7 +41,7 @@ fn bind_inner<A: ToSocketAddrs>(addr: A) -> io::Result<InnerSocket> {
 
     socket.bind(addr)?;
 
-    Ok(InnerSocket::new(socket.into_raw()))
+    Ok(InnerSocket::new(socket.into_owned_raw().into_raw()))
 }
 
 impl LocalUdpSocket {

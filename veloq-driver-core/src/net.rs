@@ -1,10 +1,10 @@
-use crate::{Handle, SockAddr};
+use crate::SockAddr;
 use std::io;
 use std::net::SocketAddr;
 
 /// 平台套接字抽象，由各 driver 后端提供具体实现。
 pub trait PlatformSocket: Sized + Send + 'static {
-    type Handle: Handle;
+    type Handle: crate::RawHandleMeta;
 
     fn new_tcp_v4() -> io::Result<Self>;
     fn new_tcp_v6() -> io::Result<Self>;
@@ -15,7 +15,7 @@ pub trait PlatformSocket: Sized + Send + 'static {
     fn listen(&self, backlog: i32) -> io::Result<()>;
     fn connect(&self, addr: SocketAddr) -> io::Result<()>;
 
-    fn into_raw(self) -> Self::Handle;
+    fn into_owned_raw(self) -> crate::OwnedRawHandle<Self::Handle>;
 
     /// # Safety
     ///

@@ -30,8 +30,8 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     let server_addr = server.local_addr().expect("server local_addr failed");
     let client_addr = client.local_addr().expect("client local_addr failed");
 
-    let server_handle = server.into_raw();
-    let client_handle = client.into_raw();
+    let server_handle = server.into_owned_raw();
+    let client_handle = client.into_owned_raw();
 
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
@@ -58,13 +58,13 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         .expect("register send chunk failed");
 
     let recv_op = UdpRecvStream {
-        fd: IoFd::Raw(server_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(server_handle.raw())),
         buf: None,
         addr: None,
         result: None,
     };
     let send_op = SendTo {
-        fd: IoFd::Raw(client_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
         buf: send_buf,
         buf_offset: 0,
         addr: server_addr,
@@ -104,8 +104,8 @@ fn test_rio_udp_send_to_recv_from_address_path() {
 
     // SAFETY: Closing the socket handles is required to release OS resources.
     unsafe {
-        drop(Socket::from_raw(client_handle));
-        drop(Socket::from_raw(server_handle));
+        drop(Socket::from_raw(client_handle.raw()));
+        drop(Socket::from_raw(server_handle.raw()));
     }
 }
 
@@ -129,8 +129,8 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     let server_addr = server.local_addr().expect("server local_addr failed");
     let client_addr = client.local_addr().expect("client local_addr failed");
 
-    let server_handle = server.into_raw();
-    let client_handle = client.into_raw();
+    let server_handle = server.into_owned_raw();
+    let client_handle = client.into_owned_raw();
 
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
@@ -157,13 +157,13 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         .expect("register send chunk failed");
 
     let recv_op = UdpRecvStream {
-        fd: IoFd::Raw(server_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(server_handle.raw())),
         buf: None,
         addr: None,
         result: None,
     };
     let send_op = SendTo {
-        fd: IoFd::Raw(client_handle),
+        fd: IoFd::Raw(crate::RawHandle::new(client_handle.raw())),
         buf: send_buf,
         buf_offset: 0,
         addr: server_addr,
@@ -203,8 +203,8 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
 
     // SAFETY: Closing the socket handles is required to release OS resources.
     unsafe {
-        drop(Socket::from_raw(client_handle));
-        drop(Socket::from_raw(server_handle));
+        drop(Socket::from_raw(client_handle.raw()));
+        drop(Socket::from_raw(server_handle.raw()));
     }
 }
 
@@ -215,7 +215,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
     server
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("server bind failed");
-    let server_handle = server.into_raw();
+    let server_handle = server.into_owned_raw();
     let socket_key = server_handle.raw().actor_key();
 
     let mut submitted = Vec::new();
@@ -223,7 +223,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
 
     for _ in 0..BURST_WAITERS {
         let recv_op = UdpRecvStream {
-            fd: IoFd::Raw(server_handle),
+            fd: IoFd::Raw(crate::RawHandle::new(server_handle.raw())),
             buf: None,
             addr: None,
             result: None,
@@ -271,7 +271,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
 
     // SAFETY: Closing the socket handle is required to release OS resources.
     unsafe {
-        drop(Socket::from_raw(server_handle));
+        drop(Socket::from_raw(server_handle.raw()));
     }
 }
 
@@ -282,7 +282,7 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
     server
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("server bind failed");
-    let server_handle = server.into_raw();
+    let server_handle = server.into_owned_raw();
     let socket_key = server_handle.raw().actor_key();
 
     let mut submitted = Vec::new();
@@ -290,7 +290,7 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
 
     for _ in 0..BURST_WAITERS {
         let recv_op = UdpRecvStream {
-            fd: IoFd::Raw(server_handle),
+            fd: IoFd::Raw(crate::RawHandle::new(server_handle.raw())),
             buf: None,
             addr: None,
             result: None,
@@ -343,6 +343,6 @@ fn test_rio_udp_recv_pool_idle_falls_back_to_min_target() {
 
     // SAFETY: Closing the socket handle is required to release OS resources.
     unsafe {
-        drop(Socket::from_raw(server_handle));
+        drop(Socket::from_raw(server_handle.raw()));
     }
 }
