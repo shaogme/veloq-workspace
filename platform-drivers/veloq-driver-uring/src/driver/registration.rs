@@ -1,5 +1,6 @@
 use crate::driver::UringDriver;
-use std::io;
+use crate::error::{UringError, UringResult, from_io_error};
+use error_stack::Report;
 use std::time::{Duration, Instant};
 
 pub(crate) const MAX_CHUNKS: usize = 1024;
@@ -20,7 +21,7 @@ impl UringDriver {
         id: u16,
         ptr: *const u8,
         len: usize,
-    ) -> io::Result<()> {
+    ) -> UringResult<()> {
         if let Some(last_fail) = self.chunk_register_failures_recent.get(&id)
             && last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN
         {
@@ -29,17 +30,16 @@ impl UringDriver {
                 .registration_stats
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(io::Error::other(format!(
-                "io_uring register_chunk skipped due to recent failure: chunk_id={id}"
+            return Err(Report::new(UringError::Registration).attach(format!(
+                "driver.register_chunk_internal: recent failure cooldown, chunk_id={id}"
             )));
         }
 
         let index = id as usize;
         if index >= MAX_CHUNKS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ChunkID exceeds MAX_CHUNKS",
-            ));
+            return Err(Report::new(UringError::InvalidInput).attach(format!(
+                "driver.register_chunk_internal: chunk id exceeds max, id={id}, max={MAX_CHUNKS}"
+            )));
         }
 
         let iovecs = [libc::iovec {
@@ -64,7 +64,11 @@ impl UringDriver {
                 .saturating_add(1);
             self.chunk_register_failures_recent
                 .insert(id, Instant::now());
-            return Err(e);
+            return Err(from_io_error(
+                UringError::Registration,
+                "driver.register_chunk_internal.register_buffers_update",
+                e,
+            ));
         }
 
         // Mark as registered in local bitset

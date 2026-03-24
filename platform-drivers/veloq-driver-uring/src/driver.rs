@@ -1,3 +1,4 @@
+use error_stack::Report;
 use io_uring::{IoUring, squeue};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -11,6 +12,7 @@ use tracing::{debug, trace};
 use crate::config::{
     BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig, UringRawHandle,
 };
+use crate::error::{UringError, UringReportExt, UringResult, UringResultExt, from_io_error};
 use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, Driver, Outcome, RegisterFd, RemoteWaker,
@@ -61,6 +63,21 @@ impl RemoteWaker for UringWaker {
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 pub(crate) const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
 const MIN_FILE_TABLE_CAPACITY: usize = 1;
+
+#[inline]
+fn invalid_state(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
+    Report::new(UringError::InvalidState).attach(format!("{scope}: {}", msg.into()))
+}
+
+#[inline]
+fn invalid_input(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
+    Report::new(UringError::InvalidInput).attach(format!("{scope}: {}", msg.into()))
+}
+
+#[inline]
+fn unsupported(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
+    Report::new(UringError::Unsupported).attach(format!("{scope}: {}", msg.into()))
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SocketLifecycleHandle;
@@ -120,7 +137,7 @@ impl UringDriver {
         SocketLifecycleHandle
     }
 
-    fn unregister_fixed_fd(&mut self, fd: IoFd) -> io::Result<()> {
+    fn unregister_fixed_fd(&mut self, fd: IoFd) -> UringResult<()> {
         if !self.file_table_initialized {
             return Ok(());
         }
@@ -130,20 +147,31 @@ impl UringDriver {
             let Some(_entry) = self.registered_files[index].take() else {
                 return Ok(());
             };
-            self.ring.submitter().register_files_update(idx, &[-1])?;
+            self.ring
+                .submitter()
+                .register_files_update(idx, &[-1])
+                .map_err(|e| {
+                    from_io_error(UringError::Registration, "driver.unregister_fixed_fd", e)
+                })?;
             self.free_file_slots.push(idx);
         }
         Ok(())
     }
 
-    fn ensure_file_table_initialized(&mut self) -> io::Result<()> {
+    fn ensure_file_table_initialized(&mut self) -> UringResult<()> {
         if self.file_table_initialized {
             return Ok(());
         }
 
         let capacity = self.ops.local.len().max(MIN_FILE_TABLE_CAPACITY);
         let sparse = vec![-1; capacity];
-        self.ring.submitter().register_files(&sparse)?;
+        self.ring.submitter().register_files(&sparse).map_err(|e| {
+            from_io_error(
+                UringError::Registration,
+                "driver.ensure_file_table_initialized",
+                e,
+            )
+        })?;
 
         self.registered_files = (0..capacity).map(|_| None).collect();
         self.free_file_slots = (0..capacity as u32).rev().collect();
@@ -151,7 +179,7 @@ impl UringDriver {
         Ok(())
     }
 
-    pub fn new(config: impl AsRef<UringConfig>) -> io::Result<Self> {
+    fn new_internal(config: impl AsRef<UringConfig>) -> UringResult<Self> {
         let config = config.as_ref();
         let mut builder = IoUring::builder();
 
@@ -165,20 +193,27 @@ impl UringDriver {
         }
 
         let entries = config.entries.get();
-        let ring = builder.build(entries).or_else(|e| {
-            if e.raw_os_error() == Some(libc::EINVAL) {
-                IoUring::new(entries)
-            } else {
-                Err(e)
-            }
-        })?;
+        let ring = builder
+            .build(entries)
+            .or_else(|e| {
+                if e.raw_os_error() == Some(libc::EINVAL) {
+                    IoUring::new(entries)
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|e| from_io_error(UringError::DriverInit, "driver.new.build_ring", e))?;
 
         let ops = OpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable = ops.shared.clone();
 
         let waker_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if waker_fd < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(from_io_error(
+                UringError::DriverInit,
+                "driver.new.eventfd",
+                io::Error::last_os_error(),
+            ));
         }
 
         debug!("Initalized UringDriver with {} entries", entries);
@@ -218,7 +253,7 @@ impl UringDriver {
             file_table_initialized: false,
         };
 
-        driver.submit_waker();
+        driver.submit_waker()?;
 
         // Sparse registration
         let iovecs = vec![
@@ -236,17 +271,26 @@ impl UringDriver {
         Ok(driver)
     }
 
+    pub fn new(config: impl AsRef<UringConfig>) -> io::Result<Self> {
+        Self::new_internal(config).to_io_result("create uring driver")
+    }
+
     pub(crate) unsafe fn submit_from_slot_raw(
         driver: *mut UringDriver,
         user_data: usize,
         slot: Slot<'_, crate::op::slot::Reserved>,
-    ) -> io::Result<bool> {
+    ) -> UringResult<bool> {
         let driver = unsafe { &mut *driver };
         let mut sub_guard = slot.start_submission_with(None);
         let strategy = sub_guard
             .slot
             .as_mut()
-            .expect("submission guard slot missing")
+            .ok_or_else(|| {
+                invalid_state(
+                    "driver.submit_from_slot_raw",
+                    "submission guard slot missing",
+                )
+            })?
             .op_mut()
             .vtable
             .strategy;
@@ -259,12 +303,25 @@ impl UringDriver {
                     let op = sub_guard
                         .slot
                         .as_mut()
-                        .expect("submission guard slot missing")
+                        .ok_or_else(|| {
+                            invalid_state(
+                                "driver.submit_from_slot_raw",
+                                "submission guard slot missing",
+                            )
+                        })?
                         .op_mut();
                     let vtable = op.vtable;
                     let count = unsafe { (vtable.resolve_chunks)(op, &mut chunks) };
                     let sqe = unsafe {
-                        (vtable.make_sqe)(op, &mut *driver_ptr)?.user_data(user_data as u64)
+                        (vtable.make_sqe)(op, &mut *driver_ptr)
+                            .map_err(|e| {
+                                from_io_error(
+                                    UringError::Submission,
+                                    "driver.submit_from_slot_raw.make_sqe",
+                                    e,
+                                )
+                            })?
+                            .user_data(user_data as u64)
                     };
                     (count, sqe)
                 };
@@ -272,7 +329,10 @@ impl UringDriver {
                 for &chunk_id in chunks.iter().take(count) {
                     let index = chunk_id as usize;
                     let is_registered = driver.registered_chunks.get(index).map_err(|e| {
-                        io::Error::other(format!("BitSet error getting {}: {:?}", index, e))
+                        invalid_state(
+                            "driver.submit_from_slot_raw.bitset_get",
+                            format!("BitSet get failed index={index}: {e:?}"),
+                        )
                     })?;
 
                     if !is_registered
@@ -284,10 +344,9 @@ impl UringDriver {
                             info.len.get(),
                         ) {
                             if driver.registration_mode.is_strict() {
-                                panic!(
-                                    "strict registration mode: io_uring lazy register failed: chunk_id={}, user_data={}, error={}",
-                                    chunk_id, user_data, e
-                                );
+                                return Err(e.attach(format!(
+                                    "strict mode lazy register failed: chunk_id={chunk_id}, user_data={user_data}"
+                                )));
                             }
                             return Err(e);
                         }
@@ -297,14 +356,19 @@ impl UringDriver {
                             .submission_missing_chunk_info
                             .saturating_add(1);
                         if driver.registration_mode.is_strict() {
-                            panic!(
-                                "strict registration mode: io_uring missing chunk info for lazy registration: chunk_id={}, user_data={}",
-                                chunk_id, user_data
-                            );
+                            return Err(invalid_state(
+                                "driver.submit_from_slot_raw.missing_chunk_info",
+                                format!(
+                                    "strict mode missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
+                                ),
+                            ));
                         }
-                        return Err(io::Error::other(format!(
-                            "Missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
-                        )));
+                        return Err(invalid_input(
+                            "driver.submit_from_slot_raw.missing_chunk_info",
+                            format!(
+                                "Missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
+                            ),
+                        ));
                     }
                 }
 
@@ -319,10 +383,12 @@ impl UringDriver {
             }
             SubmissionStrategy::SoftwareTimer => {
                 let duration_opt = {
-                    let slot = sub_guard
-                        .slot
-                        .as_mut()
-                        .expect("submission guard slot missing");
+                    let slot = sub_guard.slot.as_mut().ok_or_else(|| {
+                        invalid_state(
+                            "driver.submit_from_slot_raw.timer",
+                            "submission guard slot missing",
+                        )
+                    })?;
                     let vtable = slot.op_mut().vtable;
                     unsafe { (vtable.get_timeout)(slot.op_mut()) }
                 };
@@ -335,28 +401,36 @@ impl UringDriver {
                     trace!(user_data, ?duration, "Registered software timer");
                     Ok(true)
                 } else {
-                    Err(io::Error::other("Timer duration missing"))
+                    Err(invalid_input(
+                        "driver.submit_from_slot_raw.timer_duration",
+                        "Timer duration missing",
+                    ))
                 }
             }
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
+            _ => Err(unsupported(
+                "driver.submit_from_slot_raw.strategy",
                 "Unsupported strategy for slot submission",
             )),
         }
     }
 
-    pub(crate) fn submit_from_slot_index(&mut self, user_data: usize) -> io::Result<bool> {
+    pub(crate) fn submit_from_slot_index(&mut self, user_data: usize) -> UringResult<bool> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
             Some(SlotView::Reserved(slot)) => slot,
-            _ => return Err(io::Error::other("Op missing in slot")),
+            _ => {
+                return Err(invalid_state(
+                    "driver.submit_from_slot_index",
+                    "op missing in slot",
+                ));
+            }
         };
         unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) }
     }
 
-    fn submit_waker(&mut self) {
+    fn submit_waker(&mut self) -> UringResult<()> {
         if self.waker_token.is_some() {
-            return;
+            return Ok(());
         }
 
         let fixed_fd = match self.waker_registered_fd {
@@ -364,13 +438,11 @@ impl UringDriver {
             None => {
                 let fd = self.waker_fd.fd.raw().as_fd();
                 let raw = RawHandle::new(UringRawHandle::for_file(fd));
-                let fixed_fd = self
-                    .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
-                    .and_then(|mut fds| {
-                        fds.pop()
-                            .ok_or_else(|| io::Error::other("register_files returned empty"))
-                    })
-                    .unwrap_or_else(|e| panic!("waker fd registration failed: {e}"));
+                let mut fds =
+                    self.register_files_internal(vec![RegisterFd::Borrowed(raw.borrow())])?;
+                let fixed_fd = fds.pop().ok_or_else(|| {
+                    invalid_state("driver.submit_waker", "register_files returned empty")
+                })?;
                 self.waker_registered_fd = Some(fixed_fd);
                 fixed_fd
             }
@@ -397,27 +469,39 @@ impl UringDriver {
             match unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) } {
                 Ok(true) => {}
                 Ok(false) => self.push_backlog(user_data),
-                Err(e) => panic!("waker submission failed: {e}"),
+                Err(e) => return Err(e),
             }
+            Ok(())
         } else {
-            panic!("Failed to reserve waker slot");
+            Err(invalid_state(
+                "driver.submit_waker",
+                "failed to reserve waker slot",
+            ))
         }
     }
 
-    pub(crate) fn submit_to_kernel(&mut self) -> io::Result<()> {
+    pub(crate) fn submit_to_kernel(&mut self) -> UringResult<()> {
         trace!("submit_to_kernel entered");
         if self.ring.params().is_setup_sqpoll() {
             if self.ring.submission().need_wakeup() {
-                self.ring.submit()?;
+                self.ring.submit().map_err(|e| {
+                    from_io_error(
+                        UringError::Submission,
+                        "driver.submit_to_kernel.submit.sqpoll",
+                        e,
+                    )
+                })?;
             }
         } else {
-            self.ring.submit()?;
+            self.ring.submit().map_err(|e| {
+                from_io_error(UringError::Submission, "driver.submit_to_kernel.submit", e)
+            })?;
         }
         self.flush_backlog();
         Ok(())
     }
 
-    pub(crate) fn wait_internal(&mut self) -> io::Result<()> {
+    pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
         self.drain_cancel_requests();
         self.flush_cancellations();
         self.flush_backlog();
@@ -441,10 +525,22 @@ impl UringDriver {
                 match self.ring.submitter().submit_with_args(1, &args) {
                     Ok(_) => {}
                     Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        return Err(from_io_error(
+                            UringError::CompletionWait,
+                            "driver.wait_internal.submit_with_args",
+                            e,
+                        ));
+                    }
                 }
             } else {
-                self.ring.submit_and_wait(1)?;
+                self.ring.submit_and_wait(1).map_err(|e| {
+                    from_io_error(
+                        UringError::CompletionWait,
+                        "driver.wait_internal.submit_and_wait",
+                        e,
+                    )
+                })?;
             }
 
             let elapsed = start.elapsed();
@@ -529,7 +625,7 @@ impl UringDriver {
             let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
                 SlotView::InFlightWaiting(mut slot) => {
                     let res_val = cqe_res;
-                    let final_res = slot
+                    let final_io_res = slot
                         .with_op_mut(|op| unsafe { (op.vtable.on_complete)(op, res_val) })
                         .unwrap_or_else(|| {
                             if res_val >= 0 {
@@ -541,11 +637,11 @@ impl UringDriver {
 
                     let mut completed = slot.complete();
                     let generation = completed.entry.generation(Ordering::Acquire);
-                    let res_code = io_result_to_event_res(&final_res);
+                    let res_code = io_result_to_event_res(&final_io_res);
 
                     let (payload, mut detail) = completed.take_completion_data();
                     if detail.is_none() {
-                        detail = clone_result_if_non_os_error(&final_res);
+                        detail = clone_result_if_non_os_error(&final_io_res);
                     }
                     let _ = completed.take_op();
 
@@ -592,7 +688,9 @@ impl UringDriver {
                 self.ops.remove(token);
             }
             self.waker_payload = None;
-            self.submit_waker();
+            if let Err(e) = self.submit_waker() {
+                tracing::error!(report = ?e, "failed to resubmit waker");
+            }
             self.flush_backlog();
         }
     }
@@ -623,6 +721,46 @@ fn io_result_to_event_res(res: &io::Result<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
         Err(e) => -e.raw_os_error().unwrap_or(1).abs(),
+    }
+}
+
+impl UringDriver {
+    fn register_files_internal<'a>(
+        &mut self,
+        files: Vec<RegisterFd<'a, UringRawHandle>>,
+    ) -> UringResult<Vec<IoFd>> {
+        self.ensure_file_table_initialized()?;
+
+        let mut fixed_fds = Vec::with_capacity(files.len());
+        for file in files {
+            let entry = match file {
+                RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd(b.raw().as_fd()),
+                RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
+            };
+            let fd = match &entry {
+                RegisteredFileEntry::BorrowedFd(fd) => *fd,
+                RegisteredFileEntry::OwnedHandle(o) => o.raw().as_fd(),
+            };
+            let idx = self.free_file_slots.pop().ok_or_else(|| {
+                invalid_state(
+                    "driver.register_files_internal",
+                    "io_uring registered file table exhausted",
+                )
+            })?;
+            self.ring
+                .submitter()
+                .register_files_update(idx, &[fd])
+                .map_err(|e| {
+                    from_io_error(
+                        UringError::Registration,
+                        "driver.register_files_internal.register_files_update",
+                        e,
+                    )
+                })?;
+            self.registered_files[idx as usize] = Some(entry);
+            fixed_fds.push(IoFd::fixed(idx));
+        }
+        Ok(fixed_fds)
     }
 }
 
@@ -721,7 +859,14 @@ impl Driver for UringDriver {
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
     ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
-        let op: UringOp = op_in.take().expect("submit called with empty Option");
+        let Some(op) = op_in.take() else {
+            return binder.err(
+                invalid_state("driver.submit", "submit called with empty Option")
+                    .to_io_error("submit called with empty Option"),
+                SubmitStatus::Void,
+            );
+        };
+        let op: UringOp = op;
         let strategy = op.vtable.strategy;
         if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
             *op_in = Some(op);
@@ -735,7 +880,14 @@ impl Driver for UringDriver {
         }
 
         match strategy {
-            crate::op::SubmissionStrategy::BackgroundOnly => unreachable!(),
+            crate::op::SubmissionStrategy::BackgroundOnly => binder.err(
+                invalid_state(
+                    "driver.submit",
+                    "background strategy reached normal submit path",
+                )
+                .to_io_error("background strategy reached normal submit path"),
+                SubmitStatus::Void,
+            ),
             crate::op::SubmissionStrategy::SubmitSqe => {
                 self.submit_sqe_internal(user_data, op, op_in, binder)
             }
@@ -768,10 +920,11 @@ impl Driver for UringDriver {
         self.flush_cancellations();
         self.flush_backlog();
         self.submit_to_kernel()
+            .to_io_result("submit queue to kernel")
     }
 
     fn wait(&mut self) -> io::Result<()> {
-        self.wait_internal()
+        self.wait_internal().to_io_result("wait for completions")
     }
 
     fn process_completions(&mut self) {
@@ -793,7 +946,8 @@ impl Driver for UringDriver {
         &mut self,
         out: &mut Vec<veloq_driver_core::driver::CompletionEvent>,
     ) -> io::Result<usize> {
-        self.wait_internal()?;
+        self.wait_internal()
+            .to_io_result("wait and drain completions")?;
         Ok(self.drain_completions(out))
     }
 
@@ -803,40 +957,21 @@ impl Driver for UringDriver {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
         self.register_chunk_internal(id, ptr, len)
+            .to_io_result("register chunk")
     }
 
     fn register_files<'a>(
         &mut self,
         files: Vec<RegisterFd<'a, UringRawHandle>>,
     ) -> io::Result<Vec<IoFd>> {
-        self.ensure_file_table_initialized()?;
-
-        let mut fixed_fds = Vec::with_capacity(files.len());
-        for file in files {
-            let entry = match file {
-                RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd(b.raw().as_fd()),
-                RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
-            };
-            let fd = match &entry {
-                RegisteredFileEntry::BorrowedFd(fd) => *fd,
-                RegisteredFileEntry::OwnedHandle(o) => o.raw().as_fd(),
-            };
-            let idx = self.free_file_slots.pop().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "io_uring registered file table exhausted",
-                )
-            })?;
-            self.ring.submitter().register_files_update(idx, &[fd])?;
-            self.registered_files[idx as usize] = Some(entry);
-            fixed_fds.push(IoFd::fixed(idx));
-        }
-        Ok(fixed_fds)
+        self.register_files_internal(files)
+            .to_io_result("register files")
     }
 
     fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()> {
         for fd in files {
-            self.unregister_fixed_fd(fd)?;
+            self.unregister_fixed_fd(fd)
+                .to_io_result("unregister fixed fd")?;
         }
         Ok(())
     }
@@ -906,13 +1041,14 @@ impl UringDriver {
                 binder.ok(Poll::Pending)
             }
             Err(e) => {
-                let op = self
+                if let Some(op) = self
                     .ops
                     .get_slot_entry_op_storage_and_entry_mut(user_data)
                     .and_then(|(_, _, op, _)| op.take())
-                    .expect("slot op missing in submit_sqe recovery");
-                *op_in = Some(op);
-                binder.err(e, SubmitStatus::Void)
+                {
+                    *op_in = Some(op);
+                }
+                binder.err(e.to_io_error("submit sqe"), SubmitStatus::Void)
             }
         }
     }
@@ -954,13 +1090,14 @@ impl UringDriver {
                 binder.ok(Poll::Pending)
             }
             Err(e) => {
-                let op = self
+                if let Some(op) = self
                     .ops
                     .get_slot_entry_op_storage_and_entry_mut(user_data)
                     .and_then(|(_, _, op, _)| op.take())
-                    .expect("slot op missing in submit_timer recovery");
-                *op_in = Some(op);
-                binder.err(e, SubmitStatus::Void)
+                {
+                    *op_in = Some(op);
+                }
+                binder.err(e.to_io_error("submit timer"), SubmitStatus::Void)
             }
         }
     }

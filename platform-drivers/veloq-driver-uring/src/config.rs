@@ -105,7 +105,8 @@ impl Default for UringConfig {
     fn default() -> Self {
         Self {
             mode: IoMode::Interrupt,
-            entries: NonZeroU32::new(1024).unwrap(),
+            // SAFETY: 1024 is non-zero.
+            entries: unsafe { NonZeroU32::new_unchecked(1024) },
             registration_mode: BufferRegistrationMode::Strict,
         }
     }

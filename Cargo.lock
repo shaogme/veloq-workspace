@@ -1409,6 +1409,7 @@ name = "veloq-driver-uring"
 version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
+ "error-stack",
  "io-uring",
  "libc",
  "tracing",
