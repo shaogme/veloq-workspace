@@ -1,4 +1,7 @@
-﻿[alias]
+[build]
+rustc-workspace-wrapper = "test-utils/rustc-guard-launcher.cmd"
+
+[alias]
 xtest-linux = "run --package xtest-runner -- --task test --target linux --count 20 --quiet --features compat"
 xtest-windows = "run --package xtest-runner -- --task test --target windows --count 20 --quiet --features compat"
 xfmt = "fmt --all"

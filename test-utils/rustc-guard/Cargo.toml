@@ -1,0 +1,20 @@
+[package]
+name = "rustc-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+sysinfo = "0.38.4"
+
+[lints]
+workspace = true

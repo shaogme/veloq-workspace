@@ -15,7 +15,7 @@ members = [
     "utils/veloq-wheel", 
     "utils/veloq-blocking",
     "utils/veloq-pod", 
-    "test-utils/xtest-runner",
+    "test-utils/xtest-runner", "test-utils/rustc-guard",
 ]
 default-members = [
     "veloq-runtime",
