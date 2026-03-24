@@ -108,7 +108,7 @@ impl OpenOptions {
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
 
         // 3. 转换结果
-        let fd = res?;
+        let fd = res?.into_raw();
         use super::file::InnerFile;
         use std::cell::Cell;
 
@@ -134,7 +134,7 @@ impl OpenOptions {
         // 提交执行 (Result, Op) — Op 的所有权被返还
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
 
-        let fd = res?;
+        let fd = res?.into_raw();
 
         use super::file::InnerFile;
         use std::sync::atomic::AtomicU64;

@@ -35,21 +35,21 @@ use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, SOCKADD
 // Type Aliases for Core Ops
 // ============================================================================
 
-pub(crate) type ReadFixed = ReadFixedBase<RawHandle>;
-pub(crate) type WriteFixed = WriteFixedBase<RawHandle>;
-pub(crate) type Recv = RecvBase<RawHandle>;
-pub(crate) type OpSend = OpSendBase<RawHandle>;
-pub(crate) type UdpRecv = UdpRecvBase<RawHandle>;
-pub(crate) type UdpSend = UdpSendBase<RawHandle>;
-pub(crate) type Close = CloseBase<RawHandle>;
-pub(crate) type Fsync = FsyncBase<RawHandle>;
-pub(crate) type Connect = ConnectBase<RawHandle, SockAddrStorage>;
-pub(crate) type Accept = AcceptBase<RawHandle, SockAddrStorage>;
-pub(crate) type SendTo = SendToBase<RawHandle>;
-pub(crate) type SyncFileRange = SyncFileRangeBase<RawHandle>;
-pub(crate) type Fallocate = FallocateBase<RawHandle>;
-pub(crate) type UdpRecvStream = UdpRecvStreamBase<RawHandle>;
-pub(crate) type Wakeup = WakeupBase<RawHandle>;
+pub(crate) type ReadFixed = ReadFixedBase<IocpHandle>;
+pub(crate) type WriteFixed = WriteFixedBase<IocpHandle>;
+pub(crate) type Recv = RecvBase<IocpHandle>;
+pub(crate) type OpSend = OpSendBase<IocpHandle>;
+pub(crate) type UdpRecv = UdpRecvBase<IocpHandle>;
+pub(crate) type UdpSend = UdpSendBase<IocpHandle>;
+pub(crate) type Close = CloseBase<IocpHandle>;
+pub(crate) type Fsync = FsyncBase<IocpHandle>;
+pub(crate) type Connect = ConnectBase<IocpHandle, SockAddrStorage>;
+pub(crate) type Accept = AcceptBase<IocpHandle, SockAddrStorage>;
+pub(crate) type SendTo = SendToBase<IocpHandle>;
+pub(crate) type SyncFileRange = SyncFileRangeBase<IocpHandle>;
+pub(crate) type Fallocate = FallocateBase<IocpHandle>;
+pub(crate) type UdpRecvStream = UdpRecvStreamBase<IocpHandle>;
+pub(crate) type Wakeup = WakeupBase<IocpHandle>;
 
 // ============================================================================
 // SubmitContext Definition
@@ -354,9 +354,11 @@ define_iocp_ops! {
         kind: OpKind::Accept,
         submit: submit::submit_accept,
         on_complete: submit::on_complete_accept,
-        completion: RawHandle,
+        completion: OwnedRawHandle,
         map_completion: |_op: &Accept, res: io::Result<usize>| {
-            res.map(|raw| RawHandle::new(IocpHandle::for_socket(raw as _)))
+            res.map(|raw| unsafe {
+                OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_socket(raw as _)))
+            })
         },
         get_fd: submit::get_fd_accept,
         construct: |user: std::ptr::NonNull<Accept>| {
@@ -402,9 +404,11 @@ define_iocp_ops! {
         payload: OpenPayload,
         kind: OpKind::Open,
         submit: submit::submit_open,
-        completion: RawHandle,
+        completion: OwnedRawHandle,
         map_completion: |_op: &Open, res: io::Result<usize>| {
-            res.map(|raw| RawHandle::new(IocpHandle::for_file(raw as _)))
+            res.map(|raw| unsafe {
+                OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_file(raw as _)))
+            })
         },
         get_fd: submit::get_fd_open,
         construct: |user| OpenPayload { user },

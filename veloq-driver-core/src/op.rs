@@ -24,7 +24,7 @@ use crate::driver::{
     SubmitBinder, SubmitStatus, encode_completion_token, event_res_to_io,
 };
 use crate::slot::DetachedCancelTable;
-use crate::{Handle, IoFd, SockAddr};
+use crate::{IoFd, OwnedRawHandle, RawHandle, RawHandleMeta, SockAddr};
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,15 +147,15 @@ pub trait OpLifecycle: Sized {
     /// The final output type after the operation completes.
     type Output;
     /// Driver-defined raw handle token type.
-    type Handle: Handle;
+    type Raw: RawHandleMeta;
     /// Completion value type delivered by driver.
     type CompletionValue;
 
     /// Pre-allocate any resources needed (e.g., accept socket on Windows).
-    fn pre_alloc(fd: Self::Handle) -> std::io::Result<Self::PreAlloc>;
+    fn pre_alloc(fd: Self::Raw) -> std::io::Result<Self::PreAlloc>;
 
     /// Construct the operation from a raw handle and pre-allocated resources.
-    fn into_op(fd: Self::Handle, pre: Self::PreAlloc) -> Self;
+    fn into_op(fd: Self::Raw, pre: Self::PreAlloc) -> Self;
 
     /// Convert the completed operation result to the final output type.
     fn into_output(
@@ -164,7 +164,7 @@ pub trait OpLifecycle: Sized {
     ) -> std::io::Result<Self::Output>;
 
     /// Helper: Pre-allocate and construct the operation in one step.
-    fn prepare_op(fd: Self::Handle) -> std::io::Result<Self> {
+    fn prepare_op(fd: Self::Raw) -> std::io::Result<Self> {
         let pre = Self::pre_alloc(fd)?;
         Ok(Self::into_op(fd, pre))
     }
@@ -715,7 +715,7 @@ impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
 // ============================================================================
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
-pub struct ReadFixed<H: Handle> {
+pub struct ReadFixed<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub offset: u64,
@@ -723,7 +723,7 @@ pub struct ReadFixed<H: Handle> {
 }
 
 /// Write to a file descriptor at a specific offset using a fixed buffer.
-pub struct WriteFixed<H: Handle> {
+pub struct WriteFixed<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub offset: u64,
@@ -731,35 +731,35 @@ pub struct WriteFixed<H: Handle> {
 }
 
 /// Receive data from a socket into a fixed buffer.
-pub struct Recv<H: Handle> {
+pub struct Recv<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Send data from a fixed buffer to a socket.
-pub struct Send<H: Handle> {
+pub struct Send<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Receive data from a UDP socket into a fixed buffer.
-pub struct UdpRecv<H: Handle> {
+pub struct UdpRecv<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Send data from a fixed buffer to a UDP socket.
-pub struct UdpSend<H: Handle> {
+pub struct UdpSend<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
 }
 
 /// Connect a socket to a remote address.
-pub struct Connect<H: Handle, A: SockAddr> {
+pub struct Connect<H: RawHandleMeta, A: SockAddr> {
     pub fd: IoFd<H>,
     /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
     pub addr: A,
@@ -779,12 +779,12 @@ pub struct Open {
 }
 
 /// Close a file descriptor or handle.
-pub struct Close<H: Handle> {
+pub struct Close<H: RawHandleMeta> {
     pub fd: IoFd<H>,
 }
 
 /// Flush file buffers to disk.
-pub struct Fsync<H: Handle> {
+pub struct Fsync<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     /// If true, only sync data (not metadata).
     pub datasync: bool,
@@ -796,13 +796,13 @@ pub struct Timeout {
 }
 
 /// Wake up the event loop.
-pub struct Wakeup<H: Handle> {
+pub struct Wakeup<H: RawHandleMeta> {
     pub fd: IoFd<H>,
 }
 
 /// Accept a new connection on a listening socket.
 /// Result includes the new socket handle and remote address.
-pub struct Accept<H: Handle, A: SockAddr> {
+pub struct Accept<H: RawHandleMeta, A: SockAddr> {
     pub fd: IoFd<H>,
     /// Buffer for storing the remote address.
     /// On Windows, we parse the result from the AcceptEx output buffer, so we don't need this storage.
@@ -814,7 +814,7 @@ pub struct Accept<H: Handle, A: SockAddr> {
 }
 
 /// Send data to a specific address (UDP).
-pub struct SendTo<H: Handle> {
+pub struct SendTo<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
@@ -823,7 +823,7 @@ pub struct SendTo<H: Handle> {
 }
 
 /// Sync file range.
-pub struct SyncFileRange<H: Handle> {
+pub struct SyncFileRange<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     pub offset: u64,
     pub nbytes: u64,
@@ -831,7 +831,7 @@ pub struct SyncFileRange<H: Handle> {
 }
 
 /// Pre-allocate file space.
-pub struct Fallocate<H: Handle> {
+pub struct Fallocate<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     pub mode: i32,
     pub offset: u64,
@@ -839,7 +839,7 @@ pub struct Fallocate<H: Handle> {
 }
 
 /// Receive data as UDP datagram stream.
-pub struct UdpRecvStream<H: Handle> {
+pub struct UdpRecvStream<H: RawHandleMeta> {
     pub fd: IoFd<H>,
     /// Unix io_uring path uses this provided buffer; Windows can leave it as None.
     pub buf: Option<FixedBuf>,
@@ -859,11 +859,11 @@ pub struct UdpRecvPacket {
 // OpLifecycle Implementations
 // ============================================================================
 
-impl<H: Handle, A: SockAddr> OpLifecycle for Accept<H, A> {
+impl<H: RawHandleMeta, A: SockAddr> OpLifecycle for Accept<H, A> {
     type PreAlloc = ();
-    type Output = (H, std::net::SocketAddr);
-    type Handle = H;
-    type CompletionValue = H;
+    type Output = (OwnedRawHandle<H>, std::net::SocketAddr);
+    type Raw = H;
+    type CompletionValue = OwnedRawHandle<H>;
 
     fn pre_alloc(_fd: H) -> std::io::Result<Self::PreAlloc> {
         Ok(())
@@ -874,7 +874,7 @@ impl<H: Handle, A: SockAddr> OpLifecycle for Accept<H, A> {
         let addr_len = std::mem::size_of::<A>() as u32;
 
         Self {
-            fd: IoFd::Raw(fd),
+            fd: IoFd::Raw(RawHandle::new(fd)),
             addr: A::default(),
             addr_len,
             remote_addr: None,

@@ -1,6 +1,6 @@
 use crate::slot;
 use crate::slot::is_runnable_state;
-use crate::{Handle, IoFd, SlotSidecar};
+use crate::{IoFd, RawHandle, RawHandleMeta, SlotSidecar};
 use crossbeam_queue::SegQueue;
 
 use veloq_shim::atomic::Ordering;
@@ -525,7 +525,7 @@ pub fn event_res_to_io<R: CompletionValue>(res: i32) -> io::Result<R> {
 
 pub trait Driver: 'static {
     type Op: PlatformOp;
-    type Handle: Handle;
+    type Raw: RawHandleMeta;
     type Sidecar: SlotSidecar;
     type Completion: CompletionValue;
 
@@ -616,15 +616,16 @@ pub trait Driver: 'static {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()>;
 
-    fn register_files(&mut self, files: &[Self::Handle]) -> io::Result<Vec<IoFd<Self::Handle>>>;
+    fn register_files(
+        &mut self,
+        files: &[RawHandle<Self::Raw>],
+    ) -> io::Result<Vec<IoFd<Self::Raw>>>;
 
-    fn unregister_files(&mut self, files: Vec<IoFd<Self::Handle>>) -> io::Result<()>;
+    fn unregister_files(&mut self, files: Vec<IoFd<Self::Raw>>) -> io::Result<()>;
 
     fn submit_background(&mut self, op: Self::Op) -> io::Result<()>;
 
     fn wake(&mut self) -> io::Result<()>;
-
-    fn inner_handle(&self) -> Self::Handle;
 
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
 

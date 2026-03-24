@@ -1,7 +1,6 @@
 use io_uring::{IoUring, squeue};
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
@@ -91,7 +90,7 @@ pub struct UringDriver {
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_token: Option<usize>,
-    pub(crate) waker_payload: Option<Box<Wakeup<RawHandle>>>,
+    pub(crate) waker_payload: Option<Box<Wakeup<UringRawHandle>>>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
@@ -318,7 +317,7 @@ impl UringDriver {
             fd: IoFd::Raw(RawHandle::new(UringRawHandle::for_file(fd))),
         };
         let (uring_op, payload) =
-            <Wakeup<RawHandle> as IntoPlatformOp<UringOp>>::into_kernel_and_payload(op);
+            <Wakeup<UringRawHandle> as IntoPlatformOp<UringOp>>::into_kernel_and_payload(op);
 
         let result = self.ops.alloc(UringOpState::new());
 
@@ -603,7 +602,7 @@ impl Drop for UringDriver {
 
 impl Driver for UringDriver {
     type Op = UringOp;
-    type Handle = RawHandle;
+    type Raw = UringRawHandle;
     type Sidecar = ();
     type Completion = usize;
 
@@ -774,10 +773,6 @@ impl Driver for UringDriver {
             return Err(err);
         }
         Ok(())
-    }
-
-    fn inner_handle(&self) -> RawHandle {
-        RawHandle::new(UringRawHandle::for_file(self.ring.as_raw_fd()))
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {

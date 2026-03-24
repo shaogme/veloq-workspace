@@ -40,7 +40,7 @@ pub(crate) struct RioSendToArgs<'a> {
 pub(crate) struct RioUdpStreamArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) stream_op: &'a mut UdpRecvStream<crate::config::RawHandle>,
+    pub(crate) stream_op: &'a mut UdpRecvStream<crate::config::IocpHandle>,
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
 }
@@ -48,7 +48,7 @@ pub(crate) struct RioUdpStreamArgs<'a> {
 pub(crate) struct RioUdpRecvArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) recv_op: &'a mut UdpRecv<crate::config::RawHandle>,
+    pub(crate) recv_op: &'a mut UdpRecv<crate::config::IocpHandle>,
     pub(crate) sidecar: &'a mut crate::ops::OverlappedEntry,
 }
 

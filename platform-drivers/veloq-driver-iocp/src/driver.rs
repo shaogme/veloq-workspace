@@ -618,7 +618,7 @@ impl IocpDriver {
 
 impl Driver for IocpDriver {
     type Op = IocpOp;
-    type Handle = RawHandle;
+    type Raw = IocpHandle;
     type Sidecar = OverlappedEntry;
     type Completion = usize;
 
@@ -793,10 +793,6 @@ impl Driver for IocpDriver {
 
     fn wake(&mut self) -> io::Result<()> {
         IocpDriver::wake(self)
-    }
-
-    fn inner_handle(&self) -> RawHandle {
-        RawHandle::new(IocpHandle::for_file(self.port.as_raw() as _))
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {

@@ -24,16 +24,16 @@ impl<T> SlotSidecar for T where T: Default + Send + 'static {}
 
 /// Represents the source of an IO operation: either a raw handle or a registered index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoFd<H: Handle> {
+pub enum IoFd<H: RawHandleMeta> {
     /// A raw system handle token interpreted by each driver.
-    Raw(H),
+    Raw(RawHandle<H>),
     /// A registered index for pre-registered file descriptors.
     Fixed(u32),
 }
 
-impl<H: Handle> IoFd<H> {
+impl<H: RawHandleMeta> IoFd<H> {
     /// Returns the raw handle if this is a Raw variant.
-    pub fn raw(&self) -> Option<H> {
+    pub fn raw(&self) -> Option<RawHandle<H>> {
         match self {
             Self::Raw(fd) => Some(*fd),
             Self::Fixed(_) => None,
@@ -42,7 +42,7 @@ impl<H: Handle> IoFd<H> {
 
     /// Returns a borrowed raw handle view if this is a Raw variant.
     #[inline]
-    pub const fn raw_ref(&self) -> Option<&H> {
+    pub const fn raw_ref(&self) -> Option<&RawHandle<H>> {
         match self {
             Self::Raw(fd) => Some(fd),
             Self::Fixed(_) => None,
@@ -50,8 +50,8 @@ impl<H: Handle> IoFd<H> {
     }
 }
 
-impl<H: Handle> From<H> for IoFd<H> {
-    fn from(handle: H) -> Self {
+impl<H: RawHandleMeta> From<RawHandle<H>> for IoFd<H> {
+    fn from(handle: RawHandle<H>) -> Self {
         Self::Raw(handle)
     }
 }

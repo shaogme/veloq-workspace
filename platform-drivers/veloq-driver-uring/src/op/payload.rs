@@ -10,23 +10,23 @@ use veloq_driver_core::op::{
 
 pub(crate) use veloq_driver_core::op::{Open, Timeout};
 
-use crate::config::{RawHandle, SockAddrStorage};
+use crate::config::{SockAddrStorage, UringRawHandle};
 
-pub(crate) type ReadFixed = CoreReadFixed<RawHandle>;
-pub(crate) type WriteFixed = CoreWriteFixed<RawHandle>;
-pub(crate) type Recv = CoreRecv<RawHandle>;
-pub(crate) type OpSend = CoreSend<RawHandle>;
-pub(crate) type UdpRecv = CoreUdpRecv<RawHandle>;
-pub(crate) type UdpSend = CoreUdpSend<RawHandle>;
-pub(crate) type Connect = CoreConnect<RawHandle, SockAddrStorage>;
-pub(crate) type Close = CoreClose<RawHandle>;
-pub(crate) type Fsync = CoreFsync<RawHandle>;
-pub(crate) type SyncFileRange = CoreSyncFileRange<RawHandle>;
-pub(crate) type Fallocate = CoreFallocate<RawHandle>;
-pub(crate) type Accept = CoreAccept<RawHandle, SockAddrStorage>;
-pub(crate) type SendTo = CoreSendTo<RawHandle>;
-pub(crate) type UdpRecvStream = CoreUdpRecvStream<RawHandle>;
-pub(crate) type Wakeup = CoreWakeup<RawHandle>;
+pub(crate) type ReadFixed = CoreReadFixed<UringRawHandle>;
+pub(crate) type WriteFixed = CoreWriteFixed<UringRawHandle>;
+pub(crate) type Recv = CoreRecv<UringRawHandle>;
+pub(crate) type OpSend = CoreSend<UringRawHandle>;
+pub(crate) type UdpRecv = CoreUdpRecv<UringRawHandle>;
+pub(crate) type UdpSend = CoreUdpSend<UringRawHandle>;
+pub(crate) type Connect = CoreConnect<UringRawHandle, SockAddrStorage>;
+pub(crate) type Close = CoreClose<UringRawHandle>;
+pub(crate) type Fsync = CoreFsync<UringRawHandle>;
+pub(crate) type SyncFileRange = CoreSyncFileRange<UringRawHandle>;
+pub(crate) type Fallocate = CoreFallocate<UringRawHandle>;
+pub(crate) type Accept = CoreAccept<UringRawHandle, SockAddrStorage>;
+pub(crate) type SendTo = CoreSendTo<UringRawHandle>;
+pub(crate) type UdpRecvStream = CoreUdpRecvStream<UringRawHandle>;
+pub(crate) type Wakeup = CoreWakeup<UringRawHandle>;
 
 pub(crate) struct KernelRef<T> {
     pub(crate) user: NonNull<T>,

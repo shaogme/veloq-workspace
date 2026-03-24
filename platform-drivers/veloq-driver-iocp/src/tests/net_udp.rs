@@ -1,4 +1,4 @@
-use crate::config::{IoFd, IocpConfig, RawHandle};
+use crate::config::{IoFd, IocpConfig, IocpHandle};
 use crate::driver::IocpDriver;
 use crate::net::socket::Socket;
 use crate::ops::IocpOp;
@@ -10,8 +10,8 @@ use veloq_driver_core::driver::{Driver, SubmitBinder};
 use veloq_driver_core::op::UdpRecvStream as UdpRecvStreamBase;
 use veloq_driver_core::op::{IntoPlatformOp, SendTo as SendToBase};
 
-type SendTo = SendToBase<RawHandle>;
-type UdpRecvStream = UdpRecvStreamBase<RawHandle>;
+type SendTo = SendToBase<IocpHandle>;
+type UdpRecvStream = UdpRecvStreamBase<IocpHandle>;
 
 #[test]
 fn test_rio_udp_send_to_recv_from_address_path() {

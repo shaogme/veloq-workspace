@@ -74,7 +74,7 @@ impl<S: OpSubmitter> GenericTcpListener<S> {
     }
 
     pub async fn accept(&self) -> io::Result<(GenericTcpStream<S>, SocketAddr)> {
-        let op = Accept::prepare_op(self.inner.raw())?;
+        let op = Accept::prepare_op(self.inner.raw().raw())?;
 
         // Wait for connection
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
@@ -85,7 +85,7 @@ impl<S: OpSubmitter> GenericTcpListener<S> {
         let (fd, addr) = op.into_output(res)?;
 
         let stream = GenericTcpStream {
-            inner: InnerSocket::new(fd),
+            inner: InnerSocket::new(fd.into_raw()),
             submitter: self.submitter.clone(),
         };
 

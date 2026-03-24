@@ -66,7 +66,7 @@ impl Default for SockAddrStorage {
     }
 }
 
-pub type IoFd = veloq_driver_core::IoFd<RawHandle>;
+pub type IoFd = veloq_driver_core::IoFd<UringRawHandle>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BufferRegistrationMode {

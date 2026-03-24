@@ -2,25 +2,29 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 
+use crate::SockAddrStorage;
 use crate::driver::{Driver, PlatformDriver};
-use crate::{RawHandle, SockAddrStorage};
+#[cfg(windows)]
+use veloq_driver_iocp::IocpHandle as PlatformRawHandle;
+#[cfg(not(windows))]
+use veloq_driver_uring::UringRawHandle as PlatformRawHandle;
 
-pub type IoFd = veloq_driver_core::IoFd<RawHandle>;
-pub type ReadFixed = veloq_driver_core::op::ReadFixed<RawHandle>;
-pub type WriteFixed = veloq_driver_core::op::WriteFixed<RawHandle>;
-pub type Recv = veloq_driver_core::op::Recv<RawHandle>;
-pub type Send = veloq_driver_core::op::Send<RawHandle>;
-pub type UdpRecv = veloq_driver_core::op::UdpRecv<RawHandle>;
-pub type UdpSend = veloq_driver_core::op::UdpSend<RawHandle>;
-pub type Connect = veloq_driver_core::op::Connect<RawHandle, SockAddrStorage>;
-pub type Close = veloq_driver_core::op::Close<RawHandle>;
-pub type Fsync = veloq_driver_core::op::Fsync<RawHandle>;
-pub type Wakeup = veloq_driver_core::op::Wakeup<RawHandle>;
-pub type Accept = veloq_driver_core::op::Accept<RawHandle, SockAddrStorage>;
-pub type SendTo = veloq_driver_core::op::SendTo<RawHandle>;
-pub type SyncFileRange = veloq_driver_core::op::SyncFileRange<RawHandle>;
-pub type Fallocate = veloq_driver_core::op::Fallocate<RawHandle>;
-pub type UdpRecvStream = veloq_driver_core::op::UdpRecvStream<RawHandle>;
+pub type IoFd = veloq_driver_core::IoFd<PlatformRawHandle>;
+pub type ReadFixed = veloq_driver_core::op::ReadFixed<PlatformRawHandle>;
+pub type WriteFixed = veloq_driver_core::op::WriteFixed<PlatformRawHandle>;
+pub type Recv = veloq_driver_core::op::Recv<PlatformRawHandle>;
+pub type Send = veloq_driver_core::op::Send<PlatformRawHandle>;
+pub type UdpRecv = veloq_driver_core::op::UdpRecv<PlatformRawHandle>;
+pub type UdpSend = veloq_driver_core::op::UdpSend<PlatformRawHandle>;
+pub type Connect = veloq_driver_core::op::Connect<PlatformRawHandle, SockAddrStorage>;
+pub type Close = veloq_driver_core::op::Close<PlatformRawHandle>;
+pub type Fsync = veloq_driver_core::op::Fsync<PlatformRawHandle>;
+pub type Wakeup = veloq_driver_core::op::Wakeup<PlatformRawHandle>;
+pub type Accept = veloq_driver_core::op::Accept<PlatformRawHandle, SockAddrStorage>;
+pub type SendTo = veloq_driver_core::op::SendTo<PlatformRawHandle>;
+pub type SyncFileRange = veloq_driver_core::op::SyncFileRange<PlatformRawHandle>;
+pub type Fallocate = veloq_driver_core::op::Fallocate<PlatformRawHandle>;
+pub type UdpRecvStream = veloq_driver_core::op::UdpRecvStream<PlatformRawHandle>;
 
 pub use veloq_driver_core::op::{
     DetachedOp, DetachedSubmitter, IntoPlatformOp, LocalSubmitter, Op, OpKind, OpLifecycle,
