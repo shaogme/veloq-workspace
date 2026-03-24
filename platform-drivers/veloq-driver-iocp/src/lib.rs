@@ -15,7 +15,7 @@ use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
 // Re-exports for convenience and backward compatibility where appropriate
 pub use config::{
     BorrowedRawHandle, BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, OwnedRawHandle,
-    RawHandle, RawHandleKind, RegisteredHandle,
+    RawHandle, RawHandleKind, RegisteredHandle, SocketKey,
 };
 pub use driver::{CloseMode, IocpDriver, IocpOpState, SocketLifecycleHandle};
 pub use net::addr::{SockAddrStorage, socket_addr_to_storage, to_socket_addr};

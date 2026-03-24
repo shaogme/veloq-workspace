@@ -1,8 +1,7 @@
 //! Actor coordination and completion routing for the RIO runtime.
 
 use crate::IoFd;
-use crate::RawHandle;
-use crate::config::BorrowedRawHandle;
+use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::driver::IocpOpState;
 use crate::ops::IocpOp;
 use crate::rio::core::RioCompletionKind;
@@ -33,7 +32,7 @@ pub(crate) enum RioActorState {
 }
 
 pub(crate) struct RioSocketActor {
-    pub(crate) socket_key: RawHandle,
+    pub(crate) socket_key: SocketKey,
     pub(crate) rq: RioRq,
     pub(crate) pool_manager: UdpPoolManager,
     pub(crate) udp_mailbox: UdpMailbox,
@@ -42,7 +41,7 @@ pub(crate) struct RioSocketActor {
 }
 
 impl RioSocketActor {
-    pub(crate) fn new(socket_key: RawHandle, rq: RioRq) -> Self {
+    pub(crate) fn new(socket_key: SocketKey, rq: RioRq) -> Self {
         Self {
             socket_key,
             rq,
@@ -54,14 +53,14 @@ impl RioSocketActor {
     }
 
     #[inline]
-    pub(crate) const fn socket_key(&self) -> RawHandle {
+    pub(crate) const fn socket_key(&self) -> SocketKey {
         self.socket_key
     }
 }
 
 struct RioCompletionRouter<'a> {
     actors: &'a mut SlotMap<ActorKey, RioSocketActor>,
-    actor_by_handle: &'a mut rustc_hash::FxHashMap<RawHandle, ActorKey>,
+    actor_by_handle: &'a mut rustc_hash::FxHashMap<SocketKey, ActorKey>,
     outstanding_count: &'a mut usize,
     comp: RioCompletionContext<'a>,
     registry: &'a mut RioRegistry,
@@ -71,7 +70,7 @@ struct RioCompletionRouter<'a> {
 
 struct ActorStoreRefs<'a> {
     actors: &'a mut SlotMap<ActorKey, RioSocketActor>,
-    actor_by_handle: &'a mut rustc_hash::FxHashMap<RawHandle, ActorKey>,
+    actor_by_handle: &'a mut rustc_hash::FxHashMap<SocketKey, ActorKey>,
 }
 
 impl<'a> RioCompletionRouter<'a> {
@@ -250,7 +249,7 @@ impl RioState {
         env: RioEnv<'_>,
     ) -> RioResult<&mut RioSocketActor> {
         let (fd, handle) = target;
-        let socket_key = crate::config::RawHandle::new(handle.raw());
+        let socket_key = handle.raw().actor_key();
         if let Some(key) = self.actor_by_handle.get(&socket_key).copied() {
             return self
                 .actors
@@ -311,7 +310,7 @@ impl RioState {
             .attach("failed to retrieve inserted actor")
     }
 
-    pub(crate) fn shutdown_actor(&mut self, socket_key: RawHandle) {
+    pub(crate) fn shutdown_actor(&mut self, socket_key: SocketKey) {
         let Some(key) = self.actor_by_handle.remove(&socket_key) else {
             return;
         };
@@ -372,7 +371,7 @@ impl RioState {
 
     pub(crate) fn cancel_udp_waiter(
         &mut self,
-        socket_key: RawHandle,
+        socket_key: SocketKey,
         uid: (usize, u32),
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) {
@@ -399,7 +398,7 @@ impl RioState {
     #[cfg(test)]
     pub(crate) fn udp_pool_debug_stats(
         &self,
-        socket_key: RawHandle,
+        socket_key: SocketKey,
     ) -> Option<UdpRecvPoolDebugStats> {
         self.actor_by_handle
             .get(&socket_key)
@@ -418,7 +417,7 @@ impl RioState {
     #[cfg(test)]
     pub(crate) fn debug_tick_udp_pool_idle(
         &mut self,
-        socket_key: RawHandle,
+        socket_key: SocketKey,
         ticks: usize,
         registrar: &dyn veloq_buf::BufferRegistrar,
     ) -> RioResult<()> {

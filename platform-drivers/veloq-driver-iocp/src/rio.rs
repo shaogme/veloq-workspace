@@ -15,7 +15,7 @@ pub(crate) mod runtime;
 
 use crate::BufferRegistrationMode;
 use crate::IocpOpState;
-use crate::config::RawHandle;
+use crate::config::SocketKey;
 use crate::ops::IocpOp;
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
@@ -91,7 +91,7 @@ pub(crate) struct RioState {
     pub(crate) registry: RioRegistry,
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
-    pub(crate) actor_by_handle: FxHashMap<RawHandle, ActorKey>,
-    pub(crate) socket_runtime: FxHashMap<RawHandle, SocketRuntimeState>,
+    pub(crate) actor_by_handle: FxHashMap<SocketKey, ActorKey>,
+    pub(crate) socket_runtime: FxHashMap<SocketKey, SocketRuntimeState>,
     pub(crate) outstanding_count: usize,
 }

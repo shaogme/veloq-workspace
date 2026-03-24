@@ -101,7 +101,7 @@ impl RioState {
                 .attach("failed to ensure RIO actor")?;
             actor.rq
         };
-        if self.is_iocp_fallback(crate::config::RawHandle::new(handle.raw())) {
+        if self.is_iocp_fallback(handle.raw().actor_key()) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }
@@ -176,7 +176,7 @@ impl RioState {
 
             (actor.rq, format!("{:?}", actor.state))
         };
-        if self.is_iocp_fallback(crate::config::RawHandle::new(handle.raw())) {
+        if self.is_iocp_fallback(handle.raw().actor_key()) {
             return Err(error_stack::Report::new(RioError::NotSupported))
                 .attach("Socket is marked for IOCP fallback");
         }

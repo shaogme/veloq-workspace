@@ -19,7 +19,7 @@ use crate::common::{
     IocpErrorContext, IocpWaker, WAKEUP_USER_DATA, completion_record, io_error, io_msg,
     io_result_to_event_res, push_completion_shared,
 };
-use crate::config::{BufferRegistrationMode, IocpConfig, IocpHandle, RawHandle, RegisteredHandle};
+use crate::config::{BufferRegistrationMode, IocpConfig, IocpHandle, RegisteredHandle, SocketKey};
 use crate::driver::{CompletionSidecar, IocpOpState};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
@@ -38,7 +38,7 @@ struct EmitContext<'a> {
 }
 
 pub(crate) struct DeferredSocketCleanup {
-    pub(crate) handle: RawHandle,
+    pub(crate) handle: SocketKey,
     pub(crate) registered_fd: Option<crate::config::IoFd>,
 }
 
@@ -519,7 +519,7 @@ impl IocpDriver {
         ctx: CancelContext<'_>,
         user_data: usize,
         ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-    ) -> Option<RawHandle> {
+    ) -> Option<SocketKey> {
         let mut should_emit_aborted = false;
         let mut aborted_socket_key = None;
         let handled = match ops.slot_view(user_data) {
@@ -529,11 +529,11 @@ impl IocpDriver {
                     .flatten()
                     .or_else(|| {
                         let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten()?;
-                        submit::resolve_fd(fd, ctx.registered_files).ok()
+                        submit::resolve_fd_handle(&fd, ctx.registered_files).ok()
                     });
 
                 if let Some(raw_handle) = raw_handle {
-                    let handle = raw_handle.raw().as_handle();
+                    let handle = raw_handle.as_handle();
                     let is_rio = guard
                         .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                         .unwrap_or(false);
@@ -541,15 +541,14 @@ impl IocpDriver {
                     if guard.platform_mut().rio_pool_waiting || is_rio {
                         if guard.platform_mut().rio_pool_waiting {
                             ctx.rio_state.cancel_udp_waiter(
-                                raw_handle.raw().actor_key(),
+                                raw_handle.actor_key(),
                                 (user_data, guard.platform_mut().generation),
                                 ctx.registrar,
                             );
                         }
                         should_emit_aborted = true;
-                        aborted_socket_key = raw_handle
-                            .is_socket()
-                            .then_some(raw_handle.raw().actor_key());
+                        aborted_socket_key =
+                            raw_handle.is_socket().then_some(raw_handle.actor_key());
                     } else {
                         // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
                         let overlapped_ptr =

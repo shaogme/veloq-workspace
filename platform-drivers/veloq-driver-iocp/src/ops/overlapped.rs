@@ -1,4 +1,4 @@
-use crate::RawHandle;
+use crate::IocpHandle;
 use crate::win32::Overlapped;
 use std::io;
 
@@ -15,8 +15,8 @@ pub struct OverlappedEntry {
     pub(crate) in_flight: bool,
     /// Result of an offloaded blocking operation.
     pub(crate) blocking_result: Option<io::Result<usize>>,
-    /// Resolved raw handle captured during submission to avoid re-resolving Fixed fd on hot paths.
-    pub(crate) resolved_handle: Option<RawHandle>,
+    /// Resolved handle captured during submission to avoid re-resolving Fixed fd on hot paths.
+    pub(crate) resolved_handle: Option<IocpHandle>,
 }
 
 impl OverlappedEntry {

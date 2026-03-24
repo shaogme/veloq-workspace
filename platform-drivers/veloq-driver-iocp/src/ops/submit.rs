@@ -9,7 +9,7 @@ use crate::ops::{
 use std::io;
 
 pub(crate) use common::SubmissionResult;
-pub(crate) use common::resolve_fd;
+pub(crate) use common::resolve_fd_handle;
 pub(crate) use file::*;
 pub(crate) use net::*;
 

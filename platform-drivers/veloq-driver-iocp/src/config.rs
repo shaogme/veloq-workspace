@@ -137,8 +137,8 @@ impl IocpHandle {
     }
 
     #[inline]
-    pub(crate) const fn actor_key(self) -> RawHandle {
-        RawHandle::new(self)
+    pub(crate) const fn actor_key(self) -> SocketKey {
+        self
     }
 
     #[inline]
@@ -202,13 +202,14 @@ impl RawHandleMeta for IocpHandle {
 pub type RawHandle = CoreRawHandle<IocpHandle>;
 pub type OwnedRawHandle = CoreOwnedRawHandle<IocpHandle>;
 pub type BorrowedRawHandle<'a> = CoreBorrowedRawHandle<'a, IocpHandle>;
+pub type SocketKey = IocpHandle;
 
 /// Registered descriptor entry used by driver-side fixed-file table.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegisteredHandle {
     /// Driver owns lifecycle (used for file handles).
     Owned(OwnedRawHandle),
-    /// Driver only keeps a weak/raw view (used for socket handles).
+    /// Driver only keeps a weak/raw view (used for borrowed socket handles).
     Weak(RawHandle),
 }
 
@@ -218,6 +219,14 @@ impl RegisteredHandle {
         match self {
             Self::Owned(h) => RawHandle::new(h.raw()),
             Self::Weak(h) => *h,
+        }
+    }
+
+    #[inline]
+    pub fn as_borrowed(&self) -> BorrowedRawHandle<'_> {
+        match self {
+            Self::Owned(h) => h.borrow(),
+            Self::Weak(h) => h.borrow(),
         }
     }
 }

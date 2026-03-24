@@ -6,7 +6,7 @@ use veloq_buf::FixedBuf;
 use crate::common::IocpErrorContext;
 use crate::ops::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write,
-    mark_header_in_flight, resolve_fd, unpack_kernel_ref,
+    mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle, unpack_kernel_ref,
 };
 use crate::ops::{
     Close, Fallocate, Fsync, KernelRef, OpenPayload, OverlappedEntry, ReadFixed, SubmitContext,
@@ -29,9 +29,8 @@ macro_rules! submit_io_op {
 
             overlapped.set_offset(val.offset);
 
-            let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
-            header.resolved_handle = Some(raw_handle);
-            let handle = raw_handle.borrow();
+            let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files)?;
+            header.resolved_handle = Some(resolve_fd_handle(&val.fd, ctx.registered_files)?);
             ensure_iocp_association(
                 handle,
                 ctx.port,
@@ -48,7 +47,19 @@ macro_rules! submit_io_op {
             )?;
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
+            if val.buf_offset > val.buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{}: buf_offset {} exceeds buffer length {}",
+                        stringify!($fn_name),
+                        val.buf_offset,
+                        val.buf.len()
+                    ),
+                ));
+            }
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
+            // SAFETY: buf_offset <= buf.len() is verified above.
             let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
@@ -137,9 +148,8 @@ pub(crate) fn submit_close(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
 
     let user_data = header.user_data;
 
@@ -166,9 +176,8 @@ pub(crate) fn submit_fsync(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
 
     let user_data = header.user_data;
 
@@ -195,9 +204,8 @@ pub(crate) fn submit_sync_range(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
 
     let user_data = header.user_data;
 
@@ -224,9 +232,8 @@ pub(crate) fn submit_fallocate(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
 
     let user_data = header.user_data;
 

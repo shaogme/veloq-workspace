@@ -5,7 +5,7 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::common::{IocpErrorContext, io_error, io_msg};
-use crate::config::{BorrowedRawHandle, IoFd, RawHandle, RegisteredHandle};
+use crate::config::{BorrowedRawHandle, IoFd, IocpHandle, RegisteredHandle};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
 use crate::ops::{KernelRef, OverlappedEntry};
 use crate::win32::Overlapped;
@@ -173,15 +173,15 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> io::Result<Sub
 // Helper Functions
 // ============================================================================
 
-pub(crate) fn resolve_fd(
-    fd: IoFd,
-    registered_files: &[Option<RegisteredHandle>],
-) -> io::Result<RawHandle> {
+pub(crate) fn resolve_fd_borrowed<'a>(
+    fd: &'a IoFd,
+    registered_files: &'a [Option<RegisteredHandle>],
+) -> io::Result<BorrowedRawHandle<'a>> {
     match fd {
-        IoFd::Raw(h) => Ok(h),
+        IoFd::Raw(h) => Ok(h.borrow()),
         IoFd::Fixed(idx) => {
-            if let Some(Some(h)) = registered_files.get(idx as usize) {
-                Ok(h.as_raw())
+            if let Some(Some(h)) = registered_files.get(*idx as usize) {
+                Ok(h.as_borrowed())
             } else {
                 Err(io_msg(
                     IocpErrorContext::ResolveFd,
@@ -190,6 +190,13 @@ pub(crate) fn resolve_fd(
             }
         }
     }
+}
+
+pub(crate) fn resolve_fd_handle(
+    fd: &IoFd,
+    registered_files: &[Option<RegisteredHandle>],
+) -> io::Result<IocpHandle> {
+    resolve_fd_borrowed(fd, registered_files).map(|h| h.raw())
 }
 
 /// Unpacks a [`KernelRef<T>`] and slot overlapped pointer from submit context.

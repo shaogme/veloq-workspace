@@ -26,7 +26,7 @@ use veloq_driver_core::slot::{
 use veloq_wheel::TaskId;
 
 use crate::common::{completion_record, push_completion_shared};
-use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle};
+use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
 use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
 pub use inner::IocpDriver;
@@ -68,7 +68,7 @@ pub(crate) type CompletionSidecar = CoreCompletionSidecar;
 
 enum DriverControlCommand {
     SocketCleanup {
-        handle: RawHandle,
+        handle: SocketKey,
         registered_fd: Option<IoFd>,
     },
 }
@@ -89,7 +89,7 @@ impl SocketLifecycleHandle {
         registered_fd: Option<IoFd>,
     ) -> io::Result<()> {
         let cmd = DriverControlCommand::SocketCleanup {
-            handle,
+            handle: handle.raw().actor_key(),
             registered_fd,
         };
         let ptr = Box::into_raw(Box::new(cmd)) as *mut crate::win32::Overlapped;
@@ -153,7 +153,7 @@ impl IocpDriver {
         SocketLifecycleHandle::new(self.port.clone())
     }
 
-    fn track_socket_submit_pending(&mut self, key: RawHandle) {
+    fn track_socket_submit_pending(&mut self, key: SocketKey) {
         let _ = self.rio_state.try_acquire_socket_inflight(key);
     }
 
@@ -170,7 +170,7 @@ impl IocpDriver {
                 op.header
                     .resolved_handle
                     .filter(|h| h.is_socket())
-                    .map(|h| h.raw().actor_key())
+                    .map(|h| h.actor_key())
             });
 
         if let Some(key) = socket_key {
@@ -179,8 +179,8 @@ impl IocpDriver {
         }
     }
 
-    fn schedule_deferred_socket_cleanup(&mut self, handle: RawHandle, registered_fd: Option<IoFd>) {
-        let key = handle.raw().actor_key();
+    fn schedule_deferred_socket_cleanup(&mut self, handle: SocketKey, registered_fd: Option<IoFd>) {
+        let key = handle;
         self.rio_state.mark_socket_closing(key);
         self.deferred_socket_cleanup
             .push_back(inner::DeferredSocketCleanup {
@@ -198,7 +198,7 @@ impl IocpDriver {
                 break;
             };
 
-            let key = pending.handle.raw().actor_key();
+            let key = pending.handle;
             let ready = self.rio_state.socket_ready_for_cleanup(key);
 
             if ready {
@@ -429,7 +429,7 @@ impl IocpDriver {
                 })
                 .flatten()
                 .filter(|h| h.is_socket())
-                .map(|h| h.raw().actor_key())
+                .map(|h| h.actor_key())
         } else {
             None
         };
@@ -472,9 +472,9 @@ impl IocpDriver {
     ) -> io::Result<Vec<IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for file in files {
-            let handle = match file {
-                RegisterFd::Borrowed(h) => RawHandle::new(h.raw()),
-                RegisterFd::Owned(h) => h.into_raw(),
+            let (handle, is_owned_input) = match file {
+                RegisterFd::Borrowed(h) => (RawHandle::new(h.raw()), false),
+                RegisterFd::Owned(h) => (h.into_raw(), true),
             };
             // Trust enum semantics first; only probe file-tagged handles as fallback.
             let canonical = match handle.kind() {
@@ -491,7 +491,15 @@ impl IocpDriver {
             let entry = if kind == RawHandleKind::Socket {
                 self.rio_state
                     .mark_socket_registered(canonical.raw().actor_key());
-                RegisteredHandle::Weak(canonical)
+                if is_owned_input {
+                    // SAFETY: ownership comes from RegisterFd::Owned and is transferred
+                    // into the registered slot for deterministic lifecycle management.
+                    RegisteredHandle::Owned(unsafe {
+                        crate::OwnedRawHandle::from_raw_owned(canonical)
+                    })
+                } else {
+                    RegisteredHandle::Weak(canonical)
+                }
             } else {
                 // SAFETY: file registration transfers ownership to the driver slot.
                 RegisteredHandle::Owned(unsafe { crate::OwnedRawHandle::from_raw_owned(canonical) })

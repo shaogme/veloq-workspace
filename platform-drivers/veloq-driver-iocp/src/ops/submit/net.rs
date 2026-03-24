@@ -13,7 +13,8 @@ use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
 use crate::ops::submit::common::{
     AcceptExArgs, ConnectExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex,
-    iocp_submit_connect_ex, mark_header_in_flight, resolve_fd, unpack_kernel_ref,
+    iocp_submit_connect_ex, mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle,
+    unpack_kernel_ref,
 };
 use crate::ops::{
     ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv,
@@ -43,15 +44,15 @@ pub(crate) fn submit_recv(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let fd = val.fd;
+    let handle = resolve_fd_borrowed(&fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&fd, ctx.registered_files)?);
     let user_data = header.user_data;
     let generation = header.generation;
     ctx.rio
         .try_submit_recv(
             RioTarget {
-                fd: val.fd,
+                fd,
                 handle,
                 user_data,
                 generation,
@@ -81,13 +82,13 @@ pub(crate) fn submit_udp_recv(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let fd = val.fd;
+    let handle = resolve_fd_borrowed(&fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&fd, ctx.registered_files)?);
     ctx.rio
         .try_submit_pool_recv_for_recv(
             crate::rio::RioUdpRecvArgs {
-                fd: val.fd,
+                fd,
                 handle,
                 recv_op: val,
                 sidecar: header,
@@ -115,9 +116,8 @@ pub(crate) fn submit_send(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&val.fd, ctx.registered_files)?);
     let user_data = header.user_data;
     let generation = header.generation;
     ctx.rio
@@ -153,9 +153,8 @@ pub(crate) fn submit_udp_send(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&val.fd, ctx.registered_files)?);
     let user_data = header.user_data;
     let generation = header.generation;
     ctx.rio
@@ -189,9 +188,8 @@ pub(crate) fn submit_connect(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
-    let raw_handle = resolve_fd(connect_op.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&connect_op.fd, ctx.registered_files)?);
     ensure_iocp_association(
         handle,
         ctx.port,
@@ -305,8 +303,11 @@ pub(crate) unsafe fn on_complete_connect(
 ) -> io::Result<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let connect_op = unsafe { payload.user.as_ref() };
-    if let Some(raw_handle) = header.resolved_handle.or_else(|| connect_op.fd.raw()) {
-        with_borrowed_socket(raw_handle.raw().as_socket(), |socket| {
+    if let Some(raw_handle) = header
+        .resolved_handle
+        .or_else(|| connect_op.fd.raw().map(|h| h.raw()))
+    {
+        with_borrowed_socket(raw_handle.as_socket(), |socket| {
             socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
         })?;
     }
@@ -320,9 +321,8 @@ pub(crate) fn submit_accept(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
-    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
     if payload.accept_socket.is_none() {
         let family = socket_family_from_handle(handle)?;
         let accept_socket = if family == AF_INET {
@@ -412,9 +412,9 @@ pub(crate) unsafe fn on_complete_accept(
         .ok_or_else(|| io::Error::other("accept socket not initialized"))?;
     let listen_handle = header
         .resolved_handle
-        .or_else(|| user.fd.raw())
+        .or_else(|| user.fd.raw().map(|h| h.raw()))
         .ok_or(io::Error::from_raw_os_error(0))?;
-    let listen_socket = listen_handle.raw().as_socket();
+    let listen_socket = listen_handle.as_socket();
     let accept_socket_raw = accept_socket.raw().as_socket();
 
     if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
@@ -474,9 +474,8 @@ pub(crate) fn submit_send_to(
 ) -> io::Result<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let raw_handle = resolve_fd(user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
 
     // RIO path is mandatory for socket send_to.
     let page_idx = header.user_data / ctx.slots_per_page;
@@ -517,12 +516,12 @@ pub(crate) fn submit_udp_recv_stream(
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
-    let raw_handle = resolve_fd(val.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(raw_handle);
-    let handle = raw_handle.borrow();
+    let fd = val.fd;
+    let handle = resolve_fd_borrowed(&fd, ctx.registered_files)?;
+    header.resolved_handle = Some(resolve_fd_handle(&fd, ctx.registered_files)?);
 
     let args = crate::rio::RioUdpStreamArgs {
-        fd: val.fd,
+        fd,
         handle,
         stream_op: val,
         user_data: header.user_data,
