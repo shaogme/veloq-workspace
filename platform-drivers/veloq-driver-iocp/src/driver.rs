@@ -488,21 +488,17 @@ impl IocpDriver {
                 }
             };
             let kind = canonical.kind();
-            let entry = if kind == RawHandleKind::Socket {
+            if kind == RawHandleKind::Socket {
                 self.rio_state
                     .mark_socket_registered(canonical.raw().actor_key());
-                if is_owned_input {
-                    // SAFETY: ownership comes from RegisterFd::Owned and is transferred
-                    // into the registered slot for deterministic lifecycle management.
-                    RegisteredHandle::Owned(unsafe {
-                        crate::OwnedRawHandle::from_raw_owned(canonical)
-                    })
-                } else {
-                    RegisteredHandle::Weak(canonical)
-                }
-            } else {
-                // SAFETY: file registration transfers ownership to the driver slot.
+            }
+            let entry = if is_owned_input {
+                // SAFETY: ownership comes from RegisterFd::Owned and is transferred
+                // into the registered slot for deterministic lifecycle management.
                 RegisteredHandle::Owned(unsafe { crate::OwnedRawHandle::from_raw_owned(canonical) })
+            } else {
+                // Borrowed handles must remain non-owning to avoid accidental close/double-close.
+                RegisteredHandle::Weak(canonical)
             };
             let idx = if let Some(idx) = self.free_slots.pop() {
                 self.registered_files[idx] = Some(entry);

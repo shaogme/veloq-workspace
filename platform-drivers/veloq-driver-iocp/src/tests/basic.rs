@@ -32,6 +32,34 @@ fn test_register_files() {
 }
 
 #[test]
+fn test_register_borrowed_file_keeps_weak_ownership() {
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let handle = std::fs::File::open("Cargo.toml").unwrap();
+    let raw = crate::config::RawHandle::new(crate::config::IocpHandle::for_file(
+        handle.as_raw_handle() as _,
+    ));
+    let fd = driver
+        .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let idx = match fd {
+        crate::IoFd::Fixed(idx) => idx as usize,
+        crate::IoFd::Raw(_) => panic!("expected fixed descriptor"),
+    };
+
+    assert!(
+        matches!(
+            driver.registered_files[idx],
+            Some(crate::config::RegisteredHandle::Weak(_))
+        ),
+        "borrowed file registration must not transfer ownership to driver"
+    );
+}
+
+#[test]
 fn test_rio_extensions_load() {
     let _ext = Extensions::new().expect("RIO Extensions should load");
 }

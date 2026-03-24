@@ -60,6 +60,7 @@ impl RemoteWaker for UringWaker {
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 pub(crate) const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
+const MIN_FILE_TABLE_CAPACITY: usize = 1;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SocketLifecycleHandle;
@@ -101,12 +102,30 @@ pub struct UringDriver {
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) chunk_register_failures_recent: HashMap<u16, Instant>,
+    pub(crate) registered_files: Vec<Option<i32>>,
+    pub(crate) free_file_slots: Vec<u32>,
+    pub(crate) file_table_initialized: bool,
 }
 
 impl UringDriver {
     #[inline]
     pub const fn socket_lifecycle_handle(&self) -> SocketLifecycleHandle {
         SocketLifecycleHandle
+    }
+
+    fn ensure_file_table_initialized(&mut self) -> io::Result<()> {
+        if self.file_table_initialized {
+            return Ok(());
+        }
+
+        let capacity = self.ops.local.len().max(MIN_FILE_TABLE_CAPACITY);
+        let sparse = vec![-1; capacity];
+        self.ring.submitter().register_files(&sparse)?;
+
+        self.registered_files = vec![None; capacity];
+        self.free_file_slots = (0..capacity as u32).rev().collect();
+        self.file_table_initialized = true;
+        Ok(())
     }
 
     pub fn new(config: impl AsRef<UringConfig>) -> io::Result<Self> {
@@ -170,6 +189,9 @@ impl UringDriver {
             registration_stats: UringRegistrationStats::default(),
             registration_mode: config.registration_mode,
             chunk_register_failures_recent: HashMap::new(),
+            registered_files: Vec::new(),
+            free_file_slots: Vec::new(),
+            file_table_initialized: false,
         };
 
         driver.submit_waker();
@@ -751,24 +773,43 @@ impl Driver for UringDriver {
         &mut self,
         files: Vec<RegisterFd<'a, UringRawHandle>>,
     ) -> io::Result<Vec<IoFd>> {
-        let fds: Vec<i32> = files
-            .into_iter()
-            .map(|h| match h {
+        self.ensure_file_table_initialized()?;
+
+        let mut fixed_fds = Vec::with_capacity(files.len());
+        for file in files {
+            let fd = match file {
                 RegisterFd::Borrowed(b) => b.raw().as_fd(),
                 RegisterFd::Owned(o) => o.raw().as_fd(),
-            })
-            .collect();
-        self.ring.submitter().register_files(&fds)?;
-
-        let mut fixed_fds = Vec::with_capacity(fds.len());
-        for i in 0..fds.len() {
-            fixed_fds.push(IoFd::Fixed(i as u32));
+            };
+            let idx = self.free_file_slots.pop().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "io_uring registered file table exhausted",
+                )
+            })?;
+            self.ring.submitter().register_files_update(idx, &[fd])?;
+            self.registered_files[idx as usize] = Some(fd);
+            fixed_fds.push(IoFd::Fixed(idx));
         }
         Ok(fixed_fds)
     }
 
-    fn unregister_files(&mut self, _files: Vec<IoFd>) -> io::Result<()> {
-        self.ring.submitter().unregister_files()
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()> {
+        if !self.file_table_initialized {
+            return Ok(());
+        }
+
+        for fd in files {
+            if let IoFd::Fixed(idx) = fd {
+                let index = idx as usize;
+                if index < self.registered_files.len() && self.registered_files[index].is_some() {
+                    self.ring.submitter().register_files_update(idx, &[-1])?;
+                    self.registered_files[index] = None;
+                    self.free_file_slots.push(idx);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn wake(&mut self) -> io::Result<()> {

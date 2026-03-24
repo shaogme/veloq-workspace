@@ -209,7 +209,7 @@ pub type SocketKey = IocpHandle;
 pub enum RegisteredHandle {
     /// Driver owns lifecycle (used for file handles).
     Owned(OwnedRawHandle),
-    /// Driver only keeps a weak/raw view (used for borrowed socket handles).
+    /// Driver only keeps a weak/raw view (used for borrowed handles).
     Weak(RawHandle),
 }
 
