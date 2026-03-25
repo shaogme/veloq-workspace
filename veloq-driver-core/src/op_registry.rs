@@ -1,5 +1,6 @@
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
+use crate::error::DriverResult;
 use crate::slot::{ErasedPayload, SlotEntry, SlotState, SlotStorage, SlotTable};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
@@ -173,7 +174,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
     where
         F: FnOnce(
             &mut Option<Op>,
-            &mut Option<std::io::Result<R>>,
+            &mut Option<DriverResult<R>>,
             &mut Option<ErasedPayload>,
             &mut S,
         ) -> X,

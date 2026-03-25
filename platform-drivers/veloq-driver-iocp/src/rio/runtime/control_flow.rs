@@ -9,18 +9,18 @@ use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
 use crate::rio::core::{RioOpCtxGuard, RioPoolCtxGuard};
-use crate::rio::error::{RioDiag, RioError, RioReportExt, RioResult};
+use crate::rio::error::{RioDiag, RioError, RioResult};
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager, UdpPoolState};
 use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState, SocketRuntimeMode};
 use error_stack::ResultExt;
 use slotmap::SlotMap;
-use std::io;
 use tracing::error;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
+use veloq_driver_core::error::{DriverErrorKind, driver_os_error};
 use veloq_driver_core::op_registry::OpRegistry;
 use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
@@ -157,7 +157,12 @@ impl<'a> RioCompletionRouter<'a> {
                     let result_for_slot = if res.Status == 0 {
                         Ok(res.BytesTransferred as usize)
                     } else {
-                        Err(io::Error::from_raw_os_error(res.Status))
+                        Err(driver_os_error(
+                            DriverErrorKind::Completion,
+                            "rio.runtime.control_flow.handle_op_completion",
+                            res.Status,
+                            "rio completion returned os error",
+                        ))
                     };
                     let res_code = rio_result_to_event_res(&result_for_slot);
                     let event = CompletionEvent {
@@ -507,9 +512,8 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable,
-    ) -> io::Result<usize> {
+    ) -> RioResult<usize> {
         self.process_completions_internal(ops, registrar, completion_events, completion_table)
-            .map_err(|e| e.to_io_error("RIO completion processing failed"))
     }
 
     fn process_completions_internal(

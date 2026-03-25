@@ -97,7 +97,7 @@ impl LateBoundWaker {
 }
 
 impl RemoteWaker for LateBoundWaker {
-    fn wake(&self) -> std::io::Result<()> {
+    fn wake(&self) -> veloq_driver::error::DriverResult<()> {
         if self.ready.load(std::sync::atomic::Ordering::Acquire) {
             let w = unsafe { &*self.waker.get() };
             if let Some(w) = w {

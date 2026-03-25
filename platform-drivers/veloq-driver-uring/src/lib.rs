@@ -9,7 +9,5 @@ pub use config::{
     RawHandleKind, SockAddrStorage, UringConfig, UringRawHandle,
 };
 pub use driver::{SocketLifecycleHandle, UringDriver, UringOpState};
-pub use error::{
-    UringDiag, UringError, UringIoError, UringReportExt, UringResult, UringResultExt, from_io_error,
-};
+pub use error::{UringDiag, UringError, UringResult};
 pub use net::{Socket, socket_addr_to_storage, to_socket_addr};

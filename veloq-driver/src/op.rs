@@ -47,7 +47,7 @@ pub trait OpSubmitter: Clone + std::marker::Send + Sync + 'static {
             > + std::marker::Send
             + 'static;
 
-    fn from_current_context() -> std::io::Result<Self>;
+    fn from_current_context() -> Self;
 }
 
 impl OpSubmitter for LocalSubmitter {
@@ -72,7 +72,7 @@ impl OpSubmitter for LocalSubmitter {
         )
     }
 
-    fn from_current_context() -> std::io::Result<Self> {
+    fn from_current_context() -> Self {
         <LocalSubmitter as veloq_driver_core::op::OpSubmitter<PlatformDriver>>::from_current_context(
         )
     }
@@ -100,7 +100,7 @@ impl OpSubmitter for DetachedSubmitter {
         )
     }
 
-    fn from_current_context() -> std::io::Result<Self> {
+    fn from_current_context() -> Self {
         <DetachedSubmitter as veloq_driver_core::op::OpSubmitter<PlatformDriver>>::from_current_context()
     }
 }

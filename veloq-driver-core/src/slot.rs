@@ -1,8 +1,8 @@
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
+use crate::error::DriverResult;
 use crate::op_registry::OpRegistry;
 use crossbeam_utils::CachePadded;
-use std::io;
 use std::marker::PhantomData;
 use veloq_atomic_waker::AtomicWaker;
 use veloq_shim::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -121,7 +121,7 @@ impl AtomicPackedCoreState {
 
 pub struct SlotStorage<Op, S: SlotSidecar, R = usize> {
     op: Option<Op>,
-    result: Option<std::io::Result<R>>,
+    result: Option<DriverResult<R>>,
     payload: Option<ErasedPayload>,
     sidecar: S,
 }
@@ -147,7 +147,7 @@ impl<Op, S: SlotSidecar, R> SlotStorage<Op, S, R> {
     where
         F: FnOnce(
             &mut Option<Op>,
-            &mut Option<std::io::Result<R>>,
+            &mut Option<DriverResult<R>>,
             &mut Option<ErasedPayload>,
             &mut S,
         ) -> X,
@@ -181,7 +181,7 @@ pub struct SlotData<Op, S: SlotSidecar, R = usize> {
 #[derive(Debug)]
 pub(crate) struct CompletionData<R = usize> {
     pub payload: Option<ErasedPayload>,
-    pub detail: Option<io::Result<R>>,
+    pub detail: Option<DriverResult<R>>,
 }
 
 impl<R> Default for CompletionData<R> {
@@ -274,7 +274,7 @@ impl<Op, S: SlotSidecar, R> SlotData<Op, S, R> {
     #[inline]
     pub(crate) fn completion_with_data<F, X>(&self, f: F) -> X
     where
-        F: FnOnce(&mut Option<ErasedPayload>, &mut Option<io::Result<R>>) -> X,
+        F: FnOnce(&mut Option<ErasedPayload>, &mut Option<DriverResult<R>>) -> X,
     {
         let mut data = self.completion_data.lock();
         let CompletionData { payload, detail } = &mut *data;
@@ -640,7 +640,9 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, Completed, Op, P, S, R> 
         self.op.take()
     }
 
-    pub fn take_completion_data(&mut self) -> (Option<ErasedPayload>, Option<io::Result<R>>) {
+    pub fn take_completion_data(
+        &mut self,
+    ) -> (Option<ErasedPayload>, Option<DriverResult<R>>) {
         self.storage
             .with_mut(|_op, result, payload, _sidecar| (payload.take(), result.take()))
     }

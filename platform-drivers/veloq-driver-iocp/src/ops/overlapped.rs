@@ -1,6 +1,6 @@
 use crate::IocpHandle;
+use crate::error::IocpResult;
 use crate::win32::Overlapped;
-use std::io;
 
 /// A wrapper for the Windows OVERLAPPED structure with additional metadata.
 #[repr(C)]
@@ -14,7 +14,7 @@ pub struct OverlappedEntry {
     /// Whether the operation is currently in-flight in the kernel.
     pub(crate) in_flight: bool,
     /// Result of an offloaded blocking operation.
-    pub(crate) blocking_result: Option<io::Result<usize>>,
+    pub(crate) blocking_result: Option<IocpResult<usize>>,
     /// Resolved handle captured during submission to avoid re-resolving Fixed fd on hot paths.
     pub(crate) resolved_handle: Option<IocpHandle>,
 }

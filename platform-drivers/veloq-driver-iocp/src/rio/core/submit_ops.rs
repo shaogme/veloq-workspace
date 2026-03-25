@@ -16,10 +16,9 @@ use crate::config::BorrowedRawHandle;
 use crate::ext::Extensions;
 use crate::ops::submit::SubmissionResult;
 use crate::rio::core::registry::RioRegistry;
-use crate::rio::error::{RioDiag, RioError, RioReportExt, RioResult};
+use crate::rio::error::{RioDiag, RioError, RioResult};
 use crate::rio::{RioEnv, RioState, RioTarget};
 use error_stack::ResultExt;
-use std::io;
 use tracing::error;
 
 impl RioState {
@@ -67,9 +66,8 @@ impl RioState {
         target: RioTarget<'_>,
         buf: &mut veloq_buf::FixedBuf,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<SubmissionResult> {
+    ) -> RioResult<SubmissionResult> {
         self.try_submit_recv_internal(target, buf, registrar)
-            .map_err(|e| e.to_io_error("RIOReceive submission failed"))
     }
 
     fn try_submit_recv_internal(
@@ -129,16 +127,6 @@ impl RioState {
     }
 
     pub(crate) fn try_submit_send(
-        &mut self,
-        target: RioTarget<'_>,
-        buf: &veloq_buf::FixedBuf,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<SubmissionResult> {
-        self.try_submit_send_internal(target, buf, registrar)
-            .map_err(|e| e.to_io_error("RIOSend submission failed"))
-    }
-
-    fn try_submit_send_internal(
         &mut self,
         target: RioTarget<'_>,
         buf: &veloq_buf::FixedBuf,

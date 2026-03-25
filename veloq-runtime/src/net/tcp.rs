@@ -3,6 +3,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::net::common::InnerSocket;
 use crate::runtime::context::submit;
+use error_stack::Report;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
@@ -29,6 +30,14 @@ pub type LocalTcpStream = GenericTcpStream<LocalSubmitter>;
 pub type TcpListener = GenericTcpListener<DetachedSubmitter>;
 pub type TcpStream = GenericTcpStream<DetachedSubmitter>;
 
+#[inline]
+fn driver_err<E>(err: Report<E>) -> io::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    io::Error::other(err.to_string())
+}
+
 // ============================================================================
 // Constructors and Helpers
 // ============================================================================
@@ -40,23 +49,23 @@ fn bind_listener_inner<A: ToSocketAddrs>(addr: A) -> io::Result<InnerSocket> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No address provided"))?;
 
     let socket = if addr.is_ipv4() {
-        Socket::new_tcp_v4()?
+        Socket::new_tcp_v4().map_err(driver_err)?
     } else {
-        Socket::new_tcp_v6()?
+        Socket::new_tcp_v6().map_err(driver_err)?
     };
 
-    socket.bind(addr)?;
-    socket.listen(1024)?; // backlog
-    let local_addr = socket.local_addr()?;
+    socket.bind(addr).map_err(driver_err)?;
+    socket.listen(1024).map_err(driver_err)?; // backlog
+    let local_addr = socket.local_addr().map_err(driver_err)?;
 
     InnerSocket::new(socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
 fn new_stream_inner(addr: &SocketAddr) -> io::Result<InnerSocket> {
     let socket = if addr.is_ipv4() {
-        Socket::new_tcp_v4()?
+        Socket::new_tcp_v4().map_err(driver_err)?
     } else {
-        Socket::new_tcp_v6()?
+        Socket::new_tcp_v6().map_err(driver_err)?
     };
     InnerSocket::new(socket.into_owned_raw().into_raw(), None)
 }
@@ -69,7 +78,7 @@ impl<S: OpSubmitter> GenericTcpListener<S> {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         Ok(Self {
             inner: bind_listener_inner(addr)?,
-            submitter: S::from_current_context()?,
+            submitter: S::from_current_context(),
         })
     }
 
@@ -87,7 +96,7 @@ impl<S: OpSubmitter> GenericTcpListener<S> {
             op_back.ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Accept op lost"))?;
 
         // Completion value is the accepted socket handle; address comes from payload sideband.
-        let accepted = res?;
+        let accepted = res.map_err(driver_err)?;
         let addr = op.remote_addr.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -122,7 +131,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         inner: InnerSocket,
         addr: SocketAddr,
     ) -> io::Result<Self> {
-        let submitter = S::from_current_context()?;
+        let submitter = S::from_current_context();
 
         let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
@@ -133,7 +142,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         };
 
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
-        res?;
+        res.map_err(driver_err)?;
 
         Ok(Self { inner, submitter })
     }
@@ -160,7 +169,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         let buf = op_back
             .map(|o| o.buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res?, buf))
+        Ok((res.map_err(driver_err)?, buf))
     }
 
     pub async fn send_subset(
@@ -177,7 +186,7 @@ impl<S: OpSubmitter> GenericTcpStream<S> {
         let buf = op_back
             .map(|o| o.buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res?, buf))
+        Ok((res.map_err(driver_err)?, buf))
     }
 }
 

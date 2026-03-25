@@ -347,7 +347,7 @@ pub(crate) fn submit_accept(
         }
         .map(|s| s.into_owned_raw())
         .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_accept.create_socket", e).attach(format!(
+            e.attach(format!(
                 "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
                 handle.raw().as_handle() as usize,
                 family

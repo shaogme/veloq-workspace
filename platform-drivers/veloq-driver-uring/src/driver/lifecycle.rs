@@ -1,8 +1,8 @@
 use crate::driver::{CANCEL_USER_DATA, UringDriver};
 use io_uring::opcode;
-use std::io;
 use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::CompletionSidecar;
+use veloq_driver_core::error::DriverResult;
 
 use crate::op::slot::{Slot, SlotState, SlotView, UringOpRegistryExt};
 use veloq_driver_core::slot::ErasedPayload;
@@ -164,7 +164,7 @@ fn cancel_slot_immediate<'a, S: SlotState>(
     let generation = slot.entry.generation(Ordering::Acquire);
     let (payload, detail) = slot.storage.with_mut(
         |_op: &mut Option<crate::op::UringOp>,
-         result: &mut Option<io::Result<usize>>,
+         result: &mut Option<DriverResult<usize>>,
          payload: &mut Option<ErasedPayload>,
          _sidecar| (payload.take(), result.take()),
     );

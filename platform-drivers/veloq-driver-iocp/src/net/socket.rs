@@ -1,8 +1,7 @@
 use super::addr::{socket_addr_to_storage, to_socket_addr};
 use crate::config::{IocpHandle, OwnedRawHandle, RawHandle};
-use crate::error::{IocpError, IocpResult, IocpResultExt, from_io_error};
+use crate::error::{IocpError, IocpResult, from_io_error};
 use crate::win32::SafeSocket;
-use std::io;
 use std::net::SocketAddr;
 use veloq_driver_core::net::PlatformSocket;
 use windows_sys::Win32::Networking::WinSock::{
@@ -42,52 +41,56 @@ impl Socket {
     }
 
     /// Creates a new TCP v4 socket.
-    pub fn new_tcp_v4() -> io::Result<Self> {
-        Self::new_inner(AF_INET, SOCK_STREAM, IPPROTO_TCP).to_io_result("socket new_tcp_v4 failed")
+    pub fn new_tcp_v4() -> IocpResult<Self> {
+        Self::new_inner(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+            .map_err(|e| e.attach("socket new_tcp_v4 failed"))
     }
 
     /// Creates a new TCP v6 socket.
-    pub fn new_tcp_v6() -> io::Result<Self> {
-        Self::new_inner(AF_INET6, SOCK_STREAM, IPPROTO_TCP).to_io_result("socket new_tcp_v6 failed")
+    pub fn new_tcp_v6() -> IocpResult<Self> {
+        Self::new_inner(AF_INET6, SOCK_STREAM, IPPROTO_TCP)
+            .map_err(|e| e.attach("socket new_tcp_v6 failed"))
     }
 
     /// Creates a new UDP v4 socket.
-    pub fn new_udp_v4() -> io::Result<Self> {
-        Self::new_inner(AF_INET, SOCK_DGRAM, IPPROTO_UDP).to_io_result("socket new_udp_v4 failed")
+    pub fn new_udp_v4() -> IocpResult<Self> {
+        Self::new_inner(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+            .map_err(|e| e.attach("socket new_udp_v4 failed"))
     }
 
     /// Creates a new UDP v6 socket.
-    pub fn new_udp_v6() -> io::Result<Self> {
-        Self::new_inner(AF_INET6, SOCK_DGRAM, IPPROTO_UDP).to_io_result("socket new_udp_v6 failed")
+    pub fn new_udp_v6() -> IocpResult<Self> {
+        Self::new_inner(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+            .map_err(|e| e.attach("socket new_udp_v6 failed"))
     }
 
     /// Binds the socket to the given address.
-    pub fn bind(&self, addr: SocketAddr) -> io::Result<()> {
+    pub fn bind(&self, addr: SocketAddr) -> IocpResult<()> {
         let (storage, len) = socket_addr_to_storage(addr);
         // SAFETY: storage is a valid SOCKADDR_STORAGE and we pass its pointer and size.
         unsafe {
             self.inner
                 .bind(&storage.0 as *const _ as *const SOCKADDR, len)
-                .to_io_result("socket bind failed")
+                .map_err(|e| e.attach("socket bind failed"))
         }
     }
 
     /// Connects the socket to the given address.
-    pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+    pub fn connect(&self, addr: SocketAddr) -> IocpResult<()> {
         let (storage, len) = socket_addr_to_storage(addr);
         // SAFETY: storage is a valid SOCKADDR_STORAGE and we pass its pointer and size.
         unsafe {
             self.inner
                 .connect(&storage.0 as *const _ as *const SOCKADDR, len)
-                .to_io_result("socket connect failed")
+                .map_err(|e| e.attach("socket connect failed"))
         }
     }
 
     /// Listens for incoming connections.
-    pub fn listen(&self, backlog: i32) -> io::Result<()> {
+    pub fn listen(&self, backlog: i32) -> IocpResult<()> {
         self.inner
             .listen(backlog)
-            .to_io_result("socket listen failed")
+            .map_err(|e| e.attach("socket listen failed"))
     }
 
     /// Consumes the Socket and returns an owned handle.
@@ -109,7 +112,7 @@ impl Socket {
     }
 
     /// Returns the local address of the socket.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> IocpResult<SocketAddr> {
         // SAFETY: SOCKADDR_STORAGE is a POD struct and safe to zero-initialize.
         let mut storage = unsafe {
             std::mem::zeroed::<windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE>()
@@ -119,100 +122,101 @@ impl Socket {
         unsafe {
             self.inner
                 .getsockname(&mut storage as *mut _ as *mut SOCKADDR, &mut len)
-                .to_io_result("socket getsockname failed")?;
+                .map_err(|e| e.attach("socket getsockname failed"))?;
         }
 
         // SAFETY: storage is a valid SOCKADDR_STORAGE and len is its size.
         let buf =
             unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
-        to_socket_addr(buf).to_io_result("decode local socket address failed")
+        to_socket_addr(buf).map_err(|e| e.attach("decode local socket address failed"))
     }
 
     /// Sets TCP_NODELAY option.
-    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+    pub fn set_nodelay(&self, nodelay: bool) -> IocpResult<()> {
         let val = if nodelay { 1i32 } else { 0i32 };
         self.inner
             .setsockopt(IPPROTO_TCP, TCP_NODELAY, &val)
-            .to_io_result("socket set_nodelay failed")
+            .map_err(|e| e.attach("socket set_nodelay failed"))
     }
 
     /// Sets receive buffer size.
-    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+    pub fn set_recv_buffer_size(&self, size: usize) -> IocpResult<()> {
         let val = size as i32;
         self.inner
             .setsockopt(SOL_SOCKET, SO_RCVBUF, &val)
-            .to_io_result("socket set_recv_buffer_size failed")
+            .map_err(|e| e.attach("socket set_recv_buffer_size failed"))
     }
 
     /// Sets send buffer size.
-    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+    pub fn set_send_buffer_size(&self, size: usize) -> IocpResult<()> {
         let val = size as i32;
         self.inner
             .setsockopt(SOL_SOCKET, SO_SNDBUF, &val)
-            .to_io_result("socket set_send_buffer_size failed")
+            .map_err(|e| e.attach("socket set_send_buffer_size failed"))
     }
 
     /// Sets SO_REUSEADDR option.
-    pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+    pub fn set_reuse_address(&self, reuse: bool) -> IocpResult<()> {
         let val = if reuse { 1i32 } else { 0i32 };
         self.inner
             .setsockopt(SOL_SOCKET, SO_REUSEADDR, &val)
-            .to_io_result("socket set_reuse_address failed")
+            .map_err(|e| e.attach("socket set_reuse_address failed"))
     }
 
     /// Sets SO_KEEPALIVE option.
-    pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+    pub fn set_keepalive(&self, keepalive: bool) -> IocpResult<()> {
         let val = if keepalive { 1i32 } else { 0i32 };
         self.inner
             .setsockopt(SOL_SOCKET, SO_KEEPALIVE, &val)
-            .to_io_result("socket set_keepalive failed")
+            .map_err(|e| e.attach("socket set_keepalive failed"))
     }
 
     /// Sets IP_TTL option.
-    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+    pub fn set_ttl(&self, ttl: u32) -> IocpResult<()> {
         let val = ttl as i32;
         self.inner
             .setsockopt(IPPROTO_IP, IP_TTL, &val)
-            .to_io_result("socket set_ttl failed")
+            .map_err(|e| e.attach("socket set_ttl failed"))
     }
 
     /// Sets SO_BROADCAST option.
-    pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
+    pub fn set_broadcast(&self, broadcast: bool) -> IocpResult<()> {
         let val = if broadcast { 1i32 } else { 0i32 };
         self.inner
             .setsockopt(SOL_SOCKET, SO_BROADCAST, &val)
-            .to_io_result("socket set_broadcast failed")
+            .map_err(|e| e.attach("socket set_broadcast failed"))
     }
 }
 
 impl PlatformSocket for Socket {
     type Handle = IocpHandle;
+    type Error = IocpError;
 
-    fn new_tcp_v4() -> io::Result<Self> {
+    fn new_tcp_v4() -> IocpResult<Self> {
         Socket::new_tcp_v4()
     }
 
-    fn new_tcp_v6() -> io::Result<Self> {
+    fn new_tcp_v6() -> IocpResult<Self> {
         Socket::new_tcp_v6()
     }
 
-    fn new_udp_v4() -> io::Result<Self> {
+    fn new_udp_v4() -> IocpResult<Self> {
         Socket::new_udp_v4()
     }
 
-    fn new_udp_v6() -> io::Result<Self> {
+    fn new_udp_v6() -> IocpResult<Self> {
         Socket::new_udp_v6()
     }
 
-    fn bind(&self, addr: SocketAddr) -> io::Result<()> {
+    fn bind(&self, addr: SocketAddr) -> IocpResult<()> {
         Socket::bind(self, addr)
     }
 
-    fn listen(&self, backlog: i32) -> io::Result<()> {
+    fn listen(&self, backlog: i32) -> IocpResult<()> {
         Socket::listen(self, backlog)
     }
 
-    fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+    fn connect(&self, addr: SocketAddr) -> IocpResult<()> {
         Socket::connect(self, addr)
     }
 
@@ -228,35 +232,35 @@ impl PlatformSocket for Socket {
         unsafe { Socket::from_raw(handle) }
     }
 
-    fn local_addr(&self) -> io::Result<SocketAddr> {
+    fn local_addr(&self) -> IocpResult<SocketAddr> {
         Socket::local_addr(self)
     }
 
-    fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+    fn set_nodelay(&self, nodelay: bool) -> IocpResult<()> {
         Socket::set_nodelay(self, nodelay)
     }
 
-    fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+    fn set_recv_buffer_size(&self, size: usize) -> IocpResult<()> {
         Socket::set_recv_buffer_size(self, size)
     }
 
-    fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+    fn set_send_buffer_size(&self, size: usize) -> IocpResult<()> {
         Socket::set_send_buffer_size(self, size)
     }
 
-    fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+    fn set_reuse_address(&self, reuse: bool) -> IocpResult<()> {
         Socket::set_reuse_address(self, reuse)
     }
 
-    fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+    fn set_keepalive(&self, keepalive: bool) -> IocpResult<()> {
         Socket::set_keepalive(self, keepalive)
     }
 
-    fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+    fn set_ttl(&self, ttl: u32) -> IocpResult<()> {
         Socket::set_ttl(self, ttl)
     }
 
-    fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
+    fn set_broadcast(&self, broadcast: bool) -> IocpResult<()> {
         Socket::set_broadcast(self, broadcast)
     }
 }

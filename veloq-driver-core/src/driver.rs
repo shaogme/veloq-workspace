@@ -1,11 +1,13 @@
 use crate::slot;
 use crate::slot::is_runnable_state;
 use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
+use crate::error::{
+    DriverErrorKind, DriverErrorReport, DriverResult, driver_os_error,
+};
 use crossbeam_queue::SegQueue;
 
 use veloq_shim::atomic::Ordering;
 
-use std::io;
 use std::sync::Arc;
 
 use std::task::Poll;
@@ -25,18 +27,23 @@ pub enum RegisterFd<'a, H: RawHandleMeta> {
 }
 
 pub trait CompletionValue: Send + 'static {
-    fn from_event_res(res: i32) -> io::Result<Self>
+    fn from_event_res(res: i32) -> DriverResult<Self>
     where
         Self: Sized;
 }
 
 impl CompletionValue for usize {
     #[inline]
-    fn from_event_res(res: i32) -> io::Result<Self> {
+    fn from_event_res(res: i32) -> DriverResult<Self> {
         if res >= 0 {
             Ok(res as usize)
         } else {
-            Err(io::Error::from_raw_os_error(-res))
+            Err(driver_os_error(
+                DriverErrorKind::System,
+                "driver-core/completion",
+                -res,
+                "completion reported OS error",
+            ))
         }
     }
 }
@@ -47,7 +54,7 @@ pub struct CompletionSidecar<R = usize> {
     pub res: i32,
     pub flags: u32,
     pub payload: Option<slot::ErasedPayload>,
-    pub detail: Option<io::Result<R>>,
+    pub detail: Option<DriverResult<R>>,
 }
 
 /// Unified completion event produced by platform drivers.
@@ -67,7 +74,7 @@ pub type SharedCompletionTable<R = usize> = Arc<dyn CompletionAccess<R>>;
 pub struct CompletionRecord<R = usize> {
     pub event: CompletionEvent,
     pub payload: Option<slot::ErasedPayload>,
-    pub detail: Option<io::Result<R>>,
+    pub detail: Option<DriverResult<R>>,
 }
 
 /// Result of a completion poll, enabling detection of recycled slots.
@@ -85,7 +92,7 @@ pub trait CompletionAccess<R = usize>: Send + Sync {
         &self,
         event: CompletionEvent,
         payload: Option<slot::ErasedPayload>,
-        detail: Option<io::Result<R>>,
+        detail: Option<DriverResult<R>>,
     );
 
     fn try_take_record(&self, token: u64) -> PollRecordResult<R>;
@@ -113,7 +120,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
         &self,
         event: CompletionEvent,
         mut payload: Option<slot::ErasedPayload>,
-        mut detail: Option<io::Result<R>>,
+        mut detail: Option<DriverResult<R>>,
     ) {
         let (idx, generation) = decode_completion_token(event.user_data);
         if idx >= self.slots.len() {
@@ -524,7 +531,7 @@ pub fn decode_completion_token(token: u64) -> (usize, u32) {
 }
 
 #[inline]
-pub fn event_res_to_io<R: CompletionValue>(res: i32) -> io::Result<R> {
+pub fn event_res_to_result<R: CompletionValue>(res: i32) -> DriverResult<R> {
     R::from_event_res(res)
 }
 
@@ -534,7 +541,7 @@ pub trait Driver: 'static {
     type Sidecar: SlotSidecar;
     type Completion: CompletionValue;
 
-    fn reserve_op(&mut self) -> io::Result<(usize, u32)>;
+    fn reserve_op(&mut self) -> DriverResult<(usize, u32)>;
 
     fn slot_table(
         &self,
@@ -574,11 +581,11 @@ pub trait Driver: 'static {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>>;
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>>;
 
-    fn submit_queue(&mut self) -> io::Result<()>;
+    fn submit_queue(&mut self) -> DriverResult<()>;
 
-    fn wait(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> DriverResult<()>;
 
     fn process_completions(&mut self);
 
@@ -600,7 +607,10 @@ pub trait Driver: 'static {
         drained
     }
 
-    fn wait_and_drain_completions(&mut self, out: &mut Vec<CompletionEvent>) -> io::Result<usize> {
+    fn wait_and_drain_completions(
+        &mut self,
+        out: &mut Vec<CompletionEvent>,
+    ) -> DriverResult<usize> {
         self.wait()?;
         Ok(self.drain_completions(out))
     }
@@ -619,18 +629,19 @@ pub trait Driver: 'static {
 
     fn cancel_op(&mut self, user_data: usize);
 
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()>;
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize)
+    -> DriverResult<()>;
 
     fn register_files<'a>(
         &mut self,
         files: Vec<RegisterFd<'a, Self::Raw>>,
-    ) -> io::Result<Vec<IoFd>>;
+    ) -> DriverResult<Vec<IoFd>>;
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()>;
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()>;
 
-    fn submit_background(&mut self, op: Self::Op) -> io::Result<()>;
+    fn submit_background(&mut self, op: Self::Op) -> DriverResult<()>;
 
-    fn wake(&mut self) -> io::Result<()>;
+    fn wake(&mut self) -> DriverResult<()>;
 
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
 
@@ -640,7 +651,7 @@ pub trait Driver: 'static {
 }
 
 pub trait RemoteWaker: Send + Sync {
-    fn wake(&self) -> io::Result<()>;
+    fn wake(&self) -> DriverResult<()>;
 }
 
 #[must_use]
@@ -672,16 +683,16 @@ impl SubmitBinder {
     }
 
     #[inline]
-    pub fn ok(self, poll: Poll<()>) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
+    pub fn ok(self, poll: Poll<()>) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
         Outcome(Ok(poll))
     }
 
     #[inline]
     pub fn err(
         self,
-        err: io::Error,
+        err: DriverErrorReport,
         status: SubmitStatus,
-    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
         Outcome(Err((err, status)))
     }
 }

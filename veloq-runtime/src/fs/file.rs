@@ -18,6 +18,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
+fn driver_err(err: error_stack::Report<veloq_driver::error::DriverErrorKind>) -> io::Error {
+    io::Error::other(format!("{err:#}"))
+}
+
 #[cfg(not(unix))]
 macro_rules! ignore {
     ($($x:expr),* $(,)?) => {
@@ -169,7 +173,7 @@ impl<S: OpSubmitter> Future for SyncRangeFuture<S> {
                     match fut.poll(cx) {
                         Poll::Ready(op_res) => {
                             let (res, _) = op_res.into_inner();
-                            return Poll::Ready(res.map(|_| ()));
+                            return Poll::Ready(res.map(|_| ()).map_err(driver_err));
                         }
                         Poll::Pending => return Poll::Pending,
                     }
@@ -299,7 +303,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         let buf = op
             .map(|o| o.buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res?, buf))
+        Ok((res.map_err(driver_err)?, buf))
     }
 
     pub async fn write_at_subset(
@@ -320,7 +324,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         let buf = op
             .map(|o| o.buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res?, buf))
+        Ok((res.map_err(driver_err)?, buf))
     }
 
     pub async fn sync_all(&self) -> io::Result<()> {
@@ -330,7 +334,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         };
 
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ())
+        res.map(|_| ()).map_err(driver_err)
     }
 
     pub async fn sync_data(&self) -> io::Result<()> {
@@ -340,7 +344,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         };
 
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ())
+        res.map(|_| ()).map_err(driver_err)
     }
 
     /// Sync a file range.
@@ -362,7 +366,7 @@ impl<S: OpSubmitter, P: FilePos> GenericFile<S, P> {
         };
 
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ())
+        res.map(|_| ()).map_err(driver_err)
     }
 }
 

@@ -4,9 +4,9 @@ use crate::config::UringRawHandle;
 use crate::driver::UringDriver;
 use crate::{OwnedRawHandle, RawHandle};
 use io_uring::squeue;
-use std::io;
 use std::time::Duration;
 use veloq_driver_core::driver::PlatformOp;
+use veloq_driver_core::error::DriverResult;
 use veloq_driver_core::op::{IntoPlatformOp, OpKind};
 
 mod payload;
@@ -24,8 +24,10 @@ pub(crate) use payload::{
 // ============================================================================
 
 pub(crate) type MakeSqeFn =
-    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> io::Result<squeue::Entry>;
-pub(crate) type OnCompleteFn = unsafe fn(op: &mut UringKernelOp, result: i32) -> io::Result<usize>;
+    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver)
+        -> DriverResult<squeue::Entry>;
+pub(crate) type OnCompleteFn =
+    unsafe fn(op: &mut UringKernelOp, result: i32) -> DriverResult<usize>;
 pub(crate) type DropFn = unsafe fn(op: &mut UringKernelOp);
 pub(crate) type GetTimeoutFn = unsafe fn(op: &UringKernelOp) -> Option<Duration>;
 pub(crate) type ResolveChunksFn = unsafe fn(op: &UringKernelOp, chunks: &mut [u16]) -> usize;
@@ -140,7 +142,10 @@ macro_rules! define_uring_ops {
                     unsafe { Box::from_raw(ptr as *mut $OpType) }
                 }
 
-                fn map_completion_result(&self, res: io::Result<usize>) -> io::Result<Self::Completion> {
+                fn map_completion_result(
+                    &self,
+                    res: DriverResult<usize>,
+                ) -> DriverResult<Self::Completion> {
                     define_uring_ops!(@map_completion self, res, $($map_completion)?)
                 }
             }
@@ -281,7 +286,7 @@ define_uring_ops! {
         make_sqe: submit::make_sqe_accept,
         on_complete: submit::on_complete_accept,
         completion: OwnedRawHandle,
-        map_completion: |_op: &Accept, res: io::Result<usize>| {
+        map_completion: |_op: &Accept, res: DriverResult<usize>| {
             res.map(|raw| unsafe {
                 OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_socket(
                     raw as i32,
@@ -333,7 +338,7 @@ define_uring_ops! {
         kind: OpKind::Open,
         make_sqe: submit::make_sqe_open,
         completion: OwnedRawHandle,
-        map_completion: |_op: &Open, res: io::Result<usize>| {
+        map_completion: |_op: &Open, res: DriverResult<usize>| {
             res.map(|raw| unsafe {
                 OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(
                     raw as i32,

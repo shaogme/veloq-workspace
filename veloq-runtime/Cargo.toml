@@ -31,6 +31,7 @@ crossbeam-utils.workspace = true
 crossbeam-queue.workspace = true
 crossbeam-deque = "0.8"
 tracing = "0.1.44"
+error-stack.workspace = true
 parking_lot.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

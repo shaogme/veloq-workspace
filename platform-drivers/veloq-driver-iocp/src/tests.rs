@@ -3,14 +3,14 @@ pub(crate) mod io_tests;
 pub(crate) mod net;
 pub(crate) mod net_udp;
 
-use std::io;
 use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::{
-    Driver, PollRecordResult, encode_completion_token, event_res_to_io,
+    Driver, PollRecordResult, encode_completion_token, event_res_to_result,
 };
 use veloq_driver_core::slot::SlotTable;
 
 use crate::driver::IocpDriver;
+use crate::error::{IocpError, IocpResult, from_io_error};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);
@@ -30,28 +30,30 @@ pub(crate) fn wait_completion(
     user_data: usize,
     generation: u32,
     timeout: std::time::Duration,
-) -> io::Result<usize> {
+) -> IocpResult<usize> {
     let start = std::time::Instant::now();
     let token = encode_completion_token(user_data, generation);
     loop {
         if start.elapsed() > timeout {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
+            return Err(
+                error_stack::Report::new(IocpError::CompletionWait).attach(format!(
                     "wait completion timed out: user_data={}, generation={}",
                     user_data, generation
-                ),
-            ));
+                )),
+            );
         }
         driver.process_completions();
         match driver.try_take_completion(token) {
             PollRecordResult::Ready(record) => {
-                return event_res_to_io(record.event.res);
+                return event_res_to_result(record.event.res).map_err(|e| {
+                    from_io_error(IocpError::CompletionWait, "iocp.tests.wait_completion", e)
+                });
             }
             PollRecordResult::Stale => {
-                return Err(io::Error::other(
-                    "stale completion record (generation mismatch)",
-                ));
+                return Err(
+                    error_stack::Report::new(IocpError::CompletionWait)
+                        .attach("stale completion record (generation mismatch)"),
+                );
             }
             PollRecordResult::Pending => {}
         }

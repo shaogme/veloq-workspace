@@ -12,12 +12,16 @@ use tracing::{debug, trace};
 use crate::config::{
     BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig, UringRawHandle,
 };
-use crate::error::{UringError, UringReportExt, UringResult, UringResultExt, from_io_error};
+use crate::error::{UringError, UringResult, UringResultExt, from_io_error};
 use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, Driver, Outcome, RegisterFd, RemoteWaker,
     SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
     encode_completion_token,
+};
+use veloq_driver_core::error::{
+    DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_error_report_to_event_res,
+    driver_os_error,
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 use veloq_driver_core::op_registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
@@ -41,7 +45,7 @@ pub(crate) struct UringWaker {
 }
 
 impl RemoteWaker for UringWaker {
-    fn wake(&self) -> io::Result<()> {
+    fn wake(&self) -> DriverResult<()> {
         if self.is_waked.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -53,7 +57,12 @@ impl RemoteWaker for UringWaker {
                 if err.raw_os_error() == Some(libc::EAGAIN) {
                     return Ok(());
                 }
-                return Err(err);
+                return Err(driver_os_error(
+                    DriverErrorKind::System,
+                    "uring.driver.waker.wake",
+                    err.raw_os_error().unwrap_or(libc::EIO),
+                    err.to_string(),
+                ));
             }
         }
         Ok(())
@@ -79,6 +88,24 @@ fn unsupported(scope: &'static str, msg: impl Into<String>) -> Report<UringError
     Report::new(UringError::Unsupported).attach(format!("{scope}: {}", msg.into()))
 }
 
+#[inline]
+fn map_uring_error(
+    report: Report<UringError>,
+    kind: DriverErrorKind,
+    scope: &'static str,
+    detail: impl ToString,
+) -> DriverErrorReport {
+    let detail_text = detail.to_string();
+    match Err::<(), _>(report).to_driver_result(kind, scope, detail_text.clone()) {
+        Ok(()) => driver_error(
+            DriverErrorKind::Internal,
+            scope,
+            format!("unexpected ok while mapping uring report: {detail_text}"),
+        ),
+        Err(e) => e,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SocketLifecycleHandle;
 
@@ -94,7 +121,7 @@ impl SocketLifecycleHandle {
         &self,
         _handle: RawHandle,
         _registered_fd: Option<IoFd>,
-    ) -> io::Result<()> {
+    ) -> DriverResult<()> {
         Ok(())
     }
 
@@ -271,8 +298,8 @@ impl UringDriver {
         Ok(driver)
     }
 
-    pub fn new(config: impl AsRef<UringConfig>) -> io::Result<Self> {
-        Self::new_internal(config).to_io_result("create uring driver")
+    pub fn new(config: impl AsRef<UringConfig>) -> UringResult<Self> {
+        Self::new_internal(config).map_err(|e| e.attach("create uring driver"))
     }
 
     pub(crate) unsafe fn submit_from_slot_raw(
@@ -315,11 +342,9 @@ impl UringDriver {
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr)
                             .map_err(|e| {
-                                from_io_error(
-                                    UringError::Submission,
-                                    "driver.submit_from_slot_raw.make_sqe",
-                                    e,
-                                )
+                                Report::new(UringError::Submission).attach(format!(
+                                    "driver.submit_from_slot_raw.make_sqe: {e:#}"
+                                ))
                             })?
                             .user_data(user_data as u64)
                     };
@@ -625,23 +650,30 @@ impl UringDriver {
             let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
                 SlotView::InFlightWaiting(mut slot) => {
                     let res_val = cqe_res;
-                    let final_io_res = slot
+                    let final_res = slot
                         .with_op_mut(|op| unsafe { (op.vtable.on_complete)(op, res_val) })
                         .unwrap_or_else(|| {
                             if res_val >= 0 {
                                 Ok(res_val as usize)
                             } else {
-                                Err(io::Error::from_raw_os_error(-res_val))
+                                Err(driver_os_error(
+                                    DriverErrorKind::Completion,
+                                    "uring.driver.process_completions_internal.on_complete",
+                                    -res_val,
+                                    "kernel completion returned error",
+                                ))
                             }
                         });
 
                     let mut completed = slot.complete();
                     let generation = completed.entry.generation(Ordering::Acquire);
-                    let res_code = io_result_to_event_res(&final_io_res);
+                    let res_code = driver_result_to_event_res(&final_res);
 
                     let (payload, mut detail) = completed.take_completion_data();
                     if detail.is_none() {
-                        detail = clone_result_if_non_os_error(&final_io_res);
+                        if let Err(err) = final_res {
+                            detail = Some(Err(err));
+                        }
                     }
                     let _ = completed.take_op();
 
@@ -717,10 +749,10 @@ impl UringDriver {
 }
 
 #[inline]
-fn io_result_to_event_res(res: &io::Result<usize>) -> i32 {
+fn driver_result_to_event_res(res: &DriverResult<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
-        Err(e) => -e.raw_os_error().unwrap_or(1).abs(),
+        Err(e) => driver_error_report_to_event_res(e),
     }
 }
 
@@ -779,20 +811,6 @@ impl UringDriver {
     }
 }
 
-#[inline]
-fn clone_result_if_non_os_error(res: &io::Result<usize>) -> Option<io::Result<usize>> {
-    match res {
-        Ok(_) => None,
-        Err(e) => {
-            if e.raw_os_error().is_some() {
-                None
-            } else {
-                Some(Err(io::Error::new(e.kind(), e.to_string())))
-            }
-        }
-    }
-}
-
 impl Drop for UringDriver {
     fn drop(&mut self) {}
 }
@@ -803,7 +821,7 @@ impl Driver for UringDriver {
     type Sidecar = ();
     type Completion = usize;
 
-    fn reserve_op(&mut self) -> io::Result<(usize, u32)> {
+    fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
         match self.ops.insert(OpEntry::new(UringOpState::new())) {
             Ok(OpHandle {
                 index: id,
@@ -813,8 +831,9 @@ impl Driver for UringDriver {
                 self.ops.slot_reserve(id);
                 Ok((id, generation))
             }
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
+            Err(_) => Err(driver_error(
+                DriverErrorKind::InvalidState,
+                "uring.driver.reserve_op",
                 "OpRegistry full",
             )),
         }
@@ -858,11 +877,15 @@ impl Driver for UringDriver {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
         let Some(op) = op_in.take() else {
             return binder.err(
-                invalid_state("driver.submit", "submit called with empty Option")
-                    .to_io_error("submit called with empty Option"),
+                map_uring_error(
+                    invalid_state("driver.submit", "submit called with empty Option"),
+                    DriverErrorKind::InvalidState,
+                    "uring.driver.submit",
+                    "submit called with empty Option",
+                ),
                 SubmitStatus::Void,
             );
         };
@@ -871,8 +894,9 @@ impl Driver for UringDriver {
         if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
             *op_in = Some(op);
             return binder.err(
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
+                driver_error(
+                    DriverErrorKind::Unsupported,
+                    "uring.driver.submit",
                     "background op cannot be submitted normally",
                 ),
                 SubmitStatus::Void,
@@ -881,11 +905,15 @@ impl Driver for UringDriver {
 
         match strategy {
             crate::op::SubmissionStrategy::BackgroundOnly => binder.err(
-                invalid_state(
-                    "driver.submit",
+                map_uring_error(
+                    invalid_state(
+                        "driver.submit",
+                        "background strategy reached normal submit path",
+                    ),
+                    DriverErrorKind::InvalidState,
+                    "uring.driver.submit",
                     "background strategy reached normal submit path",
-                )
-                .to_io_error("background strategy reached normal submit path"),
+                ),
                 SubmitStatus::Void,
             ),
             crate::op::SubmissionStrategy::SubmitSqe => {
@@ -897,34 +925,46 @@ impl Driver for UringDriver {
         }
     }
 
-    fn submit_background(&mut self, mut op: Self::Op) -> io::Result<()> {
+    fn submit_background(&mut self, mut op: Self::Op) -> DriverResult<()> {
         let strategy = op.vtable.strategy;
         if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
             let sqe =
                 unsafe { (op.vtable.make_sqe)(&mut op, self)?.user_data(BACKGROUND_USER_DATA) };
 
             if !self.push_entry(sqe) {
-                return Err(io::Error::other("sq full"));
+                return Err(driver_error(
+                    DriverErrorKind::Submission,
+                    "uring.driver.submit_background",
+                    "sq full",
+                ));
             }
             Ok(())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
+            Err(driver_error(
+                DriverErrorKind::Unsupported,
+                "uring.driver.submit_background",
                 "background op only supports BackgroundOnly strategy",
             ))
         }
     }
 
-    fn submit_queue(&mut self) -> io::Result<()> {
+    fn submit_queue(&mut self) -> DriverResult<()> {
         self.drain_cancel_requests();
         self.flush_cancellations();
         self.flush_backlog();
-        self.submit_to_kernel()
-            .to_io_result("submit queue to kernel")
+        self.submit_to_kernel().to_driver_result(
+            DriverErrorKind::Submission,
+            "uring.driver.submit_queue",
+            "submit queue to kernel",
+        )
     }
 
-    fn wait(&mut self) -> io::Result<()> {
-        self.wait_internal().to_io_result("wait for completions")
+    fn wait(&mut self) -> DriverResult<()> {
+        self.wait_internal().to_driver_result(
+            DriverErrorKind::Completion,
+            "uring.driver.wait",
+            "wait for completions",
+        )
     }
 
     fn process_completions(&mut self) {
@@ -945,9 +985,12 @@ impl Driver for UringDriver {
     fn wait_and_drain_completions(
         &mut self,
         out: &mut Vec<veloq_driver_core::driver::CompletionEvent>,
-    ) -> io::Result<usize> {
-        self.wait_internal()
-            .to_io_result("wait and drain completions")?;
+    ) -> DriverResult<usize> {
+        self.wait_internal().to_driver_result(
+            DriverErrorKind::Completion,
+            "uring.driver.wait_and_drain_completions",
+            "wait and drain completions",
+        )?;
         Ok(self.drain_completions(out))
     }
 
@@ -955,28 +998,37 @@ impl Driver for UringDriver {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()> {
-        self.register_chunk_internal(id, ptr, len)
-            .to_io_result("register chunk")
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
+        self.register_chunk_internal(id, ptr, len).to_driver_result(
+            DriverErrorKind::Registration,
+            "uring.driver.register_chunk",
+            "register chunk",
+        )
     }
 
     fn register_files<'a>(
         &mut self,
         files: Vec<RegisterFd<'a, UringRawHandle>>,
-    ) -> io::Result<Vec<IoFd>> {
-        self.register_files_internal(files)
-            .to_io_result("register files")
+    ) -> DriverResult<Vec<IoFd>> {
+        self.register_files_internal(files).to_driver_result(
+            DriverErrorKind::Registration,
+            "uring.driver.register_files",
+            "register files",
+        )
     }
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> io::Result<()> {
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
         for fd in files {
-            self.unregister_fixed_fd(fd)
-                .to_io_result("unregister fixed fd")?;
+            self.unregister_fixed_fd(fd).to_driver_result(
+                DriverErrorKind::Registration,
+                "uring.driver.unregister_files",
+                "unregister fixed fd",
+            )?;
         }
         Ok(())
     }
 
-    fn wake(&mut self) -> io::Result<()> {
+    fn wake(&mut self) -> DriverResult<()> {
         let buf = 1u64.to_ne_bytes();
         let ret =
             unsafe { libc::write(self.waker_fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
@@ -985,7 +1037,12 @@ impl Driver for UringDriver {
             if err.raw_os_error() == Some(libc::EAGAIN) {
                 return Ok(());
             }
-            return Err(err);
+            return Err(driver_os_error(
+                DriverErrorKind::System,
+                "uring.driver.wake",
+                err.raw_os_error().unwrap_or(libc::EIO),
+                err.to_string(),
+            ));
         }
         Ok(())
     }
@@ -1013,7 +1070,7 @@ impl UringDriver {
         op: <Self as Driver>::Op,
         op_in: &mut Option<<Self as Driver>::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
             Some(SlotView::Reserved(slot)) => {
@@ -1027,7 +1084,11 @@ impl UringDriver {
             }
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
                 return binder.err(
-                    io::Error::other("Op slot missing in registry"),
+                    driver_error(
+                        DriverErrorKind::InvalidState,
+                        "uring.driver.submit_sqe_internal",
+                        "Op slot missing in registry",
+                    ),
                     SubmitStatus::Void,
                 );
             }
@@ -1048,7 +1109,15 @@ impl UringDriver {
                 {
                     *op_in = Some(op);
                 }
-                binder.err(e.to_io_error("submit sqe"), SubmitStatus::Void)
+                binder.err(
+                    map_uring_error(
+                        e,
+                        DriverErrorKind::Submission,
+                        "uring.driver.submit_sqe_internal",
+                        "submit sqe",
+                    ),
+                    SubmitStatus::Void,
+                )
             }
         }
     }
@@ -1059,7 +1128,7 @@ impl UringDriver {
         op: <Self as Driver>::Op,
         op_in: &mut Option<<Self as Driver>::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (io::Error, SubmitStatus)>> {
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
             Some(SlotView::Reserved(slot)) => {
@@ -1073,7 +1142,11 @@ impl UringDriver {
             }
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
                 return binder.err(
-                    io::Error::other("Op slot missing in registry"),
+                    driver_error(
+                        DriverErrorKind::InvalidState,
+                        "uring.driver.submit_timer_internal",
+                        "Op slot missing in registry",
+                    ),
                     SubmitStatus::Void,
                 );
             }
@@ -1097,7 +1170,15 @@ impl UringDriver {
                 {
                     *op_in = Some(op);
                 }
-                binder.err(e.to_io_error("submit timer"), SubmitStatus::Void)
+                binder.err(
+                    map_uring_error(
+                        e,
+                        DriverErrorKind::Submission,
+                        "uring.driver.submit_timer_internal",
+                        "submit timer",
+                    ),
+                    SubmitStatus::Void,
+                )
             }
         }
     }

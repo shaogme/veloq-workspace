@@ -1,4 +1,5 @@
 use crate::config::UringRawHandle;
+use crate::error::{UringError, UringResult, from_io_error};
 use crate::{OwnedRawHandle, RawHandle, SockAddrStorage};
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::io;
@@ -10,10 +11,14 @@ pub struct Socket {
 }
 
 impl Socket {
-    fn new_v4(ty: c_int) -> io::Result<Self> {
+    fn new_v4(ty: c_int) -> UringResult<Self> {
         let fd = unsafe { libc::socket(libc::AF_INET, ty, 0) };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(from_io_error(
+                UringError::Socket,
+                "socket.new_v4",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(Self {
             // SAFETY: newly created socket fd is uniquely owned.
@@ -23,10 +28,14 @@ impl Socket {
         })
     }
 
-    fn new_v6(ty: c_int) -> io::Result<Self> {
+    fn new_v6(ty: c_int) -> UringResult<Self> {
         let fd = unsafe { libc::socket(libc::AF_INET6, ty, 0) };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(from_io_error(
+                UringError::Socket,
+                "socket.new_v6",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(Self {
             // SAFETY: newly created socket fd is uniquely owned.
@@ -36,7 +45,7 @@ impl Socket {
         })
     }
 
-    fn setsockopt<T>(&self, level: c_int, optname: c_int, optval: T) -> io::Result<()> {
+    fn setsockopt<T>(&self, level: c_int, optname: c_int, optval: T) -> UringResult<()> {
         let ret = unsafe {
             libc::setsockopt(
                 self.fd.raw().as_fd(),
@@ -47,28 +56,32 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(from_io_error(
+                UringError::Socket,
+                "socket.setsockopt",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(())
     }
 
-    pub fn new_tcp_v4() -> io::Result<Self> {
+    pub fn new_tcp_v4() -> UringResult<Self> {
         Self::new_v4(libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
     }
 
-    pub fn new_tcp_v6() -> io::Result<Self> {
+    pub fn new_tcp_v6() -> UringResult<Self> {
         Self::new_v6(libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
     }
 
-    pub fn new_udp_v4() -> io::Result<Self> {
+    pub fn new_udp_v4() -> UringResult<Self> {
         Self::new_v4(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
     }
 
-    pub fn new_udp_v6() -> io::Result<Self> {
+    pub fn new_udp_v6() -> UringResult<Self> {
         Self::new_v6(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
     }
 
-    pub fn bind(&self, addr: SocketAddr) -> io::Result<()> {
+    pub fn bind(&self, addr: SocketAddr) -> UringResult<()> {
         let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
         let ret = unsafe {
             libc::bind(
@@ -78,12 +91,16 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(from_io_error(
+                UringError::Socket,
+                "socket.bind",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(())
     }
 
-    pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+    pub fn connect(&self, addr: SocketAddr) -> UringResult<()> {
         let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
         let ret = unsafe {
             libc::connect(
@@ -93,15 +110,23 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(from_io_error(
+                UringError::Socket,
+                "socket.connect",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(())
     }
 
-    pub fn listen(&self, backlog: i32) -> io::Result<()> {
+    pub fn listen(&self, backlog: i32) -> UringResult<()> {
         let ret = unsafe { libc::listen(self.fd.raw().as_fd(), backlog as c_int) };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(from_io_error(
+                UringError::Socket,
+                "socket.listen",
+                io::Error::last_os_error(),
+            ));
         }
         Ok(())
     }
@@ -120,7 +145,7 @@ impl Socket {
         }
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> UringResult<SocketAddr> {
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_storage>() as socklen_t;
         let ret = unsafe {
@@ -131,70 +156,76 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(from_io_error(
+                UringError::Socket,
+                "socket.local_addr.getsockname",
+                io::Error::last_os_error(),
+            ));
         }
         to_socket_addr(unsafe {
             std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
         })
+        .map_err(|e| e.attach("socket.local_addr.decode"))
     }
 
-    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+    pub fn set_nodelay(&self, nodelay: bool) -> UringResult<()> {
         self.setsockopt(libc::IPPROTO_TCP, libc::TCP_NODELAY, nodelay as c_int)
     }
 
-    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+    pub fn set_recv_buffer_size(&self, size: usize) -> UringResult<()> {
         self.setsockopt(libc::SOL_SOCKET, libc::SO_RCVBUF, size as c_int)
     }
 
-    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+    pub fn set_send_buffer_size(&self, size: usize) -> UringResult<()> {
         self.setsockopt(libc::SOL_SOCKET, libc::SO_SNDBUF, size as c_int)
     }
 
-    pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+    pub fn set_reuse_address(&self, reuse: bool) -> UringResult<()> {
         self.setsockopt(libc::SOL_SOCKET, libc::SO_REUSEADDR, reuse as c_int)
     }
 
-    pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+    pub fn set_keepalive(&self, keepalive: bool) -> UringResult<()> {
         self.setsockopt(libc::SOL_SOCKET, libc::SO_KEEPALIVE, keepalive as c_int)
     }
 
-    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+    pub fn set_ttl(&self, ttl: u32) -> UringResult<()> {
         self.setsockopt(libc::IPPROTO_IP, libc::IP_TTL, ttl as c_int)
     }
 
-    pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
+    pub fn set_broadcast(&self, broadcast: bool) -> UringResult<()> {
         self.setsockopt(libc::SOL_SOCKET, libc::SO_BROADCAST, broadcast as c_int)
     }
 }
 
 impl PlatformSocket for Socket {
     type Handle = UringRawHandle;
+    type Error = UringError;
 
-    fn new_tcp_v4() -> io::Result<Self> {
+    fn new_tcp_v4() -> UringResult<Self> {
         Socket::new_tcp_v4()
     }
 
-    fn new_tcp_v6() -> io::Result<Self> {
+    fn new_tcp_v6() -> UringResult<Self> {
         Socket::new_tcp_v6()
     }
 
-    fn new_udp_v4() -> io::Result<Self> {
+    fn new_udp_v4() -> UringResult<Self> {
         Socket::new_udp_v4()
     }
 
-    fn new_udp_v6() -> io::Result<Self> {
+    fn new_udp_v6() -> UringResult<Self> {
         Socket::new_udp_v6()
     }
 
-    fn bind(&self, addr: SocketAddr) -> io::Result<()> {
+    fn bind(&self, addr: SocketAddr) -> UringResult<()> {
         Socket::bind(self, addr)
     }
 
-    fn listen(&self, backlog: i32) -> io::Result<()> {
+    fn listen(&self, backlog: i32) -> UringResult<()> {
         Socket::listen(self, backlog)
     }
 
-    fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+    fn connect(&self, addr: SocketAddr) -> UringResult<()> {
         Socket::connect(self, addr)
     }
 
@@ -206,44 +237,45 @@ impl PlatformSocket for Socket {
         unsafe { Socket::from_raw(handle) }
     }
 
-    fn local_addr(&self) -> io::Result<SocketAddr> {
+    fn local_addr(&self) -> UringResult<SocketAddr> {
         Socket::local_addr(self)
     }
 
-    fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+    fn set_nodelay(&self, nodelay: bool) -> UringResult<()> {
         Socket::set_nodelay(self, nodelay)
     }
 
-    fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+    fn set_recv_buffer_size(&self, size: usize) -> UringResult<()> {
         Socket::set_recv_buffer_size(self, size)
     }
 
-    fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+    fn set_send_buffer_size(&self, size: usize) -> UringResult<()> {
         Socket::set_send_buffer_size(self, size)
     }
 
-    fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+    fn set_reuse_address(&self, reuse: bool) -> UringResult<()> {
         Socket::set_reuse_address(self, reuse)
     }
 
-    fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+    fn set_keepalive(&self, keepalive: bool) -> UringResult<()> {
         Socket::set_keepalive(self, keepalive)
     }
 
-    fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+    fn set_ttl(&self, ttl: u32) -> UringResult<()> {
         Socket::set_ttl(self, ttl)
     }
 
-    fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
+    fn set_broadcast(&self, broadcast: bool) -> UringResult<()> {
         Socket::set_broadcast(self, broadcast)
     }
 }
 
 impl SocketAddrCodec for SockAddrStorage {
     type Len = socklen_t;
+    type Error = UringError;
 
-    fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
-        to_socket_addr(buf)
+    fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
+        to_socket_addr(buf).map_err(|e| e.attach("socket_addr.decode"))
     }
 
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {
@@ -251,35 +283,55 @@ impl SocketAddrCodec for SockAddrStorage {
     }
 }
 
-pub fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
+pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
     if buf.len() < std::mem::size_of::<libc::sa_family_t>() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid address length",
-        ));
+        return Err(
+            error_stack::Report::new(UringError::InvalidInput).attach("Invalid address length")
+        );
     }
-    let family = unsafe { *(buf.as_ptr() as *const libc::sa_family_t) } as i32;
+    let mut family_raw = std::mem::MaybeUninit::<libc::sa_family_t>::uninit();
+    // Copy into properly aligned stack storage before reading, avoiding UB on unaligned input.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buf.as_ptr(),
+            family_raw.as_mut_ptr() as *mut u8,
+            std::mem::size_of::<libc::sa_family_t>(),
+        );
+    }
+    let family = unsafe { family_raw.assume_init() } as i32;
     match family {
         libc::AF_INET => {
             if buf.len() < std::mem::size_of::<sockaddr_in>() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid address length",
-                ));
+                return Err(error_stack::Report::new(UringError::InvalidInput)
+                    .attach("Invalid address length"));
             }
-            let sin = unsafe { &*(buf.as_ptr() as *const sockaddr_in) };
+            let mut sin_raw = std::mem::MaybeUninit::<sockaddr_in>::zeroed();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    sin_raw.as_mut_ptr() as *mut u8,
+                    std::mem::size_of::<sockaddr_in>(),
+                );
+            }
+            let sin = unsafe { sin_raw.assume_init() };
             let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
             let port = u16::from_be(sin.sin_port);
             Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
         }
         libc::AF_INET6 => {
             if buf.len() < std::mem::size_of::<sockaddr_in6>() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid address length",
-                ));
+                return Err(error_stack::Report::new(UringError::InvalidInput)
+                    .attach("Invalid address length"));
             }
-            let sin6 = unsafe { &*(buf.as_ptr() as *const sockaddr_in6) };
+            let mut sin6_raw = std::mem::MaybeUninit::<sockaddr_in6>::zeroed();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    sin6_raw.as_mut_ptr() as *mut u8,
+                    std::mem::size_of::<sockaddr_in6>(),
+                );
+            }
+            let sin6 = unsafe { sin6_raw.assume_init() };
             let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
             let port = u16::from_be(sin6.sin6_port);
             Ok(SocketAddr::V6(SocketAddrV6::new(
@@ -289,10 +341,10 @@ pub fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
                 sin6.sin6_scope_id,
             )))
         }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Unsupported address family",
-        )),
+        _ => {
+            Err(error_stack::Report::new(UringError::InvalidInput)
+                .attach("Unsupported address family"))
+        }
     }
 }
 

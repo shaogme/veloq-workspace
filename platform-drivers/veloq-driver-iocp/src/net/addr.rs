@@ -1,5 +1,4 @@
-use crate::error::{IocpError, IocpResult, IocpResultExt};
-use std::io;
+use crate::error::{IocpError, IocpResult};
 use std::mem::offset_of;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use veloq_driver_core::net::SocketAddrCodec;
@@ -193,9 +192,10 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, i32) {
 
 impl SocketAddrCodec for SockAddrStorage {
     type Len = i32;
+    type Error = IocpError;
 
-    fn to_socket_addr(buf: &[u8]) -> io::Result<SocketAddr> {
-        to_socket_addr(buf).to_io_result("decode socket address failed")
+    fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
+        to_socket_addr(buf).map_err(|e| e.attach("decode socket address failed"))
     }
 
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {

@@ -525,7 +525,7 @@ impl UdpRecvPool {
         let mut total_submissions = 0;
 
         if let Some(datagram) = mailbox.queue.pop_front() {
-            stream_op.result = Some(UdpPoolManager::into_op_datagram(datagram));
+            stream_op.result = Some(UdpPoolManager::into_op_datagram(datagram)?);
             total_submissions += self.rebalance(mailbox, ctx, registry)?;
             return Ok((SubmissionResult::PostToQueue, total_submissions));
         }
@@ -631,7 +631,7 @@ impl UdpRecvPool {
         }
 
         if actions.dispatch_waiters {
-            UdpPoolManager::dispatch_waiters_static(self, mailbox, comp);
+            UdpPoolManager::dispatch_waiters_static(self, mailbox, comp)?;
         }
 
         if actions.rebalance_pool {
@@ -714,7 +714,7 @@ impl UdpRecvPool {
                     let addr = UdpPoolManager::parse_rio_address(
                         &slot.addr,
                         std::mem::size_of::<SockAddrStorage>() as i32,
-                    );
+                    )?;
                     match UdpPoolManager::deliver_to_stream_waiter_raw(comp, waiter, buf, addr) {
                         Ok(()) => {
                             slot.in_flight = false;
@@ -785,22 +785,19 @@ impl UdpPoolManager {
         copied
     }
 
-    fn parse_rio_address(addr: &SockAddrStorage, len: i32) -> std::net::SocketAddr {
+    fn parse_rio_address(addr: &SockAddrStorage, len: i32) -> RioResult<std::net::SocketAddr> {
         let s = unsafe { std::slice::from_raw_parts(addr as *const _ as *const u8, len as usize) };
-        to_socket_addr(s).map_err(|_| ()).unwrap_or_else(|_| {
-            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-                std::net::Ipv4Addr::UNSPECIFIED,
-                0,
-            ))
-        })
+        to_socket_addr(s)
+            .change_context(RioError::Datapath)
+            .attach("failed to parse rio udp source address")
     }
 
-    fn into_op_datagram(datagram: UdpPoolPacket) -> OpUdpRecvPacket {
-        let addr = Self::parse_rio_address(&datagram.addr, datagram.addr_len);
-        OpUdpRecvPacket {
+    fn into_op_datagram(datagram: UdpPoolPacket) -> RioResult<OpUdpRecvPacket> {
+        let addr = Self::parse_rio_address(&datagram.addr, datagram.addr_len)?;
+        Ok(OpUdpRecvPacket {
             buf: datagram.buf,
             addr,
-        }
+        })
     }
 
     fn deliver_to_stream_waiter_raw(
@@ -918,13 +915,13 @@ impl UdpPoolManager {
         comp: &mut RioCompletionContext<'_>,
         waiter: UdpWaiter,
         datagram: &mut Option<UdpPoolPacket>,
-    ) -> bool {
+    ) -> RioResult<bool> {
         let Some(d) = datagram.take() else {
-            return false;
+            return Ok(false);
         };
-        let addr = Self::parse_rio_address(&d.addr, d.addr_len);
+        let addr = Self::parse_rio_address(&d.addr, d.addr_len)?;
         match Self::deliver_to_stream_waiter_raw(comp, waiter, d.buf, addr) {
-            Ok(()) => true,
+            Ok(()) => Ok(true),
             Err(buf) => {
                 *datagram = Some(UdpPoolPacket {
                     buf,
@@ -932,7 +929,7 @@ impl UdpPoolManager {
                     addr: d.addr,
                     addr_len: d.addr_len,
                 });
-                false
+                Ok(false)
             }
         }
     }
@@ -960,15 +957,15 @@ impl UdpPoolManager {
         pool: &mut UdpRecvPool,
         mailbox: &mut UdpMailbox,
         comp: &mut RioCompletionContext<'_>,
-    ) {
+    ) -> RioResult<()> {
         loop {
             let (waiter, mut datagram) = {
                 let Some(waiter) = mailbox.waiters.pop_front() else {
-                    return;
+                    return Ok(());
                 };
                 let Some(datagram) = mailbox.queue.pop_front() else {
                     mailbox.waiters.push_front(waiter);
-                    return;
+                    return Ok(());
                 };
                 (waiter, Some(datagram))
             };
@@ -978,7 +975,7 @@ impl UdpPoolManager {
 
             let delivered = match kind {
                 UdpWaiterKind::Stream => {
-                    Self::deliver_to_stream_waiter(comp, waiter, &mut datagram)
+                    Self::deliver_to_stream_waiter(comp, waiter, &mut datagram)?
                 }
                 UdpWaiterKind::Recv => Self::deliver_to_recv_waiter(comp, waiter, &mut datagram),
             };
@@ -995,7 +992,7 @@ impl UdpPoolManager {
                 if mailbox.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
                     let _ = mailbox.queue.pop_back();
                 }
-                return;
+                return Ok(());
             }
         }
     }

@@ -21,6 +21,7 @@ use crate::net::addr::SockAddrStorage;
 use crate::rio::RioState;
 
 use veloq_driver_core::driver::PlatformOp;
+use veloq_driver_core::error::DriverResult;
 use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
     Fsync as FsyncBase, IntoPlatformOp, OpKind, Open, ReadFixed as ReadFixedBase, Recv as RecvBase,
@@ -194,7 +195,10 @@ macro_rules! define_iocp_ops {
                     unsafe { Box::from_raw(ptr as *mut $OpType) }
                 }
 
-                fn map_completion_result(&self, res: std::io::Result<usize>) -> std::io::Result<Self::Completion> {
+                fn map_completion_result(
+                    &self,
+                    res: DriverResult<usize>,
+                ) -> DriverResult<Self::Completion> {
                     define_iocp_ops!(@map_completion self, res, $($map_completion)?)
                 }
             }
@@ -369,7 +373,7 @@ define_iocp_ops! {
         submit: submit::submit_accept,
         on_complete: submit::on_complete_accept,
         completion: OwnedRawHandle,
-        map_completion: |_op: &Accept, res: std::io::Result<usize>| {
+        map_completion: |_op: &Accept, res: DriverResult<usize>| {
             res.map(|raw| unsafe {
                 OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_socket(raw as _)))
             })
@@ -419,7 +423,7 @@ define_iocp_ops! {
         kind: OpKind::Open,
         submit: submit::submit_open,
         completion: OwnedRawHandle,
-        map_completion: |_op: &Open, res: std::io::Result<usize>| {
+        map_completion: |_op: &Open, res: DriverResult<usize>| {
             res.map(|raw| unsafe {
                 OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_file(raw as _)))
             })

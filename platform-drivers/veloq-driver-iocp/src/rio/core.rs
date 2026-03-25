@@ -7,7 +7,9 @@ use crate::rio::error::{RioDiag, RioError};
 use crate::rio::runtime::pool::POOL_CTX_TAG;
 use crate::rio::{ActorKey, RioState};
 use error_stack::Report;
-use std::io;
+use veloq_driver_core::error::{
+    DriverErrorKind, DriverResult, driver_error_report_to_event_res, driver_os_error,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) enum RioCompletionKind {
@@ -59,10 +61,10 @@ impl Drop for RioPoolCtxGuard {
 }
 
 #[inline]
-pub(crate) fn rio_result_to_event_res(res: &io::Result<usize>) -> i32 {
+pub(crate) fn rio_result_to_event_res(res: &DriverResult<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
-        Err(e) => -e.raw_os_error().unwrap_or(1).abs(),
+        Err(e) => driver_error_report_to_event_res(e),
     }
 }
 
@@ -141,17 +143,22 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn last_wsa_error() -> io::Error {
+    pub(crate) fn last_wsa_error_code() -> i32 {
         // SAFETY: WSAGetLastError is safe to call.
-        io::Error::from_raw_os_error(unsafe {
-            windows_sys::Win32::Networking::WinSock::WSAGetLastError()
-        })
+        unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() }
     }
 
     pub(crate) fn last_wsa_report(context: RioError, scope: &'static str) -> Report<RioError> {
-        let err = Self::last_wsa_error();
-        let code = err.raw_os_error().map(|c| c as u32).unwrap_or(0);
-        let diag = RioDiag::new(scope).with_error(code, &err);
+        let code = Self::last_wsa_error_code() as u32;
+        let diag = RioDiag::new(scope).with_error(
+            code,
+            &driver_os_error(
+                DriverErrorKind::System,
+                scope,
+                code as i32,
+                "winsock error",
+            ),
+        );
         error_stack::Report::new(context).attach(diag)
     }
 }
@@ -202,7 +209,12 @@ mod tests {
             rio_result_to_event_res(&Ok((i32::MAX as usize) + 10)),
             i32::MAX
         );
-        let err = io::Error::from_raw_os_error(10022);
+        let err = driver_os_error(
+            DriverErrorKind::System,
+            "rio.core.tests",
+            10022,
+            "invalid argument",
+        );
         assert_eq!(rio_result_to_event_res(&Err(err)), -10022);
     }
 

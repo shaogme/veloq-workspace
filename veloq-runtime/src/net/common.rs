@@ -5,6 +5,10 @@ use veloq_driver::driver::{Driver, RegisterFd};
 use veloq_driver::op::IoFd;
 use veloq_driver::{OwnedRawHandle, RawHandle};
 
+fn driver_err(err: error_stack::Report<veloq_driver::error::DriverErrorKind>) -> io::Error {
+    io::Error::other(format!("{err:#}"))
+}
+
 // ============================================================================
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
@@ -32,6 +36,7 @@ impl SocketToken {
         let fd = driver
             .borrow_mut()
             .register_files(vec![RegisterFd::Owned(owned)])
+            .map_err(driver_err)
             .and_then(|mut fds| {
                 fds.pop()
                     .ok_or_else(|| io::Error::other("register_files returned empty"))

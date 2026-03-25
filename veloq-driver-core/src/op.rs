@@ -21,8 +21,9 @@ use veloq_buf::FixedBuf;
 
 use crate::driver::{
     CompletionRecord, Driver, PlatformOp, PollRecordResult, RemoteWaker, SharedCompletionTable,
-    SubmitBinder, SubmitStatus, encode_completion_token, event_res_to_io,
+    SubmitBinder, SubmitStatus, encode_completion_token, event_res_to_result,
 };
+use crate::error::{DriverErrorKind, DriverErrorReport, DriverResult, driver_error};
 use crate::slot::DetachedCancelTable;
 use crate::{IoFd, RawHandleMeta, SockAddr};
 
@@ -77,11 +78,11 @@ impl std::fmt::Display for LostReason {
 #[derive(Debug)]
 pub struct OpError {
     pub reason: LostReason,
-    pub source: std::io::Error,
+    pub source: DriverErrorReport,
 }
 
 impl OpError {
-    pub fn new(reason: LostReason, source: std::io::Error) -> Self {
+    pub fn new(reason: LostReason, source: DriverErrorReport) -> Self {
         Self { reason, source }
     }
 
@@ -111,7 +112,7 @@ impl std::fmt::Display for OpError {
 pub enum OpResult<T, R = usize> {
     /// Operation completed (successfully or with IO error).
     /// Returns the result of the operation and the original resource.
-    Completed(std::io::Result<R>, T),
+    Completed(DriverResult<R>, T),
     /// Operation failed because the resource ownership was lost.
     /// Includes structured error information about the loss.
     ResourceLost(OpError),
@@ -128,7 +129,7 @@ impl<T, R> OpResult<T, R> {
     }
 
     /// Returns the result and the resource implementation (if available).
-    pub fn into_inner(self) -> (std::io::Result<R>, Option<T>) {
+    pub fn into_inner(self) -> (DriverResult<R>, Option<T>) {
         match self {
             OpResult::Completed(res, data) => (res, Some(data)),
             OpResult::ResourceLost(err) => (Err(err.source), None),
@@ -153,7 +154,7 @@ pub trait OpLifecycle: Sized {
     type CompletionValue;
 
     /// Pre-allocate any resources needed (e.g., accept socket on Windows).
-    fn pre_alloc(fd: Self::Raw) -> std::io::Result<Self::PreAlloc>;
+    fn pre_alloc(fd: Self::Raw) -> DriverResult<Self::PreAlloc>;
 
     /// Construct the operation from a raw handle and pre-allocated resources.
     fn into_op(fd: Self::Raw, pre: Self::PreAlloc) -> Self;
@@ -161,11 +162,11 @@ pub trait OpLifecycle: Sized {
     /// Convert the completed operation result to the final output type.
     fn into_output(
         self,
-        res: std::io::Result<Self::CompletionValue>,
-    ) -> std::io::Result<Self::Output>;
+        res: DriverResult<Self::CompletionValue>,
+    ) -> DriverResult<Self::Output>;
 
     /// Helper: Pre-allocate and construct the operation in one step.
-    fn prepare_op(fd: Self::Raw) -> std::io::Result<Self> {
+    fn prepare_op(fd: Self::Raw) -> DriverResult<Self> {
         let pre = Self::pre_alloc(fd)?;
         Ok(Self::into_op(fd, pre))
     }
@@ -199,8 +200,8 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     /// Map kernel completion integer into typed completion value.
     fn map_completion_result(
         &self,
-        res: std::io::Result<Self::DriverCompletion>,
-    ) -> std::io::Result<Self::Completion>;
+        res: DriverResult<Self::DriverCompletion>,
+    ) -> DriverResult<Self::Completion>;
 
     /// Compatibility helper for transitional callsites.
     #[inline]
@@ -368,7 +369,7 @@ where
     cancel_signal: Option<std::sync::Arc<DetachedCancelTable>>,
     cancel_waker: Option<Arc<dyn RemoteWaker>>,
     token: u64,
-    immediate_failure: Option<(std::io::Error, T)>,
+    immediate_failure: Option<(DriverErrorReport, T)>,
     _phantom: DetachedPhantom<T, O, C>,
 }
 
@@ -433,25 +434,37 @@ where
                 let Some(payload_any) = payload_any else {
                     return Poll::Ready(OpResult::ResourceLost(OpError::new(
                         LostReason::PayloadMissing,
-                        std::io::Error::other("operation payload lost: completion sidecar missing"),
+                        driver_error(
+                            DriverErrorKind::Internal,
+                            "driver-core/op",
+                            "operation payload lost: completion sidecar missing",
+                        ),
                     )));
                 };
                 if payload_any.kind != T::PAYLOAD_KIND as u16 {
                     return Poll::Ready(OpResult::ResourceLost(OpError::new(
                         LostReason::PayloadKindMismatch,
-                        std::io::Error::other("operation payload lost: kind mismatch"),
+                        driver_error(
+                            DriverErrorKind::Internal,
+                            "driver-core/op",
+                            "operation payload lost: kind mismatch",
+                        ),
                     )));
                 }
                 let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                 let data = T::from_user_payload(payload);
-                let res = detail.unwrap_or_else(|| event_res_to_io::<C>(event.res));
+                let res = detail.unwrap_or_else(|| event_res_to_result::<C>(event.res));
                 let completion = data.map_completion_result(res);
                 return Poll::Ready(OpResult::Completed(completion, data));
             }
             PollRecordResult::Stale => {
                 return Poll::Ready(OpResult::ResourceLost(OpError::new(
                     LostReason::GenerationMismatch,
-                    std::io::Error::other("operation lost: slot recycled (generation mismatch)"),
+                    driver_error(
+                        DriverErrorKind::Internal,
+                        "driver-core/op",
+                        "operation lost: slot recycled (generation mismatch)",
+                    ),
                 )));
             }
             PollRecordResult::Pending => {}
@@ -588,7 +601,9 @@ where
                     let Some(payload_any) = payload_any else {
                         return Poll::Ready(OpResult::ResourceLost(OpError::new(
                             LostReason::PayloadMissing,
-                            std::io::Error::other(
+                            driver_error(
+                                DriverErrorKind::Internal,
+                                "driver-core/op",
                                 "operation payload lost: completion sidecar missing",
                             ),
                         )));
@@ -596,12 +611,16 @@ where
                     if payload_any.kind != T::PAYLOAD_KIND as u16 {
                         return Poll::Ready(OpResult::ResourceLost(OpError::new(
                             LostReason::PayloadKindMismatch,
-                            std::io::Error::other("operation payload lost: kind mismatch"),
+                            driver_error(
+                                DriverErrorKind::Internal,
+                                "driver-core/op",
+                                "operation payload lost: kind mismatch",
+                            ),
                         )));
                     }
                     let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                     let data = T::from_user_payload(payload);
-                    let res = detail.unwrap_or_else(|| event_res_to_io::<D::Completion>(event.res));
+                    let res = detail.unwrap_or_else(|| event_res_to_result::<D::Completion>(event.res));
                     let completion = data.map_completion_result(res);
                     Poll::Ready(OpResult::Completed(completion, data))
                 }
@@ -609,7 +628,9 @@ where
                     op.state = State::Completed;
                     Poll::Ready(OpResult::ResourceLost(OpError::new(
                         LostReason::GenerationMismatch,
-                        std::io::Error::other(
+                        driver_error(
+                            DriverErrorKind::Internal,
+                            "driver-core/op",
                             "operation lost: slot recycled (generation mismatch)",
                         ),
                     )))
@@ -653,7 +674,7 @@ pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
     where
         T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static;
 
-    fn from_current_context() -> std::io::Result<Self>;
+    fn from_current_context() -> Self;
 }
 
 // ============================================================================
@@ -676,8 +697,8 @@ impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
         op.submit_local(driver)
     }
 
-    fn from_current_context() -> std::io::Result<Self> {
-        Ok(Self)
+    fn from_current_context() -> Self {
+        Self
     }
 }
 
@@ -689,8 +710,8 @@ impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
 pub struct DetachedSubmitter;
 
 impl DetachedSubmitter {
-    pub fn new() -> std::io::Result<Self> {
-        Ok(Self)
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -706,7 +727,7 @@ impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
         op.submit_detached(&mut *driver.borrow_mut())
     }
 
-    fn from_current_context() -> std::io::Result<Self> {
+    fn from_current_context() -> Self {
         Self::new()
     }
 }
@@ -889,7 +910,7 @@ mod tests {
     }
 
     impl RemoteWaker for CountingWaker {
-        fn wake(&self) -> std::io::Result<()> {
+        fn wake(&self) -> DriverResult<()> {
             self.wakes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -929,8 +950,8 @@ mod tests {
 
         fn map_completion_result(
             &self,
-            res: std::io::Result<Self::DriverCompletion>,
-        ) -> std::io::Result<Self::Completion> {
+            res: DriverResult<Self::DriverCompletion>,
+        ) -> DriverResult<Self::Completion> {
             res
         }
     }

@@ -6,10 +6,9 @@ pub(crate) mod pool;
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::ops::SubmissionResult;
-use crate::rio::error::{RioError, RioReportExt, RioResult};
+use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, SocketLifecycleState, SocketRuntimeMode, SocketRuntimeState};
 use error_stack::ResultExt;
-use std::io;
 use veloq_driver_core::op::{UdpRecv, UdpRecvStream};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, RIO_BUF, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
@@ -148,9 +147,8 @@ impl RioState {
         args: RioSendToArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
         slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-    ) -> io::Result<SubmissionResult> {
+    ) -> RioResult<SubmissionResult> {
         self.try_submit_send_to_internal(args, registrar, slab_resolver)
-            .map_err(|e| e.to_io_error("RIOSendEx submission failed"))
     }
 
     fn try_submit_send_to_internal(
@@ -229,9 +227,8 @@ impl RioState {
         &mut self,
         args: RioUdpStreamArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<SubmissionResult> {
+    ) -> RioResult<SubmissionResult> {
         self.try_submit_pool_recv_internal(args, registrar)
-            .map_err(|e| e.to_io_error("RIO pool recv submission failed"))
     }
 
     fn try_submit_pool_recv_internal(
@@ -278,8 +275,7 @@ impl RioState {
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
         let (res, pool_submissions) = pool_manager
             .try_submit_pool_recv(udp_mailbox, stream_op, (user_data, generation), &mut ctx)
-            .map_err(|e| io::Error::other(e.to_string()))
-            .change_context(RioError::Internal)
+            .map_err(|e| error_stack::Report::new(RioError::Internal).attach(e.to_string()))
             .attach("pool submission failed")?;
 
         self.outstanding_count += pool_submissions;
@@ -290,9 +286,8 @@ impl RioState {
         &mut self,
         args: RioUdpRecvArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> io::Result<SubmissionResult> {
+    ) -> RioResult<SubmissionResult> {
         self.try_submit_pool_recv_for_recv_internal(args, registrar)
-            .map_err(|e| e.to_io_error("RIO pool recv for recv submission failed"))
     }
 
     fn try_submit_pool_recv_for_recv_internal(
@@ -340,8 +335,7 @@ impl RioState {
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
         let (res, pool_submissions, immediate_copied) = pool_manager
             .try_submit_pool_recv_recv(udp_mailbox, recv_op, (user_data, generation), &mut ctx)
-            .map_err(|e| io::Error::other(e.to_string()))
-            .change_context(RioError::Internal)
+            .map_err(|e| error_stack::Report::new(RioError::Internal).attach(e.to_string()))
             .attach("pool submission failed")?;
 
         if let Some(copied) = immediate_copied {

@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 
 use crate::net::common::InnerSocket;
 use crate::runtime::context::submit;
+use error_stack::Report;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
@@ -23,6 +24,14 @@ pub struct GenericUdpSocket<S: OpSubmitter> {
 pub type LocalUdpSocket = GenericUdpSocket<LocalSubmitter>;
 pub type UdpSocket = GenericUdpSocket<DetachedSubmitter>;
 
+#[inline]
+fn driver_err<E>(err: Report<E>) -> io::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    io::Error::other(err.to_string())
+}
+
 // ============================================================================
 // Constructors
 // ============================================================================
@@ -34,13 +43,13 @@ fn bind_inner<A: ToSocketAddrs>(addr: A) -> io::Result<InnerSocket> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No address provided"))?;
 
     let socket = if addr.is_ipv4() {
-        Socket::new_udp_v4()?
+        Socket::new_udp_v4().map_err(driver_err)?
     } else {
-        Socket::new_udp_v6()?
+        Socket::new_udp_v6().map_err(driver_err)?
     };
 
-    socket.bind(addr)?;
-    let local_addr = socket.local_addr()?;
+    socket.bind(addr).map_err(driver_err)?;
+    let local_addr = socket.local_addr().map_err(driver_err)?;
 
     InnerSocket::new(socket.into_owned_raw().into_raw(), Some(local_addr))
 }
@@ -58,7 +67,7 @@ impl UdpSocket {
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         Ok(Self {
             inner: bind_inner(addr)?,
-            submitter: DetachedSubmitter::new()?,
+            submitter: DetachedSubmitter::new(),
         })
     }
 }
@@ -91,7 +100,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         let buf = op_back
             .map(|o| o.buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res?, buf))
+        Ok((res.map_err(driver_err)?, buf))
     }
 
     pub async fn recv_stream(&self, buf: FixedBuf) -> io::Result<UdpRecvPacket> {
@@ -103,7 +112,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         };
         let (res, op_back_opt) = submit(&self.submitter, Op::new(op)).await.into_inner();
         let mut op_back = op_back_opt.ok_or_else(|| io::Error::other("UdpRecvStream op lost"))?;
-        let n = res?;
+        let n = res.map_err(driver_err)?;
 
         if let Some(datagram) = op_back.result.take() {
             return Ok(datagram);
@@ -135,7 +144,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
             addr_len: raw_addr_len as u32,
         };
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ())
+        res.map(|_| ()).map_err(driver_err)
     }
 
     pub async fn send(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
@@ -160,7 +169,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         let buf = op_back
             .map(|o| o.buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res?, buf))
+        Ok((res.map_err(driver_err)?, buf))
     }
 
     pub async fn recv_subset(
@@ -177,7 +186,7 @@ impl<S: OpSubmitter> GenericUdpSocket<S> {
         let buf = op_back
             .map(|o| o.buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res?, buf))
+        Ok((res.map_err(driver_err)?, buf))
     }
 }
 

@@ -758,7 +758,9 @@ impl<D: Driver> BufferRegistrar for ExecutorRegistrar<D> {
 
         let mut indices = Vec::with_capacity(regions.len());
         for (i, region) in regions.iter().enumerate() {
-            driver.register_chunk(i as u16, region.as_ptr(), region.len())?;
+            driver
+                .register_chunk(i as u16, region.as_ptr(), region.len())
+                .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
             indices.push(i);
         }
         Ok(indices)

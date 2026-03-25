@@ -1,7 +1,6 @@
 use crate::config::IocpConfig;
 use crate::driver::IocpDriver;
 use crate::ext::Extensions;
-use std::io;
 use std::os::windows::io::AsRawHandle;
 use veloq_driver_core::driver::RegisterFd;
 
@@ -13,7 +12,7 @@ fn test_extensions_load() {
 
 #[test]
 fn test_driver_creation() {
-    let _driver: Result<IocpDriver, io::Error> = IocpDriver::new(IocpConfig::default());
+    let _driver = IocpDriver::new(IocpConfig::default());
     assert!(_driver.is_ok(), "Driver should be created");
 }
 
