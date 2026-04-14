@@ -24,8 +24,7 @@ pub(crate) use payload::{
 // ============================================================================
 
 pub(crate) type MakeSqeFn =
-    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver)
-        -> DriverResult<squeue::Entry>;
+    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> DriverResult<squeue::Entry>;
 pub(crate) type OnCompleteFn =
     unsafe fn(op: &mut UringKernelOp, result: i32) -> DriverResult<usize>;
 pub(crate) type DropFn = unsafe fn(op: &mut UringKernelOp);

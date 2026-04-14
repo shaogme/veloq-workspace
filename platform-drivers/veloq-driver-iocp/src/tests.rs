@@ -50,10 +50,8 @@ pub(crate) fn wait_completion(
                 });
             }
             PollRecordResult::Stale => {
-                return Err(
-                    error_stack::Report::new(IocpError::CompletionWait)
-                        .attach("stale completion record (generation mismatch)"),
-                );
+                return Err(error_stack::Report::new(IocpError::CompletionWait)
+                    .attach("stale completion record (generation mismatch)"));
             }
             PollRecordResult::Pending => {}
         }

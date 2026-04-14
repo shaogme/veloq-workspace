@@ -640,9 +640,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, Completed, Op, P, S, R> 
         self.op.take()
     }
 
-    pub fn take_completion_data(
-        &mut self,
-    ) -> (Option<ErasedPayload>, Option<DriverResult<R>>) {
+    pub fn take_completion_data(&mut self) -> (Option<ErasedPayload>, Option<DriverResult<R>>) {
         self.storage
             .with_mut(|_op, result, payload, _sidecar| (payload.take(), result.take()))
     }

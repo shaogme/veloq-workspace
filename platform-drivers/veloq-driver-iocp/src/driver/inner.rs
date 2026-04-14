@@ -15,8 +15,8 @@ use veloq_driver_core::op_registry::OpRegistry;
 use veloq_wheel::{Wheel, WheelConfig};
 
 use crate::common::{
-    IocpErrorContext, IocpWaker, WAKEUP_USER_DATA, completion_record, iocp_msg,
-    io_result_to_event_res, push_completion_shared,
+    IocpErrorContext, IocpWaker, WAKEUP_USER_DATA, completion_record, io_result_to_event_res,
+    iocp_msg, push_completion_shared,
 };
 use crate::config::{BufferRegistrationMode, IocpConfig, IocpHandle, RegisteredHandle, SocketKey};
 use crate::driver::{CompletionSidecar, IocpOpState};
@@ -169,16 +169,17 @@ impl IocpDriver {
                     return Ok(());
                 }
                 if key == RIO_EVENT_KEY {
-                    self.rio_state.process_completions(
-                        &mut self.ops,
-                        &*self.registrar,
-                        &self.completion_events,
-                        &self.completion_table,
-                    )
-                    .map_err(|e| {
-                        error_stack::Report::new(IocpError::CompletionWait)
-                            .attach(format!("{e:#}"))
-                    })?;
+                    self.rio_state
+                        .process_completions(
+                            &mut self.ops,
+                            &*self.registrar,
+                            &self.completion_events,
+                            &self.completion_table,
+                        )
+                        .map_err(|e| {
+                            error_stack::Report::new(IocpError::CompletionWait)
+                                .attach(format!("{e:#}"))
+                        })?;
                     return Ok(());
                 }
 
@@ -411,12 +412,9 @@ impl IocpDriver {
                 if let Some(res) = blocking_res {
                     io_result = res;
                 } else if let Ok(val) = io_result {
-                    io_result = iocp_op
-                        .on_complete(val, &self.extensions)
-                        .map_err(|e| {
-                            error_stack::Report::new(IocpError::CompletionWait)
-                                .attach(format!("{e:#}"))
-                        });
+                    io_result = iocp_op.on_complete(val, &self.extensions).map_err(|e| {
+                        error_stack::Report::new(IocpError::CompletionWait).attach(format!("{e:#}"))
+                    });
                 }
             });
         });

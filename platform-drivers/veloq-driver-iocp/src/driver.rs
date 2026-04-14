@@ -422,16 +422,13 @@ impl IocpDriver {
         op: IocpOp,
     ) -> DriverResult<(bool, DriverResult<submit::SubmissionResult>)> {
         let slots_per_page = self.ops.local.len();
-        let (slab_ptr, slab_len) = self
-            .ops
-            .get_page_slice(0)
-            .ok_or_else(|| {
-                driver_error(
-                    DriverErrorKind::InvalidState,
-                    "iocp/driver",
-                    "failed to get page slice",
-                )
-            })?;
+        let (slab_ptr, slab_len) = self.ops.get_page_slice(0).ok_or_else(|| {
+            driver_error(
+                DriverErrorKind::InvalidState,
+                "iocp/driver",
+                "failed to get page slice",
+            )
+        })?;
 
         let mut guard = Self::prep_op_slot(&mut self.ops, user_data, op).map_err(|e| {
             driver_error(
@@ -480,7 +477,11 @@ impl IocpDriver {
                     "op missing during submission",
                 )
             })?
-            .to_driver_result(DriverErrorKind::Submission, "iocp/driver", "op submit failed");
+            .to_driver_result(
+                DriverErrorKind::Submission,
+                "iocp/driver",
+                "op submit failed",
+            );
 
         let pending_socket_key = if matches!(result, Ok(submit::SubmissionResult::Pending)) {
             sub_guard
@@ -503,15 +504,13 @@ impl IocpDriver {
 
         let mut sub_guard_opt = Some(sub_guard);
         if result.is_ok() {
-            let guard = sub_guard_opt
-                .take()
-                .ok_or_else(|| {
-                    driver_error(
-                        DriverErrorKind::InvalidState,
-                        "iocp/driver",
-                        "submission guard missing",
-                    )
-                })?;
+            let guard = sub_guard_opt.take().ok_or_else(|| {
+                driver_error(
+                    DriverErrorKind::InvalidState,
+                    "iocp/driver",
+                    "submission guard missing",
+                )
+            })?;
             let _ = guard.persist();
         }
         drop(sub_guard_opt);
@@ -524,7 +523,12 @@ impl IocpDriver {
     }
 
     /// Registers a chunk of memory for RIO operations.
-    pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
+    pub(crate) fn register_chunk(
+        &mut self,
+        id: u16,
+        ptr: *const u8,
+        len: usize,
+    ) -> DriverResult<()> {
         use crate::rio::error::RioResultExt;
         self.rio_state
             .register_chunk(id, ptr, len)
@@ -664,14 +668,11 @@ impl IocpDriver {
     }
 
     pub(crate) fn poll_completion(&mut self) -> DriverResult<usize> {
-        let status = self
-            .port
-            .get_status(10)
-            .to_driver_result(
-                DriverErrorKind::Completion,
-                "iocp/driver",
-                "failed to poll IOCP status",
-            )?;
+        let status = self.port.get_status(10).to_driver_result(
+            DriverErrorKind::Completion,
+            "iocp/driver",
+            "failed to poll IOCP status",
+        )?;
 
         match status {
             crate::win32::CompletionStatus::Completed {
@@ -686,20 +687,22 @@ impl IocpDriver {
                     return Ok(1);
                 }
                 if key == RIO_EVENT_KEY {
-                    return self.rio_state.process_completions(
-                        &mut self.ops,
-                        &*self.registrar,
-                        &self.completion_events,
-                        &self.completion_table,
-                    )
-                    .map_err(|e| {
-                        Self::with_report_detail(
-                            DriverErrorKind::Completion,
-                            "iocp/driver",
-                            "failed to process rio completions",
-                            format!("{e:#}"),
+                    return self
+                        .rio_state
+                        .process_completions(
+                            &mut self.ops,
+                            &*self.registrar,
+                            &self.completion_events,
+                            &self.completion_table,
                         )
-                    });
+                        .map_err(|e| {
+                            Self::with_report_detail(
+                                DriverErrorKind::Completion,
+                                "iocp/driver",
+                                "failed to process rio completions",
+                                format!("{e:#}"),
+                            )
+                        });
                 }
 
                 if !overlapped.is_null() {
@@ -869,10 +872,8 @@ impl Driver for IocpDriver {
 
         match result {
             Ok(submit::SubmissionResult::Offload(task)) => {
-                let (_, op_entry) = self
-                    .ops
-                    .get_slot_and_entry_mut(user_data)
-                    .ok_or_else(|| {
+                let (_, op_entry) =
+                    self.ops.get_slot_and_entry_mut(user_data).ok_or_else(|| {
                         driver_error(DriverErrorKind::Internal, "iocp/driver", "op not found")
                     })?;
                 op_entry.platform_data.is_background = true;
@@ -887,10 +888,8 @@ impl Driver for IocpDriver {
                 }
             }
             Ok(_) => {
-                let (_, op_entry) = self
-                    .ops
-                    .get_slot_and_entry_mut(user_data)
-                    .ok_or_else(|| {
+                let (_, op_entry) =
+                    self.ops.get_slot_and_entry_mut(user_data).ok_or_else(|| {
                         driver_error(DriverErrorKind::Internal, "iocp/driver", "op not found")
                     })?;
                 op_entry.platform_data.is_background = true;
@@ -937,7 +936,10 @@ impl Driver for IocpDriver {
         self.completion_table.clone()
     }
 
-    fn wait_and_drain_completions(&mut self, out: &mut Vec<CompletionEvent>) -> DriverResult<usize> {
+    fn wait_and_drain_completions(
+        &mut self,
+        out: &mut Vec<CompletionEvent>,
+    ) -> DriverResult<usize> {
         self.get_completion(u32::MAX).map_err(|e| {
             Self::with_report_detail(
                 DriverErrorKind::Completion,
@@ -976,8 +978,13 @@ impl Driver for IocpDriver {
     }
 
     fn wake(&mut self) -> DriverResult<()> {
-        IocpDriver::wake(self)
-            .map_err(|e| driver_error(DriverErrorKind::Submission, "iocp/driver", format!("wakeup failed: {e:#}")))
+        IocpDriver::wake(self).map_err(|e| {
+            driver_error(
+                DriverErrorKind::Submission,
+                "iocp/driver",
+                format!("wakeup failed: {e:#}"),
+            )
+        })
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {

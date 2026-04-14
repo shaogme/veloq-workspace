@@ -1,8 +1,8 @@
 use crate::driver::UringDriver;
 use crate::op::{UringOp, UringOpPayload};
 use io_uring::{opcode, squeue, types};
-use veloq_driver_core::error::{DriverErrorKind, DriverResult, driver_error, driver_os_error};
 use veloq_buf::PoolKind;
+use veloq_driver_core::error::{DriverErrorKind, DriverResult, driver_error, driver_os_error};
 
 #[inline]
 fn payload_variant_mismatch(scope: &'static str) -> error_stack::Report<DriverErrorKind> {
@@ -252,7 +252,9 @@ pub(crate) unsafe fn make_sqe_udp_connect(
     let kernel = match &mut op.payload {
         UringOpPayload::UdpConnect(kernel) => kernel,
         _ => {
-            return Err(payload_variant_mismatch("uring.op.submit.make_sqe_udp_connect"));
+            return Err(payload_variant_mismatch(
+                "uring.op.submit.make_sqe_udp_connect",
+            ));
         }
     };
     let val = unsafe { kernel.user.as_mut() };
@@ -472,7 +474,9 @@ pub(crate) unsafe fn make_sqe_sync_range(
     let kernel = match &mut op.payload {
         UringOpPayload::SyncRange(kernel) => kernel,
         _ => {
-            return Err(payload_variant_mismatch("uring.op.submit.make_sqe_sync_range"));
+            return Err(payload_variant_mismatch(
+                "uring.op.submit.make_sqe_sync_range",
+            ));
         }
     };
     let sync_op = unsafe { kernel.user.as_mut() };
@@ -510,7 +514,9 @@ pub(crate) unsafe fn make_sqe_fallocate(
     let kernel = match &mut op.payload {
         UringOpPayload::Fallocate(kernel) => kernel,
         _ => {
-            return Err(payload_variant_mismatch("uring.op.submit.make_sqe_fallocate"));
+            return Err(payload_variant_mismatch(
+                "uring.op.submit.make_sqe_fallocate",
+            ));
         }
     };
     let fallocate_op = unsafe { kernel.user.as_mut() };

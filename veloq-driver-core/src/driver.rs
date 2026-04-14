@@ -1,9 +1,7 @@
+use crate::error::{DriverErrorKind, DriverErrorReport, DriverResult, driver_os_error};
 use crate::slot;
 use crate::slot::is_runnable_state;
 use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
-use crate::error::{
-    DriverErrorKind, DriverErrorReport, DriverResult, driver_os_error,
-};
 use crossbeam_queue::SegQueue;
 
 use veloq_shim::atomic::Ordering;
@@ -629,8 +627,7 @@ pub trait Driver: 'static {
 
     fn cancel_op(&mut self, user_data: usize);
 
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize)
-    -> DriverResult<()>;
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()>;
 
     fn register_files<'a>(
         &mut self,
@@ -683,7 +680,10 @@ impl SubmitBinder {
     }
 
     #[inline]
-    pub fn ok(self, poll: Poll<()>) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+    pub fn ok(
+        self,
+        poll: Poll<()>,
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
         Outcome(Ok(poll))
     }
 

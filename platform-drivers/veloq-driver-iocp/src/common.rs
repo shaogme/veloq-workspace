@@ -61,7 +61,10 @@ fn structured_line(
     )
 }
 
-pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> error_stack::Report<IocpError> {
+pub(crate) fn iocp_msg(
+    ctx: IocpErrorContext,
+    detail: impl Into<String>,
+) -> error_stack::Report<IocpError> {
     let detail = detail.into();
     let report = error_stack::Report::new(IocpError::from(ctx)).attach(detail.clone());
     let msg = structured_line(ctx, &detail, None, None);
@@ -94,16 +97,16 @@ fn neg_code(code: i32) -> Option<i32> {
 #[inline]
 fn fallback_errno_by_iocp_error(kind: IocpError) -> i32 {
     match kind {
-        IocpError::DriverInit => 5,      // EIO
+        IocpError::DriverInit => 5,       // EIO
         IocpError::CompletionWait => 110, // ETIMEDOUT
-        IocpError::Submission => 11,     // EAGAIN
-        IocpError::Rio => 5,             // EIO
-        IocpError::ResolveFd => 9,       // EBADF
-        IocpError::Socket => 5,          // EIO
-        IocpError::Win32 => 5,           // EIO
-        IocpError::InvalidInput => 22,   // EINVAL
-        IocpError::InvalidState => 5,    // EIO
-        IocpError::Internal => 5,        // EIO
+        IocpError::Submission => 11,      // EAGAIN
+        IocpError::Rio => 5,              // EIO
+        IocpError::ResolveFd => 9,        // EBADF
+        IocpError::Socket => 5,           // EIO
+        IocpError::Win32 => 5,            // EIO
+        IocpError::InvalidInput => 22,    // EINVAL
+        IocpError::InvalidState => 5,     // EIO
+        IocpError::Internal => 5,         // EIO
     }
 }
 
@@ -180,13 +183,11 @@ impl RemoteWaker for IocpWaker {
             return Ok(());
         }
         if !self.is_notified.swap(true, Ordering::AcqRel) {
-            self.port
-                .notify(WAKEUP_USER_DATA)
-                .to_driver_result(
-                    DriverErrorKind::Submission,
-                    "iocp/common",
-                    "failed to notify remote waker",
-                )?;
+            self.port.notify(WAKEUP_USER_DATA).to_driver_result(
+                DriverErrorKind::Submission,
+                "iocp/common",
+                "failed to notify remote waker",
+            )?;
         }
         Ok(())
     }

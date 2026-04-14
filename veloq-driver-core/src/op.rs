@@ -160,10 +160,7 @@ pub trait OpLifecycle: Sized {
     fn into_op(fd: Self::Raw, pre: Self::PreAlloc) -> Self;
 
     /// Convert the completed operation result to the final output type.
-    fn into_output(
-        self,
-        res: DriverResult<Self::CompletionValue>,
-    ) -> DriverResult<Self::Output>;
+    fn into_output(self, res: DriverResult<Self::CompletionValue>) -> DriverResult<Self::Output>;
 
     /// Helper: Pre-allocate and construct the operation in one step.
     fn prepare_op(fd: Self::Raw) -> DriverResult<Self> {
@@ -620,7 +617,8 @@ where
                     }
                     let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                     let data = T::from_user_payload(payload);
-                    let res = detail.unwrap_or_else(|| event_res_to_result::<D::Completion>(event.res));
+                    let res =
+                        detail.unwrap_or_else(|| event_res_to_result::<D::Completion>(event.res));
                     let completion = data.map_completion_result(res);
                     Poll::Ready(OpResult::Completed(completion, data))
                 }

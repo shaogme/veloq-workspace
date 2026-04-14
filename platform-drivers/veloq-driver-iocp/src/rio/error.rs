@@ -1,7 +1,5 @@
 use std::fmt;
-use veloq_driver_core::error::{
-    DriverDiag, DriverErrorKind, DriverResult, ResultAsDriverExt,
-};
+use veloq_driver_core::error::{DriverDiag, DriverErrorKind, DriverResult, ResultAsDriverExt};
 
 pub type RioDiag = DriverDiag<u32>;
 

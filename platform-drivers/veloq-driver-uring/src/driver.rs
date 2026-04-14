@@ -20,8 +20,8 @@ use veloq_driver_core::driver::{
     encode_completion_token,
 };
 use veloq_driver_core::error::{
-    DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_error_report_to_event_res,
-    driver_os_error,
+    DriverErrorKind, DriverErrorReport, DriverResult, driver_error,
+    driver_error_report_to_event_res, driver_os_error,
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 use veloq_driver_core::op_registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
@@ -342,9 +342,8 @@ impl UringDriver {
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr)
                             .map_err(|e| {
-                                Report::new(UringError::Submission).attach(format!(
-                                    "driver.submit_from_slot_raw.make_sqe: {e:#}"
-                                ))
+                                Report::new(UringError::Submission)
+                                    .attach(format!("driver.submit_from_slot_raw.make_sqe: {e:#}"))
                             })?
                             .user_data(user_data as u64)
                     };
