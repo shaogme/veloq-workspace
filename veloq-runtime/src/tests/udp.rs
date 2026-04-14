@@ -103,7 +103,7 @@ fn test_udp_send_receive() {
             let socket1_clone = socket1_arc.clone();
 
             // Receiver task: socket1 waits for data
-            let handler = crate::runtime::context::spawn(async move {
+            let handler = crate::runtime::context::spawn_eager(async move {
                 let buf = crate::runtime::context::alloc(size);
                 let datagram = crate::tests::timeout_op(
                     "receiver",
@@ -159,7 +159,7 @@ fn test_udp_echo() {
             let server_clone = server_arc.clone();
 
             // Server task: receive and echo back
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 // Receive data
                 let buf = crate::runtime::context::alloc(size);
                 let datagram = crate::tests::timeout_op(
@@ -256,7 +256,7 @@ fn test_udp_multiple_messages() {
             let (ready_tx, mut ready_rx) = crate::sync::mpsc::unbounded::<usize>();
 
             // Receiver task
-            let h_recv = crate::runtime::context::spawn(async move {
+            let h_recv = crate::runtime::context::spawn_eager(async move {
                 for i in 0..NUM_MESSAGES {
                     ready_tx.send(i).unwrap();
                     let buf = crate::runtime::context::alloc(size);
@@ -321,7 +321,7 @@ fn test_udp_large_data() {
             let socket1_clone = socket1_arc.clone();
 
             // Receiver task
-            let h_recv = crate::runtime::context::spawn(async move {
+            let h_recv = crate::runtime::context::spawn_eager(async move {
                 let buf = crate::runtime::context::alloc(size);
                 let datagram = crate::tests::timeout_op(
                     "receiver",
@@ -370,7 +370,7 @@ fn test_udp_heap_buffer() {
             let addr1 = socket1.local_addr().expect("Failed to get addr1");
 
             // Receiver task: Explicitly use heap buffer
-            let h_recv = crate::runtime::context::spawn(async move {
+            let h_recv = crate::runtime::context::spawn_eager(async move {
                 let buf = veloq_buf::FixedBuf::alloc_heap(veloq_buf::nz!(1024))
                     .expect("Heap allocation failed");
                 let datagram = crate::tests::timeout_op(
@@ -456,7 +456,7 @@ fn test_multithread_udp_no_echo() {
                     let socket1_clone = socket1_arc.clone();
 
                     // Receiver task via crate::context::spawn
-                    let h_recv = crate::runtime::context::spawn(async move {
+                    let h_recv = crate::runtime::context::spawn_eager(async move {
                         let buf = crate::runtime::context::alloc(size);
                         let datagram = crate::tests::timeout_op(
                             "receiver",
@@ -546,7 +546,7 @@ fn test_multithread_udp_echo() {
                 // Pre-post recv before publishing server address to avoid RIO timing window.
                 let (ready_tx, mut ready_rx) = crate::sync::mpsc::unbounded::<()>();
                 let socket_for_recv = socket.clone();
-                let recv_h = crate::runtime::context::spawn(async move {
+                let recv_h = crate::runtime::context::spawn_eager(async move {
                     ready_tx.send(()).unwrap();
                     let buf = crate::runtime::context::alloc(size);
                     let datagram = crate::tests::timeout_op(
@@ -604,7 +604,7 @@ fn test_multithread_udp_echo() {
                 // Pre-post client recv before sending request to avoid RIO response drop.
                 let (client_ready_tx, mut client_ready_rx) = crate::sync::mpsc::unbounded::<()>();
                 let client_for_recv = client.clone();
-                let recv_h = crate::runtime::context::spawn(async move {
+                let recv_h = crate::runtime::context::spawn_eager(async move {
                     client_ready_tx.send(()).unwrap();
                     let recv_buf = crate::runtime::context::alloc(size);
                     let datagram = crate::tests::timeout_op(
@@ -678,7 +678,7 @@ fn test_multithread_concurrent_udp_clients() {
 
                 // Pre-post recv collection before publishing address to avoid first-packet race.
                 let (ready_tx, mut ready_rx) = crate::sync::mpsc::unbounded::<()>();
-                let recv_h = crate::runtime::context::spawn(async move {
+                let recv_h = crate::runtime::context::spawn_eager(async move {
                     ready_tx.send(()).unwrap();
                     udp_recv_unique_peers(&socket, size, NUM_CLIENTS, NUM_CLIENTS * 3, 5).await
                 });
@@ -812,7 +812,7 @@ fn test_udp_read_exact_write_all() {
             use crate::io::{AsyncBufRead, AsyncBufWrite};
             let (ready_tx, mut ready_rx) = crate::sync::mpsc::unbounded::<()>();
 
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 socket_server
                     .connect(client_addr)
                     .await

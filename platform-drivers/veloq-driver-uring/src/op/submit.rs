@@ -1,7 +1,5 @@
 use crate::driver::UringDriver;
-use crate::op::{
-    FallocateRaw, FsyncRaw, ReadRaw, SyncFileRangeRaw, UringOp, UringOpPayload, WriteRaw,
-};
+use crate::op::{UringOp, UringOpPayload};
 use io_uring::{opcode, squeue, types};
 use veloq_buf::PoolKind;
 use veloq_driver_core::error::{DriverErrorKind, DriverResult, driver_error, driver_os_error};
@@ -250,9 +248,6 @@ impl_lifecycle!(drop_read_fixed, Read, direct_fd);
 
 impl_default_completion!(on_complete_write_fixed);
 impl_lifecycle!(drop_write_fixed, Write, direct_fd);
-impl_default_completion!(on_complete_write_raw);
-impl_lifecycle!(drop_write_raw, WriteRaw, direct_fd);
-
 macro_rules! make_buf_op {
     ($fn_name:ident, $variant:ident, $opcode:path, recv_args) => {
         pub(crate) unsafe fn $fn_name(
@@ -794,6 +789,10 @@ pub(crate) unsafe fn resolve_chunks_read_fixed(op: &UringOp, chunks: &mut [u16])
     }
 }
 
+pub(crate) unsafe fn resolve_chunks_read_raw(op: &UringOp, chunks: &mut [u16]) -> usize {
+    unsafe { resolve_chunks_read_fixed(op, chunks) }
+}
+
 pub(crate) unsafe fn resolve_chunks_write_fixed(op: &UringOp, chunks: &mut [u16]) -> usize {
     let kernel = match &op.payload {
         UringOpPayload::Write(kernel) => kernel,
@@ -807,4 +806,8 @@ pub(crate) unsafe fn resolve_chunks_write_fixed(op: &UringOp, chunks: &mut [u16]
     } else {
         0
     }
+}
+
+pub(crate) unsafe fn resolve_chunks_write_raw(op: &UringOp, chunks: &mut [u16]) -> usize {
+    unsafe { resolve_chunks_write_fixed(op, chunks) }
 }

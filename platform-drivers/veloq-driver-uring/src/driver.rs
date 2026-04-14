@@ -669,10 +669,10 @@ impl UringDriver {
                     let res_code = driver_result_to_event_res(&final_res);
 
                     let (payload, mut detail) = completed.take_completion_data();
-                    if detail.is_none() {
-                        if let Err(err) = final_res {
-                            detail = Some(Err(err));
-                        }
+                    if detail.is_none()
+                        && let Err(err) = final_res
+                    {
+                        detail = Some(Err(err));
                     }
                     let _ = completed.take_op();
 

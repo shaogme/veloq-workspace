@@ -152,7 +152,7 @@ impl RioState {
         let code = Self::last_wsa_error_code() as u32;
         let diag = RioDiag::new(scope).with_error(
             code,
-            &driver_os_error(DriverErrorKind::System, scope, code as i32, "winsock error"),
+            driver_os_error(DriverErrorKind::System, scope, code as i32, "winsock error"),
         );
         error_stack::Report::new(context).attach(diag)
     }

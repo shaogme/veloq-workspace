@@ -25,7 +25,7 @@ fn test_tcp_connect_with_global_api() {
             let listener_clone = listener_arc.clone();
 
             // Server task using cx.spawn
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, peer_addr) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -59,7 +59,7 @@ fn test_tcp_send_recv() {
             let listener_clone = listener_arc.clone();
 
             // Server task: Robust Echo Loop
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -147,7 +147,7 @@ fn test_tcp_multiple_connections() {
             let listener_clone = listener_arc.clone();
 
             // Server task: accept all connections
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 for i in 0..NUM_CONNECTIONS {
                     let (stream, peer) =
                         crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
@@ -194,7 +194,7 @@ fn test_tcp_large_data_transfer() {
             let listener_clone = listener_arc.clone();
 
             // Server task
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -303,7 +303,7 @@ fn test_tcp_recv_zero_bytes() {
             let listener_arc = Arc::new(listener);
             let listener_clone = listener_arc.clone();
             // Server: accept and immediately close
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -345,7 +345,7 @@ fn test_tcp_heap_buffer() {
             let listen_addr = listener.local_addr().expect("Failed to get local address");
 
             // Server task: Use heap-allocated buffer for receive
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener.accept())
                         .await
@@ -405,7 +405,7 @@ fn test_tcp_ipv6() {
             let listener_arc = Arc::new(listener);
             let listener_clone = listener_arc.clone();
 
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, peer) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -455,7 +455,7 @@ fn test_multithread_tcp_connections() {
                         let listener_clone = listener_arc.clone();
 
                         // Spawn server task
-                        crate::runtime::context::spawn(async move {
+                        crate::runtime::context::spawn_eager(async move {
                             let (stream, peer) = crate::tests::timeout_op(
                                 "server",
                                 "accept",
@@ -760,7 +760,7 @@ fn test_tcp_cancel_recv() {
             let listener_arc = Arc::new(listener);
             let listener_clone = listener_arc.clone();
 
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -803,7 +803,7 @@ fn test_tcp_read_exact_write_all() {
 
             const DATA: &[u8] = b"TCP Echo World!";
             use crate::io::{AsyncBufRead, AsyncBufWrite};
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) = listener.accept().await.expect("Accept failed");
                 let mut read_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
                 read_buf.set_len(DATA.len());

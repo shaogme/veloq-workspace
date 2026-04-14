@@ -468,7 +468,7 @@ impl<'a> IntoFuture for SyncRangeBuilder<'a> {
             flags: self.flags,
         };
 
-        let submitter = self.file.submitter.clone();
+        let submitter = self.file.submitter;
 
         SyncRangeFuture {
             state: SyncRangeState::Idle(Some((submitter, op))),

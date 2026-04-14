@@ -19,7 +19,7 @@ use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared,
 use crate::runtime::task::harness::Runnable;
 use crate::runtime::task::{SpawnedTask, Task};
 // Re-export common types
-pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
+pub use context::{RuntimeContext, spawn, spawn_eager, spawn_local, spawn_to, yield_now};
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
