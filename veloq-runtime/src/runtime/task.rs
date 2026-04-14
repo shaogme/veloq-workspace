@@ -277,8 +277,11 @@ unsafe fn wake_task(ptr: NonNull<raw::Header<PinnedData, PinnedVTable>>) {
             // Need to push to remote_queue.
             header.references.fetch_add(1, Ordering::Relaxed);
             let task = Task { ptr };
-
-            let _ = shared.remote_queue.send(task);
+            if shared.remote_queue.send(task).is_ok() {
+                // Remote wake ultimately re-enqueues onto the owner's local queue,
+                // so account it as local queued work up front to keep load balanced.
+                shared.local_load.fetch_add(1, Ordering::Relaxed);
+            }
 
             // Optimization: Only wake the driver if the executor is parking or parked.
             let state = shared.state.load(Ordering::Acquire);
