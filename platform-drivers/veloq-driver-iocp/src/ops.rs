@@ -24,10 +24,12 @@ use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::error::DriverResult;
 use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
-    Fsync as FsyncBase, IntoPlatformOp, OpKind, Open, ReadFixed as ReadFixedBase, Recv as RecvBase,
-    Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase, Timeout,
-    UdpConnect as UdpConnectBase, UdpRecv as UdpRecvBase, UdpRecvStream as UdpRecvStreamBase,
-    UdpSend as UdpSendBase, Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
+    FallocateRaw as FallocateRawBase, Fsync as FsyncBase, FsyncRaw as FsyncRawBase, IntoPlatformOp,
+    OpKind, Open, ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase, Recv as RecvBase,
+    Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
+    SyncFileRangeRaw as SyncFileRangeRawBase, Timeout, UdpConnect as UdpConnectBase,
+    UdpRecv as UdpRecvBase, UdpRecvStream as UdpRecvStreamBase, UdpSend as UdpSendBase,
+    Wakeup as WakeupBase, WriteFixed as WriteFixedBase, WriteRaw as WriteRawBase,
 };
 
 use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE};
@@ -37,19 +39,24 @@ use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, SOCKADD
 // ============================================================================
 
 pub(crate) type ReadFixed = ReadFixedBase;
+pub(crate) type ReadRaw = ReadRawBase<IocpHandle>;
 pub(crate) type WriteFixed = WriteFixedBase;
+pub(crate) type WriteRaw = WriteRawBase<IocpHandle>;
 pub(crate) type Recv = RecvBase;
 pub(crate) type OpSend = OpSendBase;
 pub(crate) type UdpRecv = UdpRecvBase;
 pub(crate) type UdpSend = UdpSendBase;
 pub(crate) type Close = CloseBase;
 pub(crate) type Fsync = FsyncBase;
+pub(crate) type FsyncRaw = FsyncRawBase<IocpHandle>;
 pub(crate) type Connect = ConnectBase<SockAddrStorage>;
 pub(crate) type UdpConnect = UdpConnectBase<SockAddrStorage>;
 pub(crate) type Accept = AcceptBase<SockAddrStorage>;
 pub(crate) type SendTo = SendToBase;
 pub(crate) type SyncFileRange = SyncFileRangeBase;
+pub(crate) type SyncFileRangeRaw = SyncFileRangeRawBase<IocpHandle>;
 pub(crate) type Fallocate = FallocateBase;
+pub(crate) type FallocateRaw = FallocateRawBase<IocpHandle>;
 pub(crate) type UdpRecvStream = UdpRecvStreamBase;
 pub(crate) type Wakeup = WakeupBase;
 
@@ -292,11 +299,23 @@ define_iocp_ops! {
         submit: submit::submit_read_fixed,
         get_fd: submit::get_fd_read_fixed,
     },
+    ReadRaw {
+        variant: ReadRaw,
+        kind: OpKind::ReadFixed,
+        submit: submit::submit_read_raw,
+        get_fd: submit::get_fd_read_raw,
+    },
     WriteFixed {
         variant: Write,
         kind: OpKind::WriteFixed,
         submit: submit::submit_write_fixed,
         get_fd: submit::get_fd_write_fixed,
+    },
+    WriteRaw {
+        variant: WriteRaw,
+        kind: OpKind::WriteFixed,
+        submit: submit::submit_write_raw,
+        get_fd: submit::get_fd_write_raw,
     },
     Recv {
         variant: Recv,
@@ -334,17 +353,35 @@ define_iocp_ops! {
         submit: submit::submit_fsync,
         get_fd: submit::get_fd_fsync,
     },
+    FsyncRaw {
+        variant: FsyncRaw,
+        kind: OpKind::Fsync,
+        submit: submit::submit_fsync_raw,
+        get_fd: submit::get_fd_fsync_raw,
+    },
     SyncFileRange {
         variant: SyncRange,
         kind: OpKind::SyncFileRange,
         submit: submit::submit_sync_range,
         get_fd: submit::get_fd_sync_range,
     },
+    SyncFileRangeRaw {
+        variant: SyncRangeRaw,
+        kind: OpKind::SyncFileRange,
+        submit: submit::submit_sync_range_raw,
+        get_fd: submit::get_fd_sync_range_raw,
+    },
     Fallocate {
         variant: Fallocate,
         kind: OpKind::Fallocate,
         submit: submit::submit_fallocate,
         get_fd: submit::get_fd_fallocate,
+    },
+    FallocateRaw {
+        variant: FallocateRaw,
+        kind: OpKind::Fallocate,
+        submit: submit::submit_fallocate_raw,
+        get_fd: submit::get_fd_fallocate_raw,
     },
     Timeout {
         variant: Timeout,

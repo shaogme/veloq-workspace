@@ -2,7 +2,7 @@ use crate::config::{IoFd, IocpConfig};
 use crate::driver::IocpDriver;
 use crate::net::socket::Socket;
 use crate::ops::IocpOp;
-use crate::tests::wait_completion;
+use crate::tests::{completion_os_error_code, wait_completion};
 use std::time::Duration;
 use veloq_buf::BufPool;
 use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
@@ -266,7 +266,7 @@ fn test_rio_udp_recv_pool_burst_waiters_raise_target() {
         );
         let err = res.expect_err("cancelled udp_recv_stream should fail");
         assert_eq!(
-            err.raw_os_error(),
+            completion_os_error_code(&err),
             Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
         );
     }

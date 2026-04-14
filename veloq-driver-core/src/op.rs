@@ -713,6 +713,12 @@ impl DetachedSubmitter {
     }
 }
 
+impl Default for DetachedSubmitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
     type Future<
         T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
@@ -742,9 +748,25 @@ pub struct ReadFixed {
     pub buf_offset: usize,
 }
 
+/// Read from a file handle using a platform raw handle.
+pub struct ReadRaw<H: RawHandleMeta> {
+    pub fd: H,
+    pub buf: FixedBuf,
+    pub offset: u64,
+    pub buf_offset: usize,
+}
+
 /// Write to a file descriptor at a specific offset using a fixed buffer.
 pub struct WriteFixed {
     pub fd: IoFd,
+    pub buf: FixedBuf,
+    pub offset: u64,
+    pub buf_offset: usize,
+}
+
+/// Write to a file handle using a platform raw handle.
+pub struct WriteRaw<H: RawHandleMeta> {
+    pub fd: H,
     pub buf: FixedBuf,
     pub offset: u64,
     pub buf_offset: usize,
@@ -818,6 +840,13 @@ pub struct Fsync {
     pub datasync: bool,
 }
 
+/// Sync a raw file handle.
+pub struct FsyncRaw<H: RawHandleMeta> {
+    pub fd: H,
+    /// If true, only sync data (not metadata).
+    pub datasync: bool,
+}
+
 /// Timeout operation (platform-specific timing).
 pub struct Timeout {
     pub duration: std::time::Duration,
@@ -858,9 +887,25 @@ pub struct SyncFileRange {
     pub flags: u32,
 }
 
+/// Sync a raw file handle range.
+pub struct SyncFileRangeRaw<H: RawHandleMeta> {
+    pub fd: H,
+    pub offset: u64,
+    pub nbytes: u64,
+    pub flags: u32,
+}
+
 /// Pre-allocate file space.
 pub struct Fallocate {
     pub fd: IoFd,
+    pub mode: i32,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Pre-allocate space on a raw file handle.
+pub struct FallocateRaw<H: RawHandleMeta> {
+    pub fd: H,
     pub mode: i32,
     pub offset: u64,
     pub len: u64,

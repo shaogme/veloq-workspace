@@ -3,7 +3,7 @@ use crate::driver::IocpDriver;
 use crate::net::addr::{SockAddrStorage, socket_addr_to_storage};
 use crate::net::socket::Socket;
 use crate::ops::IocpOp;
-use crate::tests::{remote_free_contains, wait_completion};
+use crate::tests::{completion_os_error_code, remote_free_contains, wait_completion};
 use std::io::Write;
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
@@ -314,7 +314,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(1));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
-        err.raw_os_error(),
+        completion_os_error_code(&err),
         Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
     );
 
@@ -402,7 +402,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(1));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
-        err.raw_os_error(),
+        completion_os_error_code(&err),
         Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
     );
 

@@ -8,8 +8,8 @@ use crate::ops::submit::common::{
     mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle, unpack_kernel_ref,
 };
 use crate::ops::{
-    Close, Fallocate, Fsync, KernelRef, OpenPayload, OverlappedEntry, ReadFixed, SubmitContext,
-    SyncFileRange, WriteFixed,
+    Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, KernelRef, OpenPayload, OverlappedEntry,
+    ReadFixed, ReadRaw, SubmitContext, SyncFileRange, SyncFileRangeRaw, WriteFixed, WriteRaw,
 };
 
 // ============================================================================
@@ -76,6 +76,62 @@ macro_rules! submit_io_op {
     };
 }
 
+macro_rules! submit_raw_io_op {
+    ($fn_name:ident, $field_type:ty, $wrapper_fn:ident, offset, $ptr_fn:expr) => {
+        pub(crate) fn $fn_name(
+            header: &mut OverlappedEntry,
+            payload: &mut KernelRef<$field_type>,
+            ctx: &mut SubmitContext,
+        ) -> IocpResult<SubmissionResult> {
+            // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
+            let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+
+            overlapped.set_offset(val.offset);
+
+            header.resolved_handle = Some(val.fd);
+            let raw_handle = crate::config::RawHandle::new(val.fd);
+            let handle = raw_handle.borrow();
+            ensure_iocp_association(
+                handle,
+                ctx.port,
+                format!(
+                    "{}: CreateIoCompletionPort failed: handle={:?}, user_data={}, generation={}, offset={}, len={}",
+                    stringify!($fn_name),
+                    handle.raw().as_handle(),
+                    header.user_data,
+                    header.generation,
+                    val.offset,
+                    val.buf.len()
+                ),
+            )?;
+
+            if val.buf_offset > val.buf.len() {
+                return Err(error_stack::Report::new(IocpError::InvalidInput).attach(format!(
+                    "{}: buf_offset {} exceeds buffer length {}",
+                    stringify!($fn_name),
+                    val.buf_offset,
+                    val.buf.len()
+                )));
+            }
+            let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
+            let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
+            let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
+            let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
+                .map_err(|e| e.attach(format!(
+                    "{}: syscall failed: handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
+                    stringify!($fn_name),
+                    handle.raw().as_handle(),
+                    header.user_data,
+                    header.generation,
+                    val.offset,
+                    val.buf_offset,
+                    len
+                )));
+            mark_header_in_flight(header, submit_res)
+        }
+    };
+}
+
 // ============================================================================
 // Read/Write Implementation
 // ============================================================================
@@ -87,10 +143,24 @@ submit_io_op!(
     offset,
     |b: &mut FixedBuf| b.as_mut_ptr()
 );
+submit_raw_io_op!(
+    submit_read_raw,
+    ReadRaw,
+    iocp_submit_read,
+    offset,
+    |b: &mut FixedBuf| b.as_mut_ptr()
+);
 
 submit_io_op!(
     submit_write_fixed,
     WriteFixed,
+    iocp_submit_write,
+    offset,
+    |b: &mut FixedBuf| b.as_slice().as_ptr() as *mut u8
+);
+submit_raw_io_op!(
+    submit_write_raw,
+    WriteRaw,
     iocp_submit_write,
     offset,
     |b: &mut FixedBuf| b.as_slice().as_ptr() as *mut u8
@@ -185,6 +255,31 @@ pub(crate) fn submit_fsync(
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
 
+pub(crate) fn submit_fsync_raw(
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<FsyncRaw>,
+    ctx: &mut SubmitContext,
+) -> IocpResult<SubmissionResult> {
+    let user = unsafe { payload.user.as_ref() };
+    header.resolved_handle = Some(user.fd);
+    let raw_handle = crate::config::RawHandle::new(user.fd);
+    let handle = raw_handle.borrow();
+
+    let user_data = header.user_data;
+
+    let completion = CompletionInfo {
+        port: ctx.port.as_raw() as usize,
+        user_data,
+        overlapped: ctx.overlapped as usize,
+    };
+
+    let op = BlockingOps::Fsync {
+        handle: handle.raw().as_handle() as usize,
+        completion,
+    };
+    Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
+}
+
 /// # Safety
 ///
 /// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
@@ -213,6 +308,31 @@ pub(crate) fn submit_sync_range(
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
 
+pub(crate) fn submit_sync_range_raw(
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<SyncFileRangeRaw>,
+    ctx: &mut SubmitContext,
+) -> IocpResult<SubmissionResult> {
+    let user = unsafe { payload.user.as_ref() };
+    header.resolved_handle = Some(user.fd);
+    let raw_handle = crate::config::RawHandle::new(user.fd);
+    let handle = raw_handle.borrow();
+
+    let user_data = header.user_data;
+
+    let completion = CompletionInfo {
+        port: ctx.port.as_raw() as usize,
+        user_data,
+        overlapped: ctx.overlapped as usize,
+    };
+
+    let op = BlockingOps::SyncFileRange {
+        handle: handle.raw().as_handle() as usize,
+        completion,
+    };
+    Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
+}
+
 /// # Safety
 ///
 /// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
@@ -225,6 +345,34 @@ pub(crate) fn submit_fallocate(
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
     header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
+
+    let user_data = header.user_data;
+
+    let completion = CompletionInfo {
+        port: ctx.port.as_raw() as usize,
+        user_data,
+        overlapped: ctx.overlapped as usize,
+    };
+
+    let op = BlockingOps::Fallocate {
+        handle: handle.raw().as_handle() as usize,
+        mode: user.mode,
+        offset: user.offset,
+        len: user.len,
+        completion,
+    };
+    Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
+}
+
+pub(crate) fn submit_fallocate_raw(
+    header: &mut OverlappedEntry,
+    payload: &mut KernelRef<FallocateRaw>,
+    ctx: &mut SubmitContext,
+) -> IocpResult<SubmissionResult> {
+    let user = unsafe { payload.user.as_ref() };
+    header.resolved_handle = Some(user.fd);
+    let raw_handle = crate::config::RawHandle::new(user.fd);
+    let handle = raw_handle.borrow();
 
     let user_data = header.user_data;
 

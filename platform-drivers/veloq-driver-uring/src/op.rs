@@ -15,8 +15,9 @@ mod submit;
 
 pub(crate) use payload::UringOpPayload;
 pub(crate) use payload::{
-    Accept, Close, Connect, Fallocate, Fsync, OpSend, Open, ReadFixed, Recv, SendTo, SyncFileRange,
-    Timeout, UdpConnect, UdpRecv, UdpRecvStream, UdpSend, Wakeup, WriteFixed,
+    Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ReadFixed,
+    ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
+    UdpRecvStream, UdpSend, Wakeup, WriteFixed, WriteRaw,
 };
 
 // ============================================================================
@@ -199,6 +200,14 @@ define_uring_ops! {
         drop: submit::drop_read_fixed,
         resolve_chunks: submit::resolve_chunks_read_fixed,
     },
+    ReadRaw {
+        field: ReadRaw,
+        kind: OpKind::ReadFixed,
+        make_sqe: submit::make_sqe_read_raw,
+        on_complete: submit::on_complete_read_fixed,
+        drop: submit::drop_read_fixed,
+        resolve_chunks: submit::resolve_chunks_read_raw,
+    },
     WriteFixed {
         field: Write,
         kind: OpKind::WriteFixed,
@@ -206,6 +215,14 @@ define_uring_ops! {
         on_complete: submit::on_complete_write_fixed,
         drop: submit::drop_write_fixed,
         resolve_chunks: submit::resolve_chunks_write_fixed,
+    },
+    WriteRaw {
+        field: WriteRaw,
+        kind: OpKind::WriteFixed,
+        make_sqe: submit::make_sqe_write_raw,
+        on_complete: submit::on_complete_write_fixed,
+        drop: submit::drop_write_fixed,
+        resolve_chunks: submit::resolve_chunks_write_raw,
     },
     Recv {
         field: Recv,
@@ -264,6 +281,13 @@ define_uring_ops! {
         on_complete: submit::on_complete_fsync,
         drop: submit::drop_fsync,
     },
+    FsyncRaw {
+        field: FsyncRaw,
+        kind: OpKind::Fsync,
+        make_sqe: submit::make_sqe_fsync_raw,
+        on_complete: submit::on_complete_fsync,
+        drop: submit::drop_fsync,
+    },
     SyncFileRange {
         field: SyncRange,
         kind: OpKind::SyncFileRange,
@@ -271,10 +295,24 @@ define_uring_ops! {
         on_complete: submit::on_complete_sync_range,
         drop: submit::drop_sync_range,
     },
+    SyncFileRangeRaw {
+        field: SyncRangeRaw,
+        kind: OpKind::SyncFileRange,
+        make_sqe: submit::make_sqe_sync_range_raw,
+        on_complete: submit::on_complete_sync_range,
+        drop: submit::drop_sync_range,
+    },
     Fallocate {
         field: Fallocate,
         kind: OpKind::Fallocate,
         make_sqe: submit::make_sqe_fallocate,
+        on_complete: submit::on_complete_fallocate,
+        drop: submit::drop_fallocate,
+    },
+    FallocateRaw {
+        field: FallocateRaw,
+        kind: OpKind::Fallocate,
+        make_sqe: submit::make_sqe_fallocate_raw,
         on_complete: submit::on_complete_fallocate,
         drop: submit::drop_fallocate,
     },

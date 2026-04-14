@@ -34,11 +34,13 @@ impl_get_fd!(
     KernelRef<crate::ops::ReadFixed>,
     direct_fd
 );
+impl_get_fd!(get_fd_read_raw, KernelRef<crate::ops::ReadRaw>, no_fd);
 impl_get_fd!(
     get_fd_write_fixed,
     KernelRef<crate::ops::WriteFixed>,
     direct_fd
 );
+impl_get_fd!(get_fd_write_raw, KernelRef<crate::ops::WriteRaw>, no_fd);
 impl_get_fd!(get_fd_recv, KernelRef<Recv>, direct_fd);
 impl_get_fd!(get_fd_send, KernelRef<OpSend>, direct_fd);
 impl_get_fd!(get_fd_udp_recv, KernelRef<UdpRecv>, direct_fd);
@@ -52,8 +54,19 @@ impl_get_fd!(get_fd_udp_recv_stream, KernelRef<UdpRecvStream>, direct_fd);
 
 impl_get_fd!(get_fd_close, KernelRef<Close>, direct_fd);
 impl_get_fd!(get_fd_fsync, KernelRef<Fsync>, direct_fd);
+impl_get_fd!(get_fd_fsync_raw, KernelRef<crate::ops::FsyncRaw>, no_fd);
 impl_get_fd!(get_fd_sync_range, KernelRef<SyncFileRange>, direct_fd);
+impl_get_fd!(
+    get_fd_sync_range_raw,
+    KernelRef<crate::ops::SyncFileRangeRaw>,
+    no_fd
+);
 impl_get_fd!(get_fd_fallocate, KernelRef<Fallocate>, direct_fd);
+impl_get_fd!(
+    get_fd_fallocate_raw,
+    KernelRef<crate::ops::FallocateRaw>,
+    no_fd
+);
 impl_get_fd!(get_fd_timeout, KernelRef<Timeout>, no_fd);
 impl_get_fd!(get_fd_wakeup, KernelRef<Wakeup>, no_fd);
 

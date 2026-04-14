@@ -1,5 +1,7 @@
 use crate::driver::UringDriver;
-use crate::op::{UringOp, UringOpPayload};
+use crate::op::{
+    FallocateRaw, FsyncRaw, ReadRaw, SyncFileRangeRaw, UringOp, UringOpPayload, WriteRaw,
+};
 use io_uring::{opcode, squeue, types};
 use veloq_buf::PoolKind;
 use veloq_driver_core::error::{DriverErrorKind, DriverResult, driver_error, driver_os_error};
@@ -142,12 +144,98 @@ macro_rules! make_rw_fixed {
     };
 }
 
+macro_rules! make_rw_raw {
+    ($fn_name:ident, $variant:ident, $type_raw:path, write) => {
+        pub(crate) unsafe fn $fn_name(
+            op: &mut UringOp,
+            driver: &mut UringDriver,
+        ) -> DriverResult<squeue::Entry> {
+            let kernel = match &mut op.payload {
+                UringOpPayload::$variant(kernel) => kernel,
+                _ => {
+                    return Err(payload_variant_mismatch(concat!(
+                        "uring.op.submit.",
+                        stringify!($fn_name)
+                    )));
+                }
+            };
+            let rw_op = unsafe { kernel.user.as_mut() };
+            let region_info = rw_op.buf.resolve_region_info();
+            let ptr = unsafe { rw_op.buf.as_slice().as_ptr().add(rw_op.buf_offset) };
+            let len = (rw_op.buf.len() - rw_op.buf_offset) as u32;
+            let fd = rw_op.fd.as_fd();
+
+            let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
+                driver
+                    .registered_chunks
+                    .get(region_info.id as usize)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            if is_registered {
+                let fixed_idx = region_info.id;
+                Ok(opcode::WriteFixed::new(types::Fd(fd), ptr, len, fixed_idx)
+                    .offset(rw_op.offset)
+                    .build())
+            } else {
+                Ok($type_raw(types::Fd(fd), ptr, len)
+                    .offset(rw_op.offset)
+                    .build())
+            }
+        }
+    };
+    ($fn_name:ident, $variant:ident, $type_raw:path) => {
+        pub(crate) unsafe fn $fn_name(
+            op: &mut UringOp,
+            driver: &mut UringDriver,
+        ) -> DriverResult<squeue::Entry> {
+            let kernel = match &mut op.payload {
+                UringOpPayload::$variant(kernel) => kernel,
+                _ => {
+                    return Err(payload_variant_mismatch(concat!(
+                        "uring.op.submit.",
+                        stringify!($fn_name)
+                    )));
+                }
+            };
+            let rw_op = unsafe { kernel.user.as_mut() };
+            let region_info = rw_op.buf.resolve_region_info();
+            let ptr = unsafe { rw_op.buf.as_mut_ptr().add(rw_op.buf_offset) };
+            let len = (rw_op.buf.capacity() - rw_op.buf_offset) as u32;
+            let fd = rw_op.fd.as_fd();
+
+            let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
+                driver
+                    .registered_chunks
+                    .get(region_info.id as usize)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            if is_registered {
+                let fixed_idx = region_info.id;
+                Ok(opcode::ReadFixed::new(types::Fd(fd), ptr, len, fixed_idx)
+                    .offset(rw_op.offset)
+                    .build())
+            } else {
+                Ok($type_raw(types::Fd(fd), ptr, len)
+                    .offset(rw_op.offset)
+                    .build())
+            }
+        }
+    };
+}
+
 make_rw_fixed!(
     make_sqe_read_fixed,
     Read,
     opcode::Read::new,
     opcode::ReadFixed::new
 );
+make_rw_raw!(make_sqe_read_raw, ReadRaw, opcode::Read::new);
 make_rw_fixed!(
     make_sqe_write_fixed,
     Write,
@@ -155,12 +243,15 @@ make_rw_fixed!(
     opcode::WriteFixed::new,
     write
 );
+make_rw_raw!(make_sqe_write_raw, WriteRaw, opcode::Write::new, write);
 
 impl_default_completion!(on_complete_read_fixed);
 impl_lifecycle!(drop_read_fixed, Read, direct_fd);
 
 impl_default_completion!(on_complete_write_fixed);
 impl_lifecycle!(drop_write_fixed, Write, direct_fd);
+impl_default_completion!(on_complete_write_raw);
+impl_lifecycle!(drop_write_raw, WriteRaw, direct_fd);
 
 macro_rules! make_buf_op {
     ($fn_name:ident, $variant:ident, $opcode:path, recv_args) => {
@@ -467,6 +558,29 @@ pub(crate) unsafe fn make_sqe_fsync(
 impl_default_completion!(on_complete_fsync);
 impl_lifecycle!(drop_fsync, Fsync, direct_fd);
 
+pub(crate) unsafe fn make_sqe_fsync_raw(
+    op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> DriverResult<squeue::Entry> {
+    let kernel = match &mut op.payload {
+        UringOpPayload::FsyncRaw(kernel) => kernel,
+        _ => {
+            return Err(payload_variant_mismatch(
+                "uring.op.submit.make_sqe_fsync_raw",
+            ));
+        }
+    };
+    let fsync_op = unsafe { kernel.user.as_mut() };
+    let flags = if fsync_op.datasync {
+        io_uring::types::FsyncFlags::DATASYNC
+    } else {
+        io_uring::types::FsyncFlags::empty()
+    };
+
+    let fd = fsync_op.fd.as_fd();
+    Ok(opcode::Fsync::new(types::Fd(fd)).flags(flags).build())
+}
+
 pub(crate) unsafe fn make_sqe_sync_range(
     op: &mut UringOp,
     _driver: &mut UringDriver,
@@ -507,6 +621,43 @@ pub(crate) unsafe fn make_sqe_sync_range(
 impl_default_completion!(on_complete_sync_range);
 impl_lifecycle!(drop_sync_range, SyncRange, direct_fd);
 
+pub(crate) unsafe fn make_sqe_sync_range_raw(
+    op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> DriverResult<squeue::Entry> {
+    let kernel = match &mut op.payload {
+        UringOpPayload::SyncRangeRaw(kernel) => kernel,
+        _ => {
+            return Err(payload_variant_mismatch(
+                "uring.op.submit.make_sqe_sync_range_raw",
+            ));
+        }
+    };
+    let sync_op = unsafe { kernel.user.as_mut() };
+    let nbytes = if sync_op.nbytes > u32::MAX as u64 {
+        if sync_op.nbytes == u64::MAX {
+            0
+        } else {
+            return Err(driver_error(
+                DriverErrorKind::InvalidInput,
+                "uring.op.submit.make_sqe_sync_range_raw",
+                format!(
+                    "sync_file_range: nbytes ({}) exceeds 32-bit limit and is not u64::MAX (0)",
+                    sync_op.nbytes
+                ),
+            ));
+        }
+    } else {
+        sync_op.nbytes as u32
+    };
+
+    let fd = sync_op.fd.as_fd();
+    Ok(opcode::SyncFileRange::new(types::Fd(fd), nbytes)
+        .offset(sync_op.offset)
+        .flags(sync_op.flags)
+        .build())
+}
+
 pub(crate) unsafe fn make_sqe_fallocate(
     op: &mut UringOp,
     _driver: &mut UringDriver,
@@ -529,6 +680,26 @@ pub(crate) unsafe fn make_sqe_fallocate(
 
 impl_default_completion!(on_complete_fallocate);
 impl_lifecycle!(drop_fallocate, Fallocate, direct_fd);
+
+pub(crate) unsafe fn make_sqe_fallocate_raw(
+    op: &mut UringOp,
+    _driver: &mut UringDriver,
+) -> DriverResult<squeue::Entry> {
+    let kernel = match &mut op.payload {
+        UringOpPayload::FallocateRaw(kernel) => kernel,
+        _ => {
+            return Err(payload_variant_mismatch(
+                "uring.op.submit.make_sqe_fallocate_raw",
+            ));
+        }
+    };
+    let fallocate_op = unsafe { kernel.user.as_mut() };
+    let fd = fallocate_op.fd.as_fd();
+    Ok(opcode::Fallocate::new(types::Fd(fd), fallocate_op.len)
+        .offset(fallocate_op.offset)
+        .mode(fallocate_op.mode)
+        .build())
+}
 
 pub(crate) unsafe fn make_sqe_open(
     op: &mut UringOp,

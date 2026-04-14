@@ -7,10 +7,11 @@ use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::{
     Driver, PollRecordResult, encode_completion_token, event_res_to_result,
 };
+use veloq_driver_core::error::driver_error_report_to_event_res;
 use veloq_driver_core::slot::SlotTable;
 
 use crate::driver::IocpDriver;
-use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::error::{IocpDiag, IocpError, IocpResult, from_io_error};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);
@@ -46,7 +47,13 @@ pub(crate) fn wait_completion(
         match driver.try_take_completion(token) {
             PollRecordResult::Ready(record) => {
                 return event_res_to_result(record.event.res).map_err(|e| {
-                    from_io_error(IocpError::CompletionWait, "iocp.tests.wait_completion", e)
+                    let code = driver_error_report_to_event_res(&e);
+                    let io_error = std::io::Error::from_raw_os_error(-code);
+                    from_io_error(
+                        IocpError::CompletionWait,
+                        "iocp.tests.wait_completion",
+                        io_error,
+                    )
                 });
             }
             PollRecordResult::Stale => {
@@ -57,4 +64,9 @@ pub(crate) fn wait_completion(
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+pub(crate) fn completion_os_error_code(err: &error_stack::Report<IocpError>) -> Option<i32> {
+    err.downcast_ref::<IocpDiag>()
+        .and_then(|diag| diag.error_code)
 }

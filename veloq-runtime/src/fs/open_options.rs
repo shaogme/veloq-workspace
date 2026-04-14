@@ -128,11 +128,11 @@ impl OpenOptions {
             .into_iter()
             .next()
             .ok_or_else(|| std::io::Error::other("register_files returned empty"))?;
-        use super::file::InnerFile;
         use std::cell::Cell;
 
         Ok(super::file::LocalFile {
-            inner: InnerFile::new(fd, fixed),
+            raw: fd,
+            fd: fixed,
             submitter,
             pos: Cell::new(0),
         })
@@ -154,25 +154,10 @@ impl OpenOptions {
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
         let owned = res.map_err(driver_err)?;
         let fd = owned.into_raw();
-        let ctx = crate::runtime::context::try_current()
-            .ok_or_else(|| std::io::Error::other("runtime context not set"))?;
-        let driver = ctx
-            .driver()
-            .upgrade()
-            .ok_or_else(|| std::io::Error::other("runtime driver missing"))?;
-        let fixed = driver
-            .borrow_mut()
-            .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
-            .map_err(driver_err)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| std::io::Error::other("register_files returned empty"))?;
-
-        use super::file::InnerFile;
         use std::sync::atomic::AtomicU64;
 
         Ok(super::file::File {
-            inner: InnerFile::new(fd, fixed),
+            raw: fd,
             submitter,
             pos: AtomicU64::new(0),
         })

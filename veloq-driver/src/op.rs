@@ -6,6 +6,22 @@ use crate::SockAddrStorage;
 use crate::driver::{Driver, PlatformDriver};
 
 pub type IoFd = veloq_driver_core::IoFd;
+pub type ReadRaw<H> = veloq_driver_core::op::ReadRaw<H>;
+pub type WriteRaw<H> = veloq_driver_core::op::WriteRaw<H>;
+pub type FsyncRaw<H> = veloq_driver_core::op::FsyncRaw<H>;
+pub type SyncFileRangeRaw<H> = veloq_driver_core::op::SyncFileRangeRaw<H>;
+pub type FallocateRaw<H> = veloq_driver_core::op::FallocateRaw<H>;
+
+#[cfg(unix)]
+type FileRawHandle = veloq_driver_uring::config::UringRawHandle;
+#[cfg(windows)]
+type FileRawHandle = veloq_driver_iocp::config::IocpHandle;
+
+pub type FileReadRaw = veloq_driver_core::op::ReadRaw<FileRawHandle>;
+pub type FileWriteRaw = veloq_driver_core::op::WriteRaw<FileRawHandle>;
+pub type FileFsyncRaw = veloq_driver_core::op::FsyncRaw<FileRawHandle>;
+pub type FileSyncFileRangeRaw = veloq_driver_core::op::SyncFileRangeRaw<FileRawHandle>;
+pub type FileFallocateRaw = veloq_driver_core::op::FallocateRaw<FileRawHandle>;
 pub type ReadFixed = veloq_driver_core::op::ReadFixed;
 pub type WriteFixed = veloq_driver_core::op::WriteFixed;
 pub type Recv = veloq_driver_core::op::Recv;

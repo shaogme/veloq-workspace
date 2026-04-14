@@ -2,18 +2,23 @@ use std::ptr::NonNull;
 
 use veloq_driver_core::op::{
     Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
-    Fsync as CoreFsync, ReadFixed as CoreReadFixed, Recv as CoreRecv, Send as CoreSend,
-    SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange, UdpConnect as CoreUdpConnect,
-    UdpRecv as CoreUdpRecv, UdpRecvStream as CoreUdpRecvStream, UdpSend as CoreUdpSend,
-    Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
+    FallocateRaw as CoreFallocateRaw, Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw,
+    ReadFixed as CoreReadFixed, ReadRaw as CoreReadRaw, Recv as CoreRecv, Send as CoreSend,
+    SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange,
+    SyncFileRangeRaw as CoreSyncFileRangeRaw, UdpConnect as CoreUdpConnect, UdpRecv as CoreUdpRecv,
+    UdpRecvStream as CoreUdpRecvStream, UdpSend as CoreUdpSend, Wakeup as CoreWakeup,
+    WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
 };
 
 pub(crate) use veloq_driver_core::op::{Open, Timeout};
 
 use crate::config::SockAddrStorage;
+use crate::config::UringRawHandle;
 
 pub(crate) type ReadFixed = CoreReadFixed;
+pub(crate) type ReadRaw = CoreReadRaw<UringRawHandle>;
 pub(crate) type WriteFixed = CoreWriteFixed;
+pub(crate) type WriteRaw = CoreWriteRaw<UringRawHandle>;
 pub(crate) type Recv = CoreRecv;
 pub(crate) type OpSend = CoreSend;
 pub(crate) type UdpRecv = CoreUdpRecv;
@@ -22,8 +27,11 @@ pub(crate) type Connect = CoreConnect<SockAddrStorage>;
 pub(crate) type UdpConnect = CoreUdpConnect<SockAddrStorage>;
 pub(crate) type Close = CoreClose;
 pub(crate) type Fsync = CoreFsync;
+pub(crate) type FsyncRaw = CoreFsyncRaw<UringRawHandle>;
 pub(crate) type SyncFileRange = CoreSyncFileRange;
+pub(crate) type SyncFileRangeRaw = CoreSyncFileRangeRaw<UringRawHandle>;
 pub(crate) type Fallocate = CoreFallocate;
+pub(crate) type FallocateRaw = CoreFallocateRaw<UringRawHandle>;
 pub(crate) type Accept = CoreAccept<SockAddrStorage>;
 pub(crate) type SendTo = CoreSendTo;
 pub(crate) type UdpRecvStream = CoreUdpRecvStream;
@@ -68,7 +76,9 @@ pub(crate) struct TimeoutPayload {
 
 pub(crate) enum UringOpPayload {
     Read(KernelRef<ReadFixed>),
+    ReadRaw(KernelRef<ReadRaw>),
     Write(KernelRef<WriteFixed>),
+    WriteRaw(KernelRef<WriteRaw>),
     Recv(KernelRef<Recv>),
     Send(KernelRef<OpSend>),
     UdpRecv(KernelRef<UdpRecv>),
@@ -77,8 +87,11 @@ pub(crate) enum UringOpPayload {
     UdpConnect(KernelRef<UdpConnect>),
     Close(KernelRef<Close>),
     Fsync(KernelRef<Fsync>),
+    FsyncRaw(KernelRef<FsyncRaw>),
     SyncRange(KernelRef<SyncFileRange>),
+    SyncRangeRaw(KernelRef<SyncFileRangeRaw>),
     Fallocate(KernelRef<Fallocate>),
+    FallocateRaw(KernelRef<FallocateRaw>),
     Accept(AcceptPayload),
     SendTo(SendToPayload),
     UdpRecvStream(UdpRecvStreamPayload),
