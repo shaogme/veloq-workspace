@@ -24,7 +24,7 @@ pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
 use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier, nz};
-use veloq_driver::driver::RemoteWaker;
+use veloq_driver::driver::{DriverControlCommand, RemoteWaker};
 
 use veloq_blocking::init_blocking_pool;
 
@@ -36,6 +36,7 @@ struct WorkerPrep<T: PoolTopology> {
     shared: Arc<ExecutorShared>,
     remote_receiver: mpsc::Receiver<Task>,
     pinned_receiver: mpsc::Receiver<SpawnedTask>,
+    control_receiver: mpsc::Receiver<Vec<DriverControlCommand>>,
     // Worker local queue for stealable tasks
     stealable_worker: Worker<Runnable>,
     state: T::State,
@@ -96,6 +97,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             shared: Arc<ExecutorShared>,
             remote_rx: mpsc::Receiver<Task>,
             pinned_rx: mpsc::Receiver<SpawnedTask>,
+            control_rx: mpsc::Receiver<Vec<DriverControlCommand>>,
             worker: Worker<Runnable>,
         }
 
@@ -106,6 +108,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             .map(|i| {
                 let (remote_tx, remote_rx) = mpsc::channel();
                 let (pinned_tx, pinned_rx) = mpsc::channel();
+                let (control_tx, control_rx) = mpsc::channel();
 
                 let worker = Worker::new_fifo();
                 let stealer = worker.stealer();
@@ -113,6 +116,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
                 let shared = Arc::new(ExecutorShared {
                     pinned: pinned_tx,
                     remote_queue: remote_tx,
+                    control_queue: control_tx,
                     future_injector: ArrayQueue::new(queue_capacity),
                     stealer,
                     waker: LateBoundWaker::new(),
@@ -131,6 +135,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
                     shared,
                     remote_rx,
                     pinned_rx,
+                    control_rx,
                     worker,
                 };
 
@@ -186,6 +191,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
                     .with_shared(res.shared)
                     .with_remote_receiver(res.remote_rx)
                     .with_pinned_receiver(res.pinned_rx)
+                    .with_control_receiver(res.control_rx)
                     .with_worker(res.worker)
                     .build(|registrar| {
                         // Topology determines how to build the pool and register memory
@@ -210,6 +216,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             shared: worker_0_res.shared,
             remote_receiver: worker_0_res.remote_rx,
             pinned_receiver: worker_0_res.pinned_rx,
+            control_receiver: worker_0_res.control_rx,
             stealable_worker: worker_0_res.worker,
             state: state.clone(),
             topology: self.topology,
@@ -301,6 +308,7 @@ impl<T: PoolTopology> Runtime<T> {
             .with_shared(prep.shared) // Inject shared state
             .with_remote_receiver(prep.remote_receiver) // Inject remote receiver
             .with_pinned_receiver(prep.pinned_receiver) // Inject pinned receiver
+            .with_control_receiver(prep.control_receiver) // Inject control receiver
             .with_worker(prep.stealable_worker) // Inject stealable worker
             .build(|registrar| {
                 // Bind Buffer Pool using stored prep data

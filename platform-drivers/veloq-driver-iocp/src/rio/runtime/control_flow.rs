@@ -315,6 +315,53 @@ impl RioState {
             .attach("failed to retrieve inserted actor")
     }
 
+    pub(crate) fn warmup_udp_socket(
+        &mut self,
+        target: (IoFd, BorrowedRawHandle<'_>),
+        requested_chunk_size: usize,
+        credits: usize,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+    ) -> RioResult<usize> {
+        let (fd, handle) = target;
+        let socket_key = handle.raw().actor_key();
+        let Some(dispatch) = self.kernel.dispatch else {
+            return Err(error_stack::Report::new(RioError::NotSupported))
+                .attach("RIO dispatch not available for UDP warmup");
+        };
+        let Some(cq) = (!self.kernel.cq.is_invalid()).then_some(self.kernel.cq) else {
+            return Err(error_stack::Report::new(RioError::NotSupported))
+                .attach("RIO dispatch not available for UDP warmup");
+        };
+        let env = RioEnv {
+            registrar,
+            dispatch: &dispatch,
+            cq,
+            registration_mode: self.registration_mode,
+        };
+        let _ = self.ensure_actor((fd, handle), env)?;
+
+        if self.is_iocp_fallback(socket_key) {
+            return Err(error_stack::Report::new(RioError::NotSupported))
+                .attach("Socket is marked for IOCP fallback");
+        }
+
+        let key = self
+            .actor_by_handle
+            .get(&socket_key)
+            .copied()
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("actor not found")?;
+
+        let actor = self
+            .actors
+            .get_mut(key)
+            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
+            .attach("actor not found")?;
+        let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
+        let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
+        pool_manager.warmup_pool(udp_mailbox, requested_chunk_size, credits, &mut ctx)
+    }
+
     pub(crate) fn shutdown_actor(&mut self, socket_key: SocketKey) {
         let Some(key) = self.actor_by_handle.remove(&socket_key) else {
             return;

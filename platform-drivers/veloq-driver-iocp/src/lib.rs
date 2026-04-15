@@ -18,7 +18,7 @@ pub use config::{
     BorrowedRawHandle, BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, OwnedRawHandle,
     RawHandle, RawHandleKind, RegisteredHandle, SocketKey,
 };
-pub use driver::{CloseMode, IocpDriver, IocpOpState, SocketLifecycleHandle};
+pub use driver::{CloseMode, IocpDriver, IocpOpState};
 pub use error::{IocpError, IocpResult};
 pub use net::addr::{SockAddrStorage, socket_addr_to_storage, to_socket_addr};
 pub use net::socket::Socket;

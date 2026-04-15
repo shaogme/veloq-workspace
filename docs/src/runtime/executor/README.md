@@ -11,7 +11,7 @@
 
 为了实现这一目标，执行器支持三种类型的任务执行：
 1.  **Pinned Tasks (绑定任务)**: 必须在特定线程运行的任务（如 `spawn_local`）。由 `task.rs` 定义的 `Task`。
-2.  **Stealable Tasks (可窃取任务)**: 实现了 `Send`，可以在任意线程运行的任务（通过 `spawn` 创建）。由 `runtime/task/harness.rs` 定义的 `Runnable`。
+2.  **Stealable Tasks (可窃取任务)**: 实现了 `Send`，可以在任意线程运行的任务（通过 `spawn` / `spawn_eager` / `Runtime::spawn` 创建）。由 `runtime/task/harness.rs` 定义的 `Runnable`。
 3.  **Blocking Tasks (阻塞任务)**: 长时间运行的 CPU 密集型任务或同步 I/O 任务。由 `runtime/blocking.rs` 的全局线程池处理。
 
 ## 2. 理念和思路 (Philosophy and Design)
@@ -19,7 +19,8 @@
 ### 2.1 混合调度策略 (Hybrid Scheduling)
 Veloq 结合了发送端和接收端的负载均衡：
 - **发送端 (Direct Push)**: 绑定任务 (`spawn_local`/`spawn_to`) 直接通过 MPSC 通道发送到目标 Worker。
-- **本地优先 (Local Injection)**: 当调用 `spawn` 时，任务被放入当前 Worker 的 `Stealable` 队列，优先由本地消费，但也允许被窃取。
+- **本地优先 (Local Injection)**: 当 Worker 内部调用 `spawn` / `spawn_eager` 时，`Send` 任务会直接进入当前 Worker 的 `Stealable` 队列，优先由本地消费，但也允许被窃取。
+- **远程注入缓冲 (Remote Injection Buffer)**: 跨线程创建或远程唤醒 `Runnable` 时，任务先进入目标 Worker 的 `future_injector`，再由目标线程转存到本地 `Stealable` 队列。
 - **接收端 (Work-Stealing)**: 当 Worker 空闲时，主动去“窃取”其他 Worker 的 `Stealable` 队列中的任务。
 
 ### 2.2 优先级倒置 (Priority Inversion for Latency)
@@ -43,7 +44,7 @@ Veloq 结合了发送端和接收端的负载均衡：
     - `block_on`: 创建一个临时的 `LocalExecutor` 在当前线程运行 Future。
 
 - `context.rs`:
-    - `RuntimeContext`: 提供给用户的 TLS 上下文，包含 `spawn`, `spawn_balanced`, `spawn_local` 等接口。
+    - `RuntimeContext`: 提供给用户的 TLS 上下文，包含 `spawn`, `spawn_eager`, `spawn_local`, `spawn_to` 等接口。
 
 - `executor/spawner.rs`:
     - `Spawner`: 封装任务分发逻辑。
@@ -73,12 +74,12 @@ loop {
         // 处理本地任务
         if let Some(task) = self.queue.pop() { ... }
         
-        // 3. Injectors (Pinned/Remote/Global)
+        // 3. Injectors (Pinned/Remote)
         // try_poll_injector 内部会依次检查:
         // - pinned queue (绑定任务)
-        // - remote receiver (唤醒的任务)
-        // - global injector (普通任务)
+        // - remote receiver (唤醒的绑定任务)
         if self.try_poll_injector() { ... }
+        // future_injector 只负责远程注入的 Runnable，下沉到本地 Stealable 后再执行
         if self.try_poll_future_injector() { ... }
         
         // 4. Stealing
@@ -102,7 +103,7 @@ loop {
 当其他线程通过 `pinned.send()` 发送任务时，会主动唤醒目标 Executor。
 
 ### 4.3 任务生成 (`context.rs` & `spawner.rs`)
-- **`spawn`**: 创建一个 `Runnable` (Harness)，优先推入当前 Worker 的 `Stealable` 队列。如果 Worker 繁忙，其他 Worker 可以窃取。
+- **`spawn` / `spawn_eager`**: 创建一个 `Runnable` (Harness)。若在 Worker 内部调用，优先推入当前 Worker 的 `Stealable` 队列；若跨线程创建或远程唤醒，则先进入目标 Worker 的 `future_injector`，再由目标线程转存到本地 `Stealable` 队列。
 - **`spawn_to` / `Spawner` Pinned Spawn**: 明确目标 Worker，将任务通过 MPSC 通道发送到目标的 `pinned` 队列。
 - **`spawn_local`**: 创建 `SpawnedTask` 并推入本地 `VecDeque`，永不离开线程。
 

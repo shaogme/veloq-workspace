@@ -107,6 +107,26 @@ impl UdpPoolManager {
         self.pool.grow_to(initial, ctx, &mut self.registry)
     }
 
+    pub(crate) fn warmup_pool(
+        &mut self,
+        mailbox: &mut UdpMailbox,
+        requested_chunk_size: usize,
+        credits: usize,
+        ctx: &mut RioContext,
+    ) -> RioResult<usize> {
+        let total_submissions = self.ensure_pool(ctx, requested_chunk_size)?;
+        let min = UDP_RECV_POOL_MIN_CREDITS;
+        let max = UDP_RECV_POOL_MAX_CREDITS.max(min);
+        let target = credits.max(min).min(max);
+
+        if self.pool.target_credits < target {
+            self.pool.target_credits = target;
+        }
+
+        let rebalance_submissions = self.pool.rebalance(mailbox, ctx, &mut self.registry)?;
+        Ok(total_submissions + rebalance_submissions)
+    }
+
     fn init_slab(
         ctx: &mut RioContext,
         chunk_size: usize,

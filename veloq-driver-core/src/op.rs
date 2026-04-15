@@ -137,6 +137,86 @@ impl<T, R> OpResult<T, R> {
     }
 }
 
+#[inline]
+fn payload_missing_error() -> OpError {
+    OpError::new(
+        LostReason::PayloadMissing,
+        driver_error(
+            DriverErrorKind::Internal,
+            "driver-core/op",
+            "operation payload lost: completion sidecar missing",
+        ),
+    )
+}
+
+#[inline]
+fn payload_kind_mismatch_error() -> OpError {
+    OpError::new(
+        LostReason::PayloadKindMismatch,
+        driver_error(
+            DriverErrorKind::Internal,
+            "driver-core/op",
+            "operation payload lost: kind mismatch",
+        ),
+    )
+}
+
+#[inline]
+fn generation_mismatch_error() -> OpError {
+    OpError::new(
+        LostReason::GenerationMismatch,
+        driver_error(
+            DriverErrorKind::Internal,
+            "driver-core/op",
+            "operation lost: slot recycled (generation mismatch)",
+        ),
+    )
+}
+
+#[inline]
+fn completion_record_to_result<T, O, C>(
+    record: CompletionRecord<C>,
+) -> Poll<OpResult<T, T::Completion>>
+where
+    O: PlatformOp,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
+    C: crate::driver::CompletionValue,
+{
+    let CompletionRecord {
+        event,
+        payload: payload_any,
+        detail,
+    } = record;
+    let Some(payload_any) = payload_any else {
+        return Poll::Ready(OpResult::ResourceLost(payload_missing_error()));
+    };
+    if payload_any.kind != T::PAYLOAD_KIND as u16 {
+        return Poll::Ready(OpResult::ResourceLost(payload_kind_mismatch_error()));
+    }
+    let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+    let data = T::from_user_payload(payload);
+    let res = detail.unwrap_or_else(|| event_res_to_result::<C>(event.res));
+    let completion = data.map_completion_result(res);
+    Poll::Ready(OpResult::Completed(completion, data))
+}
+
+#[inline]
+fn poll_completion_table_once<T, O, C>(
+    table: &dyn crate::driver::CompletionAccess<C>,
+    token: u64,
+) -> Poll<OpResult<T, T::Completion>>
+where
+    O: PlatformOp,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
+    C: crate::driver::CompletionValue,
+{
+    match table.try_take_record(token) {
+        PollRecordResult::Ready(record) => completion_record_to_result::<T, O, C>(record),
+        PollRecordResult::Stale => Poll::Ready(OpResult::ResourceLost(generation_mismatch_error())),
+        PollRecordResult::Pending => Poll::Pending,
+    }
+}
+
 // ============================================================================
 // Core Traits
 // ============================================================================
@@ -421,57 +501,12 @@ where
             .completion_table
             .as_ref()
             .expect("DetachedOp missing completion_table but no immediate_failure");
-        match table.try_take_record(this.token) {
-            PollRecordResult::Ready(record) => {
-                let CompletionRecord {
-                    event,
-                    payload: payload_any,
-                    detail,
-                } = record;
-                let Some(payload_any) = payload_any else {
-                    return Poll::Ready(OpResult::ResourceLost(OpError::new(
-                        LostReason::PayloadMissing,
-                        driver_error(
-                            DriverErrorKind::Internal,
-                            "driver-core/op",
-                            "operation payload lost: completion sidecar missing",
-                        ),
-                    )));
-                };
-                if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                    return Poll::Ready(OpResult::ResourceLost(OpError::new(
-                        LostReason::PayloadKindMismatch,
-                        driver_error(
-                            DriverErrorKind::Internal,
-                            "driver-core/op",
-                            "operation payload lost: kind mismatch",
-                        ),
-                    )));
-                }
-                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-                let data = T::from_user_payload(payload);
-                let res = detail.unwrap_or_else(|| event_res_to_result::<C>(event.res));
-                let completion = data.map_completion_result(res);
-                return Poll::Ready(OpResult::Completed(completion, data));
-            }
-            PollRecordResult::Stale => {
-                return Poll::Ready(OpResult::ResourceLost(OpError::new(
-                    LostReason::GenerationMismatch,
-                    driver_error(
-                        DriverErrorKind::Internal,
-                        "driver-core/op",
-                        "operation lost: slot recycled (generation mismatch)",
-                    ),
-                )));
-            }
-            PollRecordResult::Pending => {}
+        if let Poll::Ready(result) = poll_completion_table_once::<T, O, C>(&**table, this.token) {
+            return Poll::Ready(result);
         }
 
-        if let Some(table) = this.completion_table.as_ref() {
-            table.register_waker(this.token, cx.waker());
-        }
-
-        Poll::Pending
+        table.register_waker(this.token, cx.waker());
+        poll_completion_table_once::<T, O, C>(&**table, this.token)
     }
 }
 
@@ -587,55 +622,26 @@ where
 
         if let State::Submitted = op.state {
             let mut driver = op.driver.borrow_mut();
-            match driver.try_take_completion_record(op.token) {
-                PollRecordResult::Ready(record) => {
+            match poll_completion_table_once::<T, D::Op, D::Completion>(
+                &*driver.completion_table(),
+                op.token,
+            ) {
+                Poll::Ready(result) => {
                     op.state = State::Completed;
-                    let CompletionRecord {
-                        event,
-                        payload: payload_any,
-                        detail,
-                    } = record;
-                    let Some(payload_any) = payload_any else {
-                        return Poll::Ready(OpResult::ResourceLost(OpError::new(
-                            LostReason::PayloadMissing,
-                            driver_error(
-                                DriverErrorKind::Internal,
-                                "driver-core/op",
-                                "operation payload lost: completion sidecar missing",
-                            ),
-                        )));
-                    };
-                    if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                        return Poll::Ready(OpResult::ResourceLost(OpError::new(
-                            LostReason::PayloadKindMismatch,
-                            driver_error(
-                                DriverErrorKind::Internal,
-                                "driver-core/op",
-                                "operation payload lost: kind mismatch",
-                            ),
-                        )));
-                    }
-                    let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-                    let data = T::from_user_payload(payload);
-                    let res =
-                        detail.unwrap_or_else(|| event_res_to_result::<D::Completion>(event.res));
-                    let completion = data.map_completion_result(res);
-                    Poll::Ready(OpResult::Completed(completion, data))
+                    Poll::Ready(result)
                 }
-                PollRecordResult::Stale => {
-                    op.state = State::Completed;
-                    Poll::Ready(OpResult::ResourceLost(OpError::new(
-                        LostReason::GenerationMismatch,
-                        driver_error(
-                            DriverErrorKind::Internal,
-                            "driver-core/op",
-                            "operation lost: slot recycled (generation mismatch)",
-                        ),
-                    )))
-                }
-                PollRecordResult::Pending => {
+                Poll::Pending => {
                     driver.register_completion_waker(op.token, cx.waker());
-                    Poll::Pending
+                    match poll_completion_table_once::<T, D::Op, D::Completion>(
+                        &*driver.completion_table(),
+                        op.token,
+                    ) {
+                        Poll::Ready(result) => {
+                            op.state = State::Completed;
+                            Poll::Ready(result)
+                        }
+                        Poll::Pending => Poll::Pending,
+                    }
                 }
             }
         } else {
@@ -935,8 +941,10 @@ pub struct UdpRecvPacket {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
 
     #[derive(Clone, Copy)]
     struct DummyOp;
@@ -981,7 +989,7 @@ mod tests {
             let ptr = Box::into_raw(Box::new(()));
             crate::slot::ErasedPayload {
                 ptr,
-                kind: 1,
+                kind: Self::PAYLOAD_KIND as u16,
                 drop_fn: drop_payload,
             }
         }
@@ -1021,5 +1029,61 @@ mod tests {
         drop(op);
 
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    }
+
+    struct CountingWake {
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn detached_op_rechecks_after_register_and_observes_ready_completion() {
+        let completion_table: SharedCompletionTable =
+            Arc::new(crate::slot::SlotTable::<DummyPlatformOp, ()>::new(1));
+        let token = encode_completion_token(0, 1);
+        completion_table.mark_waiting(token);
+
+        let mut op = Box::pin(DetachedOp::<DummyOp, DummyPlatformOp, usize> {
+            completion_table: Some(completion_table.clone()),
+            cancel_signal: None,
+            cancel_waker: None,
+            token,
+            immediate_failure: None,
+            _phantom: std::marker::PhantomData,
+        });
+
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWake {
+            wakes: wake_count.clone(),
+        }));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(op.as_mut().poll(&mut cx), Poll::Pending));
+
+        completion_table.record_completion_with_data(
+            crate::driver::CompletionEvent {
+                user_data: token,
+                res: 7,
+                flags: 0,
+            },
+            Some(DummyOp::payload_into_erased(DummyPayload)),
+            None,
+        );
+
+        let result = op.as_mut().poll(&mut cx);
+        match result {
+            Poll::Ready(OpResult::Completed(Ok(value), _)) => assert_eq!(value, 7),
+            _ => panic!("detached op should observe ready completion after recheck"),
+        }
+        assert!(wake_count.load(Ordering::SeqCst) >= 1);
     }
 }

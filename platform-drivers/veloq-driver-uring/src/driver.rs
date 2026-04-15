@@ -2,6 +2,7 @@ use error_stack::Report;
 use io_uring::{IoUring, squeue};
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
@@ -106,29 +107,10 @@ fn map_uring_error(
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SocketLifecycleHandle;
-
 #[derive(Debug)]
 pub(crate) enum RegisteredFileEntry {
     BorrowedFd(i32),
     OwnedHandle(OwnedRawHandle),
-}
-
-impl SocketLifecycleHandle {
-    #[inline]
-    pub fn schedule_socket_cleanup(
-        &self,
-        _handle: RawHandle,
-        _registered_fd: Option<IoFd>,
-    ) -> DriverResult<()> {
-        Ok(())
-    }
-
-    #[inline]
-    pub const fn supports_registration(&self) -> bool {
-        true
-    }
 }
 
 pub struct UringDriver {
@@ -159,11 +141,6 @@ pub struct UringDriver {
 }
 
 impl UringDriver {
-    #[inline]
-    pub const fn socket_lifecycle_handle(&self) -> SocketLifecycleHandle {
-        SocketLifecycleHandle
-    }
-
     fn unregister_fixed_fd(&mut self, fd: IoFd) -> UringResult<()> {
         if !self.file_table_initialized {
             return Ok(());
@@ -1024,6 +1001,15 @@ impl Driver for UringDriver {
                 "unregister fixed fd",
             )?;
         }
+        Ok(())
+    }
+
+    fn warmup_udp_socket(
+        &mut self,
+        _fd: IoFd,
+        _buf_capacity: NonZeroUsize,
+        _credits: usize,
+    ) -> DriverResult<()> {
         Ok(())
     }
 

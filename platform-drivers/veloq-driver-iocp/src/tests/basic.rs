@@ -59,26 +59,3 @@ fn test_register_borrowed_file_keeps_weak_ownership() {
 fn test_rio_extensions_load() {
     let _ext = Extensions::new().expect("RIO Extensions should load");
 }
-
-#[test]
-fn test_socket_lifecycle_control_cleanup_unreg() {
-    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
-    let socket = crate::Socket::new_tcp_v4().unwrap();
-    let raw = socket.into_owned_raw();
-    let fd = driver
-        .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
-
-    let lifecycle = driver.socket_lifecycle_handle();
-    lifecycle
-        .schedule_socket_cleanup(crate::RawHandle::new(raw.raw()), Some(fd))
-        .unwrap();
-    let _ = driver.poll_completion().unwrap();
-
-    let idx = fd.fixed_index() as usize;
-    assert!(driver.registered_files[idx].is_none());
-    assert!(driver.free_slots.contains(&idx));
-}

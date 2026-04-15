@@ -62,12 +62,6 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn mark_socket_closing(&mut self, actor_key: SocketKey) {
-        let state = self.socket_runtime_mut(actor_key);
-        state.lifecycle = SocketLifecycleState::Closing;
-    }
-
-    #[inline]
     pub(crate) fn try_acquire_socket_inflight(&mut self, actor_key: SocketKey) -> bool {
         let state = self.socket_runtime_mut(actor_key);
         if state.lifecycle == SocketLifecycleState::Closing {

@@ -29,7 +29,6 @@ use veloq_driver_core::error::{DriverErrorKind, driver_error};
 use veloq_driver_core::slot::{DetachedCancelTable, InFlightWaiting, SlotRegistryExt, SlotView};
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
-pub(crate) const CONTROL_EVENT_KEY: usize = usize::MAX - 2;
 
 pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
@@ -164,10 +163,6 @@ impl IocpDriver {
                 success,
                 error_code,
             } => {
-                if key == CONTROL_EVENT_KEY {
-                    self.handle_control_completion(overlapped);
-                    return Ok(());
-                }
                 if key == RIO_EVENT_KEY {
                     self.rio_state
                         .process_completions(

@@ -24,6 +24,11 @@ pub enum RegisterFd<'a, H: RawHandleMeta> {
     Owned(OwnedRawHandle<H>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriverControlCommand {
+    UnregisterFiles(Vec<IoFd>),
+}
+
 pub trait CompletionValue: Send + 'static {
     fn from_event_res(res: i32) -> DriverResult<Self>
     where
@@ -635,6 +640,13 @@ pub trait Driver: 'static {
     ) -> DriverResult<Vec<IoFd>>;
 
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()>;
+
+    fn warmup_udp_socket(
+        &mut self,
+        fd: IoFd,
+        buf_capacity: std::num::NonZeroUsize,
+        credits: usize,
+    ) -> DriverResult<()>;
 
     fn submit_background(&mut self, op: Self::Op) -> DriverResult<()>;
 

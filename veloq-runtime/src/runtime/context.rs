@@ -9,14 +9,16 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::rc::Weak;
 
+use crossbeam_deque::Worker;
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver::driver::{Driver, PlatformDriver};
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
-use crate::runtime::executor::spawner::pack_job;
+use crate::runtime::executor::spawner::{local_schedule, pack_job};
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
+use crate::runtime::task::harness::{self, Runnable};
 use crate::runtime::task::{SpawnedTask, Task};
 
 thread_local! {
@@ -123,6 +125,7 @@ pub fn alloc(size: NonZeroUsize) -> FixedBuf {
 pub struct RuntimeContext {
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
     pub(crate) queue: Weak<RefCell<VecDeque<Task>>>,
+    pub(crate) local_runnable: Weak<Worker<Runnable>>,
     pub(crate) spawner: Option<Spawner>,
     pub(crate) handle: ExecutorHandle,
     pub(crate) buf_pool: AnyBufPool,
@@ -133,6 +136,7 @@ impl RuntimeContext {
     pub(crate) fn new(
         driver: Weak<RefCell<PlatformDriver>>,
         queue: Weak<RefCell<VecDeque<Task>>>,
+        local_runnable: Weak<Worker<Runnable>>,
         spawner: Option<Spawner>,
         handle: ExecutorHandle,
         buf_pool: AnyBufPool,
@@ -140,6 +144,7 @@ impl RuntimeContext {
         Self {
             driver,
             queue,
+            local_runnable,
             spawner,
             handle,
             buf_pool,
@@ -149,6 +154,18 @@ impl RuntimeContext {
     /// Get the current thread's buffer pool.
     pub fn buf_pool(&self) -> AnyBufPool {
         self.buf_pool.clone()
+    }
+
+    pub(crate) fn enqueue_local_runnable(&self, task: Runnable) {
+        let local_runnable = self
+            .local_runnable
+            .upgrade()
+            .expect("executor runnable queue has been dropped");
+        self.handle
+            .shared
+            .local_load
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        local_runnable.push(task);
     }
 
     /// Spawn a new local task on the current executor.
@@ -246,26 +263,9 @@ impl RuntimeContext {
         F: Future<Output = Output> + Send + 'static,
         Output: Send + 'static,
     {
-        let queue = self.queue.upgrade().expect("executor has been dropped");
-        let (handle, producer) = JoinHandle::new();
-
-        let task = unsafe {
-            SpawnedTask::new_local(async move {
-                let output = future.await;
-                producer.set(output);
-            })
-            .bind(
-                self.handle.id,
-                self.queue.clone(),
-                self.handle.shared.clone(),
-            )
-        };
-
-        self.handle
-            .shared
-            .local_load
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        queue.borrow_mut().push_back(task);
+        let scheduler = local_schedule(self.handle.id(), self.handle.shared.clone());
+        let (task, handle) = unsafe { harness::spawn_arc(future, scheduler) };
+        self.enqueue_local_runnable(task);
         handle
     }
 
@@ -282,23 +282,9 @@ impl RuntimeContext {
         F: Future<Output = Output> + Send + 'static,
         Output: Send + 'static,
     {
-        let queue = self.queue.upgrade().expect("executor has been dropped");
-        let (handle, producer) = JoinHandle::new();
-
-        let task = unsafe {
-            SpawnedTask::new_local(async move {
-                let output = future.await;
-                producer.set(output);
-            })
-            .bind(
-                self.handle.id,
-                self.queue.clone(),
-                self.handle.shared.clone(),
-            )
-        };
-
+        let scheduler = local_schedule(self.handle.id(), self.handle.shared.clone());
+        let (task, handle) = unsafe { harness::spawn_arc(future, scheduler) };
         task.run();
-        drop(queue);
         handle
     }
 }

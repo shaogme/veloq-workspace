@@ -6,7 +6,7 @@ pub mod slot {
     pub use veloq_driver_core::slot::*;
 }
 
-pub use veloq_driver_core::driver::{Driver, RegisterFd, RemoteWaker};
+pub use veloq_driver_core::driver::{Driver, DriverControlCommand, RegisterFd, RemoteWaker};
 
 #[cfg(target_os = "linux")]
 pub use veloq_driver_uring::UringDriver as PlatformDriver;
