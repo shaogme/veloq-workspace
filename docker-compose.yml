@@ -44,4 +44,4 @@ services:
     volumes:
       - ./docker:/work
     working_dir: /work
-    entrypoint: /bin/sh -c "nix-env -iA nixpkgs.npins && npins update && chmod -R 777 npins"
+    entrypoint: /bin/sh -c "nix-channel --update && nix-env -iA nixpkgs.npins && npins update && chmod -R 777 npins"
