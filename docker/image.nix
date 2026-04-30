@@ -1,6 +1,7 @@
 { sources ? import ./npins
 , system ? builtins.currentSystem
 , pkgs ? import sources.nixpkgs { inherit system; config.allowUnfree = true; }
+, imageName
 }:
 let
   deps = import ./deps.nix { inherit pkgs; };
@@ -67,7 +68,7 @@ let
 
 in
 pkgs.dockerTools.buildLayeredImage {
-  name = "veloq-dev";
+  name = imageName;
   tag = "latest";
   
   # Enable Nix database support
