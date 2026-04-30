@@ -19,12 +19,12 @@ use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared,
 use crate::runtime::task::harness::Runnable;
 use crate::runtime::task::{SpawnedTask, Task};
 // Re-export common types
-pub use context::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
+pub use context::{RuntimeContext, spawn, spawn_eager, spawn_local, spawn_to, yield_now};
 pub use executor::LocalExecutor;
 pub use join::{JoinHandle, LocalJoinHandle};
 
 use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier, nz};
-use veloq_driver::driver::RemoteWaker;
+use veloq_driver::driver::{DriverControlCommand, RemoteWaker};
 
 use veloq_blocking::init_blocking_pool;
 
@@ -36,6 +36,7 @@ struct WorkerPrep<T: PoolTopology> {
     shared: Arc<ExecutorShared>,
     remote_receiver: mpsc::Receiver<Task>,
     pinned_receiver: mpsc::Receiver<SpawnedTask>,
+    control_receiver: mpsc::Receiver<Vec<DriverControlCommand>>,
     // Worker local queue for stealable tasks
     stealable_worker: Worker<Runnable>,
     state: T::State,
@@ -80,13 +81,13 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
     pub fn build(self) -> std::io::Result<Runtime<T>> {
         let worker_count = self
             .config
-            .worker_threads
+            .worker_threads_opt()
             .map(|w| w.get())
             .unwrap_or(num_cpus::get());
         debug!("Building Runtime with {} workers", worker_count);
 
         // Initialize the blocking pool
-        init_blocking_pool(self.config.blocking_pool.clone());
+        init_blocking_pool(self.config.blocking_pool_config().clone());
 
         // Step 1: Initialize Pool Strategy State
         let state = self.topology.init(worker_count)?;
@@ -96,16 +97,18 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             shared: Arc<ExecutorShared>,
             remote_rx: mpsc::Receiver<Task>,
             pinned_rx: mpsc::Receiver<SpawnedTask>,
+            control_rx: mpsc::Receiver<Vec<DriverControlCommand>>,
             worker: Worker<Runnable>,
         }
 
-        let queue_capacity = self.config.internal_queue_capacity;
+        let queue_capacity = self.config.queue_capacity();
 
         // 1. Initialize Resources per Worker (Functional / Pipeline)
         let (handles, workers): (Vec<_>, Vec<_>) = (0..worker_count)
             .map(|i| {
                 let (remote_tx, remote_rx) = mpsc::channel();
                 let (pinned_tx, pinned_rx) = mpsc::channel();
+                let (control_tx, control_rx) = mpsc::channel();
 
                 let worker = Worker::new_fifo();
                 let stealer = worker.stealer();
@@ -113,6 +116,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
                 let shared = Arc::new(ExecutorShared {
                     pinned: pinned_tx,
                     remote_queue: remote_tx,
+                    control_queue: control_tx,
                     future_injector: ArrayQueue::new(queue_capacity),
                     stealer,
                     waker: LateBoundWaker::new(),
@@ -131,6 +135,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
                     shared,
                     remote_rx,
                     pinned_rx,
+                    control_rx,
                     worker,
                 };
 
@@ -155,13 +160,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             }),
         );
 
-        // Initialize peer file descriptors storage (initially 0)
-        let peer_handles = Arc::new(
-            (0..worker_count)
-                .map(|_| AtomicUsize::new(0))
-                .collect::<Vec<_>>(),
-        );
-
         // Barrier for synchronizing worker startup
         let barrier = Arc::new(Barrier::new(worker_count));
 
@@ -179,7 +177,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             let worker_id = i + 1; // Iterator started from index 1 (Worker 0 detached)
 
             let registry = registry.clone();
-            let peer_handles = peer_handles.clone();
             let barrier = barrier.clone();
             let config = self.config.clone();
             let topology = self.topology.clone();
@@ -194,6 +191,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
                     .with_shared(res.shared)
                     .with_remote_receiver(res.remote_rx)
                     .with_pinned_receiver(res.pinned_rx)
+                    .with_control_receiver(res.control_rx)
                     .with_worker(res.worker)
                     .build(|registrar| {
                         // Topology determines how to build the pool and register memory
@@ -202,10 +200,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 
                 let mut executor = executor.with_registry(registry);
                 executor.set_id(worker_id);
-
-                // Publish Handle
-                // Accessing handles inside Arc<Vec<...>>
-                peer_handles[worker_id].store(executor.raw_driver_handle(), Ordering::Release);
 
                 // Wait for all workers to be ready
                 barrier.wait();
@@ -222,6 +216,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             shared: worker_0_res.shared,
             remote_receiver: worker_0_res.remote_rx,
             pinned_receiver: worker_0_res.pinned_rx,
+            control_receiver: worker_0_res.control_rx,
             stealable_worker: worker_0_res.worker,
             state: state.clone(),
             topology: self.topology,
@@ -232,7 +227,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         Ok(Runtime {
             handles: thread_handles,
             registry,
-            peer_handles,
             worker_count,
             worker_0_prep: Some(worker_0_prep),
         })
@@ -242,7 +236,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 pub struct Runtime<T: PoolTopology = UniformSlot> {
     handles: Vec<thread::JoinHandle<()>>,
     registry: Arc<ExecutorRegistry>,
-    peer_handles: Arc<Vec<AtomicUsize>>,
     #[allow(dead_code)]
     worker_count: usize,
     worker_0_prep: Option<WorkerPrep<T>>,
@@ -315,6 +308,7 @@ impl<T: PoolTopology> Runtime<T> {
             .with_shared(prep.shared) // Inject shared state
             .with_remote_receiver(prep.remote_receiver) // Inject remote receiver
             .with_pinned_receiver(prep.pinned_receiver) // Inject pinned receiver
+            .with_control_receiver(prep.control_receiver) // Inject control receiver
             .with_worker(prep.stealable_worker) // Inject stealable worker
             .build(|registrar| {
                 // Bind Buffer Pool using stored prep data
@@ -323,10 +317,6 @@ impl<T: PoolTopology> Runtime<T> {
 
         let mut executor = executor.with_registry(self.registry.clone());
         executor.set_id(0); // Set Worker ID (Worker 0)
-
-        // Publish Handle
-        let fd = executor.raw_driver_handle();
-        self.peer_handles[0].store(fd, Ordering::Release);
 
         // Wait for all workers to be ready
         prep.barrier.wait();

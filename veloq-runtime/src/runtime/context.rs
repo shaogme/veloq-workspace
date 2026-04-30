@@ -9,14 +9,16 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::rc::Weak;
 
+use crossbeam_deque::Worker;
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver::driver::{Driver, PlatformDriver};
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 use crate::runtime::executor::ExecutorHandle;
 use crate::runtime::executor::Spawner;
-use crate::runtime::executor::spawner::pack_job;
+use crate::runtime::executor::spawner::{local_schedule, pack_job};
 use crate::runtime::join::{JoinHandle, LocalJoinHandle};
+use crate::runtime::task::harness::{self, Runnable};
 use crate::runtime::task::{SpawnedTask, Task};
 
 thread_local! {
@@ -71,7 +73,10 @@ pub fn try_current() -> Option<RuntimeContext> {
 pub fn submit<T, S>(submitter: &S, op: Op<T>) -> S::Future<T>
 where
     S: OpSubmitter,
-    T: IntoPlatformOp<<PlatformDriver as Driver>::Op> + 'static,
+    T: IntoPlatformOp<
+            <PlatformDriver as Driver>::Op,
+            DriverCompletion = <PlatformDriver as Driver>::Completion,
+        > + 'static,
 {
     let driver = CONTEXT
         .with(|ctx| {
@@ -120,6 +125,7 @@ pub fn alloc(size: NonZeroUsize) -> FixedBuf {
 pub struct RuntimeContext {
     pub(crate) driver: Weak<RefCell<PlatformDriver>>,
     pub(crate) queue: Weak<RefCell<VecDeque<Task>>>,
+    pub(crate) local_runnable: Weak<Worker<Runnable>>,
     pub(crate) spawner: Option<Spawner>,
     pub(crate) handle: ExecutorHandle,
     pub(crate) buf_pool: AnyBufPool,
@@ -130,6 +136,7 @@ impl RuntimeContext {
     pub(crate) fn new(
         driver: Weak<RefCell<PlatformDriver>>,
         queue: Weak<RefCell<VecDeque<Task>>>,
+        local_runnable: Weak<Worker<Runnable>>,
         spawner: Option<Spawner>,
         handle: ExecutorHandle,
         buf_pool: AnyBufPool,
@@ -137,6 +144,7 @@ impl RuntimeContext {
         Self {
             driver,
             queue,
+            local_runnable,
             spawner,
             handle,
             buf_pool,
@@ -146,6 +154,18 @@ impl RuntimeContext {
     /// Get the current thread's buffer pool.
     pub fn buf_pool(&self) -> AnyBufPool {
         self.buf_pool.clone()
+    }
+
+    pub(crate) fn enqueue_local_runnable(&self, task: Runnable) {
+        let local_runnable = self
+            .local_runnable
+            .upgrade()
+            .expect("executor runnable queue has been dropped");
+        self.handle
+            .shared
+            .local_load
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        local_runnable.push(task);
     }
 
     /// Spawn a new local task on the current executor.
@@ -173,6 +193,10 @@ impl RuntimeContext {
                 self.handle.shared.clone(),
             )
         };
+        self.handle
+            .shared
+            .local_load
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         queue.borrow_mut().push_back(task);
         handle
     }
@@ -214,6 +238,10 @@ impl RuntimeContext {
                     self.handle.shared.clone(),
                 )
             };
+            self.handle
+                .shared
+                .local_load
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             queue.borrow_mut().push_back(job);
             return handle;
         }
@@ -223,10 +251,10 @@ impl RuntimeContext {
         handle
     }
 
-    /// Spawn a new stealable task (Send Future) on the runtime.
+    /// Spawn a new stealable task (Send Future) on the current worker.
     ///
-    /// The task is initially assigned to a worker (via P2C), but can be stolen by other workers
-    /// if the target worker is busy. The task is wrapped in an `ArcTask` (Runnabe).
+    /// The task is queued on the local executor and will be polled by the runtime loop.
+    /// If you need the legacy "poll once immediately" behavior, use [`RuntimeContext::spawn_eager`].
     ///
     /// # Panics
     /// Panics if called outside of a runtime context.
@@ -235,27 +263,28 @@ impl RuntimeContext {
         F: Future<Output = Output> + Send + 'static,
         Output: Send + 'static,
     {
-        let queue = self.queue.upgrade().expect("executor has been dropped");
-        let (handle, producer) = JoinHandle::new();
+        let scheduler = local_schedule(self.handle.id(), self.handle.shared.clone());
+        let (task, handle) = unsafe { harness::spawn_arc(future, scheduler) };
+        self.enqueue_local_runnable(task);
+        handle
+    }
 
-        // Prioritize freshly spawned tasks on current worker so they can submit I/O
-        // before the caller continues deeper in the same logical flow.
-        let task = unsafe {
-            SpawnedTask::new_local(async move {
-                let output = future.await;
-                producer.set(output);
-            })
-            .bind(
-                self.handle.id,
-                self.queue.clone(),
-                self.handle.shared.clone(),
-            )
-        };
-
-        // Poll once immediately to raise spawn priority and reduce submit ordering races.
+    /// Spawn a new stealable task (Send Future) and poll it once immediately.
+    ///
+    /// This preserves the previous eager behavior of [`RuntimeContext::spawn`].
+    /// Use this when the task should have a chance to make progress before the
+    /// caller continues, for example to submit I/O sooner.
+    ///
+    /// # Panics
+    /// Panics if called outside of a runtime context.
+    pub fn spawn_eager<F, Output>(&self, future: F) -> JoinHandle<Output>
+    where
+        F: Future<Output = Output> + Send + 'static,
+        Output: Send + 'static,
+    {
+        let scheduler = local_schedule(self.handle.id(), self.handle.shared.clone());
+        let (task, handle) = unsafe { harness::spawn_arc(future, scheduler) };
         task.run();
-        // Ensure queue reference is retained for the task context; task.run may wake and push back.
-        drop(queue);
         handle
     }
 }
@@ -297,10 +326,8 @@ pub fn current_pool() -> Option<AnyBufPool> {
 
 /// Spawns a new asynchronous task, returning a [`JoinHandle`] for it.
 ///
-/// Spawning a task enables the task to execute concurrently to other tasks. There is no
-/// guarantee that the spawned task will execute to completion. When a task is spawned,
-/// it triggers the provided future. The returned `JoinHandle` receives the result of
-/// the future when the task completes.
+/// Spawning a task enables it to execute concurrently with other tasks. This variant
+/// only enqueues the task and does not poll it immediately.
 ///
 /// This function requires the future to be `Send` as it may be executed on a different thread.
 ///
@@ -314,6 +341,23 @@ where
     Output: Send + 'static,
 {
     current().spawn(future)
+}
+
+/// Spawns a new asynchronous task and polls it once immediately.
+///
+/// This keeps the previous eager spawning behavior, which can be useful when the
+/// spawned task should submit work before the caller continues.
+///
+/// # Panics
+///
+/// Panics if called outside of a runtime context, or if the current runtime does not support
+/// global spawning (missing executor registry).
+pub fn spawn_eager<F, Output>(future: F) -> JoinHandle<Output>
+where
+    F: Future<Output = Output> + Send + 'static,
+    Output: Send + 'static,
+{
+    current().spawn_eager(future)
 }
 
 /// Spawns a `!Send` future on the current thread.

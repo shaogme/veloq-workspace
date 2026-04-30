@@ -6,8 +6,8 @@
 //! ## Core Components
 //!
 //! - [`FixedBuf`]: An owned handle to a buffer allocated from a pool. It ensures the underlying
-//!   memory remains valid as long as the handle exists. It uses type erasure (VTables) to
-//!   delegate deallocation back to the source pool.
+//!   memory remains valid as long as the handle exists. It stores compact pool metadata
+//!   (`PoolKind + context`) for deallocation and region resolution.
 //! - [`BufPool`]: The base trait for memory pool implementations.
 //!
 //! ## Implementation Requirements
@@ -38,7 +38,7 @@
 //! within the handle itself to avoid alignment complexities.
 //!
 //! **Implementors MUST ensure:**
-//! - The `dealloc` function in the VTable can correctly free the memory using only:
+//! - The pool-specific deallocation path can correctly free memory using:
 //!   - The payload pointer (`ptr`)
 //!   - The capacity (`cap`)
 //!   - An opaque `context` value (u64) provided during allocation
@@ -53,7 +53,37 @@ use std::{
     sync::Arc,
 };
 
-const NO_REGISTRATION_INDEX: u16 = u16::MAX;
+use bilge::prelude::*;
+
+#[bitsize(1)]
+#[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolKind {
+    SlotBased,
+    Heap,
+}
+
+#[bitsize(64)]
+#[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
+pub struct PackedContext {
+    pub slot_idx: u32,
+    pub order: u8,
+    pub chunk_id: u16,
+    pub reserved: u7,
+    pub pool_kind: PoolKind,
+}
+
+#[repr(C, align(4096))]
+struct HeapControlBlock {
+    ref_count: std::sync::atomic::AtomicU32,
+    total_size: NonZeroUsize,
+}
+
+impl PackedContext {
+    #[inline(always)]
+    pub fn raw_payload(&self) -> u64 {
+        u64::from(*self) & 0x00FFFFFFFFFFFFFF
+    }
+}
 
 /// A wrapper for `u16` that guarantees it never equals `S`.
 /// This enables `Option<NotU16<S>>` to have the same size as `u16`.
@@ -95,27 +125,13 @@ impl<const S: u16> std::fmt::Debug for NotU16<S> {
     }
 }
 
-pub type GlobalIndex = NotU16<NO_REGISTRATION_INDEX>;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionInfo {
+    pub pool_kind: PoolKind,
     pub id: u16,
     pub offset: usize,
     /// A unique cookie used to distinguish different allocations for the same pointer (e.g. heap reuse).
     pub cookie: u64,
-}
-
-#[derive(Debug)]
-pub struct PoolVTable {
-    pub dealloc: unsafe fn(pool_data: NonNull<()>, params: DeallocParams),
-    pub resolve_region_info: unsafe fn(pool_data: NonNull<()>, buf: &FixedBuf) -> RegionInfo,
-}
-
-#[derive(Debug)]
-pub struct DeallocParams {
-    pub ptr: NonNull<u8>,  // Points to the Payload (data), not the header
-    pub cap: NonZeroUsize, // Capacity of the Payload
-    pub context: u64,      // Context restored from header
 }
 
 #[derive(Debug)]
@@ -136,7 +152,7 @@ impl AllocResult {
                     ptr,
                     cap,
                     pool.pool_data(),
-                    pool.vtable(),
+                    pool.pool_kind(),
                     context,
                 ))
             },
@@ -213,8 +229,8 @@ pub trait BackingPool: std::fmt::Debug + 'static {
     /// The `global_index` in the result should be ignored or None.
     fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult;
 
-    /// Get the VTable for this pool (used by FixedBuf for deallocation).
-    fn vtable(&self) -> &'static PoolVTable;
+    /// Get pool kind for compact deallocation/dispatch.
+    fn pool_kind(&self) -> PoolKind;
 
     /// Get the raw pool data pointer.
     fn pool_data(&self) -> NonNull<()>;
@@ -311,7 +327,7 @@ impl PoolTopology for UniformSlot {
     fn build(
         &self,
         pool: &Self::State,
-        _worker_idx: usize,
+        worker_idx: usize,
         registrar: Box<dyn BufferRegistrar>,
     ) -> AnyBufPool {
         // 在 Slot 架构中，所有线程共享一个大的连续区域
@@ -324,15 +340,7 @@ impl PoolTopology for UniformSlot {
             .register(&[region])
             .expect("Failed to register global buffer region (check 'ulimit -l' / RLIMIT_MEMLOCK)");
 
-        // Build mapping: ChunkID (Index) -> RegionIndex (Value)
-        // Since we only registered Chunk 0, the first ID corresponds to Chunk 0.
-        // Even if registration happens here, SlotBasedPool no longer tracks it.
-        // It's up to the Driver to verify registration.
-
-        // We still call register for now to keep existing behavior until Driver is updated,
-        // but we ignore the returned IDs in SlotBasedPool.
-
-        let slot_pool = SlotBasedPool::with_seed(pool.clone(), _worker_idx);
+        let slot_pool = SlotBasedPool::with_seed(pool.clone(), worker_idx);
         AnyBufPool::new(slot_pool)
     }
 
@@ -346,37 +354,83 @@ impl PoolTopology for UniformSlot {
 }
 
 #[derive(Debug)]
+#[repr(C, align(32))]
 pub struct FixedBuf {
     ptr: NonNull<u8>,
-    len: usize,
-    cap: NonZeroUsize,
     // Metadata moved from Heap Header to Handle
     pool_data: NonNull<()>,
-    vtable: &'static PoolVTable,
-    context: u64,
+    context: PackedContext, // [pool_kind:1 | reserved:7 | context_payload:56]
+    len: u32,
+    /// The actual capacity of this specific handle/view.
+    cap: u32,
 }
+
+impl Clone for FixedBuf {
+    fn clone(&self) -> Self {
+        match self.pool_kind() {
+            PoolKind::SlotBased => unsafe {
+                slot_based_increment(self.pool_data, self.context.raw_payload());
+            },
+            PoolKind::Heap => unsafe {
+                heap_increment(self.pool_data);
+            },
+        }
+        Self {
+            ptr: self.ptr,
+            pool_data: self.pool_data,
+            context: self.context,
+            len: self.len,
+            cap: self.cap,
+        }
+    }
+}
+
+const _: [(); 32] = [(); std::mem::size_of::<FixedBuf>()];
+const _: [(); 32] = [(); std::mem::align_of::<FixedBuf>()];
 
 // Safety: FixedBuf 拥有其底层内存的所有权。
 unsafe impl Send for FixedBuf {}
 
 impl FixedBuf {
+    #[inline(always)]
+    fn pool_kind(&self) -> PoolKind {
+        self.context.pool_kind()
+    }
+
+    #[inline(always)]
+    fn context_raw(&self) -> u64 {
+        self.context.raw_payload()
+    }
+
+    #[inline(always)]
+    fn capacity_usize(&self) -> usize {
+        self.cap as usize
+    }
+
     /// # Safety
-    /// `ptr` must be valid and allocated by the pool associated with `vtable`.
+    /// `ptr` must be valid and allocated by the pool associated with `pool_kind`.
     #[inline(always)]
     pub unsafe fn new(
         ptr: NonNull<u8>,
         cap: NonZeroUsize,
         pool_data: NonNull<()>,
-        vtable: &'static PoolVTable,
+        pool_kind: PoolKind,
         context: u64,
     ) -> Self {
+        assert!(
+            cap.get() <= u32::MAX as usize,
+            "FixedBuf only supports capacity <= u32::MAX"
+        );
+
+        let mut context = PackedContext::from(context);
+        context.set_pool_kind(pool_kind);
+
         Self {
             ptr,
-            len: cap.get(),
-            cap,
             pool_data,
-            vtable,
             context,
+            len: cap.get() as u32,
+            cap: cap.get() as u32,
         }
     }
 
@@ -386,23 +440,26 @@ impl FixedBuf {
     /// The interpretation of the region index is pool-dependent.
     #[inline(always)]
     pub fn resolve_region_info(&self) -> RegionInfo {
-        unsafe { (self.vtable.resolve_region_info)(self.pool_data, self) }
+        match self.pool_kind() {
+            PoolKind::SlotBased => unsafe { slot_based_resolve_region_info(self.pool_data, self) },
+            PoolKind::Heap => heap_resolve_region_info(self),
+        }
     }
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
     }
 
     #[inline(always)]
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }
     }
 
     /// Access the full capacity as a mutable slice for writing data before set_len is called.
     #[inline(always)]
     pub fn spare_capacity_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap.get()) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity_usize()) }
     }
 
     #[inline(always)]
@@ -418,23 +475,27 @@ impl FixedBuf {
 
     #[inline(always)]
     pub fn capacity(&self) -> usize {
-        self.cap.get()
+        self.capacity_usize()
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        false
+        self.len == 0
     }
 
     #[inline(always)]
     pub fn set_len(&mut self, len: usize) {
-        assert!(len <= self.cap.get());
-        self.len = len;
+        assert!(
+            len <= self.capacity_usize(),
+            "len must be <= buffer capacity"
+        );
+        assert!(len <= u32::MAX as usize, "len exceeds u32::MAX");
+        self.len = len as u32;
     }
 
     /// Allocate a buffer from the system heap (not from a pool).
@@ -443,30 +504,53 @@ impl FixedBuf {
     /// Note: Heap-allocated buffers may not be registered with the I/O driver
     /// and thus may incur overhead for direct I/O operations.
     pub fn alloc_heap(len: NonZeroUsize) -> Result<Self, AllocError> {
-        // Use 4KB alignment for general compatibility
-        let layout =
-            std::alloc::Layout::from_size_align(len.get(), 4096).map_err(AllocError::Layout)?;
+        // Allocate space for the metadata block plus the payload.
+        // We use os::alloc_pages to ensure page alignment for both.
+        let total_size = len.get().checked_add(4096).ok_or(AllocError::Oom)?;
+        let total_size_nz = unsafe { NonZeroUsize::new_unchecked(total_size) };
 
-        let ptr = unsafe { std::alloc::alloc(layout) };
-        if ptr.is_null() {
-            return Err(AllocError::Oom);
-        }
+        let base_ptr =
+            unsafe { crate::os::alloc_pages(total_size_nz) }.map_err(|_| AllocError::Oom)?;
 
-        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        // Initialize the control block in the first page
+        let control = unsafe { &mut *(base_ptr as *mut HeapControlBlock) };
+        control.ref_count = std::sync::atomic::AtomicU32::new(1);
+        control.total_size = total_size_nz;
+
+        let ptr = unsafe { NonNull::new_unchecked(base_ptr.add(4096)) };
 
         static HEAP_BUF_COOKIE_GEN: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
-        let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            & 0x00FFFFFFFFFFFFFF;
 
         Ok(unsafe {
             Self::new(
                 ptr,
                 len,
-                NonNull::dangling(), // No pool context for heap buffers
-                &HEAP_POOL_VTABLE,
+                NonNull::new_unchecked(base_ptr as *mut ()),
+                PoolKind::Heap,
                 cookie,
             )
         })
+    }
+
+    /// Create a new sub-view of the buffer that shares the same underlying memory.
+    ///
+    /// The new buffer will have its own length and offset, but it will keep the
+    /// original allocation alive until all views are dropped.
+    #[inline(always)]
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
+        let mut new_buf = self.clone();
+        let start = range.start;
+        let end = range.end;
+        assert!(start <= end, "slice start must be <= end");
+        assert!(end <= self.len as usize, "slice end must be <= buffer len");
+
+        new_buf.ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(start)) };
+        new_buf.len = (end - start) as u32;
+        new_buf.cap = (end - start) as u32; // Slice has its own independent capacity
+        new_buf
     }
 }
 
@@ -474,14 +558,14 @@ impl Drop for FixedBuf {
     #[inline(always)]
     fn drop(&mut self) {
         unsafe {
-            let params = DeallocParams {
-                ptr: self.ptr,
-                cap: self.cap,
-                context: self.context,
-            };
-
-            // Call dealloc via vtable stored in handle
-            (self.vtable.dealloc)(self.pool_data, params);
+            match self.pool_kind() {
+                PoolKind::SlotBased => {
+                    slot_based_dealloc(self.pool_data, self.context_raw());
+                }
+                PoolKind::Heap => {
+                    heap_dealloc(self.pool_data);
+                }
+            }
         }
     }
 }
@@ -739,8 +823,7 @@ impl Drop for ThreadLocalPoolCache {
 thread_local! {
     /// 缓存当前线程使用的全局池引用计数。
     ///
-    /// 在 Windows GNU 平台上，Clippy 会对常量初始化产生误报，
-    /// 这里通过重构为直接存储并使用 const 块来优化。
+    /// 注：在 Windows GNU 平台上，Clippy 会对常量初始化产生误报
     #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), allow(clippy::missing_const_for_thread_local))]
     static POOL_CACHE: ThreadLocalPoolCache = const { ThreadLocalPoolCache::new() };
 }
@@ -756,24 +839,13 @@ impl BackingPool for SlotBasedPool {
 
         if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order, self.seed) {
             let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
-
-            // Pack Metadata into Context (64-bit)
-            // Layout: [ChunkID 16b] [Reserved 16b] [Order 8b] [SlotIndex 24b]
-            // Constraint: SlotIndex must fit in 24 bits (16 Million slots = 64GB @ 4KB).
-
-            let chunk_id_val = chunk_id as u64;
-            // Reserved: 0
-            let s_idx = slot_idx.0 as u64;
-
-            assert!(
-                s_idx < (1 << 24),
-                "SlotIndex exceeded 24 bits (Chunk size > 64GB not supported by 24-bit addressing in FixedBuf handle)"
+            let context_data = PackedContext::new(
+                slot_idx.0 as u32,
+                order as u8,
+                chunk_id,
+                PoolKind::SlotBased,
             );
-
-            let context = (chunk_id_val << 48)
-                // | (0 << 32) // Reserved
-                | ((order as u64 & 0xFF) << 24)
-                | (s_idx & 0xFFFFFF);
+            let context = u64::from(context_data);
 
             let cap = unsafe { NonZeroUsize::new_unchecked(capacity) };
 
@@ -783,8 +855,8 @@ impl BackingPool for SlotBasedPool {
         }
     }
 
-    fn vtable(&self) -> &'static PoolVTable {
-        &SLOT_BASED_POOL_VTABLE
+    fn pool_kind(&self) -> PoolKind {
+        PoolKind::SlotBased
     }
 
     fn pool_data(&self) -> NonNull<()> {
@@ -838,48 +910,97 @@ impl BackingPool for SlotBasedPool {
 
 impl BufPool for SlotBasedPool {
     fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf> {
-        self.alloc_mem(len).into_buf(self)
+        if let Some(buf) = self.alloc_mem(len).into_buf(self) {
+            return Some(buf);
+        }
+
+        // Fallback path:
+        // `GlobalSlotPool` already attempts automatic chunk expansion internally.
+        // We only fallback to heap after slot allocation (including expansion) is exhausted.
+        FixedBuf::alloc_heap(len).ok()
     }
 }
 
-// VTable for SlotBasedPool
-static SLOT_BASED_POOL_VTABLE: PoolVTable = PoolVTable {
-    dealloc: slot_based_dealloc_shim,
-    resolve_region_info: slot_based_resolve_region_info_shim,
-};
-
-// VTable for Heap-allocated buffers
-static HEAP_POOL_VTABLE: PoolVTable = PoolVTable {
-    dealloc: heap_dealloc_shim,
-    resolve_region_info: heap_resolve_region_info_shim,
-};
-
-unsafe fn heap_dealloc_shim(_pool_data: NonNull<()>, params: DeallocParams) {
-    let layout = std::alloc::Layout::from_size_align(params.cap.get(), 4096).unwrap();
+#[inline(always)]
+unsafe fn heap_increment(pool_data: NonNull<()>) {
+    let control_ptr = pool_data.as_ptr() as *const HeapControlBlock;
     unsafe {
-        std::alloc::dealloc(params.ptr.as_ptr(), layout);
+        (*control_ptr)
+            .ref_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-unsafe fn heap_resolve_region_info_shim(_pool_data: NonNull<()>, buf: &FixedBuf) -> RegionInfo {
-    // Return NO_REGISTRATION_INDEX to indicate this buffer is not registered.
-    // Usebuf.context as the cookie for heap buffers.
+#[inline(always)]
+unsafe fn heap_dealloc(pool_data: NonNull<()>) {
+    let base_ptr = pool_data.as_ptr() as *mut u8;
+    let control_ptr = base_ptr as *const HeapControlBlock;
+
+    if unsafe {
+        (*control_ptr)
+            .ref_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Release)
+    } == 1
+    {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let total_size = unsafe { (*control_ptr).total_size };
+        unsafe {
+            crate::os::free_pages(NonNull::new_unchecked(base_ptr), total_size);
+        }
+    }
+}
+
+#[inline(always)]
+fn heap_resolve_region_info(buf: &FixedBuf) -> RegionInfo {
+    // Heap-allocated payload starts after the 4KB control block.
+    let base = buf.pool_data.as_ptr() as usize + 4096;
+    let ptr = buf.as_ptr() as usize;
+
     RegionInfo {
-        id: NO_REGISTRATION_INDEX,
-        offset: 0,
-        cookie: buf.context,
+        pool_kind: PoolKind::Heap,
+        id: 0,
+        offset: ptr.saturating_sub(base),
+        cookie: buf.context_raw(),
     }
 }
 
-unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams) {
+unsafe fn slot_based_increment(pool_data: NonNull<()>, context: u64) {
     let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
 
-    // Unpack context (u64)
-    // Layout: [ChunkID 16b] [RegionIndex 16b] [Order 8b] [SlotIndex 24b]
-    let chunk_id = ((params.context >> 48) & 0xFFFF) as u16;
-    let order = ((params.context >> 24) & 0xFF) as usize;
-    let slot_idx_val = (params.context & 0xFFFFFF) as usize;
-    let slot_idx = crate::heap::slot::SlotIndex(slot_idx_val);
+    let ctx = PackedContext::from(context);
+    let chunk_id = ctx.chunk_id();
+    let slot_idx = crate::heap::slot::SlotIndex(ctx.slot_idx() as usize);
+
+    // 1. Increment slot ref count
+    let pool = unsafe { &*raw_ptr };
+    pool.increment_ref_count(chunk_id, slot_idx, std::sync::atomic::Ordering::Relaxed);
+
+    // 2. Increment Arc ref count (using cache if possible)
+    let used_cache = with_pool_cache(|cache| {
+        let mut inner = cache.0.get();
+        if inner.ptr == raw_ptr && inner.balance > 0 {
+            inner.balance -= 1;
+            cache.0.set(inner);
+            true
+        } else {
+            false
+        }
+    });
+
+    if !used_cache {
+        unsafe {
+            Arc::increment_strong_count(raw_ptr);
+        }
+    }
+}
+
+unsafe fn slot_based_dealloc(pool_data: NonNull<()>, context: u64) {
+    let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
+
+    let ctx = PackedContext::from(context);
+    let chunk_id = ctx.chunk_id();
+    let order = ctx.order() as usize;
+    let slot_idx = crate::heap::slot::SlotIndex(ctx.slot_idx() as usize);
 
     // Try recycle
     let recycled = with_pool_cache(|cache| {
@@ -909,16 +1030,13 @@ unsafe fn slot_based_dealloc_shim(pool_data: NonNull<()>, params: DeallocParams)
     }
 }
 
-unsafe fn slot_based_resolve_region_info_shim(
-    pool_data: NonNull<()>,
-    buf: &FixedBuf,
-) -> RegionInfo {
+unsafe fn slot_based_resolve_region_info(pool_data: NonNull<()>, buf: &FixedBuf) -> RegionInfo {
     // 1. Cast back to GlobalSlotPool
     let pool = unsafe { &*(pool_data.as_ptr() as *const crate::heap::GlobalSlotPool) };
 
     // 2. Unpack ChunkID
-    // Layout: [ChunkID 16b] [Reserved 16b] [Order 8b] [SlotIndex 24b]
-    let chunk_id = ((buf.context >> 48) & 0xFFFF) as u16;
+    let ctx = PackedContext::from(buf.context_raw());
+    let chunk_id = ctx.chunk_id();
 
     // 3. Get base address from ChunkInfo
     let chunk_info = pool
@@ -929,6 +1047,7 @@ unsafe fn slot_based_resolve_region_info_shim(
 
     // Return RegionInfo { id, offset, cookie }
     RegionInfo {
+        pool_kind: PoolKind::SlotBased,
         id: chunk_id,
         offset: ptr.saturating_sub(base),
         cookie: 0, // Cookies are currently only used for heap buffers

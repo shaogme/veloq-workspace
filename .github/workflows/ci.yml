@@ -39,7 +39,7 @@ jobs:
           - os: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,7 +50,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@main
         with:
           path: |
             ~/.cargo/registry
@@ -78,13 +78,13 @@ jobs:
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@main
         with:
           path: |
             ~/.cargo/registry
@@ -97,12 +97,14 @@ jobs:
         run: cargo test --release -p veloq-sync --tests --features loom
       - name: Run Veloq Atomic Waker Loom tests
         run: cargo test --release -p veloq-atomic-waker --tests --features loom
+      - name: Run Veloq Driver Core Loom tests
+        run: cargo test --release -p veloq-driver-core --tests --features loom
 
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -121,7 +123,7 @@ jobs:
           - os: ubuntu-latest
           - os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -129,13 +131,13 @@ jobs:
           components: clippy
       - name: Run Clippy (Linux)
         if: runner.os == 'Linux'
-        run: cargo xclippy
+        run: cargo xclippy-linux
 
       - name: Run Clippy (Windows)
         if: runner.os == 'Windows'
         run: |
           rustup target add x86_64-pc-windows-gnu
-          cargo xclippy-win
+          cargo xclippy-windows
 
   ci-success:
     name: CI Success

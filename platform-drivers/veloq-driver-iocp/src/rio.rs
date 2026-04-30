@@ -8,66 +8,80 @@
 //! - `runtime`: steady-state operation split into datapath and control-flow.
 //! - `lifecycle`: shutdown sequencing and deferred cleanup semantics.
 
-mod core {
-    /// Core context encoding, registry ownership, and kernel dispatch wrappers.
-    pub(crate) mod op_ctx;
-    /// Core registration table for chunks, slab pages, and heap buffers.
-    pub(crate) mod registry;
-    /// Core RIO kernel/CQ/RQ creation and submission helpers.
-    pub(crate) mod submit_ops;
-}
-
-mod runtime {
-    /// Runtime datapath: hot path buffer/pool state and UDP submissions.
-    pub(crate) mod data_plane {
-        pub(crate) mod pool;
-        pub(crate) mod submit_udp;
-    }
-
-    /// Runtime control-flow: actor coordination and completion routing.
-    pub(crate) mod control_flow {
-        pub(crate) mod actor;
-        pub(crate) mod completion;
-    }
-}
-
-mod lifecycle {
-    /// Drop-time shutdown, background reaper handoff, and strict drain logic.
-    pub(crate) mod shutdown;
-}
+pub(crate) mod core;
+pub(crate) mod error;
+pub(crate) mod lifecycle;
+pub(crate) mod runtime;
 
 use crate::BufferRegistrationMode;
 use crate::IocpOpState;
-use crate::op::IocpOp;
+use crate::config::SocketKey;
+use crate::ops::IocpOp;
 use rustc_hash::FxHashMap;
+use slotmap::{SlotMap, new_key_type};
 use veloq_driver_core::driver::{SharedCompletionQueue, SharedCompletionTable};
 use veloq_driver_core::op_registry::OpRegistry;
-use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Networking::WinSock::{RIO_CQ, RIO_RQ};
 
 use self::core::registry::RioRegistry;
-use self::core::submit_ops::{RioDispatch, RioKernel};
-use self::runtime::control_flow::actor::RioSocketActor;
+use self::core::submit_ops::{RioCq, RioDispatch, RioKernel, RioRq};
+use self::runtime::control_flow::RioSocketActor;
 
-pub(crate) use self::runtime::data_plane::submit_udp::{RioSendToArgs, RioUdpStreamArgs};
+pub(crate) use self::runtime::RioSendToArgs;
+pub(crate) use self::runtime::RioTarget;
+pub(crate) use self::runtime::RioUdpRecvArgs;
+pub(crate) use self::runtime::RioUdpStreamArgs;
+
+new_key_type! {
+    pub(crate) struct ActorKey;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SocketRuntimeMode {
+    RioPreferred,
+    IocpFallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SocketLifecycleState {
+    Open,
+    Closing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SocketRuntimeState {
+    pub(crate) mode: SocketRuntimeMode,
+    pub(crate) lifecycle: SocketLifecycleState,
+    pub(crate) inflight: u32,
+    pub(crate) iocp_associated: bool,
+}
+
+impl Default for SocketRuntimeState {
+    fn default() -> Self {
+        Self {
+            mode: SocketRuntimeMode::RioPreferred,
+            lifecycle: SocketLifecycleState::Open,
+            inflight: 0,
+            iocp_associated: false,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioEnv<'a> {
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
     pub(crate) dispatch: &'a RioDispatch,
-    pub(crate) cq: RIO_CQ,
+    pub(crate) cq: RioCq,
     pub(crate) registration_mode: BufferRegistrationMode,
 }
 
 pub(crate) struct RioContext<'a> {
-    pub(crate) registry: &'a mut RioRegistry,
     pub(crate) env: RioEnv<'a>,
-    pub(crate) actor_id: u32,
-    pub(crate) rq: RIO_RQ,
+    pub(crate) actor_key: ActorKey,
+    pub(crate) rq: RioRq,
 }
 
 pub(crate) struct RioCompletionContext<'a> {
-    pub(crate) ops: &'a mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
+    pub(crate) ops: &'a mut OpRegistry<IocpOp, IocpOpState, crate::ops::OverlappedEntry>,
     pub(crate) events: &'a SharedCompletionQueue,
     pub(crate) table: &'a SharedCompletionTable,
 }
@@ -76,8 +90,8 @@ pub(crate) struct RioState {
     pub(crate) kernel: RioKernel,
     pub(crate) registry: RioRegistry,
     pub(crate) registration_mode: BufferRegistrationMode,
-    actors: FxHashMap<HANDLE, RioSocketActor>,
-    actor_routes: FxHashMap<u32, HANDLE>,
-    next_actor_id: u32,
+    pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
+    pub(crate) actor_by_handle: FxHashMap<SocketKey, ActorKey>,
+    pub(crate) socket_runtime: FxHashMap<SocketKey, SocketRuntimeState>,
     pub(crate) outstanding_count: usize,
 }

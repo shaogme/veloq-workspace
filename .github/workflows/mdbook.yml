@@ -21,7 +21,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
 
       - name: Install Rust
         uses: shaogme/speedy-rust@main
@@ -34,7 +34,7 @@ jobs:
       # 缓存 cargo 安装的二进制文件 (mdbook & mdbook-mermaid)
       - name: Cache Cargo Binaries
         id: cache-cargo-bin
-        uses: actions/cache@v4
+        uses: actions/cache@main
         with:
           path: ~/.cargo/bin
           key: ${{ runner.os }}-cargo-bin-mdbook-v1

@@ -25,7 +25,7 @@ fn test_tcp_connect_with_global_api() {
             let listener_clone = listener_arc.clone();
 
             // Server task using cx.spawn
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, peer_addr) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -59,7 +59,7 @@ fn test_tcp_send_recv() {
             let listener_clone = listener_arc.clone();
 
             // Server task: Robust Echo Loop
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -67,18 +67,14 @@ fn test_tcp_send_recv() {
 
                 loop {
                     let buf = crate::runtime::context::alloc(size);
-                    let (result, mut buf) = stream.recv(buf).await;
-                    let bytes_read = match result {
-                        Ok(n) if n > 0 => n,
-                        _ => break, // EOF or Error
-                    };
+                    let (bytes_read, mut buf) = stream.recv(buf).await.expect("Server recv failed");
+                    if bytes_read == 0 {
+                        break;
+                    }
 
                     // Echo exact bytes received
                     buf.set_len(bytes_read);
-                    if let Err(e) = stream.send(buf).await.0 {
-                        println!("Server echo failed: {}", e);
-                        break;
-                    }
+                    stream.send(buf).await.expect("Server echo failed");
                 }
             });
 
@@ -96,9 +92,10 @@ fn test_tcp_send_recv() {
 
             // Send data
             let bytes_to_send = send_buf.len();
-            let (result, _) =
-                crate::tests::timeout_op("client", "send", 5, stream.send(send_buf)).await;
-            let bytes_sent = result.expect("Client send failed");
+            let (bytes_sent, _) =
+                crate::tests::timeout_op("client", "send", 5, stream.send(send_buf))
+                    .await
+                    .expect("Client send failed");
             assert_eq!(bytes_sent, bytes_to_send);
             println!("Client sent {} bytes", bytes_sent);
 
@@ -107,9 +104,10 @@ fn test_tcp_send_recv() {
 
             while total_received < bytes_sent {
                 let recv_buf = crate::runtime::context::alloc(size);
-                let (result, recv_buf) =
-                    crate::tests::timeout_op("client", "recv", 5, stream.recv(recv_buf)).await;
-                let n = result.expect("Client recv failed");
+                let (n, recv_buf) =
+                    crate::tests::timeout_op("client", "recv", 5, stream.recv(recv_buf))
+                        .await
+                        .expect("Client recv failed");
                 if n == 0 {
                     break;
                 } // Unexpected EOF?
@@ -149,7 +147,7 @@ fn test_tcp_multiple_connections() {
             let listener_clone = listener_arc.clone();
 
             // Server task: accept all connections
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 for i in 0..NUM_CONNECTIONS {
                     let (stream, peer) =
                         crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
@@ -196,7 +194,7 @@ fn test_tcp_large_data_transfer() {
             let listener_clone = listener_arc.clone();
 
             // Server task
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -206,9 +204,10 @@ fn test_tcp_large_data_transfer() {
                 while total_received < DATA_SIZE {
                     let buf = crate::runtime::context::alloc(size);
                     // buf.set_len(buf.capacity());
-                    let (result, _buf) =
-                        crate::tests::timeout_op("server", "recv", 5, stream.recv(buf)).await;
-                    let bytes = result.expect("Recv failed");
+                    let (bytes, _buf) =
+                        crate::tests::timeout_op("server", "recv", 5, stream.recv(buf))
+                            .await
+                            .expect("Recv failed");
                     if bytes == 0 {
                         break;
                     }
@@ -239,9 +238,9 @@ fn test_tcp_large_data_transfer() {
                     buf.spare_capacity_mut()[i] = (i % 256) as u8;
                 }
 
-                let (result, _buf) =
-                    crate::tests::timeout_op("client", "send", 5, stream.send(buf)).await;
-                let bytes = result.expect("Send failed");
+                let (bytes, _buf) = crate::tests::timeout_op("client", "send", 5, stream.send(buf))
+                    .await
+                    .expect("Send failed");
                 total_sent += bytes;
                 println!("Client sent {} bytes (total: {})", bytes, total_sent);
             }
@@ -304,7 +303,7 @@ fn test_tcp_recv_zero_bytes() {
             let listener_arc = Arc::new(listener);
             let listener_clone = listener_arc.clone();
             // Server: accept and immediately close
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -320,14 +319,16 @@ fn test_tcp_recv_zero_bytes() {
                     .expect("Failed to connect");
 
             let buf = crate::runtime::context::alloc(size);
-            let (result, _buf) =
-                crate::tests::timeout_op("client", "recv", 5, stream.recv(buf)).await;
+            let result = crate::tests::timeout_op("client", "recv", 5, stream.recv(buf)).await;
 
-            if let Ok(bytes) = result {
-                assert_eq!(bytes, 0, "Should receive 0 bytes on closed connection");
-                println!("Correctly received 0 bytes (EOF)");
-            } else {
-                println!("Received error on closed connection: {:?}", result.err());
+            match result {
+                Ok((bytes, _buf)) => {
+                    assert_eq!(bytes, 0, "Should receive 0 bytes on closed connection");
+                    println!("Correctly received 0 bytes (EOF)");
+                }
+                Err(e) => {
+                    println!("Received error on closed connection: {:?}", e);
+                }
             }
 
             crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
@@ -344,7 +345,7 @@ fn test_tcp_heap_buffer() {
             let listen_addr = listener.local_addr().expect("Failed to get local address");
 
             // Server task: Use heap-allocated buffer for receive
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener.accept())
                         .await
@@ -353,9 +354,9 @@ fn test_tcp_heap_buffer() {
                 // Explicitly allocate from heap
                 let buf = veloq_buf::FixedBuf::alloc_heap(veloq_buf::nz!(4096))
                     .expect("Heap allocation failed");
-                let (result, buf) =
-                    crate::tests::timeout_op("server", "recv", 5, stream.recv(buf)).await;
-                let n = result.expect("Server recv failed");
+                let (n, buf) = crate::tests::timeout_op("server", "recv", 5, stream.recv(buf))
+                    .await
+                    .expect("Server recv failed");
 
                 assert_eq!(&buf.as_slice()[..n], b"Hello from heap!");
                 println!("Server received data in heap buffer correctly");
@@ -373,8 +374,9 @@ fn test_tcp_heap_buffer() {
             buf.as_slice_mut()[..data.len()].copy_from_slice(data);
             buf.set_len(data.len());
 
-            let (result, _) = crate::tests::timeout_op("client", "send", 5, stream.send(buf)).await;
-            result.expect("Client send failed");
+            crate::tests::timeout_op("client", "send", 5, stream.send(buf))
+                .await
+                .expect("Client send failed");
             println!("Client sent data from heap buffer correctly");
 
             crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
@@ -403,7 +405,7 @@ fn test_tcp_ipv6() {
             let listener_arc = Arc::new(listener);
             let listener_clone = listener_arc.clone();
 
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, peer) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -453,7 +455,7 @@ fn test_multithread_tcp_connections() {
                         let listener_clone = listener_arc.clone();
 
                         // Spawn server task
-                        crate::runtime::context::spawn(async move {
+                        crate::runtime::context::spawn_eager(async move {
                             let (stream, peer) = crate::tests::timeout_op(
                                 "server",
                                 "accept",
@@ -528,10 +530,11 @@ fn test_multithread_tcp_echo() {
                 let mut recv_buf = crate::runtime::context::alloc(size);
                 let mut received = Vec::with_capacity(expect.len());
                 while received.len() < expect.len() {
-                    let (result, buf) =
-                        crate::tests::timeout_op("server", "recv", 5, stream.recv(recv_buf)).await;
+                    let (n, buf) =
+                        crate::tests::timeout_op("server", "recv", 5, stream.recv(recv_buf))
+                            .await
+                            .expect("Recv failed");
                     recv_buf = buf;
-                    let n = result.expect("Recv failed");
                     assert!(n > 0, "Peer closed before sending full request");
                     let remain = expect.len() - received.len();
                     received.extend_from_slice(&recv_buf.as_slice()[..n.min(remain)]);
@@ -547,9 +550,10 @@ fn test_multithread_tcp_echo() {
                     echo_buf.spare_capacity_mut()[..chunk].copy_from_slice(&remain[..chunk]);
                     echo_buf.set_len(chunk);
 
-                    let (result, _) =
-                        crate::tests::timeout_op("server", "send", 5, stream.send(echo_buf)).await;
-                    let n = result.expect("Send failed");
+                    let (n, _) =
+                        crate::tests::timeout_op("server", "send", 5, stream.send(echo_buf))
+                            .await
+                            .expect("Send failed");
                     assert!(n > 0, "Send returned 0 before echo completed");
                     sent += n;
                 }
@@ -586,15 +590,15 @@ fn test_multithread_tcp_echo() {
                     let mut recv_buf = crate::runtime::context::alloc(size);
                     let mut echoed = Vec::with_capacity(data.len());
                     while echoed.len() < data.len() {
-                        let (result, buf) = crate::tests::timeout_op(
+                        let (n, buf) = crate::tests::timeout_op(
                             "client",
                             "recv",
                             5,
                             recv_stream.recv(recv_buf),
                         )
-                        .await;
+                        .await
+                        .expect("Recv failed");
                         recv_buf = buf;
-                        let n = result.expect("Recv failed");
                         assert!(n > 0, "Peer closed before echo completed");
                         let remain = data.len() - echoed.len();
                         echoed.extend_from_slice(&recv_buf.as_slice()[..n.min(remain)]);
@@ -613,9 +617,10 @@ fn test_multithread_tcp_echo() {
                     send_buf.spare_capacity_mut()[..chunk].copy_from_slice(&remain[..chunk]);
                     send_buf.set_len(chunk);
 
-                    let (result, _) =
-                        crate::tests::timeout_op("client", "send", 5, stream.send(send_buf)).await;
-                    let n = result.expect("Send failed");
+                    let (n, _) =
+                        crate::tests::timeout_op("client", "send", 5, stream.send(send_buf))
+                            .await
+                            .expect("Send failed");
                     assert!(n > 0, "Send returned 0 before request completed");
                     sent += n;
                 }
@@ -755,7 +760,7 @@ fn test_tcp_cancel_recv() {
             let listener_arc = Arc::new(listener);
             let listener_clone = listener_arc.clone();
 
-            let server_h = crate::runtime::context::spawn(async move {
+            let server_h = crate::runtime::context::spawn_eager(async move {
                 let (stream, _) =
                     crate::tests::timeout_op("server", "accept", 5, listener_clone.accept())
                         .await
@@ -785,5 +790,56 @@ fn test_tcp_cancel_recv() {
 
             drop(stream);
             crate::tests::timeout_op("main", "wait_server", 5, server_h).await;
+        });
+}
+
+#[test]
+fn test_tcp_read_exact_write_all() {
+    crate::tests::NetworkTestRunner::new("test_tcp_read_exact_write_all")
+        .worker_threads(1)
+        .run(|_| async move {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+            let listen_addr = listener.local_addr().expect("Failed to get local address");
+
+            const DATA: &[u8] = b"TCP Echo World!";
+            use crate::io::{AsyncBufRead, AsyncBufWrite};
+            let server_h = crate::runtime::context::spawn_eager(async move {
+                let (stream, _) = listener.accept().await.expect("Accept failed");
+                let mut read_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
+                read_buf.set_len(DATA.len());
+
+                let (_, buf) = stream
+                    .read_exact(read_buf)
+                    .await
+                    .expect("Server read_exact failed");
+                assert_eq!(buf.as_slice(), DATA);
+
+                stream
+                    .write_all(buf)
+                    .await
+                    .expect("Server write_all failed");
+            });
+
+            let client = TcpStream::connect(listen_addr)
+                .await
+                .expect("Failed to connect");
+            let mut write_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
+            write_buf.as_slice_mut()[..DATA.len()].copy_from_slice(DATA);
+            write_buf.set_len(DATA.len());
+
+            client
+                .write_all(write_buf)
+                .await
+                .expect("Client write_all failed");
+
+            let mut read_buf = crate::runtime::context::alloc(veloq_buf::nz!(DATA.len()));
+            read_buf.set_len(DATA.len());
+            let (_, buf) = client
+                .read_exact(read_buf)
+                .await
+                .expect("Client read_exact failed");
+            assert_eq!(buf.as_slice(), DATA);
+
+            server_h.await;
         });
 }

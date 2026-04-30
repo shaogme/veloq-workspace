@@ -17,8 +17,8 @@ futures-core.workspace = true
 veloq-intrusive-linklist.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
-criterion = { workspace = true }
+tokio.workspace = true
+criterion.workspace = true
 
 [[bench]]
 name = "stream_bench"

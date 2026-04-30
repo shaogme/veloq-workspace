@@ -1,28 +1,11 @@
 ---
 trigger: model_decision
-description: 当前项目架构、如何在linux和windows下测试
+description: 当前项目架构
 ---
 
 # AI_GUIDELINE.md
 
 此文件为 AI 在处理本仓库代码时提供指导。
-
-## 常用命令 (Commands)
-
-### 构建与测试
-- **构建**: `cargo build`
-- **测试**: `cargo test`
-- **运行单个测试**: `cargo test test_name`
-- **Lint**: `cargo clippy`
-- **格式化**: `cargo fmt`
-
-### Docker
-- **构建镜像**: `docker build -t veloq .`
-- **运行容器**: `docker run -it veloq`
-- **直接运行检查**: `docker-compose run --rm standalone cargo check`
-- **直接运行测试**: `docker-compose run --rm standalone cargo test`
-- **运行性能基准测试**: `docker-compose run --rm standalone cargo bench`
-- **更新 nix 依赖**: `docker-compose run --rm flake-update`
 
 ## 架构 (Architecture)
 

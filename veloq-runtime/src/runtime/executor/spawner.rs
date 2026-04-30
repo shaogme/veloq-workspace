@@ -1,13 +1,14 @@
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use tracing::{trace, warn};
 
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 
 use crate::runtime::task::{SpawnedTask, Task};
-use veloq_driver::driver::RemoteWaker;
+use veloq_driver::driver::{DriverControlCommand, RemoteWaker};
 
 // --- Job Definition ---
 
@@ -46,8 +47,9 @@ where
 
 // --- Shared State ---
 pub(crate) struct ExecutorShared {
-    pub(crate) pinned: std::sync::mpsc::Sender<Job>,
-    pub(crate) remote_queue: std::sync::mpsc::Sender<Task>,
+    pub(crate) pinned: mpsc::Sender<Job>,
+    pub(crate) remote_queue: mpsc::Sender<Task>,
+    pub(crate) control_queue: mpsc::Sender<Vec<DriverControlCommand>>,
 
     // --- New Stealable Task Support ---
     pub(crate) future_injector: ArrayQueue<Runnable>,
@@ -60,18 +62,61 @@ pub(crate) struct ExecutorShared {
     pub(crate) shutdown: AtomicBool,
 }
 
-impl harness::Schedule for ExecutorShared {
+pub(crate) struct ExecutorSharedSchedule {
+    shared: Arc<ExecutorShared>,
+}
+
+impl ExecutorSharedSchedule {
+    pub(crate) fn new(shared: Arc<ExecutorShared>) -> Self {
+        Self { shared }
+    }
+}
+
+impl harness::Schedule for ExecutorSharedSchedule {
     fn schedule(&self, task: Runnable) {
         trace!("Scheduling task via injector");
-        if self.future_injector.push(task).is_err() {
+        if self.shared.future_injector.push(task).is_err() {
             warn!("Internal task queue is full, dropping task");
             return;
         }
-        self.injected_load.fetch_add(1, Ordering::Relaxed);
-        self.waker
+        self.shared.injected_load.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .waker
             .wake()
             .expect("Failed to wake executor via scheduler");
     }
+}
+
+pub(crate) struct LocalSchedule {
+    owner_id: usize,
+    shared: Arc<ExecutorShared>,
+}
+
+impl LocalSchedule {
+    pub(crate) fn new(owner_id: usize, shared: Arc<ExecutorShared>) -> Self {
+        Self { owner_id, shared }
+    }
+}
+
+impl harness::Schedule for LocalSchedule {
+    fn schedule(&self, task: Runnable) {
+        if let Some(context) = crate::runtime::context::try_current()
+            && context.handle.id() == self.owner_id
+        {
+            context.enqueue_local_runnable(task);
+            return;
+        }
+
+        ExecutorSharedSchedule::new(self.shared.clone()).schedule(task);
+    }
+}
+
+pub(crate) fn shared_schedule(shared: Arc<ExecutorShared>) -> Arc<dyn Schedule> {
+    Arc::new(ExecutorSharedSchedule::new(shared))
+}
+
+pub(crate) fn local_schedule(owner_id: usize, shared: Arc<ExecutorShared>) -> Arc<dyn Schedule> {
+    Arc::new(LocalSchedule::new(owner_id, shared))
 }
 
 pub(crate) struct LateBoundWaker {
@@ -97,7 +142,7 @@ impl LateBoundWaker {
 }
 
 impl RemoteWaker for LateBoundWaker {
-    fn wake(&self) -> std::io::Result<()> {
+    fn wake(&self) -> veloq_driver::error::DriverResult<()> {
         if self.ready.load(std::sync::atomic::Ordering::Acquire) {
             let w = unsafe { &*self.waker.get() };
             if let Some(w) = w {
@@ -221,9 +266,9 @@ impl Spawner {
         trace!(target_worker = target.id, "Spawning task");
 
         unsafe {
-            let (job, handle) = harness::spawn_arc(future, target.shared.clone());
-            // We schedule it via the trait, which pushes to future_injector
-            target.shared.schedule(job);
+            let scheduler = shared_schedule(target.shared.clone());
+            let (job, handle) = harness::spawn_arc(future, scheduler);
+            ExecutorSharedSchedule::new(target.shared.clone()).schedule(job);
             handle
         }
     }
@@ -276,6 +321,22 @@ impl Spawner {
         } else {
             // Panic if the worker_id is invalid, as this implies a logic error in the caller
             // assuming the existence of a specific worker.
+            panic!("Worker {} not found in registry", worker_id);
+        }
+    }
+
+    pub(crate) fn send_driver_control_to(
+        &self,
+        worker_id: usize,
+        commands: Vec<DriverControlCommand>,
+    ) {
+        let workers = self.registry.all();
+
+        if let Some(target) = workers.get(worker_id) {
+            if target.shared.control_queue.send(commands).is_ok() {
+                let _ = target.shared.waker.wake();
+            }
+        } else {
             panic!("Worker {} not found in registry", worker_id);
         }
     }

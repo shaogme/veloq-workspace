@@ -10,6 +10,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  INTERNAL_IMAGE_NAME: veloq-dev
 
 jobs:
   build-and-push:
@@ -20,7 +21,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@main
 
       - name: Log in to the Container registry
         uses: docker/login-action@v3
@@ -39,16 +40,16 @@ jobs:
             type=sha,format=long
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v27
+        uses: cachix/install-nix-action@master
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Build Docker image with Nix
-        run: nix-build docker/image.nix
+        run: nix-build docker/image.nix --argstr imageName ${{ env.INTERNAL_IMAGE_NAME }}
 
       - name: Load and Push Docker image
         run: |
-          # Load the image (it usually has a name and tag from the nix derivation, e.g., veloq-dev:latest)
+          # Load the image (it usually has a name and tag from the nix derivation, e.g., ${{ env.INTERNAL_IMAGE_NAME }}:latest)
           docker load < result
           
           # Retag for GHCR
@@ -59,8 +60,8 @@ jobs:
           
           echo "Pushing to $IMAGE_ID"
           
-          docker tag veloq-dev:latest $IMAGE_ID:latest
-          docker tag veloq-dev:latest $IMAGE_ID:${{ github.sha }}
+          docker tag ${{ env.INTERNAL_IMAGE_NAME }}:latest $IMAGE_ID:latest
+          docker tag ${{ env.INTERNAL_IMAGE_NAME }}:latest $IMAGE_ID:${{ github.sha }}
           
           docker push $IMAGE_ID:latest
           docker push $IMAGE_ID:${{ github.sha }}

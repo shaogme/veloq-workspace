@@ -7,25 +7,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use veloq_runtime::LocalJoinHandle;
 use veloq_runtime::fs::{BufferingMode, File, OpenOptions};
-use veloq_runtime::io::buffer::{BufPool, FixedBuf};
+use veloq_runtime::io::buffer::{BufPool, FixedBuf, nz};
 use veloq_runtime::runtime::Runtime;
 use veloq_runtime::spawn_local;
 use veloq_runtime::sync::mpsc;
-
-/// 创建 NonZeroUsize 的宏
-/// - 输入 0：编译失败
-/// - 输入非 0 字面量/常量：编译通过，且无运行时开销
-macro_rules! nz {
-    ($value:expr) => {{
-        // 1. 利用匿名常量强制进行编译时检查
-        // 如果 $value 为 0，assert! 会 panic，导致编译中断
-        const _: () = assert!($value != 0, "nz! macro: Value cannot be zero!");
-
-        // 2. 如果上面通过了，说明 $value 肯定不为 0
-        // 使用 unsafe 块调用 new_unchecked
-        unsafe { NonZeroUsize::new_unchecked($value) }
-    }};
-}
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum WriteMode {
@@ -244,7 +229,7 @@ async fn run_iteration_measured(
     block_size: NonZeroUsize,
     sync_mode: SyncMode,
     available_buffers: &mut Vec<FixedBuf>,
-    pending_tasks: &mut VecDeque<LocalJoinHandle<(std::io::Result<usize>, FixedBuf)>>,
+    pending_tasks: &mut VecDeque<LocalJoinHandle<std::io::Result<(usize, FixedBuf)>>>,
 ) -> IterationResult {
     let pool =
         veloq_runtime::runtime::context::current_pool().expect("Worker should have bound pool");
@@ -302,12 +287,8 @@ async fn run_iteration_measured(
 
         // 3. Wait for ONE task
         let handle = pending_tasks.pop_front().unwrap();
-        let (res, buf) = handle.await;
-
-        match res {
-            Ok(n) => written_bytes += n as u64,
-            Err(e) => panic!("IO Error at index {}: {}", current_op_idx, e),
-        }
+        let (n, buf) = handle.await.expect("Write failed");
+        written_bytes += n as u64;
 
         // Recycle buffer
         available_buffers.push(buf);

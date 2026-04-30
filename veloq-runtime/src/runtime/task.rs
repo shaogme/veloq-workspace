@@ -109,6 +109,10 @@ pub(crate) unsafe fn poll_future_impl<F: Future<Output = ()>>(
             if let Some(weak_queue) = unsafe { &*queue_ptr }
                 && let Some(queue) = weak_queue.upgrade()
             {
+                let shared_ptr = header.data.shared.get();
+                if let Some(shared) = unsafe { &*shared_ptr } {
+                    shared.local_load.fetch_add(1, Ordering::Relaxed);
+                }
                 let task = Task { ptr };
                 queue.borrow_mut().push_back(task);
                 return;
@@ -258,6 +262,10 @@ unsafe fn wake_task(ptr: NonNull<raw::Header<PinnedData, PinnedVTable>>) {
             && let Some(queue) = weak_queue.upgrade()
         {
             // Here we need to reconstruct the Task struct to push it into the queue.
+            let shared_ptr = header.data.shared.get();
+            if let Some(shared) = unsafe { &*shared_ptr } {
+                shared.local_load.fetch_add(1, Ordering::Relaxed);
+            }
             header.references.fetch_add(1, Ordering::Relaxed);
             let task = Task { ptr };
             queue.borrow_mut().push_back(task);
@@ -269,8 +277,11 @@ unsafe fn wake_task(ptr: NonNull<raw::Header<PinnedData, PinnedVTable>>) {
             // Need to push to remote_queue.
             header.references.fetch_add(1, Ordering::Relaxed);
             let task = Task { ptr };
-
-            let _ = shared.remote_queue.send(task);
+            if shared.remote_queue.send(task).is_ok() {
+                // Remote wake ultimately re-enqueues onto the owner's local queue,
+                // so account it as local queued work up front to keep load balanced.
+                shared.local_load.fetch_add(1, Ordering::Relaxed);
+            }
 
             // Optimization: Only wake the driver if the executor is parking or parked.
             let state = shared.state.load(Ordering::Acquire);

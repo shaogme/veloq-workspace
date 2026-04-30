@@ -1,46 +1,33 @@
 //! io_uring Platform-Specific Operation Definitions
-//!
-//! This module defines:
-//! - `UringKernelOp`: The Type-Erased kernel operation struct using Unions and VTables
-//! - `OpVTable`: The virtual table for dynamic dispatch without enums
-//! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
-use crate::{UringDriver, submit};
+use crate::config::UringRawHandle;
+use crate::driver::UringDriver;
+use crate::{OwnedRawHandle, RawHandle};
 use io_uring::squeue;
-use std::io;
-use std::mem::ManuallyDrop;
 use std::time::Duration;
 use veloq_driver_core::driver::PlatformOp;
-use veloq_driver_core::op::{
-    Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
-    Fsync as CoreFsync, IntoPlatformOp, OpKind, Open, ReadFixed as CoreReadFixed, Recv as CoreRecv,
-    Send as CoreSend, SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange, Timeout,
-    UdpRecvStream as CoreUdpRecvStream, UdpRefill as CoreUdpRefill, Wakeup as CoreWakeup,
-    WriteFixed as CoreWriteFixed,
-};
+use veloq_driver_core::error::DriverResult;
+use veloq_driver_core::op::{IntoPlatformOp, OpKind};
 
-type ReadFixed = CoreReadFixed<crate::RawHandle>;
-type WriteFixed = CoreWriteFixed<crate::RawHandle>;
-type Recv = CoreRecv<crate::RawHandle>;
-type OpSend = CoreSend<crate::RawHandle>;
-type Connect = CoreConnect<crate::RawHandle, crate::SockAddrStorage>;
-type Close = CoreClose<crate::RawHandle>;
-type Fsync = CoreFsync<crate::RawHandle>;
-type SyncFileRange = CoreSyncFileRange<crate::RawHandle>;
-type Fallocate = CoreFallocate<crate::RawHandle>;
-type Accept = CoreAccept<crate::RawHandle, crate::SockAddrStorage>;
-type SendTo = CoreSendTo<crate::RawHandle>;
-type UdpRecvStream = CoreUdpRecvStream<crate::RawHandle>;
-type UdpRefill = CoreUdpRefill<crate::RawHandle>;
-type Wakeup = CoreWakeup<crate::RawHandle>;
+mod payload;
+pub(crate) mod slot;
+mod submit;
+
+pub(crate) use payload::UringOpPayload;
+pub(crate) use payload::{
+    Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ReadFixed,
+    ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
+    UdpRecvStream, UdpSend, Wakeup, WriteFixed, WriteRaw,
+};
 
 // ============================================================================
 // VTable Definition
 // ============================================================================
 
 pub(crate) type MakeSqeFn =
-    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> squeue::Entry;
-pub(crate) type OnCompleteFn = unsafe fn(op: &mut UringKernelOp, result: i32) -> io::Result<usize>;
+    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> DriverResult<squeue::Entry>;
+pub(crate) type OnCompleteFn =
+    unsafe fn(op: &mut UringKernelOp, result: i32) -> DriverResult<usize>;
 pub(crate) type DropFn = unsafe fn(op: &mut UringKernelOp);
 pub(crate) type GetTimeoutFn = unsafe fn(op: &UringKernelOp) -> Option<Duration>;
 pub(crate) type ResolveChunksFn = unsafe fn(op: &UringKernelOp, chunks: &mut [u16]) -> usize;
@@ -65,15 +52,13 @@ pub(crate) struct OpVTable {
 }
 
 // ============================================================================
-// UringKernelOp Struct & Union (Type-Erased)
+// UringKernelOp Struct & Payload (Type-Erased)
 // ============================================================================
-
-use std::ptr::NonNull;
 
 #[repr(C)]
 pub struct UringKernelOp {
     /// Virtual Table for dynamic dispatch
-    pub(crate) vtable: NonNull<OpVTable>,
+    pub(crate) vtable: &'static OpVTable,
 
     /// Type-erased payload
     pub(crate) payload: UringOpPayload,
@@ -83,9 +68,11 @@ impl PlatformOp for UringKernelOp {}
 
 impl Drop for UringKernelOp {
     fn drop(&mut self) {
-        unsafe { (self.vtable.as_ref().drop)(self) };
+        unsafe { (self.vtable.drop)(self) };
     }
 }
+
+pub type UringOp = UringKernelOp;
 
 // ============================================================================
 // Macro Definition
@@ -99,7 +86,9 @@ macro_rules! define_uring_ops {
                 $(payload: $Payload:ty,)?
                 kind: $kind:expr,
                 make_sqe: $make_sqe:path,
-                on_complete: $complete:path,
+                $(on_complete: $complete:path,)?
+                $(completion: $completion:ty,)?
+                $(map_completion: $map_completion:expr,)?
                 drop: $drop:path,
                 $(strategy: $strategy:expr,)?
                 $(get_timeout: $get_timeout:expr,)?
@@ -109,23 +98,17 @@ macro_rules! define_uring_ops {
             }
         ),+ $(,)?
     ) => {
-        // Ensure proper alignment
-        #[repr(C)]
-        pub(crate) union UringOpPayload {
-            $(
-                pub(crate) $field: ManuallyDrop< define_uring_ops!(@payload_type $OpType $(, $Payload)?) >,
-            )+
-        }
-
         $(
             impl IntoPlatformOp<UringOp> for $OpType {
                 type UserPayload = Box<$OpType>;
+                type Completion = define_uring_ops!(@completion_type $($completion)?);
+                type DriverCompletion = usize;
                 const PAYLOAD_KIND: OpKind = $kind;
 
                 fn into_kernel_and_payload(self) -> (UringKernelOp, Self::UserPayload) {
                     static TABLE: OpVTable = OpVTable {
                         make_sqe: $make_sqe,
-                        on_complete: $complete,
+                        on_complete: define_uring_ops!(@on_complete $($complete)?),
                         drop: $drop,
                         strategy: define_uring_ops!(@strategy $($strategy)?),
                         get_timeout: define_uring_ops!(@get_timeout $($get_timeout)?),
@@ -137,10 +120,8 @@ macro_rules! define_uring_ops {
                     let payload = define_uring_ops!(@construct user_ptr, $($construct)?, $OpType $(, $Payload)?);
 
                     let op = UringKernelOp {
-                        vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
-                        payload: UringOpPayload {
-                            $field: ManuallyDrop::new(payload),
-                        },
+                        vtable: &TABLE,
+                        payload: UringOpPayload::$field(payload),
                     };
                     (op, user)
                 }
@@ -160,33 +141,33 @@ macro_rules! define_uring_ops {
                 unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
                     unsafe { Box::from_raw(ptr as *mut $OpType) }
                 }
+
+                fn map_completion_result(
+                    &self,
+                    res: DriverResult<usize>,
+                ) -> DriverResult<Self::Completion> {
+                    define_uring_ops!(@map_completion self, res, $($map_completion)?)
+                }
             }
         )+
     };
 
-    (@payload_type $OpType:ty) => { KernelRef<$OpType> };
+    (@payload_type $OpType:ty) => { crate::op::payload::KernelRef<$OpType> };
     (@payload_type $OpType:ty, $Payload:ty) => { $Payload };
 
-    // Default strategy: SubmitSqe
     (@strategy ) => { SubmissionStrategy::SubmitSqe };
     (@strategy $strategy:expr) => { $strategy };
 
-    // Default get_timeout: return None
-    (@get_timeout ) => { submit::get_timeout_none };
+    (@get_timeout ) => { crate::op::submit::get_timeout_none };
     (@get_timeout $func:expr) => { $func };
 
-    // Default resolve_chunks: return 0
-    (@resolve_chunks ) => { submit::resolve_chunks_none };
+    (@resolve_chunks ) => { crate::op::submit::resolve_chunks_none };
     (@resolve_chunks $func:expr) => { $func };
 
-    // Default construct: keep only a pointer to user payload
-    (@construct $user_ptr:expr, , $OpType:ty) => { KernelRef { user: $user_ptr } };
-    // Custom construct
+    (@construct $user_ptr:expr, , $OpType:ty) => { crate::op::payload::KernelRef { user: $user_ptr } };
     (@construct $user_ptr:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user_ptr) };
 
-    // Default destruct: return user payload
     (@destruct $user_payload:expr, ) => { *$user_payload };
-    // Custom destruct
     (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
 
     (@drop_raw_fn $OpType:ty) => {{
@@ -195,50 +176,16 @@ macro_rules! define_uring_ops {
         }
         drop_raw
     }};
+
+    (@on_complete ) => { crate::op::submit::on_complete_default };
+    (@on_complete $func:path) => { $func };
+
+    (@completion_type ) => { usize };
+    (@completion_type $ty:ty) => { $ty };
+
+    (@map_completion $this:ident, $res:ident, ) => { $res };
+    (@map_completion $this:ident, $res:ident, $expr:expr) => { ($expr)($this, $res) };
 }
-
-// ============================================================================
-// Payload Structures for Complex Ops
-// ============================================================================
-
-pub(crate) struct KernelRef<T> {
-    pub(crate) user: NonNull<T>,
-}
-
-pub(crate) struct AcceptPayload {
-    pub(crate) user: NonNull<Accept>,
-}
-
-pub(crate) struct SendToPayload {
-    pub(crate) user: NonNull<SendTo>,
-    pub(crate) msg_name: libc::sockaddr_storage,
-    pub(crate) msg_namelen: libc::socklen_t,
-    pub(crate) iovec: [libc::iovec; 1],
-    pub(crate) msghdr: libc::msghdr,
-}
-
-pub(crate) struct UdpRecvStreamPayload {
-    pub(crate) user: NonNull<UdpRecvStream>,
-    pub(crate) msg_name: libc::sockaddr_storage,
-    pub(crate) iovec: [libc::iovec; 1],
-    pub(crate) msghdr: libc::msghdr,
-}
-
-pub(crate) struct OpenPayload {
-    pub(crate) user: NonNull<Open>,
-}
-
-pub(crate) struct WakeupPayload {
-    pub(crate) user: NonNull<Wakeup>,
-    pub(crate) buf: [u8; 8],
-}
-
-pub(crate) struct TimeoutPayload {
-    pub(crate) user: NonNull<Timeout>,
-    pub(crate) ts: [i64; 2],
-}
-
-pub(crate) type UringOp = UringKernelOp;
 
 // ============================================================================
 // Op Definitions
@@ -246,92 +193,158 @@ pub(crate) type UringOp = UringKernelOp;
 
 define_uring_ops! {
     ReadFixed {
-        field: read,
+        field: Read,
         kind: OpKind::ReadFixed,
         make_sqe: submit::make_sqe_read_fixed,
         on_complete: submit::on_complete_read_fixed,
         drop: submit::drop_read_fixed,
         resolve_chunks: submit::resolve_chunks_read_fixed,
-    }, // Kernel 5.1+
+    },
+    ReadRaw {
+        field: ReadRaw,
+        kind: OpKind::ReadFixed,
+        make_sqe: submit::make_sqe_read_raw,
+        on_complete: submit::on_complete_read_fixed,
+        drop: submit::drop_read_fixed,
+        resolve_chunks: submit::resolve_chunks_read_raw,
+    },
     WriteFixed {
-        field: write,
+        field: Write,
         kind: OpKind::WriteFixed,
         make_sqe: submit::make_sqe_write_fixed,
         on_complete: submit::on_complete_write_fixed,
         drop: submit::drop_write_fixed,
         resolve_chunks: submit::resolve_chunks_write_fixed,
-    }, // Kernel 5.1+
+    },
+    WriteRaw {
+        field: WriteRaw,
+        kind: OpKind::WriteFixed,
+        make_sqe: submit::make_sqe_write_raw,
+        on_complete: submit::on_complete_write_fixed,
+        drop: submit::drop_write_fixed,
+        resolve_chunks: submit::resolve_chunks_write_raw,
+    },
     Recv {
-        field: recv,
+        field: Recv,
         kind: OpKind::Recv,
         make_sqe: submit::make_sqe_recv,
         on_complete: submit::on_complete_recv,
         drop: submit::drop_recv,
-    }, // Kernel 5.6+
+    },
     OpSend {
-        field: send,
+        field: Send,
         kind: OpKind::Send,
         make_sqe: submit::make_sqe_send,
         on_complete: submit::on_complete_send,
         drop: submit::drop_send,
-    }, // Kernel 5.6+
+    },
+    UdpRecv {
+        field: UdpRecv,
+        kind: OpKind::UdpRecv,
+        make_sqe: submit::make_sqe_udp_recv,
+        on_complete: submit::on_complete_udp_recv,
+        drop: submit::drop_udp_recv,
+    },
+    UdpSend {
+        field: UdpSend,
+        kind: OpKind::UdpSend,
+        make_sqe: submit::make_sqe_udp_send,
+        on_complete: submit::on_complete_udp_send,
+        drop: submit::drop_udp_send,
+    },
     Connect {
-        field: connect,
+        field: Connect,
         kind: OpKind::Connect,
         make_sqe: submit::make_sqe_connect,
         on_complete: submit::on_complete_connect,
         drop: submit::drop_connect,
-    }, // Kernel 5.5+
+    },
+    UdpConnect {
+        field: UdpConnect,
+        kind: OpKind::UdpConnect,
+        make_sqe: submit::make_sqe_udp_connect,
+        on_complete: submit::on_complete_udp_connect,
+        drop: submit::drop_udp_connect,
+    },
     Close {
-        field: close,
+        field: Close,
         kind: OpKind::Close,
         make_sqe: submit::make_sqe_close,
         on_complete: submit::on_complete_close,
         drop: submit::drop_close,
         strategy: SubmissionStrategy::BackgroundOnly,
-    }, // Kernel 5.6+
+    },
     Fsync {
-        field: fsync,
+        field: Fsync,
         kind: OpKind::Fsync,
         make_sqe: submit::make_sqe_fsync,
         on_complete: submit::on_complete_fsync,
         drop: submit::drop_fsync,
-    }, // Kernel 5.1+
+    },
+    FsyncRaw {
+        field: FsyncRaw,
+        kind: OpKind::Fsync,
+        make_sqe: submit::make_sqe_fsync_raw,
+        on_complete: submit::on_complete_fsync,
+        drop: submit::drop_fsync,
+    },
     SyncFileRange {
-        field: sync_range,
+        field: SyncRange,
         kind: OpKind::SyncFileRange,
         make_sqe: submit::make_sqe_sync_range,
         on_complete: submit::on_complete_sync_range,
         drop: submit::drop_sync_range,
-    }, // Kernel 5.2+
+    },
+    SyncFileRangeRaw {
+        field: SyncRangeRaw,
+        kind: OpKind::SyncFileRange,
+        make_sqe: submit::make_sqe_sync_range_raw,
+        on_complete: submit::on_complete_sync_range,
+        drop: submit::drop_sync_range,
+    },
     Fallocate {
-        field: fallocate,
+        field: Fallocate,
         kind: OpKind::Fallocate,
         make_sqe: submit::make_sqe_fallocate,
         on_complete: submit::on_complete_fallocate,
         drop: submit::drop_fallocate,
-    }, // Kernel 5.6+
+    },
+    FallocateRaw {
+        field: FallocateRaw,
+        kind: OpKind::Fallocate,
+        make_sqe: submit::make_sqe_fallocate_raw,
+        on_complete: submit::on_complete_fallocate,
+        drop: submit::drop_fallocate,
+    },
     Accept {
-        field: accept,
-        payload: AcceptPayload,
+        field: Accept,
+        payload: payload::AcceptPayload,
         kind: OpKind::Accept,
         make_sqe: submit::make_sqe_accept,
         on_complete: submit::on_complete_accept,
+        completion: OwnedRawHandle,
+        map_completion: |_op: &Accept, res: DriverResult<usize>| {
+            res.map(|raw| unsafe {
+                OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_socket(
+                    raw as i32,
+                )))
+            })
+        },
         drop: submit::drop_accept,
-        construct: |user| AcceptPayload { user },
+        construct: |user| payload::AcceptPayload { user },
         destruct: |user: Box<Accept>| *user,
-    }, // Kernel 5.5+
+    },
     SendTo {
-        field: send_to,
-        payload: SendToPayload,
+        field: SendTo,
+        payload: payload::SendToPayload,
         kind: OpKind::SendTo,
         make_sqe: submit::make_sqe_send_to,
         on_complete: submit::on_complete_send_to,
         drop: submit::drop_send_to,
         construct: |user: std::ptr::NonNull<SendTo>| {
             let op = unsafe { user.as_ref() };
-            let (msg_name, msg_namelen) = crate::socket_addr_to_storage(op.addr);
-            SendToPayload {
+            let (msg_name, msg_namelen) = crate::net::socket_addr_to_storage(op.addr);
+            payload::SendToPayload {
                 user,
                 msg_name: msg_name.0,
                 msg_namelen: msg_namelen as libc::socklen_t,
@@ -340,59 +353,59 @@ define_uring_ops! {
             }
         },
         destruct: |user: Box<SendTo>| *user,
-    }, // Kernel 5.1+ (via SendMsg)
+    },
     UdpRecvStream {
-        field: udp_recv_stream,
-        payload: UdpRecvStreamPayload,
+        field: UdpRecvStream,
+        payload: payload::UdpRecvStreamPayload,
         kind: OpKind::UdpRecvStream,
         make_sqe: submit::make_sqe_udp_recv_stream,
         on_complete: submit::on_complete_udp_recv_stream,
         drop: submit::drop_udp_recv_stream,
-        construct: |user| UdpRecvStreamPayload {
+        construct: |user| payload::UdpRecvStreamPayload {
             user,
             msg_name: unsafe { std::mem::zeroed() },
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
         },
         destruct: |user: Box<UdpRecvStream>| *user,
-    }, // Kernel 5.1+ (via RecvMsg)
-    UdpRefill {
-        field: udp_refill,
-        kind: OpKind::UdpRefill,
-        make_sqe: submit::make_sqe_udp_refill,
-        on_complete: submit::on_complete_udp_refill,
-        drop: submit::drop_udp_refill,
-    }, // No-op on io_uring, kept for cross-platform API parity
+    },
     Open {
-        field: open,
-        payload: OpenPayload,
+        field: Open,
+        payload: payload::OpenPayload,
         kind: OpKind::Open,
         make_sqe: submit::make_sqe_open,
-        on_complete: submit::on_complete_open,
+        completion: OwnedRawHandle,
+        map_completion: |_op: &Open, res: DriverResult<usize>| {
+            res.map(|raw| unsafe {
+                OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(
+                    raw as i32,
+                )))
+            })
+        },
         drop: submit::drop_open,
-        construct: |user| OpenPayload { user },
+        construct: |user| payload::OpenPayload { user },
         destruct: |user: Box<Open>| *user,
-    }, // Kernel 5.6+ (via OpenAt)
+    },
     Wakeup {
-        field: wakeup,
-        payload: WakeupPayload,
+        field: Wakeup,
+        payload: payload::WakeupPayload,
         kind: OpKind::Wakeup,
         make_sqe: submit::make_sqe_wakeup,
         on_complete: submit::on_complete_wakeup,
         drop: submit::drop_wakeup,
-        construct: |user| WakeupPayload { user, buf: [0; 8] },
+        construct: |user| payload::WakeupPayload { user, buf: [0; 8] },
         destruct: |user: Box<Wakeup>| *user,
-    }, // Kernel 5.6+ (via Read)
+    },
     Timeout {
-        field: timeout,
-        payload: TimeoutPayload,
+        field: Timeout,
+        payload: payload::TimeoutPayload,
         kind: OpKind::Timeout,
         make_sqe: submit::make_sqe_timeout,
         on_complete: submit::on_complete_timeout,
         drop: submit::drop_timeout,
         strategy: SubmissionStrategy::SoftwareTimer,
         get_timeout: submit::get_timeout_timeout,
-        construct: |user| TimeoutPayload { user, ts: [0; 2] },
+        construct: |user| payload::TimeoutPayload { user, ts: [0; 2] },
         destruct: |user: Box<Timeout>| *user,
-    }, // Kernel 5.4+
+    },
 }

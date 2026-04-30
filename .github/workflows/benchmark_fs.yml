@@ -78,7 +78,7 @@ jobs:
             phase: flush
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
 
       - name: Install Rust
         uses: shaogme/speedy-rust@main
@@ -86,7 +86,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@main
         with:
           path: |
             ~/.cargo/registry
@@ -177,7 +177,7 @@ jobs:
 
       - name: Upload Benchmark Row
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@main
         with:
           name: bench-row-${{ matrix.os }}-${{ matrix.case }}
           path: |
@@ -191,7 +191,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download Benchmark Rows
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@main
         with:
           pattern: bench-row-*
           merge-multiple: true
@@ -209,7 +209,7 @@ jobs:
           cat benchmark_summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Summary Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@main
         with:
           name: benchmark-summary
           path: benchmark_summary.md

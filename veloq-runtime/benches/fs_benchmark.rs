@@ -92,7 +92,7 @@ fn create_local_executor() -> LocalExecutor {
         use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 
         // 128x multiplier -> ~256MB
-        let multiplier = ThreadMemoryMultiplier(unsafe { NonZeroUsize::new_unchecked(128) });
+        let multiplier = ThreadMemoryMultiplier(nz!(128));
         let topology = UniformSlot::new(multiplier);
 
         let global_pool = topology
@@ -177,16 +177,14 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                             }
 
                             if let Some(handle) = tasks.pop_front() {
-                                let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                                res.expect("Write failed");
+                                let (_res, _buf) = handle.await.expect("Write failed");
                             } else {
                                 panic!("Deadlock: No tasks to wait for but cannot allocate buffer");
                             }
                         }
 
                         while let Some(handle) = tasks.pop_front() {
-                            let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                            res.expect("Write failed");
+                            let (_res, _buf) = handle.await.expect("Write failed");
                         }
 
                         apply_sync(&file, TOTAL_SIZE, sync_mode).await;
@@ -252,8 +250,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                                 }
 
                                 if let Some(handle) = tasks.pop_front() {
-                                    let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                                    res.expect("Write failed");
+                                    let (_res, _buf) = handle.await.expect("Write failed");
                                 } else {
                                     panic!(
                                         "Deadlock: No tasks to wait for but cannot allocate buffer"
@@ -262,8 +259,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                             }
 
                             while let Some(handle) = tasks.pop_front() {
-                                let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                                res.expect("Write failed");
+                                let (_res, _buf) = handle.await.expect("Write failed");
                             }
                             let elapsed = start.elapsed();
 
@@ -332,8 +328,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                                 }
 
                                 if let Some(handle) = tasks.pop_front() {
-                                    let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                                    res.expect("Write failed");
+                                    let (_res, _buf) = handle.await.expect("Write failed");
                                 } else {
                                     panic!(
                                         "Deadlock: No tasks to wait for but cannot allocate buffer"
@@ -342,8 +337,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                             }
 
                             while let Some(handle) = tasks.pop_front() {
-                                let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                                res.expect("Write failed");
+                                let (_res, _buf) = handle.await.expect("Write failed");
                             }
 
                             let start = Instant::now();
@@ -497,8 +491,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                 }
 
                                 if let Some(handle) = tasks.pop_front() {
-                                    let (res, _buf): (std::io::Result<usize>, _) = handle.await;
-                                    res.expect("Write failed");
+                                    let (_res, _buf) = handle.await.expect("Write failed");
                                 } else if !all_submitted {
                                     panic!("Deadlock in worker {}: No tasks to wait for but cannot allocate buffer", i);
                                 }

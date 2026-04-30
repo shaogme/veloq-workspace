@@ -30,7 +30,13 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 
 pub struct Sleep {
     deadline: Instant,
-    inner: Option<DetachedOp<OpTimeout, <PlatformDriver as Driver>::Op>>,
+    inner: Option<
+        DetachedOp<
+            OpTimeout,
+            <PlatformDriver as Driver>::Op,
+            <PlatformDriver as Driver>::Completion,
+        >,
+    >,
 }
 
 impl Sleep {

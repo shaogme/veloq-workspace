@@ -8,6 +8,7 @@
 //! - `io/driver/iocp/op.rs` for Windows IOCP
 
 use std::rc::Rc;
+use std::sync::Arc;
 use std::{
     future::Future,
     pin::Pin,
@@ -19,10 +20,12 @@ use tracing::trace;
 use veloq_buf::FixedBuf;
 
 use crate::driver::{
-    CompletionRecord, Driver, PlatformOp, SharedCompletionTable, SubmitBinder,
-    encode_completion_token, event_res_to_io,
+    CompletionRecord, Driver, PlatformOp, PollRecordResult, RemoteWaker, SharedCompletionTable,
+    SubmitBinder, SubmitStatus, encode_completion_token, event_res_to_result,
 };
-use crate::{Handle, IoFd, SockAddr};
+use crate::error::{DriverErrorKind, DriverErrorReport, DriverResult, driver_error};
+use crate::slot::DetachedCancelTable;
+use crate::{IoFd, RawHandleMeta, SockAddr};
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,10 +42,60 @@ pub enum OpKind {
     Accept = 10,
     SendTo = 11,
     UdpRecvStream = 12,
-    UdpRefill = 13,
-    Open = 14,
-    Wakeup = 15,
-    Timeout = 16,
+    Open = 13,
+    Wakeup = 14,
+    Timeout = 15,
+    UdpRecv = 16,
+    UdpSend = 17,
+    UdpConnect = 18,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostReason {
+    /// 槽位已被回收，用于新一代操作 (Generation Mismatch)。
+    /// 调用方应当认为关联的 IO 后端（如 Socket 或 Buffer）已处于不确定状态。
+    GenerationMismatch,
+    /// 内部错误：操作负载丢失 (Completion sidecar missing)。
+    PayloadMissing,
+    /// 内部错误：操作负载类型不匹配。
+    PayloadKindMismatch,
+    /// 其它未知原因造成的资源丢失。
+    Other,
+}
+
+impl std::fmt::Display for LostReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GenerationMismatch => write!(f, "generation mismatch (slot recycled)"),
+            Self::PayloadMissing => write!(f, "payload missing"),
+            Self::PayloadKindMismatch => write!(f, "payload kind mismatch"),
+            Self::Other => write!(f, "unknown resource loss"),
+        }
+    }
+}
+
+/// 描述 IO 操作丢失及其原因的结构化错误。
+#[derive(Debug)]
+pub struct OpError {
+    pub reason: LostReason,
+    pub source: DriverErrorReport,
+}
+
+impl OpError {
+    pub fn new(reason: LostReason, source: DriverErrorReport) -> Self {
+        Self { reason, source }
+    }
+
+    /// 如果原因为 GenerationMismatch，则认为该错误是致命的（资源状态不确定）。
+    pub fn is_lethal(&self) -> bool {
+        matches!(self.reason, LostReason::GenerationMismatch)
+    }
+}
+
+impl std::fmt::Display for OpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.source)
+    }
 }
 
 // ============================================================================
@@ -56,31 +109,111 @@ pub enum OpKind {
 /// is polled after the driver has reclaimed the slot (Generation Mismatch).
 /// In such cases, the ownership of the resource `T` is lost.
 #[derive(Debug)]
-pub enum OpResult<T> {
+pub enum OpResult<T, R = usize> {
     /// Operation completed (successfully or with IO error).
     /// Returns the result of the operation and the original resource.
-    Completed(std::io::Result<usize>, T),
-    /// Operation failed because the submitter/driver slot was recycled (Generation Mismatch).
-    /// The resource `T` is lost (polled too late, driver reset slot).
-    Lost(std::io::Error),
+    Completed(DriverResult<R>, T),
+    /// Operation failed because the resource ownership was lost.
+    /// Includes structured error information about the loss.
+    ResourceLost(OpError),
 }
 
-impl<T> OpResult<T> {
+impl<T, R> OpResult<T, R> {
     /// Unwraps the result, assuming the operation completed (panics if Lost).
-    pub fn unwrap(self) -> (usize, T) {
+    pub fn unwrap(self) -> (R, T) {
         match self {
             OpResult::Completed(Ok(res), data) => (res, data),
             OpResult::Completed(Err(e), _) => panic!("OpResult::Completed(Err({}))", e),
-            OpResult::Lost(e) => panic!("OpResult::Lost({})", e),
+            OpResult::ResourceLost(e) => panic!("OpResult::ResourceLost({})", e),
         }
     }
 
     /// Returns the result and the resource implementation (if available).
-    pub fn into_inner(self) -> (std::io::Result<usize>, Option<T>) {
+    pub fn into_inner(self) -> (DriverResult<R>, Option<T>) {
         match self {
             OpResult::Completed(res, data) => (res, Some(data)),
-            OpResult::Lost(err) => (Err(err), None),
+            OpResult::ResourceLost(err) => (Err(err.source), None),
         }
+    }
+}
+
+#[inline]
+fn payload_missing_error() -> OpError {
+    OpError::new(
+        LostReason::PayloadMissing,
+        driver_error(
+            DriverErrorKind::Internal,
+            "driver-core/op",
+            "operation payload lost: completion sidecar missing",
+        ),
+    )
+}
+
+#[inline]
+fn payload_kind_mismatch_error() -> OpError {
+    OpError::new(
+        LostReason::PayloadKindMismatch,
+        driver_error(
+            DriverErrorKind::Internal,
+            "driver-core/op",
+            "operation payload lost: kind mismatch",
+        ),
+    )
+}
+
+#[inline]
+fn generation_mismatch_error() -> OpError {
+    OpError::new(
+        LostReason::GenerationMismatch,
+        driver_error(
+            DriverErrorKind::Internal,
+            "driver-core/op",
+            "operation lost: slot recycled (generation mismatch)",
+        ),
+    )
+}
+
+#[inline]
+fn completion_record_to_result<T, O, C>(
+    record: CompletionRecord<C>,
+) -> Poll<OpResult<T, T::Completion>>
+where
+    O: PlatformOp,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
+    C: crate::driver::CompletionValue,
+{
+    let CompletionRecord {
+        event,
+        payload: payload_any,
+        detail,
+    } = record;
+    let Some(payload_any) = payload_any else {
+        return Poll::Ready(OpResult::ResourceLost(payload_missing_error()));
+    };
+    if payload_any.kind != T::PAYLOAD_KIND as u16 {
+        return Poll::Ready(OpResult::ResourceLost(payload_kind_mismatch_error()));
+    }
+    let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+    let data = T::from_user_payload(payload);
+    let res = detail.unwrap_or_else(|| event_res_to_result::<C>(event.res));
+    let completion = data.map_completion_result(res);
+    Poll::Ready(OpResult::Completed(completion, data))
+}
+
+#[inline]
+fn poll_completion_table_once<T, O, C>(
+    table: &dyn crate::driver::CompletionAccess<C>,
+    token: u64,
+) -> Poll<OpResult<T, T::Completion>>
+where
+    O: PlatformOp,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
+    C: crate::driver::CompletionValue,
+{
+    match table.try_take_record(token) {
+        PollRecordResult::Ready(record) => completion_record_to_result::<T, O, C>(record),
+        PollRecordResult::Stale => Poll::Ready(OpResult::ResourceLost(generation_mismatch_error())),
+        PollRecordResult::Pending => Poll::Pending,
     }
 }
 
@@ -96,19 +229,21 @@ pub trait OpLifecycle: Sized {
     /// The final output type after the operation completes.
     type Output;
     /// Driver-defined raw handle token type.
-    type Handle: Handle;
+    type Raw: RawHandleMeta;
+    /// Completion value type delivered by driver.
+    type CompletionValue;
 
     /// Pre-allocate any resources needed (e.g., accept socket on Windows).
-    fn pre_alloc(fd: Self::Handle) -> std::io::Result<Self::PreAlloc>;
+    fn pre_alloc(fd: Self::Raw) -> DriverResult<Self::PreAlloc>;
 
     /// Construct the operation from a raw handle and pre-allocated resources.
-    fn into_op(fd: Self::Handle, pre: Self::PreAlloc) -> Self;
+    fn into_op(fd: Self::Raw, pre: Self::PreAlloc) -> Self;
 
     /// Convert the completed operation result to the final output type.
-    fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output>;
+    fn into_output(self, res: DriverResult<Self::CompletionValue>) -> DriverResult<Self::Output>;
 
     /// Helper: Pre-allocate and construct the operation in one step.
-    fn prepare_op(fd: Self::Handle) -> std::io::Result<Self> {
+    fn prepare_op(fd: Self::Raw) -> DriverResult<Self> {
         let pre = Self::pre_alloc(fd)?;
         Ok(Self::into_op(fd, pre))
     }
@@ -118,6 +253,10 @@ pub trait OpLifecycle: Sized {
 pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     /// User payload detached from kernel op.
     type UserPayload: std::marker::Send + 'static;
+    /// Completion value exposed to caller for this op.
+    type Completion;
+    /// Raw completion value delivered by the bound driver.
+    type DriverCompletion: crate::driver::CompletionValue;
     const PAYLOAD_KIND: OpKind;
 
     /// Split into kernel-facing op and user payload.
@@ -134,6 +273,12 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     /// `ptr` must originate from the matching `Self::payload_into_erased` implementation
     /// of the same concrete operation type and must not have been consumed before.
     unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload;
+
+    /// Map kernel completion integer into typed completion value.
+    fn map_completion_result(
+        &self,
+        res: DriverResult<Self::DriverCompletion>,
+    ) -> DriverResult<Self::Completion>;
 
     /// Compatibility helper for transitional callsites.
     #[inline]
@@ -183,9 +328,9 @@ impl<T> Op<T> {
 
     /// Submit this operation manually to a specific driver instance.
     /// The operation is submitted synchronously, but completion is awaited asynchronously via the returned future.
-    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op>
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Completion>
     where
-        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
         D: Driver,
     {
         let data = self.data;
@@ -198,48 +343,64 @@ impl<T> Op<T> {
                 let mut op_platform = Some(kernel_op);
                 let token = encode_completion_token(user_data, generation);
                 let completion_table = driver.completion_table();
-                let slot_table = driver.slot_table();
-                let slot = &slot_table.slots[user_data];
-                unsafe {
-                    *slot.payload.get() = Some(T::payload_into_erased(payload));
-                }
+                let cancel_signal = driver.detached_cancel_table();
+                let cancel_waker = driver.create_waker();
+                driver.slot_set_payload(user_data, T::payload_into_erased(payload));
 
-                if let Err(e) = driver
+                let result = driver
                     .submit(user_data, &mut op_platform, SubmitBinder::new())
-                    .into_inner()
-                {
-                    trace!("Submit failed: {}", e);
-                    // Submit failed synchronously.
-                    // If the platform op is returned, propagate immediate failure with payload.
-                    // Otherwise, fall back to slot-monitoring path and let generation check resolve.
-                    if let Some(op) = op_platform.take() {
-                        let payload_any = unsafe { (*slot.payload.get()).take() }
-                            .expect("Payload missing while recovering submit failure");
-                        if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                            panic!("DetachedOp payload kind mismatch on submit recovery");
-                        }
-                        let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-                        drop(op);
-                        DetachedOp {
-                            completion_table: None,
-                            token: 0,
-                            immediate_failure: Some((e, T::from_user_payload(payload))),
-                            _phantom: std::marker::PhantomData,
-                        }
-                    } else {
+                    .into_inner();
+
+                match result {
+                    Ok(_) => {
+                        completion_table.mark_waiting(token);
                         DetachedOp {
                             completion_table: Some(completion_table),
+                            cancel_signal: Some(cancel_signal),
+                            cancel_waker: Some(cancel_waker),
                             token,
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
                         }
                     }
-                } else {
-                    DetachedOp {
-                        completion_table: Some(completion_table),
-                        token,
-                        immediate_failure: None,
-                        _phantom: std::marker::PhantomData,
+                    Err((e, status)) => {
+                        trace!("Submit failed synchronously: {} (status={:?})", e, status);
+                        if status == SubmitStatus::Void {
+                            let payload_any = driver
+                                .slot_take_payload(user_data)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
+                                        user_data, status, e
+                                    )
+                                });
+                            if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                                panic!("DetachedOp payload kind mismatch on submit recovery");
+                            }
+                            let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                            if let Some(op) = op_platform.take() {
+                                drop(op);
+                            }
+                            DetachedOp {
+                                completion_table: None,
+                                cancel_signal: None,
+                                cancel_waker: None,
+                                token: 0,
+                                immediate_failure: Some((e, T::from_user_payload(payload))),
+                                _phantom: std::marker::PhantomData,
+                            }
+                        } else {
+                            // status == InFlight: driver guaranteed an asynchronous result
+                            completion_table.mark_waiting(token);
+                            DetachedOp {
+                                completion_table: Some(completion_table),
+                                cancel_signal: Some(cancel_signal),
+                                cancel_waker: Some(cancel_waker),
+                                token,
+                                immediate_failure: None,
+                                _phantom: std::marker::PhantomData,
+                            }
+                        }
                     }
                 }
             }
@@ -248,6 +409,8 @@ impl<T> Op<T> {
                 // Return DetachedOp with immediate failure.
                 DetachedOp {
                     completion_table: None,
+                    cancel_signal: None,
+                    cancel_waker: None,
                     token: 0,
                     immediate_failure: Some((e, data)),
                     _phantom: std::marker::PhantomData,
@@ -260,7 +423,7 @@ impl<T> Op<T> {
     /// Returns a `LocalOp` future that resolves when the operation completes.
     pub fn submit_local<D>(self, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
     where
-        T: IntoPlatformOp<D::Op> + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
         D: Driver,
     {
         LocalOp::new(self.data, driver)
@@ -273,29 +436,59 @@ impl<T> Op<T> {
 
 /// A Future representing a detached operation.
 /// It polls a shared completion event queue by token.
-pub struct DetachedOp<T, O>
+pub struct DetachedOp<T, O, C>
 where
     O: PlatformOp,
-    T: IntoPlatformOp<O>,
+    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
 {
-    completion_table: Option<SharedCompletionTable>,
+    completion_table: Option<SharedCompletionTable<C>>,
+    cancel_signal: Option<std::sync::Arc<DetachedCancelTable>>,
+    cancel_waker: Option<Arc<dyn RemoteWaker>>,
     token: u64,
-    immediate_failure: Option<(std::io::Error, T)>,
-    _phantom: std::marker::PhantomData<(T, fn() -> O)>,
+    immediate_failure: Option<(DriverErrorReport, T)>,
+    _phantom: DetachedPhantom<T, O, C>,
 }
+
+type DetachedPhantom<T, O, C> = std::marker::PhantomData<(T, C, fn() -> O)>;
 
 // DetachedOp is Send/Sync if the Op data is Send and the Driver Op is Send (implied by SlotTable<Op> bound).
-unsafe impl<T: IntoPlatformOp<O> + std::marker::Send, O: PlatformOp> std::marker::Send
-    for DetachedOp<T, O>
+unsafe impl<
+    T: IntoPlatformOp<O, DriverCompletion = C> + std::marker::Send,
+    O: PlatformOp,
+    C: crate::driver::CompletionValue,
+> std::marker::Send for DetachedOp<T, O, C>
 {
 }
 
-impl<T, O> Future for DetachedOp<T, O>
+impl<T, O, C> Drop for DetachedOp<T, O, C>
 where
     O: PlatformOp,
-    T: IntoPlatformOp<O>,
+    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
 {
-    type Output = OpResult<T>;
+    fn drop(&mut self) {
+        if let Some(table) = self.completion_table.as_ref() {
+            table.mark_orphaned(self.token);
+        }
+        if let Some(cancel_signal) = self.cancel_signal.as_ref() {
+            cancel_signal.request_cancel(self.token);
+        }
+        if let Some(cancel_waker) = self.cancel_waker.as_ref()
+            && let Err(e) = cancel_waker.wake()
+        {
+            trace!("DetachedOp cancel wake failed: {}", e);
+        }
+    }
+}
+
+impl<T, O, C> Future for DetachedOp<T, O, C>
+where
+    O: PlatformOp,
+    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<O, DriverCompletion = C>,
+{
+    type Output = OpResult<T, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -308,33 +501,12 @@ where
             .completion_table
             .as_ref()
             .expect("DetachedOp missing completion_table but no immediate_failure");
-        if let Some(record) = table.try_take_record(this.token) {
-            let CompletionRecord {
-                event,
-                payload: payload_any,
-                detail,
-            } = record;
-            let Some(payload_any) = payload_any else {
-                return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                    "operation payload lost: completion sidecar missing",
-                )));
-            };
-            if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                    "operation payload lost: kind mismatch",
-                )));
-            }
-            let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-            let data = T::from_user_payload(payload);
-            let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
-            return Poll::Ready(OpResult::Completed(res, data));
+        if let Poll::Ready(result) = poll_completion_table_once::<T, O, C>(&**table, this.token) {
+            return Poll::Ready(result);
         }
 
-        if let Some(table) = this.completion_table.as_ref() {
-            table.register_waker(this.token, cx.waker());
-        }
-
-        Poll::Pending
+        table.register_waker(this.token, cx.waker());
+        poll_completion_table_once::<T, O, C>(&**table, this.token)
     }
 }
 
@@ -352,7 +524,7 @@ enum State {
 pub struct LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
 {
     state: State,
     data: Option<T>,
@@ -364,7 +536,7 @@ where
 impl<T, D> LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
 {
     /// Create a new local operation future.
     pub fn new(data: T, driver: Rc<RefCell<D>>) -> Self {
@@ -381,9 +553,9 @@ where
 impl<T, D> Future for LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
 {
-    type Output = OpResult<T>;
+    type Output = OpResult<T, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let op = unsafe { self.get_unchecked_mut() };
@@ -407,29 +579,42 @@ where
             };
             op.user_data = user_data;
             op.token = encode_completion_token(user_data, generation);
-            let slot_table = driver.slot_table();
-            let slot = &slot_table.slots[user_data];
-            unsafe {
-                *slot.payload.get() = Some(T::payload_into_erased(payload));
-            }
+            driver.slot_set_payload(user_data, T::payload_into_erased(payload));
 
             // Submit to driver.
             let mut driver_op_opt = Some(driver_op);
-            if let Err(e) = driver
+            let result = driver
                 .submit(user_data, &mut driver_op_opt, SubmitBinder::new())
-                .into_inner()
-            {
-                if let Some(val) = driver_op_opt.take() {
-                    drop(val);
+                .into_inner();
+
+            match result {
+                Ok(_) => {
+                    op.state = State::Submitted;
                 }
-                let payload_any = unsafe { (*slot.payload.get()).take() }
-                    .expect("Payload missing while recovering submit failure");
-                if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                    panic!("LocalOp payload kind mismatch on submit recovery");
+                Err((e, status)) => {
+                    if status == SubmitStatus::Void {
+                        if let Some(val) = driver_op_opt.take() {
+                            drop(val);
+                        }
+                        let payload_any = driver
+                            .slot_take_payload(user_data)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
+                                    user_data, status, e
+                                )
+                            });
+                        if payload_any.kind != T::PAYLOAD_KIND as u16 {
+                            panic!("LocalOp payload kind mismatch on submit recovery");
+                        }
+                        let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                        let data = T::from_user_payload(payload);
+                        return Poll::Ready(OpResult::Completed(Err(e), data));
+                    } else {
+                        // status == InFlight: driver guaranteed an asynchronous result
+                        op.state = State::Submitted;
+                    }
                 }
-                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-                let data = T::from_user_payload(payload);
-                return Poll::Ready(OpResult::Completed(Err(e), data));
             }
 
             op.state = State::Submitted;
@@ -437,30 +622,27 @@ where
 
         if let State::Submitted = op.state {
             let mut driver = op.driver.borrow_mut();
-            if let Some(record) = driver.try_take_completion_record(op.token) {
-                op.state = State::Completed;
-                let CompletionRecord {
-                    event,
-                    payload: payload_any,
-                    detail,
-                } = record;
-                let Some(payload_any) = payload_any else {
-                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                        "operation payload lost: completion sidecar missing",
-                    )));
-                };
-                if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                    return Poll::Ready(OpResult::Lost(std::io::Error::other(
-                        "operation payload lost: kind mismatch",
-                    )));
+            match poll_completion_table_once::<T, D::Op, D::Completion>(
+                &*driver.completion_table(),
+                op.token,
+            ) {
+                Poll::Ready(result) => {
+                    op.state = State::Completed;
+                    Poll::Ready(result)
                 }
-                let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
-                let data = T::from_user_payload(payload);
-                let res = detail.unwrap_or_else(|| event_res_to_io(event.res));
-                Poll::Ready(OpResult::Completed(res, data))
-            } else {
-                driver.register_completion_waker(op.token, cx.waker());
-                Poll::Pending
+                Poll::Pending => {
+                    driver.register_completion_waker(op.token, cx.waker());
+                    match poll_completion_table_once::<T, D::Op, D::Completion>(
+                        &*driver.completion_table(),
+                        op.token,
+                    ) {
+                        Poll::Ready(result) => {
+                            op.state = State::Completed;
+                            Poll::Ready(result)
+                        }
+                        Poll::Pending => Poll::Pending,
+                    }
+                }
             }
         } else {
             panic!("Polled after completion");
@@ -471,7 +653,7 @@ where
 impl<T, D> Drop for LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
 {
     fn drop(&mut self) {
         if let State::Submitted = self.state {
@@ -486,15 +668,17 @@ where
 // ============================================================================
 
 pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
-    type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static>: Future<
-        Output = OpResult<T>,
+    type Future<
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+    >: Future<
+        Output = OpResult<T, <T as IntoPlatformOp<D::Op>>::Completion>,
     >;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static;
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static;
 
-    fn from_current_context() -> std::io::Result<Self>;
+    fn from_current_context() -> Self;
 }
 
 // ============================================================================
@@ -505,18 +689,20 @@ pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
 pub struct LocalSubmitter;
 
 impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
-    type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static> = LocalOp<T, D>;
+    type Future<
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+    > = LocalOp<T, D>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
     where
-        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
     {
         trace!("Submitting local op");
         op.submit_local(driver)
     }
 
-    fn from_current_context() -> std::io::Result<Self> {
-        Ok(Self)
+    fn from_current_context() -> Self {
+        Self
     }
 }
 
@@ -528,22 +714,30 @@ impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
 pub struct DetachedSubmitter;
 
 impl DetachedSubmitter {
-    pub fn new() -> std::io::Result<Self> {
-        Ok(Self)
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for DetachedSubmitter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
-    type Future<T: IntoPlatformOp<D::Op> + std::marker::Send + 'static> = DetachedOp<T, D::Op>;
+    type Future<
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+    > = DetachedOp<T, D::Op, D::Completion>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
     {
         op.submit_detached(&mut *driver.borrow_mut())
     }
 
-    fn from_current_context() -> std::io::Result<Self> {
+    fn from_current_context() -> Self {
         Self::new()
     }
 }
@@ -553,34 +747,76 @@ impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
 // ============================================================================
 
 /// Read from a file descriptor at a specific offset using a fixed buffer.
-pub struct ReadFixed<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct ReadFixed {
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub offset: u64,
+    pub buf_offset: usize,
+}
+
+/// Read from a file handle using a platform raw handle.
+pub struct ReadRaw<H: RawHandleMeta> {
+    pub fd: H,
+    pub buf: FixedBuf,
+    pub offset: u64,
+    pub buf_offset: usize,
 }
 
 /// Write to a file descriptor at a specific offset using a fixed buffer.
-pub struct WriteFixed<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct WriteFixed {
+    pub fd: IoFd,
     pub buf: FixedBuf,
     pub offset: u64,
+    pub buf_offset: usize,
+}
+
+/// Write to a file handle using a platform raw handle.
+pub struct WriteRaw<H: RawHandleMeta> {
+    pub fd: H,
+    pub buf: FixedBuf,
+    pub offset: u64,
+    pub buf_offset: usize,
 }
 
 /// Receive data from a socket into a fixed buffer.
-pub struct Recv<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct Recv {
+    pub fd: IoFd,
     pub buf: FixedBuf,
+    pub buf_offset: usize,
 }
 
 /// Send data from a fixed buffer to a socket.
-pub struct Send<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct Send {
+    pub fd: IoFd,
     pub buf: FixedBuf,
+    pub buf_offset: usize,
+}
+
+/// Receive data from a UDP socket into a fixed buffer.
+pub struct UdpRecv {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+    pub buf_offset: usize,
+}
+
+/// Send data from a fixed buffer to a UDP socket.
+pub struct UdpSend {
+    pub fd: IoFd,
+    pub buf: FixedBuf,
+    pub buf_offset: usize,
 }
 
 /// Connect a socket to a remote address.
-pub struct Connect<H: Handle, A: SockAddr> {
-    pub fd: IoFd<H>,
+pub struct Connect<A: SockAddr> {
+    pub fd: IoFd,
+    /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
+    pub addr: A,
+    pub addr_len: u32,
+}
+
+/// Connect a UDP socket to a remote address.
+pub struct UdpConnect<A: SockAddr> {
+    pub fd: IoFd,
     /// Raw address bytes (sockaddr representation), boxed to reduce struct size.
     pub addr: A,
     pub addr_len: u32,
@@ -599,13 +835,20 @@ pub struct Open {
 }
 
 /// Close a file descriptor or handle.
-pub struct Close<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct Close {
+    pub fd: IoFd,
 }
 
 /// Flush file buffers to disk.
-pub struct Fsync<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct Fsync {
+    pub fd: IoFd,
+    /// If true, only sync data (not metadata).
+    pub datasync: bool,
+}
+
+/// Sync a raw file handle.
+pub struct FsyncRaw<H: RawHandleMeta> {
+    pub fd: H,
     /// If true, only sync data (not metadata).
     pub datasync: bool,
 }
@@ -616,14 +859,14 @@ pub struct Timeout {
 }
 
 /// Wake up the event loop.
-pub struct Wakeup<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct Wakeup {
+    pub fd: IoFd,
 }
 
 /// Accept a new connection on a listening socket.
 /// Result includes the new socket handle and remote address.
-pub struct Accept<H: Handle, A: SockAddr> {
-    pub fd: IoFd<H>,
+pub struct Accept<A: SockAddr> {
+    pub fd: IoFd,
     /// Buffer for storing the remote address.
     /// On Windows, we parse the result from the AcceptEx output buffer, so we don't need this storage.
     pub addr: A,
@@ -634,85 +877,213 @@ pub struct Accept<H: Handle, A: SockAddr> {
 }
 
 /// Send data to a specific address (UDP).
-pub struct SendTo<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct SendTo {
+    pub fd: IoFd,
     pub buf: FixedBuf,
+    pub buf_offset: usize,
     /// Target address.
     pub addr: std::net::SocketAddr,
 }
 
 /// Sync file range.
-pub struct SyncFileRange<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct SyncFileRange {
+    pub fd: IoFd,
+    pub offset: u64,
+    pub nbytes: u64,
+    pub flags: u32,
+}
+
+/// Sync a raw file handle range.
+pub struct SyncFileRangeRaw<H: RawHandleMeta> {
+    pub fd: H,
     pub offset: u64,
     pub nbytes: u64,
     pub flags: u32,
 }
 
 /// Pre-allocate file space.
-pub struct Fallocate<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct Fallocate {
+    pub fd: IoFd,
+    pub mode: i32,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Pre-allocate space on a raw file handle.
+pub struct FallocateRaw<H: RawHandleMeta> {
+    pub fd: H,
     pub mode: i32,
     pub offset: u64,
     pub len: u64,
 }
 
 /// Receive data as UDP datagram stream.
-pub struct UdpRecvStream<H: Handle> {
-    pub fd: IoFd<H>,
+pub struct UdpRecvStream {
+    pub fd: IoFd,
     /// Unix io_uring path uses this provided buffer; Windows can leave it as None.
     pub buf: Option<FixedBuf>,
     /// Unix io_uring path: source address parsed from recvmsg.
     pub addr: Option<std::net::SocketAddr>,
     /// Windows RIO path: resulting datagram, populated on completion.
-    pub result: Option<UdpRecvDatagram>,
+    pub result: Option<UdpRecvPacket>,
 }
 
 /// A received UDP datagram.
-pub struct UdpRecvDatagram {
+pub struct UdpRecvPacket {
     pub buf: FixedBuf,
     pub addr: std::net::SocketAddr,
-}
-
-/// Provide a buffer to the driver's internal RIO UDP pool.
-pub struct UdpRefill<H: Handle> {
-    pub fd: IoFd<H>,
-    pub buf: Option<FixedBuf>,
 }
 
 // ============================================================================
 // OpLifecycle Implementations
 // ============================================================================
 
-impl<H: Handle + From<usize>, A: SockAddr> OpLifecycle for Accept<H, A> {
-    type PreAlloc = ();
-    type Output = (H, std::net::SocketAddr);
-    type Handle = H;
+#[cfg(all(test, not(feature = "loom")))]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
 
-    fn pre_alloc(_fd: H) -> std::io::Result<Self::PreAlloc> {
-        Ok(())
+    #[derive(Clone, Copy)]
+    struct DummyOp;
+
+    #[derive(Clone, Copy)]
+    struct DummyPayload;
+
+    struct DummyPlatformOp;
+
+    impl crate::driver::PlatformOp for DummyPlatformOp {}
+
+    struct CountingWaker {
+        wakes: Arc<AtomicUsize>,
     }
 
-    fn into_op(fd: H, _pre: Self::PreAlloc) -> Self {
-        // Use stack/inline storage
-        let addr_len = std::mem::size_of::<A>() as u32;
-
-        Self {
-            fd: IoFd::Raw(fd),
-            addr: A::default(),
-            addr_len,
-            remote_addr: None,
+    impl RemoteWaker for CountingWaker {
+        fn wake(&self) -> DriverResult<()> {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
-    fn into_output(self, res: std::io::Result<usize>) -> std::io::Result<Self::Output> {
-        let fd = res?.into();
-        let addr = self.remote_addr.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "driver must populate Accept::remote_addr before completion",
-            )
-        })?;
-        Ok((fd, addr))
+    impl IntoPlatformOp<DummyPlatformOp> for DummyOp {
+        type UserPayload = DummyPayload;
+        type Completion = usize;
+        type DriverCompletion = usize;
+        const PAYLOAD_KIND: OpKind = OpKind::Wakeup;
+
+        fn into_kernel_and_payload(self) -> (DummyPlatformOp, Self::UserPayload) {
+            (DummyPlatformOp, DummyPayload)
+        }
+
+        fn from_user_payload(_: Self::UserPayload) -> Self {
+            Self
+        }
+
+        fn payload_into_erased(_: Self::UserPayload) -> crate::slot::ErasedPayload {
+            unsafe fn drop_payload(ptr: *mut ()) {
+                let _ = unsafe { Box::from_raw(ptr) };
+            }
+
+            let ptr = Box::into_raw(Box::new(()));
+            crate::slot::ErasedPayload {
+                ptr,
+                kind: Self::PAYLOAD_KIND as u16,
+                drop_fn: drop_payload,
+            }
+        }
+
+        unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
+            let _ = unsafe { Box::from_raw(ptr) };
+            DummyPayload
+        }
+
+        fn map_completion_result(
+            &self,
+            res: DriverResult<Self::DriverCompletion>,
+        ) -> DriverResult<Self::Completion> {
+            res
+        }
+    }
+
+    #[test]
+    fn detached_op_drop_triggers_cancel_wake() {
+        let completion_table: SharedCompletionTable =
+            Arc::new(crate::slot::SlotTable::<DummyPlatformOp, ()>::new(1));
+        let cancel_signal = Arc::new(DetachedCancelTable::new(1));
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let cancel_waker: Arc<dyn RemoteWaker> = Arc::new(CountingWaker {
+            wakes: wake_count.clone(),
+        });
+
+        let op = DetachedOp::<DummyOp, DummyPlatformOp, usize> {
+            completion_table: Some(completion_table),
+            cancel_signal: Some(cancel_signal),
+            cancel_waker: Some(cancel_waker),
+            token: encode_completion_token(0, 1),
+            immediate_failure: None,
+            _phantom: std::marker::PhantomData,
+        };
+
+        drop(op);
+
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+    }
+
+    struct CountingWake {
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn detached_op_rechecks_after_register_and_observes_ready_completion() {
+        let completion_table: SharedCompletionTable =
+            Arc::new(crate::slot::SlotTable::<DummyPlatformOp, ()>::new(1));
+        let token = encode_completion_token(0, 1);
+        completion_table.mark_waiting(token);
+
+        let mut op = Box::pin(DetachedOp::<DummyOp, DummyPlatformOp, usize> {
+            completion_table: Some(completion_table.clone()),
+            cancel_signal: None,
+            cancel_waker: None,
+            token,
+            immediate_failure: None,
+            _phantom: std::marker::PhantomData,
+        });
+
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWake {
+            wakes: wake_count.clone(),
+        }));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(op.as_mut().poll(&mut cx), Poll::Pending));
+
+        completion_table.record_completion_with_data(
+            crate::driver::CompletionEvent {
+                user_data: token,
+                res: 7,
+                flags: 0,
+            },
+            Some(DummyOp::payload_into_erased(DummyPayload)),
+            None,
+        );
+
+        let result = op.as_mut().poll(&mut cx);
+        match result {
+            Poll::Ready(OpResult::Completed(Ok(value), _)) => assert_eq!(value, 7),
+            _ => panic!("detached op should observe ready completion after recheck"),
+        }
+        assert!(wake_count.load(Ordering::SeqCst) >= 1);
     }
 }

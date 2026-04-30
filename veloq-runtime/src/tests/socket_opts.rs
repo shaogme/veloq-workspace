@@ -33,7 +33,7 @@ fn test_tcp_socket_options() {
         let listener_clone = listener_arc.clone();
 
         // Server task
-        let server_h = crate::runtime::context::spawn(async move {
+        let server_h = crate::runtime::context::spawn_eager(async move {
             let (stream, peer_addr) = listener_clone.accept().await.expect("Accept failed");
             println!("Accepted connection from: {}", peer_addr);
 
@@ -93,13 +93,11 @@ fn test_udp_socket_options() {
         let client = builder2
             .bind("127.0.0.1:0")
             .expect("Failed to bind UDP client");
-        let _client_addr = client
-            .local_addr()
-            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        let _client_addr = client.local_addr().expect("Failed to get local addr");
 
         let socket_clone = socket.clone();
         let (tx, rx) = veloq_sync::oneshot::channel::<()>();
-        let recv_h = crate::runtime::context::spawn(async move {
+        let recv_h = crate::runtime::context::spawn_eager(async move {
             let buf = crate::runtime::context::alloc(nz!(1024));
             let res = socket_clone.recv_stream(buf).await;
             let _ = res.expect("Failed to recv");
@@ -107,12 +105,11 @@ fn test_udp_socket_options() {
         });
 
         // Send packets in a loop in case of UDP drop
-        let send_h = crate::runtime::context::spawn(async move {
+        let send_h = crate::runtime::context::spawn_eager(async move {
             let mut rx = rx;
             loop {
                 let buf = crate::runtime::context::alloc(nz!(1024));
-                let (res, _) = client.send_to(buf, addr).await;
-                res.expect("Failed to send");
+                client.send_to(buf, addr).await.expect("Failed to send");
 
                 let sleep = crate::time::sleep(std::time::Duration::from_millis(50));
 

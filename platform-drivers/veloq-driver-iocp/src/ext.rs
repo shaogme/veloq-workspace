@@ -1,9 +1,9 @@
-use std::io;
+use crate::error::{IocpError, IocpResult, from_io_error};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCK_STREAM,
     SOCKADDR, SOCKET, WSA_FLAG_OVERLAPPED, WSAID_ACCEPTEX, WSAID_CONNECTEX,
-    WSAID_GETACCEPTEXSOCKADDRS, WSAID_MULTIPLE_RIO, WSAIoctl, WSASocketW, closesocket,
+    WSAID_GETACCEPTEXSOCKADDRS, WSAID_MULTIPLE_RIO, WSAIoctl, WSASocketW,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -57,7 +57,9 @@ impl std::fmt::Debug for Extensions {
 }
 
 impl Extensions {
-    pub(crate) fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> IocpResult<Self> {
+        // SAFETY: Calling `WSASocketW` to create a new TCP socket. The parameters
+        // are standard for a overlapped socket.
         let socket = unsafe {
             let s = WSASocketW(
                 AF_INET as i32,
@@ -68,15 +70,19 @@ impl Extensions {
                 WSA_FLAG_OVERLAPPED,
             );
             if s == INVALID_SOCKET {
-                return Err(io::Error::last_os_error());
+                return Err(from_io_error(
+                    IocpError::DriverInit,
+                    "WSASocketW",
+                    std::io::Error::last_os_error(),
+                ));
             }
-            s
+            crate::win32::SafeSocket(s)
         };
 
-        let traditional = Self::load_traditional(socket);
-        let rio = Self::load_rio(socket)?;
+        let traditional = Self::load_traditional(socket.as_raw());
+        let rio = Self::load_rio(socket.as_raw())?;
 
-        unsafe { closesocket(socket) };
+        // SafeSocket will be dropped here and closesocket will be called automatically.
 
         let (accept_ex, connect_ex, get_accept_ex_sockaddrs) = traditional?;
 
@@ -90,27 +96,29 @@ impl Extensions {
 
     fn load_traditional(
         socket: SOCKET,
-    ) -> io::Result<(LpfnAcceptEx, LpfnConnectEx, LpfnGetAcceptExSockaddrs)> {
-        unsafe {
-            let accept_ex_ptr = Self::get_extension(socket, WSAID_ACCEPTEX)?;
-            let connect_ex_ptr = Self::get_extension(socket, WSAID_CONNECTEX)?;
-            let get_accept_ex_sockaddrs_ptr =
-                Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
+    ) -> IocpResult<(LpfnAcceptEx, LpfnConnectEx, LpfnGetAcceptExSockaddrs)> {
+        let accept_ex_ptr = Self::get_extension(socket, WSAID_ACCEPTEX)?;
+        let connect_ex_ptr = Self::get_extension(socket, WSAID_CONNECTEX)?;
+        let get_accept_ex_sockaddrs_ptr = Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
 
-            let accept_ex =
-                std::mem::transmute::<*const std::ffi::c_void, LpfnAcceptEx>(accept_ex_ptr);
-            let connect_ex =
-                std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(connect_ex_ptr);
-            let get_accept_ex_sockaddrs = std::mem::transmute::<
-                *const std::ffi::c_void,
-                LpfnGetAcceptExSockaddrs,
-            >(get_accept_ex_sockaddrs_ptr);
+        // SAFETY: These raw pointers are returned by WinSock for the corresponding
+        // extension GUIDs and are valid function pointers with matching ABI/signature.
+        let funcs = unsafe {
+            (
+                std::mem::transmute::<*const std::ffi::c_void, LpfnAcceptEx>(accept_ex_ptr),
+                std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(connect_ex_ptr),
+                std::mem::transmute::<*const std::ffi::c_void, LpfnGetAcceptExSockaddrs>(
+                    get_accept_ex_sockaddrs_ptr,
+                ),
+            )
+        };
 
-            Ok((accept_ex, connect_ex, get_accept_ex_sockaddrs))
-        }
+        Ok(funcs)
     }
 
-    fn load_rio(socket: SOCKET) -> io::Result<RIO_EXTENSION_FUNCTION_TABLE> {
+    fn load_rio(socket: SOCKET) -> IocpResult<RIO_EXTENSION_FUNCTION_TABLE> {
+        // SAFETY: `RIO_EXTENSION_FUNCTION_TABLE` is a POD struct. `WSAIoctl` is
+        // called to fill it. Memory layout for the struct is guaranteed to be compatible.
         unsafe {
             let mut guid = WSAID_MULTIPLE_RIO;
             let mut table: RIO_EXTENSION_FUNCTION_TABLE = std::mem::zeroed();
@@ -133,19 +141,25 @@ impl Extensions {
             if ret == 0 {
                 Ok(table)
             } else {
-                Err(io::Error::last_os_error())
+                Err(from_io_error(
+                    IocpError::Rio,
+                    "WSAIoctl.load_rio",
+                    std::io::Error::last_os_error(),
+                ))
             }
         }
     }
 
-    unsafe fn get_extension(
+    fn get_extension(
         socket: SOCKET,
         guid: windows_sys::core::GUID,
-    ) -> io::Result<*const std::ffi::c_void> {
+    ) -> IocpResult<*const std::ffi::c_void> {
         let mut guid = guid;
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut bytes_returned = 0;
 
+        // SAFETY: `WSAIoctl` is called with correct pointers and sizes for the requested GUID extension pointer.
+        // The pointers are valid and owned by the stack.
         let ret = unsafe {
             WSAIoctl(
                 socket,
@@ -160,10 +174,14 @@ impl Extensions {
             )
         };
 
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
+        if ret == 0 {
+            Ok(ptr)
+        } else {
+            Err(from_io_error(
+                IocpError::DriverInit,
+                "WSAIoctl.get_extension",
+                std::io::Error::last_os_error(),
+            ))
         }
-
-        Ok(ptr as *const _)
     }
 }

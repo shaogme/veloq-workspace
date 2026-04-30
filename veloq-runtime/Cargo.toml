@@ -31,6 +31,7 @@ crossbeam-utils.workspace = true
 crossbeam-queue.workspace = true
 crossbeam-deque = "0.8"
 tracing = "0.1.44"
+error-stack.workspace = true
 parking_lot.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -43,8 +44,9 @@ rustc-hash = "2.1.1"
 
 [dev-dependencies]
 criterion.workspace = true
-tracing-subscriber = "0.3.22"
+tracing-subscriber = "0.3.23"
 veloq-driver = { workspace = true, features = ["test-hooks"] }
+tokio.workspace = true
 
 [[bench]]
 name = "fs_benchmark"
@@ -52,6 +54,10 @@ harness = false
 
 [[bench]]
 name = "sync_alloc_bench"
+harness = false
+
+[[bench]]
+name = "net_tokio_compare_bench"
 harness = false
 
 [lints]

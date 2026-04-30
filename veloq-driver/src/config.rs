@@ -1,26 +1,69 @@
+use std::num::NonZeroU32;
+
+use veloq_buf::nz;
 #[cfg(windows)]
 pub use veloq_driver_iocp::{BufferRegistrationMode, IocpConfig};
-#[cfg(not(windows))]
-pub use veloq_driver_uring::{BufferRegistrationMode, IoMode, IocpConfig, UringConfig};
 
+#[cfg(not(windows))]
+pub use veloq_driver_uring::{BufferRegistrationMode, IoMode, UringConfig};
+
+/// I/O submission mode.
 #[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IoMode {
+    /// Interrupt-based I/O.
+    #[default]
     Interrupt,
-    Polling(std::num::NonZeroU32),
+    /// Polling-based I/O with a specific timeout.
+    Polling(NonZeroU32),
 }
 
+/// Configuration for the IOCP driver (Shim for non-Windows platforms).
+#[cfg(not(windows))]
+#[derive(Debug, Clone)]
+pub struct IocpConfig {
+    /// Number of entries in the completion port.
+    pub entries: NonZeroU32,
+    /// Mode for buffer registration.
+    pub registration_mode: BufferRegistrationMode,
+}
+
+#[cfg(not(windows))]
+impl IocpConfig {
+    /// Sets the registration mode.
+    pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
+        self.registration_mode = mode;
+        self
+    }
+}
+
+#[cfg(not(windows))]
+impl Default for IocpConfig {
+    fn default() -> Self {
+        Self {
+            entries: nz!(1024),
+            registration_mode: BufferRegistrationMode::Strict,
+        }
+    }
+}
+
+/// Configuration for the io_uring driver (Shim for Windows platform).
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 pub struct UringConfig {
+    /// I/O mode (Interrupt or Polling).
     pub mode: IoMode,
-    pub entries: std::num::NonZeroU32,
+    /// Number of entries in the ring.
+    pub entries: NonZeroU32,
+    /// Mode for buffer registration.
     pub registration_mode: BufferRegistrationMode,
 }
 
 #[cfg(windows)]
-impl AsRef<UringConfig> for UringConfig {
-    fn as_ref(&self) -> &UringConfig {
+impl UringConfig {
+    /// Sets the registration mode.
+    pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
+        self.registration_mode = mode;
         self
     }
 }
@@ -30,16 +73,8 @@ impl Default for UringConfig {
     fn default() -> Self {
         Self {
             mode: IoMode::Interrupt,
-            entries: std::num::NonZeroU32::new(1024).unwrap(),
+            entries: nz!(1024),
             registration_mode: BufferRegistrationMode::Strict,
         }
-    }
-}
-
-#[cfg(windows)]
-impl UringConfig {
-    pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
-        self.registration_mode = mode;
-        self
     }
 }

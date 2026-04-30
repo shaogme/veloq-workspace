@@ -12,7 +12,7 @@ use crossbeam_utils::CachePadded;
 use tracing::{debug, trace, warn};
 use veloq_buf::BufferRegistrar;
 use veloq_driver::config::BufferRegistrationMode;
-use veloq_driver::driver::{Driver, PlatformDriver, RemoteWaker};
+use veloq_driver::driver::{Driver, DriverControlCommand, PlatformDriver, RemoteWaker};
 
 use crate::runtime::context::RuntimeContext;
 pub(crate) use crate::runtime::executor::spawner::ExecutorShared;
@@ -39,6 +39,7 @@ pub struct LocalExecutorBuilder {
     shared: Option<Arc<ExecutorShared>>,
     remote_receiver: Option<mpsc::Receiver<Task>>,
     pinned_receiver: Option<mpsc::Receiver<SpawnedTask>>,
+    control_receiver: Option<mpsc::Receiver<Vec<DriverControlCommand>>>,
     stealable: Option<Worker<Runnable>>,
     stealer: Option<crossbeam_deque::Stealer<Runnable>>,
     registry: Option<Arc<ExecutorRegistry>>,
@@ -57,6 +58,7 @@ impl LocalExecutorBuilder {
             shared: None,
             remote_receiver: None,
             pinned_receiver: None,
+            control_receiver: None,
             stealable: None,
             stealer: None,
             registry: None,
@@ -75,6 +77,14 @@ impl LocalExecutorBuilder {
 
     pub(crate) fn with_pinned_receiver(mut self, receiver: mpsc::Receiver<SpawnedTask>) -> Self {
         self.pinned_receiver = Some(receiver);
+        self
+    }
+
+    pub(crate) fn with_control_receiver(
+        mut self,
+        receiver: mpsc::Receiver<Vec<DriverControlCommand>>,
+    ) -> Self {
+        self.control_receiver = Some(receiver);
         self
     }
 
@@ -119,35 +129,41 @@ impl LocalExecutorBuilder {
             (w, s)
         };
 
-        let (shared, remote_receiver, pinned_receiver) = if let Some(shared) = self.shared {
-            let remote_rec = self
-                .remote_receiver
-                .expect("Shared state provided without remote receiver");
-            let pinned_rec = self
-                .pinned_receiver
-                .expect("Shared state provided without pinned receiver");
-            (shared, remote_rec, pinned_rec)
-        } else {
-            let (remote_tx, remote_rx) = mpsc::channel();
-            let (pinned_tx, pinned_rx) = mpsc::channel();
-            // Default state is RUNNING
-            let state = Arc::new(AtomicU8::new(RUNNING));
+        let (shared, remote_receiver, pinned_receiver, control_receiver) =
+            if let Some(shared) = self.shared {
+                let remote_rec = self
+                    .remote_receiver
+                    .expect("Shared state provided without remote receiver");
+                let pinned_rec = self
+                    .pinned_receiver
+                    .expect("Shared state provided without pinned receiver");
+                let control_rec = self
+                    .control_receiver
+                    .expect("Shared state provided without control receiver");
+                (shared, remote_rec, pinned_rec, control_rec)
+            } else {
+                let (remote_tx, remote_rx) = mpsc::channel();
+                let (pinned_tx, pinned_rx) = mpsc::channel();
+                let (control_tx, control_rx) = mpsc::channel();
+                // Default state is RUNNING
+                let state = Arc::new(AtomicU8::new(RUNNING));
 
-            let queue_capacity = self.config.internal_queue_capacity;
+                let queue_capacity = self.config.queue_capacity();
 
-            let shared = Arc::new(ExecutorShared {
-                pinned: pinned_tx,
-                remote_queue: remote_tx,
-                future_injector: ArrayQueue::new(queue_capacity),
-                stealer,
-                waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
-                injected_load: CachePadded::new(AtomicUsize::new(0)),
-                local_load: CachePadded::new(AtomicUsize::new(0)),
-                state,
-                shutdown: AtomicBool::new(false),
-            });
-            (shared, remote_rx, pinned_rx)
-        };
+                let shared = Arc::new(ExecutorShared {
+                    pinned: pinned_tx,
+                    remote_queue: remote_tx,
+                    control_queue: control_tx,
+                    future_injector: ArrayQueue::new(queue_capacity),
+                    stealer,
+                    waker: crate::runtime::executor::spawner::LateBoundWaker::new(),
+                    injected_load: CachePadded::new(AtomicUsize::new(0)),
+                    local_load: CachePadded::new(AtomicUsize::new(0)),
+                    state,
+                    shutdown: AtomicBool::new(false),
+                });
+                (shared, remote_rx, pinned_rx, control_rx)
+            };
 
         // Bind the driver's waker to the shared state (Late Binding)
         shared.waker.set(waker);
@@ -170,9 +186,9 @@ impl LocalExecutorBuilder {
         let buf_pool = pool_constructor(registrar);
 
         #[cfg(target_os = "linux")]
-        let registration_mode = self.config.uring.registration_mode;
+        let registration_mode = self.config.get_uring().registration_mode;
         #[cfg(target_os = "windows")]
-        let registration_mode = self.config.iocp.registration_mode;
+        let registration_mode = self.config.get_iocp().registration_mode;
 
         LocalExecutor {
             driver,
@@ -180,6 +196,7 @@ impl LocalExecutorBuilder {
             shared,
             remote_receiver,
             pinned_receiver,
+            control_receiver,
             stealable: Rc::new(stealable),
             registry: self.registry,
             id: usize::MAX,
@@ -226,6 +243,7 @@ pub struct LocalExecutor {
     shared: Arc<ExecutorShared>,
     remote_receiver: mpsc::Receiver<Task>,
     pinned_receiver: mpsc::Receiver<SpawnedTask>,
+    control_receiver: mpsc::Receiver<Vec<DriverControlCommand>>,
 
     // Local Stealable Queue (Send Tasks)
     stealable: Rc<Worker<Runnable>>,
@@ -245,12 +263,6 @@ pub struct LocalExecutor {
 }
 
 impl LocalExecutor {
-    /// Get the raw handle (fd) of the underlying driver.
-    /// Used for Mesh initialization.
-    pub fn raw_driver_handle(&self) -> usize {
-        self.driver.borrow().inner_handle().into()
-    }
-
     pub fn driver_handle(&self) -> std::rc::Weak<RefCell<PlatformDriver>> {
         Rc::downgrade(&self.driver)
     }
@@ -357,10 +369,27 @@ impl LocalExecutor {
         false
     }
 
+    fn try_poll_driver_control(&self) -> bool {
+        let mut did_work = false;
+        while let Ok(commands) = self.control_receiver.try_recv() {
+            did_work = true;
+            let mut driver = self.driver.borrow_mut();
+            for command in commands {
+                match command {
+                    DriverControlCommand::UnregisterFiles(files) => {
+                        let _ = driver.unregister_files(files);
+                    }
+                }
+            }
+        }
+        did_work
+    }
+
     fn try_poll_future_injector(&self) -> bool {
         if let Some(task) = self.shared.future_injector.pop() {
             self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
-            task.run();
+            self.shared.local_load.fetch_add(1, Ordering::Relaxed);
+            self.stealable.push(task);
             return true;
         }
         false
@@ -383,19 +412,11 @@ impl LocalExecutor {
                         continue;
                     }
 
-                    // Steal from future_injector (Runnable)
-                    if let Some(task) = target.shared.future_injector.pop() {
-                        target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
-                        task.run();
-                        return true;
-                    }
-
                     // Steal from Stealer (Runnable)
                     use crossbeam_deque::Steal;
                     match target.shared.stealer.steal() {
                         Steal::Success(task) => {
-                            // We assume if we stole it, it was part of the load.
-                            target.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+                            target.shared.local_load.fetch_sub(1, Ordering::Relaxed);
                             trace!("Stole task from worker");
                             task.run();
                             return true;
@@ -477,7 +498,10 @@ impl LocalExecutor {
 
             // Double check remote queues
             if can_park {
-                if let Ok(job) = self.pinned_receiver.try_recv() {
+                if self.try_poll_driver_control() {
+                    state.store(RUNNING, Ordering::Relaxed);
+                    can_park = false;
+                } else if let Ok(job) = self.pinned_receiver.try_recv() {
                     self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
                     self.enqueue_job(job);
                     state.store(RUNNING, Ordering::Relaxed);
@@ -514,6 +538,7 @@ impl LocalExecutor {
         let context = RuntimeContext::new(
             self.driver_handle(),
             Rc::downgrade(&self.queue),
+            Rc::downgrade(&self.stealable),
             spawner,
             self.handle(),
             self.buf_pool.clone(),
@@ -543,10 +568,7 @@ impl LocalExecutor {
 
                 // 1. Poll Stealable (Send Tasks - LIFO)
                 if let Some(task) = self.stealable.pop() {
-                    // We count stealable tasks in injected_load or local_load?
-                    // Spawner: future_injector -> injected_load.
-                    // Context: stealable -> injected_load (we decided this).
-                    self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+                    self.shared.local_load.fetch_sub(1, Ordering::Relaxed);
                     task.run();
                     executed += 1;
                     continue;
@@ -564,6 +586,10 @@ impl LocalExecutor {
                 }
 
                 // 3. Poll Injector
+                if self.try_poll_driver_control() {
+                    continue;
+                }
+
                 if self.try_poll_injector() {
                     continue;
                 }
@@ -598,6 +624,7 @@ impl LocalExecutor {
         let context = RuntimeContext::new(
             self.driver_handle(),
             Rc::downgrade(&self.queue),
+            Rc::downgrade(&self.stealable),
             spawner,
             self.handle(),
             self.buf_pool.clone(),
@@ -629,7 +656,7 @@ impl LocalExecutor {
 
                 // 1. Poll Stealable (Send Tasks - LIFO)
                 if let Some(task) = self.stealable.pop() {
-                    self.shared.injected_load.fetch_sub(1, Ordering::Relaxed);
+                    self.shared.local_load.fetch_sub(1, Ordering::Relaxed);
                     task.run();
                     executed += 1;
                     continue;
@@ -655,6 +682,10 @@ impl LocalExecutor {
                 }
 
                 // 3. Poll Injector
+                if self.try_poll_driver_control() {
+                    continue;
+                }
+
                 if self.try_poll_injector() {
                     continue;
                 }
@@ -764,7 +795,9 @@ impl<D: Driver> BufferRegistrar for ExecutorRegistrar<D> {
 
         let mut indices = Vec::with_capacity(regions.len());
         for (i, region) in regions.iter().enumerate() {
-            driver.register_chunk(i as u16, region.as_ptr(), region.len())?;
+            driver
+                .register_chunk(i as u16, region.as_ptr(), region.len())
+                .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
             indices.push(i);
         }
         Ok(indices)

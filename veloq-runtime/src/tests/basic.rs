@@ -1,11 +1,12 @@
 //! Basic runtime tests for spawn and spawn_local functionality.
 
 use crate::runtime::{LocalExecutor, Runtime};
-use crate::spawn_local;
 use crate::sync::mpsc;
+use crate::{spawn, spawn_eager, spawn_local};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn create_local_executor() -> LocalExecutor {
     LocalExecutor::new_default()
@@ -99,6 +100,46 @@ fn test_runtime_global_spawn() {
     });
 
     assert_eq!(rx.recv().unwrap(), 42);
+}
+
+/// Test that `spawn` only enqueues the task and does not poll it immediately.
+#[test]
+fn test_spawn_is_deferred() {
+    let mut exec = create_local_executor();
+    let started = Arc::new(AtomicBool::new(false));
+    let started_clone = started.clone();
+
+    exec.block_on(async move {
+        let handle = spawn(async move {
+            started_clone.store(true, Ordering::SeqCst);
+            7
+        });
+
+        assert!(!started.load(Ordering::SeqCst));
+
+        crate::runtime::context::yield_now().await;
+
+        assert!(started.load(Ordering::SeqCst));
+        assert_eq!(handle.await, 7);
+    });
+}
+
+/// Test that `spawn_eager` preserves the old "poll once immediately" behavior.
+#[test]
+fn test_spawn_eager_is_immediate() {
+    let mut exec = create_local_executor();
+    let started = Arc::new(AtomicBool::new(false));
+    let started_clone = started.clone();
+
+    exec.block_on(async move {
+        let handle = spawn_eager(async move {
+            started_clone.store(true, Ordering::SeqCst);
+            11
+        });
+
+        assert!(started.load(Ordering::SeqCst));
+        assert_eq!(handle.await, 11);
+    });
 }
 
 /// Test global spawn works from INSIDE a worker.

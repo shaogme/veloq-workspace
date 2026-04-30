@@ -1,24 +1,63 @@
+use crate::error::{DriverErrorKind, DriverErrorReport, DriverResult, driver_os_error};
 use crate::slot;
-use crate::{Handle, IoFd, SlotSidecar};
+use crate::slot::is_runnable_state;
+use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
 use crossbeam_queue::SegQueue;
-use std::cell::UnsafeCell;
-use std::io;
+
+use veloq_shim::atomic::Ordering;
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+
 use std::task::Poll;
 use std::task::Waker;
-use veloq_atomic_waker::AtomicWaker;
 
-/// Platform-specific operation trait
+pub const CELL_STATE_IDLE: u8 = 0;
+pub const CELL_STATE_WAITING: u8 = 1;
+pub const CELL_STATE_READY: u8 = 2;
+pub const CELL_STATE_ORPHANED: u8 = 3;
+pub const CELL_STATE_BUSY: u8 = 4;
+
 pub trait PlatformOp: 'static {}
 
-pub struct CompletionSidecar {
+pub enum RegisterFd<'a, H: RawHandleMeta> {
+    Borrowed(BorrowedRawHandle<'a, H>),
+    Owned(OwnedRawHandle<H>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriverControlCommand {
+    UnregisterFiles(Vec<IoFd>),
+}
+
+pub trait CompletionValue: Send + 'static {
+    fn from_event_res(res: i32) -> DriverResult<Self>
+    where
+        Self: Sized;
+}
+
+impl CompletionValue for usize {
+    #[inline]
+    fn from_event_res(res: i32) -> DriverResult<Self> {
+        if res >= 0 {
+            Ok(res as usize)
+        } else {
+            Err(driver_os_error(
+                DriverErrorKind::System,
+                "driver-core/completion",
+                -res,
+                "completion reported OS error",
+            ))
+        }
+    }
+}
+
+pub struct CompletionSidecar<R = usize> {
     pub user_data: usize,
     pub generation: u32,
     pub res: i32,
     pub flags: u32,
     pub payload: Option<slot::ErasedPayload>,
-    pub detail: Option<io::Result<usize>>,
+    pub detail: Option<DriverResult<R>>,
 }
 
 /// Unified completion event produced by platform drivers.
@@ -33,120 +72,229 @@ pub struct CompletionEvent {
 }
 
 pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
-pub type SharedCompletionTable = Arc<CompletionTable>;
+pub type SharedCompletionTable<R = usize> = Arc<dyn CompletionAccess<R>>;
 
-pub struct CompletionCell {
-    expected_generation: AtomicU32,
-    ready_generation: AtomicU32,
-    ready: AtomicBool,
-    res: AtomicI32,
-    flags: AtomicU32,
-    payload: UnsafeCell<Option<slot::ErasedPayload>>,
-    detail: UnsafeCell<Option<io::Result<usize>>>,
-    waker: AtomicWaker,
-}
-
-unsafe impl Sync for CompletionCell {}
-
-impl CompletionCell {
-    fn new() -> Self {
-        Self {
-            expected_generation: AtomicU32::new(0),
-            ready_generation: AtomicU32::new(0),
-            ready: AtomicBool::new(false),
-            res: AtomicI32::new(0),
-            flags: AtomicU32::new(0),
-            payload: UnsafeCell::new(None),
-            detail: UnsafeCell::new(None),
-            waker: AtomicWaker::new(),
-        }
-    }
-}
-
-pub struct CompletionRecord {
+pub struct CompletionRecord<R = usize> {
     pub event: CompletionEvent,
     pub payload: Option<slot::ErasedPayload>,
-    pub detail: Option<io::Result<usize>>,
+    pub detail: Option<DriverResult<R>>,
 }
 
-pub struct CompletionTable {
-    cells: Box<[CompletionCell]>,
+/// Result of a completion poll, enabling detection of recycled slots.
+pub enum PollRecordResult<R = usize> {
+    /// Operation completed successfully or with an error.
+    Ready(CompletionRecord<R>),
+    /// Operation is still in flight.
+    Pending,
+    /// Operation lost because the slot has been recycled for a newer generation.
+    Stale,
 }
 
-impl CompletionTable {
-    pub fn new(capacity: usize) -> Self {
-        let mut cells = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            cells.push(CompletionCell::new());
-        }
-        Self {
-            cells: cells.into_boxed_slice(),
-        }
-    }
-
-    #[inline]
-    pub fn record_completion_with_data(
+pub trait CompletionAccess<R = usize>: Send + Sync {
+    fn record_completion_with_data(
         &self,
         event: CompletionEvent,
         payload: Option<slot::ErasedPayload>,
-        detail: Option<io::Result<usize>>,
+        detail: Option<DriverResult<R>>,
+    );
+
+    fn try_take_record(&self, token: u64) -> PollRecordResult<R>;
+
+    #[inline]
+    fn try_take(&self, token: u64) -> PollRecordResult<R> {
+        self.try_take_record(token)
+    }
+
+    fn register_waker(&self, token: u64, waker: &Waker);
+
+    fn mark_waiting(&self, token: u64);
+
+    fn mark_orphaned(&self, token: u64);
+
+    #[cfg(any(test, feature = "loom"))]
+    fn debug_get_state(&self, idx: usize) -> u8;
+}
+
+impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
+    for slot::SlotTable<Op, S, R>
+{
+    #[inline]
+    fn record_completion_with_data(
+        &self,
+        event: CompletionEvent,
+        mut payload: Option<slot::ErasedPayload>,
+        mut detail: Option<DriverResult<R>>,
     ) {
         let (idx, generation) = decode_completion_token(event.user_data);
-        if idx >= self.cells.len() {
+        if idx >= self.slots.len() {
             return;
         }
-        let cell = &self.cells[idx];
-        if cell.ready.swap(false, Ordering::AcqRel) {
-            unsafe {
-                let _ = (*cell.payload.get()).take();
-                let _ = (*cell.detail.get()).take();
+        let cell = &self.slots[idx];
+        let ready_from = loop {
+            let current = cell.load_core_state(Ordering::Acquire);
+            let state = current.state();
+            let cell_gen = current.generation();
+
+            if generation < cell_gen {
+                return;
+            }
+            if generation > cell_gen && state != slot::SlotState::Idle {
+                return;
+            }
+
+            match state {
+                slot::SlotState::Idle
+                | slot::SlotState::Reserved
+                | slot::SlotState::InFlightReady
+                | slot::SlotState::InFlightWaiting
+                | slot::SlotState::ReservedValue => {
+                    if cell
+                        .core_state
+                        .compare_exchange(current, current, Ordering::Acquire, Ordering::Acquire)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    if state == slot::SlotState::InFlightReady {
+                        cell.completion_with_data(|payload_cell, detail_cell| {
+                            let _ = payload_cell.take();
+                            let _ = detail_cell.take();
+                        });
+                    }
+                    break current;
+                }
+                slot::SlotState::InFlightOrphaned => {
+                    if cell_gen == generation {
+                        if cell
+                            .core_state
+                            .compare_exchange(
+                                current,
+                                current
+                                    .with_state(slot::SlotState::Idle)
+                                    .with_generation(generation),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            // Abandoned by consumer, drop incoming data
+                            let _ = payload.take();
+                            let _ = detail.take();
+                            return;
+                        }
+                    } else {
+                        // generation > cell_gen but state is ORPHANED?
+                        // Strict rule says reject.
+                        return;
+                    }
+                }
+                slot::SlotState::Finalizing => continue,
+            }
+        };
+
+        cell.completion_with_data(|payload_cell, detail_cell| {
+            *payload_cell = payload.take();
+            *detail_cell = detail.take();
+        });
+        cell.completion_res.store(event.res, Ordering::Release);
+        cell.completion_flags.store(event.flags, Ordering::Release);
+
+        match cell.core_state.compare_exchange(
+            ready_from,
+            ready_from
+                .with_state(slot::SlotState::InFlightReady)
+                .with_generation(generation),
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(next) => {
+                let next_gen = next.generation();
+                let next_state = next.state();
+                if next_gen == generation
+                    && next_state == slot::SlotState::InFlightWaiting
+                    && cell
+                        .core_state
+                        .compare_exchange(
+                            next,
+                            next.with_state(slot::SlotState::InFlightReady)
+                                .with_generation(generation),
+                            Ordering::Release,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    cell.completion_waker.wake();
+                    return;
+                }
+
+                cell.completion_with_data(|payload_cell, detail_cell| {
+                    let _ = payload_cell.take();
+                    let _ = detail_cell.take();
+                });
+                let cur = cell.load_core_state(Ordering::Acquire);
+                if cur.generation() == generation
+                    && cur.state() == slot::SlotState::InFlightOrphaned
+                {
+                    let _ = cell.core_state.compare_exchange(
+                        cur,
+                        cur.with_state(slot::SlotState::Idle)
+                            .with_generation(generation),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                return;
             }
         }
-        unsafe {
-            *cell.payload.get() = payload;
-            *cell.detail.get() = detail;
-        }
-        cell.res.store(event.res, Ordering::Release);
-        cell.flags.store(event.flags, Ordering::Release);
-        cell.ready_generation.store(generation, Ordering::Release);
-        cell.ready.store(true, Ordering::Release);
-        if cell.expected_generation.load(Ordering::Acquire) == generation {
-            cell.waker.wake();
-        }
+
+        cell.completion_waker.wake();
     }
 
     #[inline]
-    pub fn try_take(&self, token: u64) -> Option<CompletionEvent> {
-        self.try_take_record(token).map(|record| record.event)
-    }
-
-    #[inline]
-    pub fn try_take_record(&self, token: u64) -> Option<CompletionRecord> {
+    fn try_take_record(&self, token: u64) -> PollRecordResult<R> {
         let (idx, generation) = decode_completion_token(token);
-        if idx >= self.cells.len() {
-            return None;
+        if idx >= self.slots.len() {
+            return PollRecordResult::Pending;
         }
-        let cell = &self.cells[idx];
-        if !cell.ready.load(Ordering::Acquire) {
-            return None;
+        let cell = &self.slots[idx];
+
+        let current = cell.load_core_state(Ordering::Acquire);
+        let state = current.state();
+        let cell_gen = current.generation();
+
+        // If the cell's generation is strictly greater than ours, we are stale.
+        if cell_gen > generation {
+            return PollRecordResult::Stale;
         }
-        if cell.ready_generation.load(Ordering::Acquire) != generation {
-            return None;
+
+        if state != slot::SlotState::InFlightReady || cell_gen != generation {
+            return PollRecordResult::Pending;
         }
+
         if cell
-            .ready
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .core_state
+            .compare_exchange(
+                current,
+                current
+                    .with_state(slot::SlotState::Idle)
+                    .with_generation(generation),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_err()
         {
-            return None;
+            return PollRecordResult::Pending;
         }
-        let payload = unsafe { (*cell.payload.get()).take() };
-        let detail = unsafe { (*cell.detail.get()).take() };
-        Some(CompletionRecord {
+
+        let (payload, detail) = cell.completion_with_data(|payload_cell, detail_cell| {
+            (payload_cell.take(), detail_cell.take())
+        });
+        PollRecordResult::Ready(CompletionRecord {
             event: CompletionEvent {
                 user_data: token,
-                res: cell.res.load(Ordering::Acquire),
-                flags: cell.flags.load(Ordering::Acquire),
+                res: cell.completion_res.load(Ordering::Acquire),
+                flags: cell.completion_flags.load(Ordering::Acquire),
             },
             payload,
             detail,
@@ -154,19 +302,216 @@ impl CompletionTable {
     }
 
     #[inline]
-    pub fn register_waker(&self, token: u64, waker: &Waker) {
+    fn register_waker(&self, token: u64, waker: &Waker) {
         let (idx, generation) = decode_completion_token(token);
-        if idx >= self.cells.len() {
+        if idx >= self.slots.len() {
             return;
         }
-        let cell = &self.cells[idx];
-        cell.expected_generation
-            .store(generation, Ordering::Release);
-        cell.waker.register(waker);
-        if cell.ready.load(Ordering::Acquire)
-            && cell.ready_generation.load(Ordering::Acquire) == generation
-        {
-            waker.wake_by_ref();
+        let cell = &self.slots[idx];
+
+        loop {
+            let current = cell.load_core_state(Ordering::Acquire);
+            let state = current.state();
+            let cell_gen = current.generation();
+
+            // Register waker first to avoid missing a race.
+            cell.completion_waker.register(waker);
+
+            if cell_gen > generation {
+                // Already stale, no point in waiting or updating.
+                return;
+            }
+
+            if cell_gen < generation {
+                if state == slot::SlotState::Idle {
+                    if cell
+                        .core_state
+                        .compare_exchange(
+                            current,
+                            current
+                                .with_state(slot::SlotState::InFlightWaiting)
+                                .with_generation(generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        // Successfully initialized to new generation WAITING state.
+                        // Re-check for fast completion.
+                        let current_after = cell.load_core_state(Ordering::Acquire);
+                        let state_after = current_after.state();
+                        let gen_after = current_after.generation();
+                        if state_after == slot::SlotState::InFlightReady && gen_after == generation
+                        {
+                            waker.wake_by_ref();
+                        }
+                        return;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    // Slot not yet IDLE, cannot upgrade.
+                    return;
+                }
+            }
+
+            // cell_gen == generation path.
+            // Check for fast completion.
+            let current_after = cell.load_core_state(Ordering::Acquire);
+            let state_after = current_after.state();
+            let gen_after = current_after.generation();
+            if state_after == slot::SlotState::InFlightReady && gen_after == generation {
+                waker.wake_by_ref();
+            }
+            return;
+        }
+    }
+
+    #[inline]
+    fn mark_waiting(&self, token: u64) {
+        let (idx, generation) = decode_completion_token(token);
+        if idx >= self.slots.len() {
+            return;
+        }
+        let cell = &self.slots[idx];
+
+        loop {
+            let current = cell.load_core_state(Ordering::Acquire);
+            let state = current.state();
+            let cell_generation = current.generation();
+
+            if cell_generation > generation {
+                // Stale request, slot already repurposed for a newer op.
+                return;
+            }
+
+            if cell_generation < generation {
+                if state == slot::SlotState::Idle {
+                    if cell
+                        .core_state
+                        .compare_exchange(
+                            current,
+                            current
+                                .with_state(slot::SlotState::InFlightWaiting)
+                                .with_generation(generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                } else {
+                    // Cannot upgrade yet.
+                    return;
+                }
+            } else {
+                // cell_generation == generation
+                if state == slot::SlotState::InFlightReady {
+                    // Fast completion happened, leave as READY.
+                    return;
+                }
+
+                match state {
+                    slot::SlotState::Idle
+                    | slot::SlotState::InFlightOrphaned
+                    | slot::SlotState::InFlightWaiting
+                    | slot::SlotState::ReservedValue => {
+                        if cell
+                            .core_state
+                            .compare_exchange(
+                                current,
+                                current
+                                    .with_state(slot::SlotState::InFlightWaiting)
+                                    .with_generation(generation),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            return;
+                        }
+                    }
+                    slot::SlotState::Finalizing => {
+                        return;
+                    }
+                    slot::SlotState::Reserved | slot::SlotState::InFlightReady => return,
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn mark_orphaned(&self, token: u64) {
+        let (idx, generation) = decode_completion_token(token);
+        if idx >= self.slots.len() {
+            return;
+        }
+        let cell = &self.slots[idx];
+
+        loop {
+            let current = cell.load_core_state(Ordering::Acquire);
+            let state = current.state();
+            let cell_gen = current.generation();
+
+            match state {
+                slot::SlotState::InFlightWaiting => {
+                    if cell_gen != generation {
+                        return;
+                    }
+                    if cell
+                        .core_state
+                        .compare_exchange(
+                            current,
+                            current
+                                .with_state(slot::SlotState::InFlightOrphaned)
+                                .with_generation(generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                slot::SlotState::InFlightReady if cell_gen == generation => {
+                    if cell
+                        .core_state
+                        .compare_exchange(
+                            current,
+                            current
+                                .with_state(slot::SlotState::Idle)
+                                .with_generation(generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        cell.completion_with_data(|payload_cell, detail_cell| {
+                            let _ = payload_cell.take();
+                            let _ = detail_cell.take();
+                        });
+                        return;
+                    }
+                }
+                slot::SlotState::Finalizing => continue,
+                _ => return,
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg(any(test, feature = "loom"))]
+    fn debug_get_state(&self, idx: usize) -> u8 {
+        let current = self.slots[idx].load_core_state(Ordering::Acquire);
+        match current.state() {
+            slot::SlotState::Idle => CELL_STATE_IDLE,
+            slot::SlotState::InFlightWaiting => CELL_STATE_WAITING,
+            slot::SlotState::InFlightReady => CELL_STATE_READY,
+            slot::SlotState::InFlightOrphaned => CELL_STATE_ORPHANED,
+            slot::SlotState::Finalizing => CELL_STATE_BUSY,
+            slot::SlotState::Reserved => CELL_STATE_IDLE,
+            slot::SlotState::ReservedValue => CELL_STATE_IDLE,
         }
     }
 }
@@ -184,39 +529,67 @@ pub fn decode_completion_token(token: u64) -> (usize, u32) {
 }
 
 #[inline]
-pub fn event_res_to_io(res: i32) -> io::Result<usize> {
-    if res >= 0 {
-        Ok(res as usize)
-    } else {
-        Err(io::Error::from_raw_os_error(-res))
-    }
+pub fn event_res_to_result<R: CompletionValue>(res: i32) -> DriverResult<R> {
+    R::from_event_res(res)
 }
 
 pub trait Driver: 'static {
     type Op: PlatformOp;
-    type Handle: Handle;
+    type Raw: RawHandleMeta;
     type Sidecar: SlotSidecar;
+    type Completion: CompletionValue;
 
-    fn reserve_op(&mut self) -> io::Result<(usize, u32)>;
+    fn reserve_op(&mut self) -> DriverResult<(usize, u32)>;
 
-    fn slot_table(&self) -> std::sync::Arc<slot::SlotTable<Self::Op, Self::Sidecar>>;
+    fn slot_table(
+        &self,
+    ) -> std::sync::Arc<slot::SlotTable<Self::Op, Self::Sidecar, Self::Completion>>;
+
+    fn detached_cancel_table(&self) -> std::sync::Arc<slot::DetachedCancelTable>;
+
+    fn drain_cancel_requests(&mut self) {
+        let shared = self.slot_table();
+        let cancel_table = self.detached_cancel_table();
+        let word_count = cancel_table.cancel_word_count();
+        for word_idx in 0..word_count {
+            let mut bits = cancel_table.take_cancel_word(word_idx);
+            while bits != 0 {
+                let bit_idx = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+
+                let user_data = word_idx * 64 + bit_idx;
+                let Some((generation, state)) = shared.slot_snapshot(user_data) else {
+                    continue;
+                };
+                if cancel_table.cancel_generation(user_data) == generation as u64
+                    && is_runnable_state(state)
+                {
+                    self.cancel_op(user_data);
+                }
+            }
+        }
+    }
+
+    fn slot_set_payload(&mut self, user_data: usize, payload: slot::ErasedPayload);
+
+    fn slot_take_payload(&mut self, user_data: usize) -> Option<slot::ErasedPayload>;
 
     fn submit(
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<io::Result<Poll<()>>>;
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>>;
 
-    fn submit_queue(&mut self) -> io::Result<()>;
+    fn submit_queue(&mut self) -> DriverResult<()>;
 
-    fn wait(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> DriverResult<()>;
 
     fn process_completions(&mut self);
 
     fn completion_queue(&self) -> SharedCompletionQueue;
 
-    fn completion_table(&self) -> SharedCompletionTable;
+    fn completion_table(&self) -> SharedCompletionTable<Self::Completion>;
 
     fn try_pop_completion(&mut self) -> Option<CompletionEvent> {
         self.completion_queue().pop()
@@ -232,16 +605,19 @@ pub trait Driver: 'static {
         drained
     }
 
-    fn wait_and_drain_completions(&mut self, out: &mut Vec<CompletionEvent>) -> io::Result<usize> {
+    fn wait_and_drain_completions(
+        &mut self,
+        out: &mut Vec<CompletionEvent>,
+    ) -> DriverResult<usize> {
         self.wait()?;
         Ok(self.drain_completions(out))
     }
 
-    fn try_take_completion(&mut self, token: u64) -> Option<CompletionEvent> {
+    fn try_take_completion(&mut self, token: u64) -> PollRecordResult<Self::Completion> {
         self.completion_table().try_take(token)
     }
 
-    fn try_take_completion_record(&mut self, token: u64) -> Option<CompletionRecord> {
+    fn try_take_completion_record(&mut self, token: u64) -> PollRecordResult<Self::Completion> {
         self.completion_table().try_take_record(token)
     }
 
@@ -251,17 +627,25 @@ pub trait Driver: 'static {
 
     fn cancel_op(&mut self, user_data: usize);
 
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> io::Result<()>;
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()>;
 
-    fn register_files(&mut self, files: &[Self::Handle]) -> io::Result<Vec<IoFd<Self::Handle>>>;
+    fn register_files<'a>(
+        &mut self,
+        files: Vec<RegisterFd<'a, Self::Raw>>,
+    ) -> DriverResult<Vec<IoFd>>;
 
-    fn unregister_files(&mut self, files: Vec<IoFd<Self::Handle>>) -> io::Result<()>;
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()>;
 
-    fn submit_background(&mut self, op: Self::Op) -> io::Result<()>;
+    fn warmup_udp_socket(
+        &mut self,
+        fd: IoFd,
+        buf_capacity: std::num::NonZeroUsize,
+        credits: usize,
+    ) -> DriverResult<()>;
 
-    fn wake(&mut self) -> io::Result<()>;
+    fn submit_background(&mut self, op: Self::Op) -> DriverResult<()>;
 
-    fn inner_handle(&self) -> Self::Handle;
+    fn wake(&mut self) -> DriverResult<()>;
 
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
 
@@ -271,7 +655,7 @@ pub trait Driver: 'static {
 }
 
 pub trait RemoteWaker: Send + Sync {
-    fn wake(&self) -> io::Result<()>;
+    fn wake(&self) -> DriverResult<()>;
 }
 
 #[must_use]
@@ -284,6 +668,15 @@ impl<T> Outcome<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitStatus {
+    /// Operation successfully submitted or queued. It *will* eventually produce
+    /// a completion result in the `CompletionTable`.
+    InFlight,
+    /// Operation failed synchronously and no completion result will be produced.
+    Void,
+}
+
 #[derive(Default)]
 pub struct SubmitBinder;
 
@@ -294,13 +687,20 @@ impl SubmitBinder {
     }
 
     #[inline]
-    pub fn ok(self, poll: Poll<()>) -> Outcome<io::Result<Poll<()>>> {
+    pub fn ok(
+        self,
+        poll: Poll<()>,
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
         Outcome(Ok(poll))
     }
 
     #[inline]
-    pub fn err(self, err: io::Error) -> Outcome<io::Result<Poll<()>>> {
-        Outcome(Err(err))
+    pub fn err(
+        self,
+        err: DriverErrorReport,
+        status: SubmitStatus,
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+        Outcome(Err((err, status)))
     }
 }
 

@@ -1,5 +1,10 @@
 use std::path::Path;
+use veloq_driver::driver::{Driver, RegisterFd};
 use veloq_driver::op::Open;
+
+fn driver_err(err: error_stack::Report<veloq_driver::error::DriverErrorKind>) -> std::io::Error {
+    std::io::Error::other(format!("{err:#}"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferingMode {
@@ -107,13 +112,27 @@ impl OpenOptions {
         let submitter = LocalSubmitter;
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
 
-        // 3. 转换结果
-        let fd = veloq_driver::RawHandle::from(res?);
-        use super::file::InnerFile;
+        // 3. 转换结果 + 注册固定描述符（失败即报错）
+        let owned = res.map_err(driver_err)?;
+        let fd = owned.into_raw();
+        let ctx = crate::runtime::context::try_current()
+            .ok_or_else(|| std::io::Error::other("runtime context not set"))?;
+        let driver = ctx
+            .driver()
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("runtime driver missing"))?;
+        let fixed = driver
+            .borrow_mut()
+            .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
+            .map_err(driver_err)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("register_files returned empty"))?;
         use std::cell::Cell;
 
         Ok(super::file::LocalFile {
-            inner: InnerFile(fd),
+            raw: fd,
+            fd: fixed,
             submitter,
             pos: Cell::new(0),
         })
@@ -129,18 +148,16 @@ impl OpenOptions {
         use veloq_driver::op::{DetachedSubmitter, Op};
 
         // 捕获 SubmitContext (Injector)
-        let submitter = DetachedSubmitter::new()?;
+        let submitter = DetachedSubmitter::new();
 
         // 提交执行 (Result, Op) — Op 的所有权被返还
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
-
-        let fd = veloq_driver::RawHandle::from(res?);
-
-        use super::file::InnerFile;
+        let owned = res.map_err(driver_err)?;
+        let fd = owned.into_raw();
         use std::sync::atomic::AtomicU64;
 
         Ok(super::file::File {
-            inner: InnerFile(fd),
+            raw: fd,
             submitter,
             pos: AtomicU64::new(0),
         })

@@ -1,38 +1,19 @@
 #![cfg(feature = "compat")]
 use futures::{AsyncReadExt, AsyncWriteExt};
-use std::alloc::{Layout, alloc, dealloc};
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
-use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
-use veloq_buf::{DeallocParams, FixedBuf, PoolVTable};
+use veloq_buf::FixedBuf;
 use veloq_runtime::io::{AsyncBufRead, AsyncBufWrite, Compat};
 
 // --- Mock Pool ---
 struct MockPool;
 
-static MOCK_VTABLE: PoolVTable = PoolVTable {
-    dealloc: mock_dealloc,
-    resolve_region_info: mock_resolve,
-};
-
-unsafe fn mock_dealloc(_pool_data: NonNull<()>, params: DeallocParams) {
-    let layout = Layout::from_size_align(params.cap.get(), 1).unwrap();
-    unsafe { dealloc(params.ptr.as_ptr(), layout) };
-}
-
-unsafe fn mock_resolve(_pool_data: NonNull<()>, _buf: &FixedBuf) -> (usize, usize) {
-    (0, 0)
-}
-
 impl MockPool {
     fn alloc(size: usize) -> FixedBuf {
         let size = NonZeroUsize::new(size).unwrap();
-        let layout = Layout::from_size_align(size.get(), 1).unwrap();
-        let ptr = unsafe { alloc(layout) };
-        let ptr = NonNull::new(ptr).unwrap();
-        unsafe { FixedBuf::new(ptr, size, NonNull::dangling(), &MOCK_VTABLE, 0) }
+        FixedBuf::alloc_heap(size).expect("alloc heap buffer for compat tests")
     }
 }
 
@@ -55,7 +36,7 @@ impl MockIo {
 }
 
 impl AsyncBufRead for MockIo {
-    fn read(&self, mut buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)> {
+    fn read(&self, mut buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>> {
         let read_data = self.read_data.clone();
         let read_pos = self.read_pos.clone();
         async move {
@@ -71,31 +52,40 @@ impl AsyncBufRead for MockIo {
             *pos += n;
 
             if n > 0 {
-                buf.set_len(unsafe { NonZeroUsize::new_unchecked(n) });
+                buf.set_len(n);
             }
 
-            (Ok(n), buf)
+            Ok((n, buf))
         }
+    }
+
+    fn read_exact(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>> {
+        // Mock read already fills as much as possible, for simplicity in test:
+        self.read(buf)
     }
 }
 
 impl AsyncBufWrite for MockIo {
-    fn write(&self, buf: FixedBuf) -> impl Future<Output = (io::Result<usize>, FixedBuf)> {
+    fn write(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>> {
         let write_data = self.write_data.clone();
         async move {
             let n = buf.len();
             let mut data = write_data.lock().unwrap();
             data.extend_from_slice(buf.as_slice());
-            (Ok(n), buf)
+            Ok((n, buf))
         }
     }
 
-    fn flush(&self) -> impl Future<Output = io::Result<()>> {
-        async { Ok(()) }
+    fn write_all(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>> {
+        self.write(buf)
     }
 
-    fn shutdown(&self) -> impl Future<Output = io::Result<()>> {
-        async { Ok(()) }
+    async fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> io::Result<()> {
+        Ok(())
     }
 }
 

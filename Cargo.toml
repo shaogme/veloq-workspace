@@ -14,6 +14,8 @@ members = [
     "utils/veloq-bitset",
     "utils/veloq-wheel", 
     "utils/veloq-blocking",
+    "utils/veloq-pod", 
+    "test-utils/xtest-runner"
 ]
 default-members = [
     "veloq-runtime",
@@ -28,6 +30,8 @@ default-members = [
     "utils/veloq-bitset",
     "utils/veloq-wheel",
     "utils/veloq-blocking",
+    "utils/veloq-pod",
+    "test-utils/xtest-runner"
 ]
 resolver = "3"
 
@@ -62,12 +66,13 @@ veloq-intrusive-linklist = { path = "utils/veloq-intrusive-linklist", version = 
 veloq-bitset = { path = "utils/veloq-bitset", version = "0.1.0" }
 veloq-wheel = { path = "utils/veloq-wheel", version = "0.1.0" }
 veloq-blocking = { path = "utils/veloq-blocking", version = "0.1.0" }
+veloq-pod = { path = "utils/veloq-pod", version = "0.1.0" }
 
 # External Crates
 crossbeam-utils = { version = "0.8", default-features = false }
 futures-core = "0.3"
 crossbeam-queue = "0.3"
-libc = "0.2.182"
+libc = "0.2.183"
 windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
@@ -77,9 +82,15 @@ windows-sys = { version = "0.61", features = [
 ] }
 tracing = "0.1.44"
 parking_lot = "0.12"
+bilge = "0.3.0"
+error-stack = "0.6"
 
-loom = "0.7.0"
+clap = { version = "4.6", features = ["derive"] }
+loom = "0.7.2"
 criterion = { version = "0.8", features = ["async_tokio"] }
+
+tokio = { version = "1", features = ["full"] }
+slotmap = "1.1.1"
 
 [workspace.lints.rust]
 warnings = "deny"

@@ -18,4 +18,4 @@ mod tests;
 // Re-export key functions for convenient access
 pub use runtime::{JoinHandle, LocalJoinHandle};
 pub use runtime::{LocalExecutor, Runtime}; // Export Runtime for config usage
-pub use runtime::{RuntimeContext, spawn, spawn_local, spawn_to, yield_now};
+pub use runtime::{RuntimeContext, spawn, spawn_eager, spawn_local, spawn_to, yield_now};
