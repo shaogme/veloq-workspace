@@ -14,7 +14,7 @@ services:
   # Develop mode: Mounts local directory for hot-reloading (Default)
   dev:
     <<: *app-base
-    container_name: veloq-dev
+    container_name: dev
     volumes:
       - .:/root/workspace
       # Mount host SSH public key to temporary location
@@ -27,7 +27,7 @@ services:
   # Standalone mode: Uses code copied into the image (No host mounting)
   standalone:
     <<: *app-base
-    container_name: veloq-standalone
+    container_name: standalone
     volumes:
       - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro
       - ./docker/entrypoint.sh:/entrypoint.sh
