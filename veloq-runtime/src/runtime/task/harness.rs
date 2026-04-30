@@ -277,19 +277,18 @@ unsafe fn wake_impl(ptr: NonNull<HarnessedHeader>) {
         let state = header.state.load(Ordering::Acquire);
 
         match state {
-            IDLE => {
+            IDLE
                 // Transition IDLE -> NOTIFIED
                 if header
                     .state
                     .compare_exchange(IDLE, NOTIFIED, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
-                {
+                => {
                     // Success: We are responsible for scheduling it.
                     unsafe { (header.vtable.schedule)(ptr) };
                     return;
                 }
-            }
-            RUNNING => {
+            RUNNING
                 // Transition RUNNING -> RUNNING | NOTIFIED
                 if header
                     .state
@@ -300,10 +299,9 @@ unsafe fn wake_impl(ptr: NonNull<HarnessedHeader>) {
                         Ordering::Relaxed,
                     )
                     .is_ok()
-                {
+                => {
                     return;
                 }
-            }
             s if (s & NOTIFIED) != 0 => {
                 // Already notified. Nothing to do.
                 return;

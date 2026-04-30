@@ -474,28 +474,23 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                         return;
                     }
                 }
-                slot::SlotState::InFlightReady => {
-                    if cell_gen == generation {
-                        if cell
-                            .core_state
-                            .compare_exchange(
-                                current,
-                                current
-                                    .with_state(slot::SlotState::Idle)
-                                    .with_generation(generation),
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            cell.completion_with_data(|payload_cell, detail_cell| {
-                                let _ = payload_cell.take();
-                                let _ = detail_cell.take();
-                            });
-                            return;
-                        }
-                    } else {
-                        // Stale READY record, ignore.
+                slot::SlotState::InFlightReady if cell_gen == generation => {
+                    if cell
+                        .core_state
+                        .compare_exchange(
+                            current,
+                            current
+                                .with_state(slot::SlotState::Idle)
+                                .with_generation(generation),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        cell.completion_with_data(|payload_cell, detail_cell| {
+                            let _ = payload_cell.take();
+                            let _ = detail_cell.take();
+                        });
                         return;
                     }
                 }
