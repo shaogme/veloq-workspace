@@ -1304,8 +1304,13 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 name = "veloq"
 version = "0.1.0"
 dependencies = [
+ "error-stack",
+ "libc",
+ "veloq-blocking",
  "veloq-buf",
+ "veloq-driver",
  "veloq-runtime-next",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,19 +1,19 @@
-mod primitives;
 mod context;
-mod shared;
 mod executor;
+mod primitives;
+mod shared;
 
 use crate::task::{LocalTaskRef, SendTaskRef};
+use crate::utils::FastRand;
 use crate::utils::ownership::ArcOwnership;
 use crate::utils::storage::AtomicStorage;
-use crate::utils::{FastRand};
 use std::cell::RefCell;
 use std::future::Future;
-use std::pin::Pin;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{Ordering};
-use std::sync::mpsc::{Receiver};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
 use std::thread;
 
@@ -22,11 +22,11 @@ pub use primitives::{
     create_waker,
 };
 
-pub use context::{
-    RuntimeContext, WorkerInitContext, NoopWorkerInit, current_worker_id, 
-    set_current_runtime_context, clear_current_runtime_context
-};
 pub(crate) use context::with_current_runtime;
+pub use context::{
+    NoopWorkerInit, RuntimeContext, WorkerInitContext, clear_current_runtime_context,
+    current_worker_id, set_current_runtime_context,
+};
 pub(crate) use shared::RuntimeShared;
 
 use executor::block_on_worker_init;
@@ -61,7 +61,7 @@ impl Runtime<NoopWorkerInit> {
             shared,
             local_receivers,
             remote_receivers,
-            .. 
+            ..
         } = self;
         shared.shutdown.store(false, Ordering::Release);
         let mut local_receivers = local_receivers;
@@ -298,12 +298,10 @@ impl<I> RuntimeBuilder<I> {
     }
 
     pub fn build(self) -> Runtime<I> {
-        let count = self
-            .worker_count
-            .unwrap_or_else(|| {
-                thread::available_parallelism()
-                    .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
-            });
+        let count = self.worker_count.unwrap_or_else(|| {
+            thread::available_parallelism()
+                .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
+        });
         let (shared, local_receivers, remote_receivers) = RuntimeShared::new(count);
         let shared = Arc::new(shared);
         Runtime::from_parts(

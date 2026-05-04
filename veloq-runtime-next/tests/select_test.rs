@@ -1,9 +1,9 @@
-use veloq_runtime_next::runtime::Runtime;
-use veloq_runtime_next::select;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::num::NonZeroUsize;
+use veloq_runtime_next::runtime::Runtime;
+use veloq_runtime_next::select;
 
 struct ReadyFuture<T>(Option<T>);
 impl<T: Unpin + Copy> Future for ReadyFuture<T> {

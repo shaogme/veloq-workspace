@@ -687,4 +687,3 @@ macro_rules! task {
         let $name = $crate::task::SendTaskNode::new(__fut);
     };
 }
-

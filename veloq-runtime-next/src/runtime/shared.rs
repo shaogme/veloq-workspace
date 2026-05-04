@@ -1,3 +1,5 @@
+use super::context::{CONTEXT, current_worker_id};
+use super::primitives::{self, EventCount, Parker, Unparker};
 use crate::scope::GenericScopeCompletion;
 use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
@@ -8,8 +10,6 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use super::primitives::{self, EventCount, Parker, Unparker};
-use super::context::{CONTEXT, current_worker_id};
 
 pub(crate) struct WorkerQueue {
     pub(crate) local_tx: Sender<LocalTaskRef>,
@@ -52,7 +52,11 @@ impl IdleStack {
     fn push(&self, worker_id: usize, next_ptrs: &[AtomicUsize]) {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
-            let generation = if head == Self::EMPTY { 0 } else { (head >> 32) + 1 };
+            let generation = if head == Self::EMPTY {
+                0
+            } else {
+                (head >> 32) + 1
+            };
             let new_head = (generation << 32) | (worker_id as u64);
 
             let old_top_id = if head == Self::EMPTY {
@@ -191,7 +195,7 @@ impl RuntimeShared {
             Some(t) if t.node_count() > 0 => {
                 let node_count = t.node_count();
                 let mut node_to_workers: Vec<Vec<usize>> = vec![Vec::new(); node_count];
-                
+
                 // Distribute workers among detected NUMA nodes
                 for i in 0..worker_count_val {
                     let node_idx = i % node_count;
@@ -503,22 +507,32 @@ impl RuntimeShared {
                 let seq = self.event_count.load();
                 self.idle_mask.set(worker_id);
                 let group_idx = self.worker_to_group[worker_id];
-                self.groups[group_idx].idle_stack.push(worker_id, &self.next_idle);
+                self.groups[group_idx]
+                    .idle_stack
+                    .push(worker_id, &self.next_idle);
 
                 if self.event_count.load() != seq
                     || self.has_work(worker_id)
                     || self.shutdown.load(Ordering::Acquire)
                     || completion.map(|c| c.is_done()).unwrap_or(false)
                 {
-                    if self.groups[group_idx].idle_stack.pop(&self.next_idle).is_some() {
-                         self.idle_mask.clear(worker_id);
+                    if self.groups[group_idx]
+                        .idle_stack
+                        .pop(&self.next_idle)
+                        .is_some()
+                    {
+                        self.idle_mask.clear(worker_id);
                     }
                     continue;
                 }
 
                 if completion.is_some() {
-                    if self.groups[group_idx].idle_stack.pop(&self.next_idle).is_some() {
-                         self.idle_mask.clear(worker_id);
+                    if self.groups[group_idx]
+                        .idle_stack
+                        .pop(&self.next_idle)
+                        .is_some()
+                    {
+                        self.idle_mask.clear(worker_id);
                     }
                     std::thread::yield_now();
                     continue;

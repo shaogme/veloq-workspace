@@ -1,9 +1,9 @@
+use super::context::WorkerInitContext;
+use super::primitives::{Signal, create_waker};
 use std::ops::AsyncFn;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use super::context::WorkerInitContext;
-use super::primitives::{Signal, create_waker};
 
 pub(crate) fn block_on_worker_init<I>(worker_init: &I, ctx: WorkerInitContext)
 where

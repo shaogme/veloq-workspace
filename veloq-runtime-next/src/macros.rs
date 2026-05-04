@@ -1,7 +1,7 @@
+use crate::task::{RuntimeContextExt, TaskError};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use crate::task::{RuntimeContextExt, TaskError};
 
 /// A utility enum for the `select!` macro.
 #[doc(hidden)]
