@@ -1,6 +1,5 @@
 use veloq_runtime_next::runtime::Runtime;
 use veloq_runtime_next::scope;
-use veloq_runtime_next::spawn_boxed;
 use veloq_runtime_next::task::yield_now;
 
 #[test]
@@ -10,7 +9,7 @@ fn test_panic_propagation() {
         rt.block_on(async {
             println!("开始测试 Panic 传播...");
             scope!(s, {
-                spawn_boxed!(s, async {
+                s.spawn_boxed(async {
                     yield_now().await;
                     println!("子任务即将 Panic...");
                     panic!("BOOM!");

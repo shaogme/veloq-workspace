@@ -10,7 +10,7 @@ fn test_local_task_execution() {
     rt.block_on(async {
         scope!(s, {
             task_local!(t, async { 1 + 1 });
-            let handle = s.__private_push_local(&t);
+            let handle = s.spawn_local(&t);
             assert_eq!(handle.await.unwrap(), 2);
         });
     });
@@ -25,7 +25,7 @@ fn test_local_task_with_yield() {
                 veloq_runtime_next::task::yield_now().await;
                 42
             });
-            let handle = s.__private_push_local(&t);
+            let handle = s.spawn_local(&t);
             assert_eq!(handle.await.unwrap(), 42);
         });
     });

@@ -1,6 +1,6 @@
 use veloq_runtime_next::runtime::Runtime;
 use veloq_runtime_next::task::yield_now;
-use veloq_runtime_next::{scope, spawn, spawn_boxed, spawn_local, task, task_local};
+use veloq_runtime_next::{scope, task, task_local};
 
 // --- 测试用例 ---
 
@@ -25,16 +25,16 @@ fn main() {
         task!(send_node, work("栈Send任务".to_string(), 2));
 
         scope!(my_scope, {
-            let res_send = spawn!(my_scope, send_node).await.unwrap();
+            let res_send = my_scope.spawn(&send_node).await.unwrap();
             println!("  >> 栈Send任务完成, 结果: {}", res_send);
 
             let mut handles = Vec::new();
             for i in 1..=3 {
-                let h = spawn_boxed!(my_scope, work(format!("堆任务-{}", i), i + 1));
+                let h = my_scope.spawn_boxed(work(format!("堆任务-{}", i), i + 1));
                 handles.push(h);
             }
 
-            spawn_local!(my_scope, h_static, static_node);
+            let h_static = my_scope.spawn_local(&static_node);
 
             let res_static = h_static.await.unwrap();
             println!("  >> 栈任务已提前完成, 结果: {}", res_static);
@@ -47,7 +47,7 @@ fn main() {
             // --- 测试业务 Result + unwrap() ---
             println!("\n  [测试] 演示业务 Result 处理...");
             scope!(biz_scope, {
-                let biz_handle = spawn_boxed!(biz_scope, async {
+                let biz_handle = biz_scope.spawn_boxed(async {
                     yield_now().await;
                     if true {
                         Err("这是一个业务错误")
@@ -62,7 +62,7 @@ fn main() {
             // --- 测试显式取消 (Explicit Cancellation) ---
             println!("\n  [测试] 测试显式取消：手动取消特定任务...");
             scope!(explicit_cancel_scope, {
-                let h1 = spawn_boxed!(explicit_cancel_scope, async {
+                let h1 = explicit_cancel_scope.spawn_boxed(async {
                     for i in 1..=10 {
                         yield_now().await;
                         let worker_id = veloq_runtime_next::runtime::current_worker_id();
@@ -89,7 +89,7 @@ fn main() {
             scope!(async_notify_scope, {
                 let token = async_notify_scope.cancel_token().child();
                 let token_clone = token.clone();
-                let h = spawn_boxed!(async_notify_scope, async move {
+                let h = async_notify_scope.spawn_boxed(async move {
                     let worker_id = veloq_runtime_next::runtime::current_worker_id();
                     println!(
                         "    [Worker {}] [异步监听任务] 正在等待取消信号...",
@@ -116,7 +116,7 @@ fn main() {
             // --- 测试延迟生成的任务令牌 (Lazy Task Token) ---
             println!("\n  [测试] 测试 JoinHandle 延迟生成的取消令牌...");
             scope!(lazy_token_scope, {
-                let h = spawn_boxed!(lazy_token_scope, async {
+                let h = lazy_token_scope.spawn_boxed(async {
                     yield_now().await;
                     yield_now().await;
                     let worker_id = veloq_runtime_next::runtime::current_worker_id();
@@ -126,7 +126,7 @@ fn main() {
                 let task_token = h.cancel_token();
                 let token_clone = task_token.clone();
 
-                spawn_boxed!(lazy_token_scope, async move {
+                lazy_token_scope.spawn_boxed(async move {
                     token_clone.cancelled().await;
                     let worker_id = veloq_runtime_next::runtime::current_worker_id();
                     println!("    [Worker {}] [监听器] 检测到任务令牌被取消", worker_id);
@@ -144,7 +144,7 @@ fn main() {
             scope!(target_scope, {
                 let mut handles = Vec::new();
                 for i in 1..=3 {
-                    let h = veloq_runtime_next::spawn_boxed_to!(target_scope, 1, async move {
+                    let h = target_scope.spawn_boxed_to(1, async move {
                         let worker_id = veloq_runtime_next::runtime::current_worker_id();
                         println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
                     });

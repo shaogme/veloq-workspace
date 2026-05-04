@@ -171,7 +171,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
         }
     }
 
-    pub fn __private_push_local<T: 'scope, TTask>(
+    pub fn spawn_local<T: 'scope, TTask>(
         &self,
         task: &'scope TTask,
     ) -> JoinHandle<'scope, '_, T, LocalTaskRef, Self>
@@ -200,7 +200,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
         }
     }
 
-    pub fn __private_push_boxed_local<T: 'scope, F>(
+    pub fn spawn_boxed_local<T: 'scope, F>(
         &self,
         future: F,
     ) -> JoinHandle<'scope, '_, T, LocalTaskRef, Self>
@@ -379,7 +379,7 @@ impl<'scope, M> GenericAsyncScope<'scope, LocalStorage, RcOwnership, M> {
     where
         S: LocalTask<T> + 'scope,
     {
-        self.__private_push_local(task)
+        self.spawn_local(task)
     }
 
     pub fn spawn_boxed<T: 'scope, F>(
@@ -389,7 +389,7 @@ impl<'scope, M> GenericAsyncScope<'scope, LocalStorage, RcOwnership, M> {
     where
         F: Future<Output = T> + 'scope,
     {
-        self.__private_push_boxed_local(future)
+        self.spawn_boxed_local(future)
     }
 }
 
