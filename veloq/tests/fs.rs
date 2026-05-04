@@ -1,6 +1,4 @@
-use std::fs;
 use std::num::NonZeroUsize;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,6 +9,27 @@ use veloq::runtime::{Runtime, context};
 use veloq_blocking::{BlockingPoolConfig, init_blocking_pool};
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 use veloq_runtime_next::scope;
+use std::path::PathBuf;
+
+struct CleanupGuard(PathBuf);
+
+impl CleanupGuard {
+    fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        Self(path)
+    }
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
 
 static BLOCKING_POOL_INIT: Once = Once::new();
 
@@ -30,14 +49,11 @@ fn test_file_integrity() {
     for size in [nz!(8192), nz!(16384), nz!(65536)] {
         let runtime = create_runtime();
         runtime.block_on(async move {
-            let file_path_string = format!("test_file_integrity_{:?}.tmp", size);
-            let file_path = Path::new(&file_path_string);
-            if file_path.exists() {
-                let _ = fs::remove_file(file_path);
-            }
+            let file_path = format!("test_file_integrity_{:?}.tmp", size);
+            let _guard = CleanupGuard::new(&file_path);
 
             {
-                let file = LocalFile::create(file_path)
+                let file = LocalFile::create(&file_path)
                     .await
                     .expect("Failed to create");
 
@@ -52,15 +68,11 @@ fn test_file_integrity() {
             }
 
             {
-                let file = LocalFile::open(file_path).await.expect("Failed to open");
+                let file = LocalFile::open(&file_path).await.expect("Failed to open");
                 let read_buf = context::alloc(size);
                 let (n, read_buf) = file.read_at(read_buf, 0).await.expect("Read failed");
                 assert_eq!(n, size.get());
                 assert_eq!(&read_buf.as_slice()[..12], b"Hello World!");
-            }
-
-            if file_path.exists() {
-                let _ = fs::remove_file(file_path);
             }
         });
     }
@@ -79,10 +91,7 @@ fn test_multithread_file_ops() {
                 let counter = completion_count_for_runtime.clone();
                 s.spawn_boxed(async move {
                     let file_name = format!("test_mt_fs_{}.tmp", i);
-                    let path = Path::new(&file_name);
-                    if path.exists() {
-                        let _ = fs::remove_file(path);
-                    }
+                    let _guard = CleanupGuard::new(&file_name);
 
                     let content = format!("Task {} content", i);
                     let len = NonZeroUsize::new(content.len()).unwrap();
@@ -92,7 +101,7 @@ fn test_multithread_file_ops() {
                         .write(true)
                         .create(true)
                         .truncate(true)
-                        .open(path)
+                        .open(&file_name)
                         .await
                         .expect("Failed to create file");
                     let mut write_buf = context::alloc(len);
@@ -107,9 +116,7 @@ fn test_multithread_file_ops() {
                     assert_eq!(n, len.get());
                     assert_eq!(&read_buf.as_slice()[..n], content.as_bytes());
 
-                    if Path::new(&file_name).exists() {
-                        let _ = fs::remove_file(&file_name);
-                    }
+                    drop(file);
 
                     counter.fetch_add(1, Ordering::SeqCst);
                 });
@@ -125,10 +132,8 @@ fn test_fs_read_exact_write_all() {
     let runtime = create_runtime();
 
     runtime.block_on(async move {
-        let path = Path::new("test_fs_exact.tmp");
-        if path.exists() {
-            let _ = fs::remove_file(path);
-        }
+        let path = "test_fs_exact.tmp";
+        let _guard = CleanupGuard::new(path);
 
         let file = LocalFile::create(path)
             .await
@@ -151,8 +156,5 @@ fn test_fs_read_exact_write_all() {
         assert_eq!(read_buf.as_slice(), DATA);
 
         drop(file);
-        if path.exists() {
-            let _ = fs::remove_file(path);
-        }
     });
 }
