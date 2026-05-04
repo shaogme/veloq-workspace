@@ -274,10 +274,10 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         S: SendTask<T> + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count(),
+            worker_id < self.runtime.worker_count().get(),
             "worker_id {} is out of bounds (max {})",
             worker_id,
-            self.runtime.worker_count()
+            self.runtime.worker_count().get()
         );
         task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(self.completion.clone()));
         self.completion.add_task();
@@ -319,10 +319,10 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         F: Future<Output = T> + Send + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count(),
+            worker_id < self.runtime.worker_count().get(),
             "worker_id {} is out of bounds (max {})",
             worker_id,
-            self.runtime.worker_count()
+            self.runtime.worker_count().get()
         );
         let node = SendBoxedTaskNode::new(future);
         let layout = std::alloc::Layout::new::<SendBoxedTaskNode<'scope, T, F>>();

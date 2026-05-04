@@ -1,10 +1,12 @@
+use std::num::NonZeroUsize;
+
 use veloq_runtime_next::runtime::Runtime;
 use veloq_runtime_next::scope;
 use veloq_runtime_next::task_local;
 
 #[test]
 fn test_local_task_execution() {
-    let rt = Runtime::new(1);
+    let rt = Runtime::new(NonZeroUsize::new(1).unwrap());
     rt.block_on(async {
         scope!(s, {
             task_local!(t, async { 1 + 1 });
@@ -16,7 +18,7 @@ fn test_local_task_execution() {
 
 #[test]
 fn test_local_task_with_yield() {
-    let rt = Runtime::new(2);
+    let rt = Runtime::new(NonZeroUsize::new(2).unwrap());
     rt.block_on(async {
         scope!(s, {
             task_local!(t, async {

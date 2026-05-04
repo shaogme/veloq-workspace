@@ -13,6 +13,7 @@ readme.workspace = true
 
 [dependencies]
 veloq-runtime-next.workspace = true
+veloq-buf.workspace = true
 
 [lints]
 workspace = true

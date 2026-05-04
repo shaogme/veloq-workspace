@@ -1,6 +1,4 @@
-use crate::utils::storage::{
-    StateInt, StateLock, StateOptionPtr, Storage,
-};
+use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
 use std::alloc::{Layout, alloc, dealloc};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::Ordering;
