@@ -729,14 +729,16 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> SlotRegistryExt<Op, P, S, R>
                 index,
             )
             .map(SlotView::Reserved),
-            SlotState::InFlightWaiting => Slot::<InFlightWaiting, Op, P, S, R>::try_bind(
-                entry,
-                op,
-                storage,
-                &mut op_entry.platform_data,
-                index,
-            )
-            .map(SlotView::InFlightWaiting),
+            SlotState::InFlightWaiting | SlotState::InFlightReady => {
+                Slot::<InFlightWaiting, Op, P, S, R>::try_bind(
+                    entry,
+                    op,
+                    storage,
+                    &mut op_entry.platform_data,
+                    index,
+                )
+                .map(SlotView::InFlightWaiting)
+            }
             SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Op, P, S, R>::try_bind(
                 entry,
                 op,
@@ -745,10 +747,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> SlotRegistryExt<Op, P, S, R>
                 index,
             )
             .map(SlotView::InFlightOrphaned),
-            SlotState::Idle
-            | SlotState::InFlightReady
-            | SlotState::Finalizing
-            | SlotState::ReservedValue => None,
+            SlotState::Idle | SlotState::Finalizing | SlotState::ReservedValue => None,
         }
     }
 

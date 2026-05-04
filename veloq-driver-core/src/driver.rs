@@ -130,6 +130,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
             return;
         }
         let cell = &self.slots[idx];
+
         let ready_from = loop {
             let current = cell.load_core_state(Ordering::Acquire);
             let state = current.state();
@@ -148,19 +149,6 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                 | slot::SlotState::InFlightReady
                 | slot::SlotState::InFlightWaiting
                 | slot::SlotState::ReservedValue => {
-                    if cell
-                        .core_state
-                        .compare_exchange(current, current, Ordering::Acquire, Ordering::Acquire)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    if state == slot::SlotState::InFlightReady {
-                        cell.completion_with_data(|payload_cell, detail_cell| {
-                            let _ = payload_cell.take();
-                            let _ = detail_cell.take();
-                        });
-                    }
                     break current;
                 }
                 slot::SlotState::InFlightOrphaned => {
@@ -171,7 +159,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                                 current,
                                 current
                                     .with_state(slot::SlotState::Idle)
-                                    .with_generation(generation),
+                                    .with_generation(generation.wrapping_add(1)),
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
                             )
@@ -183,8 +171,6 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                             return;
                         }
                     } else {
-                        // generation > cell_gen but state is ORPHANED?
-                        // Strict rule says reject.
                         return;
                     }
                 }
@@ -228,10 +214,14 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                     return;
                 }
 
+                // If we reached here, someone else either:
+                // 1. already set it to InFlightReady (which is fine, we just discard our duplicate data)
+                // 2. recycled the slot (generation mismatch)
                 cell.completion_with_data(|payload_cell, detail_cell| {
                     let _ = payload_cell.take();
                     let _ = detail_cell.take();
                 });
+
                 let cur = cell.load_core_state(Ordering::Acquire);
                 if cur.generation() == generation
                     && cur.state() == slot::SlotState::InFlightOrphaned
@@ -239,7 +229,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                     let _ = cell.core_state.compare_exchange(
                         cur,
                         cur.with_state(slot::SlotState::Idle)
-                            .with_generation(generation),
+                            .with_generation(generation.wrapping_add(1)),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     );
@@ -278,7 +268,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                 current,
                 current
                     .with_state(slot::SlotState::Idle)
-                    .with_generation(generation),
+                    .with_generation(generation.wrapping_add(1)),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -314,13 +304,12 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
             let state = current.state();
             let cell_gen = current.generation();
 
-            // Register waker first to avoid missing a race.
-            cell.completion_waker.register(waker);
-
             if cell_gen > generation {
-                // Already stale, no point in waiting or updating.
                 return;
             }
+
+            // Register waker. AtomicWaker handles races with concurrent wake().
+            cell.completion_waker.register(waker);
 
             if cell_gen < generation {
                 if state == slot::SlotState::Idle {
@@ -336,12 +325,10 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                         )
                         .is_ok()
                     {
-                        // Successfully initialized to new generation WAITING state.
-                        // Re-check for fast completion.
+                        // Check for fast completion.
                         let current_after = cell.load_core_state(Ordering::Acquire);
-                        let state_after = current_after.state();
-                        let gen_after = current_after.generation();
-                        if state_after == slot::SlotState::InFlightReady && gen_after == generation
+                        if current_after.state() == slot::SlotState::InFlightReady
+                            && current_after.generation() == generation
                         {
                             waker.wake_by_ref();
                         }
@@ -350,17 +337,15 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                         continue;
                     }
                 } else {
-                    // Slot not yet IDLE, cannot upgrade.
                     return;
                 }
             }
 
-            // cell_gen == generation path.
-            // Check for fast completion.
+            // cell_gen == generation
             let current_after = cell.load_core_state(Ordering::Acquire);
-            let state_after = current_after.state();
-            let gen_after = current_after.generation();
-            if state_after == slot::SlotState::InFlightReady && gen_after == generation {
+            if current_after.state() == slot::SlotState::InFlightReady
+                && current_after.generation() == generation
+            {
                 waker.wake_by_ref();
             }
             return;

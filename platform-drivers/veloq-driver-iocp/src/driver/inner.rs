@@ -302,9 +302,7 @@ impl IocpDriver {
             payload: payload_erased,
             detail,
         });
-        let mut pending = guard.reset();
-        let _ = std::mem::take(pending.platform_mut());
-        ops.shared.push_free(user_data);
+        ops.remove(user_data);
     }
 
     pub(crate) fn process_completion(
@@ -362,7 +360,7 @@ impl IocpDriver {
                         detail,
                     }),
                 );
-                self.ops.remove(user_data);
+                self.ops.recycle(user_data, slot_generation.wrapping_add(1));
             }
             _ => {
                 debug!(user_data, "Ignoring completion for non in-flight slot");
@@ -405,7 +403,9 @@ impl IocpDriver {
 
             let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
                 if let Some(res) = blocking_res {
-                    io_result = res;
+                    io_result = res.map_err(|e| {
+                        from_io_error(IocpError::Win32, "iocp.driver.inner.blocking_completion", e)
+                    });
                 } else if let Ok(val) = io_result {
                     io_result = iocp_op.on_complete(val, &self.extensions).map_err(|e| {
                         error_stack::Report::new(IocpError::CompletionWait).attach(format!("{e:#}"))
@@ -444,6 +444,7 @@ impl IocpDriver {
         io_result: IocpResult<usize>,
     ) {
         let mut should_free = false;
+        let mut sidecar_to_push = None;
         let handled = Self::with_inflight_slot(ops, user_data, |mut guard| {
             let completion_res = io_result_to_event_res(&io_result);
             guard.platform_mut().rio_pool_waiting = false;
@@ -456,18 +457,14 @@ impl IocpDriver {
                 should_free = true;
             } else {
                 let (payload, detail) = guard.take_completion_data();
-                push_completion_shared(
-                    ctx.completion_events,
-                    ctx.completion_table,
-                    completion_record(CompletionSidecar {
-                        user_data,
-                        generation: slot_generation,
-                        res: completion_res,
-                        flags: 0,
-                        payload,
-                        detail,
-                    }),
-                );
+                sidecar_to_push = Some(CompletionSidecar {
+                    user_data,
+                    generation: slot_generation,
+                    res: completion_res,
+                    flags: 0,
+                    payload,
+                    detail,
+                });
                 if !guard.platform_mut().rio_needs_drain || guard.platform_mut().rio_drained {
                     let _ = guard.take_op();
                     let _data = std::mem::take(guard.platform_mut());
@@ -479,7 +476,15 @@ impl IocpDriver {
         if handled.is_none() {
             debug!(user_data, "Received completion for non-active slot");
         } else if should_free {
-            ops.shared.push_free(user_data);
+            ops.remove(user_data);
+        }
+
+        if let Some(sidecar) = sidecar_to_push {
+            push_completion_shared(
+                ctx.completion_events,
+                ctx.completion_table,
+                completion_record(sidecar),
+            );
         }
     }
 
@@ -603,7 +608,6 @@ impl IocpDriver {
             let _ = guard.reset();
             data
         });
-        let was_inflight = inflight.is_some();
 
         let (payload, detail) = if let Some(data) = inflight {
             data
@@ -627,11 +631,7 @@ impl IocpDriver {
             }),
         );
 
-        if was_inflight {
-            ops.shared.push_free(user_data);
-        } else {
-            ops.recycle(user_data, generation.wrapping_add(1));
-        }
+        ops.remove(user_data);
     }
 
     pub(crate) fn wake(&self) -> IocpResult<()> {

@@ -482,9 +482,9 @@ impl LocalExecutor {
     fn park_and_wait(&self, main_woken: &AtomicBool) {
         let has_pending_tasks =
             !self.queue.borrow().is_empty() || main_woken.load(Ordering::Acquire);
-        let mut driver = self.driver.borrow_mut();
 
         if has_pending_tasks {
+            let mut driver = self.driver.borrow_mut();
             driver.submit_queue().unwrap();
             driver.process_completions();
         } else {
@@ -521,6 +521,7 @@ impl LocalExecutor {
                 state.store(PARKED, Ordering::Release);
                 trace!("Entered PARKED state (wait)");
 
+                let mut driver = self.driver.borrow_mut();
                 driver.wait().unwrap();
             }
 

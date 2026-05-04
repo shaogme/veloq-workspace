@@ -87,7 +87,14 @@ fn test_multithread_file_ops() {
                     let content = format!("Task {} content", i);
                     let len = NonZeroUsize::new(content.len()).unwrap();
 
-                    let file = File::create(path).await.expect("Failed to create file");
+                    let file = File::options()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(path)
+                        .await
+                        .expect("Failed to create file");
                     let mut write_buf = context::alloc(len);
                     write_buf.set_len(len.get());
                     write_buf.as_slice_mut().copy_from_slice(content.as_bytes());

@@ -233,7 +233,8 @@ impl IocpDriver {
                     completion_record(sidecar),
                 );
             }
-            ops.remove(user_data);
+            let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
+            ops.recycle(user_data, generation.wrapping_add(1));
             return Err(driver_error(
                 DriverErrorKind::Submission,
                 "iocp/driver",
@@ -307,7 +308,8 @@ impl IocpDriver {
                 let mut guard = slot.complete();
                 *op_in = guard.take_op();
             }
-            ops.remove(user_data);
+            let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
+            ops.recycle(user_data, generation.wrapping_add(1));
             binder.err(
                 driver_error(
                     DriverErrorKind::Submission,
@@ -710,7 +712,8 @@ impl Driver for IocpDriver {
                 payload_cell.take()
             })
             .flatten();
-        self.ops.remove(user_data);
+        let generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
+        self.ops.recycle(user_data, generation.wrapping_add(1));
         payload
     }
 
@@ -798,8 +801,8 @@ impl Driver for IocpDriver {
                     })?;
                 op_entry.platform_data.is_background = true;
                 if get_blocking_pool().execute(task).is_err() {
-                    let _ = std::mem::take(&mut op_entry.platform_data);
-                    self.ops.shared.push_free(user_data);
+                    let generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
+                    self.ops.recycle(user_data, generation.wrapping_add(1));
                     return Err(driver_error(
                         DriverErrorKind::Submission,
                         "iocp/driver",
@@ -815,11 +818,8 @@ impl Driver for IocpDriver {
                 op_entry.platform_data.is_background = true;
             }
             Err(e) => {
-                let _ = self
-                    .ops
-                    .get_slot_entry_op_storage_and_entry_mut(user_data)
-                    .and_then(|(_, _, op, _)| op.take());
-                self.ops.remove(user_data);
+                let generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
+                self.ops.recycle(user_data, generation.wrapping_add(1));
                 return Err(e);
             }
         }
