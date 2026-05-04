@@ -1,0 +1,30 @@
+use veloq_runtime_next::runtime::Runtime;
+use veloq_runtime_next::scope;
+use veloq_runtime_next::task_local;
+
+#[test]
+fn test_local_task_execution() {
+    let rt = Runtime::new(1);
+    rt.block_on(async {
+        scope!(s, {
+            task_local!(t, async { 1 + 1 });
+            let handle = s.__private_push_local(&t);
+            assert_eq!(handle.await.unwrap(), 2);
+        });
+    });
+}
+
+#[test]
+fn test_local_task_with_yield() {
+    let rt = Runtime::new(2);
+    rt.block_on(async {
+        scope!(s, {
+            task_local!(t, async {
+                veloq_runtime_next::task::yield_now().await;
+                42
+            });
+            let handle = s.__private_push_local(&t);
+            assert_eq!(handle.await.unwrap(), 42);
+        });
+    });
+}

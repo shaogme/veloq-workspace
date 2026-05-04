@@ -1,6 +1,8 @@
 [workspace]
 members = [
+    "veloq",
     "veloq-runtime",
+    "veloq-runtime-next",
     "veloq-examples/disk-bench",
     "veloq-sync",
     "veloq-buf", 
@@ -18,7 +20,9 @@ members = [
     "test-utils/xtest-runner"
 ]
 default-members = [
+    "veloq",
     "veloq-runtime",
+    "veloq-runtime-next",
     "veloq-examples/disk-bench",
     "veloq-sync",
     "veloq-buf",
@@ -51,7 +55,9 @@ categories = ["asynchronous", "network-programming"]
 [workspace.dependencies]
 
 # Internal Crates
+veloq = { path = "veloq", version = "0.1.0" }
 veloq-runtime = { path = "veloq-runtime", version = "0.1.0" }
+veloq-runtime-next = { path = "veloq-runtime-next", version = "0.1.0" }
 veloq-sync = { path = "veloq-sync", version = "0.1.0" }
 veloq-local = { path = "veloq-local", version = "0.1.0" }
 veloq-buf = { path = "veloq-buf", version = "0.1.0" }
