@@ -127,6 +127,9 @@ fn new_cancel_slot<S: Storage, O: Ownership>() -> S::Lock<Option<GenericCancella
     S::Lock::new(None)
 }
 
+pub(crate) type CancelTokenSlot<S, O> =
+    <S as Storage>::Lock<Option<GenericCancellationToken<S, O>>>;
+
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
 pub struct GenericAsyncScope<'scope, S: Storage, O: Ownership, M = &'scope ()> {
     runtime: Arc<RuntimeShared>,
@@ -352,10 +355,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
             _marker: std::marker::PhantomData,
             cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
             waker_node: None,
-            reclaim: Some(|arena, ptr| unsafe {
-                let layout = std::alloc::Layout::new::<SendBoxedTaskNode<'scope, T, F>>();
-                arena.drop_object_raw(ptr as *mut u8, layout);
-            }),
+            reclaim: None,
         }
     }
 
@@ -405,8 +405,7 @@ pub struct JoinHandle<
     pub(crate) take_result: unsafe fn(*const ()) -> Option<Result<T, TaskError>>,
     pub(crate) scope: &'scope_ref S,
     pub(crate) _marker: std::marker::PhantomData<T>,
-    pub(crate) cancel_token:
-        <S::Storage as Storage>::Lock<Option<GenericCancellationToken<S::Storage, S::Ownership>>>,
+    pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<NonNull<GenericWakerNode<R::Storage>>>,
     pub(crate) reclaim: Option<unsafe fn(&S::Arena, *const ())>,
 }
@@ -456,7 +455,7 @@ impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.scope
             .runtime()
-            .drive_worker(Some(&self.scope.completion()));
+            .drive_worker(Some(self.scope.completion()));
 
         if self.task.header().is_completed() {
             let res = unsafe { (self.take_result)(self.ptr) }.expect("task result already taken");
@@ -471,7 +470,13 @@ impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> 
 
         let this = unsafe { self.get_unchecked_mut() };
         let header = this.task.header();
-        if this.waker_node.is_none() {
+        if let Some(mut node_ptr) = this.waker_node {
+            let node = unsafe { node_ptr.as_mut() };
+            if !node.waker.will_wake(cx.waker()) {
+                node.waker = cx.waker().clone();
+                unsafe { header.register_completion(node as *mut _) };
+            }
+        } else {
             let node_ptr = unsafe {
                 this.scope.arena().alloc_raw(
                     std::alloc::Layout::new::<GenericWakerNode<R::Storage>>(),
@@ -488,13 +493,7 @@ impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> 
                 );
             }
             this.waker_node = NonNull::new(node_ptr);
-            header.register_completion(node_ptr);
-        } else {
-            let node = unsafe { this.waker_node.unwrap().as_mut() };
-            if !node.waker.will_wake(cx.waker()) {
-                node.waker = cx.waker().clone();
-                header.register_completion(node as *mut _);
-            }
+            unsafe { header.register_completion(node_ptr) };
         }
         Poll::Pending
     }

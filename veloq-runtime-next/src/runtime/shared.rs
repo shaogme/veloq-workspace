@@ -113,7 +113,7 @@ pub(crate) struct AtomicBitset {
 
 impl AtomicBitset {
     fn new(size: usize) -> Self {
-        let num_u64 = (size + 63) / 64;
+        let num_u64 = size.div_ceil(64);
         let mut v = Vec::with_capacity(num_u64);
         for _ in 0..num_u64 {
             v.push(AtomicU64::new(0));
@@ -197,13 +197,17 @@ impl RuntimeShared {
                 let mut node_to_workers: Vec<Vec<usize>> = vec![Vec::new(); node_count];
 
                 // Distribute workers among detected NUMA nodes
-                for i in 0..worker_count_val {
+                for (i, group) in worker_to_group
+                    .iter_mut()
+                    .enumerate()
+                    .take(worker_count_val)
+                {
                     let node_idx = i % node_count;
                     node_to_workers[node_idx].push(i);
-                    worker_to_group[i] = node_idx;
+                    *group = node_idx;
                 }
 
-                for (_node_idx, worker_ids) in node_to_workers.into_iter().enumerate() {
+                for worker_ids in node_to_workers.into_iter() {
                     if !worker_ids.is_empty() {
                         groups.push(NUMAGroup {
                             worker_ids,
@@ -458,26 +462,22 @@ impl RuntimeShared {
                     progressed = true;
                 }
 
-                if !progressed {
-                    if let Some(task) = self.pop_local(worker_id, &ctx.local_rx) {
-                        self.poll_local_task(worker_id, task);
-                        progressed = true;
-                    }
+                if !progressed && let Some(task) = self.pop_local(worker_id, &ctx.local_rx) {
+                    self.poll_local_task(worker_id, task);
+                    progressed = true;
                 }
 
-                if !progressed {
-                    if let Some(task) = ctx.remote_rx.try_recv().ok() {
-                        self.poll_send_task(worker_id, task);
-                        progressed = true;
-                    }
+                if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
+                    self.poll_send_task(worker_id, task);
+                    progressed = true;
                 }
 
-                if !progressed || tick % injector_check_interval == 0 {
+                if !progressed || tick.is_multiple_of(injector_check_interval) {
                     if let Some(task) = self.steal_send(worker_id) {
                         self.poll_send_task(worker_id, task);
                         progressed = true;
                         injector_check_interval = 61;
-                    } else if tick % injector_check_interval == 0 {
+                    } else if tick.is_multiple_of(injector_check_interval) {
                         injector_check_interval = (injector_check_interval * 2 + 1).min(1023);
                     }
                 }
@@ -492,7 +492,7 @@ impl RuntimeShared {
                         progressed = true;
                         break;
                     }
-                    if let Some(task) = ctx.remote_rx.try_recv().ok() {
+                    if let Ok(task) = ctx.remote_rx.try_recv() {
                         self.poll_send_task(worker_id, task);
                         progressed = true;
                         break;

@@ -5,7 +5,11 @@ use std::sync::atomic::Ordering;
 
 /// 一个高性能的、块分配器接口。
 pub trait Arena {
+    /// # Safety
+    /// The layout must be valid. If `drop_fn` is provided, it must be safe to call on the returned pointer.
     unsafe fn alloc_raw(&self, layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>) -> *mut u8;
+    /// # Safety
+    /// `data_ptr` must be a pointer previously returned by `alloc_raw`.
     unsafe fn drop_object_raw(&self, data_ptr: *mut u8, layout: Layout);
 }
 
@@ -43,8 +47,18 @@ impl<S: Storage> GenericArena<S> {
             chunks: S::Lock::new(Vec::new()),
         }
     }
+}
 
+impl<S: Storage> Default for GenericArena<S> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<S: Storage> GenericArena<S> {
     /// 分配内存并记录其析构函数。
+    /// # Safety
+    /// The caller must ensure that `drop_fn` is valid.
     pub unsafe fn alloc<T>(&self, layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>) -> *mut u8 {
         // 1. 如果有析构函数，需要额外分配 DropNode 空间
         let (total_layout, is_drop) = if drop_fn.is_some() {
@@ -107,6 +121,8 @@ impl<S: Storage> GenericArena<S> {
     }
 
     /// 手动触发对象的析构并尝试回收块。
+    /// # Safety
+    /// The `data_ptr` must be valid and points to an object allocated by this arena.
     pub unsafe fn drop_object<T>(&self, data_ptr: *mut T, layout: Layout) {
         // 1. 计算 DropNode 的位置
         let node_layout = Layout::new::<GenericDropNode<S>>();

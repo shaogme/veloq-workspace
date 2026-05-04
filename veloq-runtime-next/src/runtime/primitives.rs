@@ -174,6 +174,12 @@ const EMPTY: u32 = 0;
 const NOTIFIED: u32 = 1;
 const PARKED: u32 = 2;
 
+impl Default for Parker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Parker {
     pub fn new() -> Self {
         Self {
@@ -243,10 +249,19 @@ pub struct GenericCancellationToken<S: Storage, O: Ownership> {
     inner: O::Shared<GenericCancellationTokenInner<S, O>>,
 }
 
+pub type ChildList<S, O> =
+    <S as Storage>::Lock<Vec<<O as Ownership>::Weak<GenericCancellationTokenInner<S, O>>>>;
+
 pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
     cancelled: S::Usize,
     wakers: S::WakerQueue,
-    children: S::Lock<Vec<O::Weak<GenericCancellationTokenInner<S, O>>>>,
+    children: ChildList<S, O>,
+}
+
+impl<S: Storage, O: Ownership> Default for GenericCancellationToken<S, O> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
@@ -368,6 +383,12 @@ impl<S: Storage, O: Ownership> std::future::Future for CancelledFuture<S, O> {
 /// 它通过一个单调递增的序列号来跟踪系统中“工作可用性”的变化。
 pub struct EventCount {
     state: AtomicUsize,
+}
+
+impl Default for EventCount {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EventCount {

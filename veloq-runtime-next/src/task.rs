@@ -163,7 +163,9 @@ impl<S: Storage> GenericTaskHeader<S> {
         self.state.fetch_and(!STATE_QUEUED, Ordering::Release);
     }
 
-    pub fn register_completion(&self, node: *mut GenericWakerNode<S>) {
+    /// # Safety
+    /// The `node` pointer must be a valid pointer to a `GenericWakerNode`.
+    pub unsafe fn register_completion(&self, node: *mut GenericWakerNode<S>) {
         loop {
             let head = self.waker_head.load(Ordering::Acquire);
             if self.is_completed() {
@@ -228,6 +230,9 @@ impl<S: Storage> GenericTaskHeader<S> {
         unsafe { Waker::from_raw(RawWaker::new(data, vtable)) }
     }
 
+    /// # Safety
+    /// The `waker` must have been created by a call to `create_waker` on a `TaskHeader` instance,
+    /// and `vtable` must match the vtable used for its creation.
     pub unsafe fn from_waker<'a>(
         waker: &'a Waker,
         vtable: &'static RawWakerVTable,
@@ -404,8 +409,8 @@ impl<'a, S: Storage> LifecycleManager<'a, S> {
         if old_state & STATE_WOKEN != 0 {
             self.header.state.fetch_and(!STATE_WOKEN, Ordering::Release);
             let state = self.header.state.load(Ordering::Acquire);
-            if state & STATE_POLLING == 0 {
-                if self
+            if state & STATE_POLLING == 0
+                && self
                     .header
                     .state
                     .compare_exchange_weak(
@@ -415,9 +420,8 @@ impl<'a, S: Storage> LifecycleManager<'a, S> {
                         Ordering::Acquire,
                     )
                     .is_ok()
-                {
-                    return true;
-                }
+            {
+                return true;
             }
         }
         false
@@ -458,12 +462,12 @@ where
             false
         };
 
-        if let Some(scope_ptr) = self.header.scope_completion.load(Ordering::Acquire) {
-            if !is_cancelled {
-                unsafe {
-                    scope_ptr.as_ref().report_panic(panic_err);
-                    scope_ptr.as_ref().cancel();
-                }
+        if let Some(scope_ptr) = self.header.scope_completion.load(Ordering::Acquire)
+            && !is_cancelled
+        {
+            unsafe {
+                scope_ptr.as_ref().report_panic(panic_err);
+                scope_ptr.as_ref().cancel();
             }
         }
 
@@ -557,6 +561,8 @@ macro_rules! define_task_infrastructure {
         unsafe impl Send for $ref_name {}
 
         impl $ref_name {
+            /// # Safety
+            /// The `ptr` must be a valid pointer to an object implementing `RawTask`.
             pub unsafe fn from_concrete<U>(ptr: *const U) -> Self
             where
                 U: RawTask<Storage = $storage>,
@@ -566,6 +572,8 @@ macro_rules! define_task_infrastructure {
                 }
             }
 
+            /// # Safety
+            /// The `header` pointer must be a valid pointer to a `GenericTaskHeader`.
             pub unsafe fn from_header(header: *const GenericTaskHeader<$storage>) -> Self {
                 Self { header }
             }

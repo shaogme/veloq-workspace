@@ -10,7 +10,7 @@ impl FastRand {
         }
     }
 
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x << 13;
         x ^= x >> 7;
@@ -24,6 +24,6 @@ impl FastRand {
         if max == 0 {
             return 0;
         }
-        (self.next() as u32) % max
+        (self.next_u64() as u32) % max
     }
 }

@@ -271,7 +271,11 @@ impl_state_int!(
 
 pub trait PointerStrategy<T> {
     fn to_physical(val: T) -> *mut ();
+    /// # Safety
+    /// `ptr` must be a valid pointer obtained from `to_physical`.
     unsafe fn from_physical(ptr: *mut ()) -> T;
+    /// # Safety
+    /// `ptr` must be a valid pointer obtained from `to_physical` and the pointee must be alive.
     unsafe fn as_ref<'a>(ptr: *mut ()) -> &'a T;
     fn null() -> *mut ();
 }
