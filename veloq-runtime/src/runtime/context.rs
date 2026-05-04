@@ -22,7 +22,7 @@ use crate::runtime::task::harness::{self, Runnable};
 use crate::runtime::task::{SpawnedTask, Task};
 
 thread_local! {
-    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), allow(clippy::missing_const_for_thread_local))]
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
 }
 

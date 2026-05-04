@@ -1,7 +1,10 @@
 use std::mem::ManuallyDrop;
+use std::pin::Pin;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::{RawWaker, RawWakerVTable, Waker};
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{StateInt, StateLock, StateWakerQueue, Storage};
@@ -249,13 +252,39 @@ pub struct GenericCancellationToken<S: Storage, O: Ownership> {
     inner: O::Shared<GenericCancellationTokenInner<S, O>>,
 }
 
-pub type ChildList<S, O> =
-    <S as Storage>::Lock<Vec<<O as Ownership>::Weak<GenericCancellationTokenInner<S, O>>>>;
+pub type ChildList<S, O> = <S as Storage>::Lock<LinkedList<CancellationTokenAdapter<S, O>>>;
+pub type ParentSlot<S, O> = <S as Storage>::Lock<Option<<O as Ownership>::Weak<GenericCancellationTokenInner<S, O>>>>;
 
 pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
     cancelled: S::Usize,
     wakers: S::WakerQueue,
     children: ChildList<S, O>,
+    pub(crate) link: Link,
+    parent: ParentSlot<S, O>,
+}
+
+intrusive_adapter!(pub CancellationTokenAdapter<S, O> = GenericCancellationTokenInner<S, O> { link: Link } where S: Storage, O: Ownership);
+
+impl<S: Storage, O: Ownership> GenericCancellationTokenInner<S, O> {
+    fn cancel_internal(&self) {
+        if self
+            .cancelled
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let wakers = self.wakers.take_all();
+        for waker in wakers {
+            waker.wake();
+        }
+
+        let mut children = self.children.lock();
+        while let Some(child_inner) = children.pop_front() {
+            child_inner.cancel_internal();
+        }
+    }
 }
 
 impl<S: Storage, O: Ownership> Default for GenericCancellationToken<S, O> {
@@ -270,7 +299,9 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
             inner: O::new(GenericCancellationTokenInner {
                 cancelled: S::Usize::new(0),
                 wakers: S::WakerQueue::new(),
-                children: S::Lock::new(Vec::new()),
+                children: S::Lock::new(LinkedList::new(CancellationTokenAdapter::<S, O>::new())),
+                link: Link::new(),
+                parent: S::Lock::new(None),
             }),
         }
     }
@@ -282,6 +313,11 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
             return child;
         }
 
+        {
+            let mut parent_slot = child.inner.parent.lock();
+            *parent_slot = Some(O::downgrade(&self.inner));
+        }
+
         let mut children = self.inner.children.lock();
         if self.is_cancelled() {
             drop(children);
@@ -289,37 +325,17 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
             return child;
         }
 
-        if children.len() > 16 {
-            children.retain(|c| O::strong_count(c) > 0);
+        unsafe {
+            let child_ptr = NonNull::new_unchecked(
+                O::as_ptr(&child.inner) as *mut GenericCancellationTokenInner<S, O>
+            );
+            children.push_back(Pin::new_unchecked(&mut *child_ptr.as_ptr()));
         }
-        children.push(O::downgrade(&child.inner));
         child
     }
 
     pub fn cancel(&self) {
-        if self
-            .inner
-            .cancelled
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-
-        let wakers = self.inner.wakers.take_all();
-        for waker in wakers {
-            waker.wake();
-        }
-
-        let children = {
-            let mut children = self.inner.children.lock();
-            std::mem::take(&mut *children)
-        };
-        for child_weak in children {
-            if let Some(child_inner) = O::upgrade(&child_weak) {
-                GenericCancellationToken::<S, O> { inner: child_inner }.cancel();
-            }
-        }
+        self.inner.cancel_internal();
     }
 
     #[inline]
@@ -335,6 +351,27 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
 
     pub fn from_inner(inner: O::Shared<GenericCancellationTokenInner<S, O>>) -> Self {
         Self { inner }
+    }
+}
+
+impl<S: Storage, O: Ownership> Drop for GenericCancellationToken<S, O> {
+    fn drop(&mut self) {
+        if O::strong_count(&O::downgrade(&self.inner)) == 1 {
+            let parent_guard = self.inner.parent.lock();
+            if let Some(parent_weak) = parent_guard.as_ref()
+                && let Some(parent_inner) = O::upgrade(parent_weak) {
+                    let mut children = parent_inner.children.lock();
+                    if self.inner.link.is_linked() {
+                        unsafe {
+                            let node_ptr =
+                                NonNull::new_unchecked(O::as_ptr(&self.inner)
+                                    as *mut GenericCancellationTokenInner<S, O>);
+                            let mut cursor = children.cursor_mut_from_ptr(node_ptr);
+                            cursor.remove();
+                        }
+                    }
+                }
+        }
     }
 }
 

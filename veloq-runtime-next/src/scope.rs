@@ -6,9 +6,7 @@ use crate::task::{
     SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
-use crate::utils::storage::{
-    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage,
-};
+use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, Storage};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -16,6 +14,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
+use veloq_intrusive_linklist::Link;
 
 unsafe fn take_result_of<T, S>(ptr: *const ()) -> Option<Result<T, TaskError>>
 where
@@ -474,7 +473,7 @@ impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> 
             let node = unsafe { node_ptr.as_mut() };
             if !node.waker.will_wake(cx.waker()) {
                 node.waker = cx.waker().clone();
-                unsafe { header.register_completion(node as *mut _) };
+                unsafe { header.register_completion(node_ptr.as_ptr()) };
             }
         } else {
             let node_ptr = unsafe {
@@ -488,7 +487,8 @@ impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> 
                     node_ptr,
                     GenericWakerNode {
                         waker: cx.waker().clone(),
-                        next: <R::Storage as Storage>::OptionPtr::new(None),
+                        link: Link::new(),
+                        _marker: std::marker::PhantomData,
                     },
                 );
             }
@@ -496,6 +496,25 @@ impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> 
             unsafe { header.register_completion(node_ptr) };
         }
         Poll::Pending
+    }
+}
+
+impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>> Drop
+    for JoinHandle<'scope, 'scope_ref, T, R, S>
+{
+    fn drop(&mut self) {
+        if let Some(node_ptr) = self.waker_node {
+            let header = self.task.header();
+            if !header.is_completed() {
+                let mut wakers = header.wakers.lock();
+                if unsafe { node_ptr.as_ref().link.is_linked() } {
+                    unsafe {
+                        let mut cursor = wakers.cursor_mut_from_ptr(node_ptr);
+                        cursor.remove();
+                    }
+                }
+            }
+        }
     }
 }
 

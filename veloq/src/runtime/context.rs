@@ -9,6 +9,7 @@ use veloq_driver::driver::{Driver, PlatformDriver};
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 thread_local! {
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
 }
 

@@ -2,6 +2,7 @@ use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
 use std::alloc::{Layout, alloc, dealloc};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::Ordering;
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 /// 一个高性能的、块分配器接口。
 pub trait Arena {
@@ -29,16 +30,18 @@ pub(crate) struct GenericChunk<S: Storage> {
     // 活跃对象计数器：当计数归零时，Chunk 可被回收
     active_count: S::Usize,
     // 该块拥有的析构函数链表
-    drop_head: S::OptionPtr<GenericDropNode<S>>,
+    drop_head: S::Lock<LinkedList<DropAdapter<S>>>,
 }
 
 pub(crate) struct GenericDropNode<S: Storage> {
-    next: *mut GenericDropNode<S>,
+    link: Link,
     drop_fn: unsafe fn(*mut u8),
     data_ptr: *mut u8,
     // 所属的 Chunk，用于回收
     chunk: *const GenericChunk<S>,
 }
+
+intrusive_adapter!(pub(crate) DropAdapter<S> = GenericDropNode<S> { link: Link } where S: Storage);
 
 impl<S: Storage> GenericArena<S> {
     pub fn new() -> Self {
@@ -98,21 +101,10 @@ impl<S: Storage> GenericArena<S> {
                 (*node_ptr).drop_fn = drop_fn.unwrap();
                 (*node_ptr).data_ptr = data_ptr;
                 (*node_ptr).chunk = chunk_ptr;
+                (*node_ptr).link = Link::new();
 
-                // 原子压入块内 LIFO 链表
-                let mut head = (*chunk_ptr).drop_head.load(Ordering::Acquire);
-                loop {
-                    (*node_ptr).next = head.map(|p| p.as_ptr()).unwrap_or(ptr::null_mut());
-                    match (*chunk_ptr).drop_head.compare_exchange_weak(
-                        head,
-                        NonNull::new(node_ptr),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break,
-                        Err(actual) => head = actual,
-                    }
-                }
+                let mut drop_head = (*chunk_ptr).drop_head.lock();
+                drop_head.push_front(std::pin::Pin::new_unchecked(&mut *node_ptr));
             }
             data_ptr
         } else {
@@ -131,8 +123,15 @@ impl<S: Storage> GenericArena<S> {
 
         // 2. 执行析构
         let drop_fn = unsafe { (*node_ptr).drop_fn };
-        // 将 drop_fn 置为 no-op 避免 Arena 销毁时重复调用
+        let chunk_ptr = unsafe { (*node_ptr).chunk as *mut GenericChunk<S> };
+
         unsafe {
+            let mut drop_head = (*chunk_ptr).drop_head.lock();
+            if (*node_ptr).link.is_linked() {
+                let mut cursor = drop_head.cursor_mut_from_ptr(NonNull::new_unchecked(node_ptr));
+                cursor.remove();
+            }
+            // 将 drop_fn 置为 no-op 避免重复调用
             ptr::write_volatile(&mut (*node_ptr).drop_fn, |_| {});
             (drop_fn)(data_ptr as *mut u8);
         }
@@ -197,7 +196,7 @@ impl<S: Storage> GenericArena<S> {
             layout: new_chunk_layout,
             used: S::Usize::new(0),
             active_count: S::Usize::new(0),
-            drop_head: S::OptionPtr::new(None),
+            drop_head: S::Lock::new(LinkedList::new(DropAdapter::<S>::new())),
         });
 
         let allocated_ptr = new_chunk.try_alloc(layout);
@@ -269,11 +268,9 @@ impl<S: Storage> Drop for GenericArena<S> {
         while let Some(chunk_ptr) = chunks.pop() {
             unsafe {
                 let chunk = Box::from_raw(chunk_ptr);
-                let mut curr_drop = chunk.drop_head.load(Ordering::Acquire);
-                while let Some(drop_node) = curr_drop {
-                    let node = drop_node.as_ptr();
-                    ((*node).drop_fn)((*node).data_ptr);
-                    curr_drop = NonNull::new((*node).next);
+                let mut drop_head = chunk.drop_head.lock();
+                while let Some(node) = drop_head.pop_front() {
+                    (node.drop_fn)(node.data_ptr);
                 }
                 dealloc(chunk.ptr.as_ptr(), chunk.layout);
             }

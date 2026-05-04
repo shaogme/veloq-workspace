@@ -5,7 +5,9 @@ pub use arena::{Arena, GenericArena};
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateOptionPtr, Storage};
+use crate::utils::storage::{
+    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage,
+};
 use std::any::Any;
 use std::cell::RefCell;
 use std::future::Future;
@@ -13,6 +15,7 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 // --- 任务错误与结果扩展 ---
 
@@ -47,8 +50,11 @@ pub struct TaskVTable {
 
 pub struct GenericWakerNode<S: Storage> {
     pub(crate) waker: Waker,
-    pub(crate) next: S::OptionPtr<GenericWakerNode<S>>,
+    pub(crate) link: Link,
+    pub(crate) _marker: std::marker::PhantomData<S>,
 }
+
+intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
 
 pub type WakerNode = GenericWakerNode<AtomicStorage>;
 pub type LocalWakerNode = GenericWakerNode<LocalStorage>;
@@ -99,7 +105,7 @@ impl ScopeCompletionRef {
 
 pub struct GenericTaskHeader<S: Storage> {
     pub(crate) state: S::Usize,
-    pub(crate) waker_head: S::OptionPtr<GenericWakerNode<S>>,
+    pub(crate) wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     pub(crate) scope_completion: S::OptionPtr<ScopeCompletionRef>,
     pub(crate) runtime_ptr: S::OptionPtr<crate::runtime::RuntimeShared>,
     pub(crate) worker_id: S::Usize,
@@ -113,7 +119,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     pub fn new(vtable: &'static TaskVTable) -> Self {
         Self {
             state: S::Usize::new(0),
-            waker_head: S::OptionPtr::new(None),
+            wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
             scope_completion: S::OptionPtr::new(None),
             runtime_ptr: S::OptionPtr::new(None),
             worker_id: S::Usize::new(0),
@@ -166,25 +172,20 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// # Safety
     /// The `node` pointer must be a valid pointer to a `GenericWakerNode`.
     pub unsafe fn register_completion(&self, node: *mut GenericWakerNode<S>) {
-        loop {
-            let head = self.waker_head.load(Ordering::Acquire);
-            if self.is_completed() {
-                unsafe { (&*node).waker.wake_by_ref() };
-                return;
-            }
-            unsafe { (&*node).next.store(head, Ordering::Relaxed) };
-            if self
-                .waker_head
-                .compare_exchange(
-                    head,
-                    NonNull::new(node),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return;
-            }
+        if self.is_completed() {
+            unsafe { (&*node).waker.wake_by_ref() };
+            return;
+        }
+
+        let mut wakers = self.wakers.lock();
+        if self.is_completed() {
+            drop(wakers);
+            unsafe { (&*node).waker.wake_by_ref() };
+            return;
+        }
+
+        unsafe {
+            wakers.push_back(Pin::new_unchecked(&mut *node));
         }
     }
 
@@ -195,12 +196,10 @@ impl<S: Storage> GenericTaskHeader<S> {
         if old_state & STATE_COMPLETED != 0 {
             return;
         }
-        let mut head = self.waker_head.swap(None, Ordering::AcqRel);
-        while let Some(node_ptr) = head {
-            let node = unsafe { node_ptr.as_ref() };
-            let next = node.next.load(Ordering::Acquire);
+
+        let mut wakers = self.wakers.lock();
+        while let Some(node) = wakers.pop_front() {
             node.waker.wake_by_ref();
-            head = next;
         }
     }
 
