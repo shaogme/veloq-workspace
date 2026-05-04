@@ -15,6 +15,7 @@ readme.workspace = true
 crossbeam-queue.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
+numaperf-topo = "0.1"
 
 [lints]
 workspace = true

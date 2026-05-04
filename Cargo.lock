@@ -719,6 +719,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "numaperf-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7887215b6cb1c32b01fbf313c4275c6f88e29f75ed8f3f61ab262a19b6141cb4"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "numaperf-topo"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1897bf5293355d70d4dc33ef75bea4fcca67e5c408682aec4b329386ba7dba2c"
+dependencies = [
+ "libc",
+ "numaperf-core",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1130,6 +1149,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "thread_local"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1434,6 +1473,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "libc",
+ "numaperf-topo",
  "parking_lot",
 ]
 
