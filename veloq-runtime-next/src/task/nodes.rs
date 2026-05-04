@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 
 /// 栈上本地任务：future 本身不进行任何堆分配。
+#[repr(C)]
 pub struct LocalTaskNode<'scope, 'future, T, F>
 where
     F: Future<Output = T> + 'future,
@@ -80,6 +81,7 @@ where
     );
 }
 
+#[repr(C)]
 pub struct LocalBoxedTaskNode<'scope, T, F>
 where
     F: Future<Output = T> + 'scope,
@@ -147,6 +149,7 @@ where
     );
 }
 
+#[repr(C)]
 pub struct SendBoxedTaskNode<'scope, T, F>
 where
     F: Future<Output = T> + Send + 'scope,
@@ -218,6 +221,7 @@ where
 }
 
 /// 栈上 Send 任务：future 固定在调用栈里，不进行堆分配。
+#[repr(C)]
 pub struct SendTaskNode<'scope, 'future, T, F>
 where
     F: Future<Output = T> + Send + 'future,
