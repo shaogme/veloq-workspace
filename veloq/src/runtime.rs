@@ -135,6 +135,7 @@ impl<T: PoolTopology> Runtime<T> {
         struct ClearCurrentContext;
         impl Drop for ClearCurrentContext {
             fn drop(&mut self) {
+                veloq_runtime_next::runtime::clear_worker_idle_hook();
                 context::clear_current_runtime_context();
             }
         }
@@ -192,6 +193,9 @@ impl<T: PoolTopology> Runtime<T> {
                     context::set_current_runtime_context(context::RuntimeContext::new(
                         driver, buf_pool, config, registrar,
                     ));
+                    veloq_runtime_next::runtime::set_worker_idle_hook(Some(Box::new(|| {
+                        crate::runtime::context::poll_current_driver_nonblocking()
+                    })));
                 }
             })
             .build();

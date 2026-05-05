@@ -848,6 +848,21 @@ impl Driver for IocpDriver {
         }
     }
 
+    fn poll_nonblocking(&mut self) -> DriverResult<()> {
+        self.get_completion(0).map_err(|e| {
+            Self::with_report_detail(
+                DriverErrorKind::Completion,
+                "iocp/driver",
+                "poll nonblocking failed",
+                format!("{e:#}"),
+            )
+        })
+    }
+
+    fn next_timeout_hint(&self) -> Option<Duration> {
+        self.wheel.next_timeout()
+    }
+
     fn completion_queue(&self) -> SharedCompletionQueue {
         self.completion_events.clone()
     }
@@ -934,6 +949,10 @@ impl Driver for IocpDriver {
 
     fn driver_id(&self) -> usize {
         self.port.as_raw() as usize
+    }
+
+    fn has_active_ops(&mut self) -> bool {
+        self.has_active_ops_internal()
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {

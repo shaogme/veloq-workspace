@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 pub struct RuntimeContext {
     pub(crate) shared: Arc<RuntimeShared>,
@@ -14,9 +15,14 @@ pub struct RuntimeContext {
     pub(crate) rand: RefCell<FastRand>,
 }
 
+pub type IdleHook = Box<dyn Fn() -> Option<Duration>>;
+
 thread_local! {
     #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     pub(crate) static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
+
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
+    static WORKER_IDLE_HOOK: RefCell<Option<IdleHook>> = const { RefCell::new(None) };
 }
 
 /// Worker initialization context passed to the injected worker init step.
@@ -70,4 +76,18 @@ pub fn clear_current_runtime_context() {
 
 pub(crate) fn with_current_runtime<R>(f: impl FnOnce(&Arc<RuntimeShared>) -> R) -> Option<R> {
     CONTEXT.with(|ctx| ctx.borrow().as_ref().map(|c| f(&c.shared)))
+}
+
+pub fn set_worker_idle_hook(hook: Option<IdleHook>) {
+    WORKER_IDLE_HOOK.with(|cell| {
+        *cell.borrow_mut() = hook;
+    });
+}
+
+pub fn clear_worker_idle_hook() {
+    set_worker_idle_hook(None);
+}
+
+pub(crate) fn run_worker_idle_hook() -> Option<Duration> {
+    WORKER_IDLE_HOOK.with(|cell| cell.borrow().as_ref().and_then(|hook| hook()))
 }

@@ -67,7 +67,8 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 
     pub fn task_done(&self) {
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let remaining = self.remaining.fetch_sub(1, Ordering::AcqRel) - 1;
+        if remaining == 0 {
             self.drain_wakers();
         }
     }

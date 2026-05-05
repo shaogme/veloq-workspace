@@ -10,6 +10,7 @@ use veloq_driver::driver::{Driver, PlatformDriver};
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 use crate::config::{BufferRegistrationMode, Config};
+use std::time::Duration;
 
 thread_local! {
     /// 线程局部的运行时上下文
@@ -240,6 +241,25 @@ pub fn alloc(size: NonZeroUsize) -> FixedBuf {
     try_alloc(size).expect("failed to allocate buffer")
 }
 
+pub fn poll_current_driver_nonblocking() -> Option<Duration> {
+    let ctx = try_current()?;
+
+    ctx.registrar().sync_to_driver();
+    let driver_rc = ctx.driver();
+    let mut driver = driver_rc.borrow_mut();
+    driver
+        .poll_nonblocking()
+        .unwrap_or_else(|err| panic!("driver poll_nonblocking failed: {err:#}"));
+
+    let hint = driver.next_timeout_hint();
+    if hint.is_none() && driver.has_active_ops() {
+        // If there are pending I/O operations but no timers, poll every 10ms to ensure liveness.
+        Some(Duration::from_millis(10))
+    } else {
+        hint
+    }
+}
+
 pub fn submit<'a, S, T>(
     submitter: &'a S,
     op: Op<T>,
@@ -269,11 +289,7 @@ where
                     driver
                         .submit_queue()
                         .unwrap_or_else(|err| panic!("driver submit_queue failed: {err:#}"));
-                    driver
-                        .wait()
-                        .unwrap_or_else(|err| panic!("driver wait failed: {err:#}"));
                     driver.process_completions();
-                    cx.waker().wake_by_ref();
                     Poll::Pending
                 }
             },

@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
 
 const WINDOWS_TARGET: &str = "x86_64-pc-windows-gnu";
-const XRUNNER_TOKEN_ENV: &str = "VELOQ_XRUNNER_GUARD";
-const LINUX_GUARD_WRAPPER: &str = "test-utils/rustc-guard-launcher.sh";
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum Target {
@@ -119,7 +117,7 @@ impl CommandSpec {
         Self {
             program: program.into(),
             args: args.into(),
-            envs: vec![(XRUNNER_TOKEN_ENV.to_string(), "1".to_string())],
+            envs: Vec::new(),
         }
     }
 
@@ -306,10 +304,6 @@ impl Runner {
                 args.extend(vec![
                     "run".into(),
                     "--rm".into(),
-                    "-e".into(),
-                    "CARGO_TARGET_DIR=target/guard-linux".into(),
-                    "-e".into(),
-                    format!("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER={LINUX_GUARD_WRAPPER}"),
                     "dev".into(),
                     "cargo".into(),
                     "run".into(),
@@ -331,9 +325,7 @@ impl Runner {
                     "--".into(),
                 ];
                 args.extend(std::env::args().skip(1));
-                CommandSpec::new("cross", args)
-                    .with_env("CROSS_SKIP_AUTO_UPDATE", "1")
-                    .with_env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", LINUX_GUARD_WRAPPER)
+                CommandSpec::new("cross", args).with_env("CROSS_SKIP_AUTO_UPDATE", "1")
             }
             (_, Target::Linux) => {
                 linux_native_command(self.config.task, self.config.features.as_deref())

@@ -49,6 +49,7 @@ pub struct IocpDriver {
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
+    pub(crate) last_timer_poll: Instant,
     pub(crate) registered_files: Vec<Option<RegisteredHandle>>,
     pub(crate) free_slots: Vec<usize>,
     pub(crate) is_notified: Arc<AtomicBool>,
@@ -125,6 +126,7 @@ impl IocpDriver {
             extensions,
             wheel: Wheel::new(WheelConfig::default()),
             timer_buffer: Vec::new(),
+            last_timer_poll: Instant::now(),
             registered_files: Vec::new(),
             free_slots: Vec::new(),
             is_notified: Arc::new(AtomicBool::new(false)),
@@ -145,11 +147,12 @@ impl IocpDriver {
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
         trace!(wait_ms, "Entering GetQueuedCompletionStatus");
-        let start = Instant::now();
         let status = self.port.get_status(wait_ms);
-        let elapsed = start.elapsed();
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_timer_poll);
         self.wheel.advance(elapsed, &mut self.timer_buffer);
         self.process_timers();
+        self.last_timer_poll = now;
 
         let status = status.map_err(|e| {
             error_stack::Report::new(IocpError::CompletionWait).attach(format!("{e:#}"))
@@ -632,6 +635,10 @@ impl IocpDriver {
         );
 
         ops.remove(user_data);
+    }
+
+    pub(crate) fn has_active_ops_internal(&mut self) -> bool {
+        self.ops.has_active_ops()
     }
 
     pub(crate) fn wake(&self) -> IocpResult<()> {

@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
 
@@ -131,6 +131,7 @@ pub struct UringDriver {
 
     pub(crate) wheel: veloq_wheel::Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
+    pub(crate) last_timer_poll: Instant,
     pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
@@ -248,6 +249,7 @@ impl UringDriver {
 
             wheel: veloq_wheel::Wheel::new(veloq_wheel::WheelConfig::default()),
             timer_buffer: Vec::new(),
+            last_timer_poll: Instant::now(),
             registrar: Box::new(veloq_buf::NoopRegistrar),
             registration_stats: UringRegistrationStats::default(),
             registration_mode: config.registration_mode,
@@ -507,15 +509,12 @@ impl UringDriver {
         self.flush_cancellations();
         self.flush_backlog();
 
-        if !self.has_active_ops() {
+        if !self.has_active_ops_internal() {
             return Ok(());
         }
 
-        if !self.ring.completion().is_empty() {
-            self.process_completions_internal();
-        } else {
+        if self.ring.completion().is_empty() {
             let next_timeout = self.wheel.next_timeout();
-            let start = std::time::Instant::now();
 
             if let Some(duration) = next_timeout {
                 let ts = io_uring::types::Timespec::new()
@@ -543,39 +542,12 @@ impl UringDriver {
                     )
                 })?;
             }
-
-            let elapsed = start.elapsed();
-            self.wheel.advance(elapsed, &mut self.timer_buffer);
-
-            let timer_buffer = std::mem::take(&mut self.timer_buffer);
-            for user_data in timer_buffer {
-                let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
-                    SlotView::InFlightWaiting(mut slot) => {
-                        slot.platform_mut().timer_id = None;
-                        let mut completed = slot.complete();
-
-                        let generation = completed.entry.generation(Ordering::Acquire);
-                        let _ = completed.take_op();
-                        let (payload, detail) = completed.take_completion_data();
-
-                        Some(CompletionSidecar {
-                            user_data,
-                            generation,
-                            res: 0,
-                            flags: 0,
-                            payload,
-                            detail,
-                        })
-                    }
-                    _ => None,
-                });
-
-                if let Some(sidecar) = sidecar {
-                    self.push_completion_event(sidecar);
-                    self.ops.remove(user_data);
-                }
-            }
         }
+
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_timer_poll);
+        self.advance_timers(elapsed);
+        self.last_timer_poll = now;
 
         self.process_completions_internal();
         self.flush_cancellations();
@@ -583,14 +555,58 @@ impl UringDriver {
         Ok(())
     }
 
-    fn has_active_ops(&mut self) -> bool {
-        let len = self.ops.local.len();
-        for idx in 0..len {
-            if self.ops.slot_view(idx).is_some() {
-                return true;
+    fn advance_timers(&mut self, elapsed: Duration) {
+        self.wheel.advance(elapsed, &mut self.timer_buffer);
+
+        let timer_buffer = std::mem::take(&mut self.timer_buffer);
+        for user_data in timer_buffer {
+            let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
+                SlotView::InFlightWaiting(mut slot) => {
+                    slot.platform_mut().timer_id = None;
+                    let mut completed = slot.complete();
+
+                    let generation = completed.entry.generation(Ordering::Acquire);
+                    let _ = completed.take_op();
+                    let (payload, detail) = completed.take_completion_data();
+
+                    Some(CompletionSidecar {
+                        user_data,
+                        generation,
+                        res: 0,
+                        flags: 0,
+                        payload,
+                        detail,
+                    })
+                }
+                _ => None,
+            });
+
+            if let Some(sidecar) = sidecar {
+                self.push_completion_event(sidecar);
+                self.ops.remove(user_data);
             }
         }
-        false
+    }
+
+    pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
+        self.drain_cancel_requests();
+        self.flush_cancellations();
+        self.flush_backlog();
+        self.submit_to_kernel()?;
+        self.process_completions_internal();
+
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_timer_poll);
+        self.advance_timers(elapsed);
+        self.last_timer_poll = now;
+
+        self.flush_cancellations();
+        self.flush_backlog();
+        Ok(())
+    }
+
+    fn has_active_ops_internal(&mut self) -> bool {
+        self.ops.has_active_ops()
     }
 
     pub(crate) fn process_completions_internal(&mut self) {
@@ -950,6 +966,20 @@ impl Driver for UringDriver {
         self.flush_backlog();
     }
 
+    fn poll_nonblocking(&mut self) -> DriverResult<()> {
+        self.poll_nonblocking_internal().map_err(|e| {
+            driver_error(
+                DriverErrorKind::Completion,
+                "uring.driver.poll_nonblocking",
+                format!("{e:#}"),
+            )
+        })
+    }
+
+    fn next_timeout_hint(&self) -> Option<Duration> {
+        self.wheel.next_timeout()
+    }
+
     fn completion_queue(&self) -> SharedCompletionQueue {
         self.completion_events.clone()
     }
@@ -1041,6 +1071,10 @@ impl Driver for UringDriver {
 
     fn driver_id(&self) -> usize {
         self.waker_fd.fd.raw().as_fd() as usize
+    }
+
+    fn has_active_ops(&mut self) -> bool {
+        self.has_active_ops_internal()
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {

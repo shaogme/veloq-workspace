@@ -4,6 +4,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::{RawWaker, RawWakerVTable, Waker};
+use std::time::Duration;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 use crate::task::OpaqueToken;
@@ -14,6 +15,7 @@ use crate::utils::storage::{StateInt, StateLock, StateWakerQueue, Storage};
 
 mod sys {
     use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
 
     #[cfg(windows)]
     mod win {
@@ -40,6 +42,29 @@ mod sys {
                 4,
                 0xFFFFFFFF, // INFINITE
             );
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn wait_timeout(addr: &AtomicU32, expected: u32, timeout: Duration) -> bool {
+        let expected_val = expected;
+        let millis = if timeout.is_zero() {
+            0
+        } else {
+            let nanos = timeout.as_nanos();
+            nanos
+                .saturating_add(999_999)
+                .checked_div(1_000_000)
+                .unwrap_or(u128::MAX)
+                .min(u32::MAX as u128) as u32
+        };
+        unsafe {
+            win::WaitOnAddress(
+                addr as *const _ as *const _,
+                &expected_val as *const _ as *const _,
+                4,
+                millis,
+            ) != 0
         }
     }
 
@@ -71,6 +96,24 @@ mod sys {
     }
 
     #[cfg(target_os = "linux")]
+    pub unsafe fn wait_timeout(addr: &AtomicU32, expected: u32, timeout: Duration) -> bool {
+        let ts = libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                addr as *const _ as *mut i32,
+                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                expected as i32,
+                &ts as *const libc::timespec,
+            )
+        };
+        ret == 0
+    }
+
+    #[cfg(target_os = "linux")]
     pub unsafe fn wake_one(addr: &AtomicU32) {
         unsafe {
             libc::syscall(
@@ -97,6 +140,11 @@ mod sys {
     #[cfg(not(any(windows, target_os = "linux")))]
     pub unsafe fn wait(_addr: &AtomicU32, _expected: u32) {
         std::thread::yield_now();
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    pub unsafe fn wait_timeout(_addr: &AtomicU32, _expected: u32, timeout: Duration) -> bool {
+        std::thread::sleep(timeout);
+        false
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     pub unsafe fn wake_one(_addr: &AtomicU32) {}
@@ -136,6 +184,22 @@ impl Signal {
             // Slow-path: block until notified
             unsafe { sys::wait(&self.state, 0) };
         }
+    }
+
+    pub fn wait_timeout(&self, duration: Duration) -> bool {
+        if self
+            .state
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+
+        unsafe { sys::wait_timeout(&self.state, 0, duration) };
+
+        self.state
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -227,6 +291,46 @@ impl Parker {
             } else {
                 // State must be NOTIFIED or PARKED (by another thread - though Parker is thread-exclusive)
                 // Continue to retry.
+            }
+        }
+    }
+
+    pub fn park_timeout(&self, duration: Duration) -> bool {
+        loop {
+            if self
+                .inner
+                .state
+                .compare_exchange(NOTIFIED, EMPTY, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+
+            if self
+                .inner
+                .state
+                .compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = unsafe { sys::wait_timeout(&self.inner.state, PARKED, duration) };
+
+                if self
+                    .inner
+                    .state
+                    .compare_exchange(NOTIFIED, EMPTY, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return true;
+                }
+
+                if self
+                    .inner
+                    .state
+                    .compare_exchange(PARKED, EMPTY, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return false;
+                }
             }
         }
     }

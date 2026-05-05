@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use std::task::Poll;
 use std::task::Waker;
+use std::time::Duration;
 
 pub const CELL_STATE_IDLE: u8 = 0;
 pub const CELL_STATE_WAITING: u8 = 1;
@@ -572,6 +573,15 @@ pub trait Driver: 'static {
 
     fn process_completions(&mut self);
 
+    fn poll_nonblocking(&mut self) -> DriverResult<()> {
+        self.process_completions();
+        Ok(())
+    }
+
+    fn next_timeout_hint(&self) -> Option<Duration> {
+        None
+    }
+
     fn completion_queue(&self) -> SharedCompletionQueue;
 
     fn completion_table(&self) -> SharedCompletionTable<Self::Completion>;
@@ -635,6 +645,8 @@ pub trait Driver: 'static {
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
 
     fn driver_id(&self) -> usize;
+
+    fn has_active_ops(&mut self) -> bool;
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
 }

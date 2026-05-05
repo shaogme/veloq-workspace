@@ -24,8 +24,8 @@ pub use primitives::{
 
 pub(crate) use context::with_current_runtime;
 pub use context::{
-    RuntimeContext, WorkerInitContext, clear_current_runtime_context, current_worker_id,
-    set_current_runtime_context,
+    RuntimeContext, WorkerInitContext, clear_current_runtime_context, clear_worker_idle_hook,
+    current_worker_id, set_current_runtime_context, set_worker_idle_hook,
 };
 pub(crate) use shared::RuntimeShared;
 
@@ -152,7 +152,17 @@ where
                     Poll::Ready(res) => {
                         return res;
                     }
-                    Poll::Pending => signal.wait(),
+                    Poll::Pending => {
+                        let hint = context::run_worker_idle_hook();
+                        match hint {
+                            Some(duration) => {
+                                let _ = signal.wait_timeout(duration);
+                            }
+                            None => {
+                                signal.wait();
+                            }
+                        }
+                    }
                 }
             }
         })

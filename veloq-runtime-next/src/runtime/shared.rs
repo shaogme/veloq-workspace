@@ -10,6 +10,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
 
 pub(crate) struct WorkerQueue {
     pub(crate) local_tx: Sender<LocalTaskRef>,
@@ -517,6 +518,8 @@ impl RuntimeShared {
                     .idle_stack
                     .push(worker_id, &self.next_idle);
 
+                let idle_hint = super::context::run_worker_idle_hook();
+
                 if self.event_count.load() != seq
                     || self.has_work(worker_id)
                     || self.shutdown.load(Ordering::Acquire)
@@ -545,20 +548,16 @@ impl RuntimeShared {
                     continue;
                 }
 
-                if completion.is_some() {
-                    if self.groups[group_idx]
-                        .idle_stack
-                        .pop(&self.next_idle)
-                        .is_some()
-                    {
-                        self.idle_mask.clear(worker_id);
-                    }
-                    std::thread::yield_now();
-                    continue;
+                let parker = Parker::from_inner(self.parker_inners[worker_id].clone());
+                if let Some(duration) = idle_hint {
+                    let _ = parker.park_timeout(duration);
+                } else if completion.is_some() {
+                    let _ = parker.park_timeout(Duration::from_millis(1));
+                } else {
+                    parker.park();
                 }
 
-                let parker = Parker::from_inner(self.parker_inners[worker_id].clone());
-                parker.park();
+                let _ = self.groups[group_idx].idle_stack.pop(&self.next_idle);
 
                 self.idle_mask.clear(worker_id);
             }
