@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
+use std::sync::{Arc, mpsc};
 
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
@@ -13,8 +14,7 @@ use veloq_driver::driver::{Driver, PlatformDriver};
 use veloq_runtime_next::runtime::{self as async_runtime, WorkerInitContext};
 
 use crate::config::Config;
-
-use crate::runtime::context::DriverRegistrar;
+use crate::runtime::context::{DriverRegistrar, RegistrarMessage};
 
 pub struct RuntimeBuilder<T: PoolTopology> {
     topology: T,
@@ -84,6 +84,37 @@ pub struct Runtime<T: PoolTopology> {
     config: Config,
 }
 
+struct StaticTransfer<T>(Box<[Option<T>]>);
+
+unsafe impl<T: Send> Sync for StaticTransfer<T> {}
+
+impl<T> StaticTransfer<T> {
+    fn new(items: Vec<T>) -> Self {
+        Self(items.into_iter().map(Some).collect())
+    }
+
+    fn take(&self, index: usize) -> T {
+        unsafe {
+            let ptr = self.0.as_ptr() as *mut Option<T>;
+            (*ptr.add(index))
+                .take()
+                .expect("Worker item already taken or index out of bounds")
+        }
+    }
+}
+
+struct RegistrarDispatcher {
+    senders: Vec<mpsc::Sender<RegistrarMessage>>,
+}
+
+impl RegistrarDispatcher {
+    fn broadcast(&self, msg: RegistrarMessage) {
+        for sender in &self.senders {
+            let _ = sender.send(msg.clone());
+        }
+    }
+}
+
 impl<T: PoolTopology> Runtime<T> {
     pub fn builder(topology: T) -> RuntimeBuilder<T> {
         RuntimeBuilder::new(topology)
@@ -110,6 +141,27 @@ impl<T: PoolTopology> Runtime<T> {
 
         let _clear = ClearCurrentContext;
 
+        // 预先为每个 Worker 创建消息通道
+        let mut senders = Vec::with_capacity(worker_count.get());
+        let mut receivers = Vec::with_capacity(worker_count.get());
+        for _ in 0..worker_count.get() {
+            let (tx, rx) = mpsc::channel();
+            senders.push(tx);
+            receivers.push(rx);
+        }
+
+        let receivers = Arc::new(StaticTransfer::new(receivers));
+        let dispatcher = Arc::new(RegistrarDispatcher { senders });
+
+        // 连接内存池监听器到分发器
+        let dispatcher_clone = dispatcher.clone();
+        topology.connect_listener(
+            &state,
+            Box::new(move |chunk_info| {
+                dispatcher_clone.broadcast(RegistrarMessage::NewChunk(chunk_info));
+            }),
+        );
+
         let runtime = async_runtime::Runtime::builder()
             .worker_count(worker_count)
             .queue_capacity(config.get_queue_capacity())
@@ -117,23 +169,19 @@ impl<T: PoolTopology> Runtime<T> {
                 let topology = topology.clone();
                 let state = state.clone();
                 let config = config.clone();
+                let receiver = receivers.take(worker_ctx.worker_id());
+
                 async move {
                     let driver = Rc::new(RefCell::new(
                         PlatformDriver::new(&config).expect("failed to create driver"),
                     ));
 
+                    // 初始化 TLS 中的注册中心状态
+                    context::init_worker_registrar_state(receiver);
+
                     let registration_mode = config.registration_mode();
                     let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
-                    let listener_chunks = registrar.chunks.clone();
-                    topology.connect_listener(
-                        &state,
-                        Box::new(move |chunk_info| {
-                            listener_chunks
-                                .write()
-                                .expect("chunk registry poisoned")
-                                .push(chunk_info);
-                        }),
-                    );
+
                     {
                         let mut driver_ref = driver.borrow_mut();
                         driver_ref.set_registrar(Box::new(registrar.clone()));

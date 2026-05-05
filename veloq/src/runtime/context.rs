@@ -1,8 +1,8 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
+use std::sync::mpsc;
 use std::task::Poll;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
@@ -12,15 +12,42 @@ use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 use crate::config::{BufferRegistrationMode, Config};
 
 thread_local! {
+    /// 线程局部的运行时上下文
     #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
+
+    /// 线程局部的注册中心状态
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
+    static REGISTRAR_STATE: RefCell<Option<WorkerRegistrarState>> = const { RefCell::new(None) };
+}
+
+/// 驱动注册中心的消息类型
+#[derive(Debug, Clone)]
+pub enum RegistrarMessage {
+    /// 发现了新的内存块，需要通知驱动注册
+    NewChunk(veloq_buf::heap::ChunkInfo),
+}
+
+struct WorkerRegistrarState {
+    /// 接收来自分发器的广播消息
+    receiver: mpsc::Receiver<RegistrarMessage>,
+    /// 本地已知的内存块快照
+    chunks: Vec<veloq_buf::heap::ChunkInfo>,
+}
+
+/// 初始化当前 Worker 线程的注册中心状态
+pub(crate) fn init_worker_registrar_state(receiver: mpsc::Receiver<RegistrarMessage>) {
+    REGISTRAR_STATE.with(|state| {
+        *state.borrow_mut() = Some(WorkerRegistrarState {
+            receiver,
+            chunks: Vec::new(),
+        });
+    });
 }
 
 #[derive(Clone)]
 pub struct DriverRegistrar {
     driver: Weak<RefCell<PlatformDriver>>,
-    pub(crate) chunks: Arc<std::sync::RwLock<Vec<veloq_buf::heap::ChunkInfo>>>,
-    processed_count: Cell<usize>,
     registration_mode: BufferRegistrationMode,
 }
 
@@ -31,8 +58,6 @@ impl DriverRegistrar {
     ) -> Self {
         Self {
             driver,
-            chunks: Arc::new(std::sync::RwLock::new(Vec::new())),
-            processed_count: Cell::new(0),
             registration_mode,
         }
     }
@@ -42,32 +67,35 @@ impl DriverRegistrar {
             return;
         };
 
-        let start = self.processed_count.get();
+        REGISTRAR_STATE.with(|state_cell| {
+            let mut state_opt = state_cell.borrow_mut();
+            let state = state_opt
+                .as_mut()
+                .expect("Registrar state not initialized for current thread");
 
-        let (total_chunks, new_chunks) = {
-            let chunks = self.chunks.read().expect("chunk registry poisoned");
-            let total = chunks.len();
-            if total <= start {
+            let mut new_chunks = Vec::new();
+            while let Ok(msg) = state.receiver.try_recv() {
+                match msg {
+                    RegistrarMessage::NewChunk(chunk) => {
+                        new_chunks.push(chunk);
+                    }
+                }
+            }
+
+            if new_chunks.is_empty() {
                 return;
             }
 
-            let new_chunks = if matches!(self.registration_mode, BufferRegistrationMode::Compatible)
-            {
-                Some(chunks[start..].to_vec())
-            } else {
-                None
-            };
-            (total, new_chunks)
-        };
-
-        if let Some(chunks_to_reg) = new_chunks {
-            let mut driver = driver_rc.borrow_mut();
-            for chunk in chunks_to_reg {
-                let _ = driver.register_chunk(chunk.id, chunk.ptr.as_ptr(), chunk.len.get());
+            if matches!(self.registration_mode, BufferRegistrationMode::Compatible) {
+                let mut driver = driver_rc.borrow_mut();
+                for chunk in &new_chunks {
+                    let _ = driver.register_chunk(chunk.id, chunk.ptr.as_ptr(), chunk.len.get());
+                }
             }
-        }
 
-        self.processed_count.set(total_chunks);
+            // 更新本地快照
+            state.chunks.extend(new_chunks);
+        });
     }
 }
 
@@ -80,32 +108,54 @@ impl veloq_buf::BufferRegistrar for DriverRegistrar {
         let mut driver = driver_rc.borrow_mut();
 
         let mut indices = Vec::with_capacity(regions.len());
+        let mut new_chunks = Vec::with_capacity(regions.len());
+
         for (idx, region) in regions.iter().enumerate() {
             let chunk_idx = idx as u16;
             driver
                 .register_chunk(chunk_idx, region.as_ptr(), region.len())
                 .map_err(|err| std::io::Error::other(format!("{err:#}")))?;
-            self.chunks.write().expect("chunk registry poisoned").push(
-                veloq_buf::heap::ChunkInfo {
-                    id: chunk_idx,
-                    ptr: unsafe { std::ptr::NonNull::new_unchecked(region.as_ptr() as *mut u8) },
-                    len: unsafe { std::num::NonZeroUsize::new_unchecked(region.len()) },
-                },
-            );
+
+            new_chunks.push(veloq_buf::heap::ChunkInfo {
+                id: chunk_idx,
+                ptr: unsafe { std::ptr::NonNull::new_unchecked(region.as_ptr() as *mut u8) },
+                len: unsafe { std::num::NonZeroUsize::new_unchecked(region.len()) },
+            });
             indices.push(idx);
         }
-        self.processed_count
-            .set(self.processed_count.get() + regions.len());
+
+        REGISTRAR_STATE.with(|state_cell| {
+            let mut state_opt = state_cell.borrow_mut();
+            if let Some(state) = state_opt.as_mut() {
+                state.chunks.extend(new_chunks);
+            }
+        });
+
         Ok(indices)
     }
 
     fn resolve_chunk_info(&self, chunk_id: u16) -> Option<veloq_buf::heap::ChunkInfo> {
-        self.chunks
-            .read()
-            .expect("chunk registry poisoned")
-            .iter()
-            .find(|chunk| chunk.id == chunk_id)
-            .copied()
+        // 首先在本地快照中查找
+        let found = REGISTRAR_STATE.with(|state_cell| {
+            state_cell
+                .borrow()
+                .as_ref()
+                .and_then(|state| state.chunks.iter().find(|c| c.id == chunk_id).copied())
+        });
+
+        if let Some(chunk) = found {
+            return Some(chunk);
+        }
+
+        // 如果没找到，尝试同步一次消息队列后再查找
+        self.sync_to_driver();
+
+        REGISTRAR_STATE.with(|state_cell| {
+            state_cell
+                .borrow()
+                .as_ref()
+                .and_then(|state| state.chunks.iter().find(|c| c.id == chunk_id).copied())
+        })
     }
 }
 
