@@ -59,48 +59,138 @@ intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } wher
 pub type WakerNode = GenericWakerNode<AtomicStorage>;
 pub type LocalWakerNode = GenericWakerNode<LocalStorage>;
 
-#[derive(Copy, Clone)]
+pub struct ErasedCancellationToken {
+    pub(crate) ptr: *const (),
+    pub(crate) s_id: *const (),
+    pub(crate) o_id: *const (),
+}
+
+impl ErasedCancellationToken {
+    pub fn new<S: Storage, O: Ownership>(
+        token: &crate::runtime::GenericCancellationToken<S, O>,
+    ) -> Self {
+        Self {
+            ptr: token as *const _ as *const (),
+            s_id: S::strategy_id(),
+            o_id: O::strategy_id(),
+        }
+    }
+}
+
+pub(crate) struct ScopeVTable {
+    pub(crate) task_done: unsafe fn(*const ()),
+    pub(crate) cancel: unsafe fn(*const ()),
+    pub(crate) report_panic: unsafe fn(*const (), Box<dyn Any + Send + 'static>),
+    pub(crate) is_cancelled: unsafe fn(*const ()) -> bool,
+    pub(crate) try_link_child: unsafe fn(*const (), &ErasedCancellationToken) -> bool,
+    pub(crate) clone: unsafe fn(*const ()) -> ScopeCompletionRef,
+    pub(crate) drop: unsafe fn(*const ()),
+}
+
 pub(crate) struct ScopeCompletionRef {
     ptr: NonNull<()>,
-    task_done: unsafe fn(*const ()),
-    cancel: unsafe fn(*const ()),
-    report_panic: unsafe fn(*const (), Box<dyn Any + Send + 'static>),
+    vtable: &'static ScopeVTable,
+}
+
+unsafe impl Send for ScopeCompletionRef {}
+unsafe impl Sync for ScopeCompletionRef {}
+
+impl Clone for ScopeCompletionRef {
+    fn clone(&self) -> Self {
+        unsafe { (self.vtable.clone)(self.ptr.as_ptr()) }
+    }
+}
+
+impl Drop for ScopeCompletionRef {
+    fn drop(&mut self) {
+        unsafe { (self.vtable.drop)(self.ptr.as_ptr()) }
+    }
+}
+
+struct VTableContainer<S: Storage, O: Ownership>(std::marker::PhantomData<(S, O)>);
+
+impl<S: Storage, O: Ownership> VTableContainer<S, O> {
+    const VTABLE: ScopeVTable = ScopeVTable {
+        task_done: |ptr| unsafe {
+            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            scope.task_done();
+        },
+        cancel: |ptr| unsafe {
+            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            scope.cancel();
+        },
+        report_panic: |ptr, payload| unsafe {
+            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            scope.report_panic(payload);
+        },
+        is_cancelled: |ptr| unsafe {
+            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            scope.is_cancelled()
+        },
+        try_link_child: |ptr, child_token| unsafe {
+            if child_token.s_id != S::strategy_id() || child_token.o_id != O::strategy_id() {
+                return false;
+            }
+            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            scope.cancel_token().try_link_child_raw(child_token.ptr);
+            true
+        },
+        clone: |ptr| unsafe {
+            O::increment_strong_count(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            ScopeCompletionRef {
+                ptr: NonNull::new_unchecked(ptr as *mut ()),
+                vtable: &VTableContainer::<S, O>::VTABLE,
+            }
+        },
+        drop: |ptr| unsafe {
+            O::decrement_strong_count(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+        },
+    };
 }
 
 impl ScopeCompletionRef {
     pub fn new<S: Storage, O: Ownership>(
         scope: &O::Shared<crate::scope::GenericScopeCompletion<S, O>>,
     ) -> Self {
+        let ptr = O::as_ptr(scope) as *const crate::scope::GenericScopeCompletion<S, O>;
+        unsafe { O::increment_strong_count(ptr) };
+
         Self {
-            ptr: NonNull::new(O::as_ptr(scope) as *mut _)
-                .expect("scope completion pointer is null"),
-            task_done: |ptr| unsafe {
-                (&*(ptr as *const crate::scope::GenericScopeCompletion<S, O>)).task_done();
-            },
-            cancel: |ptr| unsafe {
-                (&*(ptr as *const crate::scope::GenericScopeCompletion<S, O>)).cancel();
-            },
-            report_panic: |ptr, payload| unsafe {
-                (&*(ptr as *const crate::scope::GenericScopeCompletion<S, O>))
-                    .report_panic(payload);
-            },
+            ptr: unsafe { NonNull::new_unchecked(ptr as *mut ()) },
+            vtable: &VTableContainer::<S, O>::VTABLE,
         }
     }
 
     #[inline]
-    pub unsafe fn task_done(&self) {
-        unsafe { (self.task_done)(self.ptr.as_ptr()) };
+    pub fn task_done(&self) {
+        unsafe { (self.vtable.task_done)(self.ptr.as_ptr()) };
     }
 
     #[inline]
-    pub unsafe fn cancel(&self) {
-        unsafe { (self.cancel)(self.ptr.as_ptr()) };
+    pub fn cancel(&self) {
+        unsafe { (self.vtable.cancel)(self.ptr.as_ptr()) };
     }
 
     #[inline]
-    pub unsafe fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
-        unsafe { (self.report_panic)(self.ptr.as_ptr(), payload) };
+    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+        unsafe { (self.vtable.report_panic)(self.ptr.as_ptr(), payload) };
     }
+
+    #[inline]
+    pub(crate) fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
+        unsafe { (self.vtable.try_link_child)(self.ptr.as_ptr(), child_token) }
+    }
+
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        unsafe { (self.vtable.is_cancelled)(self.ptr.as_ptr()) }
+    }
+}
+
+
+std::thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
+    pub(crate) static CURRENT_SCOPE: RefCell<Option<ScopeCompletionRef>> = const { RefCell::new(None) };
 }
 
 pub struct GenericTaskHeader<S: Storage> {
@@ -134,7 +224,13 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     #[inline]
     pub fn is_cancelled(&self) -> bool {
-        self.state.load(Ordering::Acquire) & STATE_CANCELLED != 0
+        if self.state.load(Ordering::Acquire) & STATE_CANCELLED != 0 {
+            return true;
+        }
+        if let Some(scope_ptr) = self.scope_completion.load(Ordering::Acquire) {
+            return unsafe { scope_ptr.as_ref().is_cancelled() };
+        }
+        false
     }
 
     #[inline]
@@ -517,6 +613,12 @@ where
         PollStatus::Complete => return true,
     }
 
+    // 设置当前作用域上下文，用于嵌套作用域自动建立父子关系
+    let _scope_guard = header
+        .scope_completion
+        .load(Ordering::Acquire)
+        .map(|ptr| ScopeGuard::enter(unsafe { ptr.as_ref() }));
+
     loop {
         if header.is_cancelled() {
             finalizer.complete(Err(TaskError::Cancelled), is_local);
@@ -540,6 +642,25 @@ where
                 return true;
             }
         }
+    }
+}
+
+struct ScopeGuard;
+
+impl ScopeGuard {
+    fn enter(scope: &ScopeCompletionRef) -> Self {
+        CURRENT_SCOPE.with(|s| {
+            *s.borrow_mut() = Some(scope.clone());
+        });
+        Self
+    }
+}
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        CURRENT_SCOPE.with(|s| {
+            *s.borrow_mut() = None;
+        });
     }
 }
 
@@ -648,6 +769,17 @@ macro_rules! impl_task_typed_common {
             }
         }
     };
+}
+
+pub trait TaskJoinGate<T> {
+    fn take_result_erased(&self) -> Option<Result<T, TaskError>>;
+}
+
+impl<T, S: Task<T>> TaskJoinGate<T> for S {
+    #[inline]
+    fn take_result_erased(&self) -> Option<Result<T, TaskError>> {
+        self.take_result()
+    }
 }
 
 pub(crate) use impl_raw_task_common;

@@ -154,6 +154,33 @@ fn main() {
                     let _ = h.await;
                 }
             });
+
+            // --- 测试嵌套取消传播 (Nested Cancellation Propagation) ---
+            println!("\n  [测试] 测试嵌套取消传播：取消父作用域应自动取消子作用域...");
+            scope!(parent_scope, {
+                let token = parent_scope.cancel_token().clone();
+
+                parent_scope.spawn_boxed(async move {
+                    println!("    [父作用域] 启动子作用域...");
+                    scope!(child_scope, {
+                        child_scope.spawn_boxed(async {
+                            for i in 1..=100 {
+                                yield_now().await;
+                                if i % 10 == 0 {
+                                    println!("      [子作用域任务] 运行中... {}", i);
+                                }
+                            }
+                        });
+                    });
+                    println!("    [父作用域] 子作用域已退出");
+                });
+
+                yield_now().await;
+                yield_now().await;
+                println!("    >> 正在取消父作用域...");
+                token.cancel();
+            });
+            println!("  >> 父作用域已退出");
         });
         println!("--- scope 结束 ---");
     });

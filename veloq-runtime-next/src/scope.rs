@@ -16,13 +16,6 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 use veloq_intrusive_linklist::Link;
 
-unsafe fn take_result_of<T, S>(ptr: *const ()) -> Option<Result<T, TaskError>>
-where
-    S: Task<T>,
-{
-    unsafe { (&*(ptr as *const S)).take_result() }
-}
-
 /// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
 pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
     remaining: S::Usize,
@@ -109,6 +102,7 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 }
 
+
 pub trait ScopeProvider<'scope> {
     type Storage: Storage;
     type Ownership: Ownership;
@@ -165,10 +159,20 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
     pub fn __private_new() -> Self {
         let runtime = with_current_runtime(|runtime| runtime.clone())
             .expect("Scope must be created inside Runtime::block_on");
+        let completion = GenericScopeCompletion::<S, O>::new();
+
+        // 自动发现当前正在运行的任务所属的作用域，建立父子层级关系
+        let current_scope = crate::task::CURRENT_SCOPE.with(|s| s.borrow().clone());
+        if let Some(parent) = current_scope {
+            parent.try_link_child(&crate::task::ErasedCancellationToken::new::<S, O>(
+                completion.cancel_token(),
+            ));
+        }
+
         Self {
             runtime,
             arena: GenericArena::new(),
-            completion: GenericScopeCompletion::<S, O>::new(),
+            completion,
             _marker: std::marker::PhantomData,
         }
     }
@@ -178,7 +182,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
         task: &'scope TTask,
     ) -> JoinHandle<'scope, '_, T, LocalTaskRef, Self>
     where
-        TTask: LocalTask<T> + 'scope,
+        TTask: LocalTask<T> + Sized + 'scope,
     {
         task.set_scope_completion::<S, O>(Some(self.completion.clone()));
         self.completion.add_task();
@@ -192,8 +196,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
 
         JoinHandle {
             task: task_ref,
-            ptr: task as *const TTask as *const (),
-            take_result: take_result_of::<T, TTask>,
+            gate: unsafe { NonNull::new_unchecked(task as &dyn crate::task::TaskJoinGate<T> as *const dyn crate::task::TaskJoinGate<T> as *mut dyn crate::task::TaskJoinGate<T>) },
             scope: self,
             cancel_token: new_cancel_slot::<S, O>(),
             waker_node: None,
@@ -231,14 +234,15 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
 
         JoinHandle {
             task: task_ref,
-            ptr: node_ptr as *const (),
-            take_result: take_result_of::<T, LocalBoxedTaskNode<'scope, T, F>>,
+            gate: unsafe {
+                NonNull::new_unchecked(node_ptr as *mut dyn crate::task::TaskJoinGate<T>)
+            },
             scope: self,
             cancel_token: new_cancel_slot::<S, O>(),
             waker_node: None,
-            reclaim: Some(|arena, ptr| unsafe {
+            reclaim: Some(|arena, gate| unsafe {
                 let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<'scope, T, F>>();
-                arena.drop_object_raw(ptr as *mut u8, layout);
+                arena.drop_object_raw(gate.as_ptr() as *mut u8, layout);
             }),
         }
     }
@@ -271,7 +275,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         task: &'scope S,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
-        S: SendTask<T> + 'scope,
+        S: SendTask<T> + Sized + 'scope,
     {
         debug_assert!(
             worker_id < self.runtime.worker_count().get(),
@@ -290,8 +294,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
         JoinHandle {
             task: task_ref,
-            ptr: task as *const S as *const (),
-            take_result: take_result_of::<T, S>,
+            gate: unsafe { NonNull::new_unchecked(task as &dyn crate::task::TaskJoinGate<T> as *const dyn crate::task::TaskJoinGate<T> as *mut dyn crate::task::TaskJoinGate<T>) },
             scope: self,
             cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
             waker_node: None,
@@ -304,7 +307,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         task: &'scope S,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
-        S: SendTask<T> + 'scope,
+        S: SendTask<T> + Sized + 'scope,
     {
         self.spawn_to(self.runtime.choose_worker(), task)
     }
@@ -345,8 +348,9 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
         JoinHandle {
             task: task_ref,
-            ptr: node_ptr as *const (),
-            take_result: take_result_of::<T, SendBoxedTaskNode<'scope, T, F>>,
+            gate: unsafe {
+                NonNull::new_unchecked(node_ptr as *mut dyn crate::task::TaskJoinGate<T>)
+            },
             scope: self,
             cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
             waker_node: None,
@@ -372,7 +376,7 @@ impl<'scope, M> GenericAsyncScope<'scope, LocalStorage, RcOwnership, M> {
         task: &'scope S,
     ) -> JoinHandle<'scope, '_, T, LocalTaskRef, Self>
     where
-        S: LocalTask<T> + 'scope,
+        S: LocalTask<T> + Sized + 'scope,
     {
         self.spawn_local(task)
     }
@@ -388,20 +392,14 @@ impl<'scope, M> GenericAsyncScope<'scope, LocalStorage, RcOwnership, M> {
     }
 }
 
-pub struct JoinHandle<
-    'scope,
-    'scope_ref,
-    T,
-    R: TaskHandleRef,
-    S: ScopeProvider<'scope>,
-> {
+pub struct JoinHandle<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>> {
     pub(crate) task: R,
-    pub(crate) ptr: *const (),
-    pub(crate) take_result: unsafe fn(*const ()) -> Option<Result<T, TaskError>>,
+    pub(crate) gate: NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>,
     pub(crate) scope: &'scope_ref S,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<NonNull<GenericWakerNode<R::Storage>>>,
-    pub(crate) reclaim: Option<unsafe fn(&S::Arena, *const ())>,
+    pub(crate) reclaim:
+        Option<unsafe fn(&S::Arena, NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>)>,
 }
 
 pub type LocalJoinHandle<'scope, 'scope_ref, T> =
@@ -456,9 +454,10 @@ impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> 
             .drive_worker(Some(self.scope.completion()));
 
         if self.task.header().is_completed() {
-            let res = unsafe { (self.take_result)(self.ptr) }.expect("task result already taken");
+            let res = unsafe { self.gate.as_ref().take_result_erased() }
+                .expect("task result already taken");
             if let Some(reclaim) = self.reclaim {
-                unsafe { (reclaim)(self.scope.arena(), self.ptr) };
+                unsafe { (reclaim)(self.scope.arena(), self.gate) };
             }
             return Poll::Ready(res);
         }

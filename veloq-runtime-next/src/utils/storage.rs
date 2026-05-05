@@ -6,7 +6,8 @@ use std::task::Waker;
 
 use crossbeam_queue::SegQueue;
 
-pub trait Storage: Send + Sync + 'static {
+pub trait Storage: Send + Sync {
+    fn strategy_id() -> *const ();
     type Usize: StateInt;
     type OptionPtr<T>: StateOptionPtr<T>;
     type NonNullPtr<T>: StateNonNullPtr<T>;
@@ -99,6 +100,10 @@ pub trait StateWakerQueue: Send + Sync + 'static {
 
 pub struct AtomicStorage;
 impl Storage for AtomicStorage {
+    fn strategy_id() -> *const () {
+        static ID: u8 = 0;
+        &ID as *const _ as *const ()
+    }
     type Usize = AtomicUsize;
     type OptionPtr<T> = AtomicOptionPtr<T>;
     type NonNullPtr<T> = AtomicNonNullPtr<T>;
@@ -186,6 +191,10 @@ impl_state_int!(
 
 pub struct LocalStorage;
 impl Storage for LocalStorage {
+    fn strategy_id() -> *const () {
+        static ID: u8 = 0;
+        &ID as *const _ as *const ()
+    }
     type Usize = NonAtomicUsize;
     type OptionPtr<T> = NonAtomicOptionPtr<T>;
     type NonNullPtr<T> = NonAtomicNonNullPtr<T>;
@@ -269,58 +278,131 @@ impl_state_int!(
 
 // --- Pointer Strategy ---
 
+/// 不透明物理存储句柄，用于在原子操作中安全地传递指针。
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct PhysicalHandle(NonNull<u8>);
+
+impl PhysicalHandle {
+    /// 从原始指针创建句柄。
+    ///
+    /// # Safety
+    /// `ptr` 必须是非空的且满足对齐要求。
+    #[inline]
+    pub unsafe fn from_ptr(ptr: *mut ()) -> Self {
+        debug_assert!(!ptr.is_null());
+        // SAFETY: 调用者必须保证 ptr 非空且对齐。
+        unsafe { Self(NonNull::new_unchecked(ptr as *mut u8)) }
+    }
+
+    /// 获取内部原始指针。
+    #[inline]
+    pub fn as_ptr(self) -> *mut () {
+        self.0.as_ptr() as *mut ()
+    }
+}
+
 pub trait PointerStrategy<T> {
-    fn to_physical(val: T) -> *mut ();
+    /// 具体的中间类型，用于强类型化指针处理。
+    type Raw: Copy;
+
+    /// 将值转换为强类型的中间表示。
+    fn to_raw(val: T) -> Self::Raw;
+
+    /// 从中间类型恢复原始值。
+    ///
     /// # Safety
-    /// `ptr` must be a valid pointer obtained from `to_physical`.
-    unsafe fn from_physical(ptr: *mut ()) -> T;
+    /// `raw` 必须是由 `to_raw` 生成的有效句柄。
+    unsafe fn from_raw(raw: Self::Raw) -> T;
+
+    /// 获取对值的引用。
+    ///
     /// # Safety
-    /// `ptr` must be a valid pointer obtained from `to_physical` and the pointee must be alive.
-    unsafe fn as_ref<'a>(ptr: *mut ()) -> &'a T;
-    fn null() -> *mut ();
+    /// `raw` 指向的内容必须存活且有效。
+    unsafe fn as_ref<'a>(raw: Self::Raw) -> &'a T;
+
+    /// 将中间类型映射到物理存储指针（如 AtomicPtr 需要的 *mut ()）。
+    fn to_physical(raw: Self::Raw) -> *mut ();
+
+    /// 从物理存储指针恢复中间类型。
+    ///
+    /// # Safety
+    /// `ptr` 必须是非空的物理指针。
+    unsafe fn from_physical(ptr: *mut ()) -> Self::Raw;
+
+    /// 返回表示空状态的物理指针值。
+    fn physical_null() -> *mut ();
 }
 
 pub struct BoxStrategy<T: ?Sized>(std::marker::PhantomData<T>);
 impl<T: ?Sized> PointerStrategy<Box<T>> for BoxStrategy<T> {
-    fn to_physical(val: Box<T>) -> *mut () {
-        Box::into_raw(Box::new(val)) as *mut ()
+    type Raw = PhysicalHandle;
+
+    fn to_raw(val: Box<T>) -> Self::Raw {
+        // 对于 !Sized 类型，Box<T> 是胖指针，需要双重包装成瘦指针
+        unsafe { PhysicalHandle::from_ptr(Box::into_raw(Box::new(val)) as *mut ()) }
     }
-    unsafe fn from_physical(ptr: *mut ()) -> Box<T> {
+
+    unsafe fn from_raw(raw: Self::Raw) -> Box<T> {
         unsafe {
-            let double_boxed = Box::from_raw(ptr as *mut Box<T>);
+            let double_boxed = Box::from_raw(raw.as_ptr() as *mut Box<T>);
             *double_boxed
         }
     }
-    unsafe fn as_ref<'a>(ptr: *mut ()) -> &'a Box<T> {
-        unsafe { &*(ptr as *const Box<T>) }
+
+    unsafe fn as_ref<'a>(raw: Self::Raw) -> &'a Box<T> {
+        unsafe { &*(raw.as_ptr() as *const Box<T>) }
     }
-    fn null() -> *mut () {
+
+    fn to_physical(raw: Self::Raw) -> *mut () {
+        raw.as_ptr()
+    }
+
+    unsafe fn from_physical(ptr: *mut ()) -> Self::Raw {
+        unsafe { PhysicalHandle::from_ptr(ptr) }
+    }
+
+    fn physical_null() -> *mut () {
         std::ptr::null_mut()
     }
 }
 
 pub struct ArcStrategy<T: ?Sized>(std::marker::PhantomData<T>);
 impl<T: ?Sized> PointerStrategy<Arc<T>> for ArcStrategy<T> {
-    fn to_physical(val: Arc<T>) -> *mut () {
-        Box::into_raw(Box::new(val)) as *mut ()
+    type Raw = PhysicalHandle;
+
+    fn to_raw(val: Arc<T>) -> Self::Raw {
+        // Arc<T> 对于 !Sized 也是胖指针，同样需要双重包装
+        unsafe { PhysicalHandle::from_ptr(Box::into_raw(Box::new(val)) as *mut ()) }
     }
-    unsafe fn from_physical(ptr: *mut ()) -> Arc<T> {
+
+    unsafe fn from_raw(raw: Self::Raw) -> Arc<T> {
         unsafe {
-            let boxed_arc = Box::from_raw(ptr as *mut Arc<T>);
+            let boxed_arc = Box::from_raw(raw.as_ptr() as *mut Arc<T>);
             *boxed_arc
         }
     }
-    unsafe fn as_ref<'a>(ptr: *mut ()) -> &'a Arc<T> {
-        unsafe { &*(ptr as *const Arc<T>) }
+
+    unsafe fn as_ref<'a>(raw: Self::Raw) -> &'a Arc<T> {
+        unsafe { &*(raw.as_ptr() as *const Arc<T>) }
     }
-    fn null() -> *mut () {
+
+    fn to_physical(raw: Self::Raw) -> *mut () {
+        raw.as_ptr()
+    }
+
+    unsafe fn from_physical(ptr: *mut ()) -> Self::Raw {
+        unsafe { PhysicalHandle::from_ptr(ptr) }
+    }
+
+    fn physical_null() -> *mut () {
         std::ptr::null_mut()
     }
 }
 
 pub struct GenericAtomicOption<T, S: PointerStrategy<T>> {
     inner: AtomicPtr<()>,
-    _marker: std::marker::PhantomData<(T, S)>,
+    _marker: std::marker::PhantomData<fn(T) -> S::Raw>,
 }
 
 unsafe impl<T, S: PointerStrategy<T>> Send for GenericAtomicOption<T, S> where T: Send {}
@@ -329,8 +411,8 @@ unsafe impl<T, S: PointerStrategy<T>> Sync for GenericAtomicOption<T, S> where T
 impl<T, S: PointerStrategy<T>> GenericAtomicOption<T, S> {
     pub fn new(opt: Option<T>) -> Self {
         let ptr = match opt {
-            Some(v) => S::to_physical(v),
-            None => S::null(),
+            Some(v) => S::to_physical(S::to_raw(v)),
+            None => S::physical_null(),
         };
         Self {
             inner: AtomicPtr::new(ptr),
@@ -340,14 +422,14 @@ impl<T, S: PointerStrategy<T>> GenericAtomicOption<T, S> {
 
     pub fn swap(&self, new: Option<T>, order: Ordering) -> Option<T> {
         let new_ptr = match new {
-            Some(v) => S::to_physical(v),
-            None => S::null(),
+            Some(v) => S::to_physical(S::to_raw(v)),
+            None => S::physical_null(),
         };
         let old_ptr = self.inner.swap(new_ptr, order);
-        if old_ptr.is_null() {
+        if old_ptr == S::physical_null() {
             None
         } else {
-            unsafe { Some(S::from_physical(old_ptr)) }
+            unsafe { Some(S::from_raw(S::from_physical(old_ptr))) }
         }
     }
 
@@ -364,10 +446,10 @@ impl<T, S: PointerStrategy<T>> GenericAtomicOption<T, S> {
         T: Clone,
     {
         let ptr = self.inner.load(order);
-        if ptr.is_null() {
+        if ptr == S::physical_null() {
             None
         } else {
-            unsafe { Some(S::as_ref(ptr).clone()) }
+            unsafe { Some(S::as_ref(S::from_physical(ptr)).clone()) }
         }
     }
 
@@ -377,13 +459,14 @@ impl<T, S: PointerStrategy<T>> GenericAtomicOption<T, S> {
         success: Ordering,
         failure: Ordering,
     ) -> Result<(), T> {
-        let new_ptr = S::to_physical(new);
+        let raw = S::to_raw(new);
+        let new_ptr = S::to_physical(raw);
         match self
             .inner
-            .compare_exchange(S::null(), new_ptr, success, failure)
+            .compare_exchange(S::physical_null(), new_ptr, success, failure)
         {
             Ok(_) => Ok(()),
-            Err(_) => unsafe { Err(S::from_physical(new_ptr)) },
+            Err(_) => unsafe { Err(S::from_raw(raw)) },
         }
     }
 }

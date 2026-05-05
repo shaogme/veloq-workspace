@@ -307,11 +307,10 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
         }
     }
 
-    pub fn child(&self) -> Self {
-        let child = Self::new();
+    pub fn link_child(&self, child: &Self) {
         if self.is_cancelled() {
             child.cancel();
-            return child;
+            return;
         }
 
         {
@@ -323,7 +322,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
         if self.is_cancelled() {
             drop(children);
             child.cancel();
-            return child;
+            return;
         }
 
         unsafe {
@@ -332,6 +331,17 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
             );
             children.push_back(Pin::new_unchecked(&mut *child_ptr.as_ptr()));
         }
+    }
+
+    pub(crate) unsafe fn try_link_child_raw(&self, child_token_ptr: *const ()) -> bool {
+        let child = unsafe { &*(child_token_ptr as *const Self) };
+        self.link_child(child);
+        true
+    }
+
+    pub fn child(&self) -> Self {
+        let child = Self::new();
+        self.link_child(&child);
         child
     }
 
