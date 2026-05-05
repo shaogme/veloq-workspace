@@ -89,7 +89,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpListener<S, P> {
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(accepted.into_raw(), None)?,
-            submitter: self.submitter.clone(),
+            submitter: self.submitter,
         };
 
         Ok((stream, addr))

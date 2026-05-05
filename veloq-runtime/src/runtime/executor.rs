@@ -510,7 +510,10 @@ impl LocalExecutor {
                     self.queue.borrow_mut().push_back(task);
                     state.store(RUNNING, Ordering::Relaxed);
                     can_park = false;
-                } else if !self.shared.future_injector.is_empty() || !self.stealable.is_empty() {
+                } else if !self.shared.future_injector.is_empty()
+                    || !self.stealable.is_empty()
+                    || main_woken.load(Ordering::Acquire)
+                {
                     state.store(RUNNING, Ordering::Relaxed);
                     can_park = false;
                 }

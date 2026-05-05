@@ -54,6 +54,7 @@ struct TlbCache {
 }
 
 thread_local! {
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     static ATOMIC_TLB: Cell<Option<TlbCache>> = const { Cell::new(None) };
 }
 

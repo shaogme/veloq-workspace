@@ -6,8 +6,8 @@ mod scope;
 pub use arena::{Arena, GenericArena};
 pub use header::{
     GenericTaskHeader, GenericWakerNode, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE,
-    PollStatus, STATE_CANCELLED, STATE_COMPLETED, STATE_POLLING, STATE_QUEUED, STATE_READY,
-    STATE_WOKEN, TaskVTable,
+    PollStatus, STATE_AFFINE, STATE_CANCELLED, STATE_COMPLETED, STATE_POLLING, STATE_QUEUED,
+    STATE_READY, STATE_WOKEN, TaskVTable,
 };
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
@@ -18,6 +18,7 @@ pub use scope::{
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, StateOptionPtr, Storage};
 use std::any::Any;
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -26,6 +27,61 @@ use std::task::{Context, Poll};
 
 pub type TaskHeader = GenericTaskHeader<AtomicStorage>;
 pub type LocalTaskHeader = GenericTaskHeader<LocalStorage>;
+
+thread_local! {
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
+    static CURRENT_SEND_TASK: RefCell<Option<*const TaskHeader>> = const { RefCell::new(None) };
+}
+
+struct CurrentSendTaskGuard {
+    prev: Option<*const TaskHeader>,
+}
+
+impl CurrentSendTaskGuard {
+    fn enter(task: *const TaskHeader) -> Self {
+        let prev = CURRENT_SEND_TASK.with(|slot| slot.replace(Some(task)));
+        Self { prev }
+    }
+}
+
+impl Drop for CurrentSendTaskGuard {
+    fn drop(&mut self) {
+        CURRENT_SEND_TASK.with(|slot| {
+            slot.replace(self.prev.take());
+        });
+    }
+}
+
+fn current_send_task() -> Option<*const TaskHeader> {
+    CURRENT_SEND_TASK.with(|slot| *slot.borrow())
+}
+
+/// 持有此 guard 期间，当前 SendTask 的后续唤醒会固定回到当前 worker，
+/// 从而避免在 `await` 之间被其他 worker 窃取。
+pub struct TaskAffinityGuard {
+    header: *const TaskHeader,
+}
+
+unsafe impl Send for TaskAffinityGuard {}
+
+impl TaskAffinityGuard {
+    pub fn enter() -> Self {
+        Self::try_enter().expect("TaskAffinityGuard::enter must be called while polling a SendTask")
+    }
+
+    pub fn try_enter() -> Option<Self> {
+        let header = current_send_task()?;
+        let worker_id = crate::runtime::current_worker_id();
+        unsafe { (&*header).enter_affinity(worker_id) };
+        Some(Self { header })
+    }
+}
+
+impl Drop for TaskAffinityGuard {
+    fn drop(&mut self) {
+        unsafe { (&*self.header).exit_affinity() };
+    }
+}
 
 // --- 任务错误与结果扩展 ---
 
@@ -262,6 +318,13 @@ where
             Some(guard)
         }
         _ => None,
+    };
+    let _current_send_task_guard = if !is_local {
+        Some(CurrentSendTaskGuard::enter(
+            header as *const _ as *const TaskHeader,
+        ))
+    } else {
+        None
     };
 
     loop {

@@ -11,6 +11,7 @@ pub const STATE_READY: usize = 1 << 2;
 pub const STATE_CANCELLED: usize = 1 << 3;
 pub const STATE_POLLING: usize = 1 << 4;
 pub const STATE_WOKEN: usize = 1 << 5;
+pub const STATE_AFFINE: usize = 1 << 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollStatus {
@@ -40,6 +41,8 @@ pub struct GenericTaskHeader<S: Storage + 'static> {
     pub(crate) scope_vtable: S::OptionPtr<ScopeVTable<S>>,
     pub(crate) runtime_ptr: S::OptionPtr<crate::runtime::RuntimeShared>,
     pub(crate) worker_id: S::Usize,
+    pub(crate) affinity_depth: S::Usize,
+    pub(crate) affinity_saved_worker_id: S::Usize,
     pub(crate) vtable: &'static TaskVTable<S>,
 }
 
@@ -52,6 +55,8 @@ impl<S: Storage + 'static> GenericTaskHeader<S> {
             scope_vtable: S::OptionPtr::new(None),
             runtime_ptr: S::OptionPtr::new(None),
             worker_id: S::Usize::new(0),
+            affinity_depth: S::Usize::new(0),
+            affinity_saved_worker_id: S::Usize::new(usize::MAX),
             vtable,
         }
     }
@@ -81,6 +86,37 @@ impl<S: Storage + 'static> GenericTaskHeader<S> {
     #[inline]
     pub fn cancel(&self) {
         self.state.fetch_or(STATE_CANCELLED, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_affine(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_AFFINE != 0
+    }
+
+    #[inline]
+    pub fn enter_affinity(&self, worker_id: usize) {
+        let depth = self.affinity_depth.fetch_add(1, Ordering::AcqRel);
+        if depth == 0 {
+            let previous_worker_id = self.worker_id.load(Ordering::Acquire);
+            debug_assert_ne!(previous_worker_id, usize::MAX);
+            self.affinity_saved_worker_id
+                .store(previous_worker_id, Ordering::Release);
+            self.worker_id.store(worker_id, Ordering::Release);
+            self.state.fetch_or(STATE_AFFINE, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub fn exit_affinity(&self) {
+        let depth = self.affinity_depth.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(depth > 0, "affinity depth underflow");
+        if depth == 1 {
+            let previous_worker_id = self.affinity_saved_worker_id.load(Ordering::Acquire);
+            self.affinity_saved_worker_id
+                .store(usize::MAX, Ordering::Release);
+            self.worker_id.store(previous_worker_id, Ordering::Release);
+            self.state.fetch_and(!STATE_AFFINE, Ordering::Release);
+        }
     }
 
     #[inline]
