@@ -17,6 +17,15 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
+/// 不透明的作用域句柄
+pub struct OpaqueScope {
+    _private: [u8; 0],
+}
+/// 不透明的取消令牌句柄
+pub struct OpaqueToken {
+    _private: [u8; 0],
+}
+
 // --- 任务错误与结果扩展 ---
 
 pub enum TaskError {
@@ -60,7 +69,7 @@ pub type WakerNode = GenericWakerNode<AtomicStorage>;
 pub type LocalWakerNode = GenericWakerNode<LocalStorage>;
 
 pub struct ErasedCancellationToken {
-    pub(crate) ptr: NonNull<()>,
+    pub(crate) ptr: NonNull<OpaqueToken>,
     pub(crate) s_id: StrategyId,
     pub(crate) o_id: StrategyId,
 }
@@ -70,38 +79,72 @@ impl ErasedCancellationToken {
         token: &crate::runtime::GenericCancellationToken<S, O>,
     ) -> Self {
         Self {
-            ptr: unsafe { NonNull::new_unchecked(token as *const _ as *mut ()) },
+            ptr: unsafe { NonNull::new_unchecked(token as *const _ as *mut OpaqueToken) },
             s_id: S::strategy_id(),
             o_id: O::strategy_id(),
         }
     }
+
+    /// 尝试将擦除类型的令牌向下转换为具体类型
+    ///
+    /// # Safety
+    /// 调用者必须确保令牌的生命周期仍然有效。
+    pub unsafe fn downcast<S: Storage, O: Ownership>(
+        &self,
+    ) -> Option<&crate::runtime::GenericCancellationToken<S, O>> {
+        if self.s_id == S::strategy_id() && self.o_id == O::strategy_id() {
+            unsafe {
+                Some(&*(self.ptr.as_ptr() as *const crate::runtime::GenericCancellationToken<S, O>))
+            }
+        } else {
+            None
+        }
+    }
 }
 
-pub(crate) struct ScopeVTable {
-    pub(crate) task_done: unsafe fn(NonNull<()>),
-    pub(crate) cancel: unsafe fn(NonNull<()>),
-    pub(crate) report_panic: unsafe fn(NonNull<()>, Box<dyn Any + Send + 'static>),
-    pub(crate) is_cancelled: unsafe fn(NonNull<()>) -> bool,
-    pub(crate) try_link_child: unsafe fn(NonNull<()>, &ErasedCancellationToken) -> bool,
-    pub(crate) clone: unsafe fn(NonNull<()>) -> ScopeCompletionRef,
-    pub(crate) drop: unsafe fn(NonNull<()>),
+pub struct ScopeVTable<S: Storage> {
+    pub(crate) task_done: unsafe fn(NonNull<OpaqueScope>),
+    pub(crate) cancel: unsafe fn(NonNull<OpaqueScope>),
+    pub(crate) report_panic: unsafe fn(NonNull<OpaqueScope>, Box<dyn Any + Send + 'static>),
+    pub(crate) is_cancelled: unsafe fn(NonNull<OpaqueScope>) -> bool,
+    pub(crate) try_link_child: unsafe fn(NonNull<OpaqueScope>, &ErasedCancellationToken) -> bool,
+    pub(crate) clone: unsafe fn(NonNull<OpaqueScope>) -> ScopeCompletionRef<S>,
+    pub(crate) drop: unsafe fn(NonNull<OpaqueScope>),
+    pub(crate) _marker: std::marker::PhantomData<S>,
 }
 
-pub(crate) struct ScopeCompletionRef {
-    ptr: NonNull<()>,
-    vtable: &'static ScopeVTable,
+pub struct ScopeCompletionRef<S: Storage> {
+    ptr: NonNull<OpaqueScope>,
+    vtable: &'static ScopeVTable<S>,
 }
 
-unsafe impl Send for ScopeCompletionRef {}
-unsafe impl Sync for ScopeCompletionRef {}
+unsafe impl<S: Storage> Send for ScopeCompletionRef<S> {}
+unsafe impl<S: Storage> Sync for ScopeCompletionRef<S> {}
 
-impl Clone for ScopeCompletionRef {
+impl<S: Storage> ScopeCompletionRef<S> {
+    #[inline]
+    pub fn into_parts(self) -> (NonNull<OpaqueScope>, &'static ScopeVTable<S>) {
+        let parts = (self.ptr, self.vtable);
+        std::mem::forget(self);
+        parts
+    }
+
+    /// # Safety
+    /// The caller must ensure that the pointer and vtable are valid and that they represent
+    /// a valid reference count that this object now owns.
+    #[inline]
+    pub unsafe fn from_parts(ptr: NonNull<OpaqueScope>, vtable: &'static ScopeVTable<S>) -> Self {
+        Self { ptr, vtable }
+    }
+}
+
+impl<S: Storage> Clone for ScopeCompletionRef<S> {
     fn clone(&self) -> Self {
         unsafe { (self.vtable.clone)(self.ptr) }
     }
 }
 
-impl Drop for ScopeCompletionRef {
+impl<S: Storage> Drop for ScopeCompletionRef<S> {
     fn drop(&mut self) {
         unsafe { (self.vtable.drop)(self.ptr) }
     }
@@ -110,7 +153,7 @@ impl Drop for ScopeCompletionRef {
 struct VTableContainer<S: Storage, O: Ownership>(std::marker::PhantomData<(S, O)>);
 
 impl<S: Storage, O: Ownership> VTableContainer<S, O> {
-    const VTABLE: ScopeVTable = ScopeVTable {
+    const VTABLE: ScopeVTable<S> = ScopeVTable::<S> {
         task_done: |ptr| unsafe {
             let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
             scope.task_done();
@@ -132,31 +175,38 @@ impl<S: Storage, O: Ownership> VTableContainer<S, O> {
                 return false;
             }
             let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
-            scope.cancel_token().try_link_child_raw(child_token.ptr.as_ptr());
+            scope
+                .cancel_token()
+                .try_link_child_raw(child_token.ptr.as_ptr());
             true
         },
         clone: |ptr| unsafe {
-            O::increment_strong_count(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
-            ScopeCompletionRef {
+            O::increment_strong_count(
+                ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>
+            );
+            ScopeCompletionRef::<S> {
                 ptr,
                 vtable: &VTableContainer::<S, O>::VTABLE,
             }
         },
         drop: |ptr| unsafe {
-            O::decrement_strong_count(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
+            O::decrement_strong_count(
+                ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>
+            );
         },
+        _marker: std::marker::PhantomData,
     };
 }
 
-impl ScopeCompletionRef {
-    pub fn new<S: Storage, O: Ownership>(
+impl<S: Storage> ScopeCompletionRef<S> {
+    pub fn new<O: Ownership>(
         scope: &O::Shared<crate::scope::GenericScopeCompletion<S, O>>,
     ) -> Self {
-        let ptr = O::as_ptr(scope) as *const crate::scope::GenericScopeCompletion<S, O>;
+        let ptr = O::as_ptr(scope);
         unsafe { O::increment_strong_count(ptr) };
 
         Self {
-            ptr: unsafe { NonNull::new_unchecked(ptr as *mut ()) },
+            ptr: unsafe { NonNull::new_unchecked(ptr as *mut OpaqueScope) },
             vtable: &VTableContainer::<S, O>::VTABLE,
         }
     }
@@ -187,16 +237,68 @@ impl ScopeCompletionRef {
     }
 }
 
+pub trait IntoAnyScope {
+    fn into_any(self) -> AnyScopeCompletionRef;
+}
+
+impl IntoAnyScope for ScopeCompletionRef<LocalStorage> {
+    fn into_any(self) -> AnyScopeCompletionRef {
+        AnyScopeCompletionRef::Local(self)
+    }
+}
+
+impl IntoAnyScope for ScopeCompletionRef<AtomicStorage> {
+    fn into_any(self) -> AnyScopeCompletionRef {
+        AnyScopeCompletionRef::Send(self)
+    }
+}
+
+#[derive(Clone)]
+pub enum AnyScopeCompletionRef {
+    Local(ScopeCompletionRef<LocalStorage>),
+    Send(ScopeCompletionRef<AtomicStorage>),
+}
+
+impl AnyScopeCompletionRef {
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Local(s) => ScopeCompletionRef::<LocalStorage>::is_cancelled(s),
+            Self::Send(s) => ScopeCompletionRef::<AtomicStorage>::is_cancelled(s),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
+        match self {
+            Self::Local(s) => s.try_link_child(child_token),
+            Self::Send(s) => s.try_link_child(child_token),
+        }
+    }
+}
+
+impl From<ScopeCompletionRef<LocalStorage>> for AnyScopeCompletionRef {
+    fn from(s: ScopeCompletionRef<LocalStorage>) -> Self {
+        Self::Local(s)
+    }
+}
+
+impl From<ScopeCompletionRef<AtomicStorage>> for AnyScopeCompletionRef {
+    fn from(s: ScopeCompletionRef<AtomicStorage>) -> Self {
+        Self::Send(s)
+    }
+}
 
 std::thread_local! {
     #[allow(clippy::missing_const_for_thread_local)]
-    pub(crate) static CURRENT_SCOPE: RefCell<Option<ScopeCompletionRef>> = const { RefCell::new(None) };
+    pub(crate) static CURRENT_SCOPE: RefCell<Option<AnyScopeCompletionRef>> = const { RefCell::new(None) };
 }
 
 pub struct GenericTaskHeader<S: Storage + 'static> {
     pub(crate) state: S::Usize,
     pub(crate) wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
-    pub(crate) scope_completion: S::OptionPtr<ScopeCompletionRef>,
+    pub(crate) scope_ptr: S::OptionPtr<OpaqueScope>,
+    pub(crate) scope_vtable: S::OptionPtr<ScopeVTable<S>>,
     pub(crate) runtime_ptr: S::OptionPtr<crate::runtime::RuntimeShared>,
     pub(crate) worker_id: S::Usize,
     pub(crate) vtable: &'static TaskVTable<S>,
@@ -210,7 +312,8 @@ impl<S: Storage + 'static> GenericTaskHeader<S> {
         Self {
             state: S::Usize::new(0),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
-            scope_completion: S::OptionPtr::new(None),
+            scope_ptr: S::OptionPtr::new(None),
+            scope_vtable: S::OptionPtr::new(None),
             runtime_ptr: S::OptionPtr::new(None),
             worker_id: S::Usize::new(0),
             vtable,
@@ -227,8 +330,14 @@ impl<S: Storage + 'static> GenericTaskHeader<S> {
         if self.state.load(Ordering::Acquire) & STATE_CANCELLED != 0 {
             return true;
         }
-        if let Some(scope_ptr) = self.scope_completion.load(Ordering::Acquire) {
-            return unsafe { scope_ptr.as_ref().is_cancelled() };
+        if let Some(ptr) = self.scope_ptr.load(Ordering::Acquire)
+            && let Some(vtable_ptr) = self.scope_vtable.load(Ordering::Acquire)
+        {
+            let scope_ref =
+                unsafe { ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref()) };
+            let cancelled = scope_ref.is_cancelled();
+            std::mem::forget(scope_ref);
+            return cancelled;
         }
         false
     }
@@ -325,6 +434,17 @@ impl<S: Storage + 'static> GenericTaskHeader<S> {
         unsafe { Waker::from_raw(RawWaker::new(data, vtable)) }
     }
 
+    /// 从 RawWaker 的 data 指针安全（带对齐检查）地转换为 NonNull<Self>
+    ///
+    /// # Safety
+    /// 调用者必须确保 data 指针确实指向一个有效的 GenericTaskHeader<S> 实例。
+    #[inline]
+    pub unsafe fn from_raw_data(data: *const ()) -> NonNull<Self> {
+        debug_assert!(!data.is_null());
+        debug_assert!((data as usize).is_multiple_of(std::mem::align_of::<Self>()));
+        unsafe { NonNull::new_unchecked(data as *mut Self) }
+    }
+
     /// # Safety
     /// The `waker` must have been created by a call to `create_waker` on a `TaskHeader` instance,
     /// and `vtable` must match the vtable used for its creation.
@@ -360,6 +480,9 @@ impl RuntimeContextExt for Context<'_> {
             {
                 return h.is_cancelled();
             }
+            if let Some(scope) = CURRENT_SCOPE.with(|s| s.borrow().clone()) {
+                return scope.is_cancelled();
+            }
             false
         }
     }
@@ -368,12 +491,12 @@ impl RuntimeContextExt for Context<'_> {
 pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
-        let header = &*(data as *const TaskHeader);
-        (header.vtable.wake)(NonNull::new_unchecked(data as *mut TaskHeader));
+        let header = TaskHeader::from_raw_data(data);
+        (header.as_ref().vtable.wake)(header);
     },
     |data| unsafe {
-        let header = &*(data as *const TaskHeader);
-        (header.vtable.wake_by_ref)(NonNull::new_unchecked(data as *mut TaskHeader));
+        let header = TaskHeader::from_raw_data(data);
+        (header.as_ref().vtable.wake_by_ref)(header);
     },
     |_data| {},
 );
@@ -381,12 +504,12 @@ pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &LOCAL_INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
-        let header = &*(data as *const LocalTaskHeader);
-        (header.vtable.wake)(NonNull::new_unchecked(data as *mut LocalTaskHeader));
+        let header = LocalTaskHeader::from_raw_data(data);
+        (header.as_ref().vtable.wake)(header);
     },
     |data| unsafe {
-        let header = &*(data as *const LocalTaskHeader);
-        (header.vtable.wake_by_ref)(NonNull::new_unchecked(data as *mut LocalTaskHeader));
+        let header = LocalTaskHeader::from_raw_data(data);
+        (header.as_ref().vtable.wake_by_ref)(header);
     },
     |_data| {},
 );
@@ -405,9 +528,9 @@ pub trait RawTask {
 pub trait Task<T>: RawTask {
     fn poll_task(&self, cx: &mut Context<'_>) -> bool;
     fn take_result(&self) -> Option<Result<T, TaskError>>;
-    fn set_scope_completion<S: Storage, O: Ownership>(
+    fn set_scope_completion<SS: Storage, O: Ownership>(
         &self,
-        scope: Option<O::Shared<crate::scope::GenericScopeCompletion<S, O>>>,
+        scope: Option<O::Shared<crate::scope::GenericScopeCompletion<SS, O>>>,
     );
 }
 
@@ -421,17 +544,10 @@ pub trait TaskLock<T> {
     fn lock_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R;
 }
 
-impl<T> TaskLock<T> for RefCell<T> {
+impl<T, L: StateLock<T>> TaskLock<T> for L {
     #[inline]
     fn lock_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        f(&mut *self.borrow_mut())
-    }
-}
-
-impl<T> TaskLock<T> for std::cell::UnsafeCell<T> {
-    #[inline]
-    fn lock_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        f(unsafe { &mut *self.get() })
+        f(&mut *self.lock())
     }
 }
 
@@ -557,12 +673,15 @@ where
             false
         };
 
-        if let Some(scope_ptr) = self.header.scope_completion.load(Ordering::Acquire)
+        if let Some(ptr) = self.header.scope_ptr.load(Ordering::Acquire)
+            && let Some(vtable_ptr) = self.header.scope_vtable.load(Ordering::Acquire)
             && !is_cancelled
         {
             unsafe {
-                scope_ptr.as_ref().report_panic(panic_err);
-                scope_ptr.as_ref().cancel();
+                let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
+                scope_ref.report_panic(panic_err);
+                scope_ref.cancel();
+                std::mem::forget(scope_ref);
             }
         }
 
@@ -579,10 +698,14 @@ where
     fn finalize(&self, is_local: bool) {
         self.header.notify_completion();
         self.header.clear_queued();
-        if let Some(scope_ptr) = self.header.scope_completion.swap(None, Ordering::AcqRel) {
+        let ptr = self.header.scope_ptr.swap(None, Ordering::AcqRel);
+        let vtable_ptr = self.header.scope_vtable.swap(None, Ordering::AcqRel);
+
+        if let (Some(ptr), Some(vtable_ptr)) = (ptr, vtable_ptr) {
             unsafe {
-                scope_ptr.as_ref().task_done();
-                drop(Box::from_raw(scope_ptr.as_ptr()));
+                let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
+                scope_ref.task_done();
+                drop(scope_ref);
             }
         }
         if !is_local {
@@ -603,6 +726,7 @@ pub(crate) fn poll_task_internal<T, L, F, S: Storage>(
 where
     L: TaskLock<Option<Result<T, TaskError>>>,
     F: FnMut(&mut Context<'_>) -> Poll<T>,
+    ScopeCompletionRef<S>: IntoAnyScope,
 {
     let lifecycle = LifecycleManager::new(header);
     let finalizer = TaskFinalizer::new(header, result);
@@ -614,10 +738,19 @@ where
     }
 
     // 设置当前作用域上下文，用于嵌套作用域自动建立父子关系
-    let _scope_guard = header
-        .scope_completion
-        .load(Ordering::Acquire)
-        .map(|ptr| ScopeGuard::enter(unsafe { ptr.as_ref() }));
+    let _scope_guard = match (
+        header.scope_ptr.load(Ordering::Acquire),
+        header.scope_vtable.load(Ordering::Acquire),
+    ) {
+        (Some(ptr), Some(vtable_ptr)) => {
+            let scope_ref =
+                unsafe { ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref()) };
+            let guard = ScopeGuard::enter(scope_ref.clone().into_any());
+            std::mem::forget(scope_ref);
+            Some(guard)
+        }
+        _ => None,
+    };
 
     loop {
         if header.is_cancelled() {
@@ -648,9 +781,9 @@ where
 struct ScopeGuard;
 
 impl ScopeGuard {
-    fn enter(scope: &ScopeCompletionRef) -> Self {
+    fn enter(scope: AnyScopeCompletionRef) -> Self {
         CURRENT_SCOPE.with(|s| {
-            *s.borrow_mut() = Some(scope.clone());
+            *s.borrow_mut() = Some(scope);
         });
         Self
     }
@@ -681,6 +814,8 @@ macro_rules! define_task_infrastructure {
         unsafe impl Send for $ref_name {}
 
         impl $ref_name {
+            /// # Safety
+            /// The `ptr` must be a valid pointer to a task node implementing `RawTask` with the correct storage.
             pub unsafe fn from_concrete<U>(ptr: *const U) -> Self
             where
                 U: RawTask<Storage = $storage>,
@@ -703,7 +838,9 @@ macro_rules! define_task_infrastructure {
             #[inline]
             pub fn poll_task(&self, worker_id: usize) -> bool {
                 let header = unsafe { &*self.header };
-                unsafe { (header.vtable.poll)(NonNull::new_unchecked(self.header as *mut _), worker_id) }
+                unsafe {
+                    (header.vtable.poll)(NonNull::new_unchecked(self.header as *mut _), worker_id)
+                }
             }
         }
 
@@ -746,23 +883,32 @@ macro_rules! impl_task_typed_common {
             )
         }
         fn take_result(&$self) -> Option<Result<T, TaskError>> {
-                $self.result.lock_mut(|r| r.take())
+            $self.result.lock_mut(|r| r.take())
         }
-        fn set_scope_completion<S: $crate::utils::storage::Storage, O: $crate::utils::ownership::Ownership>(
+        fn set_scope_completion<SS: $crate::utils::storage::Storage, O: $crate::utils::ownership::Ownership>(
             &$self,
-            scope: Option<<O as $crate::utils::ownership::Ownership>::Shared<$crate::scope::GenericScopeCompletion<S, O>>>,
+            scope: Option<<O as $crate::utils::ownership::Ownership>::Shared<$crate::scope::GenericScopeCompletion<SS, O>>>,
         ) {
             use $crate::task::Ordering;
             if let Some(scope) = scope {
-                let scope_ref = Box::into_raw(Box::new($crate::task::ScopeCompletionRef::new::<S, O>(&scope)));
+                let scope_ref = $crate::task::ScopeCompletionRef::new::<O>(&scope);
+                let (ptr, vtable) = scope_ref.into_parts();
                 $self
                     .header
-                    .scope_completion
-                    .store(std::ptr::NonNull::new(scope_ref), Ordering::Release);
+                    .scope_ptr
+                    .store(Some(ptr), Ordering::Release);
+                $self
+                    .header
+                    .scope_vtable
+                    .store(Some(std::ptr::NonNull::new(vtable as *const _ as *mut _).unwrap()), Ordering::Release);
             } else {
                 $self
                     .header
-                    .scope_completion
+                    .scope_ptr
+                    .store(None, Ordering::Release);
+                $self
+                    .header
+                    .scope_vtable
                     .store(None, Ordering::Release);
             }
         }

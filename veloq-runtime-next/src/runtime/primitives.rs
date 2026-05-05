@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
+use crate::task::OpaqueToken;
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{StateInt, StateLock, StateWakerQueue, Storage};
 
@@ -333,7 +334,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
         }
     }
 
-    pub(crate) unsafe fn try_link_child_raw(&self, child_token_ptr: *const ()) -> bool {
+    pub(crate) unsafe fn try_link_child_raw(&self, child_token_ptr: *const OpaqueToken) -> bool {
         let child = unsafe { &*(child_token_ptr as *const Self) };
         self.link_child(child);
         true

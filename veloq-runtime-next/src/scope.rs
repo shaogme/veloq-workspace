@@ -16,6 +16,8 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 use veloq_intrusive_linklist::Link;
 
+type ReclaimFn<'scope, T, A> = unsafe fn(&A, NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>);
+
 /// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
 pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
     remaining: S::Usize,
@@ -101,7 +103,6 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
         self.panic_info.lock().take()
     }
 }
-
 
 pub trait ScopeProvider<'scope> {
     type Storage: Storage;
@@ -196,7 +197,13 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
 
         JoinHandle {
             task: task_ref,
-            gate: unsafe { NonNull::new_unchecked(task as &dyn crate::task::TaskJoinGate<T> as *const dyn crate::task::TaskJoinGate<T> as *mut dyn crate::task::TaskJoinGate<T>) },
+            gate: unsafe {
+                NonNull::new_unchecked(
+                    task as &dyn crate::task::TaskJoinGate<T>
+                        as *const dyn crate::task::TaskJoinGate<T>
+                        as *mut dyn crate::task::TaskJoinGate<T>,
+                )
+            },
             scope: self,
             cancel_token: new_cancel_slot::<S, O>(),
             waker_node: None,
@@ -294,7 +301,13 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
         JoinHandle {
             task: task_ref,
-            gate: unsafe { NonNull::new_unchecked(task as &dyn crate::task::TaskJoinGate<T> as *const dyn crate::task::TaskJoinGate<T> as *mut dyn crate::task::TaskJoinGate<T>) },
+            gate: unsafe {
+                NonNull::new_unchecked(
+                    task as &dyn crate::task::TaskJoinGate<T>
+                        as *const dyn crate::task::TaskJoinGate<T>
+                        as *mut dyn crate::task::TaskJoinGate<T>,
+                )
+            },
             scope: self,
             cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
             waker_node: None,
@@ -398,8 +411,7 @@ pub struct JoinHandle<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<
     pub(crate) scope: &'scope_ref S,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<NonNull<GenericWakerNode<R::Storage>>>,
-    pub(crate) reclaim:
-        Option<unsafe fn(&S::Arena, NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>)>,
+    pub(crate) reclaim: Option<ReclaimFn<'scope, T, S::Arena>>,
 }
 
 pub type LocalJoinHandle<'scope, 'scope_ref, T> =
