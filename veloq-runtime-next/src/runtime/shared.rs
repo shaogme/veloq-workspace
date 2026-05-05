@@ -454,7 +454,7 @@ impl RuntimeShared {
             let ctx = ctx.borrow();
             let ctx = ctx.as_ref().expect("runtime context missing");
             let mut tick = 0u32;
-            let mut injector_check_interval = 61;
+            const INJECTOR_CHECK_INTERVAL: u32 = 61;
 
             while !self.shutdown.load(Ordering::Acquire)
                 && completion.map(|c| !c.is_done()).unwrap_or(true)
@@ -462,28 +462,31 @@ impl RuntimeShared {
                 let mut progressed = false;
                 tick = tick.wrapping_add(1);
 
+                // 1. 本地任务优先 (LIFO + Deque)
                 if let Some(task) = self.pop_send(worker_id) {
                     self.poll_send_task(worker_id, task);
                     progressed = true;
                 }
 
+                // 2. 本地 MPSC 队列
                 if !progressed && let Some(task) = self.pop_local(worker_id, &ctx.local_rx) {
                     self.poll_local_task(worker_id, task);
                     progressed = true;
                 }
 
-                if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
-                    self.poll_send_task(worker_id, task);
-                    progressed = true;
+                // 3. 远程检查 (解耦：固定周期强制检查 OR 本地无进展时检查)
+                if tick.is_multiple_of(INJECTOR_CHECK_INTERVAL) || !progressed {
+                    if let Ok(task) = ctx.remote_rx.try_recv() {
+                        self.poll_send_task(worker_id, task);
+                        progressed = true;
+                    }
                 }
 
-                if !progressed || tick.is_multiple_of(injector_check_interval) {
+                // 4. 工作窃取 (解耦：仅在以上均无果时尝试)
+                if !progressed {
                     if let Some(task) = self.steal_send(worker_id) {
                         self.poll_send_task(worker_id, task);
                         progressed = true;
-                        injector_check_interval = 61;
-                    } else if tick.is_multiple_of(injector_check_interval) {
-                        injector_check_interval = (injector_check_interval * 2 + 1).min(1023);
                     }
                 }
 
@@ -531,6 +534,19 @@ impl RuntimeShared {
                     continue;
                 }
 
+                // 最后一道防线：检查远程队列
+                if let Ok(task) = ctx.remote_rx.try_recv() {
+                    if self.groups[group_idx]
+                        .idle_stack
+                        .pop(&self.next_idle)
+                        .is_some()
+                    {
+                        self.idle_mask.clear(worker_id);
+                    }
+                    self.poll_send_task(worker_id, task);
+                    continue;
+                }
+
                 if completion.is_some() {
                     if self.groups[group_idx]
                         .idle_stack
@@ -546,10 +562,6 @@ impl RuntimeShared {
                 let parker = Parker::from_inner(self.parker_inners[worker_id].clone());
                 parker.park();
 
-                // If we were unparked, we might have already been popped from the stack by the unparker.
-                // But if we timed out or were unparked for other reasons, we might still be in the stack.
-                // However, the current unparker logic ALWAYS pops from the stack.
-                // So we just need to ensure idle_mask is cleared.
                 self.idle_mask.clear(worker_id);
             }
         });
@@ -557,6 +569,8 @@ impl RuntimeShared {
 
     fn has_work(&self, worker_id: usize) -> bool {
         let worker = &self.workers[worker_id];
-        !worker.send.is_empty() || worker.local_count.load(Ordering::Acquire) > 0
+        worker.lifo.load(Ordering::Acquire).is_some()
+            || !worker.send.is_empty()
+            || worker.local_count.load(Ordering::Acquire) > 0
     }
 }
