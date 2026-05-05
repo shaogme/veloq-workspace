@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::num::NonZeroUsize;
 use std::ptr;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
@@ -15,7 +16,8 @@ unsafe impl<T: Copy + Send> Send for Deque<T> {}
 unsafe impl<T: Copy + Send> Sync for Deque<T> {}
 
 impl<T: Copy> Deque<T> {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: NonZeroUsize) -> Self {
+        let capacity = capacity.get();
         assert!(capacity.is_power_of_two(), "Capacity must be a power of 2");
         let vec = (0..capacity).map(|_| UnsafeCell::new(None)).collect();
         Self {

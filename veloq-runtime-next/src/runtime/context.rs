@@ -47,10 +47,6 @@ impl WorkerInitContext {
     }
 }
 
-/// Default no-op worker initializer.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoopWorkerInit;
-
 pub fn current_worker_id() -> usize {
     CONTEXT.with(|ctx| {
         ctx.borrow()

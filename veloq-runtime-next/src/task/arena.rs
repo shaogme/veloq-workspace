@@ -98,10 +98,15 @@ impl<S: Storage> GenericArena<S> {
             let data_ptr = unsafe { ptr.add(data_offset) };
 
             unsafe {
-                (*node_ptr).drop_fn = drop_fn.unwrap();
-                (*node_ptr).data_ptr = data_ptr;
-                (*node_ptr).chunk = chunk_ptr;
-                (*node_ptr).link = Link::new();
+                ptr::write(
+                    node_ptr,
+                    GenericDropNode {
+                        link: Link::new(),
+                        drop_fn: drop_fn.unwrap(),
+                        data_ptr,
+                        chunk: chunk_ptr,
+                    },
+                );
 
                 let mut drop_head = (*chunk_ptr).drop_head.lock();
                 drop_head.push_front(std::pin::Pin::new_unchecked(&mut *node_ptr));

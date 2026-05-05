@@ -20,13 +20,17 @@ pub(crate) struct WorkerQueue {
 }
 
 impl WorkerQueue {
-    fn new(local_tx: Sender<LocalTaskRef>, remote_tx: Sender<SendTaskRef>) -> Self {
+    fn new(
+        local_tx: Sender<LocalTaskRef>,
+        remote_tx: Sender<SendTaskRef>,
+        queue_capacity: NonZeroUsize,
+    ) -> Self {
         Self {
             local_tx,
             remote_tx,
             local_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),
-            send: Deque::new(256),
+            send: Deque::new(queue_capacity),
         }
     }
 }
@@ -158,6 +162,7 @@ pub struct RuntimeShared {
 impl RuntimeShared {
     pub(crate) fn new(
         worker_count: NonZeroUsize,
+        queue_capacity: NonZeroUsize,
     ) -> (
         Self,
         Vec<Receiver<LocalTaskRef>>,
@@ -182,7 +187,7 @@ impl RuntimeShared {
             let (rtx, rrx) = mpsc::channel();
             local_receivers.push(lrx);
             remote_receivers.push(rrx);
-            workers.push(Arc::new(WorkerQueue::new(ltx, rtx)));
+            workers.push(Arc::new(WorkerQueue::new(ltx, rtx, queue_capacity)));
             next_idle.push(AtomicUsize::new(usize::MAX));
         }
 

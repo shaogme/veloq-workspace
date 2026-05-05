@@ -55,7 +55,7 @@ categories = ["asynchronous", "network-programming"]
 [workspace.dependencies]
 
 # Internal Crates
-veloq = { path = "veloq", version = "0.1.0" }
+veloq = { path = "veloq", version = "0.1.0", features = ["test-hooks"] }
 veloq-runtime = { path = "veloq-runtime", version = "0.1.0" }
 veloq-runtime-next = { path = "veloq-runtime-next", version = "0.1.0" }
 veloq-sync = { path = "veloq-sync", version = "0.1.0" }

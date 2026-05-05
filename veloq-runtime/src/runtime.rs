@@ -227,7 +227,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         Ok(Runtime {
             handles: thread_handles,
             registry,
-            worker_count,
             worker_0_prep: Some(worker_0_prep),
         })
     }
@@ -236,8 +235,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 pub struct Runtime<T: PoolTopology = UniformSlot> {
     handles: Vec<thread::JoinHandle<()>>,
     registry: Arc<ExecutorRegistry>,
-    #[allow(dead_code)]
-    worker_count: usize,
     worker_0_prep: Option<WorkerPrep<T>>,
 }
 
@@ -261,14 +258,6 @@ impl<T: PoolTopology> Drop for Runtime<T> {
 impl Runtime<UniformSlot> {
     pub fn builder() -> RuntimeBuilder<UniformSlot> {
         RuntimeBuilder::new()
-    }
-
-    // Legacy New (Optional, can delegate to Builder)
-    pub fn new(config: Config) -> Self {
-        Self::builder()
-            .config(config)
-            .build()
-            .expect("Failed to build runtime")
     }
 }
 

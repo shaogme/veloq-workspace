@@ -11,20 +11,25 @@ keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
 
+[features]
+default = []
+test-hooks = ["veloq-driver/test-hooks"]
+
 [dependencies]
 veloq-runtime-next.workspace = true
 veloq-buf.workspace = true
 veloq-driver.workspace = true
-error-stack.workspace = true
-
-[dev-dependencies]
 veloq-blocking.workspace = true
+error-stack.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys.workspace = true
+
+[dev-dependencies]
+veloq-driver = { workspace = true, features = ["test-hooks"] }
 
 [lints]
 workspace = true

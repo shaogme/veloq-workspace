@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use veloq_runtime_next::runtime::Runtime;
@@ -31,7 +30,7 @@ impl Future for PendingFuture {
 
 #[test]
 fn test_select_basic() {
-    let rt = Runtime::new(NonZeroUsize::new(1).unwrap());
+    let rt = Runtime::new();
     rt.block_on(async {
         let res = select! {
             val = ready(1) => val,
@@ -44,7 +43,7 @@ fn test_select_basic() {
 #[test]
 fn test_select_biased() {
     // Both are ready immediately. First one should win.
-    let rt = Runtime::new(NonZeroUsize::new(1).unwrap());
+    let rt = Runtime::new();
     rt.block_on(async {
         let res = select! {
             val = ready(10) => val,
@@ -57,7 +56,7 @@ fn test_select_biased() {
 #[test]
 fn test_select_biased_reverse() {
     // Both are ready immediately. First one declared (which is ready(20)) should win.
-    let rt = Runtime::new(NonZeroUsize::new(1).unwrap());
+    let rt = Runtime::new();
     rt.block_on(async {
         let res = select! {
             val = ready(20) => val,
@@ -70,7 +69,7 @@ fn test_select_biased_reverse() {
 #[test]
 fn test_select_expression() {
     // Test using complex expressions in select
-    let rt = Runtime::new(NonZeroUsize::new(1).unwrap());
+    let rt = Runtime::new();
     rt.block_on(async {
         let res = select! {
             v = async { 5 + 5 } => v,
@@ -82,7 +81,7 @@ fn test_select_expression() {
 
 #[test]
 fn test_select_three_branches() {
-    let rt = Runtime::new(NonZeroUsize::new(1).unwrap());
+    let rt = Runtime::new();
     rt.block_on(async {
         let res = select! {
             _ = PendingFuture => 1,
@@ -98,7 +97,7 @@ fn test_select_cancellation() {
     use veloq_runtime_next::scope;
     use veloq_runtime_next::task::TaskError;
 
-    let rt = Runtime::new(NonZeroUsize::new(1).unwrap());
+    let rt = Runtime::new();
     rt.block_on(async {
         scope!(s, {
             let handle = s.spawn_boxed(async {

@@ -1,11 +1,9 @@
-use std::num::NonZeroUsize;
-
 use veloq_runtime_next::runtime::Runtime;
 use veloq_runtime_next::{scope_local, task_local};
 
 #[test]
 fn test_scope_local_basic() {
-    let rt = Runtime::new(NonZeroUsize::new(1).unwrap());
+    let rt = Runtime::new();
     rt.block_on(async {
         scope_local!(local_scope, {
             let h1 = local_scope.spawn_boxed_local(async { 1 + 1 });
@@ -19,7 +17,7 @@ fn test_scope_local_basic() {
 
 #[test]
 fn test_scope_local_nested() {
-    let rt = Runtime::new(NonZeroUsize::new(1).unwrap());
+    let rt = Runtime::new();
     rt.block_on(async {
         scope_local!(outer, {
             let h1 = outer.spawn_boxed_local(async {

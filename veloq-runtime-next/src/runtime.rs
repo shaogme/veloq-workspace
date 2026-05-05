@@ -24,12 +24,18 @@ pub use primitives::{
 
 pub(crate) use context::with_current_runtime;
 pub use context::{
-    NoopWorkerInit, RuntimeContext, WorkerInitContext, clear_current_runtime_context,
-    current_worker_id, set_current_runtime_context,
+    RuntimeContext, WorkerInitContext, clear_current_runtime_context, current_worker_id,
+    set_current_runtime_context,
 };
 pub(crate) use shared::RuntimeShared;
 
 use executor::block_on_worker_init;
+
+fn noop_worker_init(_: WorkerInitContext) -> std::future::Ready<()> {
+    std::future::ready(())
+}
+
+type NoopWorkerInit = fn(WorkerInitContext) -> std::future::Ready<()>;
 
 pub struct Runtime<I = NoopWorkerInit> {
     shared: Arc<RuntimeShared>,
@@ -40,124 +46,18 @@ pub struct Runtime<I = NoopWorkerInit> {
 }
 
 impl Runtime<NoopWorkerInit> {
-    pub fn new(worker_count: NonZeroUsize) -> Self {
-        let (shared, local_receivers, remote_receivers) = RuntimeShared::new(worker_count);
-        let shared = Arc::new(shared);
-        Self {
-            shared,
-            local_receivers,
-            remote_receivers,
-            worker_count,
-            worker_init: None,
-        }
+    pub fn new() -> Self {
+        Self::builder().build()
     }
 
     pub fn builder() -> RuntimeBuilder<NoopWorkerInit> {
-        RuntimeBuilder::new()
-    }
-
-    pub fn block_on<F: Future>(self, fut: F) -> F::Output {
-        let Runtime {
-            shared,
-            local_receivers,
-            remote_receivers,
-            ..
-        } = self;
-        shared.shutdown.store(false, Ordering::Release);
-        let mut local_receivers = local_receivers;
-        let mut remote_receivers = remote_receivers;
-        let worker_count = NonZeroUsize::new(local_receivers.len())
-            .expect("runtime must have at least one worker");
-
-        let mut fut = fut;
-        let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-        let signal = Arc::new(Signal::new(true));
-        let waker = create_waker(signal.clone());
-        let mut cx = Context::from_waker(&waker);
-
-        thread::scope(|scope| {
-            struct ClearContext;
-            impl Drop for ClearContext {
-                fn drop(&mut self) {
-                    clear_current_runtime_context();
-                }
-            }
-
-            struct ShutdownGuard(Arc<RuntimeShared>);
-            impl Drop for ShutdownGuard {
-                fn drop(&mut self) {
-                    self.0.shutdown.store(true, Ordering::Release);
-                    for unparker in &self.0.unparkers {
-                        unparker.unpark();
-                    }
-                }
-            }
-            let _guard = ShutdownGuard(shared.clone());
-
-            for worker_id in (1..worker_count.get()).rev() {
-                let lrx = local_receivers.pop().expect("Receiver missing for worker");
-                let rrx = remote_receivers.pop().expect("Receiver missing for worker");
-                let runtime = shared.clone();
-                scope.spawn(move || {
-                    set_current_runtime_context(RuntimeContext {
-                        shared: runtime.clone(),
-                        worker_id,
-                        local_rx: lrx,
-                        remote_rx: rrx,
-                        rand: RefCell::new(FastRand::new(worker_id as u64)),
-                    });
-                    let _clear_context = ClearContext;
-
-                    runtime.drive_worker::<AtomicStorage, ArcOwnership>(None);
-                });
-            }
-
-            let lrx0 = local_receivers
-                .pop()
-                .expect("Receiver missing for worker 0");
-            let rrx0 = remote_receivers
-                .pop()
-                .expect("Receiver missing for worker 0");
-            set_current_runtime_context(RuntimeContext {
-                shared: shared.clone(),
-                worker_id: 0,
-                local_rx: lrx0,
-                remote_rx: rrx0,
-                rand: RefCell::new(FastRand::new(0)),
-            });
-            let _clear_context = ClearContext;
-
-            loop {
-                match fut.as_mut().poll(&mut cx) {
-                    Poll::Ready(res) => {
-                        return res;
-                    }
-                    Poll::Pending => signal.wait(),
-                }
-            }
-        })
+        RuntimeBuilder::default()
     }
 }
 
-impl<I> Runtime<I> {
-    pub fn worker_count(&self) -> NonZeroUsize {
-        self.worker_count
-    }
-
-    fn from_parts(
-        shared: Arc<RuntimeShared>,
-        local_receivers: Vec<Receiver<LocalTaskRef>>,
-        remote_receivers: Vec<Receiver<SendTaskRef>>,
-        worker_count: NonZeroUsize,
-        worker_init: Option<I>,
-    ) -> Self {
-        Self {
-            shared,
-            local_receivers,
-            remote_receivers,
-            worker_count,
-            worker_init,
-        }
+impl Default for Runtime<NoopWorkerInit> {
+    fn default() -> Self {
+        Self::builder().build()
     }
 }
 
@@ -165,6 +65,10 @@ impl<I> Runtime<I>
 where
     I: AsyncFn(WorkerInitContext) -> () + Sync,
 {
+    pub fn worker_count(&self) -> NonZeroUsize {
+        self.worker_count
+    }
+
     pub fn block_on<F: Future>(self, fut: F) -> F::Output {
         let Runtime {
             shared,
@@ -255,36 +159,33 @@ where
     }
 }
 
-impl Default for Runtime<NoopWorkerInit> {
-    fn default() -> Self {
-        let worker_count = thread::available_parallelism()
-            .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"));
-        Self::new(worker_count)
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
-pub struct RuntimeBuilder<I = NoopWorkerInit> {
+pub struct RuntimeBuilder<I> {
     worker_count: Option<NonZeroUsize>,
     worker_init: Option<I>,
+    queue_capacity: NonZeroUsize,
 }
 
 impl Default for RuntimeBuilder<NoopWorkerInit> {
     fn default() -> Self {
-        Self::new()
+        Self {
+            worker_count: None,
+            worker_init: Some(noop_worker_init),
+            queue_capacity: NonZeroUsize::new(1024).unwrap(),
+        }
     }
 }
 
 impl RuntimeBuilder<NoopWorkerInit> {
     pub fn new() -> Self {
-        Self {
-            worker_count: None,
-            worker_init: None,
-        }
+        Self::default()
     }
 }
 
-impl<I> RuntimeBuilder<I> {
+impl<I> RuntimeBuilder<I>
+where
+    I: AsyncFn(WorkerInitContext) -> () + Sync,
+{
     pub fn worker_count(mut self, count: NonZeroUsize) -> Self {
         self.worker_count = Some(count);
         self
@@ -294,7 +195,13 @@ impl<I> RuntimeBuilder<I> {
         RuntimeBuilder {
             worker_count: self.worker_count,
             worker_init: Some(worker_init),
+            queue_capacity: self.queue_capacity,
         }
+    }
+
+    pub fn queue_capacity(mut self, capacity: NonZeroUsize) -> Self {
+        self.queue_capacity = capacity;
+        self
     }
 
     pub fn build(self) -> Runtime<I> {
@@ -302,14 +209,15 @@ impl<I> RuntimeBuilder<I> {
             thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
         });
-        let (shared, local_receivers, remote_receivers) = RuntimeShared::new(count);
+        let (shared, local_receivers, remote_receivers) =
+            RuntimeShared::new(count, self.queue_capacity);
         let shared = Arc::new(shared);
-        Runtime::from_parts(
+        Runtime {
             shared,
             local_receivers,
             remote_receivers,
-            count,
-            self.worker_init,
-        )
+            worker_count: count,
+            worker_init: self.worker_init,
+        }
     }
 }

@@ -1,94 +1,78 @@
 pub mod context;
 
+pub use veloq_runtime_next::{scope, scope_local};
+
 use std::cell::RefCell;
 use std::future::Future;
-use std::rc::{Rc, Weak};
-use std::sync::{Arc, RwLock};
+use std::num::NonZeroUsize;
+use std::rc::Rc;
 
-use veloq_buf::{BufferRegistrar, PoolTopology};
+use veloq_blocking::init_blocking_pool;
+use veloq_buf::PoolTopology;
 use veloq_driver::driver::{Driver, PlatformDriver};
 use veloq_runtime_next::runtime::{self as async_runtime, WorkerInitContext};
 
-#[derive(Clone)]
-struct DriverRegistrar {
-    driver: Weak<RefCell<PlatformDriver>>,
-    chunks: Arc<RwLock<Vec<veloq_buf::heap::ChunkInfo>>>,
-}
+use crate::config::Config;
 
-impl DriverRegistrar {
-    fn new(driver: Weak<RefCell<PlatformDriver>>) -> Self {
-        Self {
-            driver,
-            chunks: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-}
-
-impl BufferRegistrar for DriverRegistrar {
-    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> std::io::Result<Vec<usize>> {
-        let driver_rc = self
-            .driver
-            .upgrade()
-            .ok_or_else(|| std::io::Error::other("driver dropped"))?;
-        let mut driver = driver_rc.borrow_mut();
-
-        let mut indices = Vec::with_capacity(regions.len());
-        for (idx, region) in regions.iter().enumerate() {
-            let chunk_idx = idx as u16;
-            driver
-                .register_chunk(chunk_idx, region.as_ptr(), region.len())
-                .map_err(|err| std::io::Error::other(format!("{err:#}")))?;
-            self.chunks.write().expect("chunk registry poisoned").push(
-                veloq_buf::heap::ChunkInfo {
-                    id: chunk_idx,
-                    ptr: unsafe { std::ptr::NonNull::new_unchecked(region.as_ptr() as *mut u8) },
-                    len: unsafe { std::num::NonZeroUsize::new_unchecked(region.len()) },
-                },
-            );
-            indices.push(idx);
-        }
-        Ok(indices)
-    }
-
-    fn resolve_chunk_info(&self, chunk_id: u16) -> Option<veloq_buf::heap::ChunkInfo> {
-        self.chunks
-            .read()
-            .expect("chunk registry poisoned")
-            .iter()
-            .find(|chunk| chunk.id == chunk_id)
-            .copied()
-    }
-}
+use crate::runtime::context::DriverRegistrar;
 
 pub struct RuntimeBuilder<T: PoolTopology> {
-    worker_count: Option<std::num::NonZeroUsize>,
     topology: T,
+    config: Config,
 }
 
 impl<T: PoolTopology> RuntimeBuilder<T> {
     pub fn new(topology: T) -> Self {
         Self {
-            worker_count: None,
             topology,
+            config: Config::default(),
         }
     }
 
     pub fn worker_count(mut self, worker_count: std::num::NonZeroUsize) -> Self {
-        self.worker_count = Some(worker_count);
+        self.config = self.config.worker_threads(worker_count.get());
+        self
+    }
+
+    pub fn direct_io(mut self, direct_io: bool) -> Self {
+        self.config = self.config.direct_io(direct_io);
+        self
+    }
+
+    pub fn queue_capacity(mut self, capacity: NonZeroUsize) -> Self {
+        self.config = self.config.queue_capacity(capacity);
+        self
+    }
+
+    pub fn blocking_pool(mut self, blocking_pool: crate::config::BlockingPoolConfig) -> Self {
+        self.config = self.config.blocking_pool(blocking_pool);
+        self
+    }
+
+    pub fn with_config<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(Config) -> Config,
+    {
+        self.config = f(self.config);
         self
     }
 
     pub fn build(self) -> std::io::Result<Runtime<T>> {
-        let worker_count = self.worker_count.unwrap_or_else(|| {
+        let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
             std::thread::available_parallelism()
-                .unwrap_or_else(|_| std::num::NonZeroUsize::new(1).expect("1 is non-zero"))
+                .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
         });
+
+        // Initialize blocking pool using config
+        init_blocking_pool(self.config.get_blocking_pool_config().clone());
+
         let state = self.topology.init(worker_count.get())?;
 
         Ok(Runtime {
             worker_count,
             topology: self.topology,
             state,
+            config: self.config,
         })
     }
 }
@@ -97,6 +81,7 @@ pub struct Runtime<T: PoolTopology> {
     worker_count: std::num::NonZeroUsize,
     topology: T,
     state: T::State,
+    config: Config,
 }
 
 impl<T: PoolTopology> Runtime<T> {
@@ -113,6 +98,7 @@ impl<T: PoolTopology> Runtime<T> {
             worker_count,
             topology,
             state,
+            config,
         } = self;
 
         struct ClearCurrentContext;
@@ -126,22 +112,18 @@ impl<T: PoolTopology> Runtime<T> {
 
         let runtime = async_runtime::Runtime::builder()
             .worker_count(worker_count)
+            .queue_capacity(config.get_queue_capacity())
             .with_worker_init(move |worker_ctx: WorkerInitContext| {
                 let topology = topology.clone();
                 let state = state.clone();
+                let config = config.clone();
                 async move {
-                    #[cfg(not(windows))]
                     let driver = Rc::new(RefCell::new(
-                        PlatformDriver::new(veloq_driver::config::UringConfig::default())
-                            .expect("failed to create uring driver"),
-                    ));
-                    #[cfg(windows)]
-                    let driver = Rc::new(RefCell::new(
-                        PlatformDriver::new(veloq_driver::config::IocpConfig::default())
-                            .expect("failed to create iocp driver"),
+                        PlatformDriver::new(&config).expect("failed to create driver"),
                     ));
 
-                    let registrar = DriverRegistrar::new(Rc::downgrade(&driver));
+                    let registration_mode = config.registration_mode();
+                    let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
                     let listener_chunks = registrar.chunks.clone();
                     topology.connect_listener(
                         &state,
@@ -158,9 +140,9 @@ impl<T: PoolTopology> Runtime<T> {
                     }
 
                     let buf_pool =
-                        topology.build(&state, worker_ctx.worker_id(), Box::new(registrar));
+                        topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
                     context::set_current_runtime_context(context::RuntimeContext::new(
-                        driver, buf_pool,
+                        driver, buf_pool, config, registrar,
                     ));
                 }
             })
