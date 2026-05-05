@@ -6,7 +6,7 @@ pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNo
 
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{
-    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage,
+    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage, StrategyId,
 };
 use std::any::Any;
 use std::cell::RefCell;
@@ -42,10 +42,10 @@ pub const STATE_CANCELLED: usize = 1 << 3;
 pub const STATE_POLLING: usize = 1 << 4;
 pub const STATE_WOKEN: usize = 1 << 5;
 
-pub struct TaskVTable {
-    pub(crate) wake: unsafe fn(data: *const ()),
-    pub(crate) wake_by_ref: unsafe fn(data: *const ()),
-    pub(crate) poll: unsafe fn(data: *const (), worker_id: usize) -> bool,
+pub struct TaskVTable<S: Storage> {
+    pub(crate) wake: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
+    pub(crate) wake_by_ref: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
+    pub(crate) poll: unsafe fn(data: NonNull<GenericTaskHeader<S>>, worker_id: usize) -> bool,
 }
 
 pub struct GenericWakerNode<S: Storage> {
@@ -60,9 +60,9 @@ pub type WakerNode = GenericWakerNode<AtomicStorage>;
 pub type LocalWakerNode = GenericWakerNode<LocalStorage>;
 
 pub struct ErasedCancellationToken {
-    pub(crate) ptr: *const (),
-    pub(crate) s_id: *const (),
-    pub(crate) o_id: *const (),
+    pub(crate) ptr: NonNull<()>,
+    pub(crate) s_id: StrategyId,
+    pub(crate) o_id: StrategyId,
 }
 
 impl ErasedCancellationToken {
@@ -70,7 +70,7 @@ impl ErasedCancellationToken {
         token: &crate::runtime::GenericCancellationToken<S, O>,
     ) -> Self {
         Self {
-            ptr: token as *const _ as *const (),
+            ptr: unsafe { NonNull::new_unchecked(token as *const _ as *mut ()) },
             s_id: S::strategy_id(),
             o_id: O::strategy_id(),
         }
@@ -78,13 +78,13 @@ impl ErasedCancellationToken {
 }
 
 pub(crate) struct ScopeVTable {
-    pub(crate) task_done: unsafe fn(*const ()),
-    pub(crate) cancel: unsafe fn(*const ()),
-    pub(crate) report_panic: unsafe fn(*const (), Box<dyn Any + Send + 'static>),
-    pub(crate) is_cancelled: unsafe fn(*const ()) -> bool,
-    pub(crate) try_link_child: unsafe fn(*const (), &ErasedCancellationToken) -> bool,
-    pub(crate) clone: unsafe fn(*const ()) -> ScopeCompletionRef,
-    pub(crate) drop: unsafe fn(*const ()),
+    pub(crate) task_done: unsafe fn(NonNull<()>),
+    pub(crate) cancel: unsafe fn(NonNull<()>),
+    pub(crate) report_panic: unsafe fn(NonNull<()>, Box<dyn Any + Send + 'static>),
+    pub(crate) is_cancelled: unsafe fn(NonNull<()>) -> bool,
+    pub(crate) try_link_child: unsafe fn(NonNull<()>, &ErasedCancellationToken) -> bool,
+    pub(crate) clone: unsafe fn(NonNull<()>) -> ScopeCompletionRef,
+    pub(crate) drop: unsafe fn(NonNull<()>),
 }
 
 pub(crate) struct ScopeCompletionRef {
@@ -97,13 +97,13 @@ unsafe impl Sync for ScopeCompletionRef {}
 
 impl Clone for ScopeCompletionRef {
     fn clone(&self) -> Self {
-        unsafe { (self.vtable.clone)(self.ptr.as_ptr()) }
+        unsafe { (self.vtable.clone)(self.ptr) }
     }
 }
 
 impl Drop for ScopeCompletionRef {
     fn drop(&mut self) {
-        unsafe { (self.vtable.drop)(self.ptr.as_ptr()) }
+        unsafe { (self.vtable.drop)(self.ptr) }
     }
 }
 
@@ -112,38 +112,38 @@ struct VTableContainer<S: Storage, O: Ownership>(std::marker::PhantomData<(S, O)
 impl<S: Storage, O: Ownership> VTableContainer<S, O> {
     const VTABLE: ScopeVTable = ScopeVTable {
         task_done: |ptr| unsafe {
-            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
             scope.task_done();
         },
         cancel: |ptr| unsafe {
-            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
             scope.cancel();
         },
         report_panic: |ptr, payload| unsafe {
-            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
             scope.report_panic(payload);
         },
         is_cancelled: |ptr| unsafe {
-            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
             scope.is_cancelled()
         },
         try_link_child: |ptr, child_token| unsafe {
             if child_token.s_id != S::strategy_id() || child_token.o_id != O::strategy_id() {
                 return false;
             }
-            let scope = &*(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
-            scope.cancel_token().try_link_child_raw(child_token.ptr);
+            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
+            scope.cancel_token().try_link_child_raw(child_token.ptr.as_ptr());
             true
         },
         clone: |ptr| unsafe {
-            O::increment_strong_count(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            O::increment_strong_count(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
             ScopeCompletionRef {
-                ptr: NonNull::new_unchecked(ptr as *mut ()),
+                ptr,
                 vtable: &VTableContainer::<S, O>::VTABLE,
             }
         },
         drop: |ptr| unsafe {
-            O::decrement_strong_count(ptr as *const crate::scope::GenericScopeCompletion<S, O>);
+            O::decrement_strong_count(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
         },
     };
 }
@@ -163,27 +163,27 @@ impl ScopeCompletionRef {
 
     #[inline]
     pub fn task_done(&self) {
-        unsafe { (self.vtable.task_done)(self.ptr.as_ptr()) };
+        unsafe { (self.vtable.task_done)(self.ptr) };
     }
 
     #[inline]
     pub fn cancel(&self) {
-        unsafe { (self.vtable.cancel)(self.ptr.as_ptr()) };
+        unsafe { (self.vtable.cancel)(self.ptr) };
     }
 
     #[inline]
     pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
-        unsafe { (self.vtable.report_panic)(self.ptr.as_ptr(), payload) };
+        unsafe { (self.vtable.report_panic)(self.ptr, payload) };
     }
 
     #[inline]
     pub(crate) fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
-        unsafe { (self.vtable.try_link_child)(self.ptr.as_ptr(), child_token) }
+        unsafe { (self.vtable.try_link_child)(self.ptr, child_token) }
     }
 
     #[inline]
     pub fn is_cancelled(&self) -> bool {
-        unsafe { (self.vtable.is_cancelled)(self.ptr.as_ptr()) }
+        unsafe { (self.vtable.is_cancelled)(self.ptr) }
     }
 }
 
@@ -193,20 +193,20 @@ std::thread_local! {
     pub(crate) static CURRENT_SCOPE: RefCell<Option<ScopeCompletionRef>> = const { RefCell::new(None) };
 }
 
-pub struct GenericTaskHeader<S: Storage> {
+pub struct GenericTaskHeader<S: Storage + 'static> {
     pub(crate) state: S::Usize,
     pub(crate) wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     pub(crate) scope_completion: S::OptionPtr<ScopeCompletionRef>,
     pub(crate) runtime_ptr: S::OptionPtr<crate::runtime::RuntimeShared>,
     pub(crate) worker_id: S::Usize,
-    pub(crate) vtable: &'static TaskVTable,
+    pub(crate) vtable: &'static TaskVTable<S>,
 }
 
 pub type TaskHeader = GenericTaskHeader<AtomicStorage>;
 pub type LocalTaskHeader = GenericTaskHeader<LocalStorage>;
 
-impl<S: Storage> GenericTaskHeader<S> {
-    pub fn new(vtable: &'static TaskVTable) -> Self {
+impl<S: Storage + 'static> GenericTaskHeader<S> {
+    pub fn new(vtable: &'static TaskVTable<S>) -> Self {
         Self {
             state: S::Usize::new(0),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
@@ -369,11 +369,11 @@ pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
         let header = &*(data as *const TaskHeader);
-        (header.vtable.wake)(data);
+        (header.vtable.wake)(NonNull::new_unchecked(data as *mut TaskHeader));
     },
     |data| unsafe {
         let header = &*(data as *const TaskHeader);
-        (header.vtable.wake_by_ref)(data);
+        (header.vtable.wake_by_ref)(NonNull::new_unchecked(data as *mut TaskHeader));
     },
     |_data| {},
 );
@@ -382,11 +382,11 @@ pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &LOCAL_INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
         let header = &*(data as *const LocalTaskHeader);
-        (header.vtable.wake)(data);
+        (header.vtable.wake)(NonNull::new_unchecked(data as *mut LocalTaskHeader));
     },
     |data| unsafe {
         let header = &*(data as *const LocalTaskHeader);
-        (header.vtable.wake_by_ref)(data);
+        (header.vtable.wake_by_ref)(NonNull::new_unchecked(data as *mut LocalTaskHeader));
     },
     |_data| {},
 );
@@ -681,8 +681,6 @@ macro_rules! define_task_infrastructure {
         unsafe impl Send for $ref_name {}
 
         impl $ref_name {
-            /// # Safety
-            /// The `ptr` must be a valid pointer to an object implementing `RawTask`.
             pub unsafe fn from_concrete<U>(ptr: *const U) -> Self
             where
                 U: RawTask<Storage = $storage>,
@@ -705,7 +703,7 @@ macro_rules! define_task_infrastructure {
             #[inline]
             pub fn poll_task(&self, worker_id: usize) -> bool {
                 let header = unsafe { &*self.header };
-                unsafe { (header.vtable.poll)(self.header as *const (), worker_id) }
+                unsafe { (header.vtable.poll)(NonNull::new_unchecked(self.header as *mut _), worker_id) }
             }
         }
 

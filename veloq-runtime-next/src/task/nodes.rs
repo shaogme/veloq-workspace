@@ -27,25 +27,25 @@ where
     T: 'scope,
     F: Future<Output = T> + 'future,
 {
-    const VTABLE: TaskVTable = TaskVTable {
+    const VTABLE: TaskVTable<LocalStorage> = TaskVTable {
         wake: |data| unsafe {
-            let header = &*(data as *const LocalTaskHeader);
-            let node = data as *const Self;
+            let header = data.as_ref();
+            let node = data.as_ptr() as *const Self;
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
                 runtime.enqueue_local(worker_id, LocalTaskRef::from_concrete(node));
             }
         },
         wake_by_ref: |data| unsafe {
-            let header = &*(data as *const LocalTaskHeader);
-            let node = data as *const Self;
+            let header = data.as_ref();
+            let node = data.as_ptr() as *const Self;
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
                 runtime.enqueue_local(worker_id, LocalTaskRef::from_concrete(node));
             }
         },
         poll: |data, _worker_id| unsafe {
-            let node = &*(data as *const Self);
+            let node = &*(data.as_ptr() as *const Self);
             node.poll_raw(_worker_id)
         },
     };
@@ -96,25 +96,25 @@ impl<'scope, T: 'scope, F> LocalBoxedTaskNode<'scope, T, F>
 where
     F: Future<Output = T> + 'scope,
 {
-    const VTABLE: TaskVTable = TaskVTable {
+    const VTABLE: TaskVTable<LocalStorage> = TaskVTable {
         wake: |data| unsafe {
-            let header = &*(data as *const LocalTaskHeader);
-            let node = data as *const Self;
+            let header = data.as_ref();
+            let node = data.as_ptr() as *const Self;
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
                 runtime.enqueue_local(worker_id, LocalTaskRef::from_concrete(node));
             }
         },
         wake_by_ref: |data| unsafe {
-            let header = &*(data as *const LocalTaskHeader);
-            let node = data as *const Self;
+            let header = data.as_ref();
+            let node = data.as_ptr() as *const Self;
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
                 runtime.enqueue_local(worker_id, LocalTaskRef::from_concrete(node));
             }
         },
         poll: |data, _worker_id| unsafe {
-            let node = &*(data as *const Self);
+            let node = &*(data.as_ptr() as *const Self);
             node.poll_raw(_worker_id)
         },
     };
@@ -165,25 +165,25 @@ where
     T: Send + 'scope,
     F: Future<Output = T> + Send + 'scope,
 {
-    const VTABLE: TaskVTable = TaskVTable {
+    const VTABLE: TaskVTable<AtomicStorage> = TaskVTable {
         wake: |data| unsafe {
-            let header = &*(data as *const TaskHeader);
-            let node = data as *const Self;
+            let header = data.as_ref();
+            let node = data.as_ptr() as *const Self;
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
                 runtime.enqueue_send(worker_id, SendTaskRef::from_concrete(node));
             }
         },
         wake_by_ref: |data| unsafe {
-            let header = &*(data as *const TaskHeader);
-            let node = data as *const Self;
+            let header = data.as_ref();
+            let node = data.as_ptr() as *const Self;
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
                 runtime.enqueue_send(worker_id, SendTaskRef::from_concrete(node));
             }
         },
         poll: |data, _worker_id| unsafe {
-            let node = &*(data as *const Self);
+            let node = &*(data.as_ptr() as *const Self);
             node.poll_raw(_worker_id)
         },
     };
@@ -238,25 +238,25 @@ where
     T: Send + 'scope,
     F: Future<Output = T> + Send + 'future,
 {
-    const VTABLE: TaskVTable = TaskVTable {
+    const VTABLE: TaskVTable<AtomicStorage> = TaskVTable {
         wake: |data| unsafe {
-            let header = &*(data as *const TaskHeader);
-            let node = data as *const Self;
+            let header = data.as_ref();
+            let node = data.as_ptr() as *const Self;
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
                 runtime.enqueue_send(worker_id, SendTaskRef::from_concrete(node));
             }
         },
         wake_by_ref: |data| unsafe {
-            let header = &*(data as *const TaskHeader);
-            let node = data as *const Self;
+            let header = data.as_ref();
+            let node = data.as_ptr() as *const Self;
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
                 runtime.enqueue_send(worker_id, SendTaskRef::from_concrete(node));
             }
         },
         poll: |data, _worker_id| unsafe {
-            let node = &*(data as *const Self);
+            let node = &*(data.as_ptr() as *const Self);
             node.poll_raw(_worker_id)
         },
     };

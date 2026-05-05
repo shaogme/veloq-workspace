@@ -6,8 +6,18 @@ use std::task::Waker;
 
 use crossbeam_queue::SegQueue;
 
-pub trait Storage: Send + Sync {
-    fn strategy_id() -> *const ();
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct StrategyId(usize);
+
+impl StrategyId {
+    pub fn from_static(ptr: *const u8) -> Self {
+        Self(ptr as usize)
+    }
+}
+
+pub trait Storage: Send + Sync + 'static {
+    fn strategy_id() -> StrategyId;
     type Usize: StateInt;
     type OptionPtr<T>: StateOptionPtr<T>;
     type NonNullPtr<T>: StateNonNullPtr<T>;
@@ -100,9 +110,9 @@ pub trait StateWakerQueue: Send + Sync + 'static {
 
 pub struct AtomicStorage;
 impl Storage for AtomicStorage {
-    fn strategy_id() -> *const () {
+    fn strategy_id() -> StrategyId {
         static ID: u8 = 0;
-        &ID as *const _ as *const ()
+        StrategyId::from_static(&ID)
     }
     type Usize = AtomicUsize;
     type OptionPtr<T> = AtomicOptionPtr<T>;
@@ -191,9 +201,9 @@ impl_state_int!(
 
 pub struct LocalStorage;
 impl Storage for LocalStorage {
-    fn strategy_id() -> *const () {
+    fn strategy_id() -> StrategyId {
         static ID: u8 = 0;
-        &ID as *const _ as *const ()
+        StrategyId::from_static(&ID)
     }
     type Usize = NonAtomicUsize;
     type OptionPtr<T> = NonAtomicOptionPtr<T>;
