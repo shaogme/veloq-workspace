@@ -239,10 +239,14 @@ impl<S: Storage + 'static> GenericTaskHeader<S> {
     }
 
     /// 从 RawWaker 的 data 指针安全（带对齐检查）地转换为 NonNull<Self>
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须确保 `data` 是由 `create_waker` 生成的有效指针，且指向的对象尚未被释放。
     #[inline]
     pub unsafe fn from_raw_data(data: *const ()) -> NonNull<Self> {
         debug_assert!(!data.is_null());
-        debug_assert!((data as usize) % std::mem::align_of::<Self>() == 0);
+        debug_assert!((data as usize).is_multiple_of(std::mem::align_of::<Self>()));
         unsafe { NonNull::new_unchecked(data as *mut Self) }
     }
 

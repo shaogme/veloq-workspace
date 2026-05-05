@@ -162,10 +162,10 @@ where
 
     fn take_result(&self) -> Option<Result<T, TaskError>> {
         self.state.lock_mut(|s| {
-            if let TaskState::Done(_) = s {
-                if let TaskState::Done(res) = std::mem::replace(s, TaskState::Empty) {
-                    return Some(res);
-                }
+            if let TaskState::Done(_) = s
+                && let TaskState::Done(res) = std::mem::replace(s, TaskState::Empty)
+            {
+                return Some(res);
             }
             None
         })

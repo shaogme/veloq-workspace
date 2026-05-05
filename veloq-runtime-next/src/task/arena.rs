@@ -101,7 +101,7 @@ impl<S: Storage> GenericArena<S> {
         }
 
         // 5. 如果需要销毁，初始化 DropNode 并压入块内链表
-        if drop_fn.is_some() {
+        if let Some(drop_fn) = drop_fn {
             let node_ptr = ptr as *mut GenericDropNode<S>;
             let data_ptr = unsafe { ptr.add(offset) };
 
@@ -110,7 +110,7 @@ impl<S: Storage> GenericArena<S> {
                     node_ptr,
                     GenericDropNode {
                         link: Link::new(),
-                        drop_fn: drop_fn.unwrap(),
+                        drop_fn,
                         data_ptr,
                         chunk: chunk_ptr,
                     },
@@ -189,14 +189,13 @@ impl<S: Storage> GenericArena<S> {
     #[inline]
     fn try_alloc_fast(&self, layout: Layout) -> Option<(*mut u8, *mut GenericChunk<S>)> {
         // 针对 AtomicStorage，优先尝试 TLB
-        if S::strategy_id() == AtomicStorage::strategy_id() {
-            if let Some(cache) = ATOMIC_TLB.with(|tlb| tlb.get())
-                && cache.arena_ptr == self as *const _ as *const ()
-            {
-                let p = unsafe { cache.chunk.as_ref().try_alloc(layout) };
-                if !p.is_null() {
-                    return Some((p, cache.chunk.as_ptr() as *mut _));
-                }
+        if S::strategy_id() == AtomicStorage::strategy_id()
+            && let Some(cache) = ATOMIC_TLB.with(|tlb| tlb.get())
+            && cache.arena_ptr == self as *const _ as *const ()
+        {
+            let p = unsafe { cache.chunk.as_ref().try_alloc(layout) };
+            if !p.is_null() {
+                return Some((p, cache.chunk.as_ptr() as *mut _));
             }
         }
 

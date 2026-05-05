@@ -475,19 +475,17 @@ impl RuntimeShared {
                 }
 
                 // 3. 远程检查 (解耦：固定周期强制检查 OR 本地无进展时检查)
-                if tick.is_multiple_of(INJECTOR_CHECK_INTERVAL) || !progressed {
-                    if let Ok(task) = ctx.remote_rx.try_recv() {
-                        self.poll_send_task(worker_id, task);
-                        progressed = true;
-                    }
+                if (tick.is_multiple_of(INJECTOR_CHECK_INTERVAL) || !progressed)
+                    && let Ok(task) = ctx.remote_rx.try_recv()
+                {
+                    self.poll_send_task(worker_id, task);
+                    progressed = true;
                 }
 
                 // 4. 工作窃取 (解耦：仅在以上均无果时尝试)
-                if !progressed {
-                    if let Some(task) = self.steal_send(worker_id) {
-                        self.poll_send_task(worker_id, task);
-                        progressed = true;
-                    }
+                if !progressed && let Some(task) = self.steal_send(worker_id) {
+                    self.poll_send_task(worker_id, task);
+                    progressed = true;
                 }
 
                 if progressed {

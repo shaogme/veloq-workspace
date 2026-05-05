@@ -31,6 +31,11 @@ impl ErasedCancellationToken {
     }
 
     /// 尝试将擦除类型的令牌向下转换为具体类型
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须确保该令牌确实是 `GenericCancellationToken<S, O>` 类型。
+    /// 虽然内部有类型 ID 检查，但该函数仍被标记为 unsafe 以提醒调用者注意指针生命周期。
     pub unsafe fn downcast<S: Storage, O: Ownership>(
         &self,
     ) -> Option<&crate::runtime::GenericCancellationToken<S, O>> {
@@ -72,6 +77,9 @@ impl<S: Storage> ScopeCompletionRef<S> {
     }
 
     #[inline]
+    /// # Safety
+    ///
+    /// 调用者必须确保 `ptr` 是一个有效的 `OpaqueScope` 指针，且与 `vtable` 匹配。
     pub unsafe fn from_parts(ptr: NonNull<OpaqueScope>, vtable: &'static ScopeVTable<S>) -> Self {
         Self { ptr, vtable }
     }
