@@ -270,7 +270,7 @@ where
             <PlatformDriver as Driver>::Op,
             DriverCompletion = <PlatformDriver as Driver>::Completion,
         > + Send
-        + 'static + 'a,
+        + 'static,
 {
     let ctx = current();
     ctx.registrar().sync_to_driver();
