@@ -149,30 +149,34 @@ impl<'a, S: Storage> LifecycleManager<'a, S> {
     }
 }
 
-pub struct TaskFinalizer<'a, T, L, S: Storage>
+pub trait TaskResultSetter<T> {
+    fn set_result(&self, res: Result<T, TaskError>);
+}
+
+pub struct TaskFinalizer<'a, T, R, S: Storage>
 where
-    L: TaskLock<Option<Result<T, TaskError>>>,
+    R: TaskResultSetter<T>,
 {
     header: &'a GenericTaskHeader<S>,
-    result: &'a L,
+    result_setter: &'a R,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<'a, T, L, S: Storage> TaskFinalizer<'a, T, L, S>
+impl<'a, T, R, S: Storage> TaskFinalizer<'a, T, R, S>
 where
-    L: TaskLock<Option<Result<T, TaskError>>>,
+    R: TaskResultSetter<T>,
 {
     #[inline]
-    pub fn new(header: &'a GenericTaskHeader<S>, result: &'a L) -> Self {
+    pub fn new(header: &'a GenericTaskHeader<S>, result_setter: &'a R) -> Self {
         Self {
             header,
-            result,
+            result_setter,
             _marker: std::marker::PhantomData,
         }
     }
 
     pub fn complete(&self, res: Result<T, TaskError>, is_local: bool) {
-        self.result.lock_mut(|r| *r = Some(res));
+        self.result_setter.set_result(res);
         self.finalize(is_local);
     }
 
@@ -201,7 +205,7 @@ where
             TaskError::Panic
         };
 
-        self.result.lock_mut(|r| *r = Some(Err(error)));
+        self.result_setter.set_result(Err(error));
         self.finalize(is_local);
     }
 
@@ -224,20 +228,20 @@ where
     }
 }
 
-pub(crate) fn poll_task_internal<T, L, F, S: Storage>(
+pub(crate) fn poll_task_internal<T, R, F, S: Storage>(
     header: &GenericTaskHeader<S>,
-    result: &L,
+    result_setter: &R,
     cx: &mut Context<'_>,
     mut poll_fn: F,
     is_local: bool,
 ) -> bool
 where
-    L: TaskLock<Option<Result<T, TaskError>>>,
+    R: TaskResultSetter<T>,
     F: FnMut(&mut Context<'_>) -> Poll<T>,
     ScopeCompletionRef<S>: IntoAnyScope,
 {
     let lifecycle = LifecycleManager::new(header);
-    let finalizer = TaskFinalizer::new(header, result);
+    let finalizer = TaskFinalizer::new(header, result_setter);
 
     match lifecycle.enter_poll(is_local) {
         PollStatus::Proceed => {}
@@ -360,50 +364,6 @@ macro_rules! impl_raw_task_common {
     };
 }
 
-macro_rules! impl_task_typed_common {
-    ($self:ident, $cx:ident, $poll_expr:expr, $is_local:expr) => {
-        fn poll_task(&$self, $cx: &mut $crate::task::Context<'_>) -> bool {
-            $crate::task::poll_task_internal(
-                &$self.header,
-                &$self.result,
-                $cx,
-                |$cx| $poll_expr,
-                $is_local,
-            )
-        }
-        fn take_result(&$self) -> Option<Result<T, TaskError>> {
-            $self.result.lock_mut(|r| r.take())
-        }
-        fn set_scope_completion<SS: $crate::utils::storage::Storage, O: $crate::utils::ownership::Ownership>(
-            &$self,
-            scope: Option<<O as $crate::utils::ownership::Ownership>::Shared<$crate::scope::GenericScopeCompletion<SS, O>>>,
-        ) {
-            use std::sync::atomic::Ordering;
-            if let Some(scope) = scope {
-                let scope_ref = $crate::task::ScopeCompletionRef::new::<O>(&scope);
-                let (ptr, vtable) = scope_ref.into_parts();
-                $self
-                    .header
-                    .scope_ptr
-                    .store(Some(ptr), Ordering::Release);
-                $self
-                    .header
-                    .scope_vtable
-                    .store(Some(std::ptr::NonNull::new(vtable as *const _ as *mut _).unwrap()), Ordering::Release);
-            } else {
-                $self
-                    .header
-                    .scope_ptr
-                    .store(None, Ordering::Release);
-                $self
-                    .header
-                    .scope_vtable
-                    .store(None, Ordering::Release);
-            }
-        }
-    };
-}
-
 pub trait TaskJoinGate<T> {
     fn take_result_erased(&self) -> Option<Result<T, TaskError>>;
 }
@@ -416,7 +376,6 @@ impl<T, S: Task<T>> TaskJoinGate<T> for S {
 }
 
 pub(crate) use impl_raw_task_common;
-pub(crate) use impl_task_typed_common;
 
 // --- 实用工具与宏 (Public API) ---
 

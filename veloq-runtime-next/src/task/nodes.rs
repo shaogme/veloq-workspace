@@ -1,7 +1,7 @@
 use crate::task::{
     GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, IntoAnyScope, LOCAL_INTRUSIVE_WAKER_VTABLE,
-    LocalTaskRef, RawTask, ScopeCompletionRef, SendTaskRef, Task, TaskError, TaskLock, TaskVTable,
-    impl_raw_task_common, impl_task_typed_common,
+    LocalTaskRef, RawTask, ScopeCompletionRef, SendTaskRef, Task, TaskError, TaskLock,
+    TaskResultSetter, TaskVTable, impl_raw_task_common, poll_task_internal,
 };
 use crate::utils::storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage,
@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
-use std::task::RawWakerVTable;
+use std::task::{Context, RawWakerVTable};
 
 /// 任务存储特性，用于统一本地和发送任务的存储行为。
 pub trait TaskStorage: Storage + Sized + 'static
@@ -60,17 +60,21 @@ where
 {
 }
 
-/// 通用的任务节点实现。
-/// 通过 `S: TaskStorage` 统一了 `LocalStorage` (Local) 和 `AtomicStorage` (Send)。
-/// 通过 `F` 统一了栈上任务 (Pin<&mut F>) 和堆上任务 (F)。
+/// 任务状态枚举，合并了运行中的 Future 和完成后的 Result。
+/// 这种设计减少了锁的层数，并允许 Future 和 Result 共享内存空间。
+pub enum TaskState<T, F> {
+    Running(F),
+    Done(Result<T, TaskError>),
+    Empty,
+}
+
 #[repr(C)]
 pub struct GenericTaskNode<'scope, S: TaskStorage, T, F>
 where
     ScopeCompletionRef<S>: IntoAnyScope,
 {
     header: GenericTaskHeader<S>,
-    future: S::Lock<F>,
-    result: S::Lock<Option<Result<T, TaskError>>>,
+    state: S::Lock<TaskState<T, F>>,
     _marker: std::marker::PhantomData<&'scope ()>,
 }
 
@@ -80,7 +84,8 @@ where
     F: Future<Output = T>,
     ScopeCompletionRef<S>: IntoAnyScope,
 {
-    const VTABLE: TaskVTable<S> = TaskVTable {
+    /// 优化 VTable 的定义，确保其作为静态引用在编译期完全内联。
+    const VTABLE: &'static TaskVTable<S> = &TaskVTable {
         wake: |data| unsafe {
             let header = data.as_ref();
             if let Some(runtime) = header.runtime_shared() {
@@ -103,11 +108,22 @@ where
 
     pub fn new(future: F) -> Self {
         Self {
-            header: GenericTaskHeader::new(&Self::VTABLE),
-            future: S::Lock::new(future),
-            result: S::Lock::new(None),
+            header: GenericTaskHeader::new(Self::VTABLE),
+            state: S::Lock::new(TaskState::Running(future)),
             _marker: std::marker::PhantomData,
         }
+    }
+}
+
+impl<'scope, S: TaskStorage, T, F> TaskResultSetter<T> for GenericTaskNode<'scope, S, T, F>
+where
+    S: TaskBounds<T, F>,
+    F: Future<Output = T>,
+    ScopeCompletionRef<S>: IntoAnyScope,
+{
+    #[inline]
+    fn set_result(&self, res: Result<T, TaskError>) {
+        self.state.lock_mut(|s| *s = TaskState::Done(res));
     }
 }
 
@@ -126,13 +142,59 @@ where
     F: Future<Output = T>,
     ScopeCompletionRef<S>: IntoAnyScope,
 {
-    impl_task_typed_common!(
-        self,
-        cx,
-        self.future
-            .lock_mut(|f| unsafe { std::pin::Pin::new_unchecked(f) }.poll(cx)),
-        S::IS_LOCAL
-    );
+    fn poll_task(&self, cx: &mut Context<'_>) -> bool {
+        poll_task_internal(
+            &self.header,
+            self,
+            cx,
+            |cx| {
+                self.state.lock_mut(|s| {
+                    if let TaskState::Running(f) = s {
+                        unsafe { Pin::new_unchecked(f) }.poll(cx)
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+            },
+            S::IS_LOCAL,
+        )
+    }
+
+    fn take_result(&self) -> Option<Result<T, TaskError>> {
+        self.state.lock_mut(|s| {
+            if let TaskState::Done(_) = s {
+                if let TaskState::Done(res) = std::mem::replace(s, TaskState::Empty) {
+                    return Some(res);
+                }
+            }
+            None
+        })
+    }
+
+    fn set_scope_completion<
+        SS: crate::utils::storage::Storage,
+        O: crate::utils::ownership::Ownership,
+    >(
+        &self,
+        scope: Option<
+            <O as crate::utils::ownership::Ownership>::Shared<
+                crate::scope::GenericScopeCompletion<SS, O>,
+            >,
+        >,
+    ) {
+        if let Some(scope) = scope {
+            let scope_ref = crate::task::ScopeCompletionRef::new::<O>(&scope);
+            let (ptr, vtable) = scope_ref.into_parts();
+            self.header.scope_ptr.store(Some(ptr), Ordering::Release);
+            self.header.scope_vtable.store(
+                Some(NonNull::new(vtable as *const _ as *mut _).unwrap()),
+                Ordering::Release,
+            );
+        } else {
+            self.header.scope_ptr.store(None, Ordering::Release);
+            self.header.scope_vtable.store(None, Ordering::Release);
+        }
+    }
 }
 
 /// 栈上本地任务：future 本身不进行任何堆分配。
