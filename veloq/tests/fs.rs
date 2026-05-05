@@ -1,13 +1,11 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::path::PathBuf;
 use veloq::fs::{File, LocalFile};
 use veloq::io::{AsyncBufRead, AsyncBufWrite};
 use veloq::runtime::{Runtime, context};
-use veloq_blocking::{BlockingPoolConfig, init_blocking_pool};
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 use veloq_runtime_next::scope;
 
@@ -31,13 +29,7 @@ impl Drop for CleanupGuard {
     }
 }
 
-static BLOCKING_POOL_INIT: Once = Once::new();
-
 fn create_runtime() -> Runtime<UniformSlot> {
-    BLOCKING_POOL_INIT.call_once(|| {
-        init_blocking_pool(BlockingPoolConfig::default());
-    });
-
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
         .worker_count(NonZeroUsize::new(1).expect("1 is non-zero"))
         .build()
