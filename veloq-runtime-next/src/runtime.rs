@@ -24,8 +24,8 @@ pub use primitives::{
 
 pub(crate) use context::with_current_runtime;
 pub use context::{
-    RuntimeContext, WorkerInitContext, clear_current_runtime_context, clear_worker_idle_hook,
-    current_worker_id, set_current_runtime_context, set_worker_idle_hook,
+    IdleHook, RuntimeContext, WorkerInitContext, clear_current_runtime_context, current_worker_id,
+    set_current_runtime_context,
 };
 pub(crate) use shared::RuntimeShared;
 
@@ -43,6 +43,7 @@ pub struct Runtime<I = NoopWorkerInit> {
     remote_receivers: Vec<Receiver<SendTaskRef>>,
     worker_count: NonZeroUsize,
     worker_init: Option<I>,
+    idle_hook: Option<IdleHook>,
 }
 
 impl Runtime<NoopWorkerInit> {
@@ -76,6 +77,7 @@ where
             remote_receivers,
             worker_count,
             worker_init,
+            idle_hook,
         } = self;
         let worker_init = worker_init.expect("worker init missing");
         shared.shutdown.store(false, Ordering::Release);
@@ -119,6 +121,7 @@ where
                         local_rx: lrx,
                         remote_rx: rrx,
                         rand: RefCell::new(FastRand::new(worker_id as u64)),
+                        idle_hook,
                     });
                     let _clear_context = ClearContext;
 
@@ -141,6 +144,7 @@ where
                 local_rx: lrx0,
                 remote_rx: rrx0,
                 rand: RefCell::new(FastRand::new(0)),
+                idle_hook,
             });
             let _clear_context = ClearContext;
 
@@ -174,6 +178,7 @@ pub struct RuntimeBuilder<I> {
     worker_count: Option<NonZeroUsize>,
     worker_init: Option<I>,
     queue_capacity: NonZeroUsize,
+    idle_hook: Option<IdleHook>,
 }
 
 impl Default for RuntimeBuilder<NoopWorkerInit> {
@@ -182,6 +187,7 @@ impl Default for RuntimeBuilder<NoopWorkerInit> {
             worker_count: None,
             worker_init: Some(noop_worker_init),
             queue_capacity: NonZeroUsize::new(1024).unwrap(),
+            idle_hook: None,
         }
     }
 }
@@ -206,7 +212,13 @@ where
             worker_count: self.worker_count,
             worker_init: Some(worker_init),
             queue_capacity: self.queue_capacity,
+            idle_hook: self.idle_hook,
         }
+    }
+
+    pub fn idle_hook(mut self, hook: IdleHook) -> Self {
+        self.idle_hook = Some(hook);
+        self
     }
 
     pub fn queue_capacity(mut self, capacity: NonZeroUsize) -> Self {
@@ -228,6 +240,7 @@ where
             remote_receivers,
             worker_count: count,
             worker_init: self.worker_init,
+            idle_hook: self.idle_hook,
         }
     }
 }

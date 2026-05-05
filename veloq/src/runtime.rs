@@ -135,7 +135,6 @@ impl<T: PoolTopology> Runtime<T> {
         struct ClearCurrentContext;
         impl Drop for ClearCurrentContext {
             fn drop(&mut self) {
-                veloq_runtime_next::runtime::clear_worker_idle_hook();
                 context::clear_current_runtime_context();
             }
         }
@@ -166,6 +165,7 @@ impl<T: PoolTopology> Runtime<T> {
         let runtime = async_runtime::Runtime::builder()
             .worker_count(worker_count)
             .queue_capacity(config.get_queue_capacity())
+            .idle_hook(crate::runtime::context::poll_current_driver_nonblocking)
             .with_worker_init(move |worker_ctx: WorkerInitContext| {
                 let topology = topology.clone();
                 let state = state.clone();
@@ -193,9 +193,6 @@ impl<T: PoolTopology> Runtime<T> {
                     context::set_current_runtime_context(context::RuntimeContext::new(
                         driver, buf_pool, config, registrar,
                     ));
-                    veloq_runtime_next::runtime::set_worker_idle_hook(Some(Box::new(|| {
-                        crate::runtime::context::poll_current_driver_nonblocking()
-                    })));
                 }
             })
             .build();
