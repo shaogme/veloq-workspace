@@ -203,21 +203,21 @@ std::thread_local! {
     pub static CURRENT_SCOPE: RefCell<Option<AnyScopeCompletionRef>> = const { RefCell::new(None) };
 }
 
-pub struct ScopeGuard;
+pub struct ScopeGuard {
+    prev: Option<AnyScopeCompletionRef>,
+}
 
 impl ScopeGuard {
     pub fn enter(scope: AnyScopeCompletionRef) -> Self {
-        CURRENT_SCOPE.with(|s| {
-            *s.borrow_mut() = Some(scope);
-        });
-        Self
+        let prev = CURRENT_SCOPE.with(|s| s.replace(Some(scope)));
+        Self { prev }
     }
 }
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
         CURRENT_SCOPE.with(|s| {
-            *s.borrow_mut() = None;
+            s.replace(self.prev.take());
         });
     }
 }

@@ -1,5 +1,6 @@
-use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
+use crate::utils::storage::{AtomicStorage, StateInt, StateLock, StateOptionPtr, Storage};
 use std::alloc::{Layout, alloc, dealloc};
+use std::cell::Cell;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::Ordering;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
@@ -18,11 +19,12 @@ pub trait Arena {
 pub struct GenericArena<S: Storage> {
     // 活跃块，支持快速路径分配
     active_chunk: S::OptionPtr<GenericChunk<S>>,
-    // 所有块的拥有者
-    chunks: S::Lock<Vec<*mut GenericChunk<S>>>,
+    // 所有块的拥有者，使用侵入式链表管理
+    chunks: S::Lock<LinkedList<ChunkAdapter<S>>>,
 }
 
 pub(crate) struct GenericChunk<S: Storage> {
+    link: Link, // 用于 Arena 的 chunks 链表
     ptr: NonNull<u8>,
     layout: Layout,
     // 该块已使用的字节数
@@ -35,19 +37,31 @@ pub(crate) struct GenericChunk<S: Storage> {
 
 pub(crate) struct GenericDropNode<S: Storage> {
     link: Link,
+    data_ptr: *mut u8, // 重排字段以优化对齐
     drop_fn: unsafe fn(*mut u8),
-    data_ptr: *mut u8,
     // 所属的 Chunk，用于回收
     chunk: *const GenericChunk<S>,
 }
 
 intrusive_adapter!(pub(crate) DropAdapter<S> = GenericDropNode<S> { link: Link } where S: Storage);
+intrusive_adapter!(pub(crate) ChunkAdapter<S> = GenericChunk<S> { link: Link } where S: Storage);
+
+// TLB 缓存，专门为 AtomicStorage 设计以减少竞争
+#[derive(Clone, Copy)]
+struct TlbCache {
+    arena_ptr: *const (),
+    chunk: NonNull<GenericChunk<AtomicStorage>>,
+}
+
+thread_local! {
+    static ATOMIC_TLB: Cell<Option<TlbCache>> = const { Cell::new(None) };
+}
 
 impl<S: Storage> GenericArena<S> {
     pub fn new() -> Self {
         Self {
             active_chunk: S::OptionPtr::new(None),
-            chunks: S::Lock::new(Vec::new()),
+            chunks: S::Lock::new(LinkedList::new(ChunkAdapter::<S>::new())),
         }
     }
 }
@@ -64,12 +78,11 @@ impl<S: Storage> GenericArena<S> {
     /// The caller must ensure that `drop_fn` is valid.
     pub unsafe fn alloc<T>(&self, layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>) -> *mut u8 {
         // 1. 如果有析构函数，需要额外分配 DropNode 空间
-        let (total_layout, is_drop) = if drop_fn.is_some() {
+        let (total_layout, offset) = if drop_fn.is_some() {
             let node_layout = Layout::new::<GenericDropNode<S>>();
-            let (extended, _) = node_layout.extend(layout).expect("Layout overflow");
-            (extended.pad_to_align(), true)
+            node_layout.extend(layout).expect("Layout overflow")
         } else {
-            (layout, false)
+            (layout, 0)
         };
 
         // 2. 尝试快速分配
@@ -88,14 +101,9 @@ impl<S: Storage> GenericArena<S> {
         }
 
         // 5. 如果需要销毁，初始化 DropNode 并压入块内链表
-        if is_drop {
+        if drop_fn.is_some() {
             let node_ptr = ptr as *mut GenericDropNode<S>;
-            // 计算数据指针：在 DropNode 之后，且满足对齐要求
-            let data_offset = Layout::new::<GenericDropNode<S>>()
-                .extend(layout)
-                .unwrap()
-                .1;
-            let data_ptr = unsafe { ptr.add(data_offset) };
+            let data_ptr = unsafe { ptr.add(offset) };
 
             unsafe {
                 ptr::write(
@@ -123,8 +131,8 @@ impl<S: Storage> GenericArena<S> {
     pub unsafe fn drop_object<T>(&self, data_ptr: *mut T, layout: Layout) {
         // 1. 计算 DropNode 的位置
         let node_layout = Layout::new::<GenericDropNode<S>>();
-        let data_offset = node_layout.extend(layout).unwrap().1;
-        let node_ptr = unsafe { (data_ptr as *mut u8).sub(data_offset) as *mut GenericDropNode<S> };
+        let offset = node_layout.extend(layout).unwrap().1;
+        let node_ptr = unsafe { (data_ptr as *mut u8).sub(offset) as *mut GenericDropNode<S> };
 
         // 2. 执行析构
         let drop_fn = unsafe { (*node_ptr).drop_fn };
@@ -142,7 +150,6 @@ impl<S: Storage> GenericArena<S> {
         }
 
         // 3. 减少计数并检查回收
-        let chunk_ptr = unsafe { (*node_ptr).chunk as *mut GenericChunk<S> };
         if unsafe { (*chunk_ptr).active_count.fetch_sub(1, Ordering::AcqRel) == 1 } {
             self.reclaim_chunk(chunk_ptr);
         }
@@ -157,10 +164,22 @@ impl<S: Storage> GenericArena<S> {
             Ordering::Acquire,
         );
 
+        // 如果是 AtomicStorage，尝试从当前线程 TLB 中移除
+        if S::strategy_id() == AtomicStorage::strategy_id() {
+            ATOMIC_TLB.with(|tlb| {
+                if let Some(cache) = tlb.get()
+                    && cache.chunk.as_ptr() == chunk_ptr as *mut _
+                {
+                    tlb.set(None);
+                }
+            });
+        }
+
         let mut chunks = self.chunks.lock();
-        if let Some(pos) = chunks.iter().position(|&p| p == chunk_ptr) {
-            chunks.remove(pos);
-            unsafe {
+        unsafe {
+            let mut cursor = chunks.cursor_mut_from_ptr(NonNull::new_unchecked(chunk_ptr));
+            if cursor.get_raw().is_some() {
+                cursor.remove();
                 let chunk = Box::from_raw(chunk_ptr);
                 dealloc(chunk.ptr.as_ptr(), chunk.layout);
             }
@@ -169,9 +188,30 @@ impl<S: Storage> GenericArena<S> {
 
     #[inline]
     fn try_alloc_fast(&self, layout: Layout) -> Option<(*mut u8, *mut GenericChunk<S>)> {
+        // 针对 AtomicStorage，优先尝试 TLB
+        if S::strategy_id() == AtomicStorage::strategy_id() {
+            if let Some(cache) = ATOMIC_TLB.with(|tlb| tlb.get())
+                && cache.arena_ptr == self as *const _ as *const ()
+            {
+                let p = unsafe { cache.chunk.as_ref().try_alloc(layout) };
+                if !p.is_null() {
+                    return Some((p, cache.chunk.as_ptr() as *mut _));
+                }
+            }
+        }
+
         if let Some(chunk_ptr) = self.active_chunk.load(Ordering::Acquire) {
             let p = unsafe { chunk_ptr.as_ref().try_alloc(layout) };
             if !p.is_null() {
+                // 如果是 AtomicStorage，更新 TLB
+                if S::strategy_id() == AtomicStorage::strategy_id() {
+                    ATOMIC_TLB.with(|tlb| {
+                        tlb.set(Some(TlbCache {
+                            arena_ptr: self as *const _ as *const (),
+                            chunk: unsafe { NonNull::new_unchecked(chunk_ptr.as_ptr() as *mut _) },
+                        }));
+                    });
+                }
                 return Some((p, chunk_ptr.as_ptr()));
             }
         }
@@ -197,6 +237,7 @@ impl<S: Storage> GenericArena<S> {
         }
 
         let new_chunk = Box::new(GenericChunk {
+            link: Link::new(),
             ptr: NonNull::new(ptr).unwrap(),
             layout: new_chunk_layout,
             used: S::Usize::new(0),
@@ -209,7 +250,9 @@ impl<S: Storage> GenericArena<S> {
 
         {
             let mut chunks = self.chunks.lock();
-            chunks.push(chunk_ptr);
+            unsafe {
+                chunks.push_back(std::pin::Pin::new_unchecked(&mut *chunk_ptr));
+            }
         }
 
         // 更新活跃块指针
@@ -270,11 +313,13 @@ impl<S: Storage> GenericChunk<S> {
 impl<S: Storage> Drop for GenericArena<S> {
     fn drop(&mut self) {
         let mut chunks = self.chunks.lock();
-        while let Some(chunk_ptr) = chunks.pop() {
+        while let Some(chunk_pin) = chunks.pop_front() {
             unsafe {
+                let chunk_ptr = chunk_pin.get_unchecked_mut() as *mut GenericChunk<S>;
                 let chunk = Box::from_raw(chunk_ptr);
                 let mut drop_head = chunk.drop_head.lock();
-                while let Some(node) = drop_head.pop_front() {
+                while let Some(node_pin) = drop_head.pop_front() {
+                    let node = node_pin.get_unchecked_mut();
                     (node.drop_fn)(node.data_ptr);
                 }
                 dealloc(chunk.ptr.as_ptr(), chunk.layout);
