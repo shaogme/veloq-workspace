@@ -195,7 +195,6 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
             ptr: task as *const TTask as *const (),
             take_result: take_result_of::<T, TTask>,
             scope: self,
-            _marker: std::marker::PhantomData,
             cancel_token: new_cancel_slot::<S, O>(),
             waker_node: None,
             reclaim: None,
@@ -235,7 +234,6 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
             ptr: node_ptr as *const (),
             take_result: take_result_of::<T, LocalBoxedTaskNode<'scope, T, F>>,
             scope: self,
-            _marker: std::marker::PhantomData,
             cancel_token: new_cancel_slot::<S, O>(),
             waker_node: None,
             reclaim: Some(|arena, ptr| unsafe {
@@ -295,7 +293,6 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
             ptr: task as *const S as *const (),
             take_result: take_result_of::<T, S>,
             scope: self,
-            _marker: std::marker::PhantomData,
             cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
             waker_node: None,
             reclaim: None,
@@ -351,7 +348,6 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
             ptr: node_ptr as *const (),
             take_result: take_result_of::<T, SendBoxedTaskNode<'scope, T, F>>,
             scope: self,
-            _marker: std::marker::PhantomData,
             cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
             waker_node: None,
             reclaim: None,
@@ -397,20 +393,23 @@ pub struct JoinHandle<
     'scope_ref,
     T,
     R: TaskHandleRef,
-    S: ScopeProvider<'scope> = AsyncScope<'scope>,
+    S: ScopeProvider<'scope>,
 > {
     pub(crate) task: R,
     pub(crate) ptr: *const (),
     pub(crate) take_result: unsafe fn(*const ()) -> Option<Result<T, TaskError>>,
     pub(crate) scope: &'scope_ref S,
-    pub(crate) _marker: std::marker::PhantomData<T>,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<NonNull<GenericWakerNode<R::Storage>>>,
     pub(crate) reclaim: Option<unsafe fn(&S::Arena, *const ())>,
 }
 
-pub type LocalJoinHandle<'scope, 'scope_ref, T> = JoinHandle<'scope, 'scope_ref, T, LocalTaskRef>;
-pub type SendJoinHandle<'scope, 'scope_ref, T> = JoinHandle<'scope, 'scope_ref, T, SendTaskRef>;
+pub type LocalJoinHandle<'scope, 'scope_ref, T> =
+    JoinHandle<'scope, 'scope_ref, T, LocalTaskRef, AsyncScope<'scope>>;
+pub type SendJoinHandle<'scope, 'scope_ref, T> =
+    JoinHandle<'scope, 'scope_ref, T, SendTaskRef, AsyncScope<'scope>>;
+pub type LocalAsyncJoinHandle<'scope, 'scope_ref, T> =
+    JoinHandle<'scope, 'scope_ref, T, LocalTaskRef, LocalAsyncScope<'scope>>;
 
 impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>>
     JoinHandle<'scope, 'scope_ref, T, R, S>
