@@ -122,7 +122,10 @@ where
 
                     let init_ctx = WorkerInitContext::new(worker_id, worker_count);
                     let init_fut = std::pin::pin!(worker_init(init_ctx));
-                    runtime.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(None, Some(init_fut));
+                    runtime.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(
+                        None,
+                        Some(init_fut),
+                    );
                 });
             }
 

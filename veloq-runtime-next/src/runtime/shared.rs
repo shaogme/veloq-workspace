@@ -5,16 +5,16 @@ use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::Storage;
 use crate::utils::{AtomicOptionPtr, Deque, Steal};
-use veloq_sync::mpmc::{self, Receiver as MpmcReceiver, Sender as MpmcSender};
+use std::future::Future;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::task::{Context, Poll};
 use std::time::Duration;
+use veloq_sync::mpmc::{self, Receiver as MpmcReceiver, Sender as MpmcSender};
 
 pub(crate) struct WorkerQueue {
     pub(crate) local_tx: Sender<LocalTaskRef>,
@@ -249,7 +249,10 @@ impl TaskScheduler {
                 if victim == thief_id {
                     continue;
                 }
-                match registry.workers[victim].deque.steal_batch(&thief_worker.deque) {
+                match registry.workers[victim]
+                    .deque
+                    .steal_batch(&thief_worker.deque)
+                {
                     Steal::Success(task) => return Some(task),
                     Steal::Retry => return self.steal_send(thief_id, registry, topo),
                     Steal::Empty => continue,
@@ -275,7 +278,10 @@ impl TaskScheduler {
             }
             let other_group = &topo.groups[other_group_idx];
             for &victim in &other_group.worker_ids {
-                match registry.workers[victim].deque.steal_batch(&thief_worker.deque) {
+                match registry.workers[victim]
+                    .deque
+                    .steal_batch(&thief_worker.deque)
+                {
                     Steal::Success(task) => return Some(task),
                     Steal::Retry => return self.steal_send(thief_id, registry, topo),
                     Steal::Empty => continue,
@@ -403,7 +409,8 @@ impl RuntimeShared {
 
     #[inline]
     pub fn worker_count(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.registry.workers.len()).expect("runtime must have at least one worker")
+        NonZeroUsize::new(self.registry.workers.len())
+            .expect("runtime must have at least one worker")
     }
 
     pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
@@ -511,7 +518,8 @@ impl RuntimeShared {
     }
 
     fn steal_send(&self, thief_id: usize) -> Option<SendTaskRef> {
-        self.scheduler.steal_send(thief_id, &self.registry, &self.topo)
+        self.scheduler
+            .steal_send(thief_id, &self.registry, &self.topo)
     }
 
     fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
@@ -544,6 +552,20 @@ impl RuntimeShared {
         mut init_fut: Option<Pin<&mut F>>,
     ) {
         let worker_id = current_worker_id();
+
+        if let Some(fut) = init_fut.as_mut() {
+            use std::task::{Context, Poll};
+            let signal = Arc::new(primitives::Signal::new(false));
+            let waker = primitives::create_waker(signal.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = fut.as_mut();
+            loop {
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(()) => break,
+                    Poll::Pending => signal.wait(),
+                }
+            }
+        }
 
         CONTEXT.with(|ctx| {
             let ctx = ctx.borrow();
@@ -608,7 +630,9 @@ impl RuntimeShared {
                     continue;
                 }
 
-                self.scheduler.searching_workers.fetch_add(1, Ordering::Relaxed);
+                self.scheduler
+                    .searching_workers
+                    .fetch_add(1, Ordering::Relaxed);
                 for _ in 0..4 {
                     if let Some(task) = self.steal_send(worker_id) {
                         self.poll_send_task(worker_id, task);
@@ -622,7 +646,9 @@ impl RuntimeShared {
                     }
                     std::hint::spin_loop();
                 }
-                self.scheduler.searching_workers.fetch_sub(1, Ordering::Relaxed);
+                self.scheduler
+                    .searching_workers
+                    .fetch_sub(1, Ordering::Relaxed);
 
                 if progressed {
                     continue;
@@ -684,7 +710,9 @@ impl RuntimeShared {
                     parker.park();
                 }
 
-                let _ = self.topo.groups[group_idx].idle_stack.pop(&self.topo.next_idle);
+                let _ = self.topo.groups[group_idx]
+                    .idle_stack
+                    .pop(&self.topo.next_idle);
                 self.idle.idle_mask.clear(worker_id);
             }
         });
