@@ -61,7 +61,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build
 
       - name: Run tests (Linux)
         if: runner.os == 'Linux'

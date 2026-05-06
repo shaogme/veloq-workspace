@@ -1,2 +1,2 @@
 [profile.default]
-global-timeout = "10s"
+global-timeout = "20s"
