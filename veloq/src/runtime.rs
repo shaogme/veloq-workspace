@@ -1,6 +1,6 @@
 pub mod context;
 
-pub use veloq_runtime_next::{scope, scope_local};
+pub use veloq_runtime::{scope, scope_local};
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -11,7 +11,7 @@ use std::sync::{Arc, mpsc};
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
 use veloq_driver::driver::{Driver, PlatformDriver};
-use veloq_runtime_next::runtime::{self as async_runtime, WorkerInitContext};
+use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
 
 use crate::config::Config;
 use crate::runtime::context::{DriverRegistrar, RegistrarMessage};

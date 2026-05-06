@@ -7,7 +7,7 @@ use veloq::fs::{File, LocalFile};
 use veloq::io::{AsyncBufRead, AsyncBufWrite};
 use veloq::runtime::{Runtime, context};
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
-use veloq_runtime_next::scope;
+use veloq_runtime::scope;
 
 struct CleanupGuard(PathBuf);
 

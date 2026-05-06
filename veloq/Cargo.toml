@@ -16,13 +16,14 @@ default = []
 test-hooks = ["veloq-driver/test-hooks"]
 
 [dependencies]
-veloq-runtime-next.workspace = true
+veloq-runtime.workspace = true
 veloq-buf.workspace = true
 veloq-driver.workspace = true
 veloq-blocking.workspace = true
 veloq-sync.workspace = true
 veloq-local.workspace = true
 error-stack.workspace = true
+tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

@@ -58,6 +58,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
         }
 
         if let Some(ctx) = crate::runtime::context::try_current() {
+            ctx.registrar().sync_to_driver();
             let driver = ctx.driver();
             return driver
                 .borrow_mut()

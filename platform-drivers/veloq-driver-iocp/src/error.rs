@@ -72,6 +72,11 @@ where
     let os_code = error_ref
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error);
-    let diag = IocpDiag::new(scope).with_error_detail(os_code, error.to_string());
+    let message = if error_ref.is::<Report<IocpError>>() {
+        "IOCP report".to_string()
+    } else {
+        error.to_string()
+    };
+    let diag = IocpDiag::new(scope).with_error_detail(os_code, message);
     Report::new(context).attach(diag)
 }

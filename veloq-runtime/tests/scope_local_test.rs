@@ -1,5 +1,5 @@
-use veloq_runtime_next::runtime::Runtime;
-use veloq_runtime_next::{scope_local, task_local};
+use veloq_runtime::runtime::Runtime;
+use veloq_runtime::{scope_local, task_local};
 
 #[test]
 fn test_scope_local_basic() {

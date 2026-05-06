@@ -170,6 +170,16 @@ submit_raw_io_op!(
 // Blocking File Operations
 // ============================================================================
 
+fn make_blocking_completion(ctx: &SubmitContext<'_>, user_data: usize) -> CompletionInfo {
+    CompletionInfo {
+        port: ctx.port.as_raw() as usize,
+        user_data,
+        overlapped: ctx.overlapped as usize,
+        store_result: crate::ops::overlapped::store_blocking_result,
+        clear_result: crate::ops::overlapped::clear_blocking_result,
+    }
+}
+
 /// # Safety
 ///
 /// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
@@ -183,12 +193,7 @@ pub(crate) fn submit_open(
     let path_ptr = user.path.as_slice().as_ptr() as usize;
 
     let user_data = header.user_data;
-
-    let completion = CompletionInfo {
-        port: ctx.port.as_raw() as usize,
-        user_data,
-        overlapped: ctx.overlapped as usize,
-    };
+    let completion = make_blocking_completion(ctx, user_data);
 
     let op = BlockingOps::Open {
         path_ptr,
@@ -213,12 +218,7 @@ pub(crate) fn submit_close(
     header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
 
     let user_data = header.user_data;
-
-    let completion = CompletionInfo {
-        port: ctx.port.as_raw() as usize,
-        user_data,
-        overlapped: ctx.overlapped as usize,
-    };
+    let completion = make_blocking_completion(ctx, user_data);
 
     let op = BlockingOps::Close {
         handle: handle.raw().as_handle() as usize,
@@ -241,12 +241,7 @@ pub(crate) fn submit_fsync(
     header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
 
     let user_data = header.user_data;
-
-    let completion = CompletionInfo {
-        port: ctx.port.as_raw() as usize,
-        user_data,
-        overlapped: ctx.overlapped as usize,
-    };
+    let completion = make_blocking_completion(ctx, user_data);
 
     let op = BlockingOps::Fsync {
         handle: handle.raw().as_handle() as usize,
@@ -266,12 +261,7 @@ pub(crate) fn submit_fsync_raw(
     let handle = raw_handle.borrow();
 
     let user_data = header.user_data;
-
-    let completion = CompletionInfo {
-        port: ctx.port.as_raw() as usize,
-        user_data,
-        overlapped: ctx.overlapped as usize,
-    };
+    let completion = make_blocking_completion(ctx, user_data);
 
     let op = BlockingOps::Fsync {
         handle: handle.raw().as_handle() as usize,
@@ -294,12 +284,7 @@ pub(crate) fn submit_sync_range(
     header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
 
     let user_data = header.user_data;
-
-    let completion = CompletionInfo {
-        port: ctx.port.as_raw() as usize,
-        user_data,
-        overlapped: ctx.overlapped as usize,
-    };
+    let completion = make_blocking_completion(ctx, user_data);
 
     let op = BlockingOps::SyncFileRange {
         handle: handle.raw().as_handle() as usize,
@@ -319,12 +304,7 @@ pub(crate) fn submit_sync_range_raw(
     let handle = raw_handle.borrow();
 
     let user_data = header.user_data;
-
-    let completion = CompletionInfo {
-        port: ctx.port.as_raw() as usize,
-        user_data,
-        overlapped: ctx.overlapped as usize,
-    };
+    let completion = make_blocking_completion(ctx, user_data);
 
     let op = BlockingOps::SyncFileRange {
         handle: handle.raw().as_handle() as usize,
@@ -347,12 +327,7 @@ pub(crate) fn submit_fallocate(
     header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
 
     let user_data = header.user_data;
-
-    let completion = CompletionInfo {
-        port: ctx.port.as_raw() as usize,
-        user_data,
-        overlapped: ctx.overlapped as usize,
-    };
+    let completion = make_blocking_completion(ctx, user_data);
 
     let op = BlockingOps::Fallocate {
         handle: handle.raw().as_handle() as usize,
@@ -375,12 +350,7 @@ pub(crate) fn submit_fallocate_raw(
     let handle = raw_handle.borrow();
 
     let user_data = header.user_data;
-
-    let completion = CompletionInfo {
-        port: ctx.port.as_raw() as usize,
-        user_data,
-        overlapped: ctx.overlapped as usize,
-    };
+    let completion = make_blocking_completion(ctx, user_data);
 
     let op = BlockingOps::Fallocate {
         handle: handle.raw().as_handle() as usize,

@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn driver_err(err: error_stack::Report<veloq_driver::error::DriverErrorKind>) -> io::Error {
-    io::Error::other(format!("{err:#}"))
+    io::Error::other(err.current_context().to_string())
 }
 
 #[cfg(not(unix))]

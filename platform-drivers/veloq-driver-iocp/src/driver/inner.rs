@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crossbeam_queue::SegQueue;
-use tracing::{debug, trace};
+use tracing::debug;
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
@@ -146,7 +146,6 @@ impl IocpDriver {
         self.drain_cancel_requests();
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
-        trace!(wait_ms, "Entering GetQueuedCompletionStatus");
         let status = self.port.get_status(wait_ms);
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_timer_poll);
@@ -185,10 +184,8 @@ impl IocpDriver {
 
                 if user_data == WAKEUP_USER_DATA {
                     self.is_notified.store(false, Ordering::Release);
-                    trace!("Wakeup received");
                     return Ok(());
                 }
-                trace!(user_data, bytes, "CQE received");
                 self.process_completion(user_data, success, error_code, bytes);
             }
             crate::win32::CompletionStatus::Timeout => {}
@@ -409,6 +406,19 @@ impl IocpDriver {
                     io_result = res.map_err(|e| {
                         from_io_error(IocpError::Win32, "iocp.driver.inner.blocking_completion", e)
                     });
+                } else if matches!(
+                    &iocp_op.payload,
+                    crate::ops::IocpOpPayload::Open(_)
+                        | crate::ops::IocpOpPayload::Close(_)
+                        | crate::ops::IocpOpPayload::Fsync(_)
+                        | crate::ops::IocpOpPayload::FsyncRaw(_)
+                        | crate::ops::IocpOpPayload::SyncRange(_)
+                        | crate::ops::IocpOpPayload::SyncRangeRaw(_)
+                        | crate::ops::IocpOpPayload::Fallocate(_)
+                        | crate::ops::IocpOpPayload::FallocateRaw(_)
+                ) {
+                    io_result = Err(error_stack::Report::new(IocpError::CompletionWait)
+                        .attach("missing blocking result for offloaded file completion"));
                 } else if let Ok(val) = io_result {
                     io_result = iocp_op.on_complete(val, &self.extensions).map_err(|e| {
                         error_stack::Report::new(IocpError::CompletionWait).attach(format!("{e:#}"))
@@ -496,7 +506,6 @@ impl IocpDriver {
             return;
         }
 
-        trace!(user_data, "Cancelling op");
         let emit_ctx = EmitContext {
             completion_events: &self.completion_events,
             completion_table: &self.completion_table,
@@ -514,7 +523,11 @@ impl IocpDriver {
 
         let state = self.ops.slot_view(user_data);
         match state {
-            Some(SlotView::InFlightOrphaned(_)) => {}
+            Some(SlotView::InFlightOrphaned(_)) => {
+                if self.shutting_down {
+                    Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
+                }
+            }
             Some(SlotView::InFlightWaiting(_)) => {
                 let ctx = CancelContext {
                     registered_files: &self.registered_files,

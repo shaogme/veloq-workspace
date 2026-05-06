@@ -1,13 +1,13 @@
-use veloq_runtime_next::runtime::Runtime;
-use veloq_runtime_next::task::yield_now;
-use veloq_runtime_next::{scope, task, task_local};
+use veloq_runtime::runtime::Runtime;
+use veloq_runtime::task::yield_now;
+use veloq_runtime::{scope, task, task_local};
 
 // --- 测试用例 ---
 
 async fn work(id: String, steps: u32) -> String {
     for i in 1..=steps {
         yield_now().await;
-        let worker_id = veloq_runtime_next::runtime::current_worker_id();
+        let worker_id = veloq_runtime::runtime::current_worker_id();
         println!(
             "  [Worker {}] [任务 {}] 进度 {}/{}",
             worker_id, id, i, steps
@@ -65,7 +65,7 @@ fn main() {
                 let h1 = explicit_cancel_scope.spawn_boxed(async {
                     for i in 1..=10 {
                         yield_now().await;
-                        let worker_id = veloq_runtime_next::runtime::current_worker_id();
+                        let worker_id = veloq_runtime::runtime::current_worker_id();
                         println!("    [Worker {}] [手动取消任务] 进度 {}", worker_id, i);
                     }
                 });
@@ -77,7 +77,7 @@ fn main() {
                 h1.cancel();
 
                 match h1.await {
-                    Err(veloq_runtime_next::task::TaskError::Cancelled) => {
+                    Err(veloq_runtime::task::TaskError::Cancelled) => {
                         println!("    >> 确认：任务已被手动取消")
                     }
                     other => println!("    >> 错误：意外的返回结果 {:?}", other),
@@ -90,13 +90,13 @@ fn main() {
                 let token = async_notify_scope.cancel_token().child();
                 let token_clone = token.clone();
                 let h = async_notify_scope.spawn_boxed(async move {
-                    let worker_id = veloq_runtime_next::runtime::current_worker_id();
+                    let worker_id = veloq_runtime::runtime::current_worker_id();
                     println!(
                         "    [Worker {}] [异步监听任务] 正在等待取消信号...",
                         worker_id
                     );
                     token_clone.cancelled().await;
-                    let worker_id = veloq_runtime_next::runtime::current_worker_id();
+                    let worker_id = veloq_runtime::runtime::current_worker_id();
                     println!(
                         "    [Worker {}] [异步监听任务] 收到取消信号！正在清理资源...",
                         worker_id
@@ -119,7 +119,7 @@ fn main() {
                 let h = lazy_token_scope.spawn_boxed(async {
                     yield_now().await;
                     yield_now().await;
-                    let worker_id = veloq_runtime_next::runtime::current_worker_id();
+                    let worker_id = veloq_runtime::runtime::current_worker_id();
                     println!("    [Worker {}] [延迟令牌任务] 任务运行中...", worker_id);
                 });
 
@@ -128,7 +128,7 @@ fn main() {
 
                 lazy_token_scope.spawn_boxed(async move {
                     token_clone.cancelled().await;
-                    let worker_id = veloq_runtime_next::runtime::current_worker_id();
+                    let worker_id = veloq_runtime::runtime::current_worker_id();
                     println!("    [Worker {}] [监听器] 检测到任务令牌被取消", worker_id);
                 });
 
@@ -145,7 +145,7 @@ fn main() {
                 let mut handles = Vec::new();
                 for i in 1..=3 {
                     let h = target_scope.spawn_boxed_to(1, async move {
-                        let worker_id = veloq_runtime_next::runtime::current_worker_id();
+                        let worker_id = veloq_runtime::runtime::current_worker_id();
                         println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
                     });
                     handles.push(h);

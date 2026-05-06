@@ -45,7 +45,7 @@ impl SocketToken {
             })?;
         Ok(Self {
             fd,
-            owner_worker_id: veloq_runtime_next::runtime::current_worker_id(),
+            owner_worker_id: veloq_runtime::runtime::current_worker_id(),
         })
     }
 
@@ -62,7 +62,7 @@ impl Drop for SocketToken {
         };
 
         debug_assert_eq!(
-            veloq_runtime_next::runtime::current_worker_id(),
+            veloq_runtime::runtime::current_worker_id(),
             self.owner_worker_id
         );
         let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);
@@ -113,7 +113,7 @@ impl<P: SocketTokenPtr> InnerSocket<P> {
     }
 
     pub async fn ensure_affinity(&self) -> io::Result<()> {
-        veloq_runtime_next::task::ensure_current_task_affinity(self.token.owner_worker_id).await;
+        veloq_runtime::task::ensure_current_task_affinity(self.token.owner_worker_id).await;
         Ok(())
     }
 

@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use veloq_runtime_next::runtime::{Runtime, WorkerInitContext, current_worker_id};
+use veloq_runtime::runtime::{Runtime, WorkerInitContext, current_worker_id};
 
 #[test]
 fn worker_init_runs_for_each_worker() {

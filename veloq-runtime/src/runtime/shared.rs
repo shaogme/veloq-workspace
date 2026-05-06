@@ -144,12 +144,6 @@ impl AtomicBitset {
         let bit = index % 64;
         self.bits[word].fetch_and(!(1 << bit), Ordering::Release);
     }
-
-    fn is_set(&self, index: usize) -> bool {
-        let word = index / 64;
-        let bit = index % 64;
-        (self.bits[word].load(Ordering::Acquire) & (1 << bit)) != 0
-    }
 }
 
 pub(crate) struct WorkerRegistry {
@@ -189,23 +183,6 @@ impl TopologyContext {
         }
 
         next_worker.fetch_add(1, Ordering::Relaxed) % n
-    }
-
-    fn pop_idle(&self, preferred_worker_id: usize) -> Option<usize> {
-        let group_idx = self.worker_to_group[preferred_worker_id];
-        if let Some(idle_id) = self.groups[group_idx].idle_stack.pop(&self.next_idle) {
-            return Some(idle_id);
-        }
-
-        for (i, group) in self.groups.iter().enumerate() {
-            if i == group_idx {
-                continue;
-            }
-            if let Some(idle_id) = group.idle_stack.pop(&self.next_idle) {
-                return Some(idle_id);
-            }
-        }
-        None
     }
 }
 
@@ -497,23 +474,7 @@ impl RuntimeShared {
     }
 
     fn notify_work(&self, worker_id: usize) {
-        if self.scheduler.searching_workers.load(Ordering::Acquire) > 0 {
-            return;
-        }
-        self.unpark_worker(worker_id);
-    }
-
-    fn unpark_worker(&self, worker_id: usize) {
-        if self.idle.idle_mask.is_set(worker_id) {
-            self.idle.idle_mask.clear(worker_id);
-            self.registry.unpark(worker_id);
-            return;
-        }
-
-        if let Some(idle_id) = self.topo.pop_idle(worker_id) {
-            self.idle.idle_mask.clear(idle_id);
-            self.registry.unpark(idle_id);
-        }
+        self.registry.unpark(worker_id);
     }
 
     pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
@@ -695,11 +656,6 @@ impl RuntimeShared {
                         progressed = true;
                         break;
                     }
-                    if let Ok(task) = ctx.remote_rx.try_recv() {
-                        self.poll_send_task(worker_id, task);
-                        progressed = true;
-                        break;
-                    }
                     std::hint::spin_loop();
                 }
                 self.scheduler
@@ -710,14 +666,13 @@ impl RuntimeShared {
                     continue;
                 }
 
+                let idle_hint = super::context::run_worker_idle_hook();
                 let seq = self.idle.event_count.load();
                 self.idle.idle_mask.set(worker_id);
                 let group_idx = self.topo.worker_to_group[worker_id];
                 self.topo.groups[group_idx]
                     .idle_stack
                     .push(worker_id, &self.topo.next_idle);
-
-                let idle_hint = super::context::run_worker_idle_hook();
 
                 if self.idle.event_count.load() != seq
                     || self.has_work(worker_id)
@@ -734,17 +689,6 @@ impl RuntimeShared {
                     continue;
                 }
 
-                if let Ok(task) = ctx.remote_rx.try_recv() {
-                    if self.topo.groups[group_idx]
-                        .idle_stack
-                        .pop(&self.topo.next_idle)
-                        .is_some()
-                    {
-                        self.idle.idle_mask.clear(worker_id);
-                    }
-                    self.poll_send_task(worker_id, task);
-                    continue;
-                }
                 if let Some(task) = self.pop_global() {
                     if self.topo.groups[group_idx]
                         .idle_stack

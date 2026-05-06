@@ -1,6 +1,7 @@
 use crate::IocpHandle;
-use crate::error::IocpResult;
+use crate::error::{IocpError, IocpResult, from_io_error};
 use crate::win32::Overlapped;
+use std::io;
 
 /// A wrapper for the Windows OVERLAPPED structure with additional metadata.
 #[repr(C)]
@@ -37,6 +38,28 @@ impl Default for OverlappedEntry {
     fn default() -> Self {
         Self::new(0)
     }
+}
+
+pub(crate) unsafe fn store_blocking_result(overlapped: usize, result: io::Result<usize>) {
+    let overlapped = overlapped as *mut Overlapped;
+    // SAFETY: `OverlappedEntry` is `repr(C)` and `inner` is its first field,
+    // so the overlapped pointer is the same as the struct pointer.
+    let entry = unsafe { &mut *(overlapped as *mut OverlappedEntry) };
+    entry.blocking_result = Some(result.map_err(|e| {
+        from_io_error(
+            IocpError::Win32,
+            "iocp.driver.inner.blocking_completion.store",
+            e,
+        )
+    }));
+}
+
+pub(crate) unsafe fn clear_blocking_result(overlapped: usize) {
+    let overlapped = overlapped as *mut Overlapped;
+    // SAFETY: `OverlappedEntry` is `repr(C)` and `inner` is its first field,
+    // so the overlapped pointer is the same as the struct pointer.
+    let entry = unsafe { &mut *(overlapped as *mut OverlappedEntry) };
+    entry.blocking_result = None;
 }
 
 // SAFETY: OverlappedEntry is safe to send between threads.

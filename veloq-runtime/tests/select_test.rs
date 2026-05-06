@@ -1,8 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use veloq_runtime_next::runtime::Runtime;
-use veloq_runtime_next::select;
+use veloq_runtime::runtime::Runtime;
+use veloq_runtime::select;
 
 struct ReadyFuture<T>(Option<T>);
 impl<T: Unpin + Copy> Future for ReadyFuture<T> {
@@ -94,8 +94,8 @@ fn test_select_three_branches() {
 
 #[test]
 fn test_select_cancellation() {
-    use veloq_runtime_next::scope;
-    use veloq_runtime_next::task::TaskError;
+    use veloq_runtime::scope;
+    use veloq_runtime::task::TaskError;
 
     let rt = Runtime::new();
     rt.block_on(async {

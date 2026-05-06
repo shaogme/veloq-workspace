@@ -187,17 +187,11 @@ where
         detail: impl ToString,
     ) -> DriverResult<T> {
         let detail = detail.to_string();
-        self.map_err(|report| {
-            tracing::error!(
-                kind = %kind,
-                scope = %scope,
-                detail = %detail,
-                report = ?report,
-                "driver error report"
-            );
+        self.map_err(|_report| {
+            tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
             Report::new(kind)
                 .attach(DriverDiag::<i32>::new(scope).with_error_detail(None, detail))
-                .attach(format!("{report:#}"))
+                .attach("driver error report captured")
         })
     }
 }

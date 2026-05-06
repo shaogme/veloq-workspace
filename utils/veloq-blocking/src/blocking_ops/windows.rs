@@ -12,14 +12,8 @@ pub struct CompletionInfo {
     pub port: usize,
     pub user_data: usize,
     pub overlapped: usize,
-}
-
-#[repr(C)]
-pub struct OverlappedEntry {
-    pub inner: OVERLAPPED,
-    pub user_data: usize,
-    pub generation: u32,
-    pub blocking_result: Option<io::Result<usize>>,
+    pub store_result: unsafe fn(usize, io::Result<usize>),
+    pub clear_result: unsafe fn(usize),
 }
 
 impl CompletionInfo {
@@ -27,15 +21,17 @@ impl CompletionInfo {
         if self.overlapped == 0 {
             return;
         }
-        let ptr = self.overlapped as *mut OverlappedEntry;
         unsafe {
-            (*ptr).blocking_result = Some(result);
-            PostQueuedCompletionStatus(
+            (self.store_result)(self.overlapped, result);
+            let posted = PostQueuedCompletionStatus(
                 self.port as HANDLE,
                 0,
                 self.user_data,
-                ptr as *mut OVERLAPPED,
+                self.overlapped as *mut OVERLAPPED,
             );
+            if posted == 0 {
+                (self.clear_result)(self.overlapped);
+            }
         }
     }
 }

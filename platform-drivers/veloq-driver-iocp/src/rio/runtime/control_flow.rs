@@ -206,7 +206,6 @@ impl<'a> RioCompletionRouter<'a> {
         let Some(kind) = RioState::decode_req_ctx(res.RequestContext) else {
             return Ok(());
         };
-
         match kind {
             RioCompletionKind::Pool {
                 actor_key,
@@ -591,7 +590,6 @@ impl RioState {
         );
         loop {
             let count = self.kernel.dequeue(&mut results);
-
             if count == RIO_CORRUPT_CQ {
                 return Err(error_stack::Report::new(RioError::Internal))
                     .attach("RIO completion queue is corrupt (RIO_CORRUPT_CQ)");
@@ -614,7 +612,6 @@ impl RioState {
         if *router.outstanding_count == 0 {
             router.registry.flush_deregs(router.env);
         }
-
         Ok(router.completed_count)
     }
 }

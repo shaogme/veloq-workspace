@@ -283,8 +283,8 @@ where
                 Poll::Ready(output) => Poll::Ready(output),
                 Poll::Pending => {
                     let ctx = current();
-                    ctx.registrar().sync_to_driver();
                     let driver_rc = ctx.driver();
+                    ctx.registrar().sync_to_driver();
                     let mut driver = driver_rc.borrow_mut();
                     driver
                         .submit_queue()
@@ -302,5 +302,5 @@ pub async fn yield_now() {
     if let Some(ctx) = try_current() {
         ctx.registrar().sync_to_driver();
     }
-    veloq_runtime_next::task::yield_now().await;
+    veloq_runtime::task::yield_now().await;
 }

@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use veloq_runtime_next::runtime::Runtime;
-use veloq_runtime_next::runtime::current_worker_id;
-use veloq_runtime_next::scope;
-use veloq_runtime_next::task::{TaskAffinityGuard, with_task_affinity, yield_now};
+use veloq_runtime::runtime::Runtime;
+use veloq_runtime::runtime::current_worker_id;
+use veloq_runtime::scope;
+use veloq_runtime::task::{TaskAffinityGuard, with_task_affinity, yield_now};
 
 struct ManualGateState {
     ready: AtomicBool,

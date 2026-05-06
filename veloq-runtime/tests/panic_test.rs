@@ -1,6 +1,6 @@
-use veloq_runtime_next::runtime::Runtime;
-use veloq_runtime_next::scope;
-use veloq_runtime_next::task::yield_now;
+use veloq_runtime::runtime::Runtime;
+use veloq_runtime::scope;
+use veloq_runtime::task::yield_now;
 
 #[test]
 fn test_panic_propagation() {

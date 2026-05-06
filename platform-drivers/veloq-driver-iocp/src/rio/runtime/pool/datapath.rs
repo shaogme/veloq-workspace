@@ -633,12 +633,13 @@ impl UdpRecvPool {
     ) -> RioResult<usize> {
         let (slot_key, res) = completion;
 
-        if Self::is_datagram_completion(res)
-            && let Some(waiter) = mailbox.waiters.pop_front()
-            && let Some(n) =
-                self.try_fast_deliver(mailbox, waiter, (slot_key, res), comp, ctx, registry)?
-        {
-            return Ok(n);
+        if Self::is_datagram_completion(res) {
+            if let Some(waiter) = mailbox.waiters.pop_front()
+                && let Some(n) =
+                    self.try_fast_deliver(mailbox, waiter, (slot_key, res), comp, ctx, registry)?
+            {
+                return Ok(n);
+            }
         }
 
         let event = self.update_state(mailbox, slot_key, res);
@@ -844,6 +845,7 @@ impl UdpPoolManager {
 
         let stream_op = Self::get_stream_op_mut(&mut guard);
         if let Some(stream_op) = stream_op {
+            stream_op.buf = None;
             stream_op.result = Some(OpUdpRecvPacket { buf, addr });
             guard.platform_mut().rio_pool_waiting = false;
 

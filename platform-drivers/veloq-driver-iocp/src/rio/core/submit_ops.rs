@@ -30,7 +30,9 @@ impl RioState {
     ) -> RioResult<Self> {
         let kernel = RioKernel::from_extensions(port, entries, ext)?;
 
-        let rq_depth = entries.clamp(32, 256);
+        // Keep per-socket RQ depth conservative so that multi-socket warmup
+        // does not exhaust RIO request-queue resources too early.
+        let rq_depth = entries.clamp(32, 64);
 
         Ok(Self {
             kernel,

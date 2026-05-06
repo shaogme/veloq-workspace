@@ -1,317 +1,248 @@
-pub mod context;
-pub mod executor;
-pub mod join;
-pub mod task;
+mod context;
+mod primitives;
+mod shared;
 
+use crate::task::{LocalTaskRef, SendTaskRef};
+use crate::utils::FastRand;
+use crate::utils::ownership::ArcOwnership;
+use crate::utils::storage::AtomicStorage;
+use std::cell::RefCell;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, mpsc};
+use std::num::NonZeroUsize;
+use std::ops::AsyncFn;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver;
+use std::task::{Context, Poll};
 use std::thread;
 
-use crossbeam_deque::Worker;
-use crossbeam_queue::ArrayQueue;
-use crossbeam_utils::CachePadded;
-use tracing::debug;
+pub use primitives::{
+    EventCount, GenericCancellationToken, GenericCancellationTokenInner, Parker, Signal, Unparker,
+    create_waker,
+};
 
-use crate::config::Config;
-use crate::runtime::executor::spawner::LateBoundWaker;
-use crate::runtime::executor::{ExecutorHandle, ExecutorRegistry, ExecutorShared, Spawner};
-use crate::runtime::task::harness::Runnable;
-use crate::runtime::task::{SpawnedTask, Task};
-// Re-export common types
-pub use context::{RuntimeContext, spawn, spawn_eager, spawn_local, spawn_to, yield_now};
-pub use executor::LocalExecutor;
-pub use join::{JoinHandle, LocalJoinHandle};
+pub(crate) use context::with_current_runtime;
+pub use context::{
+    IdleHook, RuntimeContext, WorkerInitContext, clear_current_runtime_context, current_worker_id,
+    set_current_runtime_context,
+};
+pub(crate) use shared::RuntimeShared;
 
-use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier, nz};
-use veloq_driver::driver::{DriverControlCommand, RemoteWaker};
-
-use veloq_blocking::init_blocking_pool;
-
-pub mod blocking {
-    pub use veloq_blocking::*;
+fn noop_worker_init(_: WorkerInitContext) -> std::future::Ready<()> {
+    std::future::ready(())
 }
 
-struct WorkerPrep<T: PoolTopology> {
-    shared: Arc<ExecutorShared>,
-    remote_receiver: mpsc::Receiver<Task>,
-    pinned_receiver: mpsc::Receiver<SpawnedTask>,
-    control_receiver: mpsc::Receiver<Vec<DriverControlCommand>>,
-    // Worker local queue for stealable tasks
-    stealable_worker: Worker<Runnable>,
-    state: T::State,
-    topology: T,
-    config: Config,
-    barrier: Arc<Barrier>,
+type NoopWorkerInit = fn(WorkerInitContext) -> std::future::Ready<()>;
+
+pub struct Runtime<I = NoopWorkerInit> {
+    shared: Arc<RuntimeShared>,
+    local_receivers: Vec<Receiver<LocalTaskRef>>,
+    remote_receivers: Vec<Receiver<SendTaskRef>>,
+    worker_count: NonZeroUsize,
+    worker_init: Option<I>,
+    idle_hook: Option<IdleHook>,
 }
 
-pub struct RuntimeBuilder<T: PoolTopology = UniformSlot> {
-    config: Config,
-    topology: T,
-}
-
-impl Default for RuntimeBuilder<UniformSlot> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RuntimeBuilder<UniformSlot> {
+impl Runtime<NoopWorkerInit> {
     pub fn new() -> Self {
-        Self {
-            config: Config::default(),
-            topology: UniformSlot::new(ThreadMemoryMultiplier(nz!(8))),
-        }
+        Self::builder().build()
+    }
+
+    pub fn builder() -> RuntimeBuilder<NoopWorkerInit> {
+        RuntimeBuilder::default()
     }
 }
 
-impl<T: PoolTopology> RuntimeBuilder<T> {
-    pub fn config(mut self, config: Config) -> Self {
-        self.config = config;
-        self
+impl Default for Runtime<NoopWorkerInit> {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
+impl<I> Runtime<I>
+where
+    I: AsyncFn(WorkerInitContext) -> () + Sync,
+{
+    pub fn worker_count(&self) -> NonZeroUsize {
+        self.worker_count
     }
 
-    pub fn with_topology<NewT: PoolTopology>(self, topology: NewT) -> RuntimeBuilder<NewT> {
-        RuntimeBuilder {
-            config: self.config,
-            topology,
-        }
-    }
+    pub fn block_on<F: Future>(self, fut: F) -> F::Output {
+        let Runtime {
+            shared,
+            local_receivers,
+            remote_receivers,
+            worker_count,
+            worker_init,
+            idle_hook,
+        } = self;
+        let worker_init = worker_init.expect("worker init missing");
+        let worker_init = &worker_init;
+        shared.shutdown.store(false, Ordering::Release);
+        let mut local_receivers = local_receivers;
+        let mut remote_receivers = remote_receivers;
 
-    pub fn build(self) -> std::io::Result<Runtime<T>> {
-        let worker_count = self
-            .config
-            .worker_threads_opt()
-            .map(|w| w.get())
-            .unwrap_or(num_cpus::get());
-        debug!("Building Runtime with {} workers", worker_count);
+        thread::scope(move |scope| {
+            struct ClearContext;
+            impl Drop for ClearContext {
+                fn drop(&mut self) {
+                    clear_current_runtime_context();
+                }
+            }
 
-        // Initialize the blocking pool
-        init_blocking_pool(self.config.blocking_pool_config().clone());
+            struct ShutdownGuard(Arc<RuntimeShared>);
+            impl Drop for ShutdownGuard {
+                fn drop(&mut self) {
+                    self.0.shutdown();
+                }
+            }
+            let _guard = ShutdownGuard(shared.clone());
 
-        // Step 1: Initialize Pool Strategy State
-        let state = self.topology.init(worker_count)?;
-
-        // Struct to hold per-worker resources temporarily
-        struct WorkerInit {
-            shared: Arc<ExecutorShared>,
-            remote_rx: mpsc::Receiver<Task>,
-            pinned_rx: mpsc::Receiver<SpawnedTask>,
-            control_rx: mpsc::Receiver<Vec<DriverControlCommand>>,
-            worker: Worker<Runnable>,
-        }
-
-        let queue_capacity = self.config.queue_capacity();
-
-        // 1. Initialize Resources per Worker (Functional / Pipeline)
-        let (handles, workers): (Vec<_>, Vec<_>) = (0..worker_count)
-            .map(|i| {
-                let (remote_tx, remote_rx) = mpsc::channel();
-                let (pinned_tx, pinned_rx) = mpsc::channel();
-                let (control_tx, control_rx) = mpsc::channel();
-
-                let worker = Worker::new_fifo();
-                let stealer = worker.stealer();
-
-                let shared = Arc::new(ExecutorShared {
-                    pinned: pinned_tx,
-                    remote_queue: remote_tx,
-                    control_queue: control_tx,
-                    future_injector: ArrayQueue::new(queue_capacity),
-                    stealer,
-                    waker: LateBoundWaker::new(),
-                    injected_load: CachePadded::new(AtomicUsize::new(0)),
-                    local_load: CachePadded::new(AtomicUsize::new(0)),
-                    state: Arc::new(AtomicU8::new(executor::RUNNING)),
-                    shutdown: AtomicBool::new(false),
-                });
-
-                let handle = ExecutorHandle {
-                    id: i,
-                    shared: shared.clone(),
-                };
-
-                let init = WorkerInit {
-                    shared,
-                    remote_rx,
-                    pinned_rx,
-                    control_rx,
-                    worker,
-                };
-
-                (handle, init)
-            })
-            .unzip();
-
-        let registry = Arc::new(ExecutorRegistry::new(handles));
-
-        // Connect Dynamic Memory Listener
-        // This bridges the gap between veloq-buf (Allocation) and veloq-runtime (Registration).
-        // When the pool expands, this callback notifies the registry, incrementing the epoch.
-        let registry_clone = registry.clone();
-        self.topology.connect_listener(
-            &state,
-            Box::new(move |chunk_info| {
-                registry_clone.register_chunk(
-                    chunk_info.id,
-                    chunk_info.ptr.as_ptr() as usize,
-                    chunk_info.len.get(),
-                );
-            }),
-        );
-
-        // Barrier for synchronizing worker startup
-        let barrier = Arc::new(Barrier::new(worker_count));
-
-        // 2. Separate Worker 0 Resources
-        let mut workers_iter = workers.into_iter();
-        let worker_0_res = workers_iter
-            .next()
-            .expect("Worker 0 resources missing (count > 0 checked)");
-
-        let mut thread_handles = Vec::with_capacity(worker_count - 1);
-
-        // 3. Spawn Background Workers (1..N)
-        for i in 0..(worker_count - 1) {
-            let res = workers_iter.next().expect("Worker missing");
-            let worker_id = i + 1; // Iterator started from index 1 (Worker 0 detached)
-
-            let registry = registry.clone();
-            let barrier = barrier.clone();
-            let config = self.config.clone();
-            let topology = self.topology.clone();
-            let state = state.clone();
-
-            let builder = thread::Builder::new().name(format!("veloq-worker-{}", worker_id));
-
-            let handle = builder.spawn(move || {
-                debug!("Worker {} thread started", worker_id);
-                let executor = LocalExecutor::builder()
-                    .config(config)
-                    .with_shared(res.shared)
-                    .with_remote_receiver(res.remote_rx)
-                    .with_pinned_receiver(res.pinned_rx)
-                    .with_control_receiver(res.control_rx)
-                    .with_worker(res.worker)
-                    .build(|registrar| {
-                        // Topology determines how to build the pool and register memory
-                        topology.build(&state, worker_id, registrar)
+            for worker_id in (1..worker_count.get()).rev() {
+                let lrx = local_receivers.pop().expect("Receiver missing for worker");
+                let rrx = remote_receivers.pop().expect("Receiver missing for worker");
+                let runtime = shared.clone();
+                scope.spawn(move || {
+                    set_current_runtime_context(RuntimeContext {
+                        shared: runtime.clone(),
+                        worker_id,
+                        local_rx: lrx,
+                        remote_rx: rrx,
+                        rand: RefCell::new(FastRand::new(worker_id as u64)),
+                        idle_hook,
                     });
+                    let _clear_context = ClearContext;
 
-                let mut executor = executor.with_registry(registry);
-                executor.set_id(worker_id);
+                    let init_ctx = WorkerInitContext::new(worker_id, worker_count);
+                    let init_fut = std::pin::pin!(worker_init(init_ctx));
+                    runtime.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(
+                        None,
+                        Some(init_fut),
+                    );
+                });
+            }
 
-                // Wait for all workers to be ready
-                barrier.wait();
+            let lrx0 = local_receivers
+                .pop()
+                .expect("Receiver missing for worker 0");
+            let rrx0 = remote_receivers
+                .pop()
+                .expect("Receiver missing for worker 0");
+            set_current_runtime_context(RuntimeContext {
+                shared: shared.clone(),
+                worker_id: 0,
+                local_rx: lrx0,
+                remote_rx: rrx0,
+                rand: RefCell::new(FastRand::new(0)),
+                idle_hook,
+            });
+            let _clear_context = ClearContext;
 
-                // Run Loop
-                executor.run();
-            })?;
+            let result = {
+                let signal = Arc::new(Signal::new(true));
+                let waker = create_waker(signal.clone());
+                let mut cx = Context::from_waker(&waker);
+                let mut fut = fut;
+                let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
 
-            thread_handles.push(handle);
-        }
+                let init_ctx = WorkerInitContext::new(0, worker_count);
+                let init_fut = std::pin::pin!(worker_init(init_ctx));
+                shared
+                    .drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(None, Some(init_fut));
 
-        // 4. Prepare Worker 0 Prep State (for block_on)
-        let worker_0_prep = WorkerPrep {
-            shared: worker_0_res.shared,
-            remote_receiver: worker_0_res.remote_rx,
-            pinned_receiver: worker_0_res.pinned_rx,
-            control_receiver: worker_0_res.control_rx,
-            stealable_worker: worker_0_res.worker,
-            state: state.clone(),
-            topology: self.topology,
-            config: self.config,
-            barrier,
-        };
+                loop {
+                    // 主线程使用独立 completion 泵，不依赖 worker idle 路径。
+                    match fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(res) => break res,
+                        Poll::Pending => {
+                            let hint = context::run_worker_idle_hook();
+                            match hint {
+                                Some(duration) => {
+                                    let _ = signal.wait_timeout(duration);
+                                }
+                                None => {
+                                    signal.wait();
+                                }
+                            }
+                        }
+                    }
+                }
+            };
 
-        Ok(Runtime {
-            handles: thread_handles,
-            registry,
-            worker_0_prep: Some(worker_0_prep),
+            result
         })
     }
 }
 
-pub struct Runtime<T: PoolTopology = UniformSlot> {
-    handles: Vec<thread::JoinHandle<()>>,
-    registry: Arc<ExecutorRegistry>,
-    worker_0_prep: Option<WorkerPrep<T>>,
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeBuilder<I> {
+    worker_count: Option<NonZeroUsize>,
+    worker_init: Option<I>,
+    queue_capacity: NonZeroUsize,
+    idle_hook: Option<IdleHook>,
 }
 
-impl<T: PoolTopology> Drop for Runtime<T> {
-    fn drop(&mut self) {
-        debug!("Runtime shutting down");
-        // 1. Notify all workers to stop
-        for handle in self.registry.all() {
-            handle.shared.shutdown.store(true, Ordering::Relaxed);
-            // Wake them up so they see the shutdown signal
-            let _ = handle.shared.waker.wake();
-        }
-
-        // 2. Wait for worker threads to finish
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
+impl Default for RuntimeBuilder<NoopWorkerInit> {
+    fn default() -> Self {
+        Self {
+            worker_count: None,
+            worker_init: Some(noop_worker_init),
+            queue_capacity: NonZeroUsize::new(1024).unwrap(),
+            idle_hook: None,
         }
     }
 }
 
-impl Runtime<UniformSlot> {
-    pub fn builder() -> RuntimeBuilder<UniformSlot> {
-        RuntimeBuilder::new()
+impl RuntimeBuilder<NoopWorkerInit> {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
-impl<T: PoolTopology> Runtime<T> {
-    pub fn spawner(&self) -> Spawner {
-        Spawner::new(self.registry.clone())
+impl<I> RuntimeBuilder<I>
+where
+    I: AsyncFn(WorkerInitContext) -> () + Sync,
+{
+    pub fn worker_count(mut self, count: NonZeroUsize) -> Self {
+        self.worker_count = Some(count);
+        self
     }
 
-    pub fn spawn<F, Output>(&self, future: F) -> JoinHandle<Output>
-    where
-        F: Future<Output = Output> + Send + 'static,
-        Output: Send + 'static,
-    {
-        self.spawner().spawn(future)
+    pub fn with_worker_init<NewI>(self, worker_init: NewI) -> RuntimeBuilder<NewI> {
+        RuntimeBuilder {
+            worker_count: self.worker_count,
+            worker_init: Some(worker_init),
+            queue_capacity: self.queue_capacity,
+            idle_hook: self.idle_hook,
+        }
     }
 
-    /// Block on a future using a local executor on the current thread,
-    /// participating in the runtime as Worker 0 (an internal mesh node).
-    ///
-    /// This method consumes the Runtime, setting up the current thread as the first worker.
-    /// It waits for all other pre-spawned workers to be ready before starting execution.
-    pub fn block_on<F>(mut self, future: F) -> F::Output
-    where
-        F: Future,
-    {
-        debug!("Block_on entered (Worker 0)");
-        let prep = self
-            .worker_0_prep
-            .take()
-            .expect("Runtime already started or invalid state");
+    pub fn idle_hook(mut self, hook: IdleHook) -> Self {
+        self.idle_hook = Some(hook);
+        self
+    }
 
-        let state = prep.state;
-        let topology = prep.topology.clone();
+    pub fn queue_capacity(mut self, capacity: NonZeroUsize) -> Self {
+        self.queue_capacity = capacity;
+        self
+    }
 
-        let executor = LocalExecutor::builder()
-            .config(prep.config)
-            .with_shared(prep.shared) // Inject shared state
-            .with_remote_receiver(prep.remote_receiver) // Inject remote receiver
-            .with_pinned_receiver(prep.pinned_receiver) // Inject pinned receiver
-            .with_control_receiver(prep.control_receiver) // Inject control receiver
-            .with_worker(prep.stealable_worker) // Inject stealable worker
-            .build(|registrar| {
-                // Bind Buffer Pool using stored prep data
-                topology.build(&state, 0, registrar)
-            });
-
-        let mut executor = executor.with_registry(self.registry.clone());
-        executor.set_id(0); // Set Worker ID (Worker 0)
-
-        // Wait for all workers to be ready
-        prep.barrier.wait();
-
-        // Run Future
-        // block_on in LocalExecutor runs the loop until future completes.
-        executor.block_on(future)
+    pub fn build(self) -> Runtime<I> {
+        let count = self.worker_count.unwrap_or_else(|| {
+            thread::available_parallelism()
+                .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
+        });
+        let (shared, local_receivers, remote_receivers) =
+            RuntimeShared::new(count, self.queue_capacity);
+        let shared = Arc::new(shared);
+        Runtime {
+            shared,
+            local_receivers,
+            remote_receivers,
+            worker_count: count,
+            worker_init: self.worker_init,
+            idle_hook: self.idle_hook,
+        }
     }
 }
