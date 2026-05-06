@@ -17,7 +17,6 @@ libc.workspace = true
 parking_lot.workspace = true
 numaperf-topo = "0.1"
 veloq-intrusive-linklist.workspace = true
-veloq-sync.workspace = true
 
 [lints]
 workspace = true

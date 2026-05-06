@@ -43,6 +43,7 @@ pub struct GenericTaskHeader<S: Storage + 'static> {
     pub(crate) worker_id: S::Usize,
     pub(crate) affinity_depth: S::Usize,
     pub(crate) affinity_saved_worker_id: S::Usize,
+    pub(crate) injector_next: S::OptionPtr<GenericTaskHeader<S>>,
     pub(crate) vtable: &'static TaskVTable<S>,
 }
 
@@ -57,6 +58,7 @@ impl<S: Storage + 'static> GenericTaskHeader<S> {
             worker_id: S::Usize::new(0),
             affinity_depth: S::Usize::new(0),
             affinity_saved_worker_id: S::Usize::new(usize::MAX),
+            injector_next: S::OptionPtr::new(None),
             vtable,
         }
     }

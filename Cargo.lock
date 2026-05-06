@@ -1481,7 +1481,6 @@ dependencies = [
  "numaperf-topo",
  "parking_lot",
  "veloq-intrusive-linklist",
- "veloq-sync",
 ]
 
 [[package]]

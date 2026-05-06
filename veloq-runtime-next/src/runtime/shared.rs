@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use veloq_sync::mpmc::{self, Receiver as MpmcReceiver, Sender as MpmcSender};
 
 pub(crate) struct WorkerQueue {
     pub(crate) local_tx: Sender<LocalTaskRef>,
@@ -210,15 +209,86 @@ impl TopologyContext {
     }
 }
 
+pub(crate) struct GlobalInjector {
+    head: AtomicU64,
+}
+
+impl GlobalInjector {
+    const EMPTY: u64 = 0;
+
+    fn new() -> Self {
+        Self {
+            head: AtomicU64::new(Self::EMPTY),
+        }
+    }
+
+    fn push(&self, task: SendTaskRef) {
+        let header_ptr = task.header() as *const _ as u64;
+        // Modern x86_64 uses 48-bit virtual addresses.
+        debug_assert_eq!(header_ptr & 0xFFFF000000000000, 0);
+
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            let old_ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader;
+            task.header()
+                .injector_next
+                .store(NonNull::new(old_ptr as *mut _), Ordering::Release);
+
+            let next_gen = ((head >> 48).wrapping_add(1)) & 0xFFFF;
+            let new_head = (next_gen << 48) | header_ptr;
+
+            match self.head.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(h) => head = h,
+            }
+        }
+    }
+
+    fn pop(&self) -> Option<SendTaskRef> {
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            if head == Self::EMPTY {
+                return None;
+            }
+
+            let ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader;
+            let next_ptr = unsafe { (&*ptr).injector_next.load(Ordering::Acquire) };
+
+            let next_raw = next_ptr.map(|p| p.as_ptr() as u64).unwrap_or(0);
+            let next_gen = ((head >> 48).wrapping_add(1)) & 0xFFFF;
+            let new_head = if next_raw == 0 {
+                Self::EMPTY
+            } else {
+                (next_gen << 48) | next_raw
+            };
+
+            match self.head.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(unsafe { SendTaskRef::from_header(ptr) }),
+                Err(h) => head = h,
+            }
+        }
+    }
+}
+
 pub(crate) struct TaskScheduler {
-    pub(crate) injector: (MpmcSender<SendTaskRef>, MpmcReceiver<SendTaskRef>),
+    pub(crate) injector: GlobalInjector,
     pub(crate) next_worker: AtomicUsize,
     pub(crate) searching_workers: AtomicUsize,
 }
 
 impl TaskScheduler {
     fn pop_global(&self) -> Option<SendTaskRef> {
-        self.injector.1.try_recv().ok()
+        self.injector.pop()
     }
 
     fn steal_send(
@@ -388,7 +458,7 @@ impl RuntimeShared {
                     next_idle,
                 },
                 scheduler: TaskScheduler {
-                    injector: mpmc::unbounded(),
+                    injector: GlobalInjector::new(),
                     next_worker: AtomicUsize::new(0),
                     searching_workers: AtomicUsize::new(0),
                 },
@@ -489,7 +559,7 @@ impl RuntimeShared {
 
             let worker = &self.registry.workers[worker_id];
             if worker.remote_tx.send(task).is_err() {
-                let _ = self.scheduler.injector.0.try_send(task);
+                self.scheduler.injector.push(task);
             }
             self.notify_work(worker_id);
         }
@@ -552,20 +622,6 @@ impl RuntimeShared {
         mut init_fut: Option<Pin<&mut F>>,
     ) {
         let worker_id = current_worker_id();
-
-        if let Some(fut) = init_fut.as_mut() {
-            use std::task::{Context, Poll};
-            let signal = Arc::new(primitives::Signal::new(false));
-            let waker = primitives::create_waker(signal.clone());
-            let mut cx = Context::from_waker(&waker);
-            let mut fut = fut.as_mut();
-            loop {
-                match fut.as_mut().poll(&mut cx) {
-                    Poll::Ready(()) => break,
-                    Poll::Pending => signal.wait(),
-                }
-            }
-        }
 
         CONTEXT.with(|ctx| {
             let ctx = ctx.borrow();
