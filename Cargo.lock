@@ -1309,7 +1309,9 @@ dependencies = [
  "veloq-blocking",
  "veloq-buf",
  "veloq-driver",
+ "veloq-local",
  "veloq-runtime-next",
+ "veloq-sync",
  "windows-sys 0.61.2",
 ]
 
