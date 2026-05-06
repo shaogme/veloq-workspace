@@ -5,6 +5,7 @@ use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::Storage;
 use crate::utils::{AtomicOptionPtr, Deque, Steal};
+use veloq_sync::mpmc::{self, Receiver as MpmcReceiver, Sender as MpmcSender};
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -16,8 +17,10 @@ pub(crate) struct WorkerQueue {
     pub(crate) local_tx: Sender<LocalTaskRef>,
     pub(crate) remote_tx: Sender<SendTaskRef>,
     pub(crate) local_count: AtomicUsize,
+    /// LIFO slot for high-priority task (cache locality)
     pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
-    pub(crate) send: Deque<SendTaskRef>,
+    /// Chase-Lev Deque for work-stealing
+    pub(crate) deque: Deque<SendTaskRef>,
 }
 
 impl WorkerQueue {
@@ -31,7 +34,7 @@ impl WorkerQueue {
             remote_tx,
             local_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),
-            send: Deque::new(queue_capacity),
+            deque: Deque::new(queue_capacity),
         }
     }
 }
@@ -158,6 +161,8 @@ pub struct RuntimeShared {
     pub(crate) idle_mask: AtomicBitset,
     pub(crate) parker_inners: Vec<Arc<primitives::ParkerInner>>,
     pub(crate) event_count: EventCount,
+    pub(crate) searching_workers: AtomicUsize,
+    pub(crate) injector: (MpmcSender<SendTaskRef>, MpmcReceiver<SendTaskRef>),
 }
 
 impl RuntimeShared {
@@ -243,6 +248,8 @@ impl RuntimeShared {
                 idle_mask: AtomicBitset::new(worker_count_val),
                 parker_inners,
                 event_count: EventCount::new(),
+                searching_workers: AtomicUsize::new(0),
+                injector: mpmc::unbounded(),
             },
             local_receivers,
             remote_receivers,
@@ -284,13 +291,21 @@ impl RuntimeShared {
             worker.local_count.fetch_add(1, Ordering::Release);
             let _ = worker.local_tx.send(task);
             self.event_count.notify();
-            self.unpark_worker(worker_id);
+            self.notify_work(worker_id);
         }
+    }
+
+    fn notify_work(&self, worker_id: usize) {
+        if self.searching_workers.load(Ordering::Acquire) > 0 {
+            return;
+        }
+        self.unpark_worker(worker_id);
     }
 
     fn unpark_worker(&self, worker_id: usize) {
         // If the specific worker is idle, unpark it.
         if self.idle_mask.is_set(worker_id) {
+            self.idle_mask.clear(worker_id);
             self.unparkers[worker_id].unpark();
             return;
         }
@@ -320,20 +335,25 @@ impl RuntimeShared {
         if task.header().is_completed() {
             return;
         }
-        let worker_id = worker_id % self.workers.len();
+        let worker_count = self.workers.len();
+        let worker_id = worker_id % worker_count;
         if task.header().try_mark_queued() {
             self.event_count.notify();
+
+            // 1. 尝试亲和性队列 (Affine)
             if task.header().is_affine() {
                 let worker = &self.workers[worker_id];
                 let _ = worker.remote_tx.send(task);
-                self.unpark_worker(worker_id);
+                self.notify_work(worker_id);
                 return;
             }
-            let current = current_worker_id();
-            let worker = &self.workers[worker_id];
 
+            let current = current_worker_id();
+
+            // 2. 如果在当前 Worker 线程，尝试 LIFO 槽位或本地 Deque
             if current == worker_id {
-                // 尝试放入 LIFO Slot (MPSC)
+                let worker = &self.workers[worker_id];
+                // LIFO Slot
                 let header_ptr = task.header() as *const _ as *mut _;
                 if worker
                     .lifo
@@ -345,17 +365,24 @@ impl RuntimeShared {
                     )
                     .is_ok()
                 {
-                    self.unpark_worker(worker_id);
+                    self.notify_work(worker_id);
                     return;
                 }
 
-                if worker.send.push(task).is_ok() {
-                    self.unpark_worker(worker_id);
+                // Deque
+                if worker.deque.push(task).is_ok() {
+                    self.notify_work(worker_id);
                     return;
                 }
             }
-            let _ = worker.remote_tx.send(task);
-            self.unpark_worker(worker_id);
+
+            // 3. 尝试目标 Worker 的远程邮箱 (MPSC)
+            let worker = &self.workers[worker_id];
+            if worker.remote_tx.send(task).is_err() {
+                // 如果目标 worker 邮箱也出问题（通常不会，除非关闭），放入全局注入器
+                let _ = self.injector.0.try_send(task);
+            }
+            self.notify_work(worker_id);
         }
     }
 
@@ -371,23 +398,29 @@ impl RuntimeShared {
 
     fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
         let worker = &self.workers[worker_id];
+        // 1. 优先从 LIFO 槽位获取 (缓存局部性最强)
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
         }
-        worker.send.pop()
+        // 2. 从私有 Deque 获取
+        worker.deque.pop()
+    }
+
+    fn pop_global(&self) -> Option<SendTaskRef> {
+        self.injector.1.try_recv().ok()
     }
 
     fn steal_send(&self, thief_id: usize) -> Option<SendTaskRef> {
-        let thief_queue = &self.workers[thief_id].send;
+        let thief_worker = &self.workers[thief_id];
         let num_workers = self.workers.len();
         if num_workers <= 1 {
-            return None;
+            return self.pop_global();
         }
 
         let group_idx = self.worker_to_group[thief_id];
         let group = &self.groups[group_idx];
 
-        // 1. Try to steal from the same NUMA group first
+        // 1. 尝试从同 NUMA 组窃取
         if group.worker_ids.len() > 1 {
             let start = CONTEXT.with(|ctx| {
                 ctx.borrow()
@@ -401,7 +434,7 @@ impl RuntimeShared {
                 if victim == thief_id {
                     continue;
                 }
-                match self.workers[victim].send.steal_batch(thief_queue) {
+                match self.workers[victim].deque.steal_batch(&thief_worker.deque) {
                     Steal::Success(task) => return Some(task),
                     Steal::Retry => return self.steal_send(thief_id),
                     Steal::Empty => continue,
@@ -409,7 +442,12 @@ impl RuntimeShared {
             }
         }
 
-        // 2. Try to steal from other groups
+        // 2. 尝试从 Injector 获取
+        if let Some(task) = self.pop_global() {
+            return Some(task);
+        }
+
+        // 3. 尝试从其他组窃取
         let start_group = CONTEXT.with(|ctx| {
             ctx.borrow()
                 .as_ref()
@@ -424,7 +462,7 @@ impl RuntimeShared {
             }
             let other_group = &self.groups[other_group_idx];
             for &victim in &other_group.worker_ids {
-                match self.workers[victim].send.steal_batch(thief_queue) {
+                match self.workers[victim].deque.steal_batch(&thief_worker.deque) {
                     Steal::Success(task) => return Some(task),
                     Steal::Retry => return self.steal_send(thief_id),
                     Steal::Empty => continue,
@@ -469,28 +507,29 @@ impl RuntimeShared {
                 let mut progressed = false;
                 tick = tick.wrapping_add(1);
 
-                // 1. 本地任务优先 (LIFO + Deque)
+                // 1. 优先执行 LIFO Slot 和本地 Deque (缓存局部性路径)
                 if let Some(task) = self.pop_send(worker_id) {
                     self.poll_send_task(worker_id, task);
                     progressed = true;
                 }
 
-                // 2. 本地 MPSC 队列
+                // 2. 本地绑定任务 (MPSC 路径)
                 if !progressed && let Some(task) = self.pop_local(worker_id, &ctx.local_rx) {
                     self.poll_local_task(worker_id, task);
                     progressed = true;
                 }
 
-                // 3. 远程检查 (解耦：固定周期强制检查 OR 本地无进展时检查)
-                if (tick.is_multiple_of(INJECTOR_CHECK_INTERVAL) || !progressed)
-                    && let Ok(task) = ctx.remote_rx.try_recv()
+                // 3. 定期检查全局注入器 (公平性路径)
+                if !progressed
+                    && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
+                    && let Some(task) = self.pop_global()
                 {
                     self.poll_send_task(worker_id, task);
                     progressed = true;
                 }
 
-                // 4. 工作窃取 (解耦：仅在以上均无果时尝试)
-                if !progressed && let Some(task) = self.steal_send(worker_id) {
+                // 4. 检查外部发送到本 worker 的任务 (MPSC 路径)
+                if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
                     self.poll_send_task(worker_id, task);
                     progressed = true;
                 }
@@ -499,7 +538,9 @@ impl RuntimeShared {
                     continue;
                 }
 
-                for _ in 0..64 {
+                // 5. 工作窃取路径 (自适应搜索)
+                self.searching_workers.fetch_add(1, Ordering::Relaxed);
+                for _ in 0..4 {
                     if let Some(task) = self.steal_send(worker_id) {
                         self.poll_send_task(worker_id, task);
                         progressed = true;
@@ -512,11 +553,13 @@ impl RuntimeShared {
                     }
                     std::hint::spin_loop();
                 }
+                self.searching_workers.fetch_sub(1, Ordering::Relaxed);
 
                 if progressed {
                     continue;
                 }
 
+                // 6. 休眠路径
                 let seq = self.event_count.load();
                 self.idle_mask.set(worker_id);
                 let group_idx = self.worker_to_group[worker_id];
@@ -526,6 +569,7 @@ impl RuntimeShared {
 
                 let idle_hint = super::context::run_worker_idle_hook();
 
+                // Double check before parking
                 if self.event_count.load() != seq
                     || self.has_work(worker_id)
                     || self.shutdown.load(Ordering::Acquire)
@@ -541,8 +585,19 @@ impl RuntimeShared {
                     continue;
                 }
 
-                // 最后一道防线：检查远程队列
+                // 最后检查远程队列和注入器
                 if let Ok(task) = ctx.remote_rx.try_recv() {
+                    if self.groups[group_idx]
+                        .idle_stack
+                        .pop(&self.next_idle)
+                        .is_some()
+                    {
+                        self.idle_mask.clear(worker_id);
+                    }
+                    self.poll_send_task(worker_id, task);
+                    continue;
+                }
+                if let Some(task) = self.pop_global() {
                     if self.groups[group_idx]
                         .idle_stack
                         .pop(&self.next_idle)
@@ -564,7 +619,6 @@ impl RuntimeShared {
                 }
 
                 let _ = self.groups[group_idx].idle_stack.pop(&self.next_idle);
-
                 self.idle_mask.clear(worker_id);
             }
         });
@@ -573,7 +627,7 @@ impl RuntimeShared {
     fn has_work(&self, worker_id: usize) -> bool {
         let worker = &self.workers[worker_id];
         worker.lifo.load(Ordering::Acquire).is_some()
-            || !worker.send.is_empty()
+            || !worker.deque.is_empty()
             || worker.local_count.load(Ordering::Acquire) > 0
     }
 }
