@@ -496,9 +496,19 @@ impl UringDriver {
                 })?;
             }
         } else {
-            self.ring.submit().map_err(|e| {
-                from_io_error(UringError::Submission, "driver.submit_to_kernel.submit", e)
-            })?;
+            let n = self.ring.submission().len();
+            if n > 0 {
+                println!("UringDriver: submit_to_kernel flushing {} entries", n);
+                // We use enter with IORING_ENTER_GETEVENTS (1) to ensure tasks are triggered even with DEFER_TASKRUN.
+                unsafe {
+                    self.ring
+                        .submitter()
+                        .enter::<()>(n as u32, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+                        .map_err(|e| {
+                            from_io_error(UringError::Submission, "driver.submit_to_kernel.enter", e)
+                        })?;
+                }
+            }
         }
         self.flush_backlog();
         Ok(())
@@ -610,6 +620,15 @@ impl UringDriver {
     }
 
     pub(crate) fn process_completions_internal(&mut self) {
+        // If we use DEFER_TASKRUN, we need to enter the kernel with GETEVENTS to trigger task runs
+        // even if we don't want to wait for new events.
+        // We do this unconditionally as it is safe even without DEFER_TASKRUN.
+        let _ = unsafe {
+            self.ring
+                .submitter()
+                .enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+        };
+
         let mut needs_waker_resubmit = false;
         let mut pending_events: Vec<CompletionSidecar> = Vec::new();
 
@@ -728,7 +747,7 @@ impl UringDriver {
         }
 
         drop(sq);
-        let _ = self.ring.submit();
+        let _ = unsafe { self.ring.submitter().enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None) };
 
         let mut sq = self.ring.submission();
         if unsafe { sq.push(&entry) }.is_ok() {

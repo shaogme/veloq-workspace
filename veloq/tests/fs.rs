@@ -2,8 +2,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 use std::path::PathBuf;
 use veloq::fs::{File, LocalFile};
 use veloq::io::{AsyncBufRead, AsyncBufWrite};
@@ -43,13 +41,7 @@ fn test_file_integrity() {
     for size in [nz!(8192), nz!(16384), nz!(65536)] {
         let runtime = create_runtime();
         runtime.block_on(async move {
-            let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let file_path = format!(
-                "test_file_integrity_{}_{}_{}.tmp",
-                size.get(),
-                std::process::id(),
-                test_id
-            );
+            let file_path = format!("test_file_integrity_{:?}.tmp", size);
             let _guard = CleanupGuard::new(&file_path);
 
             {
@@ -90,9 +82,7 @@ fn test_multithread_file_ops() {
             for i in 0..NUM_TASKS {
                 let counter = completion_count_for_runtime.clone();
                 s.spawn_boxed(async move {
-                    let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    let file_name =
-                        format!("test_mt_fs_{}_{}_{}.tmp", i, std::process::id(), test_id);
+                    let file_name = format!("test_mt_fs_{}.tmp", i);
                     let _guard = CleanupGuard::new(&file_name);
 
                     let content = format!("Task {} content", i);
@@ -134,11 +124,10 @@ fn test_fs_read_exact_write_all() {
     let runtime = create_runtime();
 
     runtime.block_on(async move {
-        let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = format!("test_fs_exact_{}_{}.tmp", std::process::id(), test_id);
-        let _guard = CleanupGuard::new(&path);
+        let path = "test_fs_exact.tmp";
+        let _guard = CleanupGuard::new(path);
 
-        let file = LocalFile::create(&path)
+        let file = LocalFile::create(path)
             .await
             .expect("Failed to create file");
 
@@ -151,7 +140,7 @@ fn test_fs_read_exact_write_all() {
         file.sync_all().await.expect("Sync failed");
         drop(file);
 
-        let file = LocalFile::open(&path).await.expect("Failed to open file");
+        let file = LocalFile::open(path).await.expect("Failed to open file");
         let mut read_buf = context::alloc(nz!(DATA.len()));
         read_buf.set_len(DATA.len());
         let (n, read_buf) = file.read_exact(read_buf).await.expect("read_exact failed");

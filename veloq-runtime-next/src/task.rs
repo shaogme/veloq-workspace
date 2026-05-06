@@ -83,6 +83,43 @@ impl Drop for TaskAffinityGuard {
     }
 }
 
+/// 将一个 future 包装为“亲和作用域”。
+///
+/// 每次 `poll` 时都会基于当前 `SendTask` 临时进入 `TaskAffinityGuard`，
+/// 以便该 future 在执行期间的唤醒尽量回到同一个 worker。
+#[must_use = "future wrappers must be polled to make progress"]
+pub struct TaskAffinityFuture<F> {
+    inner: F,
+}
+
+impl<F> TaskAffinityFuture<F> {
+    pub fn new(inner: F) -> Self {
+        Self { inner }
+    }
+}
+
+impl<F: Future> Future for TaskAffinityFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _guard = TaskAffinityGuard::try_enter();
+        unsafe { self.map_unchecked_mut(|this| &mut this.inner) }.poll(cx)
+    }
+}
+
+/// 包装一个 future，使其在每次 poll 时临时进入 task affinity。
+#[inline]
+pub fn with_task_affinity<F: Future>(future: F) -> TaskAffinityFuture<F> {
+    TaskAffinityFuture::new(future)
+}
+
+#[macro_export]
+macro_rules! affine_scope {
+    ($future:expr $(,)?) => {
+        $crate::task::with_task_affinity($future)
+    };
+}
+
 // --- 任务错误与结果扩展 ---
 
 pub enum TaskError {

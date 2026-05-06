@@ -8,7 +8,7 @@ use std::time::Duration;
 use veloq_runtime_next::runtime::Runtime;
 use veloq_runtime_next::runtime::current_worker_id;
 use veloq_runtime_next::scope;
-use veloq_runtime_next::task::{TaskAffinityGuard, yield_now};
+use veloq_runtime_next::task::{TaskAffinityGuard, with_task_affinity, yield_now};
 
 struct ManualGateState {
     ready: AtomicBool,
@@ -92,6 +92,70 @@ fn send_task_affinity_guard_keeps_resume_on_owner_worker() {
                     resumed_worker.store(resumed, Ordering::Release);
                     resumed
                 }
+            });
+
+            while !started.load(Ordering::Acquire) {
+                yield_now().await;
+            }
+
+            assert_eq!(first_worker.load(Ordering::Acquire), 1);
+
+            let blocker = s.spawn_boxed_to(1, {
+                let blocker_started = Arc::clone(&blocker_started);
+                async move {
+                    assert_eq!(current_worker_id(), 1);
+                    blocker_started.store(true, Ordering::Release);
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            });
+
+            while !blocker_started.load(Ordering::Acquire) {
+                yield_now().await;
+            }
+
+            gate.open();
+
+            let resumed = affinity_handle
+                .await
+                .expect("affinity task should complete");
+            blocker.await.expect("blocker task should complete");
+
+            assert_eq!(resumed, 1);
+            assert_eq!(resumed_worker.load(Ordering::Acquire), 1);
+        });
+    });
+}
+
+#[test]
+fn with_task_affinity_keeps_resume_on_owner_worker() {
+    let runtime = Runtime::builder()
+        .worker_count(std::num::NonZeroUsize::new(2).expect("2 is non-zero"))
+        .build();
+
+    runtime.block_on(async {
+        scope!(s, {
+            let gate = ManualGate::new();
+            let started = Arc::new(AtomicBool::new(false));
+            let blocker_started = Arc::new(AtomicBool::new(false));
+            let first_worker = Arc::new(AtomicUsize::new(usize::MAX));
+            let resumed_worker = Arc::new(AtomicUsize::new(usize::MAX));
+
+            let affinity_handle = s.spawn_boxed_to(1, {
+                let gate = gate.clone();
+                let started = Arc::clone(&started);
+                let first_worker = Arc::clone(&first_worker);
+                let resumed_worker = Arc::clone(&resumed_worker);
+                with_task_affinity(async move {
+                    let first = current_worker_id();
+                    first_worker.store(first, Ordering::Release);
+
+                    started.store(true, Ordering::Release);
+                    gate.wait().await;
+
+                    let resumed = current_worker_id();
+                    resumed_worker.store(resumed, Ordering::Release);
+                    resumed
+                })
             });
 
             while !started.load(Ordering::Acquire) {

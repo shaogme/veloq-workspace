@@ -63,7 +63,10 @@ impl Drop for SocketToken {
             return;
         };
 
-        debug_assert_eq!(veloq_runtime_next::runtime::current_worker_id(), self.owner_worker_id);
+        debug_assert_eq!(
+            veloq_runtime_next::runtime::current_worker_id(),
+            self.owner_worker_id
+        );
         let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);
     }
 }
