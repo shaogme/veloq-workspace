@@ -277,10 +277,11 @@ impl<'scope, S: Storage, O: Ownership, M> Drop for GenericAsyncScope<'scope, S, 
 
 // 线程安全作用域特有方法
 impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
-    pub fn spawn_to<T: Send + 'scope, S>(
+    fn spawn_send_impl<T: Send + 'scope, S>(
         &self,
         worker_id: usize,
         task: &'scope S,
+        affine: bool,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
         S: SendTask<T> + Sized + 'scope,
@@ -295,9 +296,11 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S) };
-        task_ref
-            .header()
-            .set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
+        let header = task_ref.header();
+        header.set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
+        if affine {
+            header.force_affinity(worker_id);
+        }
         self.runtime.enqueue_send(worker_id, task_ref);
 
         JoinHandle {
@@ -316,6 +319,17 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         }
     }
 
+    pub fn spawn_to<T: Send + 'scope, S>(
+        &self,
+        worker_id: usize,
+        task: &'scope S,
+    ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
+    where
+        S: SendTask<T> + Sized + 'scope,
+    {
+        self.spawn_send_impl(worker_id, task, true)
+    }
+
     pub fn spawn<T: Send + 'scope, S>(
         &self,
         task: &'scope S,
@@ -323,13 +337,14 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         S: SendTask<T> + Sized + 'scope,
     {
-        self.spawn_to(self.runtime.choose_worker(), task)
+        self.spawn_send_impl(self.runtime.choose_worker(), task, false)
     }
 
-    pub fn spawn_boxed_to<T: Send + 'scope, F>(
+    fn spawn_boxed_send_impl<T: Send + 'scope, F>(
         &self,
         worker_id: usize,
         future: F,
+        affine: bool,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
         F: Future<Output = T> + Send + 'scope,
@@ -355,9 +370,11 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-        task_ref
-            .header()
-            .set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
+        let header = task_ref.header();
+        header.set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
+        if affine {
+            header.force_affinity(worker_id);
+        }
         self.runtime.enqueue_send(worker_id, task_ref);
 
         JoinHandle {
@@ -372,6 +389,17 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         }
     }
 
+    pub fn spawn_boxed_to<T: Send + 'scope, F>(
+        &self,
+        worker_id: usize,
+        future: F,
+    ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
+    where
+        F: Future<Output = T> + Send + 'scope,
+    {
+        self.spawn_boxed_send_impl(worker_id, future, true)
+    }
+
     pub fn spawn_boxed<T: Send + 'scope, F>(
         &self,
         future: F,
@@ -379,7 +407,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         F: Future<Output = T> + Send + 'scope,
     {
-        self.spawn_boxed_to(self.runtime.choose_worker(), future)
+        self.spawn_boxed_send_impl(self.runtime.choose_worker(), future, false)
     }
 }
 

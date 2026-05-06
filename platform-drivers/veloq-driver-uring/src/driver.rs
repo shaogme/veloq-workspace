@@ -505,7 +505,11 @@ impl UringDriver {
                         .submitter()
                         .enter::<()>(n as u32, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
                         .map_err(|e| {
-                            from_io_error(UringError::Submission, "driver.submit_to_kernel.enter", e)
+                            from_io_error(
+                                UringError::Submission,
+                                "driver.submit_to_kernel.enter",
+                                e,
+                            )
                         })?;
                 }
             }
@@ -747,7 +751,11 @@ impl UringDriver {
         }
 
         drop(sq);
-        let _ = unsafe { self.ring.submitter().enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None) };
+        let _ = unsafe {
+            self.ring
+                .submitter()
+                .enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+        };
 
         let mut sq = self.ring.submission();
         if unsafe { sq.push(&entry) }.is_ok() {
