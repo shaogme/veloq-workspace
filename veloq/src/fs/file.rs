@@ -398,16 +398,20 @@ impl<'a> SyncRangeBuilder<'a> {
 
 impl<'a> IntoFuture for SyncRangeBuilder<'a> {
     type Output = io::Result<()>;
-    type IntoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + 'a>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         let submitter = self.file.submitter;
+        let file = self.file;
+        let offset = self.offset;
+        let nbytes = self.nbytes;
+        let flags = self.flags;
         Box::pin(async move {
             let op: FileSyncFileRangeRaw = FileSyncFileRangeRaw {
-                fd: self.file.raw.raw(),
-                offset: self.offset,
-                nbytes: self.nbytes,
-                flags: self.flags,
+                fd: file.raw.raw(),
+                offset,
+                nbytes,
+                flags,
             };
 
             let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
