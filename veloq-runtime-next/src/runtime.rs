@@ -1,5 +1,4 @@
 mod context;
-mod executor;
 mod primitives;
 mod shared;
 
@@ -10,6 +9,7 @@ use crate::utils::storage::AtomicStorage;
 use std::cell::RefCell;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::ops::AsyncFn;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -28,8 +28,6 @@ pub use context::{
     set_current_runtime_context,
 };
 pub(crate) use shared::RuntimeShared;
-
-use executor::block_on_worker_init;
 
 fn noop_worker_init(_: WorkerInitContext) -> std::future::Ready<()> {
     std::future::ready(())
@@ -123,9 +121,8 @@ where
                     let _clear_context = ClearContext;
 
                     let init_ctx = WorkerInitContext::new(worker_id, worker_count);
-                    block_on_worker_init(worker_init, init_ctx);
-
-                    runtime.drive_worker::<AtomicStorage, ArcOwnership>(None);
+                    let init_fut = std::pin::pin!(worker_init(init_ctx));
+                    runtime.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(None, Some(init_fut));
                 });
             }
 
@@ -146,7 +143,8 @@ where
             let _clear_context = ClearContext;
 
             let init_ctx = WorkerInitContext::new(0, worker_count);
-            block_on_worker_init(&worker_init, init_ctx);
+            let init_fut = std::pin::pin!(worker_init(init_ctx));
+            shared.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(None, Some(init_fut));
 
             loop {
                 match fut.as_mut().poll(&mut cx) {

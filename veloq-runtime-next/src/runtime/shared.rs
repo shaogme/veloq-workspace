@@ -10,6 +10,9 @@ use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -532,17 +535,50 @@ impl RuntimeShared {
         &self,
         completion: Option<&GenericScopeCompletion<S, O>>,
     ) {
+        self.drive_worker_with_init::<S, O, std::future::Ready<()>>(completion, None);
+    }
+
+    pub fn drive_worker_with_init<S: Storage, O: Ownership, F: Future<Output = ()>>(
+        &self,
+        completion: Option<&GenericScopeCompletion<S, O>>,
+        mut init_fut: Option<Pin<&mut F>>,
+    ) {
         let worker_id = current_worker_id();
+
         CONTEXT.with(|ctx| {
             let ctx = ctx.borrow();
             let ctx = ctx.as_ref().expect("runtime context missing");
+
+            let waker = primitives::create_unpark_waker(self.registry.unparkers[worker_id].clone());
+            let mut init_cx = Context::from_waker(&waker);
+
             let mut tick = 0u32;
             const INJECTOR_CHECK_INTERVAL: u32 = 61;
 
-            while !self.shutdown.load(Ordering::Acquire)
-                && completion.map(|c| !c.is_done()).unwrap_or(true)
-            {
+            while init_fut.is_some() || !self.shutdown.load(Ordering::Acquire) {
                 let mut progressed = false;
+
+                if let Some(fut) = init_fut.as_mut() {
+                    match fut.as_mut().poll(&mut init_cx) {
+                        Poll::Ready(()) => {
+                            init_fut = None;
+                            progressed = true;
+                            if completion.is_none() && worker_id == 0 {
+                                return;
+                            }
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+
+                if init_fut.is_none() && completion.map(|c| c.is_done()).unwrap_or(false) {
+                    return;
+                }
+
+                if init_fut.is_none() && completion.is_none() && worker_id == 0 {
+                    return;
+                }
+
                 tick = tick.wrapping_add(1);
 
                 if let Some(task) = self.pop_send(worker_id) {

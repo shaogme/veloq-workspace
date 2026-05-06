@@ -224,12 +224,36 @@ static VTABLE: RawWakerVTable = RawWakerVTable::new(
     },
 );
 
+pub fn create_unpark_waker(unparker: Unparker) -> Waker {
+    let raw = Arc::into_raw(unparker.inner) as *const ();
+    unsafe { Waker::from_raw(RawWaker::new(raw, &UNPARK_VTABLE)) }
+}
+
+static UNPARK_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |p| unsafe {
+        Arc::increment_strong_count(p as *const ParkerInner);
+        RawWaker::new(p, &UNPARK_VTABLE)
+    },
+    |p| unsafe {
+        let inner = Arc::from_raw(p as *const ParkerInner);
+        Unparker::from_inner(inner).unpark();
+    },
+    |p| unsafe {
+        let inner = ManuallyDrop::new(Arc::from_raw(p as *const ParkerInner));
+        Unparker::from_inner((*inner).clone()).unpark();
+    },
+    |p| unsafe {
+        drop(Arc::from_raw(p as *const ParkerInner));
+    },
+);
+
 // --- 高性能唤醒原语 (Parker/Unparker) ---
 
 pub struct Parker {
     inner: Arc<ParkerInner>,
 }
 
+#[derive(Clone)]
 pub struct Unparker {
     inner: Arc<ParkerInner>,
 }
