@@ -150,19 +150,151 @@ impl AtomicBitset {
     }
 }
 
-pub struct RuntimeShared {
+pub(crate) struct WorkerRegistry {
     pub(crate) workers: Vec<Arc<WorkerQueue>>,
+    pub(crate) unparkers: Vec<Unparker>,
+    pub(crate) parker_inners: Vec<Arc<primitives::ParkerInner>>,
+}
+
+impl WorkerRegistry {
+    #[inline]
+    fn unpark(&self, worker_id: usize) {
+        self.unparkers[worker_id].unpark();
+    }
+}
+
+pub(crate) struct TopologyContext {
     pub(crate) groups: Vec<NUMAGroup>,
     pub(crate) worker_to_group: Vec<usize>,
     pub(crate) next_idle: Vec<AtomicUsize>,
-    pub(crate) next_worker: AtomicUsize,
-    pub(crate) shutdown: AtomicBool,
-    pub(crate) unparkers: Vec<Unparker>,
-    pub(crate) idle_mask: AtomicBitset,
-    pub(crate) parker_inners: Vec<Arc<primitives::ParkerInner>>,
-    pub(crate) event_count: EventCount,
-    pub(crate) searching_workers: AtomicUsize,
+}
+
+impl TopologyContext {
+    fn choose_worker(&self, next_worker: &AtomicUsize) -> usize {
+        let n = self.worker_to_group.len();
+        if n <= 1 {
+            return 0;
+        }
+
+        let current = current_worker_id();
+        if current < n {
+            let group_idx = self.worker_to_group[current];
+            let group = &self.groups[group_idx];
+            if group.worker_ids.len() > 1 {
+                let idx = next_worker.fetch_add(1, Ordering::Relaxed) % group.worker_ids.len();
+                return group.worker_ids[idx];
+            }
+        }
+
+        next_worker.fetch_add(1, Ordering::Relaxed) % n
+    }
+
+    fn pop_idle(&self, preferred_worker_id: usize) -> Option<usize> {
+        let group_idx = self.worker_to_group[preferred_worker_id];
+        if let Some(idle_id) = self.groups[group_idx].idle_stack.pop(&self.next_idle) {
+            return Some(idle_id);
+        }
+
+        for (i, group) in self.groups.iter().enumerate() {
+            if i == group_idx {
+                continue;
+            }
+            if let Some(idle_id) = group.idle_stack.pop(&self.next_idle) {
+                return Some(idle_id);
+            }
+        }
+        None
+    }
+}
+
+pub(crate) struct TaskScheduler {
     pub(crate) injector: (MpmcSender<SendTaskRef>, MpmcReceiver<SendTaskRef>),
+    pub(crate) next_worker: AtomicUsize,
+    pub(crate) searching_workers: AtomicUsize,
+}
+
+impl TaskScheduler {
+    fn pop_global(&self) -> Option<SendTaskRef> {
+        self.injector.1.try_recv().ok()
+    }
+
+    fn steal_send(
+        &self,
+        thief_id: usize,
+        registry: &WorkerRegistry,
+        topo: &TopologyContext,
+    ) -> Option<SendTaskRef> {
+        let thief_worker = &registry.workers[thief_id];
+        let num_workers = registry.workers.len();
+        if num_workers <= 1 {
+            return self.pop_global();
+        }
+
+        let group_idx = topo.worker_to_group[thief_id];
+        let group = &topo.groups[group_idx];
+
+        if group.worker_ids.len() > 1 {
+            let start = CONTEXT.with(|ctx| {
+                ctx.borrow()
+                    .as_ref()
+                    .map(|c| c.rand.borrow_mut().next_u32(group.worker_ids.len() as u32) as usize)
+                    .unwrap_or(0)
+            });
+
+            for i in 0..group.worker_ids.len() {
+                let victim = group.worker_ids[(start + i) % group.worker_ids.len()];
+                if victim == thief_id {
+                    continue;
+                }
+                match registry.workers[victim].deque.steal_batch(&thief_worker.deque) {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Retry => return self.steal_send(thief_id, registry, topo),
+                    Steal::Empty => continue,
+                }
+            }
+        }
+
+        if let Some(task) = self.pop_global() {
+            return Some(task);
+        }
+
+        let start_group = CONTEXT.with(|ctx| {
+            ctx.borrow()
+                .as_ref()
+                .map(|c| c.rand.borrow_mut().next_u32(topo.groups.len() as u32) as usize)
+                .unwrap_or(0)
+        });
+
+        for i in 0..topo.groups.len() {
+            let other_group_idx = (start_group + i) % topo.groups.len();
+            if other_group_idx == group_idx {
+                continue;
+            }
+            let other_group = &topo.groups[other_group_idx];
+            for &victim in &other_group.worker_ids {
+                match registry.workers[victim].deque.steal_batch(&thief_worker.deque) {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Retry => return self.steal_send(thief_id, registry, topo),
+                    Steal::Empty => continue,
+                }
+            }
+        }
+
+        None
+    }
+}
+
+pub(crate) struct IdleController {
+    pub(crate) idle_mask: AtomicBitset,
+    pub(crate) event_count: EventCount,
+}
+
+pub struct RuntimeShared {
+    pub(crate) registry: WorkerRegistry,
+    pub(crate) topo: TopologyContext,
+    pub(crate) scheduler: TaskScheduler,
+    pub(crate) idle: IdleController,
+    pub(crate) shutdown: AtomicBool,
 }
 
 impl RuntimeShared {
@@ -198,16 +330,15 @@ impl RuntimeShared {
         }
 
         // NUMA detection
-        let topo = numaperf_topo::Topology::discover().ok();
+        let topo_info = numaperf_topo::Topology::discover().ok();
         let mut groups = Vec::new();
         let mut worker_to_group = vec![0; worker_count_val];
 
-        match topo {
+        match topo_info {
             Some(t) if t.node_count() > 0 => {
                 let node_count = t.node_count();
                 let mut node_to_workers: Vec<Vec<usize>> = vec![Vec::new(); node_count];
 
-                // Distribute workers among detected NUMA nodes
                 for (i, group) in worker_to_group
                     .iter_mut()
                     .enumerate()
@@ -228,7 +359,6 @@ impl RuntimeShared {
                 }
             }
             _ => {
-                // Fallback to a single group if no NUMA nodes detected
                 groups.push(NUMAGroup {
                     worker_ids: (0..worker_count_val).collect(),
                     idle_stack: IdleStack::new(),
@@ -238,18 +368,26 @@ impl RuntimeShared {
 
         (
             Self {
-                workers,
-                groups,
-                worker_to_group,
-                next_idle,
-                next_worker: AtomicUsize::new(0),
+                registry: WorkerRegistry {
+                    workers,
+                    unparkers,
+                    parker_inners,
+                },
+                topo: TopologyContext {
+                    groups,
+                    worker_to_group,
+                    next_idle,
+                },
+                scheduler: TaskScheduler {
+                    injector: mpmc::unbounded(),
+                    next_worker: AtomicUsize::new(0),
+                    searching_workers: AtomicUsize::new(0),
+                },
+                idle: IdleController {
+                    idle_mask: AtomicBitset::new(worker_count_val),
+                    event_count: EventCount::new(),
+                },
                 shutdown: AtomicBool::new(false),
-                unparkers,
-                idle_mask: AtomicBitset::new(worker_count_val),
-                parker_inners,
-                event_count: EventCount::new(),
-                searching_workers: AtomicUsize::new(0),
-                injector: mpmc::unbounded(),
             },
             local_receivers,
             remote_receivers,
@@ -257,29 +395,12 @@ impl RuntimeShared {
     }
 
     pub fn choose_worker(&self) -> usize {
-        let n = self.workers.len();
-        if n == 1 {
-            return 0;
-        }
-
-        // Try to stay in the same NUMA group if called from a worker
-        let current = current_worker_id();
-        if current < n {
-            let group_idx = self.worker_to_group[current];
-            let group = &self.groups[group_idx];
-            if group.worker_ids.len() > 1 {
-                // Round-robin within the group
-                let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % group.worker_ids.len();
-                return group.worker_ids[idx];
-            }
-        }
-
-        self.next_worker.fetch_add(1, Ordering::Relaxed) % n
+        self.topo.choose_worker(&self.scheduler.next_worker)
     }
 
     #[inline]
     pub fn worker_count(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.workers.len()).expect("runtime must have at least one worker")
+        NonZeroUsize::new(self.registry.workers.len()).expect("runtime must have at least one worker")
     }
 
     pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
@@ -287,47 +408,31 @@ impl RuntimeShared {
             return;
         }
         if task.header().try_mark_queued() {
-            let worker = &self.workers[worker_id];
+            let worker = &self.registry.workers[worker_id];
             worker.local_count.fetch_add(1, Ordering::Release);
             let _ = worker.local_tx.send(task);
-            self.event_count.notify();
+            self.idle.event_count.notify();
             self.notify_work(worker_id);
         }
     }
 
     fn notify_work(&self, worker_id: usize) {
-        if self.searching_workers.load(Ordering::Acquire) > 0 {
+        if self.scheduler.searching_workers.load(Ordering::Acquire) > 0 {
             return;
         }
         self.unpark_worker(worker_id);
     }
 
     fn unpark_worker(&self, worker_id: usize) {
-        // If the specific worker is idle, unpark it.
-        if self.idle_mask.is_set(worker_id) {
-            self.idle_mask.clear(worker_id);
-            self.unparkers[worker_id].unpark();
+        if self.idle.idle_mask.is_set(worker_id) {
+            self.idle.idle_mask.clear(worker_id);
+            self.registry.unpark(worker_id);
             return;
         }
 
-        // Otherwise, try to unpark any idle worker in the same group
-        let group_idx = self.worker_to_group[worker_id];
-        if let Some(idle_id) = self.groups[group_idx].idle_stack.pop(&self.next_idle) {
-            self.idle_mask.clear(idle_id);
-            self.unparkers[idle_id].unpark();
-            return;
-        }
-
-        // Last resort: try to unpark any idle worker from other groups
-        for (i, group) in self.groups.iter().enumerate() {
-            if i == group_idx {
-                continue;
-            }
-            if let Some(idle_id) = group.idle_stack.pop(&self.next_idle) {
-                self.idle_mask.clear(idle_id);
-                self.unparkers[idle_id].unpark();
-                return;
-            }
+        if let Some(idle_id) = self.topo.pop_idle(worker_id) {
+            self.idle.idle_mask.clear(idle_id);
+            self.registry.unpark(idle_id);
         }
     }
 
@@ -335,14 +440,13 @@ impl RuntimeShared {
         if task.header().is_completed() {
             return;
         }
-        let worker_count = self.workers.len();
+        let worker_count = self.registry.workers.len();
         let worker_id = worker_id % worker_count;
         if task.header().try_mark_queued() {
-            self.event_count.notify();
+            self.idle.event_count.notify();
 
-            // 1. 尝试亲和性队列 (Affine)
             if task.header().is_affine() {
-                let worker = &self.workers[worker_id];
+                let worker = &self.registry.workers[worker_id];
                 let _ = worker.remote_tx.send(task);
                 self.notify_work(worker_id);
                 return;
@@ -350,10 +454,8 @@ impl RuntimeShared {
 
             let current = current_worker_id();
 
-            // 2. 如果在当前 Worker 线程，尝试 LIFO 槽位或本地 Deque
             if current == worker_id {
-                let worker = &self.workers[worker_id];
-                // LIFO Slot
+                let worker = &self.registry.workers[worker_id];
                 let header_ptr = task.header() as *const _ as *mut _;
                 if worker
                     .lifo
@@ -369,18 +471,15 @@ impl RuntimeShared {
                     return;
                 }
 
-                // Deque
                 if worker.deque.push(task).is_ok() {
                     self.notify_work(worker_id);
                     return;
                 }
             }
 
-            // 3. 尝试目标 Worker 的远程邮箱 (MPSC)
-            let worker = &self.workers[worker_id];
+            let worker = &self.registry.workers[worker_id];
             if worker.remote_tx.send(task).is_err() {
-                // 如果目标 worker 邮箱也出问题（通常不会，除非关闭），放入全局注入器
-                let _ = self.injector.0.try_send(task);
+                let _ = self.scheduler.injector.0.try_send(task);
             }
             self.notify_work(worker_id);
         }
@@ -389,7 +488,7 @@ impl RuntimeShared {
     fn pop_local(&self, worker_id: usize, rx: &Receiver<LocalTaskRef>) -> Option<LocalTaskRef> {
         let res = rx.try_recv().ok();
         if res.is_some() {
-            self.workers[worker_id]
+            self.registry.workers[worker_id]
                 .local_count
                 .fetch_sub(1, Ordering::Release);
         }
@@ -397,80 +496,19 @@ impl RuntimeShared {
     }
 
     fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
-        let worker = &self.workers[worker_id];
-        // 1. 优先从 LIFO 槽位获取 (缓存局部性最强)
+        let worker = &self.registry.workers[worker_id];
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
         }
-        // 2. 从私有 Deque 获取
         worker.deque.pop()
     }
 
     fn pop_global(&self) -> Option<SendTaskRef> {
-        self.injector.1.try_recv().ok()
+        self.scheduler.pop_global()
     }
 
     fn steal_send(&self, thief_id: usize) -> Option<SendTaskRef> {
-        let thief_worker = &self.workers[thief_id];
-        let num_workers = self.workers.len();
-        if num_workers <= 1 {
-            return self.pop_global();
-        }
-
-        let group_idx = self.worker_to_group[thief_id];
-        let group = &self.groups[group_idx];
-
-        // 1. 尝试从同 NUMA 组窃取
-        if group.worker_ids.len() > 1 {
-            let start = CONTEXT.with(|ctx| {
-                ctx.borrow()
-                    .as_ref()
-                    .map(|c| c.rand.borrow_mut().next_u32(group.worker_ids.len() as u32) as usize)
-                    .unwrap_or(0)
-            });
-
-            for i in 0..group.worker_ids.len() {
-                let victim = group.worker_ids[(start + i) % group.worker_ids.len()];
-                if victim == thief_id {
-                    continue;
-                }
-                match self.workers[victim].deque.steal_batch(&thief_worker.deque) {
-                    Steal::Success(task) => return Some(task),
-                    Steal::Retry => return self.steal_send(thief_id),
-                    Steal::Empty => continue,
-                }
-            }
-        }
-
-        // 2. 尝试从 Injector 获取
-        if let Some(task) = self.pop_global() {
-            return Some(task);
-        }
-
-        // 3. 尝试从其他组窃取
-        let start_group = CONTEXT.with(|ctx| {
-            ctx.borrow()
-                .as_ref()
-                .map(|c| c.rand.borrow_mut().next_u32(self.groups.len() as u32) as usize)
-                .unwrap_or(0)
-        });
-
-        for i in 0..self.groups.len() {
-            let other_group_idx = (start_group + i) % self.groups.len();
-            if other_group_idx == group_idx {
-                continue;
-            }
-            let other_group = &self.groups[other_group_idx];
-            for &victim in &other_group.worker_ids {
-                match self.workers[victim].deque.steal_batch(&thief_worker.deque) {
-                    Steal::Success(task) => return Some(task),
-                    Steal::Retry => return self.steal_send(thief_id),
-                    Steal::Empty => continue,
-                }
-            }
-        }
-
-        None
+        self.scheduler.steal_send(thief_id, &self.registry, &self.topo)
     }
 
     fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
@@ -485,8 +523,8 @@ impl RuntimeShared {
 
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        for unparker in &self.unparkers {
-            unparker.unpark();
+        for i in 0..self.registry.unparkers.len() {
+            self.registry.unpark(i);
         }
     }
 
@@ -507,19 +545,16 @@ impl RuntimeShared {
                 let mut progressed = false;
                 tick = tick.wrapping_add(1);
 
-                // 1. 优先执行 LIFO Slot 和本地 Deque (缓存局部性路径)
                 if let Some(task) = self.pop_send(worker_id) {
                     self.poll_send_task(worker_id, task);
                     progressed = true;
                 }
 
-                // 2. 本地绑定任务 (MPSC 路径)
                 if !progressed && let Some(task) = self.pop_local(worker_id, &ctx.local_rx) {
                     self.poll_local_task(worker_id, task);
                     progressed = true;
                 }
 
-                // 3. 定期检查全局注入器 (公平性路径)
                 if !progressed
                     && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
                     && let Some(task) = self.pop_global()
@@ -528,7 +563,6 @@ impl RuntimeShared {
                     progressed = true;
                 }
 
-                // 4. 检查外部发送到本 worker 的任务 (MPSC 路径)
                 if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
                     self.poll_send_task(worker_id, task);
                     progressed = true;
@@ -538,8 +572,7 @@ impl RuntimeShared {
                     continue;
                 }
 
-                // 5. 工作窃取路径 (自适应搜索)
-                self.searching_workers.fetch_add(1, Ordering::Relaxed);
+                self.scheduler.searching_workers.fetch_add(1, Ordering::Relaxed);
                 for _ in 0..4 {
                     if let Some(task) = self.steal_send(worker_id) {
                         self.poll_send_task(worker_id, task);
@@ -553,63 +586,60 @@ impl RuntimeShared {
                     }
                     std::hint::spin_loop();
                 }
-                self.searching_workers.fetch_sub(1, Ordering::Relaxed);
+                self.scheduler.searching_workers.fetch_sub(1, Ordering::Relaxed);
 
                 if progressed {
                     continue;
                 }
 
-                // 6. 休眠路径
-                let seq = self.event_count.load();
-                self.idle_mask.set(worker_id);
-                let group_idx = self.worker_to_group[worker_id];
-                self.groups[group_idx]
+                let seq = self.idle.event_count.load();
+                self.idle.idle_mask.set(worker_id);
+                let group_idx = self.topo.worker_to_group[worker_id];
+                self.topo.groups[group_idx]
                     .idle_stack
-                    .push(worker_id, &self.next_idle);
+                    .push(worker_id, &self.topo.next_idle);
 
                 let idle_hint = super::context::run_worker_idle_hook();
 
-                // Double check before parking
-                if self.event_count.load() != seq
+                if self.idle.event_count.load() != seq
                     || self.has_work(worker_id)
                     || self.shutdown.load(Ordering::Acquire)
                     || completion.map(|c| c.is_done()).unwrap_or(false)
                 {
-                    if self.groups[group_idx]
+                    if self.topo.groups[group_idx]
                         .idle_stack
-                        .pop(&self.next_idle)
+                        .pop(&self.topo.next_idle)
                         .is_some()
                     {
-                        self.idle_mask.clear(worker_id);
+                        self.idle.idle_mask.clear(worker_id);
                     }
                     continue;
                 }
 
-                // 最后检查远程队列和注入器
                 if let Ok(task) = ctx.remote_rx.try_recv() {
-                    if self.groups[group_idx]
+                    if self.topo.groups[group_idx]
                         .idle_stack
-                        .pop(&self.next_idle)
+                        .pop(&self.topo.next_idle)
                         .is_some()
                     {
-                        self.idle_mask.clear(worker_id);
+                        self.idle.idle_mask.clear(worker_id);
                     }
                     self.poll_send_task(worker_id, task);
                     continue;
                 }
                 if let Some(task) = self.pop_global() {
-                    if self.groups[group_idx]
+                    if self.topo.groups[group_idx]
                         .idle_stack
-                        .pop(&self.next_idle)
+                        .pop(&self.topo.next_idle)
                         .is_some()
                     {
-                        self.idle_mask.clear(worker_id);
+                        self.idle.idle_mask.clear(worker_id);
                     }
                     self.poll_send_task(worker_id, task);
                     continue;
                 }
 
-                let parker = Parker::from_inner(self.parker_inners[worker_id].clone());
+                let parker = Parker::from_inner(self.registry.parker_inners[worker_id].clone());
                 if let Some(duration) = idle_hint {
                     let _ = parker.park_timeout(duration);
                 } else if completion.is_some() {
@@ -618,14 +648,14 @@ impl RuntimeShared {
                     parker.park();
                 }
 
-                let _ = self.groups[group_idx].idle_stack.pop(&self.next_idle);
-                self.idle_mask.clear(worker_id);
+                let _ = self.topo.groups[group_idx].idle_stack.pop(&self.topo.next_idle);
+                self.idle.idle_mask.clear(worker_id);
             }
         });
     }
 
     fn has_work(&self, worker_id: usize) -> bool {
-        let worker = &self.workers[worker_id];
+        let worker = &self.registry.workers[worker_id];
         worker.lifo.load(Ordering::Acquire).is_some()
             || !worker.deque.is_empty()
             || worker.local_count.load(Ordering::Acquire) > 0

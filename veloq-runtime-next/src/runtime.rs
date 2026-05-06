@@ -101,10 +101,7 @@ where
             struct ShutdownGuard(Arc<RuntimeShared>);
             impl Drop for ShutdownGuard {
                 fn drop(&mut self) {
-                    self.0.shutdown.store(true, Ordering::Release);
-                    for unparker in &self.0.unparkers {
-                        unparker.unpark();
-                    }
+                    self.0.shutdown();
                 }
             }
             let _guard = ShutdownGuard(shared.clone());
