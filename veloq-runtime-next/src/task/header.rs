@@ -120,6 +120,12 @@ impl<S: Storage + 'static> GenericTaskHeader<S> {
     }
 
     #[inline]
+    pub fn force_affinity(&self, worker_id: usize) {
+        self.worker_id.store(worker_id, Ordering::Release);
+        self.state.fetch_or(STATE_AFFINE, Ordering::Release);
+    }
+
+    #[inline]
     pub fn try_mark_queued(&self) -> bool {
         loop {
             let state = self.state.load(Ordering::Acquire);

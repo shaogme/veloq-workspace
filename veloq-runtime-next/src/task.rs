@@ -56,6 +56,15 @@ fn current_send_task() -> Option<*const TaskHeader> {
     CURRENT_SEND_TASK.with(|slot| *slot.borrow())
 }
 
+pub async fn ensure_current_task_affinity(worker_id: usize) {
+    if let Some(header) = current_send_task() {
+        unsafe { (&*header).force_affinity(worker_id) };
+        if crate::runtime::current_worker_id() != worker_id {
+            yield_now().await;
+        }
+    }
+}
+
 /// 持有此 guard 期间，当前 SendTask 的后续唤醒会固定回到当前 worker，
 /// 从而避免在 `await` 之间被其他 worker 窃取。
 pub struct TaskAffinityGuard {

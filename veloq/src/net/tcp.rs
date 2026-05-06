@@ -68,6 +68,7 @@ fn new_stream_inner<P: SocketTokenPtr>(addr: &SocketAddr) -> io::Result<InnerSoc
 
 impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpListener<S, P> {
     async fn accept_direct(&self) -> io::Result<(GenericTcpStream<S, P>, SocketAddr)> {
+        self.inner.ensure_affinity().await?;
         let op = Accept {
             fd: self.inner.fd(),
             addr: veloq_driver::SockAddrStorage::default(),
@@ -106,6 +107,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpStream<S, P> {
         submitter: S,
         addr: SocketAddr,
     ) -> io::Result<Self> {
+        inner.ensure_affinity().await?;
         let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = Connect {
@@ -125,6 +127,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpStream<S, P> {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
+        self.inner.ensure_affinity().await?;
         let op = Recv {
             fd: self.inner.fd(),
             buf,
@@ -142,6 +145,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpStream<S, P> {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
+        self.inner.ensure_affinity().await?;
         let op = OpSend {
             fd: self.inner.fd(),
             buf,

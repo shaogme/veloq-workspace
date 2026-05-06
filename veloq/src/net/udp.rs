@@ -52,6 +52,7 @@ fn bind_inner<A: ToSocketAddrs, P: SocketTokenPtr>(addr: A) -> io::Result<InnerS
 
 impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
     pub async fn recv_ready(&self, buf_capacity: NonZeroUsize, credits: usize) -> io::Result<()> {
+        self.inner.ensure_affinity().await?;
         if credits == 0 {
             return Ok(());
         }
@@ -76,6 +77,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
         buf: FixedBuf,
         target: SocketAddr,
     ) -> io::Result<(usize, FixedBuf)> {
+        self.inner.ensure_affinity().await?;
         let op = SendTo {
             fd: self.inner.fd(),
             buf,
@@ -90,6 +92,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
     }
 
     async fn recv_stream_direct(&self, buf: FixedBuf) -> io::Result<UdpRecvPacket> {
+        self.inner.ensure_affinity().await?;
         let op = UdpRecvStream {
             fd: self.inner.fd(),
             buf: Some(buf),
@@ -122,6 +125,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
     }
 
     async fn connect_direct(&self, addr: SocketAddr) -> io::Result<()> {
+        self.inner.ensure_affinity().await?;
         let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = UdpConnect {
@@ -138,6 +142,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
+        self.inner.ensure_affinity().await?;
         let op = OpUdpSend {
             fd: self.inner.fd(),
             buf,
@@ -155,6 +160,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> io::Result<(usize, FixedBuf)> {
+        self.inner.ensure_affinity().await?;
         let op = OpUdpRecv {
             fd: self.inner.fd(),
             buf,

@@ -18,7 +18,6 @@ fn driver_err(err: error_stack::Report<veloq_driver::error::DriverErrorKind>) ->
 
 pub struct SocketToken {
     fd: IoFd,
-    #[cfg(debug_assertions)]
     owner_worker_id: usize,
 }
 
@@ -46,7 +45,6 @@ impl SocketToken {
             })?;
         Ok(Self {
             fd,
-            #[cfg(debug_assertions)]
             owner_worker_id: veloq_runtime_next::runtime::current_worker_id(),
         })
     }
@@ -108,6 +106,15 @@ impl<P: SocketTokenPtr> InnerSocket<P> {
     #[inline]
     pub fn fd(&self) -> IoFd {
         self.token.fd()
+    }
+
+    pub fn owner_worker_id(&self) -> usize {
+        self.token.owner_worker_id
+    }
+
+    pub async fn ensure_affinity(&self) -> io::Result<()> {
+        veloq_runtime_next::task::ensure_current_task_affinity(self.token.owner_worker_id).await;
+        Ok(())
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
