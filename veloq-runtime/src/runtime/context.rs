@@ -36,6 +36,32 @@ impl IdleWaitStrategy {
     }
 }
 
+/// Worker 空闲阶段的显式决策。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleDecision {
+    /// 继续推进，不进入阻塞等待。
+    Continue,
+    /// 进入等待阶段，具体方式由 `IdleWaitStrategy` 决定。
+    Wait(IdleWaitStrategy),
+}
+
+impl IdleDecision {
+    #[inline]
+    pub fn continue_now() -> Self {
+        Self::Continue
+    }
+
+    #[inline]
+    pub fn wait(strategy: IdleWaitStrategy) -> Self {
+        Self::Wait(strategy)
+    }
+
+    #[inline]
+    pub fn is_continue(self) -> bool {
+        matches!(self, Self::Continue)
+    }
+}
+
 pub struct RuntimeContext {
     pub(crate) shared: Arc<RuntimeShared>,
     pub(crate) worker_id: usize,
@@ -45,7 +71,7 @@ pub struct RuntimeContext {
     pub(crate) idle_hook: Option<IdleHook>,
 }
 
-pub type IdleHook = fn() -> IdleWaitStrategy;
+pub type IdleHook = fn() -> IdleDecision;
 
 thread_local! {
     #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
@@ -105,10 +131,43 @@ pub(crate) fn with_current_runtime<R>(f: impl FnOnce(&Arc<RuntimeShared>) -> R) 
     CONTEXT.with(|ctx| ctx.borrow().as_ref().map(|c| f(&c.shared)))
 }
 
-pub(crate) fn run_worker_idle_hook() -> IdleWaitStrategy {
+pub(crate) fn run_worker_idle_hook() -> IdleDecision {
     CONTEXT.with(|ctx| {
-        ctx.borrow().as_ref().map_or(IdleWaitStrategy::Block, |c| {
-            c.idle_hook.map_or(IdleWaitStrategy::Block, |h| h())
-        })
+        ctx.borrow()
+            .as_ref()
+            .map_or(IdleDecision::wait(IdleWaitStrategy::Block), |c| {
+                c.idle_hook
+                    .map_or(IdleDecision::wait(IdleWaitStrategy::Block), |h| h())
+            })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn idle_decision_continue_marks_continue() {
+        assert!(IdleDecision::continue_now().is_continue());
+    }
+
+    #[test]
+    fn idle_decision_wait_wraps_strategy() {
+        let decision = IdleDecision::wait(IdleWaitStrategy::timeout(Duration::from_millis(5)));
+        match decision {
+            IdleDecision::Wait(IdleWaitStrategy::Timeout(duration)) => {
+                assert_eq!(duration, Duration::from_millis(5));
+            }
+            _ => panic!("unexpected idle decision"),
+        }
+    }
+
+    #[test]
+    fn idle_hook_defaults_to_block_without_context() {
+        assert!(matches!(
+            run_worker_idle_hook(),
+            IdleDecision::Wait(IdleWaitStrategy::Block)
+        ));
+    }
 }

@@ -1,4 +1,5 @@
 mod context;
+mod coordinator;
 mod primitives;
 mod shared;
 
@@ -24,8 +25,8 @@ pub use primitives::{
 
 pub(crate) use context::with_current_runtime;
 pub use context::{
-    IdleHook, IdleWaitStrategy, RuntimeContext, WorkerInitContext, clear_current_runtime_context,
-    current_worker_id, set_current_runtime_context,
+    IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, WorkerInitContext,
+    clear_current_runtime_context, current_worker_id, set_current_runtime_context,
 };
 pub(crate) use shared::RuntimeShared;
 
@@ -154,10 +155,15 @@ where
                 match fut.as_mut().poll(&mut cx) {
                     Poll::Ready(res) => break res,
                     Poll::Pending => match context::run_worker_idle_hook() {
-                        context::IdleWaitStrategy::Timeout(duration) => {
+                        context::IdleDecision::Continue => {
+                            std::thread::yield_now();
+                        }
+                        context::IdleDecision::Wait(context::IdleWaitStrategy::Timeout(
+                            duration,
+                        )) => {
                             let _ = signal.wait_timeout(duration);
                         }
-                        context::IdleWaitStrategy::Block => {
+                        context::IdleDecision::Wait(context::IdleWaitStrategy::Block) => {
                             signal.wait();
                         }
                     },

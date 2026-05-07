@@ -1,5 +1,6 @@
 use super::context::{CONTEXT, current_worker_id};
-use super::primitives::{self, EventCount, Parker, Unparker};
+use super::coordinator::RuntimeProgressCoordinator;
+use super::primitives::{self, EventCount, Unparker};
 use crate::scope::GenericScopeCompletion;
 use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
@@ -13,7 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 pub(crate) struct WorkerQueue {
     pub(crate) local_tx: Sender<LocalTaskRef>,
@@ -59,7 +59,7 @@ impl IdleStack {
         }
     }
 
-    fn push(&self, worker_id: usize, next_ptrs: &[AtomicUsize]) {
+    pub(crate) fn push(&self, worker_id: usize, next_ptrs: &[AtomicUsize]) {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
             let generation = if head == Self::EMPTY {
@@ -88,7 +88,7 @@ impl IdleStack {
         }
     }
 
-    fn pop(&self, next_ptrs: &[AtomicUsize]) -> Option<usize> {
+    pub(crate) fn pop(&self, next_ptrs: &[AtomicUsize]) -> Option<usize> {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
             if head == Self::EMPTY {
@@ -133,13 +133,13 @@ impl AtomicBitset {
         }
     }
 
-    fn set(&self, index: usize) {
+    pub(crate) fn set(&self, index: usize) {
         let word = index / 64;
         let bit = index % 64;
         self.bits[word].fetch_or(1 << bit, Ordering::Release);
     }
 
-    fn clear(&self, index: usize) {
+    pub(crate) fn clear(&self, index: usize) {
         let word = index / 64;
         let bit = index % 64;
         self.bits[word].fetch_and(!(1 << bit), Ordering::Release);
@@ -264,7 +264,7 @@ pub(crate) struct TaskScheduler {
 }
 
 impl TaskScheduler {
-    fn pop_global(&self) -> Option<SendTaskRef> {
+    pub(crate) fn pop_global(&self) -> Option<SendTaskRef> {
         self.injector.pop()
     }
 
@@ -558,7 +558,7 @@ impl RuntimeShared {
         let _ = task.poll_task(worker_id);
     }
 
-    fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) {
+    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) {
         task.header().clear_queued();
         let _ = task.poll_task(worker_id);
     }
@@ -666,64 +666,12 @@ impl RuntimeShared {
                     continue;
                 }
 
-                let idle_strategy = super::context::run_worker_idle_hook();
-                let seq = self.idle.event_count.load();
-                self.idle.idle_mask.set(worker_id);
-                let group_idx = self.topo.worker_to_group[worker_id];
-                self.topo.groups[group_idx]
-                    .idle_stack
-                    .push(worker_id, &self.topo.next_idle);
-
-                if self.idle.event_count.load() != seq
-                    || self.has_work(worker_id)
-                    || self.shutdown.load(Ordering::Acquire)
-                    || completion.map(|c| c.is_done()).unwrap_or(false)
-                {
-                    if self.topo.groups[group_idx]
-                        .idle_stack
-                        .pop(&self.topo.next_idle)
-                        .is_some()
-                    {
-                        self.idle.idle_mask.clear(worker_id);
-                    }
-                    continue;
-                }
-
-                if let Some(task) = self.pop_global() {
-                    if self.topo.groups[group_idx]
-                        .idle_stack
-                        .pop(&self.topo.next_idle)
-                        .is_some()
-                    {
-                        self.idle.idle_mask.clear(worker_id);
-                    }
-                    self.poll_send_task(worker_id, task);
-                    continue;
-                }
-
-                let parker = Parker::from_inner(self.registry.parker_inners[worker_id].clone());
-                match idle_strategy {
-                    super::context::IdleWaitStrategy::Timeout(duration) => {
-                        let _ = parker.park_timeout(duration);
-                    }
-                    super::context::IdleWaitStrategy::Block => {
-                        if completion.is_some() {
-                            let _ = parker.park_timeout(Duration::from_millis(1));
-                        } else {
-                            parker.park();
-                        }
-                    }
-                }
-
-                let _ = self.topo.groups[group_idx]
-                    .idle_stack
-                    .pop(&self.topo.next_idle);
-                self.idle.idle_mask.clear(worker_id);
+                RuntimeProgressCoordinator::new(self, worker_id).run(completion);
             }
         });
     }
 
-    fn has_work(&self, worker_id: usize) -> bool {
+    pub(crate) fn has_work(&self, worker_id: usize) -> bool {
         let worker = &self.registry.workers[worker_id];
         worker.lifo.load(Ordering::Acquire).is_some()
             || !worker.deque.is_empty()

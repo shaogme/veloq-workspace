@@ -10,8 +10,7 @@ use veloq_driver::driver::{DriveMode, Driver, PlatformDriver};
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 use crate::config::{BufferRegistrationMode, Config};
-use std::time::Duration;
-use veloq_runtime::runtime::IdleWaitStrategy;
+use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy};
 
 thread_local! {
     /// 线程局部的运行时上下文
@@ -177,23 +176,35 @@ impl RuntimeDriverBridge {
         self.registrar.sync_to_driver();
     }
 
-    /// 让当前线程的驱动轮询一次，并返回下一次建议的空闲等待策略。
+    /// 让当前线程的驱动非阻塞推进一次。
     ///
-    /// 这个入口同时服务于普通提交后的推进和 runtime 的 idle hook。
-    pub fn drive_poll(&self) -> IdleWaitStrategy {
+    /// 这个入口只服务于提交路径，避免在提交后把线程阻塞在驱动里。
+    pub fn drive_poll(&self) {
         self.sync_registrar();
         let driver_rc = self.driver.clone();
         let mut driver = driver_rc.borrow_mut();
-        let outcome = driver
+        driver
             .drive(DriveMode::Poll)
             .unwrap_or_else(|err| panic!("driver drive(Poll) failed: {err:#}"));
-        let hint = outcome.next_timeout_hint;
-        match hint {
-            Some(duration) => IdleWaitStrategy::timeout(duration),
-            None if driver.has_pending_progress() => {
-                IdleWaitStrategy::timeout(Duration::from_millis(10))
-            }
-            None => IdleWaitStrategy::block(),
+    }
+
+    /// 让当前线程的驱动在空闲时进入等待推进。
+    ///
+    /// 这个入口会优先利用驱动后端的阻塞等待能力，避免固定轮询兜底。
+    pub fn drive_wait(&self) -> IdleDecision {
+        self.sync_registrar();
+        let driver_rc = self.driver.clone();
+        let mut driver = driver_rc.borrow_mut();
+        if !driver.has_pending_progress() {
+            return IdleDecision::wait(IdleWaitStrategy::block());
+        }
+
+        let outcome = driver
+            .drive(DriveMode::Wait)
+            .unwrap_or_else(|err| panic!("driver drive(Wait) failed: {err:#}"));
+        match outcome.next_timeout_hint {
+            Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
+            None => IdleDecision::wait(IdleWaitStrategy::block()),
         }
     }
 }
@@ -284,11 +295,29 @@ pub fn alloc(size: NonZeroUsize) -> FixedBuf {
     try_alloc(size).expect("failed to allocate buffer")
 }
 
-pub fn poll_current_driver() -> IdleWaitStrategy {
+pub fn poll_current_driver() -> IdleDecision {
     let Some(ctx) = try_current() else {
-        return IdleWaitStrategy::block();
+        return IdleDecision::wait(IdleWaitStrategy::block());
     };
-    ctx.driver_bridge().drive_poll()
+    let bridge = ctx.driver_bridge();
+    bridge.sync_registrar();
+    let driver_rc = bridge.driver.clone();
+    let mut driver = driver_rc.borrow_mut();
+    let outcome = driver
+        .drive(DriveMode::Poll)
+        .unwrap_or_else(|err| panic!("driver drive(Poll) failed: {err:#}"));
+    match outcome.next_timeout_hint {
+        Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
+        None if driver.has_pending_progress() => IdleDecision::continue_now(),
+        None => IdleDecision::wait(IdleWaitStrategy::block()),
+    }
+}
+
+pub fn wait_current_driver() -> IdleDecision {
+    let Some(ctx) = try_current() else {
+        return IdleDecision::wait(IdleWaitStrategy::block());
+    };
+    ctx.driver_bridge().drive_wait()
 }
 
 pub fn submit<'a, S, T>(
@@ -315,7 +344,7 @@ where
                 Poll::Pending => {
                     let ctx = current();
                     let bridge = ctx.driver_bridge();
-                    let _ = bridge.drive_poll();
+                    bridge.drive_poll();
                     Poll::Pending
                 }
             },
