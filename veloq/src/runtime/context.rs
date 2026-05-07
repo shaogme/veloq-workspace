@@ -11,6 +11,7 @@ use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 use crate::config::{BufferRegistrationMode, Config};
 use std::time::Duration;
+use veloq_runtime::runtime::IdleWaitStrategy;
 
 thread_local! {
     /// 线程局部的运行时上下文
@@ -176,10 +177,10 @@ impl RuntimeDriverBridge {
         self.registrar.sync_to_driver();
     }
 
-    /// 让当前线程的驱动轮询一次，并返回下一次建议的空闲轮询间隔。
+    /// 让当前线程的驱动轮询一次，并返回下一次建议的空闲等待策略。
     ///
     /// 这个入口同时服务于普通提交后的推进和 runtime 的 idle hook。
-    pub fn drive_poll(&self) -> Option<Duration> {
+    pub fn drive_poll(&self) -> IdleWaitStrategy {
         self.sync_registrar();
         let driver_rc = self.driver.clone();
         let mut driver = driver_rc.borrow_mut();
@@ -187,10 +188,12 @@ impl RuntimeDriverBridge {
             .drive(DriveMode::Poll)
             .unwrap_or_else(|err| panic!("driver drive(Poll) failed: {err:#}"));
         let hint = outcome.next_timeout_hint;
-        if hint.is_none() && driver.has_pending_progress() {
-            Some(Duration::from_millis(10))
-        } else {
-            hint
+        match hint {
+            Some(duration) => IdleWaitStrategy::timeout(duration),
+            None if driver.has_pending_progress() => {
+                IdleWaitStrategy::timeout(Duration::from_millis(10))
+            }
+            None => IdleWaitStrategy::block(),
         }
     }
 }
@@ -281,8 +284,10 @@ pub fn alloc(size: NonZeroUsize) -> FixedBuf {
     try_alloc(size).expect("failed to allocate buffer")
 }
 
-pub fn poll_current_driver() -> Option<Duration> {
-    let ctx = try_current()?;
+pub fn poll_current_driver() -> IdleWaitStrategy {
+    let Some(ctx) = try_current() else {
+        return IdleWaitStrategy::block();
+    };
     ctx.driver_bridge().drive_poll()
 }
 

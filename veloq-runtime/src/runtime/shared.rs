@@ -666,7 +666,7 @@ impl RuntimeShared {
                     continue;
                 }
 
-                let idle_hint = super::context::run_worker_idle_hook();
+                let idle_strategy = super::context::run_worker_idle_hook();
                 let seq = self.idle.event_count.load();
                 self.idle.idle_mask.set(worker_id);
                 let group_idx = self.topo.worker_to_group[worker_id];
@@ -702,12 +702,17 @@ impl RuntimeShared {
                 }
 
                 let parker = Parker::from_inner(self.registry.parker_inners[worker_id].clone());
-                if let Some(duration) = idle_hint {
-                    let _ = parker.park_timeout(duration);
-                } else if completion.is_some() {
-                    let _ = parker.park_timeout(Duration::from_millis(1));
-                } else {
-                    parker.park();
+                match idle_strategy {
+                    super::context::IdleWaitStrategy::Timeout(duration) => {
+                        let _ = parker.park_timeout(duration);
+                    }
+                    super::context::IdleWaitStrategy::Block => {
+                        if completion.is_some() {
+                            let _ = parker.park_timeout(Duration::from_millis(1));
+                        } else {
+                            parker.park();
+                        }
+                    }
                 }
 
                 let _ = self.topo.groups[group_idx]

@@ -7,6 +7,35 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+/// Worker 空闲时的等待策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleWaitStrategy {
+    /// 持续阻塞，直到有新的唤醒事件。
+    Block,
+    /// 阻塞指定时长后重新检查。
+    Timeout(Duration),
+}
+
+impl IdleWaitStrategy {
+    #[inline]
+    pub fn timeout(duration: Duration) -> Self {
+        Self::Timeout(duration)
+    }
+
+    #[inline]
+    pub fn block() -> Self {
+        Self::Block
+    }
+
+    #[inline]
+    pub fn into_timeout(self) -> Option<Duration> {
+        match self {
+            Self::Block => None,
+            Self::Timeout(duration) => Some(duration),
+        }
+    }
+}
+
 pub struct RuntimeContext {
     pub(crate) shared: Arc<RuntimeShared>,
     pub(crate) worker_id: usize,
@@ -16,7 +45,7 @@ pub struct RuntimeContext {
     pub(crate) idle_hook: Option<IdleHook>,
 }
 
-pub type IdleHook = fn() -> Option<Duration>;
+pub type IdleHook = fn() -> IdleWaitStrategy;
 
 thread_local! {
     #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
@@ -76,10 +105,10 @@ pub(crate) fn with_current_runtime<R>(f: impl FnOnce(&Arc<RuntimeShared>) -> R) 
     CONTEXT.with(|ctx| ctx.borrow().as_ref().map(|c| f(&c.shared)))
 }
 
-pub(crate) fn run_worker_idle_hook() -> Option<Duration> {
+pub(crate) fn run_worker_idle_hook() -> IdleWaitStrategy {
     CONTEXT.with(|ctx| {
-        ctx.borrow()
-            .as_ref()
-            .and_then(|c| c.idle_hook.and_then(|h| h()))
+        ctx.borrow().as_ref().map_or(IdleWaitStrategy::Block, |c| {
+            c.idle_hook.map_or(IdleWaitStrategy::Block, |h| h())
+        })
     })
 }
