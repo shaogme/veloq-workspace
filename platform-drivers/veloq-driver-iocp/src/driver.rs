@@ -7,7 +7,6 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
-use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{
     SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
 };
@@ -16,8 +15,8 @@ use veloq_blocking::{BlockingTask, get_blocking_pool};
 #[cfg(feature = "test-hooks")]
 pub use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver,
-    Outcome, RegisterFd, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+    CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver, Outcome,
+    RegisterFd, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
     SubmitStatus,
 };
 use veloq_driver_core::error::{
@@ -781,51 +780,6 @@ impl Driver for IocpDriver {
         )
     }
 
-    fn submit_background(&mut self, op: Self::Op) -> DriverResult<()> {
-        if self.shutting_down {
-            return Err(driver_os_error(
-                DriverErrorKind::System,
-                "iocp/driver",
-                ERROR_OPERATION_ABORTED as i32,
-                "driver is shutting down",
-            ));
-        }
-        let (user_data, _) = self.reserve_op()?;
-        let (_, result) = self.call_op_submit(user_data, op)?;
-
-        match result {
-            Ok(submit::SubmissionResult::Offload(task)) => {
-                let (_, op_entry) =
-                    self.ops.get_slot_and_entry_mut(user_data).ok_or_else(|| {
-                        driver_error(DriverErrorKind::Internal, "iocp/driver", "op not found")
-                    })?;
-                op_entry.platform_data.is_background = true;
-                if get_blocking_pool().execute(task).is_err() {
-                    let generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
-                    self.ops.recycle(user_data, generation.wrapping_add(1));
-                    return Err(driver_error(
-                        DriverErrorKind::Submission,
-                        "iocp/driver",
-                        "thread pool overloaded",
-                    ));
-                }
-            }
-            Ok(_) => {
-                let (_, op_entry) =
-                    self.ops.get_slot_and_entry_mut(user_data).ok_or_else(|| {
-                        driver_error(DriverErrorKind::Internal, "iocp/driver", "op not found")
-                    })?;
-                op_entry.platform_data.is_background = true;
-            }
-            Err(e) => {
-                let generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
-                self.ops.recycle(user_data, generation.wrapping_add(1));
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
@@ -861,21 +815,6 @@ impl Driver for IocpDriver {
 
     fn completion_table(&self) -> SharedCompletionTable {
         self.completion_table.clone()
-    }
-
-    fn wait_and_drain_completions(
-        &mut self,
-        out: &mut Vec<CompletionEvent>,
-    ) -> DriverResult<usize> {
-        self.get_completion(u32::MAX).map_err(|e| {
-            Self::with_report_detail(
-                DriverErrorKind::Completion,
-                "iocp/driver",
-                "wait for completion failed",
-                format!("{e:#}"),
-            )
-        })?;
-        Ok(self.drain_completions(out))
     }
 
     fn cancel_op(&mut self, user_data: usize) {
@@ -925,22 +864,8 @@ impl Driver for IocpDriver {
             )
     }
 
-    fn wake(&mut self) -> DriverResult<()> {
-        IocpDriver::wake(self).map_err(|e| {
-            driver_error(
-                DriverErrorKind::Submission,
-                "iocp/driver",
-                format!("wakeup failed: {e:#}"),
-            )
-        })
-    }
-
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
         IocpDriver::create_waker(self)
-    }
-
-    fn driver_id(&self) -> usize {
-        self.port.as_raw() as usize
     }
 
     fn has_active_ops(&mut self) -> bool {

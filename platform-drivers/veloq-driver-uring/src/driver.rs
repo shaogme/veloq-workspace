@@ -18,7 +18,7 @@ use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, DriveMode, DriveOutcome, Driver, Outcome, RegisterFd,
     RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
-    encode_completion_token,
+    drain_cancel_requests, encode_completion_token,
 };
 use veloq_driver_core::error::{
     DriverErrorKind, DriverErrorReport, DriverResult, driver_error,
@@ -71,7 +71,6 @@ impl RemoteWaker for UringWaker {
 }
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
-pub(crate) const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
 const MIN_FILE_TABLE_CAPACITY: usize = 1;
 
 #[inline]
@@ -518,7 +517,7 @@ impl UringDriver {
     }
 
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
-        self.drain_cancel_requests();
+        drain_cancel_requests(self);
         self.flush_cancellations();
         self.flush_backlog();
 
@@ -602,7 +601,7 @@ impl UringDriver {
     }
 
     pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
-        self.drain_cancel_requests();
+        drain_cancel_requests(self);
         self.flush_cancellations();
         self.flush_backlog();
         self.submit_to_kernel()?;
@@ -651,7 +650,6 @@ impl UringDriver {
 
             if user_data == u64::MAX as usize
                 || user_data == CANCEL_USER_DATA as usize
-                || user_data == BACKGROUND_USER_DATA as usize
             {
                 continue;
             }
@@ -943,29 +941,6 @@ impl Driver for UringDriver {
         }
     }
 
-    fn submit_background(&mut self, mut op: Self::Op) -> DriverResult<()> {
-        let strategy = op.vtable.strategy;
-        if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
-            let sqe =
-                unsafe { (op.vtable.make_sqe)(&mut op, self)?.user_data(BACKGROUND_USER_DATA) };
-
-            if !self.push_entry(sqe) {
-                return Err(driver_error(
-                    DriverErrorKind::Submission,
-                    "uring.driver.submit_background",
-                    "sq full",
-                ));
-            }
-            Ok(())
-        } else {
-            Err(driver_error(
-                DriverErrorKind::Unsupported,
-                "uring.driver.submit_background",
-                "background op only supports BackgroundOnly strategy",
-            ))
-        }
-    }
-
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
@@ -997,18 +972,6 @@ impl Driver for UringDriver {
 
     fn completion_table(&self) -> SharedCompletionTable {
         self.completion_table.clone()
-    }
-
-    fn wait_and_drain_completions(
-        &mut self,
-        out: &mut Vec<veloq_driver_core::driver::CompletionEvent>,
-    ) -> DriverResult<usize> {
-        self.wait_internal().to_driver_result(
-            DriverErrorKind::Completion,
-            "uring.driver.wait_and_drain_completions",
-            "wait and drain completions",
-        )?;
-        Ok(self.drain_completions(out))
     }
 
     fn cancel_op(&mut self, user_data: usize) {
@@ -1054,34 +1017,11 @@ impl Driver for UringDriver {
         Ok(())
     }
 
-    fn wake(&mut self) -> DriverResult<()> {
-        let buf = 1u64.to_ne_bytes();
-        let ret =
-            unsafe { libc::write(self.waker_fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EAGAIN) {
-                return Ok(());
-            }
-            return Err(driver_os_error(
-                DriverErrorKind::System,
-                "uring.driver.wake",
-                err.raw_os_error().unwrap_or(libc::EIO),
-                err.to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
         Arc::new(UringWaker {
             fd: self.waker_fd.clone(),
             is_waked: self.is_waked.clone(),
         })
-    }
-
-    fn driver_id(&self) -> usize {
-        self.waker_fd.fd.raw().as_fd() as usize
     }
 
     fn has_active_ops(&mut self) -> bool {

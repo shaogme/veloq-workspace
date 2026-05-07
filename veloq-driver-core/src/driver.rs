@@ -545,29 +545,6 @@ pub trait Driver: 'static {
 
     fn detached_cancel_table(&self) -> std::sync::Arc<slot::DetachedCancelTable>;
 
-    fn drain_cancel_requests(&mut self) {
-        let shared = self.slot_table();
-        let cancel_table = self.detached_cancel_table();
-        let word_count = cancel_table.cancel_word_count();
-        for word_idx in 0..word_count {
-            let mut bits = cancel_table.take_cancel_word(word_idx);
-            while bits != 0 {
-                let bit_idx = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-
-                let user_data = word_idx * 64 + bit_idx;
-                let Some((generation, state)) = shared.slot_snapshot(user_data) else {
-                    continue;
-                };
-                if cancel_table.cancel_generation(user_data) == generation as u64
-                    && is_runnable_state(state)
-                {
-                    self.cancel_op(user_data);
-                }
-            }
-        }
-    }
-
     fn slot_set_payload(&mut self, user_data: usize, payload: slot::ErasedPayload);
 
     fn slot_take_payload(&mut self, user_data: usize) -> Option<slot::ErasedPayload>;
@@ -599,22 +576,6 @@ pub trait Driver: 'static {
         drained
     }
 
-    fn wait_and_drain_completions(
-        &mut self,
-        out: &mut Vec<CompletionEvent>,
-    ) -> DriverResult<usize> {
-        self.drive(DriveMode::Wait)?;
-        Ok(self.drain_completions(out))
-    }
-
-    fn try_take_completion(&mut self, token: u64) -> PollRecordResult<Self::Completion> {
-        self.completion_table().try_take(token)
-    }
-
-    fn try_take_completion_record(&mut self, token: u64) -> PollRecordResult<Self::Completion> {
-        self.completion_table().try_take_record(token)
-    }
-
     fn register_completion_waker(&mut self, token: u64, waker: &Waker) {
         self.completion_table().register_waker(token, waker);
     }
@@ -637,13 +598,7 @@ pub trait Driver: 'static {
         credits: usize,
     ) -> DriverResult<()>;
 
-    fn submit_background(&mut self, op: Self::Op) -> DriverResult<()>;
-
-    fn wake(&mut self) -> DriverResult<()>;
-
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
-
-    fn driver_id(&self) -> usize;
 
     fn has_active_ops(&mut self) -> bool;
 
@@ -656,6 +611,30 @@ pub trait Driver: 'static {
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
+}
+
+#[inline]
+pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
+    let shared = driver.slot_table();
+    let cancel_table = driver.detached_cancel_table();
+    let word_count = cancel_table.cancel_word_count();
+    for word_idx in 0..word_count {
+        let mut bits = cancel_table.take_cancel_word(word_idx);
+        while bits != 0 {
+            let bit_idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+
+            let user_data = word_idx * 64 + bit_idx;
+            let Some((generation, state)) = shared.slot_snapshot(user_data) else {
+                continue;
+            };
+            if cancel_table.cancel_generation(user_data) == generation as u64
+                && is_runnable_state(state)
+            {
+                driver.cancel_op(user_data);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

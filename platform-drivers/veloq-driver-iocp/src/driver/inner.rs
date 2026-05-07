@@ -9,7 +9,7 @@ use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
 use veloq_driver_core::driver::{
-    Driver, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
 };
 use veloq_driver_core::op_registry::OpRegistry;
 use veloq_wheel::{Wheel, WheelConfig};
@@ -143,7 +143,7 @@ impl IocpDriver {
 
     /// Retrieves completion events from the I/O completion port.
     pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> IocpResult<()> {
-        self.drain_cancel_requests();
+        drain_cancel_requests(self);
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
         let status = self.port.get_status(wait_ms);
@@ -652,12 +652,6 @@ impl IocpDriver {
 
     pub(crate) fn has_active_ops_internal(&mut self) -> bool {
         self.ops.has_active_ops()
-    }
-
-    pub(crate) fn wake(&self) -> IocpResult<()> {
-        // SAFETY: we are posting a null overlapped pointer for wakeup.
-        unsafe { self.port.post(0, WAKEUP_USER_DATA, std::ptr::null_mut()) }
-            .map_err(|e| error_stack::Report::new(IocpError::Submission).attach(format!("{e:#}")))
     }
 
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker> {
