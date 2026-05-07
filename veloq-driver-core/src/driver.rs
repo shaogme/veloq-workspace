@@ -579,20 +579,7 @@ pub trait Driver: 'static {
         binder: SubmitBinder,
     ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>>;
 
-    fn submit_queue(&mut self) -> DriverResult<()>;
-
-    fn wait(&mut self) -> DriverResult<()>;
-
-    fn process_completions(&mut self);
-
-    fn poll_nonblocking(&mut self) -> DriverResult<()> {
-        self.process_completions();
-        Ok(())
-    }
-
-    fn next_timeout_hint(&self) -> Option<Duration> {
-        None
-    }
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome>;
 
     fn completion_queue(&self) -> SharedCompletionQueue;
 
@@ -616,7 +603,7 @@ pub trait Driver: 'static {
         &mut self,
         out: &mut Vec<CompletionEvent>,
     ) -> DriverResult<usize> {
-        self.wait()?;
+        self.drive(DriveMode::Wait)?;
         Ok(self.drain_completions(out))
     }
 
@@ -669,6 +656,17 @@ pub trait Driver: 'static {
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveMode {
+    Poll,
+    Wait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DriveOutcome {
+    pub next_timeout_hint: Option<Duration>,
 }
 
 pub trait RemoteWaker: Send + Sync {

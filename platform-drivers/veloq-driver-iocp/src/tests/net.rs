@@ -10,7 +10,7 @@ use std::os::windows::io::IntoRawSocket;
 use std::time::Duration;
 use veloq_buf::BufPool;
 use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
-use veloq_driver_core::driver::{Driver, RegisterFd, SubmitBinder};
+use veloq_driver_core::driver::{DriveMode, Driver, RegisterFd, SubmitBinder};
 use veloq_driver_core::op::{Accept, Connect, IntoPlatformOp, Recv};
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
@@ -414,7 +414,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let _ = tx_send.send(());
     let drain_start = std::time::Instant::now();
     while drain_start.elapsed() < Duration::from_secs(2) {
-        driver.process_completions();
+        let _ = driver.drive(DriveMode::Poll);
         if remote_free_contains(&driver, user_data) {
             break;
         }

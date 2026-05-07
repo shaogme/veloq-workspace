@@ -16,8 +16,8 @@ use crate::config::{
 use crate::error::{UringError, UringResult, UringResultExt, from_io_error};
 use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionSidecar, Driver, Outcome, RegisterFd, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    CompletionEvent, CompletionSidecar, DriveMode, DriveOutcome, Driver, Outcome, RegisterFd,
+    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
     encode_completion_token,
 };
 use veloq_driver_core::error::{
@@ -498,7 +498,6 @@ impl UringDriver {
         } else {
             let n = self.ring.submission().len();
             if n > 0 {
-                println!("UringDriver: submit_to_kernel flushing {} entries", n);
                 // We use enter with IORING_ENTER_GETEVENTS (1) to ensure tasks are triggered even with DEFER_TASKRUN.
                 unsafe {
                     self.ring
@@ -967,44 +966,29 @@ impl Driver for UringDriver {
         }
     }
 
-    fn submit_queue(&mut self) -> DriverResult<()> {
-        self.drain_cancel_requests();
-        self.flush_cancellations();
-        self.flush_backlog();
-        self.submit_to_kernel().to_driver_result(
-            DriverErrorKind::Submission,
-            "uring.driver.submit_queue",
-            "submit queue to kernel",
-        )
-    }
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+        match mode {
+            DriveMode::Poll => {
+                self.poll_nonblocking_internal().map_err(|e| {
+                    driver_error(
+                        DriverErrorKind::Completion,
+                        "uring.driver.drive.poll",
+                        format!("{e:#}"),
+                    )
+                })?;
+            }
+            DriveMode::Wait => {
+                self.wait_internal().to_driver_result(
+                    DriverErrorKind::Completion,
+                    "uring.driver.drive.wait",
+                    "wait for completions",
+                )?;
+            }
+        }
 
-    fn wait(&mut self) -> DriverResult<()> {
-        self.wait_internal().to_driver_result(
-            DriverErrorKind::Completion,
-            "uring.driver.wait",
-            "wait for completions",
-        )
-    }
-
-    fn process_completions(&mut self) {
-        self.drain_cancel_requests();
-        self.process_completions_internal();
-        self.flush_cancellations();
-        self.flush_backlog();
-    }
-
-    fn poll_nonblocking(&mut self) -> DriverResult<()> {
-        self.poll_nonblocking_internal().map_err(|e| {
-            driver_error(
-                DriverErrorKind::Completion,
-                "uring.driver.poll_nonblocking",
-                format!("{e:#}"),
-            )
+        Ok(DriveOutcome {
+            next_timeout_hint: self.wheel.next_timeout(),
         })
-    }
-
-    fn next_timeout_hint(&self) -> Option<Duration> {
-        self.wheel.next_timeout()
     }
 
     fn completion_queue(&self) -> SharedCompletionQueue {

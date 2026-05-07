@@ -16,8 +16,9 @@ use veloq_blocking::{BlockingTask, get_blocking_pool};
 #[cfg(feature = "test-hooks")]
 pub use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionSidecar as CoreCompletionSidecar, Driver, Outcome, RegisterFd,
-    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    CompletionEvent, CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver,
+    Outcome, RegisterFd, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+    SubmitStatus,
 };
 use veloq_driver_core::error::{
     DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
@@ -90,11 +91,10 @@ impl IocpDriver {
         driver_error(kind, scope, format!("{detail}: {report}"))
     }
 
-    /// Fallback probe for potentially untrusted external raw handles.
+    /// Fallback probe for potentially untrusted raw handles.
     ///
-    /// We trust `RawHandle` enum semantics by default. Probe is only used when
-    /// callers provide a `File`-tagged handle that may actually be a socket
-    /// (for example, legacy/raw trait boundaries that still pass plain HANDLE).
+    /// We trust `RawHandle` enum semantics by default. Probe is only used when a
+    /// `File`-tagged handle may actually be a socket.
     fn detect_socket_from_file_handle(handle: RawHandle) -> IocpResult<bool> {
         let socket = handle.raw().as_socket();
         let mut ty = 0i32;
@@ -826,41 +826,33 @@ impl Driver for IocpDriver {
         Ok(())
     }
 
-    fn submit_queue(&mut self) -> DriverResult<()> {
-        self.drain_cancel_requests();
-        Ok(())
-    }
-
-    fn wait(&mut self) -> DriverResult<()> {
-        self.get_completion(u32::MAX).map_err(|e| {
-            Self::with_report_detail(
-                DriverErrorKind::Completion,
-                "iocp/driver",
-                "wait for completion failed",
-                format!("{e:#}"),
-            )
-        })
-    }
-
-    fn process_completions(&mut self) {
-        if let Err(e) = self.get_completion(0) {
-            tracing::error!(report = ?e, "iocp process_completions failed");
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+        match mode {
+            DriveMode::Poll => {
+                self.get_completion(0).map_err(|e| {
+                    Self::with_report_detail(
+                        DriverErrorKind::Completion,
+                        "iocp/driver.drive.poll",
+                        "drive(Poll) failed",
+                        format!("{e:#}"),
+                    )
+                })?;
+            }
+            DriveMode::Wait => {
+                self.get_completion(u32::MAX).map_err(|e| {
+                    Self::with_report_detail(
+                        DriverErrorKind::Completion,
+                        "iocp/driver.drive.wait",
+                        "wait for completion failed",
+                        format!("{e:#}"),
+                    )
+                })?;
+            }
         }
-    }
 
-    fn poll_nonblocking(&mut self) -> DriverResult<()> {
-        self.get_completion(0).map_err(|e| {
-            Self::with_report_detail(
-                DriverErrorKind::Completion,
-                "iocp/driver",
-                "poll nonblocking failed",
-                format!("{e:#}"),
-            )
+        Ok(DriveOutcome {
+            next_timeout_hint: self.wheel.next_timeout(),
         })
-    }
-
-    fn next_timeout_hint(&self) -> Option<Duration> {
-        self.wheel.next_timeout()
     }
 
     fn completion_queue(&self) -> SharedCompletionQueue {

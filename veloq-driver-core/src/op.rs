@@ -279,32 +279,6 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
         &self,
         res: DriverResult<Self::DriverCompletion>,
     ) -> DriverResult<Self::Completion>;
-
-    /// Compatibility helper for transitional callsites.
-    #[inline]
-    fn from_kernel_and_payload(op: O, payload: Self::UserPayload) -> Self {
-        drop(op);
-        Self::from_user_payload(payload)
-    }
-
-    /// Compatibility helper for legacy callsites.
-    #[inline]
-    fn into_platform_op(self) -> O
-    where
-        Self::UserPayload: Default,
-    {
-        self.into_kernel_and_payload().0
-    }
-
-    /// Compatibility helper for legacy callsites.
-    #[inline]
-    fn from_platform_op(op: O) -> Self
-    where
-        Self::UserPayload: Default,
-    {
-        drop(op);
-        Self::from_user_payload(Default::default())
-    }
 }
 
 // ============================================================================

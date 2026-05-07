@@ -13,7 +13,7 @@ pub mod tests;
 
 use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
 
-// Re-exports for convenience and backward compatibility where appropriate
+// Re-exports used by the Windows backend and its callers.
 pub use config::{
     BorrowedRawHandle, BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, OwnedRawHandle,
     RawHandle, RawHandleKind, RegisteredHandle, SocketKey,

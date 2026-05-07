@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::task::Poll;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_driver::driver::{Driver, PlatformDriver};
+use veloq_driver::driver::{DriveMode, Driver, PlatformDriver};
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 use crate::config::{BufferRegistrationMode, Config};
@@ -176,18 +176,17 @@ impl RuntimeDriverBridge {
         self.registrar.sync_to_driver();
     }
 
-    /// 让当前线程的驱动推进一次，并返回下一次空闲轮询建议。
+    /// 让当前线程的驱动轮询一次，并返回下一次建议的空闲轮询间隔。
     ///
-    /// 这个入口同时用于普通提交后的推进和 runtime idle hook。
-    pub fn drive_nonblocking(&self) -> Option<Duration> {
+    /// 这个入口同时服务于普通提交后的推进和 runtime 的 idle hook。
+    pub fn drive_poll(&self) -> Option<Duration> {
         self.sync_registrar();
         let driver_rc = self.driver.clone();
         let mut driver = driver_rc.borrow_mut();
-        driver
-            .poll_nonblocking()
-            .unwrap_or_else(|err| panic!("driver poll_nonblocking failed: {err:#}"));
-
-        let hint = driver.next_timeout_hint();
+        let outcome = driver
+            .drive(DriveMode::Poll)
+            .unwrap_or_else(|err| panic!("driver drive(Poll) failed: {err:#}"));
+        let hint = outcome.next_timeout_hint;
         if hint.is_none() && driver.has_pending_progress() {
             Some(Duration::from_millis(10))
         } else {
@@ -282,9 +281,9 @@ pub fn alloc(size: NonZeroUsize) -> FixedBuf {
     try_alloc(size).expect("failed to allocate buffer")
 }
 
-pub fn poll_current_driver_nonblocking() -> Option<Duration> {
+pub fn poll_current_driver() -> Option<Duration> {
     let ctx = try_current()?;
-    ctx.driver_bridge().drive_nonblocking()
+    ctx.driver_bridge().drive_poll()
 }
 
 pub fn submit<'a, S, T>(
@@ -311,7 +310,7 @@ where
                 Poll::Pending => {
                     let ctx = current();
                     let bridge = ctx.driver_bridge();
-                    let _ = bridge.drive_nonblocking();
+                    let _ = bridge.drive_poll();
                     Poll::Pending
                 }
             },

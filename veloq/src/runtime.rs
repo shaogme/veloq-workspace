@@ -165,7 +165,7 @@ impl<T: PoolTopology> Runtime<T> {
         let runtime = async_runtime::Runtime::builder()
             .worker_count(worker_count)
             .queue_capacity(config.get_queue_capacity())
-            .idle_hook(crate::runtime::context::poll_current_driver_nonblocking)
+            .idle_hook(crate::runtime::context::poll_current_driver)
             .with_worker_init(move |worker_ctx: WorkerInitContext| {
                 let topology = topology.clone();
                 let state = state.clone();

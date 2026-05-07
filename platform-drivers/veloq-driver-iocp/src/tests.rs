@@ -5,7 +5,7 @@ pub(crate) mod net_udp;
 
 use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::{
-    Driver, PollRecordResult, encode_completion_token, event_res_to_result,
+    DriveMode, Driver, PollRecordResult, encode_completion_token, event_res_to_result,
 };
 use veloq_driver_core::error::driver_error_report_to_event_res;
 use veloq_driver_core::slot::SlotTable;
@@ -43,7 +43,7 @@ pub(crate) fn wait_completion(
                 )),
             );
         }
-        driver.process_completions();
+        let _ = driver.drive(DriveMode::Poll);
         match driver.try_take_completion(token) {
             PollRecordResult::Ready(record) => {
                 return event_res_to_result(record.event.res).map_err(|e| {
