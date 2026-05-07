@@ -443,6 +443,13 @@ pub struct JoinHandle<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<
     pub(crate) reclaim: Option<ReclaimFn<'scope, T, S::Arena>>,
 }
 
+unsafe impl<'scope, 'scope_ref, T> Send
+    for JoinHandle<'scope, 'scope_ref, T, SendTaskRef, AsyncScope<'scope>>
+where
+    T: Send + 'scope,
+{
+}
+
 pub type LocalJoinHandle<'scope, 'scope_ref, T> =
     JoinHandle<'scope, 'scope_ref, T, LocalTaskRef, AsyncScope<'scope>>;
 pub type SendJoinHandle<'scope, 'scope_ref, T> =

@@ -74,6 +74,7 @@ veloq-pod = { path = "utils/veloq-pod", version = "0.1.0" }
 # External Crates
 crossbeam-utils = { version = "0.8", default-features = false }
 futures-core = "0.3"
+futures-util = "0.3"
 crossbeam-queue = "0.3"
 libc = "0.2.183"
 windows-sys = { version = "0.61", features = [
