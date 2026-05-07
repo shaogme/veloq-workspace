@@ -4,6 +4,8 @@ pub(crate) mod net;
 pub(crate) mod net_udp;
 
 use std::sync::atomic::Ordering;
+use core::convert::TryFrom;
+use diagweave::report::Report;
 use veloq_driver_core::driver::{
     DriveMode, Driver, PollRecordResult, encode_completion_token, event_res_to_result,
 };
@@ -11,7 +13,7 @@ use veloq_driver_core::error::driver_error_report_to_event_res;
 use veloq_driver_core::slot::SlotTable;
 
 use crate::driver::IocpDriver;
-use crate::error::{IocpDiag, IocpError, IocpResult, from_io_error};
+use crate::error::{IocpError, IocpResult, from_io_error};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);
@@ -36,12 +38,10 @@ pub(crate) fn wait_completion(
     let token = encode_completion_token(user_data, generation);
     loop {
         if start.elapsed() > timeout {
-            return Err(
-                error_stack::Report::new(IocpError::CompletionWait).attach(format!(
-                    "wait completion timed out: user_data={}, generation={}",
-                    user_data, generation
-                )),
-            );
+            return Err(Report::new(IocpError::CompletionWait).attach_note(format!(
+                "wait completion timed out: user_data={}, generation={}",
+                user_data, generation
+            )));
         }
         let _ = driver.drive(DriveMode::Poll);
         let completion_table = driver.completion_table();
@@ -58,8 +58,10 @@ pub(crate) fn wait_completion(
                 });
             }
             PollRecordResult::Stale => {
-                return Err(error_stack::Report::new(IocpError::CompletionWait)
-                    .attach("stale completion record (generation mismatch)"));
+                return Err(
+                    Report::new(IocpError::CompletionWait)
+                        .attach_note("stale completion record (generation mismatch)"),
+                );
             }
             PollRecordResult::Pending => {}
         }
@@ -67,7 +69,8 @@ pub(crate) fn wait_completion(
     }
 }
 
-pub(crate) fn completion_os_error_code(err: &error_stack::Report<IocpError>) -> Option<i32> {
-    err.downcast_ref::<IocpDiag>()
-        .and_then(|diag| diag.error_code)
+pub(crate) fn completion_os_error_code(err: &Report<IocpError>) -> Option<i32> {
+    err.error_code()
+        .and_then(|code| i32::try_from(code).ok())
 }
+

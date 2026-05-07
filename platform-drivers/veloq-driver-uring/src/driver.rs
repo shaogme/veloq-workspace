@@ -1,4 +1,4 @@
-use error_stack::Report;
+use diagweave::report::Report;
 use io_uring::{IoUring, squeue};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -75,17 +75,17 @@ const MIN_FILE_TABLE_CAPACITY: usize = 1;
 
 #[inline]
 fn invalid_state(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::InvalidState).attach(format!("{scope}: {}", msg.into()))
+    Report::new(UringError::InvalidState).attach_note(format!("{scope}: {}", msg.into()))
 }
 
 #[inline]
 fn invalid_input(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::InvalidInput).attach(format!("{scope}: {}", msg.into()))
+    Report::new(UringError::InvalidInput).attach_note(format!("{scope}: {}", msg.into()))
 }
 
 #[inline]
 fn unsupported(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::Unsupported).attach(format!("{scope}: {}", msg.into()))
+    Report::new(UringError::Unsupported).attach_note(format!("{scope}: {}", msg.into()))
 }
 
 #[inline]
@@ -277,7 +277,7 @@ impl UringDriver {
     }
 
     pub fn new(config: impl AsRef<UringConfig>) -> UringResult<Self> {
-        Self::new_internal(config).map_err(|e| e.attach("create uring driver"))
+        Self::new_internal(config).map_err(|e| e.attach_note("create uring driver"))
     }
 
     pub(crate) unsafe fn submit_from_slot_raw(
@@ -321,7 +321,7 @@ impl UringDriver {
                         (vtable.make_sqe)(op, &mut *driver_ptr)
                             .map_err(|e| {
                                 Report::new(UringError::Submission)
-                                    .attach(format!("driver.submit_from_slot_raw.make_sqe: {e:#}"))
+                                    .attach_note(format!("driver.submit_from_slot_raw.make_sqe: {e:#}"))
                             })?
                             .user_data(user_data as u64)
                     };
@@ -346,7 +346,7 @@ impl UringDriver {
                             info.len.get(),
                         ) {
                             if driver.registration_mode.is_strict() {
-                                return Err(e.attach(format!(
+                                return Err(e.attach_note(format!(
                                     "strict mode lazy register failed: chunk_id={chunk_id}, user_data={user_data}"
                                 )));
                             }

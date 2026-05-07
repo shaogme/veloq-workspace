@@ -9,7 +9,6 @@ use crate::rio::core::submit_ops::RioKernel;
 use crate::rio::core::{RioOpCtxGuard, RioPoolCtxGuard};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::control_flow::RioSocketActor;
-use error_stack::ResultExt;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::sync::OnceLock;
@@ -101,10 +100,12 @@ impl RioState {
         let start = std::time::Instant::now();
         while self.outstanding_count > 0 {
             if start.elapsed() >= timeout {
-                return Err(error_stack::Report::new(RioError::Internal)).attach(format!(
-                    "strict close timed out while draining RIO outstanding requests: {}",
-                    self.outstanding_count
-                ));
+                return Err(
+                    diagweave::report::Report::new(RioError::Internal).attach_note(format!(
+                        "strict close timed out while draining RIO outstanding requests: {}",
+                        self.outstanding_count
+                    )),
+                );
             }
 
             const MAX_RESULTS: usize = 128;
@@ -113,8 +114,10 @@ impl RioState {
             let count = self.kernel.dequeue(&mut results);
 
             if count == RIO_CORRUPT_CQ {
-                return Err(error_stack::Report::new(RioError::Internal))
-                    .attach("RIO completion queue is corrupt (RIO_CORRUPT_CQ)");
+                return Err(
+                    diagweave::report::Report::new(RioError::Internal)
+                        .attach_note("RIO completion queue is corrupt (RIO_CORRUPT_CQ)"),
+                );
             }
 
             if count == 0 {
@@ -190,3 +193,4 @@ mod tests {
         assert!(super::RIO_REAPER_DRAIN_TIMEOUT > std::time::Duration::from_secs(0));
     }
 }
+

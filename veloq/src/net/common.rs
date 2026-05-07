@@ -8,8 +8,8 @@ use veloq_driver::driver::{Driver, RegisterFd};
 use veloq_driver::op::IoFd;
 use veloq_driver::{OwnedRawHandle, RawHandle};
 
-fn driver_err(err: error_stack::Report<veloq_driver::error::DriverErrorKind>) -> io::Error {
-    io::Error::other(format!("{err:#}"))
+fn driver_err(err: diagweave::report::Report<veloq_driver::error::DriverErrorKind>) -> io::Error {
+    io::Error::other(format!("{err}"))
 }
 
 // ============================================================================
@@ -122,3 +122,4 @@ impl<P: SocketTokenPtr> InnerSocket<P> {
             .ok_or_else(|| io::Error::other("local addr is unavailable for this socket"))
     }
 }
+

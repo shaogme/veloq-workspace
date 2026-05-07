@@ -22,8 +22,8 @@ veloq-driver.workspace = true
 veloq-blocking.workspace = true
 veloq-sync.workspace = true
 veloq-local.workspace = true
-error-stack.workspace = true
 tracing.workspace = true
+diagweave.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

@@ -338,6 +338,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "diagweave"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c65a90081a7885ffc98528514874b31b107588d242e7953f906f12d9f8828e3"
+dependencies = [
+ "diagweave-macros",
+ "ref_str",
+ "tracing",
+]
+
+[[package]]
+name = "diagweave-macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "975de2a51d8e56832adc6f15a3869211ab99434ccd8f1a0e18c4461c5c3fc402"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "disk-bench"
 version = "0.1.0"
 dependencies = [
@@ -367,16 +389,6 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "error-stack"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b878b3fac9613c3c7f22eb70bc8a3c6ebdc03cc11479ee60fde1692d747fd45f"
-dependencies = [
- "anyhow",
- "rustc_version",
 ]
 
 [[package]]
@@ -849,6 +861,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref_str"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97816352048e34e6795566f69f3d4980f2728f21c4b8dbaa7afe87821763d306"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -882,15 +903,6 @@ name = "rustc-hash"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
-
-[[package]]
-name = "rustc_version"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
-dependencies = [
- "semver",
-]
 
 [[package]]
 name = "rustix"
@@ -1217,7 +1229,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 name = "veloq"
 version = "0.1.0"
 dependencies = [
- "error-stack",
+ "diagweave",
  "libc",
  "tracing",
  "veloq-blocking",
@@ -1272,7 +1284,6 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
- "error-stack",
  "io-uring",
  "libc",
  "tracing",
@@ -1294,7 +1305,7 @@ dependencies = [
  "bilge",
  "crossbeam-queue",
  "crossbeam-utils",
- "error-stack",
+ "diagweave",
  "libc",
  "loom",
  "tracing",
@@ -1310,7 +1321,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
- "error-stack",
+ "diagweave",
  "rustc-hash",
  "slotmap",
  "tracing",
@@ -1328,7 +1339,7 @@ name = "veloq-driver-uring"
 version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
- "error-stack",
+ "diagweave",
  "io-uring",
  "libc",
  "tracing",

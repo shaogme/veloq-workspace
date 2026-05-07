@@ -1,8 +1,6 @@
-use error_stack::Report;
+use diagweave::report::Report;
 use std::fmt;
-use veloq_driver_core::error::{DriverDiag, DriverErrorKind, DriverResult, ResultAsDriverExt};
-
-pub type IocpDiag = DriverDiag<i32>;
+use veloq_driver_core::error::{DriverErrorKind, DriverResult, ResultAsDriverExt};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum IocpError {
@@ -72,11 +70,13 @@ where
     let os_code = error_ref
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error);
-    let message = if error_ref.is::<Report<IocpError>>() {
-        "IOCP report".to_string()
+    let report = Report::new(context)
+        .with_ctx("scope", scope)
+        .attach_note(error.to_string());
+    if let Some(code) = os_code {
+        report.set_error_code(code)
     } else {
-        error.to_string()
-    };
-    let diag = IocpDiag::new(scope).with_error_detail(os_code, message);
-    Report::new(context).attach(diag)
+        report
+    }
 }
+

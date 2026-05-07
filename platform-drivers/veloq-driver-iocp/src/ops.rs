@@ -156,7 +156,7 @@ macro_rules! define_iocp_ops {
                             if let IocpOpPayload::$Variant(ref mut p) = op.payload {
                                 $submit(&mut op.header, p, ctx)
                             } else {
-                                Err(error_stack::Report::new(IocpError::InvalidState).attach(format!(
+                                Err(diagweave::report::Report::new(IocpError::InvalidState).attach_note(format!(
                                     "variant mismatch in IocpKernelOp dispatch for {}",
                                     stringify!($OpType)
                                 )))
@@ -221,7 +221,7 @@ macro_rules! define_iocp_ops {
             if let IocpOpPayload::$Variant(ref mut p) = op.payload {
                 $fn(&mut op.header, p, result, ext)
             } else {
-                Err(error_stack::Report::new(IocpError::InvalidState).attach(format!(
+                Err(diagweave::report::Report::new(IocpError::InvalidState).attach_note(format!(
                     "variant mismatch in IocpKernelOp on_complete for {}",
                     stringify!($OpType)
                 )))
@@ -477,3 +477,4 @@ define_iocp_ops! {
         destruct: |user: Box<Wakeup>| *user,
     },
 }
+

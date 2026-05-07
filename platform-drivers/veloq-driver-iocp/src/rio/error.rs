@@ -1,7 +1,6 @@
 use std::fmt;
-use veloq_driver_core::error::{DriverDiag, DriverErrorKind, DriverResult, ResultAsDriverExt};
-
-pub type RioDiag = DriverDiag<u32>;
+use diagweave::report::Report;
+use veloq_driver_core::error::{DriverErrorKind, DriverResult, ResultAsDriverExt};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RioError {
@@ -32,7 +31,7 @@ impl fmt::Display for RioError {
 
 impl std::error::Error for RioError {}
 
-pub type RioResult<T> = Result<T, error_stack::Report<RioError>>;
+pub type RioResult<T> = Result<T, Report<RioError>>;
 
 pub(crate) trait RioResultExt<T> {
     fn to_driver_result(

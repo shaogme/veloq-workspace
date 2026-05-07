@@ -3,8 +3,8 @@ use std::path::Path;
 use veloq_driver::driver::{Driver, RegisterFd};
 use veloq_driver::op::Open;
 
-fn driver_err(err: error_stack::Report<veloq_driver::error::DriverErrorKind>) -> std::io::Error {
-    std::io::Error::other(format!("{err:#}"))
+fn driver_err(err: diagweave::report::Report<veloq_driver::error::DriverErrorKind>) -> std::io::Error {
+    std::io::Error::other(format!("{err}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,3 +282,4 @@ impl OpenOptions {
         })
     }
 }
+

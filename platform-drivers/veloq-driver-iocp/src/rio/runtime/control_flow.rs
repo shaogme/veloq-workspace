@@ -9,13 +9,13 @@ use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
 use crate::rio::core::{RioOpCtxGuard, RioPoolCtxGuard};
-use crate::rio::error::{RioDiag, RioError, RioResult};
+use crate::rio::error::{RioError, RioResult};
 #[cfg(test)]
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager, UdpPoolState};
 use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState, SocketRuntimeMode};
-use error_stack::ResultExt;
 use slotmap::SlotMap;
+use diagweave::report::ResultReportExt;
 use tracing::error;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
@@ -123,7 +123,7 @@ impl<'a> RioCompletionRouter<'a> {
             let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
             let submissions = pool_manager
                 .handle_completion(udp_mailbox, (slot_key, res), &mut self.comp, &mut ctx)
-                .attach("failed to handle pool completion")?;
+                .attach_note("failed to handle pool completion")?;
             let remove = pool_manager.cleanup_drained_pool(&mut ctx);
             (submissions, remove)
         };
@@ -258,31 +258,24 @@ impl RioState {
             return self
                 .actors
                 .get_mut(key)
-                .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-                .attach("failed to retrieve indexed actor");
+                .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+                .attach_note("failed to retrieve indexed actor");
         }
 
         let rq = match self.registry.create_rq((handle, fd), env) {
             Ok(rq) => rq,
             Err(e) => {
-                let diag = RioDiag::new("ensure_actor_create_rq")
-                    .field("fd", format!("{fd:?}"))
-                    .field("handle", format!("{:?}", handle.raw().as_handle()))
-                    .field(
-                        "socket_raw",
-                        format!("0x{:x}", handle.raw().as_handle() as usize),
-                    )
-                    .field("rq_depth", self.registry.rq_depth)
-                    .field("max_outstanding_recvs", self.registry.rq_depth)
-                    .field("max_outstanding_sends", self.registry.rq_depth)
-                    .field("max_receive_data_buffers", 1_u32)
-                    .field("max_send_data_buffers", 1_u32)
-                    .field("outstanding_count", self.outstanding_count)
-                    .field("actors_len", self.actors.len())
-                    .field(
-                        "actor_index_hit",
-                        self.actor_by_handle.contains_key(&socket_key),
-                    );
+                let diag = format!(
+                    "ensure_actor_create_rq: fd={fd:?}, handle={:?}, socket_raw=0x{:x}, rq_depth={}, max_outstanding_recvs={}, max_outstanding_sends={}, max_receive_data_buffers=1, max_send_data_buffers=1, outstanding_count={}, actors_len={}, actor_index_hit={}",
+                    handle.raw().as_handle(),
+                    handle.raw().as_handle() as usize,
+                    self.registry.rq_depth,
+                    self.registry.rq_depth,
+                    self.registry.rq_depth,
+                    self.outstanding_count,
+                    self.actors.len(),
+                    self.actor_by_handle.contains_key(&socket_key),
+                );
                 error!(
                     fd = ?fd,
                     handle = ?handle.raw().as_handle(),
@@ -298,7 +291,7 @@ impl RioState {
                     rio_error = %e,
                     "RIOCreateRequestQueue failed diagnostics"
                 );
-                return Err(e).attach(diag);
+                return Err(e.attach_note(diag));
             }
         };
 
@@ -310,8 +303,8 @@ impl RioState {
         state.iocp_associated = false;
         self.actors
             .get_mut(key)
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("failed to retrieve inserted actor")
+            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .attach_note("failed to retrieve inserted actor")
     }
 
     pub(crate) fn warmup_udp_socket(
@@ -324,12 +317,12 @@ impl RioState {
         let (fd, handle) = target;
         let socket_key = handle.raw().actor_key();
         let Some(dispatch) = self.kernel.dispatch else {
-            return Err(error_stack::Report::new(RioError::NotSupported))
-                .attach("RIO dispatch not available for UDP warmup");
+            return Err(diagweave::report::Report::new(RioError::NotSupported))
+                .attach_note("RIO dispatch not available for UDP warmup");
         };
         let Some(cq) = (!self.kernel.cq.is_invalid()).then_some(self.kernel.cq) else {
-            return Err(error_stack::Report::new(RioError::NotSupported))
-                .attach("RIO dispatch not available for UDP warmup");
+            return Err(diagweave::report::Report::new(RioError::NotSupported))
+                .attach_note("RIO dispatch not available for UDP warmup");
         };
         let env = RioEnv {
             registrar,
@@ -340,22 +333,22 @@ impl RioState {
         let _ = self.ensure_actor((fd, handle), env)?;
 
         if self.is_iocp_fallback(socket_key) {
-            return Err(error_stack::Report::new(RioError::NotSupported))
-                .attach("Socket is marked for IOCP fallback");
+            return Err(diagweave::report::Report::new(RioError::NotSupported))
+                .attach_note("Socket is marked for IOCP fallback");
         }
 
         let key = self
             .actor_by_handle
             .get(&socket_key)
             .copied()
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("actor not found")?;
+            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .attach_note("actor not found")?;
 
         let actor = self
             .actors
             .get_mut(key)
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("actor not found")?;
+            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .attach_note("actor not found")?;
         let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
         pool_manager.warmup_pool(udp_mailbox, requested_chunk_size, credits, &mut ctx)
@@ -591,8 +584,8 @@ impl RioState {
         loop {
             let count = self.kernel.dequeue(&mut results);
             if count == RIO_CORRUPT_CQ {
-                return Err(error_stack::Report::new(RioError::Internal))
-                    .attach("RIO completion queue is corrupt (RIO_CORRUPT_CQ)");
+                return Err(diagweave::report::Report::new(RioError::Internal))
+                    .attach_note("RIO completion queue is corrupt (RIO_CORRUPT_CQ)");
             }
             if count == 0 {
                 break;
@@ -615,3 +608,4 @@ impl RioState {
         Ok(router.completed_count)
     }
 }
+

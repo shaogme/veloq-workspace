@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::runtime::context::submit;
-use error_stack::Report;
+use diagweave::report::Report;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
@@ -373,3 +373,4 @@ impl crate::io::AsyncBufWrite for TcpStream {
         std::future::ready(Ok(()))
     }
 }
+

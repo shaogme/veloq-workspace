@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::runtime::context::submit;
-use error_stack::Report;
+use diagweave::report::Report;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::driver::Driver;
@@ -392,3 +392,4 @@ impl crate::io::AsyncBufWrite for UdpSocket {
         std::future::ready(Ok(()))
     }
 }
+

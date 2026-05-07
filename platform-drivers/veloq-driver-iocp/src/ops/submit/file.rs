@@ -47,7 +47,7 @@ macro_rules! submit_io_op {
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             if val.buf_offset > val.buf.len() {
-                return Err(error_stack::Report::new(IocpError::InvalidInput).attach(format!(
+                return Err(diagweave::report::Report::new(IocpError::InvalidInput).attach_note(format!(
                     "{}: buf_offset {} exceeds buffer length {}",
                     stringify!($fn_name),
                     val.buf_offset,
@@ -60,7 +60,7 @@ macro_rules! submit_io_op {
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
-                .map_err(|e| e.attach(format!(
+                .map_err(|e| e.attach_note(format!(
                     "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
                     stringify!($fn_name),
                     val.fd,
@@ -106,7 +106,7 @@ macro_rules! submit_raw_io_op {
             )?;
 
             if val.buf_offset > val.buf.len() {
-                return Err(error_stack::Report::new(IocpError::InvalidInput).attach(format!(
+                return Err(diagweave::report::Report::new(IocpError::InvalidInput).attach_note(format!(
                     "{}: buf_offset {} exceeds buffer length {}",
                     stringify!($fn_name),
                     val.buf_offset,
@@ -117,7 +117,7 @@ macro_rules! submit_raw_io_op {
             let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
-                .map_err(|e| e.attach(format!(
+                .map_err(|e| e.attach_note(format!(
                     "{}: syscall failed: handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
                     stringify!($fn_name),
                     handle.raw().as_handle(),
@@ -361,3 +361,4 @@ pub(crate) fn submit_fallocate_raw(
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
+

@@ -197,8 +197,8 @@ impl IocpDriver {
                 op_ref.header.resolved_handle = None;
             })
             .ok_or_else(|| {
-                error_stack::Report::new(IocpError::InvalidState)
-                    .attach("Op missing in prep_op_slot")
+                diagweave::report::Report::new(IocpError::InvalidState)
+                    .attach_note("Op missing in prep_op_slot")
             })?;
 
         Ok(guard)
@@ -902,3 +902,4 @@ impl DriverTestHooks for IocpDriver {
             .chunk_register_attempts
     }
 }
+

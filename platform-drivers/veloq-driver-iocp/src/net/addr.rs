@@ -134,7 +134,7 @@ impl SockAddrIn6 {
 pub fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
     if buf.len() < 2 {
         return Err(
-            error_stack::Report::new(IocpError::InvalidInput).attach("invalid address length")
+            diagweave::report::Report::new(IocpError::InvalidInput).attach_note("invalid address length")
         );
     }
 
@@ -144,24 +144,30 @@ pub fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
     match family {
         AF_INET => {
             if buf.len() < std::mem::size_of::<SOCKADDR_IN>() {
-                return Err(error_stack::Report::new(IocpError::InvalidInput)
-                    .attach("invalid IPv4 sockaddr length"));
+                return Err(
+                    diagweave::report::Report::new(IocpError::InvalidInput)
+                        .attach_note("invalid IPv4 sockaddr length"),
+                );
             }
             let sin_wrapped: &SockAddrIn = from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN>()]);
             Ok(SocketAddr::V4(sin_wrapped.to_std()))
         }
         AF_INET6 => {
             if buf.len() < std::mem::size_of::<SOCKADDR_IN6>() {
-                return Err(error_stack::Report::new(IocpError::InvalidInput)
-                    .attach("invalid IPv6 sockaddr length"));
+                return Err(
+                    diagweave::report::Report::new(IocpError::InvalidInput)
+                        .attach_note("invalid IPv6 sockaddr length"),
+                );
             }
             let sin6_wrapped: &SockAddrIn6 =
                 from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN6>()]);
             Ok(SocketAddr::V6(sin6_wrapped.to_std()))
         }
         _ => {
-            Err(error_stack::Report::new(IocpError::InvalidInput)
-                .attach("unsupported address family"))
+            Err(
+                diagweave::report::Report::new(IocpError::InvalidInput)
+                    .attach_note("unsupported address family"),
+            )
         }
     }
 }
@@ -195,10 +201,11 @@ impl SocketAddrCodec for SockAddrStorage {
     type Error = IocpError;
 
     fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
-        to_socket_addr(buf).map_err(|e| e.attach("decode socket address failed"))
+        to_socket_addr(buf).map_err(|e| e.attach_note("decode socket address failed"))
     }
 
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {
         socket_addr_to_storage(addr)
     }
 }
+

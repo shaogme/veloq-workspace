@@ -82,7 +82,7 @@ impl IocpDriver {
     /// Creates a pre-initialization completion port handle.
     pub(crate) fn create_pre_init() -> IocpResult<PreInit> {
         crate::win32::IoCompletionPort::new(0)
-            .map_err(|e| e.attach("failed to create pre-init IOCP"))
+            .map_err(|e| e.attach_note("failed to create pre-init IOCP"))
     }
 
     /// Creates a new IOCP driver instance.
@@ -101,7 +101,7 @@ impl IocpDriver {
         let port_handle = port_val.as_raw();
         debug!(port = ?port_handle, "Initializing IocpDriver");
         let extensions = crate::ext::Extensions::new().map_err(|e| {
-            e.attach(format!(
+            e.attach_note(format!(
                 "failed to load IOCP extensions, port={port_handle:?}"
             ))
         })?;
@@ -112,11 +112,11 @@ impl IocpDriver {
             registration_mode,
         )
         .map_err(|e| {
-            error_stack::Report::new(IocpError::Rio)
-                .attach(format!(
+            diagweave::report::Report::new(IocpError::Rio)
+                .attach_note(format!(
                     "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
                 ))
-                .attach(format!("{e:#}"))
+                .attach_note(format!("{e:#}"))
         })?;
         let ops = OpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable = ops.shared.clone();
@@ -154,7 +154,7 @@ impl IocpDriver {
         self.last_timer_poll = now;
 
         let status = status.map_err(|e| {
-            error_stack::Report::new(IocpError::CompletionWait).attach(format!("{e:#}"))
+            diagweave::report::Report::new(IocpError::CompletionWait).attach_note(format!("{e:#}"))
         })?;
 
         match status {
@@ -174,8 +174,8 @@ impl IocpDriver {
                             &self.completion_table,
                         )
                         .map_err(|e| {
-                            error_stack::Report::new(IocpError::CompletionWait)
-                                .attach(format!("{e:#}"))
+                            diagweave::report::Report::new(IocpError::CompletionWait)
+                                .attach_note(format!("{e:#}"))
                         })?;
                     return Ok(());
                 }
@@ -417,11 +417,13 @@ impl IocpDriver {
                         | crate::ops::IocpOpPayload::Fallocate(_)
                         | crate::ops::IocpOpPayload::FallocateRaw(_)
                 ) {
-                    io_result = Err(error_stack::Report::new(IocpError::CompletionWait)
-                        .attach("missing blocking result for offloaded file completion"));
+                    io_result = Err(
+                        diagweave::report::Report::new(IocpError::CompletionWait)
+                            .attach_note("missing blocking result for offloaded file completion"),
+                    );
                 } else if let Ok(val) = io_result {
                     io_result = iocp_op.on_complete(val, &self.extensions).map_err(|e| {
-                        error_stack::Report::new(IocpError::CompletionWait).attach(format!("{e:#}"))
+                        diagweave::report::Report::new(IocpError::CompletionWait).attach_note(format!("{e:#}"))
                     });
                 }
             });
@@ -669,3 +671,4 @@ struct CancelContext<'a> {
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable,
 }
+

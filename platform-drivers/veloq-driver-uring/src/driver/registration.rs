@@ -1,6 +1,6 @@
 use crate::driver::UringDriver;
 use crate::error::{UringError, UringResult, from_io_error};
-use error_stack::Report;
+use diagweave::report::Report;
 use std::time::{Duration, Instant};
 
 pub(crate) const MAX_CHUNKS: usize = 1024;
@@ -30,14 +30,14 @@ impl UringDriver {
                 .registration_stats
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(Report::new(UringError::Registration).attach(format!(
+            return Err(Report::new(UringError::Registration).attach_note(format!(
                 "driver.register_chunk_internal: recent failure cooldown, chunk_id={id}"
             )));
         }
 
         let index = id as usize;
         if index >= MAX_CHUNKS {
-            return Err(Report::new(UringError::InvalidInput).attach(format!(
+            return Err(Report::new(UringError::InvalidInput).attach_note(format!(
                 "driver.register_chunk_internal: chunk id exceeds max, id={id}, max={MAX_CHUNKS}"
             )));
         }

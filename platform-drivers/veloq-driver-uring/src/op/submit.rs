@@ -1,3 +1,4 @@
+use diagweave::report::Report;
 use crate::driver::UringDriver;
 use crate::op::{UringOp, UringOpPayload};
 use io_uring::{opcode, squeue, types};
@@ -5,7 +6,7 @@ use veloq_buf::PoolKind;
 use veloq_driver_core::error::{DriverErrorKind, DriverResult, driver_error, driver_os_error};
 
 #[inline]
-fn payload_variant_mismatch(scope: &'static str) -> error_stack::Report<DriverErrorKind> {
+fn payload_variant_mismatch(scope: &'static str) -> Report<DriverErrorKind> {
     driver_error(
         DriverErrorKind::InvalidState,
         scope,

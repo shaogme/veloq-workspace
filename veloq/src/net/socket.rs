@@ -1,7 +1,7 @@
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use error_stack::Report;
+use diagweave::report::Report;
 use veloq_driver::Socket;
 use veloq_driver::op::DetachedSubmitter;
 
@@ -172,3 +172,4 @@ impl UdpSocketBuilder {
         })
     }
 }
+
