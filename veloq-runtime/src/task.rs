@@ -29,7 +29,6 @@ pub type TaskHeader = GenericTaskHeader<AtomicStorage>;
 pub type LocalTaskHeader = GenericTaskHeader<LocalStorage>;
 
 thread_local! {
-    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     static CURRENT_SEND_TASK: RefCell<Option<*const TaskHeader>> = const { RefCell::new(None) };
 }
 
