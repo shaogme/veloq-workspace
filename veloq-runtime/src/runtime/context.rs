@@ -69,9 +69,11 @@ pub struct RuntimeContext {
     pub(crate) remote_rx: Receiver<SendTaskRef>,
     pub(crate) rand: RefCell<FastRand>,
     pub(crate) idle_hook: Option<IdleHook>,
+    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 pub type IdleHook = fn() -> IdleDecision;
+pub type WorkerTickHook = fn();
 
 thread_local! {
     pub(crate) static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };

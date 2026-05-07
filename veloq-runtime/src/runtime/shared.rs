@@ -587,6 +587,7 @@ impl RuntimeShared {
         CONTEXT.with(|ctx| {
             let ctx = ctx.borrow();
             let ctx = ctx.as_ref().expect("runtime context missing");
+            let worker_tick_hook = ctx.worker_tick_hook;
 
             let waker = primitives::create_unpark_waker(self.registry.unparkers[worker_id].clone());
             let mut init_cx = Context::from_waker(&waker);
@@ -596,6 +597,10 @@ impl RuntimeShared {
 
             while init_fut.is_some() || !self.shutdown.load(Ordering::Acquire) {
                 let mut progressed = false;
+
+                if let Some(hook) = worker_tick_hook {
+                    hook();
+                }
 
                 if let Some(fut) = init_fut.as_mut() {
                     match fut.as_mut().poll(&mut init_cx) {

@@ -105,7 +105,7 @@ fn iocp_report_to_event_res(report: &Report<IocpError>) -> i32 {
     {
         return res;
     }
-    return iocp_fallback_event_res(*report.inner());
+    iocp_fallback_event_res(*report.inner())
 }
 
 #[inline]

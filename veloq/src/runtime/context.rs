@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::task::Poll;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_driver::driver::{DriveMode, Driver, PlatformDriver};
+use veloq_driver::driver::{DriveMode, Driver, DriverControlCommand, PlatformDriver};
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 use crate::config::{BufferRegistrationMode, Config};
@@ -20,6 +20,10 @@ thread_local! {
     /// 线程局部的注册中心状态
     #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     static REGISTRAR_STATE: RefCell<Option<WorkerRegistrarState>> = const { RefCell::new(None) };
+
+    /// 线程局部的驱动控制命令状态
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
+    static DRIVER_COMMAND_STATE: RefCell<Option<WorkerDriverCommandState>> = const { RefCell::new(None) };
 }
 
 /// 驱动注册中心的消息类型
@@ -36,6 +40,10 @@ struct WorkerRegistrarState {
     chunks: Vec<veloq_buf::heap::ChunkInfo>,
 }
 
+struct WorkerDriverCommandState {
+    receiver: mpsc::Receiver<DriverControlCommand>,
+}
+
 /// 初始化当前 Worker 线程的注册中心状态
 pub(crate) fn init_worker_registrar_state(receiver: mpsc::Receiver<RegistrarMessage>) {
     REGISTRAR_STATE.with(|state| {
@@ -44,6 +52,29 @@ pub(crate) fn init_worker_registrar_state(receiver: mpsc::Receiver<RegistrarMess
             chunks: Vec::new(),
         });
     });
+}
+
+pub(crate) fn init_worker_driver_command_state(receiver: mpsc::Receiver<DriverControlCommand>) {
+    DRIVER_COMMAND_STATE.with(|state| {
+        *state.borrow_mut() = Some(WorkerDriverCommandState { receiver });
+    });
+}
+
+#[derive(Clone)]
+pub(crate) struct DriverCommandDispatcher {
+    senders: Vec<mpsc::Sender<DriverControlCommand>>,
+}
+
+impl DriverCommandDispatcher {
+    pub(crate) fn new(senders: Vec<mpsc::Sender<DriverControlCommand>>) -> Self {
+        Self { senders }
+    }
+
+    pub fn dispatch(&self, worker_id: usize, command: DriverControlCommand) {
+        if let Some(sender) = self.senders.get(worker_id) {
+            let _ = sender.send(command);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -214,6 +245,7 @@ pub struct RuntimeContext {
     driver: Rc<RefCell<PlatformDriver>>,
     config: Config,
     registrar: DriverRegistrar,
+    driver_commands: DriverCommandDispatcher,
 }
 
 impl RuntimeContext {
@@ -222,12 +254,14 @@ impl RuntimeContext {
         buf_pool: AnyBufPool,
         config: Config,
         registrar: DriverRegistrar,
+        driver_commands: DriverCommandDispatcher,
     ) -> Self {
         Self {
             buf_pool,
             driver,
             config,
             registrar,
+            driver_commands,
         }
     }
 
@@ -254,6 +288,11 @@ impl RuntimeContext {
     #[inline]
     pub(crate) fn driver_bridge(&self) -> RuntimeDriverBridge {
         RuntimeDriverBridge::new(self.driver.clone(), self.registrar.clone())
+    }
+
+    #[inline]
+    pub(crate) fn driver_commands(&self) -> DriverCommandDispatcher {
+        self.driver_commands.clone()
     }
 }
 
@@ -317,6 +356,38 @@ pub fn wait_current_driver() -> IdleDecision {
         return IdleDecision::wait(IdleWaitStrategy::block());
     };
     ctx.driver_bridge().drive_wait()
+}
+
+pub(crate) fn drain_pending_driver_commands() {
+    let Some(ctx) = try_current() else {
+        return;
+    };
+
+    DRIVER_COMMAND_STATE.with(|state_cell| {
+        let mut state_opt = state_cell.borrow_mut();
+        let Some(state) = state_opt.as_mut() else {
+            return;
+        };
+
+        let mut pending = Vec::new();
+        while let Ok(command) = state.receiver.try_recv() {
+            pending.push(command);
+        }
+
+        if pending.is_empty() {
+            return;
+        }
+
+        let driver_rc = ctx.driver();
+        let mut driver = driver_rc.borrow_mut();
+        for command in pending {
+            match command {
+                DriverControlCommand::UnregisterFiles(files) => {
+                    let _ = driver.unregister_files(files);
+                }
+            }
+        }
+    });
 }
 
 pub fn submit<'a, S, T>(

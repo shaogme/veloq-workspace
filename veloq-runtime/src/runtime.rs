@@ -23,6 +23,7 @@ pub use primitives::{
     create_waker,
 };
 
+pub use context::WorkerTickHook;
 pub(crate) use context::with_current_runtime;
 pub use context::{
     IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, WorkerInitContext,
@@ -43,6 +44,7 @@ pub struct Runtime<I = NoopWorkerInit> {
     worker_count: NonZeroUsize,
     worker_init: Option<I>,
     idle_hook: Option<IdleHook>,
+    worker_tick_hook: Option<WorkerTickHook>,
 }
 
 impl Runtime<NoopWorkerInit> {
@@ -77,6 +79,7 @@ where
             worker_count,
             worker_init,
             idle_hook,
+            worker_tick_hook,
         } = self;
         let worker_init = worker_init.expect("worker init missing");
         let worker_init = &worker_init;
@@ -112,6 +115,7 @@ where
                         remote_rx: rrx,
                         rand: RefCell::new(FastRand::new(worker_id as u64)),
                         idle_hook,
+                        worker_tick_hook,
                     });
                     let _clear_context = ClearContext;
 
@@ -137,6 +141,7 @@ where
                 remote_rx: rrx0,
                 rand: RefCell::new(FastRand::new(0)),
                 idle_hook,
+                worker_tick_hook,
             });
             let _clear_context = ClearContext;
 
@@ -179,6 +184,7 @@ pub struct RuntimeBuilder<I> {
     worker_init: Option<I>,
     queue_capacity: NonZeroUsize,
     idle_hook: Option<IdleHook>,
+    worker_tick_hook: Option<WorkerTickHook>,
 }
 
 impl Default for RuntimeBuilder<NoopWorkerInit> {
@@ -188,6 +194,7 @@ impl Default for RuntimeBuilder<NoopWorkerInit> {
             worker_init: Some(noop_worker_init),
             queue_capacity: NonZeroUsize::new(1024).unwrap(),
             idle_hook: None,
+            worker_tick_hook: None,
         }
     }
 }
@@ -213,11 +220,17 @@ where
             worker_init: Some(worker_init),
             queue_capacity: self.queue_capacity,
             idle_hook: self.idle_hook,
+            worker_tick_hook: self.worker_tick_hook,
         }
     }
 
     pub fn idle_hook(mut self, hook: IdleHook) -> Self {
         self.idle_hook = Some(hook);
+        self
+    }
+
+    pub fn worker_tick_hook(mut self, hook: WorkerTickHook) -> Self {
+        self.worker_tick_hook = Some(hook);
         self
     }
 
@@ -241,6 +254,7 @@ where
             worker_count: count,
             worker_init: self.worker_init,
             idle_hook: self.idle_hook,
+            worker_tick_hook: self.worker_tick_hook,
         }
     }
 }

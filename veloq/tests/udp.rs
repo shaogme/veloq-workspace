@@ -422,6 +422,60 @@ fn multithread_udp_echo() {
 }
 
 #[test]
+fn multithread_udp_cross_worker_drop_is_routed() {
+    use veloq_runtime::task::yield_now;
+
+    let runtime = create_runtime_with_workers(2);
+    runtime.block_on(async {
+        let (clone_tx, mut clone_rx) = mpsc::unbounded::<UdpSocket>();
+        let (ready_tx, mut ready_rx) = mpsc::unbounded::<()>();
+        let (done_tx, mut done_rx) = mpsc::unbounded::<()>();
+
+        scope!(s, {
+            s.spawn_boxed(async move {
+                let socket = bind_udp_ready("127.0.0.1:0", nz!(1024), 8).await;
+                clone_tx.send(socket.clone()).unwrap();
+                drop(socket);
+                ready_tx.send(()).unwrap();
+
+                done_rx.recv().await.expect("cross-worker drop ack missing");
+                yield_now().await;
+                yield_now().await;
+
+                let probe_server = bind_udp_ready("127.0.0.1:0", nz!(1024), 8).await;
+                let probe_client = UdpSocket::bind("127.0.0.1:0").expect("probe client bind");
+                let probe_addr = probe_server
+                    .local_addr()
+                    .expect("Failed to get probe server address");
+
+                let data = b"probe";
+                let mut send_buf = context::alloc(nz!(1024));
+                send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
+                send_buf.set_len(data.len());
+
+                probe_client
+                    .send_to(send_buf, probe_addr)
+                    .await
+                    .expect("probe send_to failed");
+
+                let datagram = probe_server
+                    .recv_stream(context::alloc(nz!(1024)))
+                    .await
+                    .expect("probe recv_stream failed");
+                assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
+            });
+
+            s.spawn_boxed(async move {
+                let socket = clone_rx.recv().await.expect("clone channel closed");
+                ready_rx.recv().await.expect("ready channel closed");
+                drop(socket);
+                done_tx.send(()).unwrap();
+            });
+        });
+    });
+}
+
+#[test]
 fn multithread_concurrent_udp_clients() {
     let runtime = create_runtime_with_workers(4);
     runtime.block_on(async {

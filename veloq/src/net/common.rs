@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
+use veloq_driver::driver::DriverControlCommand;
 use veloq_driver::driver::{Driver, RegisterFd};
 use veloq_driver::op::IoFd;
 use veloq_driver::{OwnedRawHandle, RawHandle};
@@ -58,11 +59,16 @@ impl Drop for SocketToken {
             return;
         };
 
-        debug_assert_eq!(
-            veloq_runtime::runtime::current_worker_id(),
-            self.owner_worker_id
+        let current_worker_id = veloq_runtime::runtime::current_worker_id();
+        if current_worker_id == self.owner_worker_id {
+            let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);
+            return;
+        }
+
+        ctx.driver_commands().dispatch(
+            self.owner_worker_id,
+            DriverControlCommand::UnregisterFiles(vec![self.fd]),
         );
-        let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);
     }
 }
 
