@@ -209,4 +209,3 @@ impl RioState {
         Ok(SubmissionResult::Pending)
     }
 }
-

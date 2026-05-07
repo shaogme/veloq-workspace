@@ -96,14 +96,11 @@ fn map_uring_error(
     detail: impl ToString,
 ) -> DriverErrorReport {
     let detail_text = detail.to_string();
-    match Err::<(), _>(report).to_driver_result(kind, scope, detail_text.clone()) {
-        Ok(()) => driver_error(
-            DriverErrorKind::Internal,
-            scope,
-            format!("unexpected ok while mapping uring report: {detail_text}"),
-        ),
-        Err(e) => e,
-    }
+    report
+        .set_accumulate_src_chain(true)
+        .map_err(|_| kind)
+        .with_ctx("scope", scope)
+        .attach_note(detail_text)
 }
 
 #[derive(Debug)]
@@ -320,8 +317,9 @@ impl UringDriver {
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr)
                             .map_err(|e| {
-                                Report::new(UringError::Submission)
-                                    .attach_note(format!("driver.submit_from_slot_raw.make_sqe: {e:#}"))
+                                Report::new(UringError::Submission).attach_note(format!(
+                                    "driver.submit_from_slot_raw.make_sqe: {e:#}"
+                                ))
                             })?
                             .user_data(user_data as u64)
                     };

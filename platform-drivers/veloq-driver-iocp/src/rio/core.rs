@@ -223,4 +223,3 @@ mod tests {
         RioState::free_op_req_ctx(tagged);
     }
 }
-

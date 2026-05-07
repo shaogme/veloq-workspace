@@ -1,7 +1,7 @@
-use diagweave::report::Report;
 use crate::config::UringRawHandle;
 use crate::error::{UringError, UringResult, from_io_error};
 use crate::{OwnedRawHandle, RawHandle, SockAddrStorage};
+use diagweave::report::Report;
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -286,9 +286,7 @@ impl SocketAddrCodec for SockAddrStorage {
 
 pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
     if buf.len() < std::mem::size_of::<libc::sa_family_t>() {
-        return Err(
-            Report::new(UringError::InvalidInput).attach_note("Invalid address length")
-        );
+        return Err(Report::new(UringError::InvalidInput).attach_note("Invalid address length"));
     }
     let mut family_raw = std::mem::MaybeUninit::<libc::sa_family_t>::uninit();
     // Copy into properly aligned stack storage before reading, avoiding UB on unaligned input.
@@ -344,9 +342,7 @@ pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
                 sin6.sin6_scope_id,
             )))
         }
-        _ => {
-            Err(Report::new(UringError::InvalidInput).attach_note("Unsupported address family"))
-        }
+        _ => Err(Report::new(UringError::InvalidInput).attach_note("Unsupported address family")),
     }
 }
 

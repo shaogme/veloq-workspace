@@ -16,9 +16,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-fn driver_err(err: diagweave::report::Report<veloq_driver::error::DriverErrorKind>) -> io::Error {
-    io::Error::other(err.pretty().to_string())
-}
+use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
 
 #[cfg(not(unix))]
 macro_rules! ignore {
@@ -92,11 +90,11 @@ impl LocalFile {
         self.pos.get()
     }
 
-    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> io::Result<(usize, FixedBuf)> {
+    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> VeloqResult<(usize, FixedBuf)> {
         self.read_at_subset(buf, offset, 0).await
     }
 
-    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> io::Result<(usize, FixedBuf)> {
+    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> VeloqResult<(usize, FixedBuf)> {
         self.write_at_subset(buf, offset, 0).await
     }
 
@@ -105,7 +103,7 @@ impl LocalFile {
         buf: FixedBuf,
         offset: u64,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         let op = ReadFixed {
             fd: self.fd,
             buf,
@@ -114,10 +112,10 @@ impl LocalFile {
         };
 
         let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let buf = op
-            .map(|o| o.buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res.map_err(driver_err)?, buf))
+        let buf = op.map(|o| o.buf).ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
+        })?;
+        Ok((res.map_err(from_driver_report)?, buf))
     }
 
     pub async fn write_at_subset(
@@ -125,7 +123,7 @@ impl LocalFile {
         buf: FixedBuf,
         offset: u64,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         let op = WriteFixed {
             fd: self.fd,
             buf,
@@ -134,33 +132,33 @@ impl LocalFile {
         };
 
         let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let buf = op
-            .map(|o| o.buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res.map_err(driver_err)?, buf))
+        let buf = op.map(|o| o.buf).ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
+        })?;
+        Ok((res.map_err(from_driver_report)?, buf))
     }
 
-    pub async fn sync_all(&self) -> io::Result<()> {
+    pub async fn sync_all(&self) -> VeloqResult<()> {
         let op = Fsync {
             fd: self.fd,
             datasync: false,
         };
 
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ()).map_err(driver_err)
+        res.map(|_| ()).map_err(from_driver_report)
     }
 
-    pub async fn sync_data(&self) -> io::Result<()> {
+    pub async fn sync_data(&self) -> VeloqResult<()> {
         let op = Fsync {
             fd: self.fd,
             datasync: true,
         };
 
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ()).map_err(driver_err)
+        res.map(|_| ()).map_err(from_driver_report)
     }
 
-    pub async fn fallocate(&self, offset: u64, len: u64) -> io::Result<()> {
+    pub async fn fallocate(&self, offset: u64, len: u64) -> VeloqResult<()> {
         let op = Fallocate {
             fd: self.fd,
             mode: 0,
@@ -169,14 +167,14 @@ impl LocalFile {
         };
 
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ()).map_err(driver_err)
+        res.map(|_| ()).map_err(from_driver_report)
     }
 }
 
 impl crate::io::AsyncBufRead for LocalFile {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
-        let (n, buf) = self.read_at(buf, offset).await?;
+        let (n, buf) = self.read_at(buf, offset).await.map_err(to_io_error)?;
         self.pos.set(self.pos.get() + n as u64);
         Ok((n, buf))
     }
@@ -186,7 +184,10 @@ impl crate::io::AsyncBufRead for LocalFile {
         let mut total = 0;
         while total < target {
             let offset = self.pos.get();
-            let (n, b) = self.read_at_subset(buf, offset, total).await?;
+            let (n, b) = self
+                .read_at_subset(buf, offset, total)
+                .await
+                .map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -204,7 +205,7 @@ impl crate::io::AsyncBufRead for LocalFile {
 impl crate::io::AsyncBufWrite for LocalFile {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
-        let (n, buf) = self.write_at(buf, offset).await?;
+        let (n, buf) = self.write_at(buf, offset).await.map_err(to_io_error)?;
         self.pos.set(self.pos.get() + n as u64);
         Ok((n, buf))
     }
@@ -214,7 +215,10 @@ impl crate::io::AsyncBufWrite for LocalFile {
         let mut total = 0;
         while total < target {
             let offset = self.pos.get();
-            let (n, b) = self.write_at_subset(buf, offset, total).await?;
+            let (n, b) = self
+                .write_at_subset(buf, offset, total)
+                .await
+                .map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -228,12 +232,12 @@ impl crate::io::AsyncBufWrite for LocalFile {
         Ok((total, buf))
     }
 
-    fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {
-        self.sync_data()
+    async fn flush(&self) -> io::Result<()> {
+        self.sync_data().await.map_err(to_io_error)
     }
 
-    fn shutdown(&self) -> impl std::future::Future<Output = io::Result<()>> {
-        self.sync_all()
+    async fn shutdown(&self) -> io::Result<()> {
+        self.sync_all().await.map_err(to_io_error)
     }
 }
 
@@ -250,11 +254,11 @@ impl File {
         self.pos.load(Ordering::Relaxed)
     }
 
-    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> io::Result<(usize, FixedBuf)> {
+    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> VeloqResult<(usize, FixedBuf)> {
         self.read_at_subset(buf, offset, 0).await
     }
 
-    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> io::Result<(usize, FixedBuf)> {
+    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> VeloqResult<(usize, FixedBuf)> {
         self.write_at_subset(buf, offset, 0).await
     }
 
@@ -263,7 +267,7 @@ impl File {
         buf: FixedBuf,
         offset: u64,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         let op: FileReadRaw = FileReadRaw {
             fd: self.raw.raw(),
             buf,
@@ -272,10 +276,10 @@ impl File {
         };
 
         let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let buf = op
-            .map(|o| o.buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res.map_err(driver_err)?, buf))
+        let buf = op.map(|o| o.buf).ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
+        })?;
+        Ok((res.map_err(from_driver_report)?, buf))
     }
 
     pub async fn write_at_subset(
@@ -283,7 +287,7 @@ impl File {
         buf: FixedBuf,
         offset: u64,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         let op: FileWriteRaw = FileWriteRaw {
             fd: self.raw.raw(),
             buf,
@@ -292,33 +296,33 @@ impl File {
         };
 
         let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let buf = op
-            .map(|o| o.buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res.map_err(driver_err)?, buf))
+        let buf = op.map(|o| o.buf).ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
+        })?;
+        Ok((res.map_err(from_driver_report)?, buf))
     }
 
-    pub async fn sync_all(&self) -> io::Result<()> {
+    pub async fn sync_all(&self) -> VeloqResult<()> {
         let op: FileFsyncRaw = FileFsyncRaw {
             fd: self.raw.raw(),
             datasync: false,
         };
 
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ()).map_err(driver_err)
+        res.map(|_| ()).map_err(from_driver_report)
     }
 
-    pub async fn sync_data(&self) -> io::Result<()> {
+    pub async fn sync_data(&self) -> VeloqResult<()> {
         let op: FileFsyncRaw = FileFsyncRaw {
             fd: self.raw.raw(),
             datasync: true,
         };
 
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ()).map_err(driver_err)
+        res.map(|_| ()).map_err(from_driver_report)
     }
 
-    pub async fn fallocate(&self, offset: u64, len: u64) -> io::Result<()> {
+    pub async fn fallocate(&self, offset: u64, len: u64) -> VeloqResult<()> {
         let op: FileFallocateRaw = FileFallocateRaw {
             fd: self.raw.raw(),
             mode: 0,
@@ -327,7 +331,7 @@ impl File {
         };
 
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ()).map_err(driver_err)
+        res.map(|_| ()).map_err(from_driver_report)
     }
 
     pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_> {
@@ -415,7 +419,9 @@ impl<'a> IntoFuture for SyncRangeBuilder<'a> {
             };
 
             let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
-            res.map(|_| ()).map_err(driver_err)
+            res.map(|_| ())
+                .map_err(from_driver_report)
+                .map_err(to_io_error)
         })
     }
 }
@@ -423,7 +429,7 @@ impl<'a> IntoFuture for SyncRangeBuilder<'a> {
 impl crate::io::AsyncBufRead for File {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.load(Ordering::Relaxed);
-        let (n, buf) = self.read_at(buf, offset).await?;
+        let (n, buf) = self.read_at(buf, offset).await.map_err(to_io_error)?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
         Ok((n, buf))
     }
@@ -433,7 +439,10 @@ impl crate::io::AsyncBufRead for File {
         let mut total = 0;
         while total < target {
             let offset = self.pos.load(Ordering::Relaxed);
-            let (n, b) = self.read_at_subset(buf, offset, total).await?;
+            let (n, b) = self
+                .read_at_subset(buf, offset, total)
+                .await
+                .map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -451,7 +460,7 @@ impl crate::io::AsyncBufRead for File {
 impl crate::io::AsyncBufWrite for File {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.load(Ordering::Relaxed);
-        let (n, buf) = self.write_at(buf, offset).await?;
+        let (n, buf) = self.write_at(buf, offset).await.map_err(to_io_error)?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
         Ok((n, buf))
     }
@@ -461,7 +470,10 @@ impl crate::io::AsyncBufWrite for File {
         let mut total = 0;
         while total < target {
             let offset = self.pos.load(Ordering::Relaxed);
-            let (n, b) = self.write_at_subset(buf, offset, total).await?;
+            let (n, b) = self
+                .write_at_subset(buf, offset, total)
+                .await
+                .map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -475,21 +487,21 @@ impl crate::io::AsyncBufWrite for File {
         Ok((total, buf))
     }
 
-    fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {
-        self.sync_data()
+    async fn flush(&self) -> io::Result<()> {
+        self.sync_data().await.map_err(to_io_error)
     }
 
-    fn shutdown(&self) -> impl std::future::Future<Output = io::Result<()>> {
-        self.sync_all()
+    async fn shutdown(&self) -> io::Result<()> {
+        self.sync_all().await.map_err(to_io_error)
     }
 }
 
 impl LocalFile {
-    pub async fn open(path: impl AsRef<Path>) -> io::Result<LocalFile> {
+    pub async fn open(path: impl AsRef<Path>) -> VeloqResult<LocalFile> {
         OpenOptions::new().read(true).open_local(path).await
     }
 
-    pub async fn create(path: impl AsRef<Path>) -> io::Result<LocalFile> {
+    pub async fn create(path: impl AsRef<Path>) -> VeloqResult<LocalFile> {
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -500,11 +512,11 @@ impl LocalFile {
 }
 
 impl File {
-    pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
+    pub async fn open(path: impl AsRef<Path>) -> VeloqResult<File> {
         OpenOptions::new().read(true).open(path).await
     }
 
-    pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
+    pub async fn create(path: impl AsRef<Path>) -> VeloqResult<File> {
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -513,4 +525,3 @@ impl File {
             .await
     }
 }
-

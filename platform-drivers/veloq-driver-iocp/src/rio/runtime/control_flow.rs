@@ -14,8 +14,8 @@ use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::pool::UdpRecvPoolDebugStats;
 use crate::rio::runtime::pool::{UdpMailbox, UdpPoolManager, UdpPoolState};
 use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState, SocketRuntimeMode};
-use slotmap::SlotMap;
 use diagweave::report::ResultReportExt;
+use slotmap::SlotMap;
 use tracing::error;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
@@ -608,4 +608,3 @@ impl RioState {
         Ok(router.completed_count)
     }
 }
-

@@ -361,4 +361,3 @@ pub(crate) fn submit_fallocate_raw(
     };
     Ok(SubmissionResult::Offload(BlockingTask::SysOp(op)))
 }
-

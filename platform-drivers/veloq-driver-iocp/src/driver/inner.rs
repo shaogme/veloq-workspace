@@ -417,13 +417,12 @@ impl IocpDriver {
                         | crate::ops::IocpOpPayload::Fallocate(_)
                         | crate::ops::IocpOpPayload::FallocateRaw(_)
                 ) {
-                    io_result = Err(
-                        diagweave::report::Report::new(IocpError::CompletionWait)
-                            .attach_note("missing blocking result for offloaded file completion"),
-                    );
+                    io_result = Err(diagweave::report::Report::new(IocpError::CompletionWait)
+                        .attach_note("missing blocking result for offloaded file completion"));
                 } else if let Ok(val) = io_result {
                     io_result = iocp_op.on_complete(val, &self.extensions).map_err(|e| {
-                        diagweave::report::Report::new(IocpError::CompletionWait).attach_note(format!("{e:#}"))
+                        diagweave::report::Report::new(IocpError::CompletionWait)
+                            .attach_note(format!("{e:#}"))
                     });
                 }
             });
@@ -671,4 +670,3 @@ struct CancelContext<'a> {
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable,
 }
-

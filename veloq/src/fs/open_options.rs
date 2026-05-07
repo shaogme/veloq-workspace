@@ -1,11 +1,8 @@
 use std::path::Path;
 
+use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
 use veloq_driver::driver::{Driver, RegisterFd};
 use veloq_driver::op::Open;
-
-fn driver_err(err: diagweave::report::Report<veloq_driver::error::DriverErrorKind>) -> std::io::Error {
-    std::io::Error::other(format!("{err}"))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferingMode {
@@ -96,28 +93,25 @@ impl OpenOptions {
         self
     }
 
-    pub async fn open_local(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> std::io::Result<super::file::LocalFile> {
-        let op = self.build_op(path.as_ref())?;
+    pub async fn open_local(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::LocalFile> {
+        let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
         use crate::runtime::context::submit;
         use veloq_driver::op::{LocalSubmitter, Op};
 
         let submitter = LocalSubmitter;
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
-        let owned = res.map_err(driver_err)?;
+        let owned = res.map_err(from_driver_report)?;
         let fd = owned.into_raw();
         let ctx = crate::runtime::context::try_current()
-            .ok_or_else(|| std::io::Error::other("runtime context not set"))?;
+            .ok_or_else(|| from_io_error(std::io::Error::other("runtime context not set")))?;
         let driver = ctx.driver();
         let fixed = driver
             .borrow_mut()
             .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
-            .map_err(driver_err)?
+            .map_err(from_driver_report)?
             .into_iter()
             .next()
-            .ok_or_else(|| std::io::Error::other("register_files returned empty"))?;
+            .ok_or_else(|| from_io_error(std::io::Error::other("register_files returned empty")))?;
         use std::cell::Cell;
 
         Ok(super::file::LocalFile {
@@ -128,14 +122,14 @@ impl OpenOptions {
         })
     }
 
-    pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<super::file::File> {
-        let op = self.build_op(path.as_ref())?;
+    pub async fn open(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::File> {
+        let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
         use crate::runtime::context::submit;
         use veloq_driver::op::{DetachedSubmitter, Op};
 
         let submitter = DetachedSubmitter::new();
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
-        let owned = res.map_err(driver_err)?;
+        let owned = res.map_err(from_driver_report)?;
         let fd = owned.into_raw();
         use std::sync::atomic::AtomicU64;
 
@@ -282,4 +276,3 @@ impl OpenOptions {
         })
     }
 }
-

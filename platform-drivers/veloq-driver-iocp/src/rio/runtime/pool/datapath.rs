@@ -11,8 +11,8 @@ use crate::ops::submit::SubmissionResult;
 use crate::rio::core::submit_ops::{RioDispatch, RioExConfig, RioProvider, RioRq};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioCompletionContext, RioContext, RioState};
-use rustc_hash::FxHashMap;
 use diagweave::report::ResultReportExt;
+use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::collections::{VecDeque, hash_map};
 use veloq_buf::FixedBuf;
@@ -139,8 +139,9 @@ impl UdpPoolManager {
         let total_nz = std::num::NonZeroUsize::new(total)
             .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
             .attach_note("UDP slab total size must be > 0")?;
-        let backing = FixedBuf::alloc_heap(total_nz)
-            .map_err(|e| diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string()))?;
+        let backing = FixedBuf::alloc_heap(total_nz).map_err(|e| {
+            diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string())
+        })?;
 
         let rio_id = ctx
             .env

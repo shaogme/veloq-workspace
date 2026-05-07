@@ -114,10 +114,8 @@ impl RioState {
             let count = self.kernel.dequeue(&mut results);
 
             if count == RIO_CORRUPT_CQ {
-                return Err(
-                    diagweave::report::Report::new(RioError::Internal)
-                        .attach_note("RIO completion queue is corrupt (RIO_CORRUPT_CQ)"),
-                );
+                return Err(diagweave::report::Report::new(RioError::Internal)
+                    .attach_note("RIO completion queue is corrupt (RIO_CORRUPT_CQ)"));
             }
 
             if count == 0 {
@@ -193,4 +191,3 @@ mod tests {
         assert!(super::RIO_REAPER_DRAIN_TIMEOUT > std::time::Duration::from_secs(0));
     }
 }
-

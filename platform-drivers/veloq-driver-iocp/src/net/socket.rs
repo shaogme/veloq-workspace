@@ -264,4 +264,3 @@ impl PlatformSocket for Socket {
         Socket::set_broadcast(self, broadcast)
     }
 }
-

@@ -1,39 +1,31 @@
-use diagweave::report::Report;
-use std::fmt;
+use diagweave::{report::Report, set};
 use veloq_driver_core::error::{DriverErrorKind, DriverResult, ResultAsDriverExt};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum IocpError {
-    DriverInit,
-    CompletionWait,
-    Submission,
-    Rio,
-    ResolveFd,
-    Socket,
-    Win32,
-    InvalidInput,
-    InvalidState,
-    Internal,
-}
-
-impl fmt::Display for IocpError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DriverInit => write!(f, "IOCP driver initialization failed"),
-            Self::CompletionWait => write!(f, "IOCP completion wait failed"),
-            Self::Submission => write!(f, "IOCP operation submission failed"),
-            Self::Rio => write!(f, "RIO operation failed"),
-            Self::ResolveFd => write!(f, "failed to resolve IO handle"),
-            Self::Socket => write!(f, "socket operation failed"),
-            Self::Win32 => write!(f, "Win32 API call failed"),
-            Self::InvalidInput => write!(f, "invalid input"),
-            Self::InvalidState => write!(f, "invalid internal state"),
-            Self::Internal => write!(f, "internal error"),
-        }
+set! {
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub IocpError = {
+        #[display("IOCP driver initialization failed")]
+        DriverInit,
+        #[display("IOCP completion wait failed")]
+        CompletionWait,
+        #[display("IOCP operation submission failed")]
+        Submission,
+        #[display("RIO operation failed")]
+        Rio,
+        #[display("failed to resolve IO handle")]
+        ResolveFd,
+        #[display("socket operation failed")]
+        Socket,
+        #[display("Win32 API call failed")]
+        Win32,
+        #[display("invalid input")]
+        InvalidInput,
+        #[display("invalid internal state")]
+        InvalidState,
+        #[display("internal error")]
+        Internal,
     }
 }
-
-impl std::error::Error for IocpError {}
 
 pub type IocpResult<T> = Result<T, Report<IocpError>>;
 
@@ -64,19 +56,20 @@ pub(crate) fn from_io_error<E>(
     error: E,
 ) -> Report<IocpError>
 where
-    E: fmt::Display + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     let error_ref = &error as &dyn std::any::Any;
     let os_code = error_ref
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error);
+    let detail = error.to_string();
     let report = Report::new(context)
         .with_ctx("scope", scope)
-        .attach_note(error.to_string());
+        .attach_note(detail)
+        .with_diag_src_err(error);
     if let Some(code) = os_code {
         report.set_error_code(code)
     } else {
         report
     }
 }
-

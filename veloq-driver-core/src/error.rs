@@ -1,40 +1,33 @@
 use core::convert::TryFrom;
 use core::fmt;
 
-use diagweave::report::Report;
+use diagweave::{report::Report, set};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriverErrorKind {
-    InvalidInput,
-    InvalidState,
-    Submission,
-    Completion,
-    Registration,
-    Socket,
-    Timeout,
-    Unsupported,
-    Internal,
-    System,
-}
-
-impl fmt::Display for DriverErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidInput => f.write_str("invalid input"),
-            Self::InvalidState => f.write_str("invalid state"),
-            Self::Submission => f.write_str("submission failed"),
-            Self::Completion => f.write_str("completion failed"),
-            Self::Registration => f.write_str("registration failed"),
-            Self::Socket => f.write_str("socket operation failed"),
-            Self::Timeout => f.write_str("timeout"),
-            Self::Unsupported => f.write_str("unsupported"),
-            Self::Internal => f.write_str("internal error"),
-            Self::System => f.write_str("system error"),
-        }
+set! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub DriverErrorKind = {
+        #[display("invalid input")]
+        InvalidInput,
+        #[display("invalid state")]
+        InvalidState,
+        #[display("submission failed")]
+        Submission,
+        #[display("completion failed")]
+        Completion,
+        #[display("registration failed")]
+        Registration,
+        #[display("socket operation failed")]
+        Socket,
+        #[display("timeout")]
+        Timeout,
+        #[display("unsupported")]
+        Unsupported,
+        #[display("internal error")]
+        Internal,
+        #[display("system error")]
+        System,
     }
 }
-
-impl std::error::Error for DriverErrorKind {}
 
 pub type DriverResult<T> = Result<T, Report<DriverErrorKind>>;
 pub type DriverErrorReport = Report<DriverErrorKind>;
@@ -113,7 +106,7 @@ pub trait ResultAsDriverExt<T, E> {
 
 impl<T, E> ResultAsDriverExt<T, E> for Result<T, Report<E>>
 where
-    E: fmt::Debug + fmt::Display + Send + Sync + 'static,
+    E: fmt::Debug + fmt::Display + std::error::Error + Send + Sync + 'static,
 {
     fn to_driver_result(
         self,
@@ -122,9 +115,11 @@ where
         detail: impl ToString,
     ) -> DriverResult<T> {
         let detail = detail.to_string();
-        self.map_err(|_report| {
+        self.map_err(|report| {
             tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
-            Report::new(kind)
+            report
+                .set_accumulate_src_chain(true)
+                .map_err(|_| kind)
                 .with_ctx("scope", scope)
                 .attach_note(detail)
                 .attach_note("driver error report captured")

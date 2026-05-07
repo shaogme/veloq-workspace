@@ -269,7 +269,9 @@ impl RioState {
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
         let (res, pool_submissions) = pool_manager
             .try_submit_pool_recv(udp_mailbox, stream_op, (user_data, generation), &mut ctx)
-            .map_err(|e| diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string()))
+            .map_err(|e| {
+                diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string())
+            })
             .attach_note("pool submission failed")?;
 
         self.outstanding_count += pool_submissions;
@@ -329,7 +331,9 @@ impl RioState {
         let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
         let (res, pool_submissions, immediate_copied) = pool_manager
             .try_submit_pool_recv_recv(udp_mailbox, recv_op, (user_data, generation), &mut ctx)
-            .map_err(|e| diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string()))
+            .map_err(|e| {
+                diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string())
+            })
             .attach_note("pool submission failed")?;
 
         if let Some(copied) = immediate_copied {
@@ -339,4 +343,3 @@ impl RioState {
         Ok(res)
     }
 }
-

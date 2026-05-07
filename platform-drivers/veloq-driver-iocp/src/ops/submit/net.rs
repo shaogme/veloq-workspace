@@ -356,7 +356,8 @@ pub(crate) fn submit_accept(
         payload.accept_socket = Some(accept_socket);
     }
     let accept_socket = payload.accept_socket.as_ref().ok_or_else(|| {
-        diagweave::report::Report::new(IocpError::InvalidState).attach_note("accept socket not initialized")
+        diagweave::report::Report::new(IocpError::InvalidState)
+            .attach_note("accept socket not initialized")
     })?;
     let accept_socket_raw = accept_socket.raw().as_socket();
 
@@ -413,7 +414,8 @@ pub(crate) unsafe fn on_complete_accept(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
     let accept_socket = payload.accept_socket.take().ok_or_else(|| {
-        diagweave::report::Report::new(IocpError::InvalidState).attach_note("accept socket not initialized")
+        diagweave::report::Report::new(IocpError::InvalidState)
+            .attach_note("accept socket not initialized")
     })?;
     let listen_handle = header.resolved_handle.ok_or_else(|| {
         diagweave::report::Report::new(IocpError::InvalidState)
@@ -552,4 +554,3 @@ pub(crate) unsafe fn on_udp_stream_complete(
     }
     Ok(result)
 }
-

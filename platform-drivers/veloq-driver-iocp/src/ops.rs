@@ -477,4 +477,3 @@ define_iocp_ops! {
         destruct: |user: Box<Wakeup>| *user,
     },
 }
-

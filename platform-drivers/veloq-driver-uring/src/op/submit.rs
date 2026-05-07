@@ -1,6 +1,6 @@
-use diagweave::report::Report;
 use crate::driver::UringDriver;
 use crate::op::{UringOp, UringOpPayload};
+use diagweave::report::Report;
 use io_uring::{opcode, squeue, types};
 use veloq_buf::PoolKind;
 use veloq_driver_core::error::{DriverErrorKind, DriverResult, driver_error, driver_os_error};

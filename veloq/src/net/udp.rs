@@ -4,9 +4,9 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::runtime::context::submit;
-use diagweave::report::Report;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::driver::Driver;
@@ -24,35 +24,33 @@ pub struct GenericUdpSocket<S: OpSubmitter, P: SocketTokenPtr> {
 pub type LocalUdpSocket = GenericUdpSocket<LocalSubmitter, Rc<SocketToken>>;
 pub type UdpSocket = GenericUdpSocket<DetachedSubmitter, Arc<SocketToken>>;
 
-#[inline]
-fn driver_err<E>(err: Report<E>) -> io::Error
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    io::Error::other(err.to_string())
-}
-
-fn bind_inner<A: ToSocketAddrs, P: SocketTokenPtr>(addr: A) -> io::Result<InnerSocket<P>> {
+fn bind_inner<A: ToSocketAddrs, P: SocketTokenPtr>(addr: A) -> VeloqResult<InnerSocket<P>> {
     let addr = addr
-        .to_socket_addrs()?
+        .to_socket_addrs()
+        .map_err(from_io_error)?
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No address provided"))?;
+        .ok_or_else(|| {
+            from_io_error(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "No address provided",
+            ))
+        })?;
 
     let socket = if addr.is_ipv4() {
-        Socket::new_udp_v4().map_err(driver_err)?
+        Socket::new_udp_v4().map_err(from_driver_report)?
     } else {
-        Socket::new_udp_v6().map_err(driver_err)?
+        Socket::new_udp_v6().map_err(from_driver_report)?
     };
 
-    socket.bind(addr).map_err(driver_err)?;
-    let local_addr = socket.local_addr().map_err(driver_err)?;
+    socket.bind(addr).map_err(from_driver_report)?;
+    let local_addr = socket.local_addr().map_err(from_driver_report)?;
 
     InnerSocket::new(socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
 impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
-    pub async fn recv_ready(&self, buf_capacity: NonZeroUsize, credits: usize) -> io::Result<()> {
-        self.inner.ensure_affinity().await?;
+    pub async fn recv_ready(&self, buf_capacity: NonZeroUsize, credits: usize) -> VeloqResult<()> {
+        self.inner.ensure_affinity().await.map_err(from_io_error)?;
         if credits == 0 {
             return Ok(());
         }
@@ -63,13 +61,13 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
             return driver
                 .borrow_mut()
                 .warmup_udp_socket(self.inner.fd(), buf_capacity, credits)
-                .map_err(driver_err);
+                .map_err(from_driver_report);
         }
 
         Ok(())
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
         self.inner.local_addr()
     }
 
@@ -77,8 +75,8 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
         &self,
         buf: FixedBuf,
         target: SocketAddr,
-    ) -> io::Result<(usize, FixedBuf)> {
-        self.inner.ensure_affinity().await?;
+    ) -> VeloqResult<(usize, FixedBuf)> {
+        self.inner.ensure_affinity().await.map_err(from_io_error)?;
         let op = SendTo {
             fd: self.inner.fd(),
             buf,
@@ -86,14 +84,14 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
             addr: target,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let buf = op_back
-            .map(|o| o.buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res.map_err(driver_err)?, buf))
+        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
+        })?;
+        Ok((res.map_err(from_driver_report)?, buf))
     }
 
-    async fn recv_stream_direct(&self, buf: FixedBuf) -> io::Result<UdpRecvPacket> {
-        self.inner.ensure_affinity().await?;
+    async fn recv_stream_direct(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
+        self.inner.ensure_affinity().await.map_err(from_io_error)?;
         let op = UdpRecvStream {
             fd: self.inner.fd(),
             buf: Some(buf),
@@ -101,8 +99,9 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
             result: None,
         };
         let (res, op_back_opt) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let mut op_back = op_back_opt.ok_or_else(|| io::Error::other("UdpRecvStream op lost"))?;
-        let n = res.map_err(driver_err)?;
+        let mut op_back =
+            op_back_opt.ok_or_else(|| from_io_error(io::Error::other("UdpRecvStream op lost")))?;
+        let n = res.map_err(from_driver_report)?;
 
         if let Some(datagram) = op_back.result.take() {
             return Ok(datagram);
@@ -111,13 +110,13 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
         let mut recv_buf = op_back
             .buf
             .take()
-            .ok_or_else(|| io::Error::other("udp recv_stream buffer missing"))?;
+            .ok_or_else(|| from_io_error(io::Error::other("udp recv_stream buffer missing")))?;
         recv_buf.set_len(n);
         let addr = op_back.addr.ok_or_else(|| {
-            io::Error::new(
+            from_io_error(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "driver must populate UdpRecvStream::addr before completion",
-            )
+            ))
         })?;
         Ok(UdpRecvPacket {
             buf: recv_buf,
@@ -125,8 +124,8 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
         })
     }
 
-    async fn connect_direct(&self, addr: SocketAddr) -> io::Result<()> {
-        self.inner.ensure_affinity().await?;
+    async fn connect_direct(&self, addr: SocketAddr) -> VeloqResult<()> {
+        self.inner.ensure_affinity().await.map_err(from_io_error)?;
         let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = UdpConnect {
@@ -135,48 +134,48 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
             addr_len: raw_addr_len as u32,
         };
         let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        res.map(|_| ()).map_err(driver_err)
+        res.map(|_| ()).map_err(from_driver_report)
     }
 
     async fn send_subset_direct(
         &self,
         buf: FixedBuf,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
-        self.inner.ensure_affinity().await?;
+    ) -> VeloqResult<(usize, FixedBuf)> {
+        self.inner.ensure_affinity().await.map_err(from_io_error)?;
         let op = OpUdpSend {
             fd: self.inner.fd(),
             buf,
             buf_offset,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let buf = op_back
-            .map(|o| o.buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res.map_err(driver_err)?, buf))
+        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
+        })?;
+        Ok((res.map_err(from_driver_report)?, buf))
     }
 
     async fn recv_subset_direct(
         &self,
         buf: FixedBuf,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
-        self.inner.ensure_affinity().await?;
+    ) -> VeloqResult<(usize, FixedBuf)> {
+        self.inner.ensure_affinity().await.map_err(from_io_error)?;
         let op = OpUdpRecv {
             fd: self.inner.fd(),
             buf,
             buf_offset,
         };
         let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let buf = op_back
-            .map(|o| o.buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))?;
-        Ok((res.map_err(driver_err)?, buf))
+        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
+        })?;
+        Ok((res.map_err(from_driver_report)?, buf))
     }
 }
 
 impl LocalUdpSocket {
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(addr)?,
             submitter: LocalSubmitter,
@@ -187,23 +186,23 @@ impl LocalUdpSocket {
         &self,
         buf: FixedBuf,
         target: SocketAddr,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         self.send_to_direct(buf, target).await
     }
 
-    pub async fn recv_stream(&self, buf: FixedBuf) -> io::Result<UdpRecvPacket> {
+    pub async fn recv_stream(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
         self.recv_stream_direct(buf).await
     }
 
-    pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+    pub async fn connect(&self, addr: SocketAddr) -> VeloqResult<()> {
         self.connect_direct(addr).await
     }
 
-    pub async fn send(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    pub async fn send(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
         self.send_subset(buf, 0).await
     }
 
-    pub async fn recv(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    pub async fn recv(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
         self.recv_subset(buf, 0).await
     }
 
@@ -211,7 +210,7 @@ impl LocalUdpSocket {
         &self,
         buf: FixedBuf,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         self.send_subset_direct(buf, buf_offset).await
     }
 
@@ -219,13 +218,13 @@ impl LocalUdpSocket {
         &self,
         buf: FixedBuf,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         self.recv_subset_direct(buf, buf_offset).await
     }
 }
 
 impl UdpSocket {
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(addr)?,
             submitter: DetachedSubmitter::new(),
@@ -236,23 +235,23 @@ impl UdpSocket {
         &self,
         buf: FixedBuf,
         target: SocketAddr,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         self.send_to_direct(buf, target).await
     }
 
-    pub async fn recv_stream(&self, buf: FixedBuf) -> io::Result<UdpRecvPacket> {
+    pub async fn recv_stream(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
         self.recv_stream_direct(buf).await
     }
 
-    pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+    pub async fn connect(&self, addr: SocketAddr) -> VeloqResult<()> {
         self.connect_direct(addr).await
     }
 
-    pub async fn send(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    pub async fn send(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
         self.send_subset(buf, 0).await
     }
 
-    pub async fn recv(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    pub async fn recv(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
         self.recv_subset(buf, 0).await
     }
 
@@ -260,7 +259,7 @@ impl UdpSocket {
         &self,
         buf: FixedBuf,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         self.send_subset_direct(buf, buf_offset).await
     }
 
@@ -268,24 +267,21 @@ impl UdpSocket {
         &self,
         buf: FixedBuf,
         buf_offset: usize,
-    ) -> io::Result<(usize, FixedBuf)> {
+    ) -> VeloqResult<(usize, FixedBuf)> {
         self.recv_subset_direct(buf, buf_offset).await
     }
 }
 
 impl crate::io::AsyncBufRead for LocalUdpSocket {
-    fn read(
-        &self,
-        buf: FixedBuf,
-    ) -> impl std::future::Future<Output = io::Result<(usize, FixedBuf)>> {
-        self.recv(buf)
+    async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+        self.recv(buf).await.map_err(to_io_error)
     }
 
     async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.recv_subset(buf, total).await?;
+            let (n, b) = self.recv_subset(buf, total).await.map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -300,18 +296,15 @@ impl crate::io::AsyncBufRead for LocalUdpSocket {
 }
 
 impl crate::io::AsyncBufRead for UdpSocket {
-    fn read(
-        &self,
-        buf: FixedBuf,
-    ) -> impl std::future::Future<Output = io::Result<(usize, FixedBuf)>> {
-        self.recv(buf)
+    async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+        self.recv(buf).await.map_err(to_io_error)
     }
 
     async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.recv_subset(buf, total).await?;
+            let (n, b) = self.recv_subset(buf, total).await.map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -326,18 +319,15 @@ impl crate::io::AsyncBufRead for UdpSocket {
 }
 
 impl crate::io::AsyncBufWrite for LocalUdpSocket {
-    fn write(
-        &self,
-        buf: FixedBuf,
-    ) -> impl std::future::Future<Output = io::Result<(usize, FixedBuf)>> {
-        self.send(buf)
+    async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+        self.send(buf).await.map_err(to_io_error)
     }
 
     async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.send_subset(buf, total).await?;
+            let (n, b) = self.send_subset(buf, total).await.map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -350,28 +340,25 @@ impl crate::io::AsyncBufWrite for LocalUdpSocket {
         Ok((total, buf))
     }
 
-    fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {
-        std::future::ready(Ok(()))
+    async fn flush(&self) -> io::Result<()> {
+        Ok(())
     }
 
-    fn shutdown(&self) -> impl std::future::Future<Output = io::Result<()>> {
-        std::future::ready(Ok(()))
+    async fn shutdown(&self) -> io::Result<()> {
+        Ok(())
     }
 }
 
 impl crate::io::AsyncBufWrite for UdpSocket {
-    fn write(
-        &self,
-        buf: FixedBuf,
-    ) -> impl std::future::Future<Output = io::Result<(usize, FixedBuf)>> {
-        self.send(buf)
+    async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+        self.send(buf).await.map_err(to_io_error)
     }
 
     async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.send_subset(buf, total).await?;
+            let (n, b) = self.send_subset(buf, total).await.map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -384,12 +371,11 @@ impl crate::io::AsyncBufWrite for UdpSocket {
         Ok((total, buf))
     }
 
-    fn flush(&self) -> impl std::future::Future<Output = io::Result<()>> {
-        std::future::ready(Ok(()))
+    async fn flush(&self) -> io::Result<()> {
+        Ok(())
     }
 
-    fn shutdown(&self) -> impl std::future::Future<Output = io::Result<()>> {
-        std::future::ready(Ok(()))
+    async fn shutdown(&self) -> io::Result<()> {
+        Ok(())
     }
 }
-

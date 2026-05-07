@@ -44,42 +44,18 @@ fn sanitize_field(s: &str) -> String {
     s.replace('\n', "\\n").replace('\r', "\\r")
 }
 
-fn structured_line(
-    ctx: IocpErrorContext,
-    detail: &str,
-    source: Option<&str>,
-    os_code: Option<i32>,
-) -> String {
-    let source = source
-        .map(sanitize_field)
-        .unwrap_or_else(|| "none".to_string());
-    let os_code = os_code
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "none".to_string());
-    format!(
-        "context={ctx}; detail={}; source={source}; os_error={os_code}",
-        sanitize_field(detail)
-    )
-}
-
-pub(crate) fn iocp_msg(
-    ctx: IocpErrorContext,
-    detail: impl Into<String>,
-) -> Report<IocpError> {
+pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Report<IocpError> {
     let detail = detail.into();
     let report = Report::new(IocpError::from(ctx))
         .with_ctx("scope", "iocp/common")
-        .attach_note(detail.clone());
-    let msg = structured_line(ctx, &detail, None, None);
+        .with_ctx("detail", sanitize_field(&detail))
+        .attach_note(detail);
     error!(
         context = %ctx,
-        detail = %detail,
         report = %report,
         "IOCP error report"
     );
-    Report::new(IocpError::from(ctx))
-        .with_ctx("scope", "iocp/common")
-        .attach_note(msg)
+    report
 }
 
 // ============================================================================
@@ -182,4 +158,3 @@ impl RemoteWaker for IocpWaker {
         Ok(())
     }
 }
-

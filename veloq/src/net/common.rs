@@ -4,13 +4,10 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
 use veloq_driver::driver::{Driver, RegisterFd};
 use veloq_driver::op::IoFd;
 use veloq_driver::{OwnedRawHandle, RawHandle};
-
-fn driver_err(err: diagweave::report::Report<veloq_driver::error::DriverErrorKind>) -> io::Error {
-    io::Error::other(format!("{err}"))
-}
 
 // ============================================================================
 // SocketToken + InnerSocket (RAII Wrapper)
@@ -22,26 +19,26 @@ pub struct SocketToken {
 }
 
 impl SocketToken {
-    pub(crate) fn new(handle: RawHandle) -> io::Result<Self> {
+    pub(crate) fn new(handle: RawHandle) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
-            return Err(io::Error::new(
+            return Err(from_io_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "socket registration requires socket handle",
-            ));
+            )));
         }
 
         // SAFETY: caller transfers ownership via RawHandle created from OwnedRawHandle::into_raw.
         let owned = unsafe { OwnedRawHandle::from_raw_owned(handle) };
         let ctx = crate::runtime::context::try_current()
-            .ok_or_else(|| io::Error::other("runtime context not set"))?;
+            .ok_or_else(|| from_io_error(io::Error::other("runtime context not set")))?;
         let driver = ctx.driver();
         let fd = driver
             .borrow_mut()
             .register_files(vec![RegisterFd::Owned(owned)])
-            .map_err(driver_err)
+            .map_err(from_driver_report)
             .and_then(|mut fds| {
                 fds.pop()
-                    .ok_or_else(|| io::Error::other("register_files returned empty"))
+                    .ok_or_else(|| from_io_error(io::Error::other("register_files returned empty")))
             })?;
         Ok(Self {
             fd,
@@ -96,7 +93,7 @@ pub struct InnerSocket<P> {
 }
 
 impl<P: SocketTokenPtr> InnerSocket<P> {
-    pub fn new(handle: RawHandle, local_addr: Option<SocketAddr>) -> io::Result<Self> {
+    pub fn new(handle: RawHandle, local_addr: Option<SocketAddr>) -> VeloqResult<Self> {
         Ok(Self {
             token: P::new_ptr(SocketToken::new(handle)?),
             local_addr,
@@ -117,9 +114,11 @@ impl<P: SocketTokenPtr> InnerSocket<P> {
         Ok(())
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.local_addr
-            .ok_or_else(|| io::Error::other("local addr is unavailable for this socket"))
+    pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
+        self.local_addr.ok_or_else(|| {
+            from_io_error(io::Error::other(
+                "local addr is unavailable for this socket",
+            ))
+        })
     }
 }
-

@@ -3,9 +3,9 @@ pub(crate) mod io_tests;
 pub(crate) mod net;
 pub(crate) mod net_udp;
 
-use std::sync::atomic::Ordering;
 use core::convert::TryFrom;
 use diagweave::report::Report;
+use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::{
     DriveMode, Driver, PollRecordResult, encode_completion_token, event_res_to_result,
 };
@@ -58,10 +58,8 @@ pub(crate) fn wait_completion(
                 });
             }
             PollRecordResult::Stale => {
-                return Err(
-                    Report::new(IocpError::CompletionWait)
-                        .attach_note("stale completion record (generation mismatch)"),
-                );
+                return Err(Report::new(IocpError::CompletionWait)
+                    .attach_note("stale completion record (generation mismatch)"));
             }
             PollRecordResult::Pending => {}
         }
@@ -70,7 +68,5 @@ pub(crate) fn wait_completion(
 }
 
 pub(crate) fn completion_os_error_code(err: &Report<IocpError>) -> Option<i32> {
-    err.error_code()
-        .and_then(|code| i32::try_from(code).ok())
+    err.error_code().and_then(|code| i32::try_from(code).ok())
 }
-

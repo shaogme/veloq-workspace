@@ -237,8 +237,7 @@ pub(crate) fn ensure_iocp_association(
     detail: impl Into<String>,
 ) -> IocpResult<()> {
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
-    unsafe { port.associate(handle.raw().as_handle(), 0) }
-        .map_err(|e| e.attach_note(detail.into()))
+    unsafe { port.associate(handle.raw().as_handle(), 0) }.map_err(|e| e.attach_note(detail.into()))
 }
 
 #[inline]
@@ -251,4 +250,3 @@ pub(crate) fn mark_header_in_flight(
     }
     res
 }
-

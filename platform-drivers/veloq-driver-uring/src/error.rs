@@ -1,39 +1,31 @@
-use diagweave::report::Report;
-use std::fmt;
+use diagweave::{report::Report, set};
 use veloq_driver_core::error::{DriverErrorKind, DriverResult, ResultAsDriverExt};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum UringError {
-    DriverInit,
-    CompletionWait,
-    Submission,
-    Registration,
-    ResolveFd,
-    Socket,
-    InvalidInput,
-    InvalidState,
-    Unsupported,
-    Internal,
-}
-
-impl fmt::Display for UringError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DriverInit => write!(f, "io_uring driver initialization failed"),
-            Self::CompletionWait => write!(f, "io_uring completion wait failed"),
-            Self::Submission => write!(f, "io_uring operation submission failed"),
-            Self::Registration => write!(f, "io_uring registration failed"),
-            Self::ResolveFd => write!(f, "failed to resolve io_uring file descriptor"),
-            Self::Socket => write!(f, "socket operation failed"),
-            Self::InvalidInput => write!(f, "invalid input"),
-            Self::InvalidState => write!(f, "invalid internal state"),
-            Self::Unsupported => write!(f, "unsupported operation"),
-            Self::Internal => write!(f, "internal error"),
-        }
+set! {
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub UringError = {
+        #[display("io_uring driver initialization failed")]
+        DriverInit,
+        #[display("io_uring completion wait failed")]
+        CompletionWait,
+        #[display("io_uring operation submission failed")]
+        Submission,
+        #[display("io_uring registration failed")]
+        Registration,
+        #[display("failed to resolve io_uring file descriptor")]
+        ResolveFd,
+        #[display("socket operation failed")]
+        Socket,
+        #[display("invalid input")]
+        InvalidInput,
+        #[display("invalid internal state")]
+        InvalidState,
+        #[display("unsupported operation")]
+        Unsupported,
+        #[display("internal error")]
+        Internal,
     }
 }
-
-impl std::error::Error for UringError {}
 
 pub type UringResult<T> = Result<T, Report<UringError>>;
 
@@ -64,15 +56,17 @@ pub(crate) fn from_io_error<E>(
     error: E,
 ) -> Report<UringError>
 where
-    E: fmt::Display + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     let error_ref = &error as &dyn std::any::Any;
     let os_code = error_ref
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error);
+    let detail = error.to_string();
     let report = Report::new(context)
         .with_ctx("scope", scope)
-        .attach_note(error.to_string());
+        .attach_note(detail)
+        .with_diag_src_err(error);
     if let Some(code) = os_code {
         report.set_error_code(code)
     } else {
