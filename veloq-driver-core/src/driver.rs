@@ -590,12 +590,6 @@ pub trait Driver: 'static {
 
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
 
-    /// 判断当前驱动是否仍有需要 runtime 继续推进的工作。
-    ///
-    /// 这个判断比 `has_active_ops()` 更宽松，会把已产生但尚未被消费的完成事件
-    /// 一并纳入，避免 runtime 过早进入长时间睡眠。
-    fn has_pending_progress(&mut self) -> bool;
-
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
 }
 
@@ -632,6 +626,7 @@ pub enum DriveMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DriveOutcome {
     pub next_timeout_hint: Option<Duration>,
+    pub pending_progress: bool,
 }
 
 pub trait RemoteWaker: Send + Sync {

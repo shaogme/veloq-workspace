@@ -195,13 +195,12 @@ impl RuntimeDriverBridge {
         self.sync_registrar();
         let driver_rc = self.driver.clone();
         let mut driver = driver_rc.borrow_mut();
-        if !driver.has_pending_progress() {
-            return IdleDecision::wait(IdleWaitStrategy::block());
-        }
-
         let outcome = driver
             .drive(DriveMode::Wait)
             .unwrap_or_else(|err| panic!("driver drive(Wait) failed: {err:#}"));
+        if !outcome.pending_progress {
+            return IdleDecision::wait(IdleWaitStrategy::block());
+        }
         match outcome.next_timeout_hint {
             Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
             None => IdleDecision::wait(IdleWaitStrategy::block()),
@@ -308,7 +307,7 @@ pub fn poll_current_driver() -> IdleDecision {
         .unwrap_or_else(|err| panic!("driver drive(Poll) failed: {err:#}"));
     match outcome.next_timeout_hint {
         Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
-        None if driver.has_pending_progress() => IdleDecision::continue_now(),
+        None if outcome.pending_progress => IdleDecision::continue_now(),
         None => IdleDecision::wait(IdleWaitStrategy::block()),
     }
 }

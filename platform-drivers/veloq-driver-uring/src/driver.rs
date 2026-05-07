@@ -951,6 +951,14 @@ impl Driver for UringDriver {
                 })?;
             }
             DriveMode::Wait => {
+                let pending_progress =
+                    self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
+                if !pending_progress {
+                    return Ok(DriveOutcome {
+                        next_timeout_hint: self.wheel.next_timeout(),
+                        pending_progress,
+                    });
+                }
                 self.wait_internal().to_driver_result(
                     DriverErrorKind::Completion,
                     "uring.driver.drive.wait",
@@ -959,8 +967,11 @@ impl Driver for UringDriver {
             }
         }
 
+        let pending_progress =
+            self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
         Ok(DriveOutcome {
             next_timeout_hint: self.wheel.next_timeout(),
+            pending_progress,
         })
     }
 
@@ -1020,10 +1031,6 @@ impl Driver for UringDriver {
             fd: self.waker_fd.clone(),
             is_waked: self.is_waked.clone(),
         })
-    }
-
-    fn has_pending_progress(&mut self) -> bool {
-        self.has_active_ops_internal() || self.ops.shared.has_ready_completion()
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {

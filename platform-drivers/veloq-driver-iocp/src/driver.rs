@@ -793,6 +793,14 @@ impl Driver for IocpDriver {
                 })?;
             }
             DriveMode::Wait => {
+                let pending_progress =
+                    self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
+                if !pending_progress {
+                    return Ok(DriveOutcome {
+                        next_timeout_hint: self.wheel.next_timeout(),
+                        pending_progress,
+                    });
+                }
                 self.get_completion(u32::MAX).map_err(|e| {
                     Self::with_report_detail(
                         DriverErrorKind::Completion,
@@ -804,8 +812,11 @@ impl Driver for IocpDriver {
             }
         }
 
+        let pending_progress =
+            self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
         Ok(DriveOutcome {
             next_timeout_hint: self.wheel.next_timeout(),
+            pending_progress,
         })
     }
 
@@ -866,10 +877,6 @@ impl Driver for IocpDriver {
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
         IocpDriver::create_waker(self)
-    }
-
-    fn has_pending_progress(&mut self) -> bool {
-        self.has_active_ops_internal() || self.ops.shared.has_ready_completion()
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
