@@ -131,6 +131,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
             return;
         }
         let cell = &self.slots[idx];
+        let should_note_ready;
 
         let ready_from = loop {
             let current = cell.load_core_state(Ordering::Acquire);
@@ -150,6 +151,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                 | slot::SlotState::InFlightReady
                 | slot::SlotState::InFlightWaiting
                 | slot::SlotState::ReservedValue => {
+                    should_note_ready = state != slot::SlotState::InFlightReady;
                     break current;
                 }
                 slot::SlotState::InFlightOrphaned => {
@@ -179,6 +181,9 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
             }
         };
 
+        if should_note_ready {
+            self.note_ready_completion();
+        }
         cell.completion_with_data(|payload_cell, detail_cell| {
             *payload_cell = payload.take();
             *detail_cell = detail.take();
@@ -227,6 +232,9 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                 if cur.generation() == generation
                     && cur.state() == slot::SlotState::InFlightOrphaned
                 {
+                    if should_note_ready {
+                        self.clear_ready_completion();
+                    }
                     let _ = cell.core_state.compare_exchange(
                         cur,
                         cur.with_state(slot::SlotState::Idle)
@@ -234,6 +242,8 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     );
+                } else if should_note_ready {
+                    self.clear_ready_completion();
                 }
                 return;
             }
@@ -278,6 +288,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
             return PollRecordResult::Pending;
         }
 
+        self.clear_ready_completion();
         let (payload, detail) = cell.completion_with_data(|payload_cell, detail_cell| {
             (payload_cell.take(), detail_cell.take())
         });
@@ -467,12 +478,13 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                             current,
                             current
                                 .with_state(slot::SlotState::Idle)
-                                .with_generation(generation),
+                                .with_generation(generation.wrapping_add(1)),
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
                         .is_ok()
                     {
+                        self.clear_ready_completion();
                         cell.completion_with_data(|payload_cell, detail_cell| {
                             let _ = payload_cell.take();
                             let _ = detail_cell.take();
@@ -647,6 +659,14 @@ pub trait Driver: 'static {
     fn driver_id(&self) -> usize;
 
     fn has_active_ops(&mut self) -> bool;
+
+    /// 判断当前驱动是否仍有需要 runtime 继续推进的工作。
+    ///
+    /// 这个判断比 `has_active_ops()` 更宽松，会把已产生但尚未被消费的完成事件
+    /// 一并纳入，避免 runtime 过早进入长时间睡眠。
+    fn has_pending_progress(&mut self) -> bool {
+        self.has_active_ops() || self.slot_table().has_ready_completion()
+    }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
 }

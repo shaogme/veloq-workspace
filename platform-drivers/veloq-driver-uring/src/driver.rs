@@ -1104,6 +1104,10 @@ impl Driver for UringDriver {
         self.has_active_ops_internal()
     }
 
+    fn has_pending_progress(&mut self) -> bool {
+        self.has_active_ops_internal() || self.ops.shared.has_ready_completion()
+    }
+
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
         self.registrar = registrar;
     }

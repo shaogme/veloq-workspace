@@ -161,6 +161,42 @@ impl veloq_buf::BufferRegistrar for DriverRegistrar {
 }
 
 #[derive(Clone)]
+pub(crate) struct RuntimeDriverBridge {
+    driver: Rc<RefCell<PlatformDriver>>,
+    registrar: DriverRegistrar,
+}
+
+impl RuntimeDriverBridge {
+    fn new(driver: Rc<RefCell<PlatformDriver>>, registrar: DriverRegistrar) -> Self {
+        Self { driver, registrar }
+    }
+
+    #[inline]
+    pub fn sync_registrar(&self) {
+        self.registrar.sync_to_driver();
+    }
+
+    /// 让当前线程的驱动推进一次，并返回下一次空闲轮询建议。
+    ///
+    /// 这个入口同时用于普通提交后的推进和 runtime idle hook。
+    pub fn drive_nonblocking(&self) -> Option<Duration> {
+        self.sync_registrar();
+        let driver_rc = self.driver.clone();
+        let mut driver = driver_rc.borrow_mut();
+        driver
+            .poll_nonblocking()
+            .unwrap_or_else(|err| panic!("driver poll_nonblocking failed: {err:#}"));
+
+        let hint = driver.next_timeout_hint();
+        if hint.is_none() && driver.has_pending_progress() {
+            Some(Duration::from_millis(10))
+        } else {
+            hint
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct RuntimeContext {
     buf_pool: AnyBufPool,
     driver: Rc<RefCell<PlatformDriver>>,
@@ -201,6 +237,11 @@ impl RuntimeContext {
     #[inline]
     pub fn registrar(&self) -> DriverRegistrar {
         self.registrar.clone()
+    }
+
+    #[inline]
+    pub(crate) fn driver_bridge(&self) -> RuntimeDriverBridge {
+        RuntimeDriverBridge::new(self.driver.clone(), self.registrar.clone())
     }
 }
 
@@ -243,21 +284,7 @@ pub fn alloc(size: NonZeroUsize) -> FixedBuf {
 
 pub fn poll_current_driver_nonblocking() -> Option<Duration> {
     let ctx = try_current()?;
-
-    ctx.registrar().sync_to_driver();
-    let driver_rc = ctx.driver();
-    let mut driver = driver_rc.borrow_mut();
-    driver
-        .poll_nonblocking()
-        .unwrap_or_else(|err| panic!("driver poll_nonblocking failed: {err:#}"));
-
-    let hint = driver.next_timeout_hint();
-    if hint.is_none() && driver.has_active_ops() {
-        // If there are pending I/O operations but no timers, poll every 10ms to ensure liveness.
-        Some(Duration::from_millis(10))
-    } else {
-        hint
-    }
+    ctx.driver_bridge().drive_nonblocking()
 }
 
 pub fn submit<'a, S, T>(
@@ -273,7 +300,7 @@ where
         + 'static,
 {
     let ctx = current();
-    ctx.registrar().sync_to_driver();
+    ctx.driver_bridge().sync_registrar();
     let fut = submitter.submit(op, ctx.driver());
     let mut fut = Box::pin(fut);
 
@@ -283,13 +310,8 @@ where
                 Poll::Ready(output) => Poll::Ready(output),
                 Poll::Pending => {
                     let ctx = current();
-                    let driver_rc = ctx.driver();
-                    ctx.registrar().sync_to_driver();
-                    let mut driver = driver_rc.borrow_mut();
-                    driver
-                        .submit_queue()
-                        .unwrap_or_else(|err| panic!("driver submit_queue failed: {err:#}"));
-                    driver.process_completions();
+                    let bridge = ctx.driver_bridge();
+                    let _ = bridge.drive_nonblocking();
                     Poll::Pending
                 }
             },
@@ -300,7 +322,7 @@ where
 
 pub async fn yield_now() {
     if let Some(ctx) = try_current() {
-        ctx.registrar().sync_to_driver();
+        ctx.driver_bridge().sync_registrar();
     }
     veloq_runtime::task::yield_now().await;
 }

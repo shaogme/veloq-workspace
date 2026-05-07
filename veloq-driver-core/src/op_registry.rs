@@ -226,6 +226,9 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
         let _ = std::mem::take(&mut local.entry.platform_data);
         local.storage.reset();
 
+        if self.shared.slots[user_data].state(Ordering::Acquire) == SlotState::InFlightReady {
+            self.shared.clear_ready_completion();
+        }
         self.shared.slots[user_data].reset(generation);
         self.shared.push_free(user_data);
         self.active_count -= 1;
