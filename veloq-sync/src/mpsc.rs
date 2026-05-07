@@ -320,7 +320,13 @@ impl<T, S: ChannelStrategy> GenericReceiver<T, S> {
             self.shared.strategy.on_msg_recv();
             Ok(msg)
         } else if self.shared.state.sender_count.load(Ordering::Acquire) == 0 {
-            Err(TryRecvError::Disconnected)
+            // Re-check queue after seeing sender_count == 0 to avoid race with send+drop
+            if let Some(msg) = self.shared.queue.pop() {
+                self.shared.strategy.on_msg_recv();
+                Ok(msg)
+            } else {
+                Err(TryRecvError::Disconnected)
+            }
         } else {
             Err(TryRecvError::Empty)
         }
@@ -351,6 +357,11 @@ impl<T, S: ChannelStrategy> Stream for GenericReceiver<T, S> {
         }
 
         if self.shared.state.sender_count.load(Ordering::Acquire) == 0 {
+            // Re-check queue after seeing sender_count == 0 to avoid race with send+drop
+            if let Some(val) = self.shared.queue.pop() {
+                self.shared.strategy.on_msg_recv();
+                return Poll::Ready(Some(val));
+            }
             return Poll::Ready(None);
         }
 

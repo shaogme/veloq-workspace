@@ -61,7 +61,7 @@ pub(crate) fn submit_recv(
             ctx.registrar,
         )
         .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_recv", e).attach(format!(
+            from_io_error(IocpError::Submission, "submit_recv", e).attach_note(format!(
                 "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, user_data, generation
             ))
@@ -91,7 +91,7 @@ pub(crate) fn submit_udp_recv(
             ctx.registrar,
         )
         .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_udp_recv", e).attach(format!(
+            from_io_error(IocpError::Submission, "submit_udp_recv", e).attach_note(format!(
                 "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, header.user_data, header.generation
             ))
@@ -124,7 +124,7 @@ pub(crate) fn submit_send(
             ctx.registrar,
         )
         .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_send", e).attach(format!(
+            from_io_error(IocpError::Submission, "submit_send", e).attach_note(format!(
                 "RIO send submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, user_data, generation
             ))
@@ -157,7 +157,7 @@ pub(crate) fn submit_udp_send(
             ctx.registrar,
         )
         .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_udp_send", e).attach(format!(
+            from_io_error(IocpError::Submission, "submit_udp_send", e).attach_note(format!(
                 "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, user_data, generation
             ))
@@ -270,7 +270,7 @@ fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> IocpResult<u16> {
     match storage.family() {
         AF_INET | AF_INET6 => Ok(storage.family()),
         family => Err(
-            error_stack::Report::new(IocpError::InvalidInput).attach(format!(
+            diagweave::report::Report::new(IocpError::InvalidInput).attach_note(format!(
                 "unsupported listen socket family for accept: {family}"
             )),
         ),
@@ -287,8 +287,8 @@ pub(crate) unsafe fn on_complete_connect(
     _ext: &Extensions,
 ) -> IocpResult<usize> {
     let raw_handle = header.resolved_handle.ok_or_else(|| {
-        error_stack::Report::new(IocpError::InvalidState)
-            .attach("resolved handle missing for connect completion")
+        diagweave::report::Report::new(IocpError::InvalidState)
+            .attach_note("resolved handle missing for connect completion")
     })?;
     with_borrowed_socket(raw_handle.as_socket(), |socket| {
         socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
@@ -347,7 +347,7 @@ pub(crate) fn submit_accept(
         }
         .map(|s| s.into_owned_raw())
         .map_err(|e| {
-            e.attach(format!(
+            e.attach_note(format!(
                 "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
                 handle.raw().as_handle() as usize,
                 family
@@ -356,7 +356,8 @@ pub(crate) fn submit_accept(
         payload.accept_socket = Some(accept_socket);
     }
     let accept_socket = payload.accept_socket.as_ref().ok_or_else(|| {
-        error_stack::Report::new(IocpError::InvalidState).attach("accept socket not initialized")
+        diagweave::report::Report::new(IocpError::InvalidState)
+            .attach_note("accept socket not initialized")
     })?;
     let accept_socket_raw = accept_socket.raw().as_socket();
 
@@ -388,7 +389,7 @@ pub(crate) fn submit_accept(
         })
     }
     .map_err(|e| {
-        e.attach(format!(
+        e.attach_note(format!(
             "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
             handle.raw().as_handle() as usize,
             accept_socket_raw,
@@ -413,11 +414,12 @@ pub(crate) unsafe fn on_complete_accept(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
     let accept_socket = payload.accept_socket.take().ok_or_else(|| {
-        error_stack::Report::new(IocpError::InvalidState).attach("accept socket not initialized")
+        diagweave::report::Report::new(IocpError::InvalidState)
+            .attach_note("accept socket not initialized")
     })?;
     let listen_handle = header.resolved_handle.ok_or_else(|| {
-        error_stack::Report::new(IocpError::InvalidState)
-            .attach("resolved listen handle missing for accept completion")
+        diagweave::report::Report::new(IocpError::InvalidState)
+            .attach_note("resolved listen handle missing for accept completion")
     })?;
     let listen_socket = listen_handle.as_socket();
     let accept_socket_raw = accept_socket.raw().as_socket();
@@ -425,7 +427,7 @@ pub(crate) unsafe fn on_complete_accept(
     if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
         socket.setsockopt(SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_socket)
     }) {
-        return Err(e.attach(format!(
+        return Err(e.attach_note(format!(
             "on_complete_accept: setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed: accept_socket=0x{:x}, listen_socket=0x{:x}, optlen={}",
             accept_socket_raw,
             listen_socket,
@@ -494,7 +496,7 @@ pub(crate) fn submit_send_to(
     ctx.rio
         .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
         .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_send_to", e).attach(format!(
+            from_io_error(IocpError::Submission, "submit_send_to", e).attach_note(format!(
                 "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
                 user.fd, header.user_data, header.generation, page_idx
             ))
@@ -527,7 +529,7 @@ pub(crate) fn submit_udp_recv_stream(
     ctx.rio
         .try_submit_pool_recv(args, ctx.registrar)
         .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_udp_recv_stream", e).attach(format!(
+            from_io_error(IocpError::Submission, "submit_udp_recv_stream", e).attach_note(format!(
                 "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, header.user_data, header.generation
             ))

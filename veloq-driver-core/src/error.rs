@@ -1,97 +1,33 @@
-use error_stack::Report;
-use std::fmt;
+use core::convert::TryFrom;
+use core::fmt;
 
-#[derive(Debug, Clone)]
-pub struct DriverDiag<C = i32> {
-    pub scope: &'static str,
-    pub error_code: Option<C>,
-    pub original_message: Option<String>,
-    pub fields: Vec<(&'static str, String)>,
-}
+use diagweave::{report::Report, set};
 
-impl<C> DriverDiag<C> {
-    #[inline]
-    pub fn new(scope: &'static str) -> Self {
-        Self {
-            scope,
-            error_code: None,
-            original_message: None,
-            fields: Vec::new(),
-        }
-    }
-
-    #[inline]
-    pub fn with_error(mut self, code: C, msg: impl ToString) -> Self {
-        self.error_code = Some(code);
-        self.original_message = Some(msg.to_string());
-        self
-    }
-
-    #[inline]
-    pub fn with_error_detail(mut self, error_code: Option<C>, message: impl ToString) -> Self {
-        self.error_code = error_code;
-        self.original_message = Some(message.to_string());
-        self
-    }
-
-    #[inline]
-    pub fn field(mut self, key: &'static str, value: impl ToString) -> Self {
-        self.fields.push((key, value.to_string()));
-        self
+set! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub DriverErrorKind = {
+        #[display("invalid input")]
+        InvalidInput,
+        #[display("invalid state")]
+        InvalidState,
+        #[display("submission failed")]
+        Submission,
+        #[display("completion failed")]
+        Completion,
+        #[display("registration failed")]
+        Registration,
+        #[display("socket operation failed")]
+        Socket,
+        #[display("timeout")]
+        Timeout,
+        #[display("unsupported")]
+        Unsupported,
+        #[display("internal error")]
+        Internal,
+        #[display("system error")]
+        System,
     }
 }
-
-impl<C> fmt::Display for DriverDiag<C>
-where
-    C: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "driver_diag(scope={}", self.scope)?;
-        if let Some(ref code) = self.error_code {
-            write!(f, ", error_code={code}")?;
-        }
-        if let Some(ref msg) = self.original_message {
-            write!(f, ", original_error={msg}")?;
-        }
-        for (k, v) in &self.fields {
-            write!(f, ", {k}={v}")?;
-        }
-        write!(f, ")")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriverErrorKind {
-    InvalidInput,
-    InvalidState,
-    Submission,
-    Completion,
-    Registration,
-    Socket,
-    Timeout,
-    Unsupported,
-    Internal,
-    System,
-}
-
-impl fmt::Display for DriverErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidInput => f.write_str("invalid input"),
-            Self::InvalidState => f.write_str("invalid state"),
-            Self::Submission => f.write_str("submission failed"),
-            Self::Completion => f.write_str("completion failed"),
-            Self::Registration => f.write_str("registration failed"),
-            Self::Socket => f.write_str("socket operation failed"),
-            Self::Timeout => f.write_str("timeout"),
-            Self::Unsupported => f.write_str("unsupported"),
-            Self::Internal => f.write_str("internal error"),
-            Self::System => f.write_str("system error"),
-        }
-    }
-}
-
-impl std::error::Error for DriverErrorKind {}
 
 pub type DriverResult<T> = Result<T, Report<DriverErrorKind>>;
 pub type DriverErrorReport = Report<DriverErrorKind>;
@@ -103,20 +39,10 @@ fn neg_code(code: i32) -> Option<i32> {
 
 #[inline]
 fn diag_code_i32(report: &DriverErrorReport) -> Option<i32> {
-    if let Some(diag) = report.downcast_ref::<DriverDiag<i32>>()
-        && let Some(code) = diag.error_code
-        && let Some(res) = neg_code(code)
-    {
-        return Some(res);
-    }
-    if let Some(diag) = report.downcast_ref::<DriverDiag<u32>>()
-        && let Some(code) = diag.error_code
-        && let Ok(code_i32) = i32::try_from(code)
-        && let Some(res) = neg_code(code_i32)
-    {
-        return Some(res);
-    }
-    None
+    report
+        .error_code()
+        .and_then(|code| i32::try_from(code).ok())
+        .and_then(neg_code)
 }
 
 #[inline]
@@ -140,10 +66,7 @@ pub fn driver_error_report_to_event_res(report: &DriverErrorReport) -> i32 {
     if let Some(res) = diag_code_i32(report) {
         return res;
     }
-    if let Some(kind) = report.downcast_ref::<DriverErrorKind>() {
-        return -driver_error_kind_fallback_errno(*kind);
-    }
-    -5 // EIO
+    -driver_error_kind_fallback_errno(*report.inner())
 }
 
 #[inline]
@@ -153,7 +76,9 @@ pub fn driver_error(
     detail: impl ToString,
 ) -> DriverErrorReport {
     let detail = detail.to_string();
-    Report::new(kind).attach(DriverDiag::<i32>::new(scope).with_error_detail(None, detail))
+    Report::new(kind)
+        .with_ctx("scope", scope)
+        .attach_note(detail)
 }
 
 #[inline]
@@ -164,7 +89,10 @@ pub fn driver_os_error(
     detail: impl ToString,
 ) -> DriverErrorReport {
     let detail = detail.to_string();
-    Report::new(kind).attach(DriverDiag::new(scope).with_error(code, detail))
+    Report::new(kind)
+        .with_ctx("scope", scope)
+        .set_error_code(code)
+        .attach_note(detail)
 }
 
 pub trait ResultAsDriverExt<T, E> {
@@ -178,7 +106,7 @@ pub trait ResultAsDriverExt<T, E> {
 
 impl<T, E> ResultAsDriverExt<T, E> for Result<T, Report<E>>
 where
-    E: fmt::Debug + fmt::Display + Send + Sync + 'static,
+    E: fmt::Debug + fmt::Display + std::error::Error + Send + Sync + 'static,
 {
     fn to_driver_result(
         self,
@@ -188,16 +116,13 @@ where
     ) -> DriverResult<T> {
         let detail = detail.to_string();
         self.map_err(|report| {
-            tracing::error!(
-                kind = %kind,
-                scope = %scope,
-                detail = %detail,
-                report = ?report,
-                "driver error report"
-            );
-            Report::new(kind)
-                .attach(DriverDiag::<i32>::new(scope).with_error_detail(None, detail))
-                .attach(format!("{report:#}"))
+            tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
+            report
+                .set_accumulate_src_chain(true)
+                .map_err(|_| kind)
+                .with_ctx("scope", scope)
+                .attach_note(detail)
+                .attach_note("driver error report captured")
         })
     }
 }

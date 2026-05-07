@@ -1,16 +1,13 @@
 use clap::{Parser, ValueEnum};
 use rand::prelude::*;
-use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
-use veloq_runtime::LocalJoinHandle;
-use veloq_runtime::fs::{BufferingMode, File, OpenOptions};
-use veloq_runtime::io::buffer::{BufPool, FixedBuf, nz};
-use veloq_runtime::runtime::Runtime;
-use veloq_runtime::spawn_local;
-use veloq_runtime::sync::mpsc;
+use veloq::fs::{BufferingMode, File, OpenOptions};
+use veloq::io::buffer::{BufPool, FixedBuf};
+use veloq::runtime::{Runtime, context, scope};
+use veloq::sync::mpsc;
+use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum WriteMode {
@@ -107,35 +104,35 @@ impl std::fmt::Display for BlockSize {
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Write mode: sequential or random
+    /// Write order for file offsets (sequential scan or shuffled order)
     #[arg(long, value_enum)]
     mode: WriteMode,
 
-    /// Number of worker threads
+    /// Number of runtime worker threads and benchmarked files
     #[arg(long, default_value_t = 1)]
     threads: usize,
 
-    /// Queue depth (concurrent tasks per thread)
+    /// Maximum in-flight write tasks per worker
     #[arg(long, default_value_t = 32)]
     qdepth: usize,
 
-    /// Duration in seconds to run the benchmark
+    /// Minimum wall-clock duration in seconds for each worker
     #[arg(long, default_value_t = 10)]
     duration: u64,
 
-    /// Minimum number of iterations
+    /// Minimum benchmark iterations per worker before it may stop
     #[arg(long, default_value_t = 3)]
     iterations: usize,
 
-    /// Block size (chunk size) for I/O operations
+    /// I/O block size as a ValueEnum token such as k4, m1, or m16
     #[arg(long, value_enum, default_value_t = BlockSize::M1)]
     block_size: BlockSize,
 
-    /// I/O buffering strategy
+    /// File buffering mode: buffered, direct, or direct-sync
     #[arg(long, value_enum, default_value_t = IoBuffering::Direct)]
     buffering: IoBuffering,
 
-    /// Post-write sync strategy (measured within iteration)
+    /// Post-write durability sync: none, sync-range, sync-all, or sync-data
     #[arg(long, value_enum, default_value_t = SyncMode::SyncAll)]
     sync: SyncMode,
 }
@@ -180,7 +177,7 @@ async fn prepare_files_for_thread(file_size: u64, t_idx: usize, buffering_mode: 
         .create(true)
         .truncate(true)
         .buffering(buffering_mode)
-        .open_local(&path)
+        .open(&path)
         .await
         .expect("Failed to create file during preparation");
 
@@ -224,15 +221,13 @@ async fn apply_sync(file: &File, mode: SyncMode, bytes: u64) {
 
 async fn run_iteration_measured(
     qdepth: usize,
-    file: Rc<File>,
+    file: &File,
     ops: &[WriteOp],
     block_size: NonZeroUsize,
     sync_mode: SyncMode,
     available_buffers: &mut Vec<FixedBuf>,
-    pending_tasks: &mut VecDeque<LocalJoinHandle<std::io::Result<(usize, FixedBuf)>>>,
 ) -> IterationResult {
-    let pool =
-        veloq_runtime::runtime::context::current_pool().expect("Worker should have bound pool");
+    let pool = context::current_pool().expect("Worker should have bound pool");
 
     // We need ownership of buffers to submit them.
     // We will collect them back as tasks finish.
@@ -250,51 +245,59 @@ async fn run_iteration_measured(
     let total_ops = ops.len();
     let mut current_op_idx = 0;
     let mut written_bytes = 0u64;
+    let (tx, mut rx) = mpsc::unbounded();
 
-    loop {
-        // 1. Submit tasks up to qdepth if we have buffers and ops
-        while pending_tasks.len() < qdepth && current_op_idx < total_ops {
-            let buf = if let Some(b) = available_buffers.pop() {
-                b
-            } else if let Some(b) = pool.alloc(block_size) {
-                // Fallback if initial set wasn't enough (shouldn't happen if properly sized)
-                b
-            } else {
-                // No buffers available, stop submitting and wait for completions
-                break;
-            };
+    scope!(s, {
+        let mut in_flight = 0usize;
+        loop {
+            // 1. Submit tasks up to qdepth if we have buffers and ops
+            while in_flight < qdepth && current_op_idx < total_ops {
+                let buf = if let Some(b) = available_buffers.pop() {
+                    b
+                } else if let Some(b) = pool.alloc(block_size) {
+                    // Fallback if initial set wasn't enough (shouldn't happen if properly sized)
+                    b
+                } else {
+                    // No buffers available, stop submitting and wait for completions
+                    break;
+                };
 
-            let op = ops[current_op_idx];
-            let file_clone = file.clone();
+                let op = ops[current_op_idx];
+                let tx = tx.clone();
 
-            // Spawn task
-            let fut = async move { file_clone.write_at(buf, op.offset).await };
-            pending_tasks.push_back(spawn_local(fut));
+                // Spawn task and report completion through the channel.
+                let fut = async move {
+                    let res = file.write_at(buf, op.offset).await;
+                    let _ = tx.send(res);
+                };
+                s.spawn_boxed(fut);
 
-            current_op_idx += 1;
-        }
+                current_op_idx += 1;
+                in_flight += 1;
+            }
 
-        // 2. Check for completion or exit
-        if pending_tasks.is_empty() {
-            if current_op_idx >= total_ops {
-                break; // DONE
-            } else {
-                // Deadlock check: We have ops left, but no pending tasks and no buffers?
+            // 2. Check for completion or exit
+            if in_flight == 0 {
+                if current_op_idx >= total_ops {
+                    break; // DONE
+                }
+                // Deadlock check: We have ops left, but no in-flight tasks and no buffers?
                 // This means we failed to alloc and have no tasks to return buffers.
                 panic!("Stall: No buffers available and no pending tasks.");
             }
+
+            // 3. Wait for ONE task
+            let result = rx.recv().await.expect("completion channel closed");
+            let (n, buf) = result.expect("Write op failed");
+            written_bytes += n as u64;
+
+            // Recycle buffer
+            available_buffers.push(buf);
+            in_flight -= 1;
         }
+    });
 
-        // 3. Wait for ONE task
-        let handle = pending_tasks.pop_front().unwrap();
-        let (n, buf) = handle.await.expect("Write failed");
-        written_bytes += n as u64;
-
-        // Recycle buffer
-        available_buffers.push(buf);
-    }
-
-    apply_sync(&file, sync_mode, written_bytes).await;
+    apply_sync(file, sync_mode, written_bytes).await;
 
     let duration = start_time.elapsed();
 
@@ -312,7 +315,7 @@ async fn run_worker(
     sync_mode: SyncMode,
     config: ThreadConfig,
 ) -> std::io::Result<Vec<IterationResult>> {
-    let pool = veloq_runtime::runtime::context::current_pool().expect("No pool");
+    let pool = context::current_pool().expect("No pool");
 
     // 1. Open File (Persistent handle for benchmarking)
     let file = OpenOptions::new()
@@ -322,7 +325,6 @@ async fn run_worker(
         .open(&config.file_path)
         .await
         .expect("Failed to open file in worker");
-    let file = Rc::new(file);
 
     // 2. Pre-allocate Buffers
     // We allocate QDEPTH buffers once and reuse them across ALL iterations.
@@ -336,9 +338,6 @@ async fn run_worker(
         }
     }
 
-    // Pre-allocate pending tasks queue
-    let mut pending_tasks = VecDeque::with_capacity(qdepth);
-
     let mut results = Vec::new();
     let start_total = Instant::now();
     let mut iter_count = 0;
@@ -351,12 +350,11 @@ async fn run_worker(
 
         let res = run_iteration_measured(
             qdepth,
-            file.clone(),
+            &file,
             &config.ops,
             config.block_size,
             sync_mode,
             &mut reuse_buffers,
-            &mut pending_tasks,
         )
         .await;
 
@@ -429,108 +427,117 @@ fn main() {
     }
 
     // Initialize Runtime
-    let runtime = Runtime::builder()
-        .config(veloq_runtime::config::Config::default().worker_threads(args.threads))
+    let worker_count = NonZeroUsize::new(args.threads).expect("threads must be non-zero");
+    let buffer_multiplier_bytes = args
+        .qdepth
+        .saturating_mul(block_size_bytes.get())
+        .saturating_mul(2);
+    let multiplier_units =
+        (buffer_multiplier_bytes.saturating_add(4 * 1024 * 1024 - 1)) / (4 * 1024 * 1024);
+    let multiplier =
+        NonZeroUsize::new(multiplier_units.max(1)).expect("multiplier must be non-zero");
+
+    let runtime = Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(multiplier)))
+        .worker_count(worker_count)
         .build()
         .expect("Failed to build Runtime");
 
     // Execute
     runtime.block_on(async {
-        // 1. Preparation Phase (Create & Fallocate)
-        println!("Initializing disk files (creating & fallocating)... This may take a while.");
-        let mut handles = Vec::new();
-        for t_idx in 0..args.threads {
-            // Spawn to workers to do it in parallel
-            let prepare_buffering = buffering_mode;
-            handles.push(spawn_local(async move {
-                prepare_files_for_thread(FILE_SIZE_PER_THREAD, t_idx, prepare_buffering).await;
-            }));
-        }
-        for h in handles {
-            h.await;
-        }
-        println!("Files prepared. Starting Benchmark Measurement...");
+        scope!(s, {
+            // 1. Preparation Phase (Create & Fallocate)
+            println!("Initializing disk files (creating & fallocating)... This may take a while.");
+            let mut prepare_handles = Vec::with_capacity(args.threads);
+            for t_idx in 0..args.threads {
+                let prepare_buffering = buffering_mode;
+                prepare_handles.push(s.spawn_boxed_to(t_idx, async move {
+                    prepare_files_for_thread(FILE_SIZE_PER_THREAD, t_idx, prepare_buffering).await;
+                }));
+            }
+            for handle in prepare_handles {
+                handle.await.expect("Preparation task failed");
+            }
+            println!("Files prepared. Starting Benchmark Measurement...");
 
-        // 2. Measurement Phase
-        let (tx, mut rx) = mpsc::unbounded();
-        let duration_limit = Duration::from_secs(args.duration);
-        let min_iters = args.iterations;
+            // 2. Measurement Phase
+            let duration_limit = Duration::from_secs(args.duration);
+            let min_iters = args.iterations;
+            let mut worker_handles = Vec::with_capacity(args.threads);
 
-        for config in configs {
-            let tx = tx.clone();
-            let qdepth = args.qdepth;
-            let t_idx = config.thread_index; // needed for placement
-            let worker_buffering = buffering_mode;
-            let worker_sync = sync_mode;
+            for config in configs {
+                let qdepth = args.qdepth;
+                let worker_buffering = buffering_mode;
+                let worker_sync = sync_mode;
+                let t_idx = config.thread_index;
 
-            veloq_runtime::runtime::context::spawn_to(t_idx, async move || {
-                let res = run_worker(
-                    qdepth,
-                    duration_limit,
-                    min_iters,
-                    worker_buffering,
-                    worker_sync,
-                    config,
-                )
-                .await
-                .expect("Worker Failed");
-                tx.send(res).unwrap();
-            });
-        }
-        drop(tx);
+                worker_handles.push(s.spawn_boxed_to(t_idx, async move {
+                    run_worker(
+                        qdepth,
+                        duration_limit,
+                        min_iters,
+                        worker_buffering,
+                        worker_sync,
+                        config,
+                    )
+                    .await
+                }));
+            }
 
-        // 3. Aggregate
-        let mut all_throughputs = Vec::new();
-        let mut total_bytes_all = 0;
-        let bench_start = Instant::now(); // Approx wall time for throughput calc if we want system-wide
+            // 3. Aggregate
+            let mut all_throughputs = Vec::new();
+            let mut total_bytes_all = 0;
+            let bench_start = Instant::now(); // Approx wall time for throughput calc if we want system-wide
 
-        for _ in 0..args.threads {
-            let worker_results = rx.recv().await.expect("Failed to receive");
+            for handle in worker_handles {
+                let worker_results = handle
+                    .await
+                    .expect("Worker task failed")
+                    .expect("Worker execution failed");
 
-            // Calculate thread average
-            let mut thread_bytes = 0;
-            let mut thread_time = Duration::ZERO;
+                // Calculate thread average
+                let mut thread_bytes = 0;
 
-            for r in worker_results {
-                thread_bytes += r.bytes;
-                thread_time += r.duration;
+                for r in worker_results {
+                    thread_bytes += r.bytes;
 
-                let secs = r.duration.as_secs_f64();
-                if secs > 0.0 {
-                    let mb = r.bytes as f64 / 1024.0 / 1024.0;
-                    all_throughputs.push(mb / secs);
+                    let secs = r.duration.as_secs_f64();
+                    if secs > 0.0 {
+                        let mb = r.bytes as f64 / 1024.0 / 1024.0;
+                        all_throughputs.push(mb / secs);
+                    }
                 }
+                total_bytes_all += thread_bytes;
             }
-            total_bytes_all += thread_bytes;
-        }
 
-        let elapsed = bench_start.elapsed();
-        let total_mb = total_bytes_all as f64 / 1024.0 / 1024.0;
-        let system_throughput = if elapsed.as_secs_f64() > 0.0 {
-            total_mb / elapsed.as_secs_f64()
-        } else {
-            0.0
-        };
+            let elapsed = bench_start.elapsed();
+            let total_mb = total_bytes_all as f64 / 1024.0 / 1024.0;
+            let system_throughput = if elapsed.as_secs_f64() > 0.0 {
+                total_mb / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
 
-        println!("--------------------------------------------------");
-        println!("Benchmark Completed.");
-        println!("Total Data Measured: {:.2} MB", total_mb);
-        println!("Wall Time (Approx):  {:.2} s", elapsed.as_secs_f64());
-        println!("System Throughput:   {:.2} MB/s", system_throughput);
-        println!("--------------------------------------------------");
+            println!("--------------------------------------------------");
+            println!("Benchmark Completed.");
+            println!("Total Data Measured: {:.2} MB", total_mb);
+            println!("Wall Time (Approx):  {:.2} s", elapsed.as_secs_f64());
+            println!("System Throughput:   {:.2} MB/s", system_throughput);
+            println!("--------------------------------------------------");
 
-        if !all_throughputs.is_empty() {
-            let avg_raw: f64 = all_throughputs.iter().sum::<f64>() / all_throughputs.len() as f64;
-            println!("Average Iteration Throughput: {:.2} MB/s", avg_raw);
+            if !all_throughputs.is_empty() {
+                let avg_raw: f64 =
+                    all_throughputs.iter().sum::<f64>() / all_throughputs.len() as f64;
+                println!("Average Iteration Throughput: {:.2} MB/s", avg_raw);
 
-            let filtered = filter_outliers(all_throughputs);
-            if !filtered.is_empty() {
-                let avg_filt: f64 = filtered.iter().sum::<f64>() / filtered.len() as f64;
-                println!("Filtered Avg Throughput (IQR): {:.2} MB/s", avg_filt);
+                let filtered = filter_outliers(all_throughputs);
+                if !filtered.is_empty() {
+                    let avg_filt: f64 = filtered.iter().sum::<f64>() / filtered.len() as f64;
+                    println!("Filtered Avg Throughput (IQR): {:.2} MB/s", avg_filt);
+                }
+            } else {
+                println!("No data collected.");
             }
-        } else {
-            println!("No data collected.");
-        }
+        });
     });
 
     // 4. Cleanup Phase

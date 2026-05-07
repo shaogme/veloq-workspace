@@ -25,7 +25,7 @@ crossbeam-utils.workspace = true
 crossbeam-queue.workspace = true
 tracing.workspace = true
 veloq-shim.workspace = true
-error-stack.workspace = true
+diagweave.workspace = true
 
 bilge.workspace = true
 

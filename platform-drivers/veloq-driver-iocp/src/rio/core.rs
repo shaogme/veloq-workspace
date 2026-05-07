@@ -3,10 +3,10 @@
 pub(crate) mod registry;
 pub(crate) mod submit_ops;
 
-use crate::rio::error::{RioDiag, RioError};
+use crate::rio::error::RioError;
 use crate::rio::runtime::pool::POOL_CTX_TAG;
 use crate::rio::{ActorKey, RioState};
-use error_stack::Report;
+use diagweave::report::Report;
 use veloq_driver_core::error::{
     DriverErrorKind, DriverResult, driver_error_report_to_event_res, driver_os_error,
 };
@@ -150,11 +150,15 @@ impl RioState {
 
     pub(crate) fn last_wsa_report(context: RioError, scope: &'static str) -> Report<RioError> {
         let code = Self::last_wsa_error_code() as u32;
-        let diag = RioDiag::new(scope).with_error(
-            code,
-            driver_os_error(DriverErrorKind::System, scope, code as i32, "winsock error"),
-        );
-        error_stack::Report::new(context).attach(diag)
+        diagweave::report::Report::new(context)
+            .with_ctx("scope", scope)
+            .set_error_code(code)
+            .attach_note(driver_os_error(
+                DriverErrorKind::System,
+                scope,
+                code as i32,
+                "winsock error",
+            ))
     }
 }
 

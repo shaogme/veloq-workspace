@@ -1,3 +1,4 @@
+use crate::task::{RuntimeContextExt, TaskError};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -27,6 +28,11 @@ where
     type Output = Either<A::Output, B::Output>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Support for structured cancellation in veloq-runtime
+        if cx.is_cancelled() {
+            std::panic::panic_any(TaskError::Cancelled);
+        }
+
         // SAFETY:
         // We are projecting Pin<&mut Self> to Pin<&mut A> and Pin<&mut B>.
         // This is safe because we never move A or B out of Self, and Self is Pinned.

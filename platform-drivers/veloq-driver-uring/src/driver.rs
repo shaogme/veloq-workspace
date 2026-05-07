@@ -1,4 +1,4 @@
-use error_stack::Report;
+use diagweave::report::Report;
 use io_uring::{IoUring, squeue};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
 
@@ -16,9 +16,9 @@ use crate::config::{
 use crate::error::{UringError, UringResult, UringResultExt, from_io_error};
 use crate::op::{SubmissionStrategy, UringOp};
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionSidecar, Driver, Outcome, RegisterFd, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
-    encode_completion_token,
+    CompletionEvent, CompletionSidecar, DriveMode, DriveOutcome, Driver, Outcome, RegisterFd,
+    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    drain_cancel_requests, encode_completion_token,
 };
 use veloq_driver_core::error::{
     DriverErrorKind, DriverErrorReport, DriverResult, driver_error,
@@ -71,22 +71,21 @@ impl RemoteWaker for UringWaker {
 }
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
-pub(crate) const BACKGROUND_USER_DATA: u64 = u64::MAX - 2;
 const MIN_FILE_TABLE_CAPACITY: usize = 1;
 
 #[inline]
 fn invalid_state(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::InvalidState).attach(format!("{scope}: {}", msg.into()))
+    Report::new(UringError::InvalidState).attach_note(format!("{scope}: {}", msg.into()))
 }
 
 #[inline]
 fn invalid_input(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::InvalidInput).attach(format!("{scope}: {}", msg.into()))
+    Report::new(UringError::InvalidInput).attach_note(format!("{scope}: {}", msg.into()))
 }
 
 #[inline]
 fn unsupported(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::Unsupported).attach(format!("{scope}: {}", msg.into()))
+    Report::new(UringError::Unsupported).attach_note(format!("{scope}: {}", msg.into()))
 }
 
 #[inline]
@@ -97,14 +96,11 @@ fn map_uring_error(
     detail: impl ToString,
 ) -> DriverErrorReport {
     let detail_text = detail.to_string();
-    match Err::<(), _>(report).to_driver_result(kind, scope, detail_text.clone()) {
-        Ok(()) => driver_error(
-            DriverErrorKind::Internal,
-            scope,
-            format!("unexpected ok while mapping uring report: {detail_text}"),
-        ),
-        Err(e) => e,
-    }
+    report
+        .set_accumulate_src_chain(true)
+        .map_err(|_| kind)
+        .with_ctx("scope", scope)
+        .attach_note(detail_text)
 }
 
 #[derive(Debug)]
@@ -131,11 +127,13 @@ pub struct UringDriver {
 
     pub(crate) wheel: veloq_wheel::Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
+    pub(crate) last_timer_poll: Instant,
     pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) chunk_register_failures_recent: HashMap<u16, Instant>,
     pub(crate) registered_files: Vec<Option<RegisteredFileEntry>>,
+    pub(crate) file_generations: Vec<u64>,
     pub(crate) free_file_slots: Vec<u32>,
     pub(crate) file_table_initialized: bool,
 }
@@ -148,6 +146,9 @@ impl UringDriver {
         let idx = fd.fixed_index();
         let index = idx as usize;
         if index < self.registered_files.len() {
+            if self.file_generations.get(index).copied() != Some(fd.generation()) {
+                return Ok(());
+            }
             let Some(_entry) = self.registered_files[index].take() else {
                 return Ok(());
             };
@@ -158,6 +159,7 @@ impl UringDriver {
                     from_io_error(UringError::Registration, "driver.unregister_fixed_fd", e)
                 })?;
             self.free_file_slots.push(idx);
+            self.file_generations[index] = self.file_generations[index].wrapping_add(1);
         }
         Ok(())
     }
@@ -178,6 +180,7 @@ impl UringDriver {
         })?;
 
         self.registered_files = (0..capacity).map(|_| None).collect();
+        self.file_generations = vec![0; capacity];
         self.free_file_slots = (0..capacity as u32).rev().collect();
         self.file_table_initialized = true;
         Ok(())
@@ -248,11 +251,13 @@ impl UringDriver {
 
             wheel: veloq_wheel::Wheel::new(veloq_wheel::WheelConfig::default()),
             timer_buffer: Vec::new(),
+            last_timer_poll: Instant::now(),
             registrar: Box::new(veloq_buf::NoopRegistrar),
             registration_stats: UringRegistrationStats::default(),
             registration_mode: config.registration_mode,
             chunk_register_failures_recent: HashMap::new(),
             registered_files: Vec::new(),
+            file_generations: Vec::new(),
             free_file_slots: Vec::new(),
             file_table_initialized: false,
         };
@@ -276,7 +281,7 @@ impl UringDriver {
     }
 
     pub fn new(config: impl AsRef<UringConfig>) -> UringResult<Self> {
-        Self::new_internal(config).map_err(|e| e.attach("create uring driver"))
+        Self::new_internal(config).map_err(|e| e.attach_note("create uring driver"))
     }
 
     pub(crate) unsafe fn submit_from_slot_raw(
@@ -319,8 +324,9 @@ impl UringDriver {
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr)
                             .map_err(|e| {
-                                Report::new(UringError::Submission)
-                                    .attach(format!("driver.submit_from_slot_raw.make_sqe: {e:#}"))
+                                Report::new(UringError::Submission).attach_note(format!(
+                                    "driver.submit_from_slot_raw.make_sqe: {e:#}"
+                                ))
                             })?
                             .user_data(user_data as u64)
                     };
@@ -345,7 +351,7 @@ impl UringDriver {
                             info.len.get(),
                         ) {
                             if driver.registration_mode.is_strict() {
-                                return Err(e.attach(format!(
+                                return Err(e.attach_note(format!(
                                     "strict mode lazy register failed: chunk_id={chunk_id}, user_data={user_data}"
                                 )));
                             }
@@ -494,28 +500,38 @@ impl UringDriver {
                 })?;
             }
         } else {
-            self.ring.submit().map_err(|e| {
-                from_io_error(UringError::Submission, "driver.submit_to_kernel.submit", e)
-            })?;
+            let n = self.ring.submission().len();
+            if n > 0 {
+                // We use enter with IORING_ENTER_GETEVENTS (1) to ensure tasks are triggered even with DEFER_TASKRUN.
+                unsafe {
+                    self.ring
+                        .submitter()
+                        .enter::<()>(n as u32, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+                        .map_err(|e| {
+                            from_io_error(
+                                UringError::Submission,
+                                "driver.submit_to_kernel.enter",
+                                e,
+                            )
+                        })?;
+                }
+            }
         }
         self.flush_backlog();
         Ok(())
     }
 
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
-        self.drain_cancel_requests();
+        drain_cancel_requests(self);
         self.flush_cancellations();
         self.flush_backlog();
 
-        if !self.has_active_ops() {
+        if !self.has_active_ops_internal() {
             return Ok(());
         }
 
-        if !self.ring.completion().is_empty() {
-            self.process_completions_internal();
-        } else {
+        if self.ring.completion().is_empty() {
             let next_timeout = self.wheel.next_timeout();
-            let start = std::time::Instant::now();
 
             if let Some(duration) = next_timeout {
                 let ts = io_uring::types::Timespec::new()
@@ -543,39 +559,12 @@ impl UringDriver {
                     )
                 })?;
             }
-
-            let elapsed = start.elapsed();
-            self.wheel.advance(elapsed, &mut self.timer_buffer);
-
-            let timer_buffer = std::mem::take(&mut self.timer_buffer);
-            for user_data in timer_buffer {
-                let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
-                    SlotView::InFlightWaiting(mut slot) => {
-                        slot.platform_mut().timer_id = None;
-                        let mut completed = slot.complete();
-
-                        let generation = completed.entry.generation(Ordering::Acquire);
-                        let _ = completed.take_op();
-                        let (payload, detail) = completed.take_completion_data();
-
-                        Some(CompletionSidecar {
-                            user_data,
-                            generation,
-                            res: 0,
-                            flags: 0,
-                            payload,
-                            detail,
-                        })
-                    }
-                    _ => None,
-                });
-
-                if let Some(sidecar) = sidecar {
-                    self.push_completion_event(sidecar);
-                    self.ops.remove(user_data);
-                }
-            }
         }
+
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_timer_poll);
+        self.advance_timers(elapsed);
+        self.last_timer_poll = now;
 
         self.process_completions_internal();
         self.flush_cancellations();
@@ -583,17 +572,70 @@ impl UringDriver {
         Ok(())
     }
 
-    fn has_active_ops(&mut self) -> bool {
-        let len = self.ops.local.len();
-        for idx in 0..len {
-            if self.ops.slot_view(idx).is_some() {
-                return true;
+    fn advance_timers(&mut self, elapsed: Duration) {
+        self.wheel.advance(elapsed, &mut self.timer_buffer);
+
+        let timer_buffer = std::mem::take(&mut self.timer_buffer);
+        for user_data in timer_buffer {
+            let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
+                SlotView::InFlightWaiting(mut slot) => {
+                    slot.platform_mut().timer_id = None;
+                    let mut completed = slot.complete();
+
+                    let generation = completed.entry.generation(Ordering::Acquire);
+                    let _ = completed.take_op();
+                    let (payload, detail) = completed.take_completion_data();
+
+                    Some(CompletionSidecar {
+                        user_data,
+                        generation,
+                        res: 0,
+                        flags: 0,
+                        payload,
+                        detail,
+                    })
+                }
+                _ => None,
+            });
+
+            if let Some(sidecar) = sidecar {
+                self.push_completion_event(sidecar);
+                self.ops.remove(user_data);
             }
         }
-        false
+    }
+
+    pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
+        drain_cancel_requests(self);
+        self.flush_cancellations();
+        self.flush_backlog();
+        self.submit_to_kernel()?;
+        self.process_completions_internal();
+
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_timer_poll);
+        self.advance_timers(elapsed);
+        self.last_timer_poll = now;
+
+        self.flush_cancellations();
+        self.flush_backlog();
+        Ok(())
+    }
+
+    fn has_active_ops_internal(&mut self) -> bool {
+        self.ops.has_active_ops()
     }
 
     pub(crate) fn process_completions_internal(&mut self) {
+        // If we use DEFER_TASKRUN, we need to enter the kernel with GETEVENTS to trigger task runs
+        // even if we don't want to wait for new events.
+        // We do this unconditionally as it is safe even without DEFER_TASKRUN.
+        let _ = unsafe {
+            self.ring
+                .submitter()
+                .enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+        };
+
         let mut needs_waker_resubmit = false;
         let mut pending_events: Vec<CompletionSidecar> = Vec::new();
 
@@ -611,10 +653,7 @@ impl UringDriver {
         for (cqe_user_data, cqe_res, cqe_flags) in cqes {
             let user_data = cqe_user_data as usize;
 
-            if user_data == u64::MAX as usize
-                || user_data == CANCEL_USER_DATA as usize
-                || user_data == BACKGROUND_USER_DATA as usize
-            {
+            if user_data == u64::MAX as usize || user_data == CANCEL_USER_DATA as usize {
                 continue;
             }
 
@@ -712,7 +751,11 @@ impl UringDriver {
         }
 
         drop(sq);
-        let _ = self.ring.submit();
+        let _ = unsafe {
+            self.ring
+                .submitter()
+                .enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+        };
 
         let mut sq = self.ring.submission();
         if unsafe { sq.push(&entry) }.is_ok() {
@@ -766,7 +809,8 @@ impl UringDriver {
                     )
                 })?;
             self.registered_files[idx as usize] = Some(entry);
-            fixed_fds.push(IoFd::fixed(idx));
+            let generation = self.file_generations[idx as usize];
+            fixed_fds.push(IoFd::fixed_with_generation(idx, generation));
         }
         Ok(fixed_fds)
     }
@@ -901,53 +945,40 @@ impl Driver for UringDriver {
         }
     }
 
-    fn submit_background(&mut self, mut op: Self::Op) -> DriverResult<()> {
-        let strategy = op.vtable.strategy;
-        if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
-            let sqe =
-                unsafe { (op.vtable.make_sqe)(&mut op, self)?.user_data(BACKGROUND_USER_DATA) };
-
-            if !self.push_entry(sqe) {
-                return Err(driver_error(
-                    DriverErrorKind::Submission,
-                    "uring.driver.submit_background",
-                    "sq full",
-                ));
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+        match mode {
+            DriveMode::Poll => {
+                self.poll_nonblocking_internal().map_err(|e| {
+                    driver_error(
+                        DriverErrorKind::Completion,
+                        "uring.driver.drive.poll",
+                        format!("{e:#}"),
+                    )
+                })?;
             }
-            Ok(())
-        } else {
-            Err(driver_error(
-                DriverErrorKind::Unsupported,
-                "uring.driver.submit_background",
-                "background op only supports BackgroundOnly strategy",
-            ))
+            DriveMode::Wait => {
+                let pending_progress =
+                    self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
+                if !pending_progress {
+                    return Ok(DriveOutcome {
+                        next_timeout_hint: self.wheel.next_timeout(),
+                        pending_progress,
+                    });
+                }
+                self.wait_internal().to_driver_result(
+                    DriverErrorKind::Completion,
+                    "uring.driver.drive.wait",
+                    "wait for completions",
+                )?;
+            }
         }
-    }
 
-    fn submit_queue(&mut self) -> DriverResult<()> {
-        self.drain_cancel_requests();
-        self.flush_cancellations();
-        self.flush_backlog();
-        self.submit_to_kernel().to_driver_result(
-            DriverErrorKind::Submission,
-            "uring.driver.submit_queue",
-            "submit queue to kernel",
-        )
-    }
-
-    fn wait(&mut self) -> DriverResult<()> {
-        self.wait_internal().to_driver_result(
-            DriverErrorKind::Completion,
-            "uring.driver.wait",
-            "wait for completions",
-        )
-    }
-
-    fn process_completions(&mut self) {
-        self.drain_cancel_requests();
-        self.process_completions_internal();
-        self.flush_cancellations();
-        self.flush_backlog();
+        let pending_progress =
+            self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
+        Ok(DriveOutcome {
+            next_timeout_hint: self.wheel.next_timeout(),
+            pending_progress,
+        })
     }
 
     fn completion_queue(&self) -> SharedCompletionQueue {
@@ -956,18 +987,6 @@ impl Driver for UringDriver {
 
     fn completion_table(&self) -> SharedCompletionTable {
         self.completion_table.clone()
-    }
-
-    fn wait_and_drain_completions(
-        &mut self,
-        out: &mut Vec<veloq_driver_core::driver::CompletionEvent>,
-    ) -> DriverResult<usize> {
-        self.wait_internal().to_driver_result(
-            DriverErrorKind::Completion,
-            "uring.driver.wait_and_drain_completions",
-            "wait and drain completions",
-        )?;
-        Ok(self.drain_completions(out))
     }
 
     fn cancel_op(&mut self, user_data: usize) {
@@ -1013,34 +1032,11 @@ impl Driver for UringDriver {
         Ok(())
     }
 
-    fn wake(&mut self) -> DriverResult<()> {
-        let buf = 1u64.to_ne_bytes();
-        let ret =
-            unsafe { libc::write(self.waker_fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EAGAIN) {
-                return Ok(());
-            }
-            return Err(driver_os_error(
-                DriverErrorKind::System,
-                "uring.driver.wake",
-                err.raw_os_error().unwrap_or(libc::EIO),
-                err.to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
         Arc::new(UringWaker {
             fd: self.waker_fd.clone(),
             is_waked: self.is_waked.clone(),
         })
-    }
-
-    fn driver_id(&self) -> usize {
-        self.waker_fd.fd.raw().as_fd() as usize
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {

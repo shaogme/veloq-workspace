@@ -27,18 +27,37 @@ impl<T> SlotSidecar for T where T: Default + Send + 'static {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IoFd {
     fixed_index: u32,
+    generation: u64,
 }
 
 impl IoFd {
     /// Creates an IO descriptor from a registered descriptor index.
     #[inline]
     pub const fn fixed(index: u32) -> Self {
-        Self { fixed_index: index }
+        Self {
+            fixed_index: index,
+            generation: 0,
+        }
+    }
+
+    /// Creates an IO descriptor from a registered descriptor index and generation.
+    #[inline]
+    pub const fn fixed_with_generation(index: u32, generation: u64) -> Self {
+        Self {
+            fixed_index: index,
+            generation,
+        }
     }
 
     /// Returns the registered descriptor index.
     #[inline]
     pub const fn fixed_index(self) -> u32 {
         self.fixed_index
+    }
+
+    /// Returns the descriptor generation.
+    #[inline]
+    pub const fn generation(self) -> u64 {
+        self.generation
     }
 }

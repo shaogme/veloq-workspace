@@ -13,8 +13,8 @@ use crate::IoFd;
 use crate::config::BorrowedRawHandle;
 use crate::rio::RioEnv;
 use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
-use crate::rio::error::{RioDiag, RioError, RioResult};
-use error_stack::ResultExt;
+use crate::rio::error::{RioError, RioResult};
+use diagweave::report::ResultReportExt;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 use veloq_buf::{FixedBuf, PoolKind};
@@ -91,8 +91,8 @@ impl RioRegistry {
 
         match buffer_id {
             Some(id) => Ok((id, info.offset as u32)),
-            None => Err(error_stack::Report::new(RioError::Internal))
-                .attach(format!("RIO chunk not registered: chunk_id={}", info.id)),
+            None => Err(diagweave::report::Report::new(RioError::Internal))
+                .attach_note(format!("RIO chunk not registered: chunk_id={}", info.id)),
         }
     }
 
@@ -130,9 +130,11 @@ impl RioRegistry {
                 .registration_stats
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(error_stack::Report::new(RioError::ResourceExhaustion)).attach(format!(
-                "RIO chunk registration skipped due to recent failure: chunk_id={id}"
-            ));
+            return Err(
+                diagweave::report::Report::new(RioError::ResourceExhaustion).attach_note(format!(
+                    "RIO chunk registration skipped due to recent failure: chunk_id={id}"
+                )),
+            );
         }
 
         let (ptr, len) = mem;
@@ -163,8 +165,8 @@ impl RioRegistry {
                 self.chunk_register_failures_recent
                     .insert(id, Instant::now());
                 return Err(e)
-                    .change_context(RioError::BufferRegistration)
-                    .attach(format!(
+                    .map_report_err(|_| RioError::BufferRegistration)
+                    .attach_note(format!(
                         "RIORegisterBuffer failed: chunk_id={id}, len={len}"
                     ));
             }
@@ -194,14 +196,16 @@ impl RioRegistry {
                 let id = env
                     .dispatch
                     .register_buffer(ptr, len as u32)
-                    .attach(format!(
+                    .attach_note(format!(
                         "RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"
                     ))?;
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize, len));
             } else {
-                return Err(error_stack::Report::new(RioError::Internal)).attach(format!(
-                    "RIO slab page not found in registry: page_idx={page_idx}"
-                ));
+                return Err(
+                    diagweave::report::Report::new(RioError::Internal).attach_note(format!(
+                        "RIO slab page not found in registry: page_idx={page_idx}"
+                    )),
+                );
             }
         }
         Ok(())
@@ -229,19 +233,16 @@ impl RioRegistry {
                 context: std::ptr::null(),
             })
             .map_err(|e| {
-                let diag = RioDiag::new("create_rq")
-                    .field(
-                        "socket_raw",
-                        format!("0x{:x}", handle.raw().as_handle() as usize),
-                    )
-                    .field("rq_depth", self.rq_depth)
-                    .field("max_outstanding_recvs", max_outstanding_recvs)
-                    .field("max_outstanding_sends", max_outstanding_sends)
-                    .field("max_receive_data_buffers", 1_u32)
-                    .field("max_send_data_buffers", 1_u32);
-                e.attach(diag)
+                let diag = format!(
+                    "create_rq: socket_raw=0x{:x}, rq_depth={}, max_outstanding_recvs={}, max_outstanding_sends={}, max_receive_data_buffers=1, max_send_data_buffers=1",
+                    handle.raw().as_handle() as usize,
+                    self.rq_depth,
+                    max_outstanding_recvs,
+                    max_outstanding_sends,
+                );
+                e.attach_note(diag)
             })
-            .attach(format!(
+            .attach_note(format!(
                 "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",
                 self.rq_depth,
                 handle = handle.raw().as_handle()
@@ -311,11 +312,11 @@ impl RioRegistry {
                 .registration_stats
                 .heap_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(error_stack::Report::new(RioError::ResourceExhaustion))
-                .attach(format!(
+            return Err(diagweave::report::Report::new(RioError::ResourceExhaustion)
+                .attach_note(format!(
                     "RIO heap registration skipped due to recent failure (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
                     env.registration_mode, key.0, key.1, key.2
-                ));
+                )));
         }
 
         if self.heap_rio_bufs.len() >= 1024 {
@@ -353,7 +354,7 @@ impl RioRegistry {
                 self.heap_register_failures_recent
                     .insert(key, Instant::now());
                 return Err(e)
-                    .attach(format!(
+                    .attach_note(format!(
                         "RIORegisterBuffer failed for heap buffer (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
                         env.registration_mode, key.0, key.1, key.2
                     ));

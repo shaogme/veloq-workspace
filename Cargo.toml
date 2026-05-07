@@ -1,10 +1,11 @@
 [workspace]
 members = [
+    "veloq",
     "veloq-runtime",
-    "veloq-examples/disk-bench",
     "veloq-sync",
     "veloq-buf", 
     "veloq-driver-core",
+    "veloq-examples/disk-bench",
     "platform-drivers/veloq-driver-uring",
     "platform-drivers/veloq-driver-iocp",
     "veloq-driver",
@@ -18,12 +19,13 @@ members = [
     "test-utils/xtest-runner"
 ]
 default-members = [
+    "veloq",
     "veloq-runtime",
-    "veloq-examples/disk-bench",
     "veloq-sync",
     "veloq-buf",
     "veloq-driver-core",
     "veloq-driver",
+    "veloq-examples/disk-bench",
     "utils/veloq-shim",
     "utils/veloq-atomic-waker",
     "utils/veloq-intrusive-linklist",
@@ -51,6 +53,7 @@ categories = ["asynchronous", "network-programming"]
 [workspace.dependencies]
 
 # Internal Crates
+veloq = { path = "veloq", version = "0.1.0", features = ["test-hooks"] }
 veloq-runtime = { path = "veloq-runtime", version = "0.1.0" }
 veloq-sync = { path = "veloq-sync", version = "0.1.0" }
 veloq-local = { path = "veloq-local", version = "0.1.0" }
@@ -83,7 +86,7 @@ windows-sys = { version = "0.61", features = [
 tracing = "0.1.44"
 parking_lot = "0.12"
 bilge = "0.3.0"
-error-stack = "0.6"
+diagweave = "0.1.1"
 
 clap = { version = "4.6", features = ["derive"] }
 loom = "0.7.2"

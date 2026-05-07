@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use diagweave::report::Report;
 use tracing::error;
 
 use crate::error::{IocpError, IocpResult, IocpResultExt};
@@ -10,7 +11,7 @@ use veloq_driver_core::driver::{
     CompletionEvent, CompletionRecord, CompletionSidecar, RemoteWaker, SharedCompletionQueue,
     SharedCompletionTable, encode_completion_token,
 };
-use veloq_driver_core::error::{DriverDiag, DriverErrorKind, DriverResult};
+use veloq_driver_core::error::{DriverErrorKind, DriverResult};
 
 // ============================================================================
 // Error Context & Logic
@@ -43,38 +44,18 @@ fn sanitize_field(s: &str) -> String {
     s.replace('\n', "\\n").replace('\r', "\\r")
 }
 
-fn structured_line(
-    ctx: IocpErrorContext,
-    detail: &str,
-    source: Option<&str>,
-    os_code: Option<i32>,
-) -> String {
-    let source = source
-        .map(sanitize_field)
-        .unwrap_or_else(|| "none".to_string());
-    let os_code = os_code
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "none".to_string());
-    format!(
-        "context={ctx}; detail={}; source={source}; os_error={os_code}",
-        sanitize_field(detail)
-    )
-}
-
-pub(crate) fn iocp_msg(
-    ctx: IocpErrorContext,
-    detail: impl Into<String>,
-) -> error_stack::Report<IocpError> {
+pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Report<IocpError> {
     let detail = detail.into();
-    let report = error_stack::Report::new(IocpError::from(ctx)).attach(detail.clone());
-    let msg = structured_line(ctx, &detail, None, None);
+    let report = Report::new(IocpError::from(ctx))
+        .with_ctx("scope", "iocp/common")
+        .with_ctx("detail", sanitize_field(&detail))
+        .attach_note(detail);
     error!(
         context = %ctx,
-        detail = %detail,
-        report = ?report,
+        report = %report,
         "IOCP error report"
     );
-    error_stack::Report::new(IocpError::from(ctx)).attach(msg)
+    report
 }
 
 // ============================================================================
@@ -116,30 +97,15 @@ pub(crate) fn iocp_fallback_event_res(kind: IocpError) -> i32 {
 }
 
 #[inline]
-fn iocp_report_to_event_res(report: &error_stack::Report<IocpError>) -> i32 {
-    if let Some(diag) = report.downcast_ref::<crate::error::IocpDiag>()
-        && let Some(code) = diag.error_code
+fn iocp_report_to_event_res(report: &Report<IocpError>) -> i32 {
+    if let Some(code) = report
+        .error_code()
+        .and_then(|code| i32::try_from(code).ok())
         && let Some(res) = neg_code(code)
     {
         return res;
     }
-    if let Some(diag) = report.downcast_ref::<DriverDiag<i32>>()
-        && let Some(code) = diag.error_code
-        && let Some(res) = neg_code(code)
-    {
-        return res;
-    }
-    if let Some(diag) = report.downcast_ref::<DriverDiag<u32>>()
-        && let Some(code) = diag.error_code
-        && let Ok(code_i32) = i32::try_from(code)
-        && let Some(res) = neg_code(code_i32)
-    {
-        return res;
-    }
-    if let Some(kind) = report.downcast_ref::<IocpError>() {
-        return iocp_fallback_event_res(*kind);
-    }
-    -5 // EIO
+    iocp_fallback_event_res(*report.inner())
 }
 
 #[inline]

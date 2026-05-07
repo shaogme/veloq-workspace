@@ -62,11 +62,15 @@ impl IocpConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IocpHandle {
-    handle: HANDLE,
-    kind: RawHandleKind,
-    // Per-thread allocated socket generation used to avoid HANDLE reuse aliasing in RIO actor mapping.
-    generation: u64,
+pub enum IocpHandle {
+    File {
+        handle: HANDLE,
+    },
+    Socket {
+        handle: HANDLE,
+        // Per-thread allocated socket generation used to avoid HANDLE reuse aliasing in RIO actor mapping.
+        generation: u64,
+    },
 }
 
 // SAFETY: Windows HANDLEs are thread-safe and can be sent across threads.
@@ -120,18 +124,13 @@ fn alloc_socket_generation() -> u64 {
 impl IocpHandle {
     #[inline]
     pub const fn for_file(handle: HANDLE) -> Self {
-        Self {
-            handle,
-            kind: RawHandleKind::File,
-            generation: 0,
-        }
+        Self::File { handle }
     }
 
     #[inline]
     pub fn for_socket(handle: HANDLE) -> Self {
-        Self {
+        Self::Socket {
             handle,
-            kind: RawHandleKind::Socket,
             generation: alloc_socket_generation(),
         }
     }
@@ -143,53 +142,55 @@ impl IocpHandle {
 
     #[inline]
     pub const fn as_handle(self) -> HANDLE {
-        self.handle
-    }
-
-    #[inline]
-    pub const fn generation(self) -> u64 {
-        self.generation
+        match self {
+            Self::File { handle } | Self::Socket { handle, .. } => handle,
+        }
     }
 
     #[inline]
     pub fn as_socket(self) -> SOCKET {
-        self.handle as SOCKET
+        self.as_handle() as SOCKET
     }
 
     #[inline]
     pub const fn kind(self) -> RawHandleKind {
-        self.kind
+        match self {
+            Self::File { .. } => RawHandleKind::File,
+            Self::Socket { .. } => RawHandleKind::Socket,
+        }
     }
 
     #[inline]
     pub const fn is_socket(self) -> bool {
-        matches!(self.kind, RawHandleKind::Socket)
+        matches!(self, Self::Socket { .. })
     }
 
     #[inline]
     pub const fn is_file(self) -> bool {
-        matches!(self.kind, RawHandleKind::File)
+        matches!(self, Self::File { .. })
     }
 }
 
 impl RawHandleMeta for IocpHandle {
     #[inline]
     fn kind(self) -> RawHandleKind {
-        self.kind
+        match self {
+            Self::File { .. } => RawHandleKind::File,
+            Self::Socket { .. } => RawHandleKind::Socket,
+        }
     }
 
     #[inline]
     fn close(self) {
-        match self.kind {
-            RawHandleKind::File => {
-                let handle = self.handle;
+        match self {
+            Self::File { handle } => {
                 if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
                     // SAFETY: `handle` is owned by this value.
                     unsafe { CloseHandle(handle) };
                 }
             }
-            RawHandleKind::Socket => {
-                let socket = self.handle as SOCKET;
+            Self::Socket { handle, .. } => {
+                let socket = handle as SOCKET;
                 if socket != INVALID_SOCKET {
                     // SAFETY: `socket` is owned by this value.
                     unsafe { closesocket(socket) };

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use std::task::Poll;
 use std::task::Waker;
+use std::time::Duration;
 
 pub const CELL_STATE_IDLE: u8 = 0;
 pub const CELL_STATE_WAITING: u8 = 1;
@@ -130,6 +131,8 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
             return;
         }
         let cell = &self.slots[idx];
+        let should_note_ready;
+
         let ready_from = loop {
             let current = cell.load_core_state(Ordering::Acquire);
             let state = current.state();
@@ -148,19 +151,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                 | slot::SlotState::InFlightReady
                 | slot::SlotState::InFlightWaiting
                 | slot::SlotState::ReservedValue => {
-                    if cell
-                        .core_state
-                        .compare_exchange(current, current, Ordering::Acquire, Ordering::Acquire)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    if state == slot::SlotState::InFlightReady {
-                        cell.completion_with_data(|payload_cell, detail_cell| {
-                            let _ = payload_cell.take();
-                            let _ = detail_cell.take();
-                        });
-                    }
+                    should_note_ready = state != slot::SlotState::InFlightReady;
                     break current;
                 }
                 slot::SlotState::InFlightOrphaned => {
@@ -171,7 +162,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                                 current,
                                 current
                                     .with_state(slot::SlotState::Idle)
-                                    .with_generation(generation),
+                                    .with_generation(generation.wrapping_add(1)),
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
                             )
@@ -183,8 +174,6 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                             return;
                         }
                     } else {
-                        // generation > cell_gen but state is ORPHANED?
-                        // Strict rule says reject.
                         return;
                     }
                 }
@@ -192,6 +181,9 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
             }
         };
 
+        if should_note_ready {
+            self.note_ready_completion();
+        }
         cell.completion_with_data(|payload_cell, detail_cell| {
             *payload_cell = payload.take();
             *detail_cell = detail.take();
@@ -228,21 +220,30 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                     return;
                 }
 
+                // If we reached here, someone else either:
+                // 1. already set it to InFlightReady (which is fine, we just discard our duplicate data)
+                // 2. recycled the slot (generation mismatch)
                 cell.completion_with_data(|payload_cell, detail_cell| {
                     let _ = payload_cell.take();
                     let _ = detail_cell.take();
                 });
+
                 let cur = cell.load_core_state(Ordering::Acquire);
                 if cur.generation() == generation
                     && cur.state() == slot::SlotState::InFlightOrphaned
                 {
+                    if should_note_ready {
+                        self.clear_ready_completion();
+                    }
                     let _ = cell.core_state.compare_exchange(
                         cur,
                         cur.with_state(slot::SlotState::Idle)
-                            .with_generation(generation),
+                            .with_generation(generation.wrapping_add(1)),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     );
+                } else if should_note_ready {
+                    self.clear_ready_completion();
                 }
                 return;
             }
@@ -278,7 +279,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                 current,
                 current
                     .with_state(slot::SlotState::Idle)
-                    .with_generation(generation),
+                    .with_generation(generation.wrapping_add(1)),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -287,6 +288,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
             return PollRecordResult::Pending;
         }
 
+        self.clear_ready_completion();
         let (payload, detail) = cell.completion_with_data(|payload_cell, detail_cell| {
             (payload_cell.take(), detail_cell.take())
         });
@@ -314,13 +316,12 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
             let state = current.state();
             let cell_gen = current.generation();
 
-            // Register waker first to avoid missing a race.
-            cell.completion_waker.register(waker);
-
             if cell_gen > generation {
-                // Already stale, no point in waiting or updating.
                 return;
             }
+
+            // Register waker. AtomicWaker handles races with concurrent wake().
+            cell.completion_waker.register(waker);
 
             if cell_gen < generation {
                 if state == slot::SlotState::Idle {
@@ -336,12 +337,10 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                         )
                         .is_ok()
                     {
-                        // Successfully initialized to new generation WAITING state.
-                        // Re-check for fast completion.
+                        // Check for fast completion.
                         let current_after = cell.load_core_state(Ordering::Acquire);
-                        let state_after = current_after.state();
-                        let gen_after = current_after.generation();
-                        if state_after == slot::SlotState::InFlightReady && gen_after == generation
+                        if current_after.state() == slot::SlotState::InFlightReady
+                            && current_after.generation() == generation
                         {
                             waker.wake_by_ref();
                         }
@@ -350,17 +349,15 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                         continue;
                     }
                 } else {
-                    // Slot not yet IDLE, cannot upgrade.
                     return;
                 }
             }
 
-            // cell_gen == generation path.
-            // Check for fast completion.
+            // cell_gen == generation
             let current_after = cell.load_core_state(Ordering::Acquire);
-            let state_after = current_after.state();
-            let gen_after = current_after.generation();
-            if state_after == slot::SlotState::InFlightReady && gen_after == generation {
+            if current_after.state() == slot::SlotState::InFlightReady
+                && current_after.generation() == generation
+            {
                 waker.wake_by_ref();
             }
             return;
@@ -481,12 +478,13 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
                             current,
                             current
                                 .with_state(slot::SlotState::Idle)
-                                .with_generation(generation),
+                                .with_generation(generation.wrapping_add(1)),
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         )
                         .is_ok()
                     {
+                        self.clear_ready_completion();
                         cell.completion_with_data(|payload_cell, detail_cell| {
                             let _ = payload_cell.take();
                             let _ = detail_cell.take();
@@ -547,29 +545,6 @@ pub trait Driver: 'static {
 
     fn detached_cancel_table(&self) -> std::sync::Arc<slot::DetachedCancelTable>;
 
-    fn drain_cancel_requests(&mut self) {
-        let shared = self.slot_table();
-        let cancel_table = self.detached_cancel_table();
-        let word_count = cancel_table.cancel_word_count();
-        for word_idx in 0..word_count {
-            let mut bits = cancel_table.take_cancel_word(word_idx);
-            while bits != 0 {
-                let bit_idx = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-
-                let user_data = word_idx * 64 + bit_idx;
-                let Some((generation, state)) = shared.slot_snapshot(user_data) else {
-                    continue;
-                };
-                if cancel_table.cancel_generation(user_data) == generation as u64
-                    && is_runnable_state(state)
-                {
-                    self.cancel_op(user_data);
-                }
-            }
-        }
-    }
-
     fn slot_set_payload(&mut self, user_data: usize, payload: slot::ErasedPayload);
 
     fn slot_take_payload(&mut self, user_data: usize) -> Option<slot::ErasedPayload>;
@@ -581,11 +556,7 @@ pub trait Driver: 'static {
         binder: SubmitBinder,
     ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>>;
 
-    fn submit_queue(&mut self) -> DriverResult<()>;
-
-    fn wait(&mut self) -> DriverResult<()>;
-
-    fn process_completions(&mut self);
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome>;
 
     fn completion_queue(&self) -> SharedCompletionQueue;
 
@@ -593,32 +564,6 @@ pub trait Driver: 'static {
 
     fn try_pop_completion(&mut self) -> Option<CompletionEvent> {
         self.completion_queue().pop()
-    }
-
-    fn drain_completions(&mut self, out: &mut Vec<CompletionEvent>) -> usize {
-        let mut drained = 0;
-        let queue = self.completion_queue();
-        while let Some(ev) = queue.pop() {
-            out.push(ev);
-            drained += 1;
-        }
-        drained
-    }
-
-    fn wait_and_drain_completions(
-        &mut self,
-        out: &mut Vec<CompletionEvent>,
-    ) -> DriverResult<usize> {
-        self.wait()?;
-        Ok(self.drain_completions(out))
-    }
-
-    fn try_take_completion(&mut self, token: u64) -> PollRecordResult<Self::Completion> {
-        self.completion_table().try_take(token)
-    }
-
-    fn try_take_completion_record(&mut self, token: u64) -> PollRecordResult<Self::Completion> {
-        self.completion_table().try_take_record(token)
     }
 
     fn register_completion_waker(&mut self, token: u64, waker: &Waker) {
@@ -643,15 +588,45 @@ pub trait Driver: 'static {
         credits: usize,
     ) -> DriverResult<()>;
 
-    fn submit_background(&mut self, op: Self::Op) -> DriverResult<()>;
-
-    fn wake(&mut self) -> DriverResult<()>;
-
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
 
-    fn driver_id(&self) -> usize;
-
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
+}
+
+#[inline]
+pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
+    let shared = driver.slot_table();
+    let cancel_table = driver.detached_cancel_table();
+    let word_count = cancel_table.cancel_word_count();
+    for word_idx in 0..word_count {
+        let mut bits = cancel_table.take_cancel_word(word_idx);
+        while bits != 0 {
+            let bit_idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+
+            let user_data = word_idx * 64 + bit_idx;
+            let Some((generation, state)) = shared.slot_snapshot(user_data) else {
+                continue;
+            };
+            if cancel_table.cancel_generation(user_data) == generation as u64
+                && is_runnable_state(state)
+            {
+                driver.cancel_op(user_data);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveMode {
+    Poll,
+    Wait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DriveOutcome {
+    pub next_timeout_hint: Option<Duration>,
+    pub pending_progress: bool,
 }
 
 pub trait RemoteWaker: Send + Sync {

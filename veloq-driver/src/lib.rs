@@ -1,8 +1,7 @@
 pub mod config;
 pub mod driver;
+pub mod error;
 pub mod op;
-
-pub use veloq_driver_core::error;
 
 #[cfg(unix)]
 pub use veloq_driver_uring::{

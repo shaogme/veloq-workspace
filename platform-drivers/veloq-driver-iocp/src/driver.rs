@@ -7,7 +7,6 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, trace};
-use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{
     SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
 };
@@ -16,8 +15,9 @@ use veloq_blocking::{BlockingTask, get_blocking_pool};
 #[cfg(feature = "test-hooks")]
 pub use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionSidecar as CoreCompletionSidecar, Driver, Outcome, RegisterFd,
-    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver, Outcome,
+    RegisterFd, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
+    SubmitStatus,
 };
 use veloq_driver_core::error::{
     DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
@@ -90,11 +90,10 @@ impl IocpDriver {
         driver_error(kind, scope, format!("{detail}: {report}"))
     }
 
-    /// Fallback probe for potentially untrusted external raw handles.
+    /// Fallback probe for potentially untrusted raw handles.
     ///
-    /// We trust `RawHandle` enum semantics by default. Probe is only used when
-    /// callers provide a `File`-tagged handle that may actually be a socket
-    /// (for example, legacy/raw trait boundaries that still pass plain HANDLE).
+    /// We trust `RawHandle` enum semantics by default. Probe is only used when a
+    /// `File`-tagged handle may actually be a socket.
     fn detect_socket_from_file_handle(handle: RawHandle) -> IocpResult<bool> {
         let socket = handle.raw().as_socket();
         let mut ty = 0i32;
@@ -198,8 +197,8 @@ impl IocpDriver {
                 op_ref.header.resolved_handle = None;
             })
             .ok_or_else(|| {
-                error_stack::Report::new(IocpError::InvalidState)
-                    .attach("Op missing in prep_op_slot")
+                diagweave::report::Report::new(IocpError::InvalidState)
+                    .attach_note("Op missing in prep_op_slot")
             })?;
 
         Ok(guard)
@@ -233,7 +232,8 @@ impl IocpDriver {
                     completion_record(sidecar),
                 );
             }
-            ops.remove(user_data);
+            let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
+            ops.recycle(user_data, generation.wrapping_add(1));
             return Err(driver_error(
                 DriverErrorKind::Submission,
                 "iocp/driver",
@@ -307,7 +307,8 @@ impl IocpDriver {
                 let mut guard = slot.complete();
                 *op_in = guard.take_op();
             }
-            ops.remove(user_data);
+            let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
+            ops.recycle(user_data, generation.wrapping_add(1));
             binder.err(
                 driver_error(
                     DriverErrorKind::Submission,
@@ -518,9 +519,11 @@ impl IocpDriver {
             } else {
                 self.registered_files.push(Some(entry));
                 self.rio_state.resize_rqs(self.registered_files.len());
+                self.file_generations.push(0);
                 self.registered_files.len() - 1
             };
-            registered.push(IoFd::fixed(idx as u32));
+            let generation = self.file_generations[idx];
+            registered.push(IoFd::fixed_with_generation(idx as u32, generation));
         }
         Ok(registered)
     }
@@ -530,6 +533,9 @@ impl IocpDriver {
         for fd in files {
             let idx = fd.fixed_index() as usize;
             if idx < self.registered_files.len() {
+                if self.file_generations.get(idx).copied() != Some(fd.generation()) {
+                    continue;
+                }
                 let Some(entry) = self.registered_files[idx].take() else {
                     continue;
                 };
@@ -539,6 +545,7 @@ impl IocpDriver {
                 }
                 self.rio_state.clear_registered_rq(idx);
                 self.free_slots.push(idx);
+                self.file_generations[idx] = self.file_generations[idx].wrapping_add(1);
             }
         }
         Ok(())
@@ -710,7 +717,8 @@ impl Driver for IocpDriver {
                 payload_cell.take()
             })
             .flatten();
-        self.ops.remove(user_data);
+        let generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
+        self.ops.recycle(user_data, generation.wrapping_add(1));
         payload
     }
 
@@ -778,74 +786,44 @@ impl Driver for IocpDriver {
         )
     }
 
-    fn submit_background(&mut self, op: Self::Op) -> DriverResult<()> {
-        if self.shutting_down {
-            return Err(driver_os_error(
-                DriverErrorKind::System,
-                "iocp/driver",
-                ERROR_OPERATION_ABORTED as i32,
-                "driver is shutting down",
-            ));
-        }
-        let (user_data, _) = self.reserve_op()?;
-        let (_, result) = self.call_op_submit(user_data, op)?;
-
-        match result {
-            Ok(submit::SubmissionResult::Offload(task)) => {
-                let (_, op_entry) =
-                    self.ops.get_slot_and_entry_mut(user_data).ok_or_else(|| {
-                        driver_error(DriverErrorKind::Internal, "iocp/driver", "op not found")
-                    })?;
-                op_entry.platform_data.is_background = true;
-                if get_blocking_pool().execute(task).is_err() {
-                    let _ = std::mem::take(&mut op_entry.platform_data);
-                    self.ops.shared.push_free(user_data);
-                    return Err(driver_error(
-                        DriverErrorKind::Submission,
-                        "iocp/driver",
-                        "thread pool overloaded",
-                    ));
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+        match mode {
+            DriveMode::Poll => {
+                self.get_completion(0).map_err(|e| {
+                    Self::with_report_detail(
+                        DriverErrorKind::Completion,
+                        "iocp/driver.drive.poll",
+                        "drive(Poll) failed",
+                        format!("{e:#}"),
+                    )
+                })?;
+            }
+            DriveMode::Wait => {
+                let pending_progress =
+                    self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
+                if !pending_progress {
+                    return Ok(DriveOutcome {
+                        next_timeout_hint: self.wheel.next_timeout(),
+                        pending_progress,
+                    });
                 }
-            }
-            Ok(_) => {
-                let (_, op_entry) =
-                    self.ops.get_slot_and_entry_mut(user_data).ok_or_else(|| {
-                        driver_error(DriverErrorKind::Internal, "iocp/driver", "op not found")
-                    })?;
-                op_entry.platform_data.is_background = true;
-            }
-            Err(e) => {
-                let _ = self
-                    .ops
-                    .get_slot_entry_op_storage_and_entry_mut(user_data)
-                    .and_then(|(_, _, op, _)| op.take());
-                self.ops.remove(user_data);
-                return Err(e);
+                self.get_completion(u32::MAX).map_err(|e| {
+                    Self::with_report_detail(
+                        DriverErrorKind::Completion,
+                        "iocp/driver.drive.wait",
+                        "wait for completion failed",
+                        format!("{e:#}"),
+                    )
+                })?;
             }
         }
-        Ok(())
-    }
 
-    fn submit_queue(&mut self) -> DriverResult<()> {
-        self.drain_cancel_requests();
-        Ok(())
-    }
-
-    fn wait(&mut self) -> DriverResult<()> {
-        self.get_completion(u32::MAX).map_err(|e| {
-            Self::with_report_detail(
-                DriverErrorKind::Completion,
-                "iocp/driver",
-                "wait for completion failed",
-                format!("{e:#}"),
-            )
+        let pending_progress =
+            self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
+        Ok(DriveOutcome {
+            next_timeout_hint: self.wheel.next_timeout(),
+            pending_progress,
         })
-    }
-
-    fn process_completions(&mut self) {
-        if let Err(e) = self.get_completion(0) {
-            tracing::error!(report = ?e, "iocp process_completions failed");
-        }
     }
 
     fn completion_queue(&self) -> SharedCompletionQueue {
@@ -854,21 +832,6 @@ impl Driver for IocpDriver {
 
     fn completion_table(&self) -> SharedCompletionTable {
         self.completion_table.clone()
-    }
-
-    fn wait_and_drain_completions(
-        &mut self,
-        out: &mut Vec<CompletionEvent>,
-    ) -> DriverResult<usize> {
-        self.get_completion(u32::MAX).map_err(|e| {
-            Self::with_report_detail(
-                DriverErrorKind::Completion,
-                "iocp/driver",
-                "wait for completion failed",
-                format!("{e:#}"),
-            )
-        })?;
-        Ok(self.drain_completions(out))
     }
 
     fn cancel_op(&mut self, user_data: usize) {
@@ -918,22 +881,8 @@ impl Driver for IocpDriver {
             )
     }
 
-    fn wake(&mut self) -> DriverResult<()> {
-        IocpDriver::wake(self).map_err(|e| {
-            driver_error(
-                DriverErrorKind::Submission,
-                "iocp/driver",
-                format!("wakeup failed: {e:#}"),
-            )
-        })
-    }
-
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
         IocpDriver::create_waker(self)
-    }
-
-    fn driver_id(&self) -> usize {
-        self.port.as_raw() as usize
     }
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {

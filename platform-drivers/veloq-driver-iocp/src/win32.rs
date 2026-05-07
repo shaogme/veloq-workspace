@@ -1,6 +1,7 @@
 use std::ptr;
 
 use crate::error::{IocpError, IocpResult, from_io_error};
+use diagweave::report::Report;
 use veloq_pod::{Pod, Zeroable, bytes_of, bytes_of_mut, zeroed};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
@@ -113,7 +114,7 @@ unsafe impl Sync for OwnedHandle {}
 pub struct SafeSocket(pub SOCKET);
 
 #[inline]
-fn win32_last_error(context: IocpError, scope: &'static str) -> error_stack::Report<IocpError> {
+fn win32_last_error(context: IocpError, scope: &'static str) -> Report<IocpError> {
     from_io_error(context, scope, std::io::Error::last_os_error())
 }
 

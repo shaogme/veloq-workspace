@@ -4,12 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crossbeam_queue::SegQueue;
-use tracing::{debug, trace};
+use tracing::debug;
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
 use veloq_driver_core::driver::{
-    Driver, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
 };
 use veloq_driver_core::op_registry::OpRegistry;
 use veloq_wheel::{Wheel, WheelConfig};
@@ -49,7 +49,9 @@ pub struct IocpDriver {
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
+    pub(crate) last_timer_poll: Instant,
     pub(crate) registered_files: Vec<Option<RegisteredHandle>>,
+    pub(crate) file_generations: Vec<u64>,
     pub(crate) free_slots: Vec<usize>,
     pub(crate) is_notified: Arc<AtomicBool>,
     pub(crate) completion_events: SharedCompletionQueue,
@@ -81,7 +83,7 @@ impl IocpDriver {
     /// Creates a pre-initialization completion port handle.
     pub(crate) fn create_pre_init() -> IocpResult<PreInit> {
         crate::win32::IoCompletionPort::new(0)
-            .map_err(|e| e.attach("failed to create pre-init IOCP"))
+            .map_err(|e| e.attach_note("failed to create pre-init IOCP"))
     }
 
     /// Creates a new IOCP driver instance.
@@ -100,7 +102,7 @@ impl IocpDriver {
         let port_handle = port_val.as_raw();
         debug!(port = ?port_handle, "Initializing IocpDriver");
         let extensions = crate::ext::Extensions::new().map_err(|e| {
-            e.attach(format!(
+            e.attach_note(format!(
                 "failed to load IOCP extensions, port={port_handle:?}"
             ))
         })?;
@@ -111,11 +113,11 @@ impl IocpDriver {
             registration_mode,
         )
         .map_err(|e| {
-            error_stack::Report::new(IocpError::Rio)
-                .attach(format!(
+            diagweave::report::Report::new(IocpError::Rio)
+                .attach_note(format!(
                     "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
                 ))
-                .attach(format!("{e:#}"))
+                .attach_note(format!("{e:#}"))
         })?;
         let ops = OpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable = ops.shared.clone();
@@ -125,7 +127,9 @@ impl IocpDriver {
             extensions,
             wheel: Wheel::new(WheelConfig::default()),
             timer_buffer: Vec::new(),
+            last_timer_poll: Instant::now(),
             registered_files: Vec::new(),
+            file_generations: Vec::new(),
             free_slots: Vec::new(),
             is_notified: Arc::new(AtomicBool::new(false)),
             completion_events: Arc::new(SegQueue::new()),
@@ -141,18 +145,18 @@ impl IocpDriver {
 
     /// Retrieves completion events from the I/O completion port.
     pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> IocpResult<()> {
-        self.drain_cancel_requests();
+        drain_cancel_requests(self);
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
-        trace!(wait_ms, "Entering GetQueuedCompletionStatus");
-        let start = Instant::now();
         let status = self.port.get_status(wait_ms);
-        let elapsed = start.elapsed();
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_timer_poll);
         self.wheel.advance(elapsed, &mut self.timer_buffer);
         self.process_timers();
+        self.last_timer_poll = now;
 
         let status = status.map_err(|e| {
-            error_stack::Report::new(IocpError::CompletionWait).attach(format!("{e:#}"))
+            diagweave::report::Report::new(IocpError::CompletionWait).attach_note(format!("{e:#}"))
         })?;
 
         match status {
@@ -172,8 +176,8 @@ impl IocpDriver {
                             &self.completion_table,
                         )
                         .map_err(|e| {
-                            error_stack::Report::new(IocpError::CompletionWait)
-                                .attach(format!("{e:#}"))
+                            diagweave::report::Report::new(IocpError::CompletionWait)
+                                .attach_note(format!("{e:#}"))
                         })?;
                     return Ok(());
                 }
@@ -182,10 +186,8 @@ impl IocpDriver {
 
                 if user_data == WAKEUP_USER_DATA {
                     self.is_notified.store(false, Ordering::Release);
-                    trace!("Wakeup received");
                     return Ok(());
                 }
-                trace!(user_data, bytes, "CQE received");
                 self.process_completion(user_data, success, error_code, bytes);
             }
             crate::win32::CompletionStatus::Timeout => {}
@@ -302,9 +304,7 @@ impl IocpDriver {
             payload: payload_erased,
             detail,
         });
-        let mut pending = guard.reset();
-        let _ = std::mem::take(pending.platform_mut());
-        ops.shared.push_free(user_data);
+        ops.remove(user_data);
     }
 
     pub(crate) fn process_completion(
@@ -362,7 +362,7 @@ impl IocpDriver {
                         detail,
                     }),
                 );
-                self.ops.remove(user_data);
+                self.ops.recycle(user_data, slot_generation.wrapping_add(1));
             }
             _ => {
                 debug!(user_data, "Ignoring completion for non in-flight slot");
@@ -405,10 +405,26 @@ impl IocpDriver {
 
             let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
                 if let Some(res) = blocking_res {
-                    io_result = res;
+                    io_result = res.map_err(|e| {
+                        from_io_error(IocpError::Win32, "iocp.driver.inner.blocking_completion", e)
+                    });
+                } else if matches!(
+                    &iocp_op.payload,
+                    crate::ops::IocpOpPayload::Open(_)
+                        | crate::ops::IocpOpPayload::Close(_)
+                        | crate::ops::IocpOpPayload::Fsync(_)
+                        | crate::ops::IocpOpPayload::FsyncRaw(_)
+                        | crate::ops::IocpOpPayload::SyncRange(_)
+                        | crate::ops::IocpOpPayload::SyncRangeRaw(_)
+                        | crate::ops::IocpOpPayload::Fallocate(_)
+                        | crate::ops::IocpOpPayload::FallocateRaw(_)
+                ) {
+                    io_result = Err(diagweave::report::Report::new(IocpError::CompletionWait)
+                        .attach_note("missing blocking result for offloaded file completion"));
                 } else if let Ok(val) = io_result {
                     io_result = iocp_op.on_complete(val, &self.extensions).map_err(|e| {
-                        error_stack::Report::new(IocpError::CompletionWait).attach(format!("{e:#}"))
+                        diagweave::report::Report::new(IocpError::CompletionWait)
+                            .attach_note(format!("{e:#}"))
                     });
                 }
             });
@@ -444,6 +460,7 @@ impl IocpDriver {
         io_result: IocpResult<usize>,
     ) {
         let mut should_free = false;
+        let mut sidecar_to_push = None;
         let handled = Self::with_inflight_slot(ops, user_data, |mut guard| {
             let completion_res = io_result_to_event_res(&io_result);
             guard.platform_mut().rio_pool_waiting = false;
@@ -456,18 +473,14 @@ impl IocpDriver {
                 should_free = true;
             } else {
                 let (payload, detail) = guard.take_completion_data();
-                push_completion_shared(
-                    ctx.completion_events,
-                    ctx.completion_table,
-                    completion_record(CompletionSidecar {
-                        user_data,
-                        generation: slot_generation,
-                        res: completion_res,
-                        flags: 0,
-                        payload,
-                        detail,
-                    }),
-                );
+                sidecar_to_push = Some(CompletionSidecar {
+                    user_data,
+                    generation: slot_generation,
+                    res: completion_res,
+                    flags: 0,
+                    payload,
+                    detail,
+                });
                 if !guard.platform_mut().rio_needs_drain || guard.platform_mut().rio_drained {
                     let _ = guard.take_op();
                     let _data = std::mem::take(guard.platform_mut());
@@ -479,7 +492,15 @@ impl IocpDriver {
         if handled.is_none() {
             debug!(user_data, "Received completion for non-active slot");
         } else if should_free {
-            ops.shared.push_free(user_data);
+            ops.remove(user_data);
+        }
+
+        if let Some(sidecar) = sidecar_to_push {
+            push_completion_shared(
+                ctx.completion_events,
+                ctx.completion_table,
+                completion_record(sidecar),
+            );
         }
     }
 
@@ -488,7 +509,6 @@ impl IocpDriver {
             return;
         }
 
-        trace!(user_data, "Cancelling op");
         let emit_ctx = EmitContext {
             completion_events: &self.completion_events,
             completion_table: &self.completion_table,
@@ -506,7 +526,11 @@ impl IocpDriver {
 
         let state = self.ops.slot_view(user_data);
         match state {
-            Some(SlotView::InFlightOrphaned(_)) => {}
+            Some(SlotView::InFlightOrphaned(_)) => {
+                if self.shutting_down {
+                    Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
+                }
+            }
             Some(SlotView::InFlightWaiting(_)) => {
                 let ctx = CancelContext {
                     registered_files: &self.registered_files,
@@ -603,7 +627,6 @@ impl IocpDriver {
             let _ = guard.reset();
             data
         });
-        let was_inflight = inflight.is_some();
 
         let (payload, detail) = if let Some(data) = inflight {
             data
@@ -627,17 +650,11 @@ impl IocpDriver {
             }),
         );
 
-        if was_inflight {
-            ops.shared.push_free(user_data);
-        } else {
-            ops.recycle(user_data, generation.wrapping_add(1));
-        }
+        ops.remove(user_data);
     }
 
-    pub(crate) fn wake(&self) -> IocpResult<()> {
-        // SAFETY: we are posting a null overlapped pointer for wakeup.
-        unsafe { self.port.post(0, WAKEUP_USER_DATA, std::ptr::null_mut()) }
-            .map_err(|e| error_stack::Report::new(IocpError::Submission).attach(format!("{e:#}")))
+    pub(crate) fn has_active_ops_internal(&mut self) -> bool {
+        self.ops.has_active_ops()
     }
 
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker> {

@@ -1,6 +1,7 @@
 use crate::config::UringRawHandle;
 use crate::error::{UringError, UringResult, from_io_error};
 use crate::{OwnedRawHandle, RawHandle, SockAddrStorage};
+use diagweave::report::Report;
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -165,7 +166,7 @@ impl Socket {
         to_socket_addr(unsafe {
             std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
         })
-        .map_err(|e| e.attach("socket.local_addr.decode"))
+        .map_err(|e| e.attach_note("socket.local_addr.decode"))
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> UringResult<()> {
@@ -275,7 +276,7 @@ impl SocketAddrCodec for SockAddrStorage {
     type Error = UringError;
 
     fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
-        to_socket_addr(buf).map_err(|e| e.attach("socket_addr.decode"))
+        to_socket_addr(buf).map_err(|e| e.attach_note("socket_addr.decode"))
     }
 
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {
@@ -285,9 +286,7 @@ impl SocketAddrCodec for SockAddrStorage {
 
 pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
     if buf.len() < std::mem::size_of::<libc::sa_family_t>() {
-        return Err(
-            error_stack::Report::new(UringError::InvalidInput).attach("Invalid address length")
-        );
+        return Err(Report::new(UringError::InvalidInput).attach_note("Invalid address length"));
     }
     let mut family_raw = std::mem::MaybeUninit::<libc::sa_family_t>::uninit();
     // Copy into properly aligned stack storage before reading, avoiding UB on unaligned input.
@@ -302,8 +301,9 @@ pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
     match family {
         libc::AF_INET => {
             if buf.len() < std::mem::size_of::<sockaddr_in>() {
-                return Err(error_stack::Report::new(UringError::InvalidInput)
-                    .attach("Invalid address length"));
+                return Err(
+                    Report::new(UringError::InvalidInput).attach_note("Invalid address length")
+                );
             }
             let mut sin_raw = std::mem::MaybeUninit::<sockaddr_in>::zeroed();
             unsafe {
@@ -320,8 +320,9 @@ pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
         }
         libc::AF_INET6 => {
             if buf.len() < std::mem::size_of::<sockaddr_in6>() {
-                return Err(error_stack::Report::new(UringError::InvalidInput)
-                    .attach("Invalid address length"));
+                return Err(
+                    Report::new(UringError::InvalidInput).attach_note("Invalid address length")
+                );
             }
             let mut sin6_raw = std::mem::MaybeUninit::<sockaddr_in6>::zeroed();
             unsafe {
@@ -341,10 +342,7 @@ pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
                 sin6.sin6_scope_id,
             )))
         }
-        _ => {
-            Err(error_stack::Report::new(UringError::InvalidInput)
-                .attach("Unsupported address family"))
-        }
+        _ => Err(Report::new(UringError::InvalidInput).attach_note("Unsupported address family")),
     }
 }
 

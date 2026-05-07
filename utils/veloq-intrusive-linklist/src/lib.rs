@@ -96,3 +96,4 @@ impl core::fmt::Debug for Link {
 }
 
 unsafe impl Send for Link {}
+unsafe impl Sync for Link {}

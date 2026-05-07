@@ -136,7 +136,7 @@ jobs:
           VELOQ_BENCH_PHASE: ${{ matrix.phase }}
         run: |
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
-          cargo bench -p veloq-runtime --bench fs_benchmark --verbose -- write_1gb_concurrent_ 2>&1 | tee bench_output_${{ matrix.os }}_${{ matrix.case }}.log
+          cargo bench -p veloq-runtime --bench fs_benchmark -- write_1gb_concurrent_ 2>&1 | tee bench_output_${{ matrix.os }}_${{ matrix.case }}.log
 
       - name: Parse Benchmark Row (Linux)
         if: runner.os == 'Linux'
@@ -160,7 +160,7 @@ jobs:
           VELOQ_BENCH_SYNC: ${{ matrix.sync }}
           VELOQ_BENCH_PHASE: ${{ matrix.phase }}
         run: |
-          cargo bench -p veloq-runtime --bench fs_benchmark --verbose -- write_1gb_concurrent_ 2>&1 | Tee-Object -FilePath bench_output_${{ matrix.os }}_${{ matrix.case }}.log
+          cargo bench -p veloq-runtime --bench fs_benchmark -- write_1gb_concurrent_ 2>&1 | Tee-Object -FilePath bench_output_${{ matrix.os }}_${{ matrix.case }}.log
 
       - name: Parse Benchmark Row (Windows)
         if: runner.os == 'Windows'

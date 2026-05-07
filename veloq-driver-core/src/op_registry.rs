@@ -39,6 +39,7 @@ pub struct OpRegistry<Op: PlatformOp, P, S: SlotSidecar, R = usize> {
     pub shared: Arc<SlotTable<Op, S, R>>,
     pub local: Box<[LocalSlot<Op, P, S, R>]>,
     local_free_head: usize,
+    active_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
             shared,
             local: local.into_boxed_slice(),
             local_free_head: SlotTable::<Op, S>::NULL_INDEX,
+            active_count: 0,
         }
     }
 
@@ -105,6 +107,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
             self.local[idx].op = None;
             self.local[idx].entry.platform_data = data;
             self.local[idx].storage.reset();
+            self.active_count += 1;
 
             for deferred_idx in deferred_non_idle {
                 self.shared.push_free(deferred_idx);
@@ -205,6 +208,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
         local.storage.reset();
         self.shared.slots[user_data].free();
         self.shared.push_free(user_data);
+        self.active_count -= 1;
 
         OpEntry {
             platform_data: data,
@@ -222,8 +226,12 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
         let _ = std::mem::take(&mut local.entry.platform_data);
         local.storage.reset();
 
+        if self.shared.slots[user_data].state(Ordering::Acquire) == SlotState::InFlightReady {
+            self.shared.clear_ready_completion();
+        }
         self.shared.slots[user_data].reset(generation);
         self.shared.push_free(user_data);
+        self.active_count -= 1;
     }
 
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
@@ -234,6 +242,11 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
         } else {
             None
         }
+    }
+
+    #[inline]
+    pub fn has_active_ops(&self) -> bool {
+        self.active_count > 0
     }
 }
 

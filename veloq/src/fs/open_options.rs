@@ -1,0 +1,278 @@
+use std::path::Path;
+
+use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
+use veloq_driver::driver::{Driver, RegisterFd};
+use veloq_driver::op::Open;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferingMode {
+    /// Use system default buffering (Page Cache).
+    Buffered,
+    /// Bypass system cache (e.g., O_DIRECT on Unix, FILE_FLAG_NO_BUFFERING on Windows).
+    Direct,
+    /// Bypass system cache and force write-through to physical storage.
+    DirectSync,
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenOptions {
+    read: bool,
+    write: bool,
+    append: bool,
+    truncate: bool,
+    create: bool,
+    create_new: bool,
+    mode: u32,
+    custom_flags: i32,
+    buffering_mode: BufferingMode,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpenOptions {
+    pub fn new() -> Self {
+        Self {
+            read: false,
+            write: false,
+            append: false,
+            truncate: false,
+            create: false,
+            create_new: false,
+            mode: 0o666,
+            custom_flags: 0,
+            buffering_mode: BufferingMode::Buffered,
+        }
+    }
+
+    pub fn buffering(&mut self, mode: BufferingMode) -> &mut Self {
+        self.buffering_mode = mode;
+        self
+    }
+
+    pub fn read(&mut self, read: bool) -> &mut Self {
+        self.read = read;
+        self
+    }
+
+    pub fn write(&mut self, write: bool) -> &mut Self {
+        self.write = write;
+        self
+    }
+
+    pub fn append(&mut self, append: bool) -> &mut Self {
+        self.append = append;
+        self
+    }
+
+    pub fn truncate(&mut self, truncate: bool) -> &mut Self {
+        self.truncate = truncate;
+        self
+    }
+
+    pub fn create(&mut self, create: bool) -> &mut Self {
+        self.create = create;
+        self
+    }
+
+    pub fn create_new(&mut self, create_new: bool) -> &mut Self {
+        self.create_new = create_new;
+        self
+    }
+
+    pub fn mode(&mut self, mode: u32) -> &mut Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn custom_flags(&mut self, flags: i32) -> &mut Self {
+        self.custom_flags = flags;
+        self
+    }
+
+    pub async fn open_local(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::LocalFile> {
+        let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
+        use crate::runtime::context::submit;
+        use veloq_driver::op::{LocalSubmitter, Op};
+
+        let submitter = LocalSubmitter;
+        let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
+        let owned = res.map_err(from_driver_report)?;
+        let fd = owned.into_raw();
+        let ctx = crate::runtime::context::try_current()
+            .ok_or_else(|| from_io_error(std::io::Error::other("runtime context not set")))?;
+        let driver = ctx.driver();
+        let fixed = driver
+            .borrow_mut()
+            .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
+            .map_err(from_driver_report)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| from_io_error(std::io::Error::other("register_files returned empty")))?;
+        use std::cell::Cell;
+
+        Ok(super::file::LocalFile {
+            raw: fd,
+            fd: fixed,
+            submitter,
+            pos: Cell::new(0),
+        })
+    }
+
+    pub async fn open(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::File> {
+        let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
+        use crate::runtime::context::submit;
+        use veloq_driver::op::{DetachedSubmitter, Op};
+
+        let submitter = DetachedSubmitter::new();
+        let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
+        let owned = res.map_err(from_driver_report)?;
+        let fd = owned.into_raw();
+        use std::sync::atomic::AtomicU64;
+
+        Ok(super::file::File {
+            raw: fd,
+            submitter,
+            pos: AtomicU64::new(0),
+        })
+    }
+
+    #[cfg(unix)]
+    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+        use std::num::NonZeroUsize;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path_bytes = path.as_os_str().as_bytes();
+        let len = path_bytes.len() + 1;
+        let len_nz = NonZeroUsize::new(len).unwrap();
+
+        let mut buf = crate::runtime::context::try_alloc(len_nz)?;
+        let slice = buf.as_slice_mut();
+        if slice.len() < len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "path too long for buffer",
+            ));
+        }
+        slice[..len - 1].copy_from_slice(path_bytes);
+        slice[len - 1] = 0;
+        buf.set_len(len);
+
+        let mut flags = if self.read && !self.write && !self.append {
+            libc::O_RDONLY
+        } else if !self.read && self.write && !self.append {
+            libc::O_WRONLY
+        } else if self.append {
+            libc::O_WRONLY | libc::O_APPEND
+        } else {
+            libc::O_RDWR
+        };
+
+        if self.create {
+            flags |= libc::O_CREAT;
+        }
+        if self.create_new {
+            flags |= libc::O_EXCL | libc::O_CREAT;
+        }
+        if self.truncate {
+            flags |= libc::O_TRUNC;
+        }
+
+        match self.buffering_mode {
+            BufferingMode::Buffered => {}
+            BufferingMode::Direct => {
+                flags |= libc::O_DIRECT;
+            }
+            BufferingMode::DirectSync => {
+                flags |= libc::O_DIRECT | libc::O_DSYNC;
+            }
+        }
+
+        flags |= self.custom_flags;
+
+        Ok(Open {
+            path: buf,
+            flags,
+            mode: self.mode,
+        })
+    }
+
+    #[cfg(windows)]
+    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+        use std::num::NonZeroUsize;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::*;
+        use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
+
+        const FAKE_NO_BUFFERING: u32 = 1 << 8;
+        const FAKE_WRITE_THROUGH: u32 = 1 << 9;
+
+        let os_str = path.as_os_str();
+        let mut path_w = Vec::with_capacity(os_str.len() + 1);
+        path_w.extend(os_str.encode_wide());
+        path_w.push(0);
+        let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
+
+        let mut buf = crate::runtime::context::try_alloc(len_bytes)?;
+        let slice = buf.as_slice_mut();
+        if slice.len() < len_bytes.get() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "path too long for buffer",
+            ));
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                path_w.as_ptr() as *const u8,
+                slice.as_mut_ptr(),
+                len_bytes.get(),
+            );
+            buf.set_len(len_bytes.get());
+        }
+
+        let mut access = 0;
+        if self.read {
+            access |= GENERIC_READ;
+        }
+        if self.write {
+            access |= GENERIC_WRITE;
+        }
+        if self.append {
+            access |= FILE_APPEND_DATA;
+        }
+
+        const OPEN_EXISTING: u32 = 3;
+        const CREATE_NEW: u32 = 1;
+        const CREATE_ALWAYS: u32 = 2;
+        const OPEN_ALWAYS: u32 = 4;
+        const TRUNCATE_EXISTING: u32 = 5;
+
+        let mut disposition = match (self.create, self.create_new, self.truncate) {
+            (_, true, _) => CREATE_NEW,
+            (true, _, true) => CREATE_ALWAYS,
+            (true, _, false) => OPEN_ALWAYS,
+            (false, _, true) => TRUNCATE_EXISTING,
+            (false, _, false) => OPEN_EXISTING,
+        };
+
+        match self.buffering_mode {
+            BufferingMode::Buffered => {}
+            BufferingMode::Direct => {
+                disposition |= FAKE_NO_BUFFERING;
+            }
+            BufferingMode::DirectSync => {
+                disposition |= FAKE_NO_BUFFERING | FAKE_WRITE_THROUGH;
+            }
+        }
+
+        Ok(Open {
+            path: buf,
+            flags: access as i32,
+            mode: disposition,
+        })
+    }
+}

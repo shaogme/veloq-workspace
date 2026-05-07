@@ -279,32 +279,6 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
         &self,
         res: DriverResult<Self::DriverCompletion>,
     ) -> DriverResult<Self::Completion>;
-
-    /// Compatibility helper for transitional callsites.
-    #[inline]
-    fn from_kernel_and_payload(op: O, payload: Self::UserPayload) -> Self {
-        drop(op);
-        Self::from_user_payload(payload)
-    }
-
-    /// Compatibility helper for legacy callsites.
-    #[inline]
-    fn into_platform_op(self) -> O
-    where
-        Self::UserPayload: Default,
-    {
-        self.into_kernel_and_payload().0
-    }
-
-    /// Compatibility helper for legacy callsites.
-    #[inline]
-    fn from_platform_op(op: O) -> Self
-    where
-        Self::UserPayload: Default,
-    {
-        drop(op);
-        Self::from_user_payload(Default::default())
-    }
 }
 
 // ============================================================================
@@ -561,6 +535,10 @@ where
         let op = unsafe { self.get_unchecked_mut() };
 
         if let State::Defined = op.state {
+            trace!(
+                op = %std::any::type_name::<T>(),
+                "LocalOp::poll: submit begin"
+            );
             let mut driver = op.driver.borrow_mut();
 
             // Submit to driver
@@ -590,6 +568,12 @@ where
             match result {
                 Ok(_) => {
                     op.state = State::Submitted;
+                    trace!(
+                        op = %std::any::type_name::<T>(),
+                        user_data = op.user_data,
+                        token = op.token,
+                        "LocalOp::poll: submitted"
+                    );
                 }
                 Err((e, status)) => {
                     if status == SubmitStatus::Void {
@@ -609,10 +593,24 @@ where
                         }
                         let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
                         let data = T::from_user_payload(payload);
+                        trace!(
+                            op = %std::any::type_name::<T>(),
+                            user_data = user_data,
+                            status = ?status,
+                            error = %e,
+                            "LocalOp::poll: submit failed synchronously"
+                        );
                         return Poll::Ready(OpResult::Completed(Err(e), data));
                     } else {
                         // status == InFlight: driver guaranteed an asynchronous result
                         op.state = State::Submitted;
+                        trace!(
+                            op = %std::any::type_name::<T>(),
+                            user_data = op.user_data,
+                            token = op.token,
+                            status = ?status,
+                            "LocalOp::poll: submitted in flight"
+                        );
                     }
                 }
             }
@@ -628,19 +626,45 @@ where
             ) {
                 Poll::Ready(result) => {
                     op.state = State::Completed;
+                    trace!(
+                        op = %std::any::type_name::<T>(),
+                        user_data = op.user_data,
+                        token = op.token,
+                        "LocalOp::poll: completion ready"
+                    );
                     Poll::Ready(result)
                 }
                 Poll::Pending => {
                     driver.register_completion_waker(op.token, cx.waker());
+                    trace!(
+                        op = %std::any::type_name::<T>(),
+                        user_data = op.user_data,
+                        token = op.token,
+                        "LocalOp::poll: completion pending"
+                    );
                     match poll_completion_table_once::<T, D::Op, D::Completion>(
                         &*driver.completion_table(),
                         op.token,
                     ) {
                         Poll::Ready(result) => {
                             op.state = State::Completed;
+                            trace!(
+                                op = %std::any::type_name::<T>(),
+                                user_data = op.user_data,
+                                token = op.token,
+                                "LocalOp::poll: completion ready after register"
+                            );
                             Poll::Ready(result)
                         }
-                        Poll::Pending => Poll::Pending,
+                        Poll::Pending => {
+                            trace!(
+                                op = %std::any::type_name::<T>(),
+                                user_data = op.user_data,
+                                token = op.token,
+                                "LocalOp::poll: still pending"
+                            );
+                            Poll::Pending
+                        }
                     }
                 }
             }

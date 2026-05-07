@@ -360,6 +360,7 @@ impl DetachedCancelTable {
 pub struct SlotTable<Op, S: SlotSidecar, R = usize> {
     pub slots: Box<[SlotEntry<Op, S, R>]>,
     pub remote_free_head: AtomicUsize,
+    ready_completion_count: AtomicUsize,
 }
 
 unsafe impl<Op, S: SlotSidecar, R> Sync for SlotTable<Op, S, R> {}
@@ -375,6 +376,7 @@ impl<Op, S: SlotSidecar, R> SlotTable<Op, S, R> {
         Self {
             slots: slots.into_boxed_slice(),
             remote_free_head: AtomicUsize::new(Self::NULL_INDEX),
+            ready_completion_count: AtomicUsize::new(0),
         }
     }
 
@@ -406,6 +408,36 @@ impl<Op, S: SlotSidecar, R> SlotTable<Op, S, R> {
             let core = slot.load_core_state(Ordering::Acquire);
             (core.generation(), core.state())
         })
+    }
+
+    /// 检查是否存在已完成但尚未被消费的完成项。
+    #[inline]
+    pub fn has_ready_completion(&self) -> bool {
+        self.ready_completion_count.load(Ordering::Acquire) > 0
+    }
+
+    #[inline]
+    pub(crate) fn note_ready_completion(&self) {
+        self.ready_completion_count.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn clear_ready_completion(&self) {
+        let mut current = self.ready_completion_count.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.ready_completion_count.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
     }
 }
 
@@ -729,14 +761,16 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> SlotRegistryExt<Op, P, S, R>
                 index,
             )
             .map(SlotView::Reserved),
-            SlotState::InFlightWaiting => Slot::<InFlightWaiting, Op, P, S, R>::try_bind(
-                entry,
-                op,
-                storage,
-                &mut op_entry.platform_data,
-                index,
-            )
-            .map(SlotView::InFlightWaiting),
+            SlotState::InFlightWaiting | SlotState::InFlightReady => {
+                Slot::<InFlightWaiting, Op, P, S, R>::try_bind(
+                    entry,
+                    op,
+                    storage,
+                    &mut op_entry.platform_data,
+                    index,
+                )
+                .map(SlotView::InFlightWaiting)
+            }
             SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Op, P, S, R>::try_bind(
                 entry,
                 op,
@@ -745,10 +779,7 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> SlotRegistryExt<Op, P, S, R>
                 index,
             )
             .map(SlotView::InFlightOrphaned),
-            SlotState::Idle
-            | SlotState::InFlightReady
-            | SlotState::Finalizing
-            | SlotState::ReservedValue => None,
+            SlotState::Idle | SlotState::Finalizing | SlotState::ReservedValue => None,
         }
     }
 

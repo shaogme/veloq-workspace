@@ -11,7 +11,7 @@ use crate::ops::submit::SubmissionResult;
 use crate::rio::core::submit_ops::{RioDispatch, RioExConfig, RioProvider, RioRq};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioCompletionContext, RioContext, RioState};
-use error_stack::ResultExt;
+use diagweave::report::ResultReportExt;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::collections::{VecDeque, hash_map};
@@ -134,19 +134,20 @@ impl UdpPoolManager {
     ) -> RioResult<UdpBufferSlab> {
         let total = chunk_size
             .checked_mul(chunk_count)
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("UDP slab size overflow")?;
+            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .attach_note("UDP slab size overflow")?;
         let total_nz = std::num::NonZeroUsize::new(total)
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("UDP slab total size must be > 0")?;
-        let backing = FixedBuf::alloc_heap(total_nz)
-            .map_err(|e| error_stack::Report::new(RioError::Internal).attach(e.to_string()))?;
+            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .attach_note("UDP slab total size must be > 0")?;
+        let backing = FixedBuf::alloc_heap(total_nz).map_err(|e| {
+            diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string())
+        })?;
 
         let rio_id = ctx
             .env
             .dispatch
             .register_buffer(backing.as_ptr(), backing.capacity() as u32)
-            .attach("RIORegisterBuffer failed for UDP slab backing")?;
+            .attach_note("RIORegisterBuffer failed for UDP slab backing")?;
 
         let mut chunks = Vec::with_capacity(chunk_count);
         for idx in 0..chunk_count {
@@ -285,7 +286,7 @@ impl UdpRecvPool {
                 (&mut *addr as *mut SockAddrStorage).cast::<u8>(),
                 std::mem::size_of::<SockAddrStorage>() as u32,
             )
-            .attach("RIORegisterBuffer failed for UDP recv pool addr buffer")?;
+            .attach_note("RIORegisterBuffer failed for UDP recv pool addr buffer")?;
 
         Ok(UdpRecvPoolSlot {
             current_idx,
@@ -330,20 +331,20 @@ impl UdpRecvPool {
         let (slot_key, completion_token) = target;
 
         if !matches!(self.state, UdpPoolState::Running) {
-            return Err(error_stack::Report::new(RioError::Internal))
-                .attach("RIO pool not running during submit_slot");
+            return Err(diagweave::report::Report::new(RioError::Internal))
+                .attach_note("RIO pool not running during submit_slot");
         }
 
         let slot = self
             .slots
             .get_mut(slot_key)
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("UDP recv pool slot missing")?;
+            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .attach_note("UDP recv pool slot missing")?;
         let slab = self
             .slab
             .as_ref()
-            .ok_or_else(|| error_stack::Report::new(RioError::Internal))
-            .attach("UDP slab missing during submit_slot")?;
+            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .attach_note("UDP slab missing during submit_slot")?;
 
         slot.in_flight = true;
         slot.stop_requested = false;
@@ -380,7 +381,7 @@ impl UdpRecvPool {
         &mut self,
         slot_key: SlotKey,
         token: u32,
-        e: error_stack::Report<RioError>,
+        e: diagweave::report::Report<RioError>,
         rq: RioRq,
         registry: &mut TokenRegistry,
     ) -> RioResult<usize> {
@@ -389,10 +390,10 @@ impl UdpRecvPool {
             slot.in_flight = false;
             slot.stop_requested = false;
         }
-        Err(e).attach(format!(
+        Err(e.attach_note(format!(
             "RIOReceiveEx submit failed: key={:?}, rq=0x{:x}",
             slot_key, rq.0 as usize
-        ))
+        )))
     }
 
     pub(crate) fn grow_to(
@@ -533,12 +534,12 @@ impl UdpRecvPool {
         match self.state {
             UdpPoolState::Running => {}
             UdpPoolState::Uninitialized => {
-                return Err(error_stack::Report::new(RioError::Internal))
-                    .attach("UDP recv pool uninitialized");
+                return Err(diagweave::report::Report::new(RioError::Internal))
+                    .attach_note("UDP recv pool uninitialized");
             }
             _ => {
-                return Err(error_stack::Report::new(RioError::Internal))
-                    .attach("RIO pool operation aborted during try_submit_recv");
+                return Err(diagweave::report::Report::new(RioError::Internal))
+                    .attach_note("RIO pool operation aborted during try_submit_recv");
             }
         }
 
@@ -577,12 +578,12 @@ impl UdpRecvPool {
         match self.state {
             UdpPoolState::Running => {}
             UdpPoolState::Uninitialized => {
-                return Err(error_stack::Report::new(RioError::Internal))
-                    .attach("UDP recv pool uninitialized");
+                return Err(diagweave::report::Report::new(RioError::Internal))
+                    .attach_note("UDP recv pool uninitialized");
             }
             _ => {
-                return Err(error_stack::Report::new(RioError::Internal))
-                    .attach("RIO pool operation aborted during try_submit_recv_recv");
+                return Err(diagweave::report::Report::new(RioError::Internal))
+                    .attach_note("RIO pool operation aborted during try_submit_recv_recv");
             }
         }
 
@@ -673,22 +674,24 @@ impl UdpRecvPool {
         let (slot_key, res) = completion;
         let slots_len = self.slots.len();
         let slot = self.slots.get_mut(slot_key).ok_or_else(|| {
-            error_stack::Report::new(RioError::Internal)
-                .attach("UDP recv pool slot missing in try_fast_deliver")
+            diagweave::report::Report::new(RioError::Internal)
+                .attach_note("UDP recv pool slot missing in try_fast_deliver")
         })?;
         let slab = self.slab.as_mut().ok_or_else(|| {
-            error_stack::Report::new(RioError::Internal)
-                .attach("UDP slab missing in try_fast_deliver")
+            diagweave::report::Report::new(RioError::Internal)
+                .attach_note("UDP slab missing in try_fast_deliver")
         })?;
 
         let bytes = res.BytesTransferred as usize;
         if bytes > slab.chunk_capacity() {
             mailbox.waiters.push_front(waiter);
-            return Err(error_stack::Report::new(RioError::Internal)).attach(format!(
-                "UDP recv completion exceeded slot capacity in try_fast_deliver: bytes={}, cap={}",
-                bytes,
-                slab.chunk_capacity()
-            ));
+            return Err(
+                diagweave::report::Report::new(RioError::Internal).attach_note(format!(
+                    "UDP recv completion exceeded slot capacity in try_fast_deliver: bytes={}, cap={}",
+                    bytes,
+                    slab.chunk_capacity()
+                )),
+            );
         }
 
         let Some(next_idx) = slab.free_indices.pop_front() else {
@@ -808,8 +811,8 @@ impl UdpPoolManager {
     fn parse_rio_address(addr: &SockAddrStorage, len: i32) -> RioResult<std::net::SocketAddr> {
         let s = unsafe { std::slice::from_raw_parts(addr as *const _ as *const u8, len as usize) };
         to_socket_addr(s)
-            .change_context(RioError::Datapath)
-            .attach("failed to parse rio udp source address")
+            .map_report_err(|_| RioError::Datapath)
+            .attach_note("failed to parse rio udp source address")
     }
 
     fn into_op_datagram(datagram: UdpPoolPacket) -> RioResult<OpUdpRecvPacket> {
@@ -844,6 +847,7 @@ impl UdpPoolManager {
 
         let stream_op = Self::get_stream_op_mut(&mut guard);
         if let Some(stream_op) = stream_op {
+            stream_op.buf = None;
             stream_op.result = Some(OpUdpRecvPacket { buf, addr });
             guard.platform_mut().rio_pool_waiting = false;
 
