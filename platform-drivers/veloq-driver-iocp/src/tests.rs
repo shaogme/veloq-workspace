@@ -5,7 +5,7 @@ pub(crate) mod net_udp;
 
 use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::{
-    DriveMode, Driver, PollRecordResult, encode_completion_token, event_res_to_result
+    DriveMode, Driver, PollRecordResult, encode_completion_token, event_res_to_result,
 };
 use veloq_driver_core::error::driver_error_report_to_event_res;
 use veloq_driver_core::slot::SlotTable;

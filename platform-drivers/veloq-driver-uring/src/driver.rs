@@ -648,9 +648,7 @@ impl UringDriver {
         for (cqe_user_data, cqe_res, cqe_flags) in cqes {
             let user_data = cqe_user_data as usize;
 
-            if user_data == u64::MAX as usize
-                || user_data == CANCEL_USER_DATA as usize
-            {
+            if user_data == u64::MAX as usize || user_data == CANCEL_USER_DATA as usize {
                 continue;
             }
 

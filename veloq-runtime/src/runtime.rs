@@ -139,38 +139,33 @@ where
             });
             let _clear_context = ClearContext;
 
-            let result = {
-                let signal = Arc::new(Signal::new(true));
-                let waker = create_waker(signal.clone());
-                let mut cx = Context::from_waker(&waker);
-                let mut fut = fut;
-                let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+            let signal = Arc::new(Signal::new(true));
+            let waker = create_waker(signal.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = fut;
+            let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
 
-                let init_ctx = WorkerInitContext::new(0, worker_count);
-                let init_fut = std::pin::pin!(worker_init(init_ctx));
-                shared
-                    .drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(None, Some(init_fut));
+            let init_ctx = WorkerInitContext::new(0, worker_count);
+            let init_fut = std::pin::pin!(worker_init(init_ctx));
+            shared.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(None, Some(init_fut));
 
-                loop {
-                    // 主线程使用独立 completion 泵，不依赖 worker idle 路径。
-                    match fut.as_mut().poll(&mut cx) {
-                        Poll::Ready(res) => break res,
-                        Poll::Pending => {
-                            let hint = context::run_worker_idle_hook();
-                            match hint {
-                                Some(duration) => {
-                                    let _ = signal.wait_timeout(duration);
-                                }
-                                None => {
-                                    signal.wait();
-                                }
+            loop {
+                // 主线程使用独立 completion 泵，不依赖 worker idle 路径。
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(res) => break res,
+                    Poll::Pending => {
+                        let hint = context::run_worker_idle_hook();
+                        match hint {
+                            Some(duration) => {
+                                let _ = signal.wait_timeout(duration);
+                            }
+                            None => {
+                                signal.wait();
                             }
                         }
                     }
                 }
-            };
-
-            result
+            }
         })
     }
 }
