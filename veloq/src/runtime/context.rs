@@ -7,10 +7,10 @@ use std::task::Poll;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver::driver::{DriveMode, Driver, DriverControlCommand, PlatformDriver};
-use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
+use veloq_driver::op::{DetachedSubmitter, IntoPlatformOp, Op, OpSubmitter};
 
 use crate::config::{BufferRegistrationMode, Config};
-use crate::net::route::SocketRouteDispatcher;
+use crate::error::{Result as VeloqResult, from_io_error};
 use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy};
 
 thread_local! {
@@ -249,7 +249,6 @@ pub struct RuntimeContext {
     config: Config,
     registrar: DriverRegistrar,
     driver_commands: DriverCommandDispatcher,
-    socket_route_dispatcher: SocketRouteDispatcher,
 }
 
 impl RuntimeContext {
@@ -259,7 +258,6 @@ impl RuntimeContext {
         config: Config,
         registrar: DriverRegistrar,
         driver_commands: DriverCommandDispatcher,
-        socket_route_dispatcher: SocketRouteDispatcher,
     ) -> Self {
         Self {
             buf_pool,
@@ -267,7 +265,6 @@ impl RuntimeContext {
             config,
             registrar,
             driver_commands,
-            socket_route_dispatcher,
         }
     }
 
@@ -299,11 +296,6 @@ impl RuntimeContext {
     #[inline]
     pub(crate) fn driver_commands(&self) -> DriverCommandDispatcher {
         self.driver_commands.clone()
-    }
-
-    #[inline]
-    pub(crate) fn socket_route_dispatcher(&self) -> SocketRouteDispatcher {
-        self.socket_route_dispatcher.clone()
     }
 }
 
@@ -399,8 +391,6 @@ pub(crate) fn drain_pending_driver_commands() {
             }
         }
     });
-
-    crate::net::route::drain_pending_socket_route_commands();
 }
 
 pub fn submit<'a, S, T>(
@@ -441,4 +431,39 @@ pub async fn yield_now() {
         ctx.driver_bridge().sync_registrar();
     }
     veloq_runtime::task::yield_now().await;
+}
+
+pub async fn submit_to<T>(
+    worker_id: usize,
+    op: Op<T>,
+) -> VeloqResult<(
+    Result<
+        <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion,
+        veloq_driver::error::DriverErrorReport,
+    >,
+    T,
+)>
+where
+    T: IntoPlatformOp<
+            <PlatformDriver as Driver>::Op,
+            DriverCompletion = <PlatformDriver as Driver>::Completion,
+        > + Send
+        + 'static,
+{
+    if veloq_runtime::runtime::current_worker_id() == worker_id {
+        let (res, op_back) = submit(&DetachedSubmitter::new(), op).await.into_inner();
+        let op = op_back.expect("Op lost in local submit");
+        Ok((res, op))
+    } else {
+        let routed = veloq_runtime::runtime::route::route_to_worker(worker_id, move || {
+            let ctx = current();
+            let driver_rc = ctx.driver();
+            let mut driver = driver_rc.borrow_mut();
+            op.submit_detached(&mut *driver)
+        })
+        .map_err(from_io_error)?;
+        let (res, op_back) = routed.await.into_inner();
+        let op = op_back.expect("Op lost in remote submit");
+        Ok((res, op))
+    }
 }

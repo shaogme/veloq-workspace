@@ -598,6 +598,8 @@ impl RuntimeShared {
             while init_fut.is_some() || !self.shutdown.load(Ordering::Acquire) {
                 let mut progressed = false;
 
+                crate::runtime::route::drain_pending_worker_route_jobs();
+
                 if let Some(hook) = worker_tick_hook {
                     hook();
                 }

@@ -1379,6 +1379,7 @@ dependencies = [
  "libc",
  "numaperf-topo",
  "parking_lot",
+ "veloq-atomic-waker",
  "veloq-intrusive-linklist",
 ]
 

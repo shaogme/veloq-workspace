@@ -5,8 +5,7 @@ use std::sync::Arc;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
-use crate::net::route;
-use crate::runtime::context::submit;
+use crate::runtime::context::{submit, submit_to};
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::op::{
@@ -188,22 +187,14 @@ impl TcpListener {
 
     pub async fn accept(&self) -> VeloqResult<(TcpStream, SocketAddr)> {
         let owner = self.inner.owner_worker_id();
-        if veloq_runtime::runtime::current_worker_id() == owner {
-            return self.accept_direct().await;
-        }
-
         let op = Accept {
             fd: self.inner.fd(),
             addr: veloq_driver::SockAddrStorage::default(),
             addr_len: std::mem::size_of::<veloq_driver::SockAddrStorage>() as u32,
             remote_addr: None,
         };
-        let routed = route::route_tcp_accept(owner, op).map_err(from_io_error)?;
-        let (res, op_back) = routed.await.into_inner();
-        let op = op_back.ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Accept op lost"))
-        })?;
 
+        let (res, op) = submit_to(owner, Op::new(op)).await?;
         let accepted = res.map_err(from_driver_report)?;
         let addr = op.remote_addr.ok_or_else(|| {
             from_io_error(io::Error::new(
@@ -279,21 +270,13 @@ impl TcpStream {
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
         let owner = self.inner.owner_worker_id();
-        if veloq_runtime::runtime::current_worker_id() == owner {
-            return self.recv_subset_direct(buf, buf_offset).await;
-        }
-
         let op = Recv {
             fd: self.inner.fd(),
             buf,
             buf_offset,
         };
-        let routed = route::route_tcp_recv(owner, op).map_err(from_io_error)?;
-        let (res, op_back) = routed.await.into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        let (res, op) = submit_to(owner, Op::new(op)).await?;
+        Ok((res.map_err(from_driver_report)?, op.buf))
     }
 
     pub async fn send_subset(
@@ -302,21 +285,13 @@ impl TcpStream {
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
         let owner = self.inner.owner_worker_id();
-        if veloq_runtime::runtime::current_worker_id() == owner {
-            return self.send_subset_direct(buf, buf_offset).await;
-        }
-
         let op = OpSend {
             fd: self.inner.fd(),
             buf,
             buf_offset,
         };
-        let routed = route::route_tcp_send(owner, op).map_err(from_io_error)?;
-        let (res, op_back) = routed.await.into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        let (res, op) = submit_to(owner, Op::new(op)).await?;
+        Ok((res.map_err(from_driver_report)?, op.buf))
     }
 }
 

@@ -6,8 +6,7 @@ use std::sync::Arc;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
-use crate::net::route;
-use crate::runtime::context::submit;
+use crate::runtime::context::{submit, submit_to};
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
 use veloq_driver::driver::Driver;
@@ -236,52 +235,37 @@ impl UdpSocket {
         target: SocketAddr,
     ) -> VeloqResult<(usize, FixedBuf)> {
         let owner = self.inner.owner_worker_id();
-        if veloq_runtime::runtime::current_worker_id() == owner {
-            return self.send_to_direct(buf, target).await;
-        }
-
         let op = SendTo {
             fd: self.inner.fd(),
             buf,
             buf_offset: 0,
             addr: target,
         };
-        let routed = route::route_udp_send_to(owner, op).map_err(from_io_error)?;
-        let (res, op_back) = routed.await.into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        let (res, op) = submit_to(owner, Op::new(op)).await?;
+        Ok((res.map_err(from_driver_report)?, op.buf))
     }
 
     pub async fn recv_stream(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
         let owner = self.inner.owner_worker_id();
-        if veloq_runtime::runtime::current_worker_id() == owner {
-            return self.recv_stream_direct(buf).await;
-        }
-
         let op = UdpRecvStream {
             fd: self.inner.fd(),
             buf: Some(buf),
             addr: None,
             result: None,
         };
-        let routed = route::route_udp_recv_stream(owner, op).map_err(from_io_error)?;
-        let (res, op_back_opt) = routed.await.into_inner();
-        let mut op_back =
-            op_back_opt.ok_or_else(|| from_io_error(io::Error::other("UdpRecvStream op lost")))?;
+        let (res, mut op) = submit_to(owner, Op::new(op)).await?;
         let n = res.map_err(from_driver_report)?;
 
-        if let Some(datagram) = op_back.result.take() {
+        if let Some(datagram) = op.result.take() {
             return Ok(datagram);
         }
 
-        let mut recv_buf = op_back
+        let mut recv_buf = op
             .buf
             .take()
             .ok_or_else(|| from_io_error(io::Error::other("udp recv_stream buffer missing")))?;
         recv_buf.set_len(n);
-        let addr = op_back.addr.ok_or_else(|| {
+        let addr = op.addr.ok_or_else(|| {
             from_io_error(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "driver must populate UdpRecvStream::addr before completion",
@@ -295,10 +279,6 @@ impl UdpSocket {
 
     pub async fn connect(&self, addr: SocketAddr) -> VeloqResult<()> {
         let owner = self.inner.owner_worker_id();
-        if veloq_runtime::runtime::current_worker_id() == owner {
-            return self.connect_direct(addr).await;
-        }
-
         let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = UdpConnect {
@@ -306,8 +286,7 @@ impl UdpSocket {
             addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
-        let routed = route::route_udp_connect(owner, op).map_err(from_io_error)?;
-        let (res, _) = routed.await.into_inner();
+        let (res, _) = submit_to(owner, Op::new(op)).await?;
         res.map(|_| ()).map_err(from_driver_report)
     }
 
@@ -325,21 +304,13 @@ impl UdpSocket {
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
         let owner = self.inner.owner_worker_id();
-        if veloq_runtime::runtime::current_worker_id() == owner {
-            return self.send_subset_direct(buf, buf_offset).await;
-        }
-
         let op = OpUdpSend {
             fd: self.inner.fd(),
             buf,
             buf_offset,
         };
-        let routed = route::route_udp_send(owner, op).map_err(from_io_error)?;
-        let (res, op_back) = routed.await.into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        let (res, op) = submit_to(owner, Op::new(op)).await?;
+        Ok((res.map_err(from_driver_report)?, op.buf))
     }
 
     pub async fn recv_subset(
@@ -348,21 +319,13 @@ impl UdpSocket {
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
         let owner = self.inner.owner_worker_id();
-        if veloq_runtime::runtime::current_worker_id() == owner {
-            return self.recv_subset_direct(buf, buf_offset).await;
-        }
-
         let op = OpUdpRecv {
             fd: self.inner.fd(),
             buf,
             buf_offset,
         };
-        let routed = route::route_udp_recv(owner, op).map_err(from_io_error)?;
-        let (res, op_back) = routed.await.into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        let (res, op) = submit_to(owner, Op::new(op)).await?;
+        Ok((res.map_err(from_driver_report)?, op.buf))
     }
 }
 
