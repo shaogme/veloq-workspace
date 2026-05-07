@@ -519,9 +519,11 @@ impl IocpDriver {
             } else {
                 self.registered_files.push(Some(entry));
                 self.rio_state.resize_rqs(self.registered_files.len());
+                self.file_generations.push(0);
                 self.registered_files.len() - 1
             };
-            registered.push(IoFd::fixed(idx as u32));
+            let generation = self.file_generations[idx];
+            registered.push(IoFd::fixed_with_generation(idx as u32, generation));
         }
         Ok(registered)
     }
@@ -531,6 +533,9 @@ impl IocpDriver {
         for fd in files {
             let idx = fd.fixed_index() as usize;
             if idx < self.registered_files.len() {
+                if self.file_generations.get(idx).copied() != Some(fd.generation()) {
+                    continue;
+                }
                 let Some(entry) = self.registered_files[idx].take() else {
                     continue;
                 };
@@ -540,6 +545,7 @@ impl IocpDriver {
                 }
                 self.rio_state.clear_registered_rq(idx);
                 self.free_slots.push(idx);
+                self.file_generations[idx] = self.file_generations[idx].wrapping_add(1);
             }
         }
         Ok(())

@@ -133,6 +133,7 @@ pub struct UringDriver {
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) chunk_register_failures_recent: HashMap<u16, Instant>,
     pub(crate) registered_files: Vec<Option<RegisteredFileEntry>>,
+    pub(crate) file_generations: Vec<u64>,
     pub(crate) free_file_slots: Vec<u32>,
     pub(crate) file_table_initialized: bool,
 }
@@ -145,6 +146,9 @@ impl UringDriver {
         let idx = fd.fixed_index();
         let index = idx as usize;
         if index < self.registered_files.len() {
+            if self.file_generations.get(index).copied() != Some(fd.generation()) {
+                return Ok(());
+            }
             let Some(_entry) = self.registered_files[index].take() else {
                 return Ok(());
             };
@@ -155,6 +159,7 @@ impl UringDriver {
                     from_io_error(UringError::Registration, "driver.unregister_fixed_fd", e)
                 })?;
             self.free_file_slots.push(idx);
+            self.file_generations[index] = self.file_generations[index].wrapping_add(1);
         }
         Ok(())
     }
@@ -175,6 +180,7 @@ impl UringDriver {
         })?;
 
         self.registered_files = (0..capacity).map(|_| None).collect();
+        self.file_generations = vec![0; capacity];
         self.free_file_slots = (0..capacity as u32).rev().collect();
         self.file_table_initialized = true;
         Ok(())
@@ -251,6 +257,7 @@ impl UringDriver {
             registration_mode: config.registration_mode,
             chunk_register_failures_recent: HashMap::new(),
             registered_files: Vec::new(),
+            file_generations: Vec::new(),
             free_file_slots: Vec::new(),
             file_table_initialized: false,
         };
@@ -802,7 +809,8 @@ impl UringDriver {
                     )
                 })?;
             self.registered_files[idx as usize] = Some(entry);
-            fixed_fds.push(IoFd::fixed(idx));
+            let generation = self.file_generations[idx as usize];
+            fixed_fds.push(IoFd::fixed_with_generation(idx, generation));
         }
         Ok(fixed_fds)
     }
