@@ -15,15 +15,12 @@ use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy};
 
 thread_local! {
     /// 线程局部的运行时上下文
-    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
 
     /// 线程局部的注册中心状态
-    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     static REGISTRAR_STATE: RefCell<Option<WorkerRegistrarState>> = const { RefCell::new(None) };
 
     /// 线程局部的驱动控制命令状态
-    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), expect(clippy::missing_const_for_thread_local))]
     static DRIVER_COMMAND_STATE: RefCell<Option<WorkerDriverCommandState>> = const { RefCell::new(None) };
 }
 
