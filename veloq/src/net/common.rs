@@ -20,7 +20,7 @@ pub struct SocketToken {
 }
 
 impl SocketToken {
-    pub(crate) fn new(handle: RawHandle) -> VeloqResult<Self> {
+    pub(crate) fn new(handle: RawHandle, owner_worker_id: usize) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
             return Err(from_io_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -43,7 +43,7 @@ impl SocketToken {
             })?;
         Ok(Self {
             fd,
-            owner_worker_id: veloq_runtime::runtime::current_worker_id(),
+            owner_worker_id,
         })
     }
 
@@ -99,9 +99,13 @@ pub struct InnerSocket<P> {
 }
 
 impl<P: SocketTokenPtr> InnerSocket<P> {
-    pub fn new(handle: RawHandle, local_addr: Option<SocketAddr>) -> VeloqResult<Self> {
+    pub fn new(
+        handle: RawHandle,
+        local_addr: Option<SocketAddr>,
+        owner_worker_id: usize,
+    ) -> VeloqResult<Self> {
         Ok(Self {
-            token: P::new_ptr(SocketToken::new(handle)?),
+            token: P::new_ptr(SocketToken::new(handle, owner_worker_id)?),
             local_addr,
         })
     }
@@ -113,11 +117,6 @@ impl<P: SocketTokenPtr> InnerSocket<P> {
 
     pub fn owner_worker_id(&self) -> usize {
         self.token.owner_worker_id
-    }
-
-    pub async fn ensure_affinity(&self) -> io::Result<()> {
-        veloq_runtime::task::ensure_current_task_affinity(self.token.owner_worker_id).await;
-        Ok(())
     }
 
     pub fn local_addr(&self) -> VeloqResult<SocketAddr> {

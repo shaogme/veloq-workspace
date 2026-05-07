@@ -4,6 +4,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
 use veloq_driver::Socket;
 use veloq_driver::op::DetachedSubmitter;
+use veloq_runtime::runtime::current_worker_id;
 
 use crate::net::common::InnerSocket;
 use crate::net::tcp::{GenericTcpListener, TcpListener, TcpStream};
@@ -100,7 +101,11 @@ impl TcpSocket {
             .listen(backlog as i32)
             .map_err(from_driver_report)?;
         Ok(GenericTcpListener {
-            inner: InnerSocket::new(self.inner.into_owned_raw().into_raw(), Some(local_addr))?,
+            inner: InnerSocket::new(
+                self.inner.into_owned_raw().into_raw(),
+                Some(local_addr),
+                current_worker_id(),
+            )?,
             submitter: DetachedSubmitter::new(),
         })
     }
@@ -109,7 +114,11 @@ impl TcpSocket {
     ///
     /// Consumes the `TcpSocket` and returns a `TcpStream` future.
     pub async fn connect(self, addr: SocketAddr) -> VeloqResult<TcpStream> {
-        let inner = InnerSocket::new(self.inner.into_owned_raw().into_raw(), None)?;
+        let inner = InnerSocket::new(
+            self.inner.into_owned_raw().into_raw(),
+            None,
+            current_worker_id(),
+        )?;
         TcpStream::connect_from_inner(inner, addr).await
     }
 }
@@ -189,7 +198,11 @@ impl UdpSocketBuilder {
         let local_addr = self.inner.local_addr().map_err(from_driver_report)?;
 
         Ok(GenericUdpSocket {
-            inner: InnerSocket::new(self.inner.into_owned_raw().into_raw(), Some(local_addr))?,
+            inner: InnerSocket::new(
+                self.inner.into_owned_raw().into_raw(),
+                Some(local_addr),
+                current_worker_id(),
+            )?,
             submitter: DetachedSubmitter::new(),
         })
     }

@@ -116,6 +116,14 @@ pub fn current_worker_id() -> usize {
     })
 }
 
+pub fn wake_worker(worker_id: usize) {
+    CONTEXT.with(|ctx| {
+        if let Some(runtime) = ctx.borrow().as_ref() {
+            runtime.shared.registry.unpark(worker_id);
+        }
+    });
+}
+
 pub fn set_current_runtime_context(context: RuntimeContext) {
     CONTEXT.with(|ctx| {
         *ctx.borrow_mut() = Some(context);

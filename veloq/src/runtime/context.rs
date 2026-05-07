@@ -10,6 +10,7 @@ use veloq_driver::driver::{DriveMode, Driver, DriverControlCommand, PlatformDriv
 use veloq_driver::op::{IntoPlatformOp, Op, OpSubmitter};
 
 use crate::config::{BufferRegistrationMode, Config};
+use crate::net::route::SocketRouteDispatcher;
 use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy};
 
 thread_local! {
@@ -71,8 +72,10 @@ impl DriverCommandDispatcher {
     }
 
     pub fn dispatch(&self, worker_id: usize, command: DriverControlCommand) {
-        if let Some(sender) = self.senders.get(worker_id) {
-            let _ = sender.send(command);
+        if let Some(sender) = self.senders.get(worker_id)
+            && sender.send(command).is_ok()
+        {
+            veloq_runtime::runtime::wake_worker(worker_id);
         }
     }
 }
@@ -246,6 +249,7 @@ pub struct RuntimeContext {
     config: Config,
     registrar: DriverRegistrar,
     driver_commands: DriverCommandDispatcher,
+    socket_route_dispatcher: SocketRouteDispatcher,
 }
 
 impl RuntimeContext {
@@ -255,6 +259,7 @@ impl RuntimeContext {
         config: Config,
         registrar: DriverRegistrar,
         driver_commands: DriverCommandDispatcher,
+        socket_route_dispatcher: SocketRouteDispatcher,
     ) -> Self {
         Self {
             buf_pool,
@@ -262,6 +267,7 @@ impl RuntimeContext {
             config,
             registrar,
             driver_commands,
+            socket_route_dispatcher,
         }
     }
 
@@ -293,6 +299,11 @@ impl RuntimeContext {
     #[inline]
     pub(crate) fn driver_commands(&self) -> DriverCommandDispatcher {
         self.driver_commands.clone()
+    }
+
+    #[inline]
+    pub(crate) fn socket_route_dispatcher(&self) -> SocketRouteDispatcher {
+        self.socket_route_dispatcher.clone()
     }
 }
 
@@ -388,6 +399,8 @@ pub(crate) fn drain_pending_driver_commands() {
             }
         }
     });
+
+    crate::net::route::drain_pending_socket_route_commands();
 }
 
 pub fn submit<'a, S, T>(

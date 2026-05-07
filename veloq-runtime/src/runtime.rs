@@ -27,7 +27,7 @@ pub use context::WorkerTickHook;
 pub(crate) use context::with_current_runtime;
 pub use context::{
     IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, WorkerInitContext,
-    clear_current_runtime_context, current_worker_id, set_current_runtime_context,
+    clear_current_runtime_context, current_worker_id, set_current_runtime_context, wake_worker,
 };
 pub(crate) use shared::RuntimeShared;
 

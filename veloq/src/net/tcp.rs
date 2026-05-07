@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
+use crate::net::route;
 use crate::runtime::context::submit;
 use veloq_buf::FixedBuf;
 use veloq_driver::Socket;
@@ -54,7 +55,11 @@ fn bind_listener_inner<A: ToSocketAddrs, P: SocketTokenPtr>(
     socket.listen(1024).map_err(from_driver_report)?;
     let local_addr = socket.local_addr().map_err(from_driver_report)?;
 
-    InnerSocket::new(socket.into_owned_raw().into_raw(), Some(local_addr))
+    InnerSocket::new(
+        socket.into_owned_raw().into_raw(),
+        Some(local_addr),
+        veloq_runtime::runtime::current_worker_id(),
+    )
 }
 
 fn new_stream_inner<P: SocketTokenPtr>(addr: &SocketAddr) -> VeloqResult<InnerSocket<P>> {
@@ -63,12 +68,15 @@ fn new_stream_inner<P: SocketTokenPtr>(addr: &SocketAddr) -> VeloqResult<InnerSo
     } else {
         Socket::new_tcp_v6().map_err(from_driver_report)?
     };
-    InnerSocket::new(socket.into_owned_raw().into_raw(), None)
+    InnerSocket::new(
+        socket.into_owned_raw().into_raw(),
+        None,
+        veloq_runtime::runtime::current_worker_id(),
+    )
 }
 
 impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpListener<S, P> {
     async fn accept_direct(&self) -> VeloqResult<(GenericTcpStream<S, P>, SocketAddr)> {
-        self.inner.ensure_affinity().await.map_err(from_io_error)?;
         let op = Accept {
             fd: self.inner.fd(),
             addr: veloq_driver::SockAddrStorage::default(),
@@ -90,7 +98,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpListener<S, P> {
         })?;
 
         let stream = GenericTcpStream {
-            inner: InnerSocket::new(accepted.into_raw(), None)?,
+            inner: InnerSocket::new(accepted.into_raw(), None, self.inner.owner_worker_id())?,
             submitter: self.submitter,
         };
 
@@ -108,7 +116,6 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpStream<S, P> {
         submitter: S,
         addr: SocketAddr,
     ) -> VeloqResult<Self> {
-        inner.ensure_affinity().await.map_err(from_io_error)?;
         let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = Connect {
@@ -128,7 +135,6 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpStream<S, P> {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
-        self.inner.ensure_affinity().await.map_err(from_io_error)?;
         let op = Recv {
             fd: self.inner.fd(),
             buf,
@@ -146,7 +152,6 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpStream<S, P> {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
-        self.inner.ensure_affinity().await.map_err(from_io_error)?;
         let op = OpSend {
             fd: self.inner.fd(),
             buf,
@@ -182,7 +187,37 @@ impl TcpListener {
     }
 
     pub async fn accept(&self) -> VeloqResult<(TcpStream, SocketAddr)> {
-        self.accept_direct().await
+        let owner = self.inner.owner_worker_id();
+        if veloq_runtime::runtime::current_worker_id() == owner {
+            return self.accept_direct().await;
+        }
+
+        let op = Accept {
+            fd: self.inner.fd(),
+            addr: veloq_driver::SockAddrStorage::default(),
+            addr_len: std::mem::size_of::<veloq_driver::SockAddrStorage>() as u32,
+            remote_addr: None,
+        };
+        let routed = route::route_tcp_accept(owner, op).map_err(from_io_error)?;
+        let (res, op_back) = routed.await.into_inner();
+        let op = op_back.ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Accept op lost"))
+        })?;
+
+        let accepted = res.map_err(from_driver_report)?;
+        let addr = op.remote_addr.ok_or_else(|| {
+            from_io_error(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Accept completed without remote address",
+            ))
+        })?;
+
+        let stream = GenericTcpStream {
+            inner: InnerSocket::new(accepted.into_raw(), None, owner)?,
+            submitter: self.submitter,
+        };
+
+        Ok((stream, addr))
     }
 }
 
@@ -243,7 +278,22 @@ impl TcpStream {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
-        self.recv_subset_direct(buf, buf_offset).await
+        let owner = self.inner.owner_worker_id();
+        if veloq_runtime::runtime::current_worker_id() == owner {
+            return self.recv_subset_direct(buf, buf_offset).await;
+        }
+
+        let op = Recv {
+            fd: self.inner.fd(),
+            buf,
+            buf_offset,
+        };
+        let routed = route::route_tcp_recv(owner, op).map_err(from_io_error)?;
+        let (res, op_back) = routed.await.into_inner();
+        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
+        })?;
+        Ok((res.map_err(from_driver_report)?, buf))
     }
 
     pub async fn send_subset(
@@ -251,7 +301,22 @@ impl TcpStream {
         buf: FixedBuf,
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
-        self.send_subset_direct(buf, buf_offset).await
+        let owner = self.inner.owner_worker_id();
+        if veloq_runtime::runtime::current_worker_id() == owner {
+            return self.send_subset_direct(buf, buf_offset).await;
+        }
+
+        let op = OpSend {
+            fd: self.inner.fd(),
+            buf,
+            buf_offset,
+        };
+        let routed = route::route_tcp_send(owner, op).map_err(from_io_error)?;
+        let (res, op_back) = routed.await.into_inner();
+        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
+            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
+        })?;
+        Ok((res.map_err(from_driver_report)?, buf))
     }
 }
 

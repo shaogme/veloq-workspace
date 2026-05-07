@@ -18,7 +18,6 @@ pub use scope::{
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, StateOptionPtr, Storage};
 use std::any::Any;
-use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -27,106 +26,6 @@ use std::task::{Context, Poll};
 
 pub type TaskHeader = GenericTaskHeader<AtomicStorage>;
 pub type LocalTaskHeader = GenericTaskHeader<LocalStorage>;
-
-thread_local! {
-    static CURRENT_SEND_TASK: RefCell<Option<*const TaskHeader>> = const { RefCell::new(None) };
-}
-
-struct CurrentSendTaskGuard {
-    prev: Option<*const TaskHeader>,
-}
-
-impl CurrentSendTaskGuard {
-    fn enter(task: *const TaskHeader) -> Self {
-        let prev = CURRENT_SEND_TASK.with(|slot| slot.replace(Some(task)));
-        Self { prev }
-    }
-}
-
-impl Drop for CurrentSendTaskGuard {
-    fn drop(&mut self) {
-        CURRENT_SEND_TASK.with(|slot| {
-            slot.replace(self.prev.take());
-        });
-    }
-}
-
-fn current_send_task() -> Option<*const TaskHeader> {
-    CURRENT_SEND_TASK.with(|slot| *slot.borrow())
-}
-
-pub async fn ensure_current_task_affinity(worker_id: usize) {
-    if let Some(header) = current_send_task() {
-        unsafe { (&*header).force_affinity(worker_id) };
-        if crate::runtime::current_worker_id() != worker_id {
-            yield_now().await;
-        }
-    }
-}
-
-/// 持有此 guard 期间，当前 SendTask 的后续唤醒会固定回到当前 worker，
-/// 从而避免在 `await` 之间被其他 worker 窃取。
-pub struct TaskAffinityGuard {
-    header: *const TaskHeader,
-}
-
-unsafe impl Send for TaskAffinityGuard {}
-
-impl TaskAffinityGuard {
-    pub fn enter() -> Self {
-        Self::try_enter().expect("TaskAffinityGuard::enter must be called while polling a SendTask")
-    }
-
-    pub fn try_enter() -> Option<Self> {
-        let header = current_send_task()?;
-        let worker_id = crate::runtime::current_worker_id();
-        unsafe { (&*header).enter_affinity(worker_id) };
-        Some(Self { header })
-    }
-}
-
-impl Drop for TaskAffinityGuard {
-    fn drop(&mut self) {
-        unsafe { (&*self.header).exit_affinity() };
-    }
-}
-
-/// 将一个 future 包装为“亲和作用域”。
-///
-/// 每次 `poll` 时都会基于当前 `SendTask` 临时进入 `TaskAffinityGuard`，
-/// 以便该 future 在执行期间的唤醒尽量回到同一个 worker。
-#[must_use = "future wrappers must be polled to make progress"]
-pub struct TaskAffinityFuture<F> {
-    inner: F,
-}
-
-impl<F> TaskAffinityFuture<F> {
-    pub fn new(inner: F) -> Self {
-        Self { inner }
-    }
-}
-
-impl<F: Future> Future for TaskAffinityFuture<F> {
-    type Output = F::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let _guard = TaskAffinityGuard::try_enter();
-        unsafe { self.map_unchecked_mut(|this| &mut this.inner) }.poll(cx)
-    }
-}
-
-/// 包装一个 future，使其在每次 poll 时临时进入 task affinity。
-#[inline]
-pub fn with_task_affinity<F: Future>(future: F) -> TaskAffinityFuture<F> {
-    TaskAffinityFuture::new(future)
-}
-
-#[macro_export]
-macro_rules! affine_scope {
-    ($future:expr $(,)?) => {
-        $crate::task::with_task_affinity($future)
-    };
-}
 
 // --- 任务错误与结果扩展 ---
 
@@ -364,14 +263,6 @@ where
         }
         _ => None,
     };
-    let _current_send_task_guard = if !is_local {
-        Some(CurrentSendTaskGuard::enter(
-            header as *const _ as *const TaskHeader,
-        ))
-    } else {
-        None
-    };
-
     loop {
         if header.is_cancelled() {
             finalizer.complete(Err(TaskError::Cancelled), is_local);

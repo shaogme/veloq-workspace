@@ -14,6 +14,7 @@ use veloq_driver::driver::{Driver, PlatformDriver};
 use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
 
 use crate::config::Config;
+use crate::net::route::{SocketRouteDispatcher, init_worker_socket_route_state};
 use crate::runtime::context::{DriverCommandDispatcher, init_worker_driver_command_state};
 use crate::runtime::context::{DriverRegistrar, RegistrarMessage};
 
@@ -147,6 +148,8 @@ impl<T: PoolTopology> Runtime<T> {
         let mut receivers = Vec::with_capacity(worker_count.get());
         let mut command_senders = Vec::with_capacity(worker_count.get());
         let mut command_receivers = Vec::with_capacity(worker_count.get());
+        let mut socket_route_senders = Vec::with_capacity(worker_count.get());
+        let mut socket_route_receivers = Vec::with_capacity(worker_count.get());
         for _ in 0..worker_count.get() {
             let (tx, rx) = mpsc::channel();
             senders.push(tx);
@@ -154,12 +157,17 @@ impl<T: PoolTopology> Runtime<T> {
             let (cmd_tx, cmd_rx) = mpsc::channel();
             command_senders.push(cmd_tx);
             command_receivers.push(cmd_rx);
+            let (socket_tx, socket_rx) = mpsc::channel();
+            socket_route_senders.push(socket_tx);
+            socket_route_receivers.push(socket_rx);
         }
 
         let receivers = Arc::new(StaticTransfer::new(receivers));
         let command_receivers = Arc::new(StaticTransfer::new(command_receivers));
+        let socket_route_receivers = Arc::new(StaticTransfer::new(socket_route_receivers));
         let dispatcher = Arc::new(RegistrarDispatcher { senders });
         let command_dispatcher = DriverCommandDispatcher::new(command_senders);
+        let socket_route_dispatcher = SocketRouteDispatcher::new(socket_route_senders);
 
         // 连接内存池监听器到分发器
         let dispatcher_clone = dispatcher.clone();
@@ -181,7 +189,9 @@ impl<T: PoolTopology> Runtime<T> {
                 let config = config.clone();
                 let receiver = receivers.take(worker_ctx.worker_id());
                 let command_receiver = command_receivers.take(worker_ctx.worker_id());
+                let socket_route_receiver = socket_route_receivers.take(worker_ctx.worker_id());
                 let command_dispatcher = command_dispatcher.clone();
+                let socket_route_dispatcher = socket_route_dispatcher.clone();
 
                 async move {
                     let driver = Rc::new(RefCell::new(
@@ -191,6 +201,7 @@ impl<T: PoolTopology> Runtime<T> {
                     // 初始化 TLS 中的注册中心状态
                     context::init_worker_registrar_state(receiver);
                     init_worker_driver_command_state(command_receiver);
+                    init_worker_socket_route_state(socket_route_receiver);
 
                     let registration_mode = config.registration_mode();
                     let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
@@ -208,6 +219,7 @@ impl<T: PoolTopology> Runtime<T> {
                         config,
                         registrar,
                         command_dispatcher,
+                        socket_route_dispatcher,
                     ));
                 }
             })

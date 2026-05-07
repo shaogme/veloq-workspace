@@ -1232,6 +1232,7 @@ dependencies = [
  "diagweave",
  "libc",
  "tracing",
+ "veloq-atomic-waker",
  "veloq-blocking",
  "veloq-buf",
  "veloq-driver",

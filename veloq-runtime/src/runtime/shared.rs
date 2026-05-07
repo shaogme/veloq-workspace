@@ -154,7 +154,7 @@ pub(crate) struct WorkerRegistry {
 
 impl WorkerRegistry {
     #[inline]
-    fn unpark(&self, worker_id: usize) {
+    pub(crate) fn unpark(&self, worker_id: usize) {
         self.unparkers[worker_id].unpark();
     }
 }
