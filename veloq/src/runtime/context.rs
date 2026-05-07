@@ -210,18 +210,6 @@ impl RuntimeDriverBridge {
         self.registrar.sync_to_driver();
     }
 
-    /// 让当前线程的驱动非阻塞推进一次。
-    ///
-    /// 这个入口只服务于提交路径，避免在提交后把线程阻塞在驱动里。
-    pub fn drive_poll(&self) {
-        self.sync_registrar();
-        let driver_rc = self.driver.clone();
-        let mut driver = driver_rc.borrow_mut();
-        driver
-            .drive(DriveMode::Poll)
-            .unwrap_or_else(|err| panic!("driver drive(Poll) failed: {err:#}"));
-    }
-
     /// 让当前线程的驱动在空闲时进入等待推进。
     ///
     /// 这个入口会优先利用驱动后端的阻塞等待能力，避免固定轮询兜底。
@@ -414,12 +402,7 @@ where
         std::future::poll_fn(
             move |cx: &mut std::task::Context<'_>| match fut.as_mut().poll(cx) {
                 Poll::Ready(output) => Poll::Ready(output),
-                Poll::Pending => {
-                    let ctx = current();
-                    let bridge = ctx.driver_bridge();
-                    bridge.drive_poll();
-                    Poll::Pending
-                }
+                Poll::Pending => Poll::Pending,
             },
         )
         .await
