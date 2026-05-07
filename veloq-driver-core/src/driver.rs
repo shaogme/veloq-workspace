@@ -566,16 +566,6 @@ pub trait Driver: 'static {
         self.completion_queue().pop()
     }
 
-    fn drain_completions(&mut self, out: &mut Vec<CompletionEvent>) -> usize {
-        let mut drained = 0;
-        let queue = self.completion_queue();
-        while let Some(ev) = queue.pop() {
-            out.push(ev);
-            drained += 1;
-        }
-        drained
-    }
-
     fn register_completion_waker(&mut self, token: u64, waker: &Waker) {
         self.completion_table().register_waker(token, waker);
     }
@@ -600,15 +590,11 @@ pub trait Driver: 'static {
 
     fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
 
-    fn has_active_ops(&mut self) -> bool;
-
     /// 判断当前驱动是否仍有需要 runtime 继续推进的工作。
     ///
     /// 这个判断比 `has_active_ops()` 更宽松，会把已产生但尚未被消费的完成事件
     /// 一并纳入，避免 runtime 过早进入长时间睡眠。
-    fn has_pending_progress(&mut self) -> bool {
-        self.has_active_ops() || self.slot_table().has_ready_completion()
-    }
+    fn has_pending_progress(&mut self) -> bool;
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
 }

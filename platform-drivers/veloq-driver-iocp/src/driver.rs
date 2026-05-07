@@ -868,10 +868,6 @@ impl Driver for IocpDriver {
         IocpDriver::create_waker(self)
     }
 
-    fn has_active_ops(&mut self) -> bool {
-        self.has_active_ops_internal()
-    }
-
     fn has_pending_progress(&mut self) -> bool {
         self.has_active_ops_internal() || self.ops.shared.has_ready_completion()
     }
