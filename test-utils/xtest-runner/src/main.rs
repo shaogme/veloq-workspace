@@ -3,8 +3,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
 
-const WINDOWS_TARGET: &str = "x86_64-pc-windows-gnu";
-
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum Target {
     Linux,
@@ -166,6 +164,7 @@ struct Runner {
     config: Config,
     workspace_root: PathBuf,
     mode: RunMode,
+    windows_target: Option<String>,
 }
 
 impl Runner {
@@ -173,10 +172,44 @@ impl Runner {
         let workspace_root = workspace_root()?;
         let mode = determine_mode(config.target, &workspace_root)?;
 
+        let windows_target = if cfg!(target_os = "windows") {
+            None
+        } else {
+            // 在非 Windows 环境下（如 Linux），探测已安装的 Windows target
+            let output = command_output(
+                &CommandSpec::new(
+                    "rustup",
+                    vec!["target".into(), "list".into(), "--installed".into()],
+                ),
+                &workspace_root,
+            )?;
+            let installed = String::from_utf8_lossy(&output.stdout);
+            let mut targets: Vec<_> = installed.lines().map(|l| l.trim().to_string()).collect();
+
+            // 优先选择 x86_64-pc-windows-msvc，其次是 gnu
+            targets.sort_by_key(|t| {
+                if t == "x86_64-pc-windows-msvc" {
+                    0
+                } else if t == "x86_64-pc-windows-gnu" {
+                    1
+                } else if t.contains("-windows-") {
+                    2
+                } else {
+                    3
+                }
+            });
+
+            targets
+                .into_iter()
+                .find(|t| t.contains("-windows-"))
+                .or_else(|| Some("x86_64-pc-windows-gnu".to_string()))
+        };
+
         let runner = Self {
             config,
             workspace_root,
             mode,
+            windows_target,
         };
         runner.prepare_environment()?;
         Ok(runner)
@@ -251,12 +284,14 @@ impl Runner {
                 )?;
             }
 
-            if !has_rust_target(WINDOWS_TARGET, &self.workspace_root)? {
+            if let Some(target) = &self.windows_target
+                && !has_rust_target(target, &self.workspace_root)?
+            {
                 self.run_setup(
-                    "安装 x86_64-pc-windows-gnu 工具链",
+                    &format!("安装 {} 工具链", target),
                     CommandSpec::new(
                         "rustup",
-                        vec!["target".into(), "add".into(), WINDOWS_TARGET.into()],
+                        vec!["target".into(), "add".into(), target.clone()],
                     ),
                 )?;
             }
@@ -316,10 +351,14 @@ impl Runner {
                 CommandSpec::new(program, args)
             }
             (RunMode::WindowsOnLinux, Target::Windows) => {
+                let target = self
+                    .windows_target
+                    .as_deref()
+                    .unwrap_or("x86_64-pc-windows-gnu");
                 let mut args = vec![
                     "run".into(),
                     "--target".into(),
-                    WINDOWS_TARGET.into(),
+                    target.into(),
                     "-p".into(),
                     "xtest-runner".into(),
                     "--".into(),
@@ -330,9 +369,11 @@ impl Runner {
             (_, Target::Linux) => {
                 linux_native_command(self.config.task, self.config.features.as_deref())
             }
-            (_, Target::Windows) => {
-                windows_native_command(self.config.task, self.config.features.as_deref())
-            }
+            (_, Target::Windows) => windows_native_command(
+                self.config.task,
+                self.config.features.as_deref(),
+                self.windows_target.as_deref(),
+            ),
         }
     }
 }
@@ -375,7 +416,7 @@ fn linux_native_command(task: Task, features: Option<&str>) -> CommandSpec {
     CommandSpec::new("cargo", args)
 }
 
-fn windows_native_command(task: Task, features: Option<&str>) -> CommandSpec {
+fn windows_native_command(task: Task, features: Option<&str>, target: Option<&str>) -> CommandSpec {
     let mut args = match task {
         Task::Test => vec!["nextest".into(), "run".into()],
         Task::Clippy => vec!["clippy".into()],
@@ -400,17 +441,18 @@ fn windows_native_command(task: Task, features: Option<&str>) -> CommandSpec {
             ]);
         }
         Task::Clippy => {
-            args.extend(vec![
-                "--all-targets".into(),
-                "--target".into(),
-                WINDOWS_TARGET.into(),
-                "--".into(),
-                "-D".into(),
-                "warnings".into(),
-            ]);
+            args.extend(vec!["--all-targets".into()]);
+            if let Some(t) = target {
+                args.push("--target".into());
+                args.push(t.into());
+            }
+            args.extend(vec!["--".into(), "-D".into(), "warnings".into()]);
         }
         Task::Check => {
-            args.extend(vec!["--target".into(), WINDOWS_TARGET.into()]);
+            if let Some(t) = target {
+                args.push("--target".into());
+                args.push(t.into());
+            }
         }
     }
 
