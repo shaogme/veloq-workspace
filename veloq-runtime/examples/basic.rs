@@ -144,7 +144,7 @@ fn main() {
             scope!(target_scope, {
                 let mut handles = Vec::new();
                 for i in 1..=3 {
-                    let h = target_scope.spawn_boxed_to(1, async move {
+                    let h = target_scope.spawn_boxed_to(1, async move || {
                         let worker_id = veloq_runtime::runtime::current_worker_id();
                         println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
                     });

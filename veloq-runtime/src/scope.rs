@@ -1,22 +1,185 @@
 use crate::runtime::{
-    GenericCancellationToken, RuntimeShared, current_worker_id, with_current_runtime,
+    GenericCancellationToken, RuntimeShared, current_worker_id, with_current_context,
+    with_current_runtime,
 };
 use crate::task::{
     Arena, GenericArena, GenericWakerNode, LocalBoxedTaskNode, LocalTask, LocalTaskRef,
-    SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
+    PinnedBoxedTaskNode, SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, Storage};
 use std::any::Any;
 use std::future::Future;
+use std::ops::AsyncFnOnce;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
+use veloq_atomic_waker::AtomicWaker;
 use veloq_intrusive_linklist::Link;
 
 type ReclaimFn<'scope, T, A> = unsafe fn(&A, NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>);
+
+type PinnedReclaimFn = unsafe fn(&dyn crate::task::Arena, *mut ());
+type PinnedTakeResultFn = unsafe fn(*const (), *mut ());
+
+enum RoutedSpawnOutcome {
+    Pending,
+    Ready(RoutedSpawnReady),
+    Failed(TaskError),
+    Taken,
+}
+
+struct RoutedSpawnReady {
+    task: SendTaskRef,
+    node_ptr: usize,
+    take_result: PinnedTakeResultFn,
+    reclaim: PinnedReclaimFn,
+}
+
+struct RoutedJobCell<'scope, F> {
+    job: Option<F>,
+    _marker: std::marker::PhantomData<&'scope ()>,
+}
+
+impl<'scope, F> RoutedJobCell<'scope, F> {
+    fn new(job: F) -> Self {
+        Self {
+            job: Some(job),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn take(&mut self) -> F {
+        self.job.take().expect("routed job already taken")
+    }
+}
+
+struct RoutedSpawnState {
+    outcome: Mutex<RoutedSpawnOutcome>,
+    cancel_requested: std::sync::atomic::AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl RoutedSpawnState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(RoutedSpawnOutcome::Pending),
+            cancel_requested: std::sync::atomic::AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        })
+    }
+
+    fn request_cancel(&self) {
+        self.cancel_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.waker.wake();
+    }
+
+    fn is_cancel_requested(&self) -> bool {
+        self.cancel_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_ready(&self, ready: RoutedSpawnReady) {
+        let should_wake = {
+            let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
+            if matches!(*outcome, RoutedSpawnOutcome::Pending) {
+                *outcome = RoutedSpawnOutcome::Ready(ready);
+                true
+            } else {
+                false
+            }
+        };
+        if should_wake {
+            self.waker.wake();
+        }
+    }
+
+    fn fail(&self, err: TaskError) {
+        let should_wake = {
+            let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
+            if matches!(*outcome, RoutedSpawnOutcome::Pending) {
+                *outcome = RoutedSpawnOutcome::Failed(err);
+                true
+            } else {
+                false
+            }
+        };
+        if should_wake {
+            self.waker.wake();
+        }
+    }
+
+    fn try_take_ready(&self) -> Result<Option<RoutedSpawnReady>, TaskError> {
+        let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
+        match std::mem::replace(&mut *outcome, RoutedSpawnOutcome::Taken) {
+            RoutedSpawnOutcome::Ready(ready) => Ok(Some(ready)),
+            RoutedSpawnOutcome::Failed(err) => Err(err),
+            RoutedSpawnOutcome::Pending => {
+                *outcome = RoutedSpawnOutcome::Pending;
+                Ok(None)
+            }
+            RoutedSpawnOutcome::Taken => {
+                *outcome = RoutedSpawnOutcome::Taken;
+                Ok(None)
+            }
+        }
+    }
+
+    fn register(&self, waker: &Waker) {
+        self.waker.register(waker);
+    }
+}
+
+fn install_routed_pinned_task<'scope, T, Fut>(
+    runtime: Arc<RuntimeShared>,
+    arena_addr: usize,
+    completion: Arc<GenericScopeCompletion<AtomicStorage, ArcOwnership>>,
+    worker_id: usize,
+    state: Arc<RoutedSpawnState>,
+    future: Fut,
+) where
+    T: Send + 'scope,
+    Fut: Future<Output = T>,
+{
+    let arena = unsafe { &*(arena_addr as *const GenericArena<AtomicStorage>) };
+    let node = PinnedBoxedTaskNode::new(future);
+    let layout = std::alloc::Layout::new::<PinnedBoxedTaskNode<'scope, T, Fut>>();
+    let node_ptr = unsafe {
+        arena.alloc::<PinnedBoxedTaskNode<'scope, T, Fut>>(
+            layout,
+            Some(|ptr| std::ptr::drop_in_place(ptr as *mut PinnedBoxedTaskNode<'scope, T, Fut>)),
+        ) as *mut PinnedBoxedTaskNode<'scope, T, Fut>
+    };
+    unsafe { std::ptr::write(node_ptr, node) };
+    let node_ref = unsafe { &*node_ptr };
+
+    node_ref.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(completion.clone()));
+
+    let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
+    let header = task_ref.header();
+    header.set_runtime_info(Arc::as_ptr(&runtime), worker_id);
+    if !runtime.enqueue_pinned(worker_id, task_ref) {
+        unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };
+        state.fail(TaskError::Panic);
+        completion.task_done();
+        return;
+    }
+
+    if state.is_cancel_requested() {
+        header.cancel();
+    }
+
+    state.set_ready(RoutedSpawnReady {
+        task: task_ref,
+        node_ptr: node_ptr as usize,
+        take_result: PinnedBoxedTaskNode::<'scope, T, Fut>::take_result_into_erased,
+        reclaim: PinnedBoxedTaskNode::<'scope, T, Fut>::reclaim_erased,
+    });
+}
 
 /// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
 pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
@@ -384,12 +547,92 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     pub fn spawn_boxed_to<T: Send + 'scope, F>(
         &self,
         worker_id: usize,
-        future: F,
-    ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
+        job: F,
+    ) -> RoutedJoinHandle<'scope, '_, M, T>
     where
-        F: Future<Output = T> + Send + 'scope,
+        F: AsyncFnOnce() -> T + Send + 'scope,
     {
-        self.spawn_boxed_send_impl(worker_id, future)
+        debug_assert!(
+            worker_id < self.runtime.worker_count().get(),
+            "worker_id {} is out of bounds (max {})",
+            worker_id,
+            self.runtime.worker_count().get()
+        );
+
+        let state = RoutedSpawnState::new();
+        self.completion.add_task();
+
+        let Some(dispatcher) = with_current_context(|ctx| ctx.worker_route_dispatcher()) else {
+            self.completion.task_done();
+            panic!("runtime context not set");
+        };
+
+        let runtime = self.runtime.clone();
+        let completion = self.completion.clone();
+        let arena_addr = &self.arena as *const _ as usize;
+        let state_for_job = state.clone();
+        let job_layout = std::alloc::Layout::new::<RoutedJobCell<'scope, F>>();
+        let job_cell = RoutedJobCell::new(job);
+        let job_ptr = unsafe {
+            self.arena.alloc::<RoutedJobCell<'scope, F>>(
+                job_layout,
+                Some(|ptr| {
+                    std::ptr::drop_in_place(ptr as *mut RoutedJobCell<'scope, F>);
+                }),
+            ) as *mut RoutedJobCell<'scope, F>
+        };
+        unsafe { std::ptr::write(job_ptr, job_cell) };
+        let job_addr = job_ptr as usize;
+
+        if !dispatcher.dispatch(worker_id, move || {
+            let arena = unsafe { &*(arena_addr as *const GenericArena<AtomicStorage>) };
+            let mut job_reclaimed = false;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if state_for_job.is_cancel_requested() {
+                    unsafe { arena.drop_object_raw(job_addr as *mut u8, job_layout) };
+                    job_reclaimed = true;
+                    state_for_job.fail(TaskError::Cancelled);
+                    completion.task_done();
+                    return;
+                }
+
+                let job_cell = unsafe { &mut *(job_addr as *mut RoutedJobCell<'scope, F>) };
+                let job = job_cell.take();
+                let future = job();
+
+                unsafe { arena.drop_object_raw(job_addr as *mut u8, job_layout) };
+                job_reclaimed = true;
+
+                if state_for_job.is_cancel_requested() {
+                    state_for_job.fail(TaskError::Cancelled);
+                    completion.task_done();
+                    return;
+                }
+
+                install_routed_pinned_task(
+                    runtime.clone(),
+                    arena_addr,
+                    completion.clone(),
+                    worker_id,
+                    state_for_job.clone(),
+                    future,
+                );
+            }));
+
+            if result.is_err() {
+                if !job_reclaimed {
+                    unsafe { arena.drop_object_raw(job_addr as *mut u8, job_layout) };
+                }
+                state_for_job.fail(TaskError::Panic);
+                completion.task_done();
+            }
+        }) {
+            unsafe { self.arena.drop_object_raw(job_addr as *mut u8, job_layout) };
+            self.completion.task_done();
+            panic!("failed to dispatch routed pinned task");
+        }
+
+        RoutedJoinHandle::new(self, state)
     }
 
     pub fn spawn_boxed<T: Send + 'scope, F>(
@@ -543,6 +786,202 @@ impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>> Drop
     fn drop(&mut self) {
         if let Some(node_ptr) = self.waker_node {
             let header = self.task.header();
+            if !header.is_completed() {
+                let mut wakers = header.wakers.lock();
+                if unsafe { node_ptr.as_ref().link.is_linked() } {
+                    unsafe {
+                        let mut cursor = wakers.cursor_mut_from_ptr(node_ptr);
+                        cursor.remove();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct RoutedJoinHandle<'scope, 'scope_ref, M, T> {
+    scope: &'scope_ref GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M>,
+    state: Arc<RoutedSpawnState>,
+    task: Option<SendTaskRef>,
+    node_ptr: Option<usize>,
+    take_result: Option<PinnedTakeResultFn>,
+    reclaim: Option<PinnedReclaimFn>,
+    cancel_token: CancelTokenSlot<AtomicStorage, ArcOwnership>,
+    waker_node: Option<NonNull<GenericWakerNode<AtomicStorage>>>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'scope, 'scope_ref, M, T> RoutedJoinHandle<'scope, 'scope_ref, M, T> {
+    fn new(
+        scope: &'scope_ref GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M>,
+        state: Arc<RoutedSpawnState>,
+    ) -> Self {
+        Self {
+            scope,
+            state,
+            task: None,
+            node_ptr: None,
+            take_result: None,
+            reclaim: None,
+            cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
+            waker_node: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'scope, 'scope_ref, M, T> RoutedJoinHandle<'scope, 'scope_ref, M, T>
+where
+    T: Send + 'scope,
+{
+    pub fn cancel(&self) {
+        self.state.request_cancel();
+
+        if let Some(task) = self.task {
+            task.header().cancel();
+            return;
+        }
+
+        let outcome = self
+            .state
+            .outcome
+            .lock()
+            .expect("routed spawn state poisoned");
+        if let RoutedSpawnOutcome::Ready(ready) = &*outcome {
+            ready.task.header().cancel();
+        }
+    }
+
+    pub fn cancel_token(&self) -> GenericCancellationToken<AtomicStorage, ArcOwnership> {
+        {
+            let cancel_slot = self.cancel_token.lock();
+            if let Some(token) = cancel_slot.as_ref() {
+                return token.clone();
+            }
+        }
+
+        let token = self.scope.completion().cancel_token().child();
+        if let Some(task) = self.task
+            && task.header().is_cancelled()
+        {
+            token.cancel();
+        }
+
+        let mut cancel_slot = self.cancel_token.lock();
+        if let Some(existing) = cancel_slot.as_ref() {
+            existing.clone()
+        } else {
+            cancel_slot.replace(token.clone());
+            token
+        }
+    }
+
+    fn install_ready(&mut self, ready: RoutedSpawnReady) {
+        self.task = Some(ready.task);
+        self.node_ptr = Some(ready.node_ptr);
+        self.take_result = Some(ready.take_result);
+        self.reclaim = Some(ready.reclaim);
+    }
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, TaskError>> {
+        let task = self.task.expect("routed spawn task missing");
+        self.scope
+            .runtime()
+            .drive_worker(Some(self.scope.completion()));
+
+        if task.header().is_completed() {
+            let node_ptr = self.node_ptr.expect("routed spawn node pointer missing");
+            let take_result = self.take_result.expect("routed spawn take_result missing");
+            let mut result = std::mem::MaybeUninit::<Result<T, TaskError>>::uninit();
+            unsafe {
+                take_result(node_ptr as *const (), result.as_mut_ptr() as *mut ());
+            }
+            let res = unsafe { result.assume_init() };
+            if let Some(reclaim) = self.reclaim.take() {
+                unsafe { reclaim(self.scope.arena(), node_ptr as *mut ()) };
+            }
+            return Poll::Ready(res);
+        }
+        if self.scope.completion().is_cancelled() || task.header().is_cancelled() {
+            return Poll::Ready(Err(TaskError::Cancelled));
+        }
+
+        let header = task.header();
+        if let Some(mut node_ptr) = self.waker_node {
+            let node = unsafe { node_ptr.as_mut() };
+            if !node.waker.will_wake(cx.waker()) {
+                node.waker = cx.waker().clone();
+                unsafe { header.register_completion(node_ptr.as_ptr()) };
+            }
+        } else {
+            let node_ptr = unsafe {
+                self.scope.arena().alloc_raw(
+                    std::alloc::Layout::new::<GenericWakerNode<AtomicStorage>>(),
+                    Some(|ptr| {
+                        std::ptr::drop_in_place(ptr as *mut GenericWakerNode<AtomicStorage>)
+                    }),
+                ) as *mut GenericWakerNode<AtomicStorage>
+            };
+            unsafe {
+                std::ptr::write(
+                    node_ptr,
+                    GenericWakerNode {
+                        waker: cx.waker().clone(),
+                        link: Link::new(),
+                        _marker: std::marker::PhantomData,
+                    },
+                );
+            }
+            self.waker_node = NonNull::new(node_ptr);
+            unsafe { header.register_completion(node_ptr) };
+        }
+        Poll::Pending
+    }
+}
+
+impl<'scope, 'scope_ref, M, T: Send + 'scope> Future
+    for RoutedJoinHandle<'scope, 'scope_ref, M, T>
+{
+    type Output = Result<T, TaskError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.task.is_some() {
+            return this.poll_ready(cx);
+        }
+
+        this.scope
+            .runtime()
+            .drive_worker(Some(this.scope.completion()));
+
+        match this.state.try_take_ready() {
+            Ok(Some(ready)) => {
+                this.install_ready(ready);
+                this.poll_ready(cx)
+            }
+            Ok(None) => {
+                this.state.register(cx.waker());
+                match this.state.try_take_ready() {
+                    Ok(Some(ready)) => {
+                        this.install_ready(ready);
+                        this.poll_ready(cx)
+                    }
+                    Ok(None) => Poll::Pending,
+                    Err(err) => Poll::Ready(Err(err)),
+                }
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+}
+
+impl<'scope, 'scope_ref, M, T> Drop for RoutedJoinHandle<'scope, 'scope_ref, M, T> {
+    fn drop(&mut self) {
+        if let Some(node_ptr) = self.waker_node
+            && let Some(task) = self.task
+        {
+            let header = task.header();
             if !header.is_completed() {
                 let mut wakers = header.wakers.lock();
                 if unsafe { node_ptr.as_ref().link.is_linked() } {

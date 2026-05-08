@@ -18,7 +18,9 @@ use std::task::{Context, Poll};
 pub(crate) struct WorkerQueue {
     pub(crate) local_tx: Sender<LocalTaskRef>,
     pub(crate) remote_tx: Sender<SendTaskRef>,
+    pub(crate) pinned_tx: Sender<SendTaskRef>,
     pub(crate) local_count: AtomicUsize,
+    pub(crate) pinned_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
     pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
     /// Chase-Lev Deque for work-stealing
@@ -29,12 +31,15 @@ impl WorkerQueue {
     fn new(
         local_tx: Sender<LocalTaskRef>,
         remote_tx: Sender<SendTaskRef>,
+        pinned_tx: Sender<SendTaskRef>,
         queue_capacity: NonZeroUsize,
     ) -> Self {
         Self {
             local_tx,
             remote_tx,
+            pinned_tx,
             local_count: AtomicUsize::new(0),
+            pinned_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),
             deque: Deque::new(queue_capacity),
         }
@@ -353,20 +358,24 @@ pub struct RuntimeShared {
     pub(crate) shutdown: AtomicBool,
 }
 
+pub(crate) struct RuntimeSharedComponents {
+    pub(crate) shared: RuntimeShared,
+    pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
+    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
+    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
+}
+
 impl RuntimeShared {
     pub(crate) fn new(
         worker_count: NonZeroUsize,
         queue_capacity: NonZeroUsize,
-    ) -> (
-        Self,
-        Vec<Receiver<LocalTaskRef>>,
-        Vec<Receiver<SendTaskRef>>,
-    ) {
+    ) -> RuntimeSharedComponents {
         let worker_count_val = worker_count.get();
         let mut unparkers = Vec::with_capacity(worker_count_val);
         let mut parker_inners = Vec::with_capacity(worker_count_val);
         let mut local_receivers = Vec::with_capacity(worker_count_val);
         let mut remote_receivers = Vec::with_capacity(worker_count_val);
+        let mut pinned_receivers = Vec::with_capacity(worker_count_val);
         let mut workers = Vec::with_capacity(worker_count_val);
         let mut next_idle = Vec::with_capacity(worker_count_val);
 
@@ -379,9 +388,11 @@ impl RuntimeShared {
 
             let (ltx, lrx) = mpsc::channel();
             let (rtx, rrx) = mpsc::channel();
+            let (ptx, prx) = mpsc::channel();
             local_receivers.push(lrx);
             remote_receivers.push(rrx);
-            workers.push(Arc::new(WorkerQueue::new(ltx, rtx, queue_capacity)));
+            pinned_receivers.push(prx);
+            workers.push(Arc::new(WorkerQueue::new(ltx, rtx, ptx, queue_capacity)));
             next_idle.push(AtomicUsize::new(usize::MAX));
         }
 
@@ -422,8 +433,8 @@ impl RuntimeShared {
             }
         }
 
-        (
-            Self {
+        RuntimeSharedComponents {
+            shared: Self {
                 registry: WorkerRegistry {
                     workers,
                     unparkers,
@@ -447,7 +458,8 @@ impl RuntimeShared {
             },
             local_receivers,
             remote_receivers,
-        )
+            pinned_receivers,
+        }
     }
 
     pub fn choose_worker(&self) -> usize {
@@ -471,6 +483,25 @@ impl RuntimeShared {
             self.idle.event_count.notify();
             self.notify_work(worker_id);
         }
+    }
+
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
+        if task.header().is_completed() {
+            return false;
+        }
+        let worker_count = self.registry.workers.len();
+        let worker_id = worker_id % worker_count;
+        if task.header().try_mark_queued() {
+            self.idle.event_count.notify();
+            let worker = &self.registry.workers[worker_id];
+            worker.pinned_count.fetch_add(1, Ordering::Release);
+            if worker.pinned_tx.send(task).is_err() {
+                worker.pinned_count.fetch_sub(1, Ordering::Release);
+                return false;
+            }
+            self.notify_work(worker_id);
+        }
+        true
     }
 
     fn notify_work(&self, worker_id: usize) {
@@ -535,6 +566,16 @@ impl RuntimeShared {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
         }
         worker.deque.pop()
+    }
+
+    fn pop_pinned(&self, worker_id: usize, rx: &Receiver<SendTaskRef>) -> Option<SendTaskRef> {
+        let res = rx.try_recv().ok();
+        if res.is_some() {
+            self.registry.workers[worker_id]
+                .pinned_count
+                .fetch_sub(1, Ordering::Release);
+        }
+        res
     }
 
     fn pop_global(&self) -> Option<SendTaskRef> {
@@ -625,6 +666,11 @@ impl RuntimeShared {
                     progressed = true;
                 }
 
+                if !progressed && let Some(task) = self.pop_pinned(worker_id, &ctx.pinned_rx) {
+                    self.poll_send_task(worker_id, task);
+                    progressed = true;
+                }
+
                 if !progressed && let Some(task) = self.pop_local(worker_id, &ctx.local_rx) {
                     self.poll_local_task(worker_id, task);
                     progressed = true;
@@ -676,5 +722,6 @@ impl RuntimeShared {
         worker.lifo.load(Ordering::Acquire).is_some()
             || !worker.deque.is_empty()
             || worker.local_count.load(Ordering::Acquire) > 0
+            || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 }

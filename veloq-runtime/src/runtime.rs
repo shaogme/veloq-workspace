@@ -25,6 +25,7 @@ pub use primitives::{
 };
 
 pub use context::WorkerTickHook;
+pub(crate) use context::with_current_context;
 pub(crate) use context::with_current_runtime;
 pub use context::{
     IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, WorkerInitContext,
@@ -43,6 +44,7 @@ pub struct Runtime<I = NoopWorkerInit> {
     shared: Arc<RuntimeShared>,
     local_receivers: Vec<Receiver<LocalTaskRef>>,
     remote_receivers: Vec<Receiver<SendTaskRef>>,
+    pinned_receivers: Vec<Receiver<SendTaskRef>>,
     worker_count: NonZeroUsize,
     worker_init: Option<I>,
     idle_hook: Option<IdleHook>,
@@ -97,6 +99,7 @@ where
             shared,
             local_receivers,
             remote_receivers,
+            pinned_receivers,
             worker_count,
             worker_init,
             idle_hook,
@@ -107,6 +110,7 @@ where
         shared.shutdown.store(false, Ordering::Release);
         let mut local_receivers = local_receivers;
         let mut remote_receivers = remote_receivers;
+        let mut pinned_receivers = pinned_receivers;
         let mut route_senders = Vec::with_capacity(worker_count.get());
         let mut route_receivers = Vec::with_capacity(worker_count.get());
         for _ in 0..worker_count.get() {
@@ -136,6 +140,9 @@ where
             for worker_id in (1..worker_count.get()).rev() {
                 let lrx = local_receivers.pop().expect("Receiver missing for worker");
                 let rrx = remote_receivers.pop().expect("Receiver missing for worker");
+                let prx = pinned_receivers
+                    .pop()
+                    .expect("Pinned receiver missing for worker");
                 let route_rx = route_receivers.take(worker_id);
                 let runtime = shared.clone();
                 let route_dispatcher = route_dispatcher.clone();
@@ -145,6 +152,7 @@ where
                         worker_id,
                         local_rx: lrx,
                         remote_rx: rrx,
+                        pinned_rx: prx,
                         rand: RefCell::new(FastRand::new(worker_id as u64)),
                         idle_hook,
                         worker_tick_hook,
@@ -168,6 +176,9 @@ where
             let rrx0 = remote_receivers
                 .pop()
                 .expect("Receiver missing for worker 0");
+            let prx0 = pinned_receivers
+                .pop()
+                .expect("Pinned receiver missing for worker 0");
             let route_rx0 = route_receivers.take(0);
             let route_dispatcher = route_dispatcher.clone();
             set_current_runtime_context(RuntimeContext {
@@ -175,6 +186,7 @@ where
                 worker_id: 0,
                 local_rx: lrx0,
                 remote_rx: rrx0,
+                pinned_rx: prx0,
                 rand: RefCell::new(FastRand::new(0)),
                 idle_hook,
                 worker_tick_hook,
@@ -283,13 +295,13 @@ where
             thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
         });
-        let (shared, local_receivers, remote_receivers) =
-            RuntimeShared::new(count, self.queue_capacity);
-        let shared = Arc::new(shared);
+        let components = RuntimeShared::new(count, self.queue_capacity);
+        let shared = Arc::new(components.shared);
         Runtime {
             shared,
-            local_receivers,
-            remote_receivers,
+            local_receivers: components.local_receivers,
+            remote_receivers: components.remote_receivers,
+            pinned_receivers: components.pinned_receivers,
             worker_count: count,
             worker_init: self.worker_init,
             idle_hook: self.idle_hook,

@@ -399,7 +399,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                 })
                                 .collect();
 
-                            prepare_handles.push(s.spawn_boxed_to(worker_id, async move {
+                            prepare_handles.push(s.spawn_boxed_to(worker_id, async move || {
                                 let mut files = Vec::with_capacity(FILES_PER_WORKER);
                                 for path in &prepare_path_names {
                                     if path.exists() {

@@ -450,7 +450,7 @@ fn main() {
             let mut prepare_handles = Vec::with_capacity(args.threads);
             for t_idx in 0..args.threads {
                 let prepare_buffering = buffering_mode;
-                prepare_handles.push(s.spawn_boxed_to(t_idx, async move {
+                prepare_handles.push(s.spawn_boxed_to(t_idx, async move || {
                     prepare_files_for_thread(FILE_SIZE_PER_THREAD, t_idx, prepare_buffering).await;
                 }));
             }
@@ -470,7 +470,7 @@ fn main() {
                 let worker_sync = sync_mode;
                 let t_idx = config.thread_index;
 
-                worker_handles.push(s.spawn_boxed_to(t_idx, async move {
+                worker_handles.push(s.spawn_boxed_to(t_idx, async move || {
                     run_worker(
                         qdepth,
                         duration_limit,
