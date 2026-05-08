@@ -3,183 +3,22 @@ use crate::runtime::{
     with_current_runtime,
 };
 use crate::task::{
-    Arena, GenericArena, GenericWakerNode, LocalBoxedTaskNode, LocalTask, LocalTaskRef,
-    PinnedBoxedTaskNode, SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
+    Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef, SendTask, SendTaskRef, Task,
+    TaskError, TaskHandleRef,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, Storage};
 use std::any::Any;
 use std::future::Future;
 use std::ops::AsyncFnOnce;
-use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
-use std::task::{Context, Poll, Waker};
-use veloq_atomic_waker::AtomicWaker;
-use veloq_intrusive_linklist::Link;
+use std::task::Waker;
 
-type ReclaimFn<'scope, T, A> = unsafe fn(&A, NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>);
+mod join;
 
-type PinnedReclaimFn = unsafe fn(&dyn crate::task::Arena, *mut ());
-type PinnedTakeResultFn = unsafe fn(*const (), *mut ());
-
-enum RoutedSpawnOutcome {
-    Pending,
-    Ready(RoutedSpawnReady),
-    Failed(TaskError),
-    Taken,
-}
-
-struct RoutedSpawnReady {
-    task: SendTaskRef,
-    node_ptr: usize,
-    take_result: PinnedTakeResultFn,
-    reclaim: PinnedReclaimFn,
-}
-
-struct RoutedJobCell<'scope, F> {
-    job: Option<F>,
-    _marker: std::marker::PhantomData<&'scope ()>,
-}
-
-impl<'scope, F> RoutedJobCell<'scope, F> {
-    fn new(job: F) -> Self {
-        Self {
-            job: Some(job),
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    fn take(&mut self) -> F {
-        self.job.take().expect("routed job already taken")
-    }
-}
-
-struct RoutedSpawnState {
-    outcome: Mutex<RoutedSpawnOutcome>,
-    cancel_requested: std::sync::atomic::AtomicBool,
-    waker: AtomicWaker,
-}
-
-impl RoutedSpawnState {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            outcome: Mutex::new(RoutedSpawnOutcome::Pending),
-            cancel_requested: std::sync::atomic::AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-        })
-    }
-
-    fn request_cancel(&self) {
-        self.cancel_requested
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.waker.wake();
-    }
-
-    fn is_cancel_requested(&self) -> bool {
-        self.cancel_requested
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn set_ready(&self, ready: RoutedSpawnReady) {
-        let should_wake = {
-            let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
-            if matches!(*outcome, RoutedSpawnOutcome::Pending) {
-                *outcome = RoutedSpawnOutcome::Ready(ready);
-                true
-            } else {
-                false
-            }
-        };
-        if should_wake {
-            self.waker.wake();
-        }
-    }
-
-    fn fail(&self, err: TaskError) {
-        let should_wake = {
-            let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
-            if matches!(*outcome, RoutedSpawnOutcome::Pending) {
-                *outcome = RoutedSpawnOutcome::Failed(err);
-                true
-            } else {
-                false
-            }
-        };
-        if should_wake {
-            self.waker.wake();
-        }
-    }
-
-    fn try_take_ready(&self) -> Result<Option<RoutedSpawnReady>, TaskError> {
-        let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
-        match std::mem::replace(&mut *outcome, RoutedSpawnOutcome::Taken) {
-            RoutedSpawnOutcome::Ready(ready) => Ok(Some(ready)),
-            RoutedSpawnOutcome::Failed(err) => Err(err),
-            RoutedSpawnOutcome::Pending => {
-                *outcome = RoutedSpawnOutcome::Pending;
-                Ok(None)
-            }
-            RoutedSpawnOutcome::Taken => {
-                *outcome = RoutedSpawnOutcome::Taken;
-                Ok(None)
-            }
-        }
-    }
-
-    fn register(&self, waker: &Waker) {
-        self.waker.register(waker);
-    }
-}
-
-fn install_routed_pinned_task<'scope, T, Fut>(
-    runtime: Arc<RuntimeShared>,
-    arena_addr: usize,
-    completion: Arc<GenericScopeCompletion<AtomicStorage, ArcOwnership>>,
-    worker_id: usize,
-    state: Arc<RoutedSpawnState>,
-    future: Fut,
-) where
-    T: Send + 'scope,
-    Fut: Future<Output = T>,
-{
-    let arena = unsafe { &*(arena_addr as *const GenericArena<AtomicStorage>) };
-    let node = PinnedBoxedTaskNode::new(future);
-    let layout = std::alloc::Layout::new::<PinnedBoxedTaskNode<'scope, T, Fut>>();
-    let node_ptr = unsafe {
-        arena.alloc::<PinnedBoxedTaskNode<'scope, T, Fut>>(
-            layout,
-            Some(|ptr| std::ptr::drop_in_place(ptr as *mut PinnedBoxedTaskNode<'scope, T, Fut>)),
-        ) as *mut PinnedBoxedTaskNode<'scope, T, Fut>
-    };
-    unsafe { std::ptr::write(node_ptr, node) };
-    let node_ref = unsafe { &*node_ptr };
-
-    node_ref.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(completion.clone()));
-
-    let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-    let header = task_ref.header();
-    header.set_runtime_info(Arc::as_ptr(&runtime), worker_id);
-    if !runtime.enqueue_pinned(worker_id, task_ref) {
-        unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };
-        state.fail(TaskError::Panic);
-        completion.task_done();
-        return;
-    }
-
-    if state.is_cancel_requested() {
-        header.cancel();
-    }
-
-    state.set_ready(RoutedSpawnReady {
-        task: task_ref,
-        node_ptr: node_ptr as usize,
-        take_result: PinnedBoxedTaskNode::<'scope, T, Fut>::take_result_into_erased,
-        reclaim: PinnedBoxedTaskNode::<'scope, T, Fut>::reclaim_erased,
-    });
-}
+pub use join::{JoinHandle, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle};
 
 /// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
 pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
@@ -281,7 +120,8 @@ pub trait ScopeProvider<'scope> {
     >;
 }
 
-fn new_cancel_slot<S: Storage, O: Ownership>() -> S::Lock<Option<GenericCancellationToken<S, O>>> {
+pub(crate) fn new_cancel_slot<S: Storage, O: Ownership>()
+-> S::Lock<Option<GenericCancellationToken<S, O>>> {
     S::Lock::new(None)
 }
 
@@ -359,20 +199,18 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
             .set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
         self.runtime.enqueue_local(worker_id, task_ref);
 
-        JoinHandle {
-            task: task_ref,
-            gate: unsafe {
+        JoinHandle::new_direct(
+            self,
+            task_ref,
+            unsafe {
                 NonNull::new_unchecked(
                     task as &dyn crate::task::TaskJoinGate<T>
                         as *const dyn crate::task::TaskJoinGate<T>
                         as *mut dyn crate::task::TaskJoinGate<T>,
                 )
             },
-            scope: self,
-            cancel_token: new_cancel_slot::<S, O>(),
-            waker_node: None,
-            reclaim: None,
-        }
+            None,
+        )
     }
 
     pub fn spawn_boxed_local<T: 'scope, F>(
@@ -391,8 +229,8 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
             ) as *mut LocalBoxedTaskNode<'scope, T, F>
         };
         unsafe { std::ptr::write(node_ptr, node) };
-        let node_ref = unsafe { &*node_ptr };
 
+        let node_ref = unsafe { &*node_ptr };
         node_ref.set_scope_completion::<S, O>(Some(self.completion.clone()));
         self.completion.add_task();
 
@@ -403,19 +241,15 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
             .set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
         self.runtime.enqueue_local(worker_id, task_ref);
 
-        JoinHandle {
-            task: task_ref,
-            gate: unsafe {
-                NonNull::new_unchecked(node_ptr as *mut dyn crate::task::TaskJoinGate<T>)
-            },
-            scope: self,
-            cancel_token: new_cancel_slot::<S, O>(),
-            waker_node: None,
-            reclaim: Some(|arena, gate| unsafe {
+        JoinHandle::new_direct(
+            self,
+            task_ref,
+            unsafe { NonNull::new_unchecked(node_ptr as *mut dyn crate::task::TaskJoinGate<T>) },
+            Some(|arena, gate| unsafe {
                 let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<'scope, T, F>>();
                 arena.drop_object_raw(gate.as_ptr() as *mut u8, layout);
             }),
-        }
+        )
     }
 
     pub fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
@@ -440,61 +274,58 @@ impl<'scope, S: Storage, O: Ownership, M> Drop for GenericAsyncScope<'scope, S, 
 
 // 线程安全作用域特有方法
 impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
-    fn spawn_send_impl<T: Send + 'scope, S>(
+    fn spawn_send_impl<T: Send + 'scope, S_>(
         &self,
         worker_id: usize,
-        task: &'scope S,
+        task: &'scope S_,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
-        S: SendTask<T> + Sized + 'scope,
+        S_: SendTask<T> + Sized + 'scope,
     {
         debug_assert!(
             worker_id < self.runtime.worker_count().get(),
-            "worker_id {} is out of bounds (max {})",
-            worker_id,
-            self.runtime.worker_count().get()
+            "worker_id {} is out of bounds",
+            worker_id
         );
         task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(self.completion.clone()));
         self.completion.add_task();
 
-        let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S) };
+        let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
         let header = task_ref.header();
         header.set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
         self.runtime.enqueue_send(worker_id, task_ref);
 
-        JoinHandle {
-            task: task_ref,
-            gate: unsafe {
+        JoinHandle::new_direct(
+            self,
+            task_ref,
+            unsafe {
                 NonNull::new_unchecked(
                     task as &dyn crate::task::TaskJoinGate<T>
                         as *const dyn crate::task::TaskJoinGate<T>
                         as *mut dyn crate::task::TaskJoinGate<T>,
                 )
             },
-            scope: self,
-            cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
-            waker_node: None,
-            reclaim: None,
-        }
+            None,
+        )
     }
 
-    pub fn spawn_to<T: Send + 'scope, S>(
+    pub fn spawn_to<T: Send + 'scope, S_>(
         &self,
         worker_id: usize,
-        task: &'scope S,
+        task: &'scope S_,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
-        S: SendTask<T> + Sized + 'scope,
+        S_: SendTask<T> + Sized + 'scope,
     {
         self.spawn_send_impl(worker_id, task)
     }
 
-    pub fn spawn<T: Send + 'scope, S>(
+    pub fn spawn<T: Send + 'scope, S_>(
         &self,
-        task: &'scope S,
+        task: &'scope S_,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
-        S: SendTask<T> + Sized + 'scope,
+        S_: SendTask<T> + Sized + 'scope,
     {
         self.spawn_send_impl(self.runtime.choose_worker(), task)
     }
@@ -509,57 +340,61 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     {
         debug_assert!(
             worker_id < self.runtime.worker_count().get(),
-            "worker_id {} is out of bounds (max {})",
-            worker_id,
-            self.runtime.worker_count().get()
+            "worker_id {} is out of bounds",
+            worker_id
         );
-        let node = SendBoxedTaskNode::new(future);
-        let layout = std::alloc::Layout::new::<SendBoxedTaskNode<'scope, T, F>>();
+        let node = crate::task::SendBoxedTaskNode::new(future);
+        let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'scope, T, F>>();
         let node_ptr = unsafe {
-            self.arena.alloc::<SendBoxedTaskNode<'scope, T, F>>(
-                layout,
-                Some(|ptr| std::ptr::drop_in_place(ptr as *mut SendBoxedTaskNode<'scope, T, F>)),
-            ) as *mut SendBoxedTaskNode<'scope, T, F>
+            self.arena
+                .alloc::<crate::task::SendBoxedTaskNode<'scope, T, F>>(
+                    layout,
+                    Some(|ptr| {
+                        std::ptr::drop_in_place(
+                            ptr as *mut crate::task::SendBoxedTaskNode<'scope, T, F>,
+                        )
+                    }),
+                ) as *mut crate::task::SendBoxedTaskNode<'scope, T, F>
         };
         unsafe { std::ptr::write(node_ptr, node) };
-        let node_ref = unsafe { &*node_ptr };
 
+        let node_ref = unsafe { &*node_ptr };
         node_ref.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(self.completion.clone()));
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-        let header = task_ref.header();
-        header.set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
+        task_ref
+            .header()
+            .set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
         self.runtime.enqueue_send(worker_id, task_ref);
 
-        JoinHandle {
-            task: task_ref,
-            gate: unsafe {
-                NonNull::new_unchecked(node_ptr as *mut dyn crate::task::TaskJoinGate<T>)
-            },
-            scope: self,
-            cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
-            waker_node: None,
-            reclaim: None,
-        }
+        JoinHandle::new_direct(
+            self,
+            task_ref,
+            unsafe { NonNull::new_unchecked(node_ptr as *mut dyn crate::task::TaskJoinGate<T>) },
+            Some(|arena, gate| unsafe {
+                let layout =
+                    std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'scope, T, F>>();
+                arena.drop_object_raw(gate.as_ptr() as *mut u8, layout);
+            }),
+        )
     }
 
     pub fn spawn_boxed_to<T: Send + 'scope, F>(
         &self,
         worker_id: usize,
         job: F,
-    ) -> RoutedJoinHandle<'scope, '_, M, T>
+    ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
         F: AsyncFnOnce() -> T + Send + 'scope,
     {
         debug_assert!(
             worker_id < self.runtime.worker_count().get(),
-            "worker_id {} is out of bounds (max {})",
-            worker_id,
-            self.runtime.worker_count().get()
+            "worker_id {} is out of bounds",
+            worker_id
         );
 
-        let state = RoutedSpawnState::new();
+        let state = self::join::RoutedSpawnState::new();
         self.completion.add_task();
 
         let Some(dispatcher) = with_current_context(|ctx| ctx.worker_route_dispatcher()) else {
@@ -571,37 +406,38 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let completion = self.completion.clone();
         let arena_addr = &self.arena as *const _ as usize;
         let state_for_job = state.clone();
-        let job_layout = std::alloc::Layout::new::<RoutedJobCell<'scope, F>>();
-        let job_cell = RoutedJobCell::new(job);
+        let job_layout = std::alloc::Layout::new::<self::join::RoutedJobCell<'scope, F>>();
         let job_ptr = unsafe {
-            self.arena.alloc::<RoutedJobCell<'scope, F>>(
+            self.arena.alloc::<self::join::RoutedJobCell<'scope, F>>(
                 job_layout,
                 Some(|ptr| {
-                    std::ptr::drop_in_place(ptr as *mut RoutedJobCell<'scope, F>);
+                    std::ptr::drop_in_place(ptr as *mut self::join::RoutedJobCell<'scope, F>)
                 }),
-            ) as *mut RoutedJobCell<'scope, F>
+            ) as *mut self::join::RoutedJobCell<'scope, F>
         };
-        unsafe { std::ptr::write(job_ptr, job_cell) };
+        unsafe { std::ptr::write(job_ptr, self::join::RoutedJobCell::new(job)) };
+
         let job_addr = job_ptr as usize;
 
         if !dispatcher.dispatch(worker_id, move || {
             let arena = unsafe { &*(arena_addr as *const GenericArena<AtomicStorage>) };
-            let mut job_reclaimed = false;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let state_for_err = state_for_job.clone();
+            let completion_for_err = completion.clone();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 if state_for_job.is_cancel_requested() {
                     unsafe { arena.drop_object_raw(job_addr as *mut u8, job_layout) };
-                    job_reclaimed = true;
                     state_for_job.fail(TaskError::Cancelled);
                     completion.task_done();
                     return;
                 }
 
-                let job_cell = unsafe { &mut *(job_addr as *mut RoutedJobCell<'scope, F>) };
-                let job = job_cell.take();
+                let job = unsafe {
+                    (&mut *(job_addr as *mut self::join::RoutedJobCell<'scope, F>)).take()
+                };
                 let future = job();
 
                 unsafe { arena.drop_object_raw(job_addr as *mut u8, job_layout) };
-                job_reclaimed = true;
 
                 if state_for_job.is_cancel_requested() {
                     state_for_job.fail(TaskError::Cancelled);
@@ -609,30 +445,27 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
                     return;
                 }
 
-                install_routed_pinned_task(
-                    runtime.clone(),
-                    arena_addr,
-                    completion.clone(),
+                self::join::install_routed_pinned_task(
+                    runtime,
+                    arena,
+                    completion,
                     worker_id,
-                    state_for_job.clone(),
+                    state_for_job,
                     future,
                 );
             }));
 
             if result.is_err() {
-                if !job_reclaimed {
-                    unsafe { arena.drop_object_raw(job_addr as *mut u8, job_layout) };
-                }
-                state_for_job.fail(TaskError::Panic);
-                completion.task_done();
+                state_for_err.fail(TaskError::Panic);
+                completion_for_err.task_done();
             }
         }) {
-            unsafe { self.arena.drop_object_raw(job_addr as *mut u8, job_layout) };
+            unsafe { self.arena.drop_object_raw(job_ptr as *mut u8, job_layout) };
             self.completion.task_done();
             panic!("failed to dispatch routed pinned task");
         }
 
-        RoutedJoinHandle::new(self, state)
+        JoinHandle::new_routed(self, state)
     }
 
     pub fn spawn_boxed<T: Send + 'scope, F>(
@@ -648,12 +481,12 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
 // 本地作用域特有方法
 impl<'scope, M> GenericAsyncScope<'scope, LocalStorage, RcOwnership, M> {
-    pub fn spawn<T: 'scope, S>(
+    pub fn spawn<T: 'scope, S_>(
         &self,
-        task: &'scope S,
+        task: &'scope S_,
     ) -> JoinHandle<'scope, '_, T, LocalTaskRef, Self>
     where
-        S: LocalTask<T> + Sized + 'scope,
+        S_: LocalTask<T> + Sized + 'scope,
     {
         self.spawn_local(task)
     }
@@ -666,332 +499,6 @@ impl<'scope, M> GenericAsyncScope<'scope, LocalStorage, RcOwnership, M> {
         F: Future<Output = T> + 'scope,
     {
         self.spawn_boxed_local(future)
-    }
-}
-
-pub struct JoinHandle<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>> {
-    pub(crate) task: R,
-    pub(crate) gate: NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>,
-    pub(crate) scope: &'scope_ref S,
-    pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
-    pub(crate) waker_node: Option<NonNull<GenericWakerNode<R::Storage>>>,
-    pub(crate) reclaim: Option<ReclaimFn<'scope, T, S::Arena>>,
-}
-
-unsafe impl<'scope, 'scope_ref, T> Send
-    for JoinHandle<'scope, 'scope_ref, T, SendTaskRef, AsyncScope<'scope>>
-where
-    T: Send + 'scope,
-{
-}
-
-pub type LocalJoinHandle<'scope, 'scope_ref, T> =
-    JoinHandle<'scope, 'scope_ref, T, LocalTaskRef, AsyncScope<'scope>>;
-pub type SendJoinHandle<'scope, 'scope_ref, T> =
-    JoinHandle<'scope, 'scope_ref, T, SendTaskRef, AsyncScope<'scope>>;
-pub type LocalAsyncJoinHandle<'scope, 'scope_ref, T> =
-    JoinHandle<'scope, 'scope_ref, T, LocalTaskRef, LocalAsyncScope<'scope>>;
-
-impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>>
-    JoinHandle<'scope, 'scope_ref, T, R, S>
-{
-    pub fn cancel(&self) {
-        let mut cancel_slot = self.cancel_token.lock();
-        if let Some(token) = cancel_slot.take() {
-            token.cancel();
-        }
-        self.task.header().cancel();
-    }
-
-    pub fn cancel_token(&self) -> GenericCancellationToken<S::Storage, S::Ownership> {
-        {
-            let cancel_slot = self.cancel_token.lock();
-            if let Some(token) = cancel_slot.as_ref() {
-                return token.clone();
-            }
-        }
-
-        let token = self.scope.completion().cancel_token().child();
-        if self.task.header().is_cancelled() {
-            token.cancel();
-        }
-
-        let mut cancel_slot = self.cancel_token.lock();
-        if let Some(existing) = cancel_slot.as_ref() {
-            existing.clone()
-        } else {
-            cancel_slot.replace(token.clone());
-            token
-        }
-    }
-}
-
-impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> Future
-    for JoinHandle<'scope, 'scope_ref, T, R, S>
-{
-    type Output = Result<T, TaskError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.scope
-            .runtime()
-            .drive_worker(Some(self.scope.completion()));
-
-        if self.task.header().is_completed() {
-            let res = unsafe { self.gate.as_ref().take_result_erased() }
-                .expect("task result already taken");
-            if let Some(reclaim) = self.reclaim {
-                unsafe { (reclaim)(self.scope.arena(), self.gate) };
-            }
-            return Poll::Ready(res);
-        }
-        if self.scope.completion().is_cancelled() || self.task.header().is_cancelled() {
-            return Poll::Ready(Err(TaskError::Cancelled));
-        }
-
-        let this = unsafe { self.get_unchecked_mut() };
-        let header = this.task.header();
-        if let Some(mut node_ptr) = this.waker_node {
-            let node = unsafe { node_ptr.as_mut() };
-            if !node.waker.will_wake(cx.waker()) {
-                node.waker = cx.waker().clone();
-                unsafe { header.register_completion(node_ptr.as_ptr()) };
-            }
-        } else {
-            let node_ptr = unsafe {
-                this.scope.arena().alloc_raw(
-                    std::alloc::Layout::new::<GenericWakerNode<R::Storage>>(),
-                    Some(|ptr| std::ptr::drop_in_place(ptr as *mut GenericWakerNode<R::Storage>)),
-                ) as *mut GenericWakerNode<R::Storage>
-            };
-            unsafe {
-                std::ptr::write(
-                    node_ptr,
-                    GenericWakerNode {
-                        waker: cx.waker().clone(),
-                        link: Link::new(),
-                        _marker: std::marker::PhantomData,
-                    },
-                );
-            }
-            this.waker_node = NonNull::new(node_ptr);
-            unsafe { header.register_completion(node_ptr) };
-        }
-        Poll::Pending
-    }
-}
-
-impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>> Drop
-    for JoinHandle<'scope, 'scope_ref, T, R, S>
-{
-    fn drop(&mut self) {
-        if let Some(node_ptr) = self.waker_node {
-            let header = self.task.header();
-            if !header.is_completed() {
-                let mut wakers = header.wakers.lock();
-                if unsafe { node_ptr.as_ref().link.is_linked() } {
-                    unsafe {
-                        let mut cursor = wakers.cursor_mut_from_ptr(node_ptr);
-                        cursor.remove();
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub struct RoutedJoinHandle<'scope, 'scope_ref, M, T> {
-    scope: &'scope_ref GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M>,
-    state: Arc<RoutedSpawnState>,
-    task: Option<SendTaskRef>,
-    node_ptr: Option<usize>,
-    take_result: Option<PinnedTakeResultFn>,
-    reclaim: Option<PinnedReclaimFn>,
-    cancel_token: CancelTokenSlot<AtomicStorage, ArcOwnership>,
-    waker_node: Option<NonNull<GenericWakerNode<AtomicStorage>>>,
-    _marker: std::marker::PhantomData<T>,
-}
-
-impl<'scope, 'scope_ref, M, T> RoutedJoinHandle<'scope, 'scope_ref, M, T> {
-    fn new(
-        scope: &'scope_ref GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M>,
-        state: Arc<RoutedSpawnState>,
-    ) -> Self {
-        Self {
-            scope,
-            state,
-            task: None,
-            node_ptr: None,
-            take_result: None,
-            reclaim: None,
-            cancel_token: new_cancel_slot::<AtomicStorage, ArcOwnership>(),
-            waker_node: None,
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<'scope, 'scope_ref, M, T> RoutedJoinHandle<'scope, 'scope_ref, M, T>
-where
-    T: Send + 'scope,
-{
-    pub fn cancel(&self) {
-        self.state.request_cancel();
-
-        if let Some(task) = self.task {
-            task.header().cancel();
-            return;
-        }
-
-        let outcome = self
-            .state
-            .outcome
-            .lock()
-            .expect("routed spawn state poisoned");
-        if let RoutedSpawnOutcome::Ready(ready) = &*outcome {
-            ready.task.header().cancel();
-        }
-    }
-
-    pub fn cancel_token(&self) -> GenericCancellationToken<AtomicStorage, ArcOwnership> {
-        {
-            let cancel_slot = self.cancel_token.lock();
-            if let Some(token) = cancel_slot.as_ref() {
-                return token.clone();
-            }
-        }
-
-        let token = self.scope.completion().cancel_token().child();
-        if let Some(task) = self.task
-            && task.header().is_cancelled()
-        {
-            token.cancel();
-        }
-
-        let mut cancel_slot = self.cancel_token.lock();
-        if let Some(existing) = cancel_slot.as_ref() {
-            existing.clone()
-        } else {
-            cancel_slot.replace(token.clone());
-            token
-        }
-    }
-
-    fn install_ready(&mut self, ready: RoutedSpawnReady) {
-        self.task = Some(ready.task);
-        self.node_ptr = Some(ready.node_ptr);
-        self.take_result = Some(ready.take_result);
-        self.reclaim = Some(ready.reclaim);
-    }
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<T, TaskError>> {
-        let task = self.task.expect("routed spawn task missing");
-        self.scope
-            .runtime()
-            .drive_worker(Some(self.scope.completion()));
-
-        if task.header().is_completed() {
-            let node_ptr = self.node_ptr.expect("routed spawn node pointer missing");
-            let take_result = self.take_result.expect("routed spawn take_result missing");
-            let mut result = std::mem::MaybeUninit::<Result<T, TaskError>>::uninit();
-            unsafe {
-                take_result(node_ptr as *const (), result.as_mut_ptr() as *mut ());
-            }
-            let res = unsafe { result.assume_init() };
-            if let Some(reclaim) = self.reclaim.take() {
-                unsafe { reclaim(self.scope.arena(), node_ptr as *mut ()) };
-            }
-            return Poll::Ready(res);
-        }
-        if self.scope.completion().is_cancelled() || task.header().is_cancelled() {
-            return Poll::Ready(Err(TaskError::Cancelled));
-        }
-
-        let header = task.header();
-        if let Some(mut node_ptr) = self.waker_node {
-            let node = unsafe { node_ptr.as_mut() };
-            if !node.waker.will_wake(cx.waker()) {
-                node.waker = cx.waker().clone();
-                unsafe { header.register_completion(node_ptr.as_ptr()) };
-            }
-        } else {
-            let node_ptr = unsafe {
-                self.scope.arena().alloc_raw(
-                    std::alloc::Layout::new::<GenericWakerNode<AtomicStorage>>(),
-                    Some(|ptr| {
-                        std::ptr::drop_in_place(ptr as *mut GenericWakerNode<AtomicStorage>)
-                    }),
-                ) as *mut GenericWakerNode<AtomicStorage>
-            };
-            unsafe {
-                std::ptr::write(
-                    node_ptr,
-                    GenericWakerNode {
-                        waker: cx.waker().clone(),
-                        link: Link::new(),
-                        _marker: std::marker::PhantomData,
-                    },
-                );
-            }
-            self.waker_node = NonNull::new(node_ptr);
-            unsafe { header.register_completion(node_ptr) };
-        }
-        Poll::Pending
-    }
-}
-
-impl<'scope, 'scope_ref, M, T: Send + 'scope> Future
-    for RoutedJoinHandle<'scope, 'scope_ref, M, T>
-{
-    type Output = Result<T, TaskError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-
-        if this.task.is_some() {
-            return this.poll_ready(cx);
-        }
-
-        this.scope
-            .runtime()
-            .drive_worker(Some(this.scope.completion()));
-
-        match this.state.try_take_ready() {
-            Ok(Some(ready)) => {
-                this.install_ready(ready);
-                this.poll_ready(cx)
-            }
-            Ok(None) => {
-                this.state.register(cx.waker());
-                match this.state.try_take_ready() {
-                    Ok(Some(ready)) => {
-                        this.install_ready(ready);
-                        this.poll_ready(cx)
-                    }
-                    Ok(None) => Poll::Pending,
-                    Err(err) => Poll::Ready(Err(err)),
-                }
-            }
-            Err(err) => Poll::Ready(Err(err)),
-        }
-    }
-}
-
-impl<'scope, 'scope_ref, M, T> Drop for RoutedJoinHandle<'scope, 'scope_ref, M, T> {
-    fn drop(&mut self) {
-        if let Some(node_ptr) = self.waker_node
-            && let Some(task) = self.task
-        {
-            let header = task.header();
-            if !header.is_completed() {
-                let mut wakers = header.wakers.lock();
-                if unsafe { node_ptr.as_ref().link.is_linked() } {
-                    unsafe {
-                        let mut cursor = wakers.cursor_mut_from_ptr(node_ptr);
-                        cursor.remove();
-                    }
-                }
-            }
-        }
     }
 }
 

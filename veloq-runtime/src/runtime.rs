@@ -295,7 +295,7 @@ where
             thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
         });
-        let components = RuntimeShared::new(count, self.queue_capacity);
+        let components = shared::RuntimeSharedComponents::new(count, self.queue_capacity);
         let shared = Arc::new(components.shared);
         Runtime {
             shared,

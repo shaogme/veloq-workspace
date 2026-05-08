@@ -365,11 +365,8 @@ pub(crate) struct RuntimeSharedComponents {
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
 }
 
-impl RuntimeShared {
-    pub(crate) fn new(
-        worker_count: NonZeroUsize,
-        queue_capacity: NonZeroUsize,
-    ) -> RuntimeSharedComponents {
+impl RuntimeSharedComponents {
+    pub(crate) fn new(worker_count: NonZeroUsize, queue_capacity: NonZeroUsize) -> Self {
         let worker_count_val = worker_count.get();
         let mut unparkers = Vec::with_capacity(worker_count_val);
         let mut parker_inners = Vec::with_capacity(worker_count_val);
@@ -433,8 +430,8 @@ impl RuntimeShared {
             }
         }
 
-        RuntimeSharedComponents {
-            shared: Self {
+        Self {
+            shared: RuntimeShared {
                 registry: WorkerRegistry {
                     workers,
                     unparkers,
@@ -461,7 +458,9 @@ impl RuntimeShared {
             pinned_receivers,
         }
     }
+}
 
+impl RuntimeShared {
     pub fn choose_worker(&self) -> usize {
         self.topo.choose_worker(&self.scheduler.next_worker)
     }

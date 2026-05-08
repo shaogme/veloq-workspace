@@ -89,6 +89,9 @@ impl RuntimeContextExt for Context<'_> {
 pub trait TaskHandleRef: Copy + Send {
     type Storage: Storage;
     fn header(&self) -> &GenericTaskHeader<Self::Storage>;
+    /// # Safety
+    /// The `header` pointer must be a valid pointer to a `GenericTaskHeader`.
+    unsafe fn from_header(header: *const GenericTaskHeader<Self::Storage>) -> Self;
 }
 
 pub trait RawTask {
@@ -343,6 +346,10 @@ macro_rules! define_task_infrastructure {
             #[inline]
             fn header(&self) -> &GenericTaskHeader<$storage> {
                 unsafe { &*self.header }
+            }
+            #[inline]
+            unsafe fn from_header(header: *const GenericTaskHeader<$storage>) -> Self {
+                Self { header }
             }
         }
     };
