@@ -58,7 +58,7 @@ mod flavor {
         }
     }
 
-    pub trait ChannelFlavor: Send + Sync + 'static {
+    pub trait ChannelFlavor: Send + Sync {
         fn new() -> Self;
         fn release(&self);
         fn register_send_wait(

@@ -223,7 +223,7 @@ impl BufferRegistrar for NoopRegistrar {
 /// Memory pool implementation providing raw memory allocation.
 /// This trait manages memory layout, allocation algorithms, and deallocation.
 /// It does NOT handle driver registration.
-pub trait BackingPool: std::fmt::Debug + 'static {
+pub trait BackingPool: std::fmt::Debug {
     /// Allocate memory without registration context.
     /// Returns allocation result containing ptr, capacity, and header context.
     /// The `global_index` in the result should be ignored or None.
@@ -238,7 +238,7 @@ pub trait BackingPool: std::fmt::Debug + 'static {
 
 /// High-level Buffer Pool trait.
 /// Represents a pool that is ready for I/O operations (registered if necessary).
-pub trait BufPool: std::fmt::Debug + 'static {
+pub trait BufPool: std::fmt::Debug {
     /// Allocate a buffer ready for I/O.
     fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf>;
 }
@@ -251,11 +251,11 @@ pub trait BufPool: std::fmt::Debug + 'static {
 /// - Shared Global Pools (e.g., `UniformSlot`)
 /// - Independent Per-Thread Pools
 /// - Hybrid approaches
-pub trait PoolTopology: Clone + Send + Sync + 'static {
+pub trait PoolTopology: Clone + Send + Sync {
     /// Shared state initialized once at startup.
     /// This is passed to every worker during pool construction.
     /// Must be `Clone` (shared via `Arc` or `&'static`) and thread-safe.
-    type State: Clone + Send + Sync + 'static;
+    type State: Clone + Send + Sync;
 
     /// Initialize the global/shared state.
     /// Called once by the Runtime Builder.
@@ -623,7 +623,7 @@ pub struct AnyBufPool {
 
 impl AnyBufPool {
     /// 从任意实现了 `BufPool + Clone` 的类型构造 `AnyBufPool`。
-    pub fn new<P: BufPool + Clone + 'static>(pool: P) -> Self {
+    pub fn new<P: BufPool + Clone>(pool: P) -> Self {
         // Size of the storage in bytes
         const STORAGE_SIZE: usize = std::mem::size_of::<[usize; 3]>();
 
@@ -631,7 +631,7 @@ impl AnyBufPool {
         let is_inline = std::mem::size_of::<P>() <= STORAGE_SIZE
             && std::mem::align_of::<P>() <= std::mem::align_of::<usize>();
 
-        unsafe fn alloc_shim<P: BufPool + Clone + 'static>(
+        unsafe fn alloc_shim<P: BufPool + Clone>(
             ptr: *const u8,
             size: NonZeroUsize,
         ) -> Option<FixedBuf> {
@@ -647,7 +647,7 @@ impl AnyBufPool {
             }
         }
 
-        unsafe fn clone_shim<P: BufPool + Clone + 'static>(ptr: *const u8) -> AnyBufPool {
+        unsafe fn clone_shim<P: BufPool + Clone>(ptr: *const u8) -> AnyBufPool {
             const STORAGE_SIZE: usize = std::mem::size_of::<[usize; 3]>();
             if std::mem::size_of::<P>() <= STORAGE_SIZE
                 && std::mem::align_of::<P>() <= std::mem::align_of::<usize>()
@@ -660,7 +660,7 @@ impl AnyBufPool {
             }
         }
 
-        unsafe fn drop_shim<P: BufPool + Clone + 'static>(ptr: *mut u8) {
+        unsafe fn drop_shim<P: BufPool + Clone>(ptr: *mut u8) {
             const STORAGE_SIZE: usize = std::mem::size_of::<[usize; 3]>();
             if std::mem::size_of::<P>() <= STORAGE_SIZE
                 && std::mem::align_of::<P>() <= std::mem::align_of::<usize>()
@@ -673,7 +673,7 @@ impl AnyBufPool {
             }
         }
 
-        unsafe fn fmt_shim<P: BufPool + Clone + 'static>(
+        unsafe fn fmt_shim<P: BufPool + Clone>(
             ptr: *const u8,
             f: &mut std::fmt::Formatter<'_>,
         ) -> std::fmt::Result {
@@ -691,7 +691,7 @@ impl AnyBufPool {
 
         struct VTableGen<P>(std::marker::PhantomData<P>);
 
-        impl<P: BufPool + Clone + 'static> VTableGen<P> {
+        impl<P: BufPool + Clone> VTableGen<P> {
             const VTABLE: BufPoolVTable = BufPoolVTable {
                 alloc: alloc_shim::<P>,
                 clone: clone_shim::<P>,

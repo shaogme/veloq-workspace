@@ -9,19 +9,19 @@ pub mod slot;
 pub use raw_handle::{BorrowedRawHandle, OwnedRawHandle, RawHandle, RawHandleKind, RawHandleMeta};
 
 /// Platform-neutral handle trait implemented by driver-defined handle types.
-pub trait Handle: Copy + Send + Sync + 'static {}
+pub trait Handle: Copy + Send + Sync {}
 
-impl<T> Handle for T where T: Copy + Send + Sync + 'static {}
+impl<T> Handle for T where T: Copy + Send + Sync {}
 
 /// Platform-neutral socket address storage trait implemented by driver-defined types.
-pub trait SockAddr: Default + Send + 'static {}
+pub trait SockAddr: Default + Send {}
 
-impl<T> SockAddr for T where T: Default + Send + 'static {}
+impl<T> SockAddr for T where T: Default + Send {}
 
 /// Platform-neutral per-slot sidecar trait implemented by driver-defined types.
-pub trait SlotSidecar: Default + Send + 'static {}
+pub trait SlotSidecar: Default + Send {}
 
-impl<T> SlotSidecar for T where T: Default + Send + 'static {}
+impl<T> SlotSidecar for T where T: Default + Send {}
 
 /// Represents the source of an IO operation as a registered descriptor index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

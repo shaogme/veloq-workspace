@@ -46,13 +46,12 @@ pub use veloq_driver_core::op::{
 
 pub type LocalOp<T> = veloq_driver_core::op::LocalOp<T, PlatformDriver>;
 
-pub trait OpSubmitter: Clone + std::marker::Send + Sync + 'static {
+pub trait OpSubmitter: Clone + std::marker::Send + Sync {
     type Future<
         T: IntoPlatformOp<
                 <PlatformDriver as Driver>::Op,
                 DriverCompletion = <PlatformDriver as Driver>::Completion,
-            > + std::marker::Send
-            + 'static,
+            > + std::marker::Send,
     >: Future<Output = OpResult<T, <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion>>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
@@ -60,8 +59,7 @@ pub trait OpSubmitter: Clone + std::marker::Send + Sync + 'static {
         T: IntoPlatformOp<
                 <PlatformDriver as Driver>::Op,
                 DriverCompletion = <PlatformDriver as Driver>::Completion,
-            > + std::marker::Send
-            + 'static;
+            > + std::marker::Send;
 
     fn from_current_context() -> Self;
 }
@@ -71,8 +69,7 @@ impl OpSubmitter for LocalSubmitter {
         T: IntoPlatformOp<
                 <PlatformDriver as Driver>::Op,
                 DriverCompletion = <PlatformDriver as Driver>::Completion,
-            > + std::marker::Send
-            + 'static,
+            > + std::marker::Send,
     > = LocalOp<T>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> LocalOp<T>
@@ -80,8 +77,7 @@ impl OpSubmitter for LocalSubmitter {
         T: IntoPlatformOp<
                 <PlatformDriver as Driver>::Op,
                 DriverCompletion = <PlatformDriver as Driver>::Completion,
-            > + std::marker::Send
-            + 'static,
+            > + std::marker::Send,
     {
         <LocalSubmitter as veloq_driver_core::op::OpSubmitter<PlatformDriver>>::submit(
             self, op, driver,
@@ -99,8 +95,7 @@ impl OpSubmitter for DetachedSubmitter {
         T: IntoPlatformOp<
                 <PlatformDriver as Driver>::Op,
                 DriverCompletion = <PlatformDriver as Driver>::Completion,
-            > + std::marker::Send
-            + 'static,
+            > + std::marker::Send,
     > = DetachedOp<T, <PlatformDriver as Driver>::Op, <PlatformDriver as Driver>::Completion>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
@@ -108,8 +103,7 @@ impl OpSubmitter for DetachedSubmitter {
         T: IntoPlatformOp<
                 <PlatformDriver as Driver>::Op,
                 DriverCompletion = <PlatformDriver as Driver>::Completion,
-            > + std::marker::Send
-            + 'static,
+            > + std::marker::Send,
     {
         <DetachedSubmitter as veloq_driver_core::op::OpSubmitter<PlatformDriver>>::submit(
             self, op, driver,

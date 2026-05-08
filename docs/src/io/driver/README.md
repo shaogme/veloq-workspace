@@ -76,7 +76,7 @@ veloq-driver/src/
 
 ### 4.1 Driver Trait (`driver.rs`)
 ```rust
-pub trait Driver: 'static {
+pub trait Driver {
     type Op: PlatformOp;
 
     // 核心生命周期

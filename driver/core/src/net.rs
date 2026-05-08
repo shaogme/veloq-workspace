@@ -3,9 +3,9 @@ use diagweave::report::Report;
 use std::net::SocketAddr;
 
 /// 平台套接字抽象，由各 driver 后端提供具体实现。
-pub trait PlatformSocket: Sized + Send + 'static {
+pub trait PlatformSocket: Sized + Send {
     type Handle: crate::RawHandleMeta;
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: std::error::Error + Send + Sync;
 
     fn new_tcp_v4() -> Result<Self, Report<Self::Error>>;
     fn new_tcp_v6() -> Result<Self, Report<Self::Error>>;
@@ -36,8 +36,8 @@ pub trait PlatformSocket: Sized + Send + 'static {
 
 /// 平台地址存储编解码抽象。
 pub trait SocketAddrCodec: SockAddr {
-    type Len: Copy + Send + 'static;
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Len: Copy + Send;
+    type Error: std::error::Error + Send + Sync;
 
     fn to_socket_addr(buf: &[u8]) -> Result<SocketAddr, Report<Self::Error>>;
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len);

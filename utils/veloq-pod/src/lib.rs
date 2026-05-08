@@ -26,7 +26,7 @@ impl std::error::Error for PodError {}
 /// # Safety
 ///
 /// The type must be valid when all its bits are zero.
-pub unsafe trait Zeroable: Copy + 'static {}
+pub unsafe trait Zeroable: Copy {}
 
 /// Trait for Plain Old Data types that can be safely cast to/from byte slices.
 ///

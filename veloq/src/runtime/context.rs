@@ -387,8 +387,8 @@ where
     T: IntoPlatformOp<
             <PlatformDriver as Driver>::Op,
             DriverCompletion = <PlatformDriver as Driver>::Completion,
-        > + Send
-        + 'static,
+        > + Send,
+    <S as OpSubmitter>::Future<T>: 'a,
 {
     let ctx = current();
     ctx.driver_bridge().sync_registrar();
@@ -427,8 +427,7 @@ where
     T: IntoPlatformOp<
             <PlatformDriver as Driver>::Op,
             DriverCompletion = <PlatformDriver as Driver>::Completion,
-        > + Send
-        + 'static,
+        > + Send,
 {
     if veloq_runtime::runtime::current_worker_id() == worker_id {
         let (res, op_back) = submit(&DetachedSubmitter::new(), op).await.into_inner();

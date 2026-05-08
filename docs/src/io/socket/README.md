@@ -47,7 +47,7 @@ src/io/
 
 ### 4.1 `Op<T>` Future (`op.rs`)
 ```rust
-pub struct Op<T: IntoPlatformOp<PlatformDriver> + 'static> {
+pub struct Op<T: IntoPlatformOp<PlatformDriver>> {
     state: State,
     data: Option<T>,
     user_data: usize,

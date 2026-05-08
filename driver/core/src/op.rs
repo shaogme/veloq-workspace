@@ -252,7 +252,7 @@ pub trait OpLifecycle: Sized {
 /// Trait to convert a user-facing operation to a platform-specific driver operation.
 pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     /// User payload detached from kernel op.
-    type UserPayload: std::marker::Send + 'static;
+    type UserPayload: std::marker::Send;
     /// Completion value exposed to caller for this op.
     type Completion;
     /// Raw completion value delivered by the bound driver.
@@ -304,7 +304,7 @@ impl<T> Op<T> {
     /// The operation is submitted synchronously, but completion is awaited asynchronously via the returned future.
     pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Completion>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send,
         D: Driver,
     {
         let data = self.data;
@@ -397,7 +397,7 @@ impl<T> Op<T> {
     /// Returns a `LocalOp` future that resolves when the operation completes.
     pub fn submit_local<D>(self, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion>,
         D: Driver,
     {
         LocalOp::new(self.data, driver)
@@ -498,7 +498,7 @@ enum State {
 pub struct LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion>,
 {
     state: State,
     data: Option<T>,
@@ -510,7 +510,7 @@ where
 impl<T, D> LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion>,
 {
     /// Create a new local operation future.
     pub fn new(data: T, driver: Rc<RefCell<D>>) -> Self {
@@ -527,7 +527,7 @@ where
 impl<T, D> Future for LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion>,
 {
     type Output = OpResult<T, T::Completion>;
 
@@ -677,7 +677,7 @@ where
 impl<T, D> Drop for LocalOp<T, D>
 where
     D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + 'static,
+    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion>,
 {
     fn drop(&mut self) {
         if let State::Submitted = self.state {
@@ -691,16 +691,16 @@ where
 // OpSubmitter Trait
 // ============================================================================
 
-pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
+pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync {
     type Future<
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send,
     >: Future<
         Output = OpResult<T, <T as IntoPlatformOp<D::Op>>::Completion>,
     >;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static;
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send;
 
     fn from_current_context() -> Self;
 }
@@ -713,13 +713,12 @@ pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync + 'static {
 pub struct LocalSubmitter;
 
 impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
-    type Future<
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
-    > = LocalOp<T, D>;
+    type Future<T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send> =
+        LocalOp<T, D>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send,
     {
         trace!("Submitting local op");
         op.submit_local(driver)
@@ -750,13 +749,12 @@ impl Default for DetachedSubmitter {
 }
 
 impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
-    type Future<
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
-    > = DetachedOp<T, D::Op, D::Completion>;
+    type Future<T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send> =
+        DetachedOp<T, D::Op, D::Completion>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send + 'static,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send,
     {
         op.submit_detached(&mut *driver.borrow_mut())
     }

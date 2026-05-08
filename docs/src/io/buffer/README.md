@@ -74,8 +74,8 @@ veloq-buf/src/
 ### 4.1 PoolTopology 抽象 (`buffer.rs`)
 `PoolTopology` 的职责进一步明确为“初始化全局状态”、“为 Worker 建池并注册内存”以及“监听动态扩展”：
 ```rust
-pub trait PoolTopology: Clone + Send + Sync + 'static {
-    type State: Clone + Send + Sync + 'static;
+pub trait PoolTopology: Clone + Send + Sync {
+    type State: Clone + Send + Sync;
     fn init(&self, worker_count: usize) -> std::io::Result<Self::State>;
     fn build(
         &self,

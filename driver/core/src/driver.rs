@@ -18,7 +18,7 @@ pub const CELL_STATE_READY: u8 = 2;
 pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
 
-pub trait PlatformOp: 'static {}
+pub trait PlatformOp {}
 
 pub enum RegisterFd<'a, H: RawHandleMeta> {
     Borrowed(BorrowedRawHandle<'a, H>),
@@ -30,7 +30,7 @@ pub enum DriverControlCommand {
     UnregisterFiles(Vec<IoFd>),
 }
 
-pub trait CompletionValue: Send + 'static {
+pub trait CompletionValue: Send {
     fn from_event_res(res: i32) -> DriverResult<Self>
     where
         Self: Sized;
@@ -116,9 +116,7 @@ pub trait CompletionAccess<R = usize>: Send + Sync {
     fn debug_get_state(&self, idx: usize) -> u8;
 }
 
-impl<Op: PlatformOp, S: SlotSidecar, R: Send + 'static> CompletionAccess<R>
-    for slot::SlotTable<Op, S, R>
-{
+impl<Op: PlatformOp, S: SlotSidecar, R: Send> CompletionAccess<R> for slot::SlotTable<Op, S, R> {
     #[inline]
     fn record_completion_with_data(
         &self,
@@ -531,7 +529,7 @@ pub fn event_res_to_result<R: CompletionValue>(res: i32) -> DriverResult<R> {
     R::from_event_res(res)
 }
 
-pub trait Driver: 'static {
+pub trait Driver {
     type Op: PlatformOp;
     type Raw: RawHandleMeta;
     type Sidecar: SlotSidecar;
