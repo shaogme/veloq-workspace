@@ -1,7 +1,5 @@
 use crate::runtime::{GenericCancellationToken, RuntimeShared};
-use crate::task::{
-    Arena, GenericWakerNode, RawTask, SendTaskRef, Task, TaskError, TaskHandleRef,
-};
+use crate::task::{Arena, GenericWakerNode, RawTask, SendTaskRef, Task, TaskError, TaskHandleRef};
 use crate::utils::storage::{AtomicStorage, StateLock};
 use std::future::Future;
 use std::pin::Pin;
@@ -121,6 +119,49 @@ impl RoutedSpawnState {
     }
 }
 
+pub(crate) fn dispatch_routed<
+    'scope,
+    S: crate::utils::storage::Storage,
+    O: crate::utils::ownership::Ownership,
+    F,
+>(
+    completion: &O::Shared<super::GenericScopeCompletion<S, O>>,
+    state: Arc<RoutedSpawnState>,
+    worker_id: usize,
+    job: F,
+) where
+    O::Shared<super::GenericScopeCompletion<S, O>>: Send + 'static,
+    F: FnOnce() + Send + 'static,
+{
+    let Some(dispatcher) =
+        crate::runtime::with_current_context(|ctx| ctx.worker_route_dispatcher())
+    else {
+        completion.task_done();
+        state.fail(TaskError::Panic);
+        panic!("runtime context not set");
+    };
+
+    let completion_for_job = completion.clone();
+    let state_for_job = state.clone();
+
+    if !dispatcher.dispatch(worker_id, move || {
+        let state_err = state_for_job.clone();
+        let completion_err = completion_for_job.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            job();
+        }));
+
+        if result.is_err() {
+            state_err.fail(TaskError::Panic);
+            completion_err.task_done();
+        }
+    }) {
+        completion.task_done();
+        state.fail(TaskError::Panic);
+        panic!("failed to dispatch routed pinned task");
+    }
+}
+
 pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
     runtime: Arc<RuntimeShared>,
     arena: &crate::task::GenericArena<AtomicStorage>,
@@ -174,7 +215,8 @@ pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
             std::ptr::write(dst as *mut Result<T, TaskError>, res);
         },
         reclaim: |arena, ptr| unsafe {
-            let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'scope, T, Fut>>();
+            let layout =
+                std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'scope, T, Fut>>();
             arena.drop_object_raw(ptr as *mut u8, layout);
         },
     });
@@ -362,27 +404,32 @@ impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> 
             .runtime()
             .drive_worker(Some(this.scope.completion()));
 
-        loop {
-            match &mut this.source {
-                JoinSource::Direct { task, gate } => {
-                    let header = task.header();
-                    if header.is_completed() {
-                        let res = unsafe { gate.as_ref().take_result_erased() }
-                            .expect("task result already taken");
-                        if let Some(reclaim) = this.reclaim {
-                            unsafe { (reclaim)(this.scope.arena(), *gate) };
-                        }
-                        return Poll::Ready(res);
-                    }
+        let arena = this.scope.arena();
+        let completion = this.scope.completion();
+        let waker_node = &mut this.waker_node;
+        let reclaim = this.reclaim;
 
-                    if this.scope.completion().is_cancelled() || header.is_cancelled() {
-                        return Poll::Ready(Err(TaskError::Cancelled));
+        match &mut this.source {
+            JoinSource::Direct { task, gate } => {
+                let header = task.header();
+                if header.is_completed() {
+                    let res = unsafe { gate.as_ref().take_result_erased() }
+                        .expect("task result already taken");
+                    if let Some(reclaim) = reclaim {
+                        unsafe { (reclaim)(arena, *gate) };
                     }
-
-                    Self::register_waker_on(&mut this.waker_node, this.scope.arena(), header, cx);
-                    return Poll::Pending;
+                    return Poll::Ready(res);
                 }
-                JoinSource::Routed { state, resolved } => {
+
+                if completion.is_cancelled() || header.is_cancelled() {
+                    return Poll::Ready(Err(TaskError::Cancelled));
+                }
+
+                Self::register_waker_on(waker_node, arena, header, cx);
+                Poll::Pending
+            }
+            JoinSource::Routed { state, resolved } => {
+                loop {
                     if let Some(res) = resolved {
                         let header = res.task.header();
                         if header.is_completed() {
@@ -395,50 +442,53 @@ impl<'scope, 'scope_ref, T: 'scope, R: TaskHandleRef, S: ScopeProvider<'scope>> 
                                 );
                             }
                             let output = unsafe { result.assume_init() };
-                            unsafe { (res.reclaim)(this.scope.arena(), res.node_ptr as *mut ()) };
+                            unsafe { (res.reclaim)(arena, res.node_ptr as *mut ()) };
                             return Poll::Ready(output);
                         }
 
-                        if this.scope.completion().is_cancelled() || header.is_cancelled() {
+                        if completion.is_cancelled() || header.is_cancelled() {
                             return Poll::Ready(Err(TaskError::Cancelled));
                         }
 
-                        Self::register_waker_on(
-                            &mut this.waker_node,
-                            this.scope.arena(),
-                            header,
-                            cx,
-                        );
+                        Self::register_waker_on(waker_node, arena, header, cx);
                         return Poll::Pending;
                     } else {
                         match state.try_take_ready() {
                             Ok(Some(ready)) => {
                                 *resolved = Some(ResolvedRoutedTask {
                                     task: unsafe {
-                                        R::from_header(ready.task.header()
-                                            as *const crate::task::GenericTaskHeader<AtomicStorage>
-                                            as *const crate::task::GenericTaskHeader<R::Storage>)
+                                        R::from_header(
+                                            ready.task.header()
+                                                as *const crate::task::GenericTaskHeader<
+                                                    AtomicStorage,
+                                                >
+                                                as *const crate::task::GenericTaskHeader<
+                                                    R::Storage,
+                                                >,
+                                        )
                                     },
                                     node_ptr: ready.node_ptr,
                                     take_result: ready.take_result,
                                     reclaim: ready.reclaim,
                                     _marker: std::marker::PhantomData,
                                 });
-                                continue;
+                                // Continue to poll the newly resolved task
                             }
                             Ok(None) => {
                                 state.register(cx.waker());
-                                // 二次检查防止竞态
+                                // Double check to avoid race condition
                                 if let Some(ready) = state.try_take_ready()? {
                                     *resolved = Some(ResolvedRoutedTask {
                                         task: unsafe {
-                                            R::from_header(ready.task.header()
-                                                as *const crate::task::GenericTaskHeader<
-                                                    AtomicStorage,
-                                                >
-                                                as *const crate::task::GenericTaskHeader<
-                                                    R::Storage,
-                                                >)
+                                            R::from_header(
+                                                ready.task.header()
+                                                    as *const crate::task::GenericTaskHeader<
+                                                        AtomicStorage,
+                                                    >
+                                                    as *const crate::task::GenericTaskHeader<
+                                                        R::Storage,
+                                                    >,
+                                            )
                                         },
                                         node_ptr: ready.node_ptr,
                                         take_result: ready.take_result,

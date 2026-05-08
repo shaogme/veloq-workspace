@@ -9,9 +9,7 @@ pub use header::{
     PollStatus, STATE_CANCELLED, STATE_COMPLETED, STATE_POLLING, STATE_QUEUED, STATE_READY,
     STATE_WOKEN, TaskVTable,
 };
-pub use nodes::{
-    LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode,
-};
+pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
     AnyScopeCompletionRef, CURRENT_SCOPE, ErasedCancellationToken, OpaqueScope, OpaqueToken,
     ScopeCompletionRef, ScopeGuard,

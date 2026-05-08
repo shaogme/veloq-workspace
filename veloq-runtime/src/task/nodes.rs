@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, RawWakerVTable};
 
 /// 任务存储特性，用于统一本地和发送任务的存储行为。
-pub trait TaskStorage: Storage + Sized + 'static
+pub trait TaskStorage: Storage + Sized
 where
     ScopeCompletionRef<Self>: IntoAnyScope,
 {
@@ -53,11 +53,7 @@ impl TaskStorage for AtomicStorage {
 /// 任务约束特性，用于在编译期区分 Local 和 Send 任务的 Bound。
 pub trait TaskBounds<T, F> {}
 impl<T, F> TaskBounds<T, F> for LocalStorage {}
-impl<T, F> TaskBounds<T, F> for AtomicStorage
-where
-    T: Send,
-{
-}
+impl<T, F> TaskBounds<T, F> for AtomicStorage where T: Send {}
 
 /// 任务状态枚举，合并了运行中的 Future 和完成后的 Result。
 /// 这种设计减少了锁的层数，并允许 Future 和 Result 共享内存空间。
@@ -219,4 +215,3 @@ pub type SendTaskNode<'scope, 'future, T, F> =
 
 /// 堆上/拥有所有权的 Send 任务。
 pub type SendBoxedTaskNode<'scope, T, F> = GenericTaskNode<'scope, AtomicStorage, T, F>;
-

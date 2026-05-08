@@ -42,10 +42,14 @@ impl WorkerRouteDispatcher {
     where
         F: FnOnce() + Send + 'static,
     {
+        self.dispatch_job(worker_id, Box::new(job))
+    }
+
+    pub(crate) fn dispatch_job(&self, worker_id: usize, job: WorkerRouteJob) -> bool {
         let Some(sender) = self.senders.get(worker_id) else {
             return false;
         };
-        if sender.send(Box::new(job)).is_err() {
+        if sender.send(job).is_err() {
             return false;
         }
         context::wake_worker(worker_id);

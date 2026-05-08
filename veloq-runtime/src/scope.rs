@@ -1,6 +1,5 @@
 use crate::runtime::{
-    GenericCancellationToken, RuntimeShared, current_worker_id, with_current_context,
-    with_current_runtime,
+    GenericCancellationToken, RuntimeShared, current_worker_id, with_current_runtime,
 };
 use crate::task::{
     Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef, SendTask, SendTaskRef, Task,
@@ -326,21 +325,16 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let state = self::join::RoutedSpawnState::new();
         self.completion.add_task();
 
-        let Some(dispatcher) = with_current_context(|ctx| ctx.worker_route_dispatcher()) else {
-            self.completion.task_done();
-            panic!("runtime context not set");
-        };
-
         let runtime = self.runtime.clone();
         let completion = self.completion.clone();
         let task_ptr = task as *const S_ as usize;
         let state_for_job = state.clone();
 
-        if !dispatcher.dispatch(worker_id, move || {
-            let state_for_err = state_for_job.clone();
-            let completion_for_err = completion.clone();
-
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        self::join::dispatch_routed::<AtomicStorage, ArcOwnership, _>(
+            &self.completion,
+            state.clone(),
+            worker_id,
+            move || {
                 if state_for_job.is_cancel_requested() {
                     state_for_job.fail(TaskError::Cancelled);
                     completion.task_done();
@@ -349,7 +343,8 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
                 let task = unsafe { &*(task_ptr as *const S_) };
                 task.header().set_pinned();
-                task.header().set_runtime_info(Arc::as_ptr(&runtime), worker_id);
+                task.header()
+                    .set_runtime_info(Arc::as_ptr(&runtime), worker_id);
                 task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(completion.clone()));
 
                 let task_ref = unsafe { SendTaskRef::from_concrete(task) };
@@ -369,16 +364,8 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
                     },
                     reclaim: |_, _| {},
                 });
-            }));
-
-            if result.is_err() {
-                state_for_err.fail(TaskError::Panic);
-                completion_for_err.task_done();
-            }
-        }) {
-            self.completion.task_done();
-            panic!("failed to dispatch routed pinned task");
-        }
+            },
+        );
 
         JoinHandle::new_routed(self, state)
     }
@@ -460,11 +447,6 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let state = self::join::RoutedSpawnState::new();
         self.completion.add_task();
 
-        let Some(dispatcher) = with_current_context(|ctx| ctx.worker_route_dispatcher()) else {
-            self.completion.task_done();
-            panic!("runtime context not set");
-        };
-
         let runtime = self.runtime.clone();
         let completion = self.completion.clone();
         let arena_addr = &self.arena as *const _ as usize;
@@ -482,12 +464,12 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
         let job_addr = job_ptr as usize;
 
-        if !dispatcher.dispatch(worker_id, move || {
-            let arena = unsafe { &*(arena_addr as *const GenericArena<AtomicStorage>) };
-            let state_for_err = state_for_job.clone();
-            let completion_for_err = completion.clone();
-
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        self::join::dispatch_routed::<AtomicStorage, ArcOwnership, _>(
+            &self.completion,
+            state.clone(),
+            worker_id,
+            move || {
+                let arena = unsafe { &*(arena_addr as *const GenericArena<AtomicStorage>) };
                 if state_for_job.is_cancel_requested() {
                     unsafe { arena.drop_object_raw(job_addr as *mut u8, job_layout) };
                     state_for_job.fail(TaskError::Cancelled);
@@ -516,17 +498,8 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
                     state_for_job,
                     future,
                 );
-            }));
-
-            if result.is_err() {
-                state_for_err.fail(TaskError::Panic);
-                completion_for_err.task_done();
-            }
-        }) {
-            unsafe { self.arena.drop_object_raw(job_ptr as *mut u8, job_layout) };
-            self.completion.task_done();
-            panic!("failed to dispatch routed pinned task");
-        }
+            },
+        );
 
         JoinHandle::new_routed(self, state)
     }

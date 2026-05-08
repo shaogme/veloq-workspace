@@ -34,7 +34,7 @@ pub struct GenericWakerNode<S: Storage> {
 
 intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
 
-pub struct GenericTaskHeader<S: Storage + 'static> {
+pub struct GenericTaskHeader<S: Storage> {
     pub(crate) state: S::Usize,
     pub(crate) wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     pub(crate) scope_ptr: S::OptionPtr<OpaqueScope>,
@@ -45,7 +45,7 @@ pub struct GenericTaskHeader<S: Storage + 'static> {
     pub(crate) vtable: &'static TaskVTable<S>,
 }
 
-impl<S: Storage + 'static> GenericTaskHeader<S> {
+impl<S: Storage> GenericTaskHeader<S> {
     pub fn new(vtable: &'static TaskVTable<S>) -> Self {
         Self {
             state: S::Usize::new(0),
