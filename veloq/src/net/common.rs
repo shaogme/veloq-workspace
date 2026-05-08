@@ -5,10 +5,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
-use veloq_driver::driver::DriverControlCommand;
-use veloq_driver::driver::{Driver, RegisterFd};
-use veloq_driver::op::IoFd;
-use veloq_driver::{OwnedRawHandle, RawHandle};
+use veloq_driver_native::driver::DriverControlCommand;
+use veloq_driver_native::driver::{Driver, RegisterFd};
+use veloq_driver_native::op::IoFd;
+use veloq_driver_native::{OwnedRawHandle, RawHandle};
 
 // ============================================================================
 // SocketToken + InnerSocket (RAII Wrapper)

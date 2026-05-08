@@ -7,8 +7,8 @@ use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::runtime::context::{submit, submit_to};
 use veloq_buf::FixedBuf;
-use veloq_driver::Socket;
-use veloq_driver::op::{
+use veloq_driver_native::Socket;
+use veloq_driver_native::op::{
     Accept, Connect, DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, Recv, Send as OpSend,
 };
 
@@ -78,8 +78,8 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpListener<S, P> {
     async fn accept_direct(&self) -> VeloqResult<(GenericTcpStream<S, P>, SocketAddr)> {
         let op = Accept {
             fd: self.inner.fd(),
-            addr: veloq_driver::SockAddrStorage::default(),
-            addr_len: std::mem::size_of::<veloq_driver::SockAddrStorage>() as u32,
+            addr: veloq_driver_native::SockAddrStorage::default(),
+            addr_len: std::mem::size_of::<veloq_driver_native::SockAddrStorage>() as u32,
             remote_addr: None,
         };
 
@@ -115,7 +115,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericTcpStream<S, P> {
         submitter: S,
         addr: SocketAddr,
     ) -> VeloqResult<Self> {
-        let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = Connect {
             fd: inner.fd(),
@@ -189,8 +189,8 @@ impl TcpListener {
         let owner = self.inner.owner_worker_id();
         let op = Accept {
             fd: self.inner.fd(),
-            addr: veloq_driver::SockAddrStorage::default(),
-            addr_len: std::mem::size_of::<veloq_driver::SockAddrStorage>() as u32,
+            addr: veloq_driver_native::SockAddrStorage::default(),
+            addr_len: std::mem::size_of::<veloq_driver_native::SockAddrStorage>() as u32,
             remote_addr: None,
         };
 

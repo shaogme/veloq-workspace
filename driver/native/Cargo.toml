@@ -1,5 +1,5 @@
 [package]
-name = "veloq-driver"
+name = "veloq-driver-native"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -2,12 +2,12 @@ use super::open_options::OpenOptions;
 use crate::runtime::context::submit;
 
 use veloq_buf::FixedBuf;
-use veloq_driver::driver::Driver;
-use veloq_driver::op::{
+use veloq_driver_native::driver::Driver;
+use veloq_driver_native::op::{
     DetachedSubmitter, Fallocate, FileFallocateRaw, FileFsyncRaw, FileReadRaw,
     FileSyncFileRangeRaw, FileWriteRaw, Fsync, IoFd, LocalSubmitter, Op, ReadFixed, WriteFixed,
 };
-use veloq_driver::{RawHandle, RawHandleKind};
+use veloq_driver_native::{RawHandle, RawHandleKind};
 
 use std::cell::Cell;
 use std::future::{Future, IntoFuture};
@@ -40,7 +40,7 @@ fn close_raw_handle(raw: RawHandle) {
             windows_sys::Win32::Foundation::CloseHandle(raw.raw().as_handle());
         },
         RawHandleKind::Socket => {
-            let _ = unsafe { veloq_driver::Socket::from_raw(raw.raw()) };
+            let _ = unsafe { veloq_driver_native::Socket::from_raw(raw.raw()) };
         }
     }
 }

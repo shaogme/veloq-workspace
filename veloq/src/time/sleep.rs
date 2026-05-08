@@ -4,8 +4,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use veloq_driver::driver::{Driver, PlatformDriver};
-use veloq_driver::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
+use veloq_driver_native::driver::{Driver, PlatformDriver};
+use veloq_driver_native::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
 
 // ============================================================================
 // Sync/Send Sleep (uses DetachedOp)

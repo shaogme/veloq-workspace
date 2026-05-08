@@ -13,12 +13,12 @@ readme.workspace = true
 
 [features]
 default = []
-test-hooks = ["veloq-driver/test-hooks"]
+test-hooks = ["veloq-driver-native/test-hooks"]
 
 [dependencies]
 veloq-runtime.workspace = true
 veloq-buf.workspace = true
-veloq-driver.workspace = true
+veloq-driver-native.workspace = true
 veloq-blocking.workspace = true
 veloq-sync.workspace = true
 veloq-local.workspace = true
@@ -33,7 +33,6 @@ libc.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
-veloq-driver = { workspace = true, features = ["test-hooks"] }
 criterion.workspace = true
 futures-util.workspace = true
 

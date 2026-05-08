@@ -6,8 +6,8 @@ use std::sync::mpsc;
 use std::task::Poll;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_driver::driver::{DriveMode, Driver, DriverControlCommand, PlatformDriver};
-use veloq_driver::op::{DetachedSubmitter, IntoPlatformOp, Op, OpSubmitter};
+use veloq_driver_native::driver::{DriveMode, Driver, DriverControlCommand, PlatformDriver};
+use veloq_driver_native::op::{DetachedSubmitter, IntoPlatformOp, Op, OpSubmitter};
 
 use crate::config::{BufferRegistrationMode, Config};
 use crate::error::{Result as VeloqResult, from_io_error};
@@ -419,7 +419,7 @@ pub async fn submit_to<T>(
 ) -> VeloqResult<(
     Result<
         <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion,
-        veloq_driver::error::DriverErrorReport,
+        veloq_driver_native::error::DriverErrorReport,
     >,
     T,
 )>

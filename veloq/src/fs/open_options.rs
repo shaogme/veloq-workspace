@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
-use veloq_driver::driver::{Driver, RegisterFd};
-use veloq_driver::op::Open;
+use veloq_driver_native::driver::{Driver, RegisterFd};
+use veloq_driver_native::op::Open;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferingMode {
@@ -96,7 +96,7 @@ impl OpenOptions {
     pub async fn open_local(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::LocalFile> {
         let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
         use crate::runtime::context::submit;
-        use veloq_driver::op::{LocalSubmitter, Op};
+        use veloq_driver_native::op::{LocalSubmitter, Op};
 
         let submitter = LocalSubmitter;
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
@@ -125,7 +125,7 @@ impl OpenOptions {
     pub async fn open(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::File> {
         let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
         use crate::runtime::context::submit;
-        use veloq_driver::op::{DetachedSubmitter, Op};
+        use veloq_driver_native::op::{DetachedSubmitter, Op};
 
         let submitter = DetachedSubmitter::new();
         let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();

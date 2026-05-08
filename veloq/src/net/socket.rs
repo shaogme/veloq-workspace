@@ -2,8 +2,8 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
-use veloq_driver::Socket;
-use veloq_driver::op::DetachedSubmitter;
+use veloq_driver_native::Socket;
+use veloq_driver_native::op::DetachedSubmitter;
 use veloq_runtime::runtime::current_worker_id;
 
 use crate::net::common::InnerSocket;

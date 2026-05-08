@@ -5,7 +5,7 @@ use veloq::runtime::{Runtime, context, scope};
 use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 #[cfg(feature = "test-hooks")]
-use veloq_driver::driver::test_hooks::DriverTestHooks;
+use veloq_driver_native::driver::test_hooks::DriverTestHooks;
 
 fn build_runtime(worker_threads: usize, mode: BufferRegistrationMode) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))

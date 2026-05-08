@@ -8,9 +8,9 @@ use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::runtime::context::{submit, submit_to};
 use veloq_buf::FixedBuf;
-use veloq_driver::Socket;
-use veloq_driver::driver::Driver;
-use veloq_driver::op::{
+use veloq_driver_native::Socket;
+use veloq_driver_native::driver::Driver;
+use veloq_driver_native::op::{
     DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpConnect, UdpRecv as OpUdpRecv,
     UdpRecvPacket, UdpRecvStream, UdpSend as OpUdpSend,
 };
@@ -126,7 +126,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
     }
 
     async fn connect_direct(&self, addr: SocketAddr) -> VeloqResult<()> {
-        let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = UdpConnect {
             fd: self.inner.fd(),
@@ -279,7 +279,7 @@ impl UdpSocket {
 
     pub async fn connect(&self, addr: SocketAddr) -> VeloqResult<()> {
         let owner = self.inner.owner_worker_id();
-        let (raw_addr, raw_addr_len) = veloq_driver::socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = UdpConnect {
             fd: self.inner.fd(),

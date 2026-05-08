@@ -10,7 +10,7 @@ use std::sync::{Arc, mpsc};
 
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
-use veloq_driver::driver::{Driver, PlatformDriver};
+use veloq_driver_native::driver::{Driver, PlatformDriver};
 use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
 
 use crate::config::Config;
