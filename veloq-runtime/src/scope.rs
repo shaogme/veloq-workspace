@@ -478,7 +478,8 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
             ) as *mut self::join::RoutedJobCell<'scope, F>
         };
         unsafe { std::ptr::write(job_ptr, self::join::RoutedJobCell::new(job)) };
-        let job_ptr = SendPtr::new(unsafe { NonNull::new_unchecked(job_ptr) });
+        let mut job_ptr: SendPtr<self::join::RoutedJobCell<'scope, F>> =
+            SendPtr::new(unsafe { NonNull::new_unchecked(job_ptr) });
 
         self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _>(
             &self.completion,
@@ -493,7 +494,6 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
                     return;
                 }
 
-                let mut job_ptr = job_ptr;
                 let job = unsafe { job_ptr.as_mut().take() };
                 let future = job();
 
