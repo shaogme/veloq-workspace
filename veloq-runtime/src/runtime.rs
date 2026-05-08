@@ -25,7 +25,6 @@ pub use primitives::{
 };
 
 pub use context::WorkerTickHook;
-pub(crate) use context::with_current_context;
 pub(crate) use context::with_current_runtime;
 pub use context::{
     IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, WorkerInitContext,
@@ -156,12 +155,20 @@ where
                         rand: RefCell::new(FastRand::new(worker_id as u64)),
                         idle_hook,
                         worker_tick_hook,
-                        worker_route_dispatcher: route_dispatcher,
                     });
                     let _clear_context = ClearContext;
+                    let route_state =
+                        route::WorkerRouteState::new(route_rx, route_dispatcher.clone());
+                    route::init_worker_route_state(&route_state);
+                    struct ClearRouteState;
+                    impl Drop for ClearRouteState {
+                        fn drop(&mut self) {
+                            route::clear_worker_route_state();
+                        }
+                    }
+                    let _clear_route_state = ClearRouteState;
 
                     let init_ctx = WorkerInitContext::new(worker_id, worker_count);
-                    route::init_worker_route_state(route_rx);
                     let init_fut = std::pin::pin!(worker_init(init_ctx));
                     runtime.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(
                         None,
@@ -190,9 +197,17 @@ where
                 rand: RefCell::new(FastRand::new(0)),
                 idle_hook,
                 worker_tick_hook,
-                worker_route_dispatcher: route_dispatcher,
             });
             let _clear_context = ClearContext;
+            let route_state = route::WorkerRouteState::new(route_rx0, route_dispatcher.clone());
+            route::init_worker_route_state(&route_state);
+            struct ClearRouteState;
+            impl Drop for ClearRouteState {
+                fn drop(&mut self) {
+                    route::clear_worker_route_state();
+                }
+            }
+            let _clear_route_state = ClearRouteState;
 
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());
@@ -201,7 +216,6 @@ where
             let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
 
             let init_ctx = WorkerInitContext::new(0, worker_count);
-            route::init_worker_route_state(route_rx0);
             let init_fut = std::pin::pin!(worker_init(init_ctx));
             shared.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(None, Some(init_fut));
 

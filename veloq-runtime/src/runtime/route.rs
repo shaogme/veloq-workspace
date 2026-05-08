@@ -11,28 +11,28 @@ use veloq_atomic_waker::AtomicWaker;
 
 use super::context;
 
-pub trait WorkerJob: Send {
+pub trait WorkerJob<'scope>: Send {
     fn execute(self: Box<Self>);
 }
 
-impl<F> WorkerJob for F
+impl<'scope, F> WorkerJob<'scope> for F
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce() + Send + 'scope,
 {
     fn execute(self: Box<Self>) {
         (*self)();
     }
 }
 
-pub(crate) type WorkerRouteJob = Box<dyn WorkerJob>;
+pub(crate) type WorkerRouteJob<'scope> = Box<dyn WorkerJob<'scope> + Send + 'scope>;
 
 #[derive(Clone)]
-pub(crate) struct WorkerRouteDispatcher {
-    senders: Arc<Vec<mpsc::Sender<WorkerRouteJob>>>,
+pub(crate) struct WorkerRouteDispatcher<'scope> {
+    senders: Arc<Vec<mpsc::Sender<WorkerRouteJob<'scope>>>>,
 }
 
-impl WorkerRouteDispatcher {
-    pub(crate) fn new(senders: Vec<mpsc::Sender<WorkerRouteJob>>) -> Self {
+impl<'scope> WorkerRouteDispatcher<'scope> {
+    pub(crate) fn new(senders: Vec<mpsc::Sender<WorkerRouteJob<'scope>>>) -> Self {
         Self {
             senders: Arc::new(senders),
         }
@@ -40,12 +40,12 @@ impl WorkerRouteDispatcher {
 
     pub(crate) fn dispatch<F>(&self, worker_id: usize, job: F) -> bool
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce() + Send + 'scope,
     {
         self.dispatch_job(worker_id, Box::new(job))
     }
 
-    pub(crate) fn dispatch_job(&self, worker_id: usize, job: WorkerRouteJob) -> bool {
+    pub(crate) fn dispatch_job(&self, worker_id: usize, job: WorkerRouteJob<'scope>) -> bool {
         let Some(sender) = self.senders.get(worker_id) else {
             return false;
         };
@@ -57,27 +57,64 @@ impl WorkerRouteDispatcher {
     }
 }
 
-struct WorkerRouteState {
-    receiver: mpsc::Receiver<WorkerRouteJob>,
+pub(crate) struct WorkerRouteState<'scope> {
+    receiver: mpsc::Receiver<WorkerRouteJob<'scope>>,
+    dispatcher: WorkerRouteDispatcher<'scope>,
+}
+
+impl<'scope> WorkerRouteState<'scope> {
+    pub(crate) fn new(
+        receiver: mpsc::Receiver<WorkerRouteJob<'scope>>,
+        dispatcher: WorkerRouteDispatcher<'scope>,
+    ) -> Self {
+        Self {
+            receiver,
+            dispatcher,
+        }
+    }
 }
 
 thread_local! {
-    static ROUTE_STATE: RefCell<Option<WorkerRouteState>> = const { RefCell::new(None) };
+    static ROUTE_STATE: RefCell<Option<std::ptr::NonNull<OpaqueWorkerRouteState>>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn init_worker_route_state(receiver: mpsc::Receiver<WorkerRouteJob>) {
+pub struct OpaqueWorkerRouteState {
+    _private: [u8; 0],
+}
+
+pub(crate) fn init_worker_route_state<'scope>(_state: &WorkerRouteState<'scope>) {
     ROUTE_STATE.with(|state| {
-        *state.borrow_mut() = Some(WorkerRouteState { receiver });
+        *state.borrow_mut() = Some(std::ptr::NonNull::from(_state).cast());
     });
 }
 
-pub(crate) fn drain_pending_worker_route_jobs() {
+pub(crate) fn clear_worker_route_state() {
     ROUTE_STATE.with(|state| {
-        let mut state_opt = state.borrow_mut();
-        let Some(state) = state_opt.as_mut() else {
-            return;
-        };
+        *state.borrow_mut() = None;
+    });
+}
 
+fn with_current_worker_route_state<'scope, R>(
+    f: impl FnOnce(&WorkerRouteState<'scope>) -> R,
+) -> Option<R> {
+    ROUTE_STATE.with(|state| {
+        let ptr = *state.borrow();
+        let ptr = ptr?;
+        let state = unsafe { &*(ptr.as_ptr() as *const WorkerRouteState<'scope>) };
+        Some(f(state))
+    })
+}
+
+pub(crate) fn dispatch_worker_route_job<'scope, F>(worker_id: usize, job: F) -> bool
+where
+    F: FnOnce() + Send + 'scope,
+{
+    with_current_worker_route_state(|state| state.dispatcher.dispatch(worker_id, job))
+        .unwrap_or(false)
+}
+
+pub(crate) fn drain_pending_worker_route_jobs() {
+    let _ = with_current_worker_route_state(|state| {
         let mut pending = Vec::new();
         while let Ok(job) = state.receiver.try_recv() {
             pending.push(job);
@@ -175,15 +212,14 @@ where
     }
 }
 
-pub fn route_to_worker<F>(
+pub fn route_to_worker<'scope, F>(
     worker_id: usize,
-    job: impl FnOnce() -> F + Send + 'static,
+    job: impl FnOnce() -> F + Send + 'scope,
 ) -> io::Result<RoutedFuture<F>>
 where
-    F: Send + 'static,
+    F: Send + 'scope,
 {
-    let Some(dispatcher) = context::with_current_context(|ctx| ctx.worker_route_dispatcher())
-    else {
+    let Some(dispatcher) = with_current_worker_route_state(|state| state.dispatcher.clone()) else {
         return Err(io::Error::other("runtime context not set"));
     };
 

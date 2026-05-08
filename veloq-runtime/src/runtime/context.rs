@@ -1,4 +1,3 @@
-use super::route::WorkerRouteDispatcher;
 use super::shared::RuntimeShared;
 use crate::task::{LocalTaskRef, SendTaskRef};
 use crate::utils::FastRand;
@@ -72,7 +71,6 @@ pub struct RuntimeContext {
     pub(crate) rand: RefCell<FastRand>,
     pub(crate) idle_hook: Option<IdleHook>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
-    pub(crate) worker_route_dispatcher: WorkerRouteDispatcher,
 }
 
 pub type IdleHook = fn() -> IdleDecision;
@@ -127,10 +125,6 @@ pub fn wake_worker(worker_id: usize) {
     });
 }
 
-pub(crate) fn with_current_context<R>(f: impl FnOnce(&RuntimeContext) -> R) -> Option<R> {
-    CONTEXT.with(|ctx| ctx.borrow().as_ref().map(f))
-}
-
 pub fn set_current_runtime_context(context: RuntimeContext) {
     CONTEXT.with(|ctx| {
         *ctx.borrow_mut() = Some(context);
@@ -157,13 +151,6 @@ pub(crate) fn run_worker_idle_hook() -> IdleDecision {
             })
     })
 }
-
-impl RuntimeContext {
-    pub(crate) fn worker_route_dispatcher(&self) -> WorkerRouteDispatcher {
-        self.worker_route_dispatcher.clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

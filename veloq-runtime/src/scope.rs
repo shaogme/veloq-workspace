@@ -19,6 +19,29 @@ mod join;
 
 pub use join::{JoinHandle, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle};
 
+#[derive(Copy, Clone)]
+struct SendPtr<T>(NonNull<T>);
+
+unsafe impl<T> Send for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    fn new(ptr: NonNull<T>) -> Self {
+        Self(ptr)
+    }
+
+    unsafe fn as_ref(&self) -> &T {
+        unsafe { self.0.as_ref() }
+    }
+
+    unsafe fn as_mut(&mut self) -> &mut T {
+        unsafe { self.0.as_mut() }
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.0.as_ptr()
+    }
+}
+
 /// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
 pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
     remaining: S::Usize,
@@ -327,10 +350,10 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
         let runtime = self.runtime.clone();
         let completion = self.completion.clone();
-        let task_ptr = task as *const S_ as usize;
+        let task_ptr = SendPtr::new(NonNull::from(task));
         let state_for_job = state.clone();
 
-        self::join::dispatch_routed::<AtomicStorage, ArcOwnership, _>(
+        self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _>(
             &self.completion,
             state.clone(),
             worker_id,
@@ -341,7 +364,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
                     return;
                 }
 
-                let task = unsafe { &*(task_ptr as *const S_) };
+                let task = unsafe { task_ptr.as_ref() };
                 task.header().set_pinned();
                 task.header()
                     .set_runtime_info(Arc::as_ptr(&runtime), worker_id);
@@ -356,13 +379,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
                 state_for_job.set_ready(self::join::RoutedSpawnReady {
                     task: task_ref,
-                    node_ptr: task_ptr,
-                    take_result: |ptr, dst| unsafe {
-                        let task = &*(ptr as *const S_);
-                        let res = task.take_result().expect("task result already taken");
-                        std::ptr::write(dst as *mut Result<T, TaskError>, res);
-                    },
-                    reclaim: |_, _| {},
+                    access: self::join::make_spawn_to_access::<T, S_>(task_ptr.0),
                 });
             },
         );
@@ -449,7 +466,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
         let runtime = self.runtime.clone();
         let completion = self.completion.clone();
-        let arena_addr = &self.arena as *const _ as usize;
+        let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
         let state_for_job = state.clone();
         let job_layout = std::alloc::Layout::new::<self::join::RoutedJobCell<'scope, F>>();
         let job_ptr = unsafe {
@@ -461,28 +478,26 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
             ) as *mut self::join::RoutedJobCell<'scope, F>
         };
         unsafe { std::ptr::write(job_ptr, self::join::RoutedJobCell::new(job)) };
+        let job_ptr = SendPtr::new(unsafe { NonNull::new_unchecked(job_ptr) });
 
-        let job_addr = job_ptr as usize;
-
-        self::join::dispatch_routed::<AtomicStorage, ArcOwnership, _>(
+        self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _>(
             &self.completion,
             state.clone(),
             worker_id,
             move || {
-                let arena = unsafe { &*(arena_addr as *const GenericArena<AtomicStorage>) };
+                let arena = unsafe { arena_ptr.as_ref() };
                 if state_for_job.is_cancel_requested() {
-                    unsafe { arena.drop_object_raw(job_addr as *mut u8, job_layout) };
+                    unsafe { arena.drop_object_raw(job_ptr.as_ptr() as *mut u8, job_layout) };
                     state_for_job.fail(TaskError::Cancelled);
                     completion.task_done();
                     return;
                 }
 
-                let job = unsafe {
-                    (&mut *(job_addr as *mut self::join::RoutedJobCell<'scope, F>)).take()
-                };
+                let mut job_ptr = job_ptr;
+                let job = unsafe { job_ptr.as_mut().take() };
                 let future = job();
 
-                unsafe { arena.drop_object_raw(job_addr as *mut u8, job_layout) };
+                unsafe { arena.drop_object_raw(job_ptr.as_ptr() as *mut u8, job_layout) };
 
                 if state_for_job.is_cancel_requested() {
                     state_for_job.fail(TaskError::Cancelled);
