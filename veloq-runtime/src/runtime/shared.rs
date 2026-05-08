@@ -486,13 +486,6 @@ impl RuntimeShared {
         if task.header().try_mark_queued() {
             self.idle.event_count.notify();
 
-            if task.header().is_affine() {
-                let worker = &self.registry.workers[worker_id];
-                let _ = worker.remote_tx.send(task);
-                self.notify_work(worker_id);
-                return;
-            }
-
             let current = current_worker_id();
 
             if current == worker_id {

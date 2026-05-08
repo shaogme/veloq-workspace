@@ -281,7 +281,6 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         &self,
         worker_id: usize,
         task: &'scope S,
-        affine: bool,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
         S: SendTask<T> + Sized + 'scope,
@@ -298,9 +297,6 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S) };
         let header = task_ref.header();
         header.set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
-        if affine {
-            header.force_affinity(worker_id);
-        }
         self.runtime.enqueue_send(worker_id, task_ref);
 
         JoinHandle {
@@ -327,7 +323,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         S: SendTask<T> + Sized + 'scope,
     {
-        self.spawn_send_impl(worker_id, task, true)
+        self.spawn_send_impl(worker_id, task)
     }
 
     pub fn spawn<T: Send + 'scope, S>(
@@ -337,14 +333,13 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         S: SendTask<T> + Sized + 'scope,
     {
-        self.spawn_send_impl(self.runtime.choose_worker(), task, false)
+        self.spawn_send_impl(self.runtime.choose_worker(), task)
     }
 
     fn spawn_boxed_send_impl<T: Send + 'scope, F>(
         &self,
         worker_id: usize,
         future: F,
-        affine: bool,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self>
     where
         F: Future<Output = T> + Send + 'scope,
@@ -372,9 +367,6 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
         let header = task_ref.header();
         header.set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
-        if affine {
-            header.force_affinity(worker_id);
-        }
         self.runtime.enqueue_send(worker_id, task_ref);
 
         JoinHandle {
@@ -397,7 +389,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         F: Future<Output = T> + Send + 'scope,
     {
-        self.spawn_boxed_send_impl(worker_id, future, true)
+        self.spawn_boxed_send_impl(worker_id, future)
     }
 
     pub fn spawn_boxed<T: Send + 'scope, F>(
@@ -407,7 +399,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         F: Future<Output = T> + Send + 'scope,
     {
-        self.spawn_boxed_send_impl(self.runtime.choose_worker(), future, false)
+        self.spawn_boxed_send_impl(self.runtime.choose_worker(), future)
     }
 }
 

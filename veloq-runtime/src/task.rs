@@ -6,8 +6,8 @@ mod scope;
 pub use arena::{Arena, GenericArena};
 pub use header::{
     GenericTaskHeader, GenericWakerNode, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE,
-    PollStatus, STATE_AFFINE, STATE_CANCELLED, STATE_COMPLETED, STATE_POLLING, STATE_QUEUED,
-    STATE_READY, STATE_WOKEN, TaskVTable,
+    PollStatus, STATE_CANCELLED, STATE_COMPLETED, STATE_POLLING, STATE_QUEUED, STATE_READY,
+    STATE_WOKEN, TaskVTable,
 };
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
