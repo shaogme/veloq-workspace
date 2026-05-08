@@ -10,7 +10,7 @@ pub use header::{
     STATE_WOKEN, TaskVTable,
 };
 pub use nodes::{
-    LocalBoxedTaskNode, LocalTaskNode, PinnedBoxedTaskNode, SendBoxedTaskNode, SendTaskNode,
+    LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode,
 };
 pub use scope::{
     AnyScopeCompletionRef, CURRENT_SCOPE, ErasedCancellationToken, OpaqueScope, OpaqueToken,

@@ -11,6 +11,7 @@ pub const STATE_READY: usize = 1 << 2;
 pub const STATE_CANCELLED: usize = 1 << 3;
 pub const STATE_POLLING: usize = 1 << 4;
 pub const STATE_WOKEN: usize = 1 << 5;
+pub const STATE_PINNED: usize = 1 << 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollStatus {
@@ -61,6 +62,16 @@ impl<S: Storage + 'static> GenericTaskHeader<S> {
     #[inline]
     pub fn is_completed(&self) -> bool {
         self.state.load(Ordering::Acquire) & STATE_COMPLETED != 0
+    }
+
+    #[inline]
+    pub fn is_pinned(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_PINNED != 0
+    }
+
+    #[inline]
+    pub fn set_pinned(&self) {
+        self.state.fetch_or(STATE_PINNED, Ordering::Release);
     }
 
     #[inline]

@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
-use std::task::{Context, RawWaker, RawWakerVTable};
+use std::task::{Context, RawWakerVTable};
 
 /// 任务存储特性，用于统一本地和发送任务的存储行为。
 pub trait TaskStorage: Storage + Sized + 'static
@@ -56,7 +56,6 @@ impl<T, F> TaskBounds<T, F> for LocalStorage {}
 impl<T, F> TaskBounds<T, F> for AtomicStorage
 where
     T: Send,
-    F: Send,
 {
 }
 
@@ -90,6 +89,11 @@ where
             let header = data.as_ref();
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
+                if !S::IS_LOCAL && header.is_pinned() {
+                    let task = SendTaskRef::from_header(data.as_ptr() as *const _);
+                    runtime.enqueue_pinned(worker_id, task);
+                    return;
+                }
                 S::enqueue(runtime, worker_id, data);
             }
         },
@@ -97,6 +101,11 @@ where
             let header = data.as_ref();
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
+                if !S::IS_LOCAL && header.is_pinned() {
+                    let task = SendTaskRef::from_header(data.as_ptr() as *const _);
+                    runtime.enqueue_pinned(worker_id, task);
+                    return;
+                }
                 S::enqueue(runtime, worker_id, data);
             }
         },
@@ -211,159 +220,3 @@ pub type SendTaskNode<'scope, 'future, T, F> =
 /// 堆上/拥有所有权的 Send 任务。
 pub type SendBoxedTaskNode<'scope, T, F> = GenericTaskNode<'scope, AtomicStorage, T, F>;
 
-pub(crate) static PINNED_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |data| RawWaker::new(data, &PINNED_INTRUSIVE_WAKER_VTABLE),
-    |data| unsafe {
-        let header = GenericTaskHeader::<AtomicStorage>::from_raw_data(data);
-        let header = header.as_ref();
-        if let Some(runtime) = header.runtime_shared() {
-            let worker_id = header.worker_id.load(Ordering::Acquire);
-            let task = SendTaskRef::from_header(header as *const _);
-            runtime.enqueue_pinned(worker_id, task);
-        }
-    },
-    |data| unsafe {
-        let header = GenericTaskHeader::<AtomicStorage>::from_raw_data(data);
-        let header = header.as_ref();
-        if let Some(runtime) = header.runtime_shared() {
-            let worker_id = header.worker_id.load(Ordering::Acquire);
-            let task = SendTaskRef::from_header(header as *const _);
-            runtime.enqueue_pinned(worker_id, task);
-        }
-    },
-    |_data| {},
-);
-
-#[repr(C)]
-pub struct PinnedBoxedTaskNode<'scope, T, F>
-where
-    F: Future<Output = T>,
-{
-    header: GenericTaskHeader<AtomicStorage>,
-    state: <AtomicStorage as Storage>::Lock<TaskState<T, F>>,
-    _marker: std::marker::PhantomData<&'scope ()>,
-}
-
-impl<'scope, T, F> PinnedBoxedTaskNode<'scope, T, F>
-where
-    F: Future<Output = T>,
-{
-    const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
-        wake: |data| unsafe {
-            let header = data.as_ref();
-            if let Some(runtime) = header.runtime_shared() {
-                let worker_id = header.worker_id.load(Ordering::Acquire);
-                let task = SendTaskRef::from_header(header as *const _);
-                runtime.enqueue_pinned(worker_id, task);
-            }
-        },
-        wake_by_ref: |data| unsafe {
-            let header = data.as_ref();
-            if let Some(runtime) = header.runtime_shared() {
-                let worker_id = header.worker_id.load(Ordering::Acquire);
-                let task = SendTaskRef::from_header(header as *const _);
-                runtime.enqueue_pinned(worker_id, task);
-            }
-        },
-        poll: |data, worker_id| unsafe {
-            let node = &*(data.as_ptr() as *const Self);
-            node.poll_raw(worker_id)
-        },
-    };
-
-    pub fn new(future: F) -> Self {
-        Self {
-            header: GenericTaskHeader::new(Self::VTABLE),
-            state: <AtomicStorage as Storage>::Lock::new(TaskState::Running(future)),
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    pub(crate) unsafe fn take_result_into_erased(ptr: *const (), dst: *mut ()) {
-        let node = unsafe { &*(ptr as *const Self) };
-        let res = node.take_result().expect("task result already taken");
-        unsafe { std::ptr::write(dst as *mut Result<T, TaskError>, res) };
-    }
-
-    pub(crate) unsafe fn reclaim_erased(arena: &dyn crate::task::Arena, ptr: *mut ()) {
-        let layout = std::alloc::Layout::new::<Self>();
-        unsafe { arena.drop_object_raw(ptr as *mut u8, layout) };
-    }
-}
-
-impl<'scope, T, F> TaskResultSetter<T> for PinnedBoxedTaskNode<'scope, T, F>
-where
-    F: Future<Output = T>,
-{
-    #[inline]
-    fn set_result(&self, res: Result<T, TaskError>) {
-        self.state.lock_mut(|s| *s = TaskState::Done(res));
-    }
-}
-
-impl<'scope, T, F> RawTask for PinnedBoxedTaskNode<'scope, T, F>
-where
-    F: Future<Output = T>,
-{
-    impl_raw_task_common!(false, AtomicStorage, &PINNED_INTRUSIVE_WAKER_VTABLE);
-}
-
-impl<'scope, T, F> Task<T> for PinnedBoxedTaskNode<'scope, T, F>
-where
-    F: Future<Output = T>,
-    ScopeCompletionRef<AtomicStorage>: IntoAnyScope,
-{
-    fn poll_task(&self, cx: &mut Context<'_>) -> bool {
-        poll_task_internal(
-            &self.header,
-            self,
-            cx,
-            |cx| {
-                self.state.lock_mut(|s| {
-                    if let TaskState::Running(f) = s {
-                        unsafe { Pin::new_unchecked(f) }.poll(cx)
-                    } else {
-                        std::task::Poll::Pending
-                    }
-                })
-            },
-            false,
-        )
-    }
-
-    fn take_result(&self) -> Option<Result<T, TaskError>> {
-        self.state.lock_mut(|s| {
-            if let TaskState::Done(_) = s
-                && let TaskState::Done(res) = std::mem::replace(s, TaskState::Empty)
-            {
-                return Some(res);
-            }
-            None
-        })
-    }
-
-    fn set_scope_completion<
-        SS: crate::utils::storage::Storage,
-        O: crate::utils::ownership::Ownership,
-    >(
-        &self,
-        scope: Option<
-            <O as crate::utils::ownership::Ownership>::Shared<
-                crate::scope::GenericScopeCompletion<SS, O>,
-            >,
-        >,
-    ) {
-        if let Some(scope) = scope {
-            let scope_ref = crate::task::ScopeCompletionRef::new::<O>(&scope);
-            let (ptr, vtable) = scope_ref.into_parts();
-            self.header.scope_ptr.store(Some(ptr), Ordering::Release);
-            self.header.scope_vtable.store(
-                Some(NonNull::new(vtable as *const _ as *mut _).unwrap()),
-                Ordering::Release,
-            );
-        } else {
-            self.header.scope_ptr.store(None, Ordering::Release);
-            self.header.scope_vtable.store(None, Ordering::Release);
-        }
-    }
-}

@@ -317,7 +317,70 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         S_: SendTask<T> + Sized + 'scope,
     {
-        self.spawn_send_impl(worker_id, task)
+        debug_assert!(
+            worker_id < self.runtime.worker_count().get(),
+            "worker_id {} is out of bounds",
+            worker_id
+        );
+
+        let state = self::join::RoutedSpawnState::new();
+        self.completion.add_task();
+
+        let Some(dispatcher) = with_current_context(|ctx| ctx.worker_route_dispatcher()) else {
+            self.completion.task_done();
+            panic!("runtime context not set");
+        };
+
+        let runtime = self.runtime.clone();
+        let completion = self.completion.clone();
+        let task_ptr = task as *const S_ as usize;
+        let state_for_job = state.clone();
+
+        if !dispatcher.dispatch(worker_id, move || {
+            let state_for_err = state_for_job.clone();
+            let completion_for_err = completion.clone();
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                if state_for_job.is_cancel_requested() {
+                    state_for_job.fail(TaskError::Cancelled);
+                    completion.task_done();
+                    return;
+                }
+
+                let task = unsafe { &*(task_ptr as *const S_) };
+                task.header().set_pinned();
+                task.header().set_runtime_info(Arc::as_ptr(&runtime), worker_id);
+                task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(completion.clone()));
+
+                let task_ref = unsafe { SendTaskRef::from_concrete(task) };
+                if !runtime.enqueue_pinned(worker_id, task_ref) {
+                    state_for_job.fail(TaskError::Panic);
+                    completion.task_done();
+                    return;
+                }
+
+                state_for_job.set_ready(self::join::RoutedSpawnReady {
+                    task: task_ref,
+                    node_ptr: task_ptr,
+                    take_result: |ptr, dst| unsafe {
+                        let task = &*(ptr as *const S_);
+                        let res = task.take_result().expect("task result already taken");
+                        std::ptr::write(dst as *mut Result<T, TaskError>, res);
+                    },
+                    reclaim: |_, _| {},
+                });
+            }));
+
+            if result.is_err() {
+                state_for_err.fail(TaskError::Panic);
+                completion_for_err.task_done();
+            }
+        }) {
+            self.completion.task_done();
+            panic!("failed to dispatch routed pinned task");
+        }
+
+        JoinHandle::new_routed(self, state)
     }
 
     pub fn spawn<T: Send + 'scope, S_>(

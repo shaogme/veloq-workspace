@@ -1,6 +1,6 @@
 use crate::runtime::{GenericCancellationToken, RuntimeShared};
 use crate::task::{
-    Arena, GenericWakerNode, PinnedBoxedTaskNode, SendTaskRef, Task, TaskError, TaskHandleRef,
+    Arena, GenericWakerNode, RawTask, SendTaskRef, Task, TaskError, TaskHandleRef,
 };
 use crate::utils::storage::{AtomicStorage, StateLock};
 use std::future::Future;
@@ -130,19 +130,22 @@ pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
     future: Fut,
 ) where
     T: Send + 'scope,
-    Fut: Future<Output = T>,
+    Fut: Future<Output = T> + 'scope,
 {
-    let node = PinnedBoxedTaskNode::new(future);
-    let layout = std::alloc::Layout::new::<PinnedBoxedTaskNode<'scope, T, Fut>>();
+    let node = crate::task::SendBoxedTaskNode::new(future);
+    let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'scope, T, Fut>>();
     let node_ptr = unsafe {
-        arena.alloc::<PinnedBoxedTaskNode<'scope, T, Fut>>(
+        arena.alloc::<crate::task::SendBoxedTaskNode<'scope, T, Fut>>(
             layout,
-            Some(|ptr| std::ptr::drop_in_place(ptr as *mut PinnedBoxedTaskNode<'scope, T, Fut>)),
-        ) as *mut PinnedBoxedTaskNode<'scope, T, Fut>
+            Some(|ptr| {
+                std::ptr::drop_in_place(ptr as *mut crate::task::SendBoxedTaskNode<'scope, T, Fut>)
+            }),
+        ) as *mut crate::task::SendBoxedTaskNode<'scope, T, Fut>
     };
     unsafe { std::ptr::write(node_ptr, node) };
 
     let node_ref = unsafe { &*node_ptr };
+    node_ref.header().set_pinned();
     node_ref.set_scope_completion::<AtomicStorage, crate::utils::ownership::ArcOwnership>(Some(
         completion.clone(),
     ));
@@ -165,8 +168,15 @@ pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
     state.set_ready(RoutedSpawnReady {
         task: task_ref,
         node_ptr: node_ptr as usize,
-        take_result: PinnedBoxedTaskNode::<'scope, T, Fut>::take_result_into_erased,
-        reclaim: PinnedBoxedTaskNode::<'scope, T, Fut>::reclaim_erased,
+        take_result: |ptr, dst| unsafe {
+            let node = &*(ptr as *const crate::task::SendBoxedTaskNode<'scope, T, Fut>);
+            let res = node.take_result().expect("task result already taken");
+            std::ptr::write(dst as *mut Result<T, TaskError>, res);
+        },
+        reclaim: |arena, ptr| unsafe {
+            let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'scope, T, Fut>>();
+            arena.drop_object_raw(ptr as *mut u8, layout);
+        },
     });
 }
 
