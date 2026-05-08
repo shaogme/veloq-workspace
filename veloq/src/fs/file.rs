@@ -15,6 +15,7 @@ use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
 
@@ -402,27 +403,45 @@ impl<'a> SyncRangeBuilder<'a> {
 
 impl<'a> IntoFuture for SyncRangeBuilder<'a> {
     type Output = io::Result<()>;
-    type IntoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>;
+    type IntoFuture = SyncRangeFuture<'a>;
 
     fn into_future(self) -> Self::IntoFuture {
-        let submitter = self.file.submitter;
-        let file = self.file;
-        let offset = self.offset;
-        let nbytes = self.nbytes;
-        let flags = self.flags;
-        Box::pin(async move {
-            let op: FileSyncFileRangeRaw = FileSyncFileRangeRaw {
-                fd: file.raw.raw(),
-                offset,
-                nbytes,
-                flags,
-            };
+        let op: FileSyncFileRangeRaw = FileSyncFileRangeRaw {
+            fd: self.file.raw.raw(),
+            offset: self.offset,
+            nbytes: self.nbytes,
+            flags: self.flags,
+        };
 
-            let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
-            res.map(|_| ())
-                .map_err(from_driver_report)
-                .map_err(to_io_error)
-        })
+        SyncRangeFuture {
+            inner: submit(&self.file.submitter, Op::new(op)),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+pub struct SyncRangeFuture<'a> {
+    inner:
+        <DetachedSubmitter as veloq_driver_native::op::OpSubmitter>::Future<FileSyncFileRangeRaw>,
+    _marker: std::marker::PhantomData<&'a File>,
+}
+
+impl<'a> Future for SyncRangeFuture<'a> {
+    type Output = io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        match Pin::new(&mut this.inner).poll(cx) {
+            Poll::Ready(res) => {
+                let (res, _) = res.into_inner();
+                Poll::Ready(
+                    res.map(|_| ())
+                        .map_err(from_driver_report)
+                        .map_err(to_io_error),
+                )
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

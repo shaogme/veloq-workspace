@@ -335,7 +335,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericSender<T, F, Q> {
                 SendFuture {
                     sender: self,
                     msg: Some(m),
-                    node: Box::pin(WaiterNode::new()),
+                    node: WaiterNode::new(),
                     queued: false,
                 }
                 .await
@@ -374,7 +374,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericReceiver<T, F, Q> {
 
         RecvFuture {
             receiver: self,
-            node: Box::pin(WaiterNode::new()),
+            node: WaiterNode::new(),
             queued: false,
         }
         .await
@@ -383,7 +383,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericReceiver<T, F, Q> {
     pub fn stream(&self) -> ReceiverStream<'_, T, F, Q> {
         ReceiverStream {
             shared: &self.shared,
-            node: Box::pin(WaiterNode::new()),
+            node: WaiterNode::new(),
             queued: false,
         }
     }
@@ -394,7 +394,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericReceiver<T, F, Q> {
 struct SendFuture<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
     sender: &'a GenericSender<T, F, Q>,
     msg: Option<T>,
-    node: Pin<Box<WaiterNode>>,
+    node: WaiterNode,
     queued: bool,
 }
 
@@ -409,10 +409,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for SendFuture<'a, 
             match this.sender.shared.queue.push(this.msg.take().unwrap()) {
                 Ok(_) => {
                     if this.queued {
-                        this.sender
-                            .shared
-                            .flavor
-                            .remove_send_wait(this.node.as_mut());
+                        let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                        this.sender.shared.flavor.remove_send_wait(node_pin);
                         this.queued = false;
                     }
                     this.sender.shared.notify_recv_one();
@@ -426,23 +424,20 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for SendFuture<'a, 
             // 2. Check closed
             if this.sender.shared.is_closed.load(Ordering::Relaxed) {
                 if this.queued {
-                    this.sender
-                        .shared
-                        .flavor
-                        .remove_send_wait(this.node.as_mut());
+                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                    this.sender.shared.flavor.remove_send_wait(node_pin);
                 }
                 return Poll::Ready(Err(SendError(this.msg.take().unwrap())));
             }
 
             // 3. Register wait
             if !this.queued {
+                let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
                 if this
                     .sender
                     .shared
                     .flavor
-                    .register_send_wait(this.node.as_mut(), cx, || {
-                        this.sender.shared.queue.is_full()
-                    })
+                    .register_send_wait(node_pin, cx, || this.sender.shared.queue.is_full())
                 {
                     this.queued = true;
                     // registered successfully means we should wait now
@@ -465,17 +460,15 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for SendFuture<'a, 
 impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for SendFuture<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
-            self.sender
-                .shared
-                .flavor
-                .remove_send_wait(self.node.as_mut());
+            let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
+            self.sender.shared.flavor.remove_send_wait(node_pin);
         }
     }
 }
 
 struct RecvFuture<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
     receiver: &'a GenericReceiver<T, F, Q>,
-    node: Pin<Box<WaiterNode>>,
+    node: WaiterNode,
     queued: bool,
 }
 
@@ -489,7 +482,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
             // 1. Try Recv
             if let Some(msg) = this.receiver.shared.queue.pop() {
                 if this.queued {
-                    remove_recv_waiter(&this.receiver.shared, this.node.as_mut());
+                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                    remove_recv_waiter(&this.receiver.shared, node_pin);
                     this.queued = false;
                 }
                 this.receiver.shared.flavor.release();
@@ -501,7 +495,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
                 // Re-check to ensure no race where item was pushed before close
                 if let Some(msg) = this.receiver.shared.queue.pop() {
                     if this.queued {
-                        remove_recv_waiter(&this.receiver.shared, this.node.as_mut());
+                        let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                        remove_recv_waiter(&this.receiver.shared, node_pin);
                         this.queued = false;
                     }
                     this.receiver.shared.flavor.release();
@@ -509,7 +504,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
                 }
 
                 if this.queued {
-                    remove_recv_waiter(&this.receiver.shared, this.node.as_mut());
+                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                    remove_recv_waiter(&this.receiver.shared, node_pin);
                 }
                 return Poll::Ready(Err(TryRecvError::Disconnected));
             }
@@ -520,7 +516,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
             if !this.queued {
                 let mut lock = this.receiver.shared.recv_waiters.lock();
                 unsafe {
-                    lock.push_back(this.node.as_mut());
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    lock.push_back(node_pin);
                 }
                 this.receiver
                     .shared
@@ -537,7 +534,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
 impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for RecvFuture<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
-            remove_recv_waiter(&self.receiver.shared, self.node.as_mut());
+            let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
+            remove_recv_waiter(&self.receiver.shared, node_pin);
         }
     }
 }
@@ -559,7 +557,7 @@ fn remove_recv_waiter<T, F: ChannelFlavor, Q: flavor::RawQueue<T>>(
 
 pub struct ReceiverStream<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
     shared: &'a Shared<T, F, Q>,
-    node: Pin<Box<WaiterNode>>,
+    node: WaiterNode,
     queued: bool,
 }
 
@@ -572,7 +570,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
         loop {
             if let Some(msg) = this.shared.queue.pop() {
                 if this.queued {
-                    remove_recv_waiter(this.shared, this.node.as_mut());
+                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                    remove_recv_waiter(this.shared, node_pin);
                     this.queued = false;
                 }
                 this.shared.flavor.release();
@@ -583,7 +582,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
                 // Re-check to ensure no race where item was pushed before close
                 if let Some(msg) = this.shared.queue.pop() {
                     if this.queued {
-                        remove_recv_waiter(this.shared, this.node.as_mut());
+                        let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                        remove_recv_waiter(this.shared, node_pin);
                         this.queued = false;
                     }
                     this.shared.flavor.release();
@@ -591,7 +591,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
                 }
 
                 if this.queued {
-                    remove_recv_waiter(this.shared, this.node.as_mut());
+                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                    remove_recv_waiter(this.shared, node_pin);
                 }
                 return Poll::Ready(None);
             }
@@ -601,7 +602,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
             if !this.queued {
                 let mut lock = this.shared.recv_waiters.lock();
                 unsafe {
-                    lock.push_back(this.node.as_mut());
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    lock.push_back(node_pin);
                 }
                 this.shared
                     .recv_waiter_count
@@ -617,7 +619,8 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
 impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for ReceiverStream<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
-            remove_recv_waiter(self.shared, self.node.as_mut());
+            let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
+            remove_recv_waiter(self.shared, node_pin);
         }
     }
 }

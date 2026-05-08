@@ -1,9 +1,7 @@
 use std::cell::RefCell;
-use std::future::Future;
 use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc;
-use std::task::Poll;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver_native::driver::{DriveMode, Driver, DriverControlCommand, PlatformDriver};
@@ -378,10 +376,7 @@ pub(crate) fn drain_pending_driver_commands() {
     });
 }
 
-pub fn submit<'a, S, T>(
-    submitter: &'a S,
-    op: Op<T>,
-) -> impl Future<Output = <S::Future<T> as Future>::Output> + 'a
+pub fn submit<'a, S, T>(submitter: &'a S, op: Op<T>) -> S::Future<T>
 where
     S: OpSubmitter + Copy + 'a,
     T: IntoPlatformOp<
@@ -392,18 +387,7 @@ where
 {
     let ctx = current();
     ctx.driver_bridge().sync_registrar();
-    let fut = submitter.submit(op, ctx.driver());
-    let mut fut = Box::pin(fut);
-
-    async move {
-        std::future::poll_fn(
-            move |cx: &mut std::task::Context<'_>| match fut.as_mut().poll(cx) {
-                Poll::Ready(output) => Poll::Ready(output),
-                Poll::Pending => Poll::Pending,
-            },
-        )
-        .await
-    }
+    submitter.submit(op, ctx.driver())
 }
 
 pub async fn yield_now() {

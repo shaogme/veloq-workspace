@@ -96,7 +96,7 @@ impl<T: ?Sized> RwLock<T> {
     pub fn read(&self) -> RwLockReadFuture<'_, T> {
         RwLockReadFuture {
             lock: self,
-            node: Box::pin(WaiterNode::new()),
+            node: WaiterNode::new(),
             queued: false,
             woken: false,
         }
@@ -119,7 +119,7 @@ impl<T: ?Sized> RwLock<T> {
     pub fn write(&self) -> RwLockWriteFuture<'_, T> {
         RwLockWriteFuture {
             lock: self,
-            node: Box::pin(WaiterNode::new()),
+            node: WaiterNode::new(),
             queued: false,
             woken: false,
         }
@@ -243,7 +243,7 @@ impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
 
 pub struct RwLockReadFuture<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
-    node: Pin<Box<WaiterNode>>,
+    node: WaiterNode,
     queued: bool,
     woken: bool,
 }
@@ -281,10 +281,11 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
                         // Success
                         if this.queued || this.woken {
                             let mut waiters = this.lock.waiters.lock();
+                            let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
                             // Remove ourselves if still linked
-                            if this.node.as_ref().link.is_linked() {
+                            if node_pin.as_ref().link.is_linked() {
                                 unsafe {
-                                    let ptr = NonNull::from(&*this.node);
+                                    let ptr = NonNull::from(&*node_pin);
                                     let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                                     cursor.remove();
                                 }
@@ -325,9 +326,7 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
             this.node.waker.register(cx.waker());
 
             if !this.queued {
-                unsafe {
-                    this.node.as_mut().get_unchecked_mut().kind = KIND_READER;
-                }
+                this.node.kind = KIND_READER;
 
                 let mut waiters = this.lock.waiters.lock();
 
@@ -350,14 +349,15 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
                 }
 
                 unsafe {
-                    waiters.push_back(this.node.as_mut());
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    waiters.push_back(node_pin);
                 }
                 this.queued = true;
             } else {
                 // Check if woken
                 let is_linked = {
                     let _w = this.lock.waiters.lock();
-                    this.node.as_ref().link.is_linked()
+                    this.node.link.is_linked()
                 };
                 if !is_linked {
                     this.woken = true;
@@ -375,9 +375,9 @@ impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
     fn drop(&mut self) {
         if self.queued {
             let mut waiters = self.lock.waiters.lock();
-            if self.node.as_ref().link.is_linked() {
+            if self.node.link.is_linked() {
                 unsafe {
-                    let ptr = NonNull::from(&*self.node);
+                    let ptr = NonNull::from(&self.node);
                     let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                     cursor.remove();
                 }
@@ -388,7 +388,7 @@ impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
 
 pub struct RwLockWriteFuture<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
-    node: Pin<Box<WaiterNode>>,
+    node: WaiterNode,
     queued: bool,
     woken: bool,
 }
@@ -433,9 +433,10 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
                 {
                     if this.queued || this.woken {
                         let mut waiters = this.lock.waiters.lock();
-                        if this.node.as_ref().link.is_linked() {
+                        let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                        if node_pin.as_ref().link.is_linked() {
                             unsafe {
-                                let ptr = NonNull::from(&*this.node);
+                                let ptr = NonNull::from(&*node_pin);
                                 let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                                 cursor.remove();
                             }
@@ -466,9 +467,7 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
             this.node.waker.register(cx.waker());
 
             if !this.queued {
-                unsafe {
-                    this.node.as_mut().get_unchecked_mut().kind = KIND_WRITER;
-                }
+                this.node.kind = KIND_WRITER;
                 let mut waiters = this.lock.waiters.lock();
 
                 // Double check
@@ -486,13 +485,14 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
                 }
 
                 unsafe {
-                    waiters.push_back(this.node.as_mut());
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    waiters.push_back(node_pin);
                 }
                 this.queued = true;
             } else {
                 let is_linked = {
                     let _w = this.lock.waiters.lock();
-                    this.node.as_ref().link.is_linked()
+                    this.node.link.is_linked()
                 };
                 if !is_linked {
                     this.woken = true;
@@ -510,9 +510,9 @@ impl<'a, T: ?Sized> Drop for RwLockWriteFuture<'a, T> {
     fn drop(&mut self) {
         if self.queued {
             let mut waiters = self.lock.waiters.lock();
-            if self.node.as_ref().link.is_linked() {
+            if self.node.link.is_linked() {
                 unsafe {
-                    let ptr = NonNull::from(&*self.node);
+                    let ptr = NonNull::from(&self.node);
                     let mut cursor = waiters.cursor_mut_from_ptr(ptr);
                     cursor.remove();
                 }
