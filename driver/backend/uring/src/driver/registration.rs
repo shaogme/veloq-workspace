@@ -3,8 +3,18 @@ use crate::error::{UringError, UringResult, from_io_error};
 use diagweave::report::Report;
 use std::time::{Duration, Instant};
 
+use crate::config::{IoFd, OwnedRawHandle, UringRawHandle};
+use veloq_driver_core::driver::RegisterFd;
+
 pub(crate) const MAX_CHUNKS: usize = 1024;
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
+const MIN_FILE_TABLE_CAPACITY: usize = 1;
+
+#[derive(Debug)]
+pub(crate) enum RegisteredFileEntry {
+    BorrowedFd(i32),
+    OwnedHandle(OwnedRawHandle),
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct UringRegistrationStats {
@@ -80,5 +90,91 @@ impl UringDriver {
             .saturating_add(1);
 
         Ok(())
+    }
+
+    pub(crate) fn unregister_fixed_fd(&mut self, fd: IoFd) -> UringResult<()> {
+        if !self.file_table_initialized {
+            return Ok(());
+        }
+        let idx = fd.fixed_index();
+        let index = idx as usize;
+        if index < self.registered_files.len() {
+            if self.file_generations.get(index).copied() != Some(fd.generation()) {
+                return Ok(());
+            }
+            let Some(_entry) = self.registered_files[index].take() else {
+                return Ok(());
+            };
+            self.ring
+                .submitter()
+                .register_files_update(idx, &[-1])
+                .map_err(|e| {
+                    from_io_error(UringError::Registration, "driver.unregister_fixed_fd", e)
+                })?;
+            self.free_file_slots.push(idx);
+            self.file_generations[index] = self.file_generations[index].wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_file_table_initialized(&mut self) -> UringResult<()> {
+        if self.file_table_initialized {
+            return Ok(());
+        }
+
+        let capacity = self.ops.local.len().max(MIN_FILE_TABLE_CAPACITY);
+        let sparse = vec![-1; capacity];
+        self.ring.submitter().register_files(&sparse).map_err(|e| {
+            from_io_error(
+                UringError::Registration,
+                "driver.ensure_file_table_initialized",
+                e,
+            )
+        })?;
+
+        self.registered_files = (0..capacity).map(|_| None).collect();
+        self.file_generations = vec![0; capacity];
+        self.free_file_slots = (0..capacity as u32).rev().collect();
+        self.file_table_initialized = true;
+        Ok(())
+    }
+
+    pub(crate) fn register_files_internal<'a>(
+        &mut self,
+        files: Vec<RegisterFd<'a, UringRawHandle>>,
+    ) -> UringResult<Vec<IoFd>> {
+        self.ensure_file_table_initialized()?;
+
+        let mut fixed_fds = Vec::with_capacity(files.len());
+        for file in files {
+            let entry = match file {
+                RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd(b.raw().as_fd()),
+                RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
+            };
+            let fd = match &entry {
+                RegisteredFileEntry::BorrowedFd(fd) => *fd,
+                RegisteredFileEntry::OwnedHandle(o) => o.raw().as_fd(),
+            };
+            let idx = self.free_file_slots.pop().ok_or_else(|| {
+                crate::driver::invalid_state(
+                    "driver.register_files_internal",
+                    "io_uring registered file table exhausted",
+                )
+            })?;
+            self.ring
+                .submitter()
+                .register_files_update(idx, &[fd])
+                .map_err(|e| {
+                    from_io_error(
+                        UringError::Registration,
+                        "driver.register_files_internal.register_files_update",
+                        e,
+                    )
+                })?;
+            self.registered_files[idx as usize] = Some(entry);
+            let generation = self.file_generations[idx as usize];
+            fixed_fds.push(IoFd::fixed_with_generation(idx, generation));
+        }
+        Ok(fixed_fds)
     }
 }

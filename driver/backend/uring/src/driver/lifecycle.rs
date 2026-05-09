@@ -1,4 +1,5 @@
-use crate::driver::{CANCEL_USER_DATA, UringDriver};
+use crate::driver::UringDriver;
+use crate::driver::submission::CANCEL_USER_DATA;
 use io_uring::opcode;
 use std::sync::atomic::Ordering;
 use veloq_driver_core::DriverResult;
