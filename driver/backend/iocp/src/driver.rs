@@ -1,52 +1,71 @@
-pub(crate) mod inner;
+pub(crate) mod completion;
+pub(crate) mod registration;
+pub(crate) mod submission;
 
+pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
+pub(crate) type PreInit = crate::win32::IoCompletionPort;
+
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::AtomicBool;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
-use windows_sys::Win32::Networking::WinSock::{
-    SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
-};
 
-use veloq_blocking::{BlockingTask, get_blocking_pool};
+use veloq_buf::{BufferRegistrar, NoopRegistrar};
 use veloq_driver_core::driver::registry::{OpEntry, OpRegistry};
-#[cfg(feature = "test-hooks")]
-pub use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 use veloq_driver_core::driver::{
-    CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver, Outcome,
-    RegisterFd, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
-    SubmitStatus,
+    CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver, RegisterFd,
+    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
-use veloq_driver_core::slot::{
-    DetachedCancelTable, ErasedPayload, Reserved, SlotRegistryExt, SlotTable, SlotView,
-};
+use veloq_driver_core::slot::{DetachedCancelTable, ErasedPayload, SlotTable};
 use veloq_driver_core::{
     DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
 };
-use veloq_wheel::TaskId;
+use veloq_wheel::{Wheel, WheelConfig};
 
-use crate::common::{completion_record, iocp_fallback_event_res, push_completion_shared};
-use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
-use crate::error::{IocpError, IocpResult, IocpResultExt, from_io_error};
-use crate::op::slot::Slot;
-use crate::op::submit::common::resolve_fd_borrowed;
-use crate::op::{IocpOp, OverlappedEntry, SubmitContext, submit};
-use crate::rio::error::RioResultExt;
-pub use inner::IocpDriver;
-use inner::RIO_EVENT_KEY;
+use crate::common::IocpWaker;
+use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, RegisteredHandle};
+use crate::error::{IocpError, IocpResult};
+use crate::op::{IocpOp, IocpOpPayload, OverlappedEntry};
+use crate::rio::RioState;
 
 // ============================================================================
 // State & Lifecycle Types
 // ============================================================================
 
+/// The IOCP driver implementation that manages I/O completion ports and operations.
+pub struct IocpDriver {
+    pub(crate) port: Arc<crate::win32::IoCompletionPort>,
+    pub(crate) ops: OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+    pub(crate) extensions: crate::ext::Extensions,
+    pub(crate) wheel: Wheel<usize>,
+    pub(crate) timer_buffer: Vec<usize>,
+    pub(crate) last_timer_poll: Instant,
+    pub(crate) registered_files: Vec<Option<RegisteredHandle>>,
+    pub(crate) file_generations: Vec<u64>,
+    pub(crate) free_slots: Vec<usize>,
+    pub(crate) is_notified: Arc<AtomicBool>,
+    pub(crate) completion_events: SharedCompletionQueue,
+    pub(crate) completion_table: SharedCompletionTable,
+    pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
+
+    // RIO Support (required)
+    pub(crate) rio_state: RioState,
+    pub(crate) registrar: Box<dyn BufferRegistrar>,
+    pub(crate) shutting_down: bool,
+    pub(crate) closed: bool,
+    pub(crate) deferred_socket_cleanup: VecDeque<registration::DeferredSocketCleanup>,
+}
+
 /// State associated with an IOCP operation.
 #[derive(Default)]
 pub struct IocpOpState {
     pub(crate) generation: u32,
-    pub(crate) timer_id: Option<TaskId>,
+    pub(crate) timer_id: Option<veloq_wheel::TaskId>,
     pub(crate) timer_deadline: Option<Instant>,
     pub(crate) is_background: bool,
     // For RIO cancel path: the slot can be recycled only after both:
@@ -68,20 +87,96 @@ pub enum CloseMode {
 
 pub(crate) type CompletionSidecar = CoreCompletionSidecar;
 
-// ============================================================================
-// Driver Implementation
-// ============================================================================
-
-struct SubmitContextInternal<'a> {
-    port: &'a crate::win32::IoCompletionPort,
-    wheel: &'a mut veloq_wheel::Wheel<usize>,
-    completion_events: &'a SharedCompletionQueue,
-    completion_table: &'a SharedCompletionTable,
-}
-
 impl IocpDriver {
+    /// Checks if the provided operation is a RIO-based operation.
+    pub(crate) fn is_rio_op(op: &IocpOp) -> bool {
+        matches!(
+            op.payload,
+            IocpOpPayload::Recv(_)
+                | IocpOpPayload::Send(_)
+                | IocpOpPayload::UdpRecv(_)
+                | IocpOpPayload::UdpSend(_)
+                | IocpOpPayload::SendTo(_)
+                | IocpOpPayload::UdpRecvStream(_)
+        )
+    }
+
+    /// Creates a pre-initialization completion port handle.
+    pub(crate) fn create_pre_init() -> IocpResult<PreInit> {
+        crate::win32::IoCompletionPort::new(0)
+            .map_err(|e| e.attach_note("failed to create pre-init IOCP"))
+    }
+
+    /// Creates a new IOCP driver instance.
+    pub fn new(config: impl AsRef<IocpConfig>) -> IocpResult<Self> {
+        let cfg = config.as_ref();
+        let pre = Self::create_pre_init()?;
+        Self::new_from_pre_init(cfg.entries.get(), pre, cfg.registration_mode)
+    }
+
+    /// Creates a new IOCP driver from a pre-initialized handle.
+    pub(crate) fn new_from_pre_init(
+        entries: u32,
+        port_val: PreInit,
+        registration_mode: BufferRegistrationMode,
+    ) -> IocpResult<Self> {
+        let port_handle = port_val.as_raw();
+        debug!(port = ?port_handle, "Initializing IocpDriver");
+        let extensions = crate::ext::Extensions::new().map_err(|e| {
+            e.attach_note(format!(
+                "failed to load IOCP extensions, port={port_handle:?}"
+            ))
+        })?;
+        let rio_state = RioState::new(
+            crate::config::RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
+            entries,
+            &extensions,
+            registration_mode,
+        )
+        .map_err(|e| {
+            diagweave::report::Report::new(IocpError::Rio)
+                .attach_note(format!(
+                    "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
+                ))
+                .attach_note(format!("{e:#}"))
+        })?;
+        let ops = OpRegistry::new(entries as usize);
+        let completion_table: SharedCompletionTable = ops.shared.clone();
+        Ok(Self {
+            port: Arc::new(port_val),
+            ops,
+            extensions,
+            wheel: Wheel::new(WheelConfig::default()),
+            timer_buffer: Vec::new(),
+            last_timer_poll: Instant::now(),
+            registered_files: Vec::new(),
+            file_generations: Vec::new(),
+            free_slots: Vec::new(),
+            is_notified: Arc::new(AtomicBool::new(false)),
+            completion_events: Arc::new(SegQueue::new()),
+            completion_table,
+            detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
+            rio_state,
+            registrar: Box::new(NoopRegistrar),
+            shutting_down: false,
+            closed: false,
+            deferred_socket_cleanup: VecDeque::new(),
+        })
+    }
+
+    pub(crate) fn has_active_ops_internal(&mut self) -> bool {
+        self.ops.has_active_ops()
+    }
+
+    pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker> {
+        Arc::new(IocpWaker {
+            port: self.port.clone(),
+            is_notified: self.is_notified.clone(),
+        })
+    }
+
     #[inline]
-    fn with_report_detail(
+    pub(crate) fn with_report_detail(
         kind: DriverErrorKind,
         scope: &'static str,
         detail: &'static str,
@@ -89,594 +184,12 @@ impl IocpDriver {
     ) -> DriverErrorReport {
         driver_error(kind, scope, format!("{detail}: {report}"))
     }
-
-    /// Fallback probe for potentially untrusted raw handles.
-    ///
-    /// We trust `RawHandle` enum semantics by default. Probe is only used when a
-    /// `File`-tagged handle may actually be a socket.
-    fn detect_socket_from_file_handle(handle: RawHandle) -> IocpResult<bool> {
-        let socket = handle.raw().as_socket();
-        let mut ty = 0i32;
-        let mut len = std::mem::size_of::<i32>() as i32;
-        // SAFETY: buffer pointers are valid for getsockopt call.
-        let ret = unsafe {
-            getsockopt(
-                socket as SOCKET,
-                SOL_SOCKET,
-                SO_TYPE,
-                &mut ty as *mut i32 as *mut u8,
-                &mut len,
-            )
-        };
-        if ret == 0 {
-            return Ok(true);
-        }
-        // SAFETY: reads last winsock error after getsockopt failure.
-        let err = unsafe { WSAGetLastError() };
-        if err == WSAENOTSOCK {
-            Ok(false)
-        } else {
-            Err(from_io_error(
-                IocpError::ResolveFd,
-                "iocp/driver.detect_socket_from_file_handle",
-                std::io::Error::from_raw_os_error(err),
-            ))
-        }
-    }
-
-    fn track_socket_submit_pending(&mut self, key: SocketKey) {
-        let _ = self.rio_state.try_acquire_socket_inflight(key);
-    }
-
-    pub(crate) fn release_socket_inflight_for_op(&mut self, user_data: usize) {
-        let socket_key = self
-            .ops
-            .get_slot_entry_op_storage_and_entry_mut(user_data)
-            .and_then(|(_, _, op_opt, _)| {
-                let op = op_opt.as_mut()?;
-                if !op.header.in_flight {
-                    return None;
-                }
-                op.header.in_flight = false;
-                op.header
-                    .resolved_handle
-                    .filter(|h| h.is_socket())
-                    .map(|h| h.actor_key())
-            });
-
-        if let Some(key) = socket_key {
-            self.rio_state.release_socket_inflight(key);
-            self.drain_deferred_socket_cleanup();
-        }
-    }
-
-    fn drain_deferred_socket_cleanup(&mut self) {
-        let mut rounds = self.deferred_socket_cleanup.len();
-        while rounds > 0 {
-            rounds -= 1;
-            let Some(pending) = self.deferred_socket_cleanup.pop_front() else {
-                break;
-            };
-
-            let key = pending.handle;
-            let ready = self.rio_state.socket_ready_for_cleanup(key);
-
-            if ready {
-                self.rio_state.shutdown_actor(key);
-                if let Some(fd) = pending.registered_fd {
-                    let _ = self.unregister_files(vec![fd]);
-                }
-                self.rio_state.forget_socket_runtime(key);
-            } else {
-                self.deferred_socket_cleanup.push_back(pending);
-            }
-        }
-    }
-
-    #[inline]
-    fn prep_op_slot(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-        user_data: usize,
-        op: IocpOp,
-    ) -> IocpResult<Slot<'_, Reserved>> {
-        let mut guard = ops.slot_reserve(user_data);
-        let generation = guard.entry.generation(Ordering::Acquire);
-        guard.platform_mut().generation = generation;
-        let mut guard = guard.init_op_with(op, |sidecar| {
-            sidecar.user_data = user_data;
-            sidecar.generation = generation;
-            sidecar.blocking_result = None;
-            sidecar.in_flight = false;
-            sidecar.resolved_handle = None;
-        });
-
-        guard
-            .with_op_mut(|op_ref| {
-                op_ref.header.user_data = user_data;
-                op_ref.header.generation = generation;
-                op_ref.header.resolved_handle = None;
-            })
-            .ok_or_else(|| {
-                diagweave::report::Report::new(IocpError::InvalidState)
-                    .attach_note("Op missing in prep_op_slot")
-            })?;
-
-        Ok(guard)
-    }
-
-    fn handle_offload(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-        ctx: SubmitContextInternal<'_>,
-        user_data: usize,
-        task: BlockingTask,
-    ) -> DriverResult<Poll<()>> {
-        if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-            op_entry.platform_data.rio_pool_waiting = false;
-        }
-        if get_blocking_pool().execute(task).is_err() {
-            if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
-                let mut guard = slot.complete();
-                let (payload, detail) = guard.take_completion_data();
-                let _ = guard.take_op();
-                let sidecar = CompletionSidecar {
-                    user_data,
-                    generation: guard.entry.generation(Ordering::Acquire),
-                    res: iocp_fallback_event_res(IocpError::Submission),
-                    flags: 0,
-                    payload,
-                    detail,
-                };
-                push_completion_shared(
-                    ctx.completion_events,
-                    ctx.completion_table,
-                    completion_record(sidecar),
-                );
-            }
-            let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
-            ops.recycle(user_data, generation.wrapping_add(1));
-            return Err(driver_error(
-                DriverErrorKind::Submission,
-                "iocp/driver",
-                "thread pool overloaded",
-            ));
-        }
-        Ok(Poll::Pending)
-    }
-
-    fn on_submit_res(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-        ctx: SubmitContextInternal<'_>,
-        result: DriverResult<submit::SubmissionResult>,
-        user_data: usize,
-        op_in: &mut Option<IocpOp>,
-        binder: SubmitBinder,
-        is_rio_pool_waiting: bool,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
-        match result {
-            Ok(submit::SubmissionResult::Pending) => {
-                if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-                    op_entry.platform_data.rio_pool_waiting = is_rio_pool_waiting;
-                }
-                binder.ok(Poll::Pending)
-            }
-            Ok(submit::SubmissionResult::PostToQueue) => {
-                Self::handle_post_to_queue(ops, ctx, user_data, op_in, binder)
-            }
-            Ok(submit::SubmissionResult::Offload(task)) => {
-                match Self::handle_offload(ops, ctx, user_data, task) {
-                    Ok(poll) => binder.ok(poll),
-                    Err(_) => binder.err(
-                        driver_error(
-                            DriverErrorKind::Submission,
-                            "iocp/driver",
-                            "offload task submission failed",
-                        ),
-                        SubmitStatus::InFlight,
-                    ),
-                }
-            }
-            Ok(submit::SubmissionResult::Timer(duration)) => {
-                Self::handle_timer_sub(ops, ctx, user_data, duration, binder)
-            }
-            Err(_e) => {
-                if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
-                    let mut guard = slot.complete();
-                    *op_in = guard.take_op();
-                }
-                binder.err(
-                    driver_error(
-                        DriverErrorKind::Submission,
-                        "iocp/driver",
-                        "operation submission failed",
-                    ),
-                    SubmitStatus::Void,
-                )
-            }
-        }
-    }
-
-    fn handle_post_to_queue(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-        ctx: SubmitContextInternal<'_>,
-        user_data: usize,
-        op_in: &mut Option<IocpOp>,
-        binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
-        if let Err(err) = ctx.port.notify(user_data) {
-            if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
-                let mut guard = slot.complete();
-                *op_in = guard.take_op();
-            }
-            let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
-            ops.recycle(user_data, generation.wrapping_add(1));
-            binder.err(
-                driver_error(
-                    DriverErrorKind::Submission,
-                    "iocp/driver",
-                    format!("failed to post completion queue notification: {err:#}"),
-                ),
-                SubmitStatus::Void,
-            )
-        } else {
-            if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-                op_entry.platform_data.rio_pool_waiting = false;
-            }
-            binder.ok(Poll::Pending)
-        }
-    }
-
-    fn handle_timer_sub(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
-        ctx: SubmitContextInternal<'_>,
-        user_data: usize,
-        duration: Duration,
-        binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
-        let timeout = ctx.wheel.insert(user_data, duration);
-        if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-            op_entry.platform_data.timer_id = Some(timeout);
-            op_entry.platform_data.timer_deadline = Some(Instant::now() + duration);
-            op_entry.platform_data.rio_pool_waiting = false;
-        }
-        binder.ok(Poll::Pending)
-    }
-
-    fn call_op_submit(
-        &mut self,
-        user_data: usize,
-        op: IocpOp,
-    ) -> DriverResult<(bool, DriverResult<submit::SubmissionResult>)> {
-        let slots_per_page = self.ops.local.len();
-        let (slab_ptr, slab_len) = self.ops.get_page_slice(0).ok_or_else(|| {
-            driver_error(
-                DriverErrorKind::InvalidState,
-                "iocp/driver",
-                "failed to get page slice",
-            )
-        })?;
-
-        let mut guard = Self::prep_op_slot(&mut self.ops, user_data, op).map_err(|e| {
-            driver_error(
-                DriverErrorKind::InvalidState,
-                "iocp/driver",
-                format!("failed to prepare op slot: {e:#}"),
-            )
-        })?;
-
-        let is_rio_pool_waiting = guard
-            .with_op_mut(|op| {
-                matches!(
-                    op.payload,
-                    crate::op::IocpOpPayload::UdpRecvStream(_)
-                        | crate::op::IocpOpPayload::UdpRecv(_)
-                )
-            })
-            .unwrap_or(false);
-        let overlapped = guard.storage.with_mut(|_op, _result, _payload, sidecar| {
-            &mut sidecar.inner as *mut crate::win32::Overlapped
-        });
-
-        let mut ctx = SubmitContext {
-            port: self.port.as_ref(),
-            overlapped,
-            ext: &self.extensions,
-            registered_files: &self.registered_files,
-            registrar: self.registrar.as_ref(),
-            rio: &mut self.rio_state,
-            slots_per_page,
-            slab_resolver: &|idx| (idx == 0).then_some((slab_ptr, slab_len)),
-        };
-
-        let mut sub_guard = guard.start_submission_with(Some(|slot| {
-            slot.storage
-                .with_mut(|_op, _result, _payload, sidecar| sidecar.in_flight = false);
-        }));
-        let result = sub_guard
-            .slot
-            .as_mut()
-            .and_then(|slot| slot.with_op_mut(|op| op.submit(&mut ctx)))
-            .ok_or_else(|| {
-                driver_error(
-                    DriverErrorKind::InvalidState,
-                    "iocp/driver",
-                    "op missing during submission",
-                )
-            })?
-            .to_driver_result(
-                DriverErrorKind::Submission,
-                "iocp/driver",
-                "op submit failed",
-            );
-
-        let pending_socket_key = if matches!(result, Ok(submit::SubmissionResult::Pending)) {
-            sub_guard
-                .slot
-                .as_mut()
-                .and_then(|slot| {
-                    slot.with_op_mut(|op| {
-                        op.header
-                            .in_flight
-                            .then_some(op.header.resolved_handle)
-                            .flatten()
-                    })
-                })
-                .flatten()
-                .filter(|h| h.is_socket())
-                .map(|h| h.actor_key())
-        } else {
-            None
-        };
-
-        let mut sub_guard_opt = Some(sub_guard);
-        if result.is_ok() {
-            let guard = sub_guard_opt.take().ok_or_else(|| {
-                driver_error(
-                    DriverErrorKind::InvalidState,
-                    "iocp/driver",
-                    "submission guard missing",
-                )
-            })?;
-            let _ = guard.persist();
-        }
-        drop(sub_guard_opt);
-
-        if let Some(socket_key) = pending_socket_key {
-            self.track_socket_submit_pending(socket_key);
-        }
-
-        Ok((is_rio_pool_waiting, result))
-    }
-
-    /// Registers a chunk of memory for RIO operations.
-    pub(crate) fn register_chunk(
-        &mut self,
-        id: u16,
-        ptr: *const u8,
-        len: usize,
-    ) -> DriverResult<()> {
-        use crate::rio::error::RioResultExt;
-        self.rio_state
-            .register_chunk(id, ptr, len)
-            .to_driver_result(
-                DriverErrorKind::Registration,
-                "iocp/driver",
-                "failed to register RIO chunk",
-            )?;
-        Ok(())
-    }
-
-    /// Shuts down the RIO actor associated with the specified socket handle.
-    /// This is used by both TCP and UDP teardown paths.
-    pub fn shutdown_actor(&mut self, handle: RawHandle) {
-        self.rio_state.shutdown_actor(handle.raw().actor_key());
-    }
-
-    /// Registers a set of file/socket handles for use with the driver.
-    pub(crate) fn register_files<'a>(
-        &mut self,
-        files: Vec<RegisterFd<'a, IocpHandle>>,
-    ) -> DriverResult<Vec<IoFd>> {
-        let mut registered = Vec::with_capacity(files.len());
-        for file in files {
-            let (handle, is_owned_input) = match file {
-                RegisterFd::Borrowed(h) => (RawHandle::new(h.raw()), false),
-                RegisterFd::Owned(h) => (h.into_raw(), true),
-            };
-            // Trust enum semantics first; only probe file-tagged handles as fallback.
-            let canonical = match handle.kind() {
-                RawHandleKind::Socket => handle,
-                RawHandleKind::File => {
-                    if Self::detect_socket_from_file_handle(handle).map_err(|e| {
-                        driver_error(
-                            DriverErrorKind::InvalidInput,
-                            "iocp/driver",
-                            format!("detect socket from file handle failed: {e:#}"),
-                        )
-                    })? {
-                        RawHandle::new(IocpHandle::for_socket(handle.raw().as_handle()))
-                    } else {
-                        handle
-                    }
-                }
-            };
-            let kind = canonical.kind();
-            if kind == RawHandleKind::Socket {
-                self.rio_state
-                    .mark_socket_registered(canonical.raw().actor_key());
-            }
-            let entry = if is_owned_input {
-                // SAFETY: ownership comes from RegisterFd::Owned and is transferred
-                // into the registered slot for deterministic lifecycle management.
-                RegisteredHandle::Owned(unsafe { crate::OwnedRawHandle::from_raw_owned(canonical) })
-            } else {
-                // Borrowed handles must remain non-owning to avoid accidental close/double-close.
-                RegisteredHandle::Weak(canonical)
-            };
-            let idx = if let Some(idx) = self.free_slots.pop() {
-                self.registered_files[idx] = Some(entry);
-                self.rio_state.clear_registered_rq(idx);
-                idx
-            } else {
-                self.registered_files.push(Some(entry));
-                self.rio_state.resize_rqs(self.registered_files.len());
-                self.file_generations.push(0);
-                self.registered_files.len() - 1
-            };
-            let generation = self.file_generations[idx];
-            registered.push(IoFd::fixed_with_generation(idx as u32, generation));
-        }
-        Ok(registered)
-    }
-
-    /// Unregisters a set of previously registered files.
-    pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
-        for fd in files {
-            let idx = fd.fixed_index() as usize;
-            if idx < self.registered_files.len() {
-                if self.file_generations.get(idx).copied() != Some(fd.generation()) {
-                    continue;
-                }
-                let Some(entry) = self.registered_files[idx].take() else {
-                    continue;
-                };
-                if entry.as_raw().kind() == RawHandleKind::Socket {
-                    self.rio_state
-                        .shutdown_actor(entry.as_raw().raw().actor_key());
-                }
-                self.rio_state.clear_registered_rq(idx);
-                self.free_slots.push(idx);
-                self.file_generations[idx] = self.file_generations[idx].wrapping_add(1);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn shutdown_ops(&mut self) -> usize {
-        if self.shutting_down {
-            return 0;
-        }
-        self.shutting_down = true;
-        self.rio_state.begin_shutdown();
-
-        let mut in_flight = Vec::new();
-        for user_data in 0..self.ops.local.len() {
-            if matches!(
-                self.ops.slot_view(user_data),
-                Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_))
-            ) {
-                in_flight.push(user_data);
-            }
-        }
-        let count = in_flight.len();
-        for user_data in in_flight {
-            self.cancel_op_internal(user_data);
-        }
-        count
-    }
-
-    pub(crate) fn drain_pending_iocp(
-        &mut self,
-        pending_count: usize,
-        timeout: Duration,
-    ) -> DriverResult<()> {
-        if pending_count == 0 {
-            return Ok(());
-        }
-        let mut drained = 0usize;
-        let deadline = Instant::now() + timeout;
-
-        while drained < pending_count {
-            if Instant::now() >= deadline {
-                return Err(driver_error(
-                    DriverErrorKind::Timeout,
-                    "iocp/driver",
-                    "drain timed out",
-                ));
-            }
-            drained += self.poll_completion()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn poll_completion(&mut self) -> DriverResult<usize> {
-        let status = self.port.get_status(10).to_driver_result(
-            DriverErrorKind::Completion,
-            "iocp/driver",
-            "failed to poll IOCP status",
-        )?;
-
-        match status {
-            crate::win32::CompletionStatus::Completed {
-                bytes,
-                key,
-                overlapped,
-                success,
-                error_code,
-            } => {
-                if key == RIO_EVENT_KEY {
-                    return self
-                        .rio_state
-                        .process_completions(
-                            &mut self.ops,
-                            &*self.registrar,
-                            &self.completion_events,
-                            &self.completion_table,
-                        )
-                        .map_err(|e| {
-                            Self::with_report_detail(
-                                DriverErrorKind::Completion,
-                                "iocp/driver",
-                                "failed to process rio completions",
-                                format!("{e:#}"),
-                            )
-                        });
-                }
-
-                if !overlapped.is_null() {
-                    // SAFETY: overlapped pointer is guaranteed to be valid during IOCP completion.
-                    let id = unsafe { crate::win32::OverlappedId::from_ptr(overlapped) };
-                    self.process_completion(id.as_usize(), success, error_code, bytes);
-                    return Ok(1);
-                }
-            }
-            crate::win32::CompletionStatus::Timeout => {}
-        }
-        Ok(0)
-    }
-
-    pub(crate) fn close_impl(&mut self, mode: CloseMode) -> DriverResult<()> {
-        if self.closed {
-            return Ok(());
-        }
-        let pending = self.shutdown_ops();
-        if let CloseMode::Strict { timeout } = mode {
-            self.drain_pending_iocp(pending, timeout).map_err(|e| {
-                Self::with_report_detail(
-                    DriverErrorKind::Timeout,
-                    "iocp/driver",
-                    "drain pending iocp timed out",
-                    format!("{e:#}"),
-                )
-            })?;
-            self.rio_state.drain_outstanding(timeout).map_err(|e| {
-                Self::with_report_detail(
-                    DriverErrorKind::Completion,
-                    "iocp/driver",
-                    "failed to drain RIO outstanding requests",
-                    format!("{e:#}"),
-                )
-            })?;
-        }
-        self.rio_state.kernel.close();
-        self.closed = true;
-        Ok(())
-    }
 }
 
 impl Driver for IocpDriver {
-    type Op = IocpOp;
+    type Op = crate::op::IocpOp;
     type Raw = IocpHandle;
-    type Sidecar = OverlappedEntry;
+    type Sidecar = crate::op::OverlappedEntry;
     type Completion = usize;
 
     fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
@@ -711,6 +224,7 @@ impl Driver for IocpDriver {
     }
 
     fn slot_take_payload(&mut self, user_data: usize) -> Option<ErasedPayload> {
+        use std::sync::atomic::Ordering;
         let payload = self
             .ops
             .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
@@ -727,7 +241,8 @@ impl Driver for IocpDriver {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+    ) -> veloq_driver_core::driver::Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>>
+    {
         if self.shutting_down {
             return binder.err(
                 driver_os_error(
@@ -768,7 +283,7 @@ impl Driver for IocpDriver {
             }
         };
 
-        let ctx = SubmitContextInternal {
+        let ctx = submission::SubmitContextInternal {
             port: self.port.as_ref(),
             wheel: &mut self.wheel,
             completion_events: &self.completion_events,
@@ -866,19 +381,7 @@ impl Driver for IocpDriver {
         buf_capacity: NonZeroUsize,
         credits: usize,
     ) -> DriverResult<()> {
-        let handle = resolve_fd_borrowed(&fd, &self.registered_files).to_driver_result(
-            DriverErrorKind::Registration,
-            "iocp/driver.warmup_udp_socket",
-            "resolve fd for UDP warmup",
-        )?;
-        self.rio_state
-            .warmup_udp_socket((fd, handle), buf_capacity.get(), credits, &*self.registrar)
-            .map(|_| ())
-            .to_driver_result(
-                DriverErrorKind::Internal,
-                "iocp/driver.warmup_udp_socket",
-                "warm up UDP recv pool",
-            )
+        self.warmup_udp_socket_impl(fd, buf_capacity, credits)
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
@@ -900,7 +403,7 @@ impl Drop for IocpDriver {
 }
 
 #[cfg(feature = "test-hooks")]
-impl DriverTestHooks for IocpDriver {
+impl veloq_driver_core::driver::test_hooks::DriverTestHooks for IocpDriver {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.rio_state
             .registry
