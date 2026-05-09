@@ -507,6 +507,10 @@ pub(crate) unsafe fn make_sqe_send_to(
         unsafe { user.buf.as_slice().as_ptr().add(user.buf_offset) } as *mut _;
     kernel.iovec[0].iov_len = user.buf.len() - user.buf_offset;
 
+    let (msg_name, msg_namelen) = crate::net::socket_addr_to_storage(user.addr);
+    kernel.msg_name = msg_name.0;
+    kernel.msg_namelen = msg_namelen;
+
     kernel.msghdr.msg_name = &mut kernel.msg_name as *mut _ as *mut libc::c_void;
     kernel.msghdr.msg_namelen = kernel.msg_namelen;
     kernel.msghdr.msg_iov = kernel.iovec.as_mut_ptr();
