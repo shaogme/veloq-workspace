@@ -1,5 +1,6 @@
 use crate::driver::IocpOpState;
-use crate::op::{IocpOp, OverlappedEntry};
+use crate::op::{IocpOp, IocpUserPayload, OverlappedEntry};
 use veloq_driver_core::slot::Slot as CoreSlot;
 
-pub(crate) type Slot<'a, State> = CoreSlot<'a, State, IocpOp, IocpOpState, OverlappedEntry>;
+pub(crate) type Slot<'a, State, UP = IocpUserPayload> =
+    CoreSlot<'a, State, IocpOp, UP, IocpOpState, OverlappedEntry>;

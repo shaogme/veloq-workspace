@@ -4,13 +4,14 @@ use tracing::{error, trace};
 
 use crate::driver::UringDriver;
 use crate::error::{UringError, UringResult, from_io_error};
-use crate::op::slot::{SlotView, UringOpRegistryExt};
+use crate::op::{
+    UringUserPayload,
+    slot::{SlotView, UringOpRegistryExt},
+};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, drain_cancel_requests, encode_completion_token,
 };
-use veloq_driver_core::{
-    DriverErrorKind, DriverResult, driver_error_report_to_event_res, driver_os_error,
-};
+use veloq_driver_core::{DriverResult, driver_error_report_to_event_res};
 
 impl UringDriver {
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
@@ -78,7 +79,7 @@ impl UringDriver {
                     let _ = completed.take_op();
                     let (payload, detail) = completed.take_completion_data();
 
-                    Some(CompletionSidecar {
+                    Some(CompletionSidecar::<UringUserPayload> {
                         user_data,
                         generation,
                         res: 0,
@@ -125,7 +126,7 @@ impl UringDriver {
         };
 
         let mut needs_waker_resubmit = false;
-        let mut pending_events: Vec<CompletionSidecar> = Vec::new();
+        let mut pending_events: Vec<CompletionSidecar<UringUserPayload>> = Vec::new();
 
         let mut cqes = Vec::new();
         {
@@ -153,22 +154,13 @@ impl UringDriver {
             }
 
             let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
-                SlotView::InFlightWaiting(mut slot) => {
+                SlotView::InFlightWaiting(slot) => {
                     let res_val = cqe_res;
-                    let final_res = slot
-                        .with_op_mut(|op| unsafe { (op.vtable.on_complete)(op, res_val) })
-                        .unwrap_or_else(|| {
-                            if res_val >= 0 {
-                                Ok(res_val as usize)
-                            } else {
-                                Err(driver_os_error(
-                                    DriverErrorKind::Completion,
-                                    "uring.driver.process_completions_internal.on_complete",
-                                    -res_val,
-                                    "kernel completion returned error",
-                                ))
-                            }
-                        });
+                    let final_res = {
+                        let payload = slot.storage.payload.as_mut().unwrap();
+                        let op = slot.op.as_mut().unwrap();
+                        unsafe { (op.vtable.on_complete)(op, payload, res_val) }
+                    };
 
                     let mut completed = slot.complete();
                     let generation = completed.entry.generation(Ordering::Acquire);
@@ -182,7 +174,7 @@ impl UringDriver {
                     }
                     let _ = completed.take_op();
 
-                    Some(CompletionSidecar {
+                    Some(CompletionSidecar::<UringUserPayload> {
                         user_data,
                         generation,
                         res: res_code,
@@ -197,7 +189,7 @@ impl UringDriver {
                     let (payload, detail) = completed.take_completion_data();
                     let _ = completed.take_op();
 
-                    Some(CompletionSidecar {
+                    Some(CompletionSidecar::<UringUserPayload> {
                         user_data,
                         generation,
                         res: cqe_res,
@@ -224,7 +216,6 @@ impl UringDriver {
             if let Some(token) = self.waker_token.take() {
                 self.ops.remove(token);
             }
-            self.waker_payload = None;
             if let Err(e) = self.submit_waker() {
                 error!(report = ?e, "failed to resubmit waker");
             }
@@ -232,8 +223,7 @@ impl UringDriver {
         }
     }
 
-    #[inline]
-    pub(crate) fn push_completion_event(&mut self, sidecar: CompletionSidecar) {
+    pub(crate) fn push_completion_event(&mut self, sidecar: CompletionSidecar<UringUserPayload>) {
         let token = encode_completion_token(sidecar.user_data, sidecar.generation);
         let event = CompletionEvent {
             user_data: token,

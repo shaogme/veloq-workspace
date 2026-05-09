@@ -14,13 +14,12 @@ use crate::config::{
     BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig, UringRawHandle,
 };
 use crate::error::{UringError, UringResult, UringResultExt, from_io_error};
-use crate::op::UringOp;
+use crate::op::{UringOp, UringUserPayload};
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle, OpRegistry};
 use veloq_driver_core::driver::{
     DriveMode, DriveOutcome, Driver, Outcome, RegisterFd, RemoteWaker, SharedCompletionQueue,
     SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
-use veloq_driver_core::op::Wakeup;
 use veloq_driver_core::slot::DetachedCancelTable;
 use veloq_driver_core::{
     DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
@@ -102,17 +101,16 @@ pub(crate) fn map_uring_error(
 
 pub struct UringDriver {
     pub(crate) ring: IoUring,
-    pub(crate) ops: OpRegistry<UringOp, UringOpState, ()>,
+    pub(crate) ops: OpRegistry<UringOp, UringUserPayload, UringOpState, ()>,
     pub(crate) backlog: VecDeque<usize>,
     pub(crate) pending_cancellations: VecDeque<usize>,
     pub(crate) completion_events: SharedCompletionQueue,
-    pub(crate) completion_table: SharedCompletionTable,
+    pub(crate) completion_table: SharedCompletionTable<UringUserPayload>,
     pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_registered_fd: Option<IoFd>,
     pub(crate) waker_token: Option<usize>,
-    pub(crate) waker_payload: Option<Box<Wakeup>>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
@@ -156,7 +154,7 @@ impl UringDriver {
             .map_err(|e| from_io_error(UringError::DriverInit, "driver.new.build_ring", e))?;
 
         let ops = OpRegistry::new(entries as usize);
-        let completion_table: SharedCompletionTable = ops.shared.clone();
+        let completion_table: SharedCompletionTable<UringUserPayload> = ops.shared.clone();
 
         let waker_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if waker_fd < 0 {
@@ -189,7 +187,6 @@ impl UringDriver {
             }),
             waker_registered_fd: None,
             waker_token: None,
-            waker_payload: None,
             registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
             is_waked,
 
@@ -239,6 +236,7 @@ impl Drop for UringDriver {
 
 impl Driver for UringDriver {
     type Op = UringOp;
+    type UP = UringUserPayload;
     type Raw = UringRawHandle;
     type Sidecar = ();
     type Completion = usize;
@@ -263,7 +261,9 @@ impl Driver for UringDriver {
 
     fn slot_table(
         &self,
-    ) -> std::sync::Arc<veloq_driver_core::slot::SlotTable<Self::Op, Self::Sidecar>> {
+    ) -> std::sync::Arc<
+        veloq_driver_core::slot::SlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion>,
+    > {
         self.ops.shared.clone()
     }
 
@@ -271,11 +271,7 @@ impl Driver for UringDriver {
         self.detached_cancel_table.clone()
     }
 
-    fn slot_set_payload(
-        &mut self,
-        user_data: usize,
-        payload: veloq_driver_core::slot::ErasedPayload,
-    ) {
+    fn slot_set_payload(&mut self, user_data: usize, payload: UringUserPayload) {
         let _ =
             self.ops
                 .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
@@ -283,10 +279,7 @@ impl Driver for UringDriver {
                 });
     }
 
-    fn slot_take_payload(
-        &mut self,
-        user_data: usize,
-    ) -> Option<veloq_driver_core::slot::ErasedPayload> {
+    fn slot_take_payload(&mut self, user_data: usize) -> Option<UringUserPayload> {
         self.ops
             .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
                 payload_cell.take()
@@ -387,7 +380,7 @@ impl Driver for UringDriver {
         self.completion_events.clone()
     }
 
-    fn completion_table(&self) -> SharedCompletionTable {
+    fn completion_table(&self) -> SharedCompletionTable<UringUserPayload> {
         self.completion_table.clone()
     }
 

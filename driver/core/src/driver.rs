@@ -3,6 +3,7 @@ use crate::slot::is_runnable_state;
 use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
 use crate::{DriverErrorReport, DriverResult};
 
+use std::sync::Arc;
 use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
@@ -24,23 +25,24 @@ pub enum DriverControlCommand {
     UnregisterFiles(Vec<IoFd>),
 }
 
+pub type SharedSlotTable<Op, UP, S, C> = Arc<slot::SlotTable<Op, UP, S, C>>;
+
 pub trait Driver {
     type Op: PlatformOp;
+    type UP: Send;
     type Raw: RawHandleMeta;
     type Sidecar: SlotSidecar;
     type Completion: CompletionValue;
 
     fn reserve_op(&mut self) -> DriverResult<(usize, u32)>;
 
-    fn slot_table(
-        &self,
-    ) -> std::sync::Arc<slot::SlotTable<Self::Op, Self::Sidecar, Self::Completion>>;
+    fn slot_table(&self) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion>;
 
-    fn detached_cancel_table(&self) -> std::sync::Arc<slot::DetachedCancelTable>;
+    fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable>;
 
-    fn slot_set_payload(&mut self, user_data: usize, payload: slot::ErasedPayload);
+    fn slot_set_payload(&mut self, user_data: usize, payload: Self::UP);
 
-    fn slot_take_payload(&mut self, user_data: usize) -> Option<slot::ErasedPayload>;
+    fn slot_take_payload(&mut self, user_data: usize) -> Option<Self::UP>;
 
     fn submit(
         &mut self,
@@ -53,7 +55,7 @@ pub trait Driver {
 
     fn completion_queue(&self) -> SharedCompletionQueue;
 
-    fn completion_table(&self) -> SharedCompletionTable<Self::Completion>;
+    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion>;
 
     fn try_pop_completion(&mut self) -> Option<CompletionEvent> {
         self.completion_queue().pop()
@@ -81,7 +83,7 @@ pub trait Driver {
         credits: usize,
     ) -> DriverResult<()>;
 
-    fn create_waker(&self) -> std::sync::Arc<dyn RemoteWaker>;
+    fn create_waker(&self) -> Arc<dyn RemoteWaker>;
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
 }

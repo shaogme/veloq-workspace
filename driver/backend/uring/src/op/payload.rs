@@ -1,5 +1,3 @@
-use std::ptr::NonNull;
-
 use veloq_driver_core::op::{
     Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
     FallocateRaw as CoreFallocateRaw, Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw,
@@ -38,15 +36,12 @@ pub(crate) type UdpRecvStream = CoreUdpRecvStream;
 pub(crate) type Wakeup = CoreWakeup;
 
 pub(crate) struct KernelRef<T> {
-    pub(crate) user: NonNull<T>,
+    pub(crate) _marker: std::marker::PhantomData<T>,
 }
 
-pub(crate) struct AcceptPayload {
-    pub(crate) user: NonNull<Accept>,
-}
+pub(crate) struct AcceptPayload {}
 
 pub(crate) struct SendToPayload {
-    pub(crate) user: NonNull<SendTo>,
     pub(crate) msg_name: libc::sockaddr_storage,
     pub(crate) msg_namelen: libc::socklen_t,
     pub(crate) iovec: [libc::iovec; 1],
@@ -54,23 +49,18 @@ pub(crate) struct SendToPayload {
 }
 
 pub(crate) struct UdpRecvStreamPayload {
-    pub(crate) user: NonNull<UdpRecvStream>,
     pub(crate) msg_name: libc::sockaddr_storage,
     pub(crate) iovec: [libc::iovec; 1],
     pub(crate) msghdr: libc::msghdr,
 }
 
-pub(crate) struct OpenPayload {
-    pub(crate) user: NonNull<Open>,
-}
+pub(crate) struct OpenPayload {}
 
 pub(crate) struct WakeupPayload {
-    pub(crate) user: NonNull<Wakeup>,
     pub(crate) buf: [u8; 8],
 }
 
 pub(crate) struct TimeoutPayload {
-    pub(crate) user: NonNull<Timeout>,
     pub(crate) ts: [i64; 2],
 }
 

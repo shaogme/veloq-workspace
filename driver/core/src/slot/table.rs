@@ -3,7 +3,7 @@ use crate::slot::core::{SlotData, SlotState};
 use crossbeam_utils::CachePadded;
 use veloq_shim::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-pub type SlotEntry<Op, S, R = usize> = CachePadded<SlotData<Op, S, R>>;
+pub type SlotEntry<Op, UP, S, R = usize> = CachePadded<SlotData<Op, UP, S, R>>;
 
 pub struct DetachedCancelTable {
     slot_count: usize,
@@ -72,15 +72,15 @@ impl DetachedCancelTable {
     }
 }
 
-pub struct SlotTable<Op, S: SlotSidecar, R = usize> {
-    pub slots: Box<[SlotEntry<Op, S, R>]>,
+pub struct SlotTable<Op, UP, S: SlotSidecar, R = usize> {
+    pub slots: Box<[SlotEntry<Op, UP, S, R>]>,
     pub remote_free_head: AtomicUsize,
     ready_completion_count: AtomicUsize,
 }
 
-unsafe impl<Op, S: SlotSidecar, R> Sync for SlotTable<Op, S, R> {}
+unsafe impl<Op, UP, S: SlotSidecar, R> Sync for SlotTable<Op, UP, S, R> {}
 
-impl<Op, S: SlotSidecar, R> SlotTable<Op, S, R> {
+impl<Op, UP, S: SlotSidecar, R> SlotTable<Op, UP, S, R> {
     pub const NULL_INDEX: usize = usize::MAX;
 
     pub fn new(capacity: usize) -> Self {

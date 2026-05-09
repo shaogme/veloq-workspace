@@ -6,6 +6,7 @@ use diagweave::report::Report;
 use tracing::error;
 
 use crate::error::{IocpError, IocpResult, IocpResultExt};
+use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionRecord, CompletionSidecar, RemoteWaker, SharedCompletionQueue,
@@ -109,7 +110,9 @@ fn iocp_report_to_event_res(report: &Report<IocpError>) -> i32 {
 }
 
 #[inline]
-pub(crate) fn completion_record(sidecar: CompletionSidecar) -> CompletionRecord {
+pub(crate) fn completion_record(
+    sidecar: CompletionSidecar<IocpUserPayload>,
+) -> CompletionRecord<IocpUserPayload> {
     CompletionRecord {
         event: CompletionEvent {
             user_data: encode_completion_token(sidecar.user_data, sidecar.generation),
@@ -124,8 +127,8 @@ pub(crate) fn completion_record(sidecar: CompletionSidecar) -> CompletionRecord 
 #[inline]
 pub(crate) fn push_completion_shared(
     queue: &SharedCompletionQueue,
-    table: &SharedCompletionTable,
-    record: CompletionRecord,
+    table: &SharedCompletionTable<IocpUserPayload>,
+    record: CompletionRecord<IocpUserPayload>,
 ) {
     table.record_completion_with_data(record.event, record.payload, record.detail);
     queue.push(record.event);

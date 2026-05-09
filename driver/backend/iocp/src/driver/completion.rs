@@ -18,12 +18,12 @@ use crate::config::SocketKey;
 use crate::driver::{CloseMode, CompletionSidecar, IocpDriver, IocpOpState, RIO_EVENT_KEY};
 use crate::error::{IocpError, IocpResult, from_io_error};
 use crate::op::slot::Slot;
-use crate::op::{IocpOp, OverlappedEntry, submit};
+use crate::op::{IocpOp, IocpUserPayload, OverlappedEntry, submit};
 use veloq_buf::BufferRegistrar;
 
 pub(crate) struct EmitContext<'a> {
     pub(crate) completion_events: &'a SharedCompletionQueue,
-    pub(crate) completion_table: &'a SharedCompletionTable,
+    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
 }
 
 pub(crate) struct CancelContext<'a> {
@@ -31,7 +31,7 @@ pub(crate) struct CancelContext<'a> {
     pub(crate) rio_state: &'a mut crate::rio::RioState,
     pub(crate) registrar: &'a dyn BufferRegistrar,
     pub(crate) completion_events: &'a SharedCompletionQueue,
-    pub(crate) completion_table: &'a SharedCompletionTable,
+    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
 }
 
 impl IocpDriver {
@@ -299,7 +299,7 @@ impl IocpDriver {
     }
 
     pub(crate) fn finish_timer_op(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
         user_data: usize,
         pending_events: &mut Vec<CompletionSidecar>,
     ) {
@@ -387,7 +387,7 @@ impl IocpDriver {
 
     #[inline]
     pub(crate) fn with_inflight_slot<R>(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
         index: usize,
         f: impl FnOnce(Slot<'_, InFlightWaiting>) -> R,
     ) -> Option<R> {
@@ -469,7 +469,7 @@ impl IocpDriver {
 
     pub(crate) fn emit_event_inner(
         ctx: EmitContext<'_>,
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
         user_data: usize,
         slot_generation: u32,
         io_result: IocpResult<usize>,
@@ -568,7 +568,7 @@ impl IocpDriver {
     pub(crate) fn perform_cancel(
         ctx: CancelContext<'_>,
         user_data: usize,
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
     ) -> Option<SocketKey> {
         let mut should_emit_aborted = false;
         let mut aborted_socket_key = None;
@@ -632,7 +632,7 @@ impl IocpDriver {
     pub(crate) fn emit_aborted_inner(
         ctx: EmitContext<'_>,
         user_data: usize,
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
     ) {
         let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
         let inflight = Self::with_inflight_slot(ops, user_data, |guard| {

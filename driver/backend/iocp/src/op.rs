@@ -99,6 +99,14 @@ macro_rules! define_iocp_ops {
             }
         ),+ $(,)?
     ) => {
+        pub enum IocpUserPayload {
+            $(
+                $OpType(Box<$OpType>),
+            )+
+        }
+
+        unsafe impl Send for IocpUserPayload {}
+
         /// Type-safe payload enum for IOCP operations.
         pub(crate) enum IocpOpPayload {
             $(
@@ -146,6 +154,7 @@ macro_rules! define_iocp_ops {
         $(
             impl IntoPlatformOp<IocpOp> for $OpType {
                 type UserPayload = Box<$OpType>;
+                type ErasedPayload = IocpUserPayload;
                 type Completion = define_iocp_ops!(@completion_type $($completion)?);
                 type DriverCompletion = usize;
                 const PAYLOAD_KIND: OpKind = $kind;
@@ -189,17 +198,16 @@ macro_rules! define_iocp_ops {
                     define_iocp_ops!(@destruct payload, $($destruct)?)
                 }
 
-                fn payload_into_erased(payload: Self::UserPayload) -> veloq_driver_core::slot::ErasedPayload {
-                    veloq_driver_core::slot::ErasedPayload {
-                        ptr: Box::into_raw(payload) as *mut (),
-                        kind: Self::PAYLOAD_KIND as u16,
-                        drop_fn: define_iocp_ops!(@drop_raw_fn $OpType),
-                    }
+                fn payload_into_erased(payload: Self::UserPayload) -> IocpUserPayload {
+                    IocpUserPayload::$OpType(payload)
                 }
 
-                unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
-                    // SAFETY: ptr is guaranteed to be a valid pointer to $OpType.
-                    unsafe { Box::from_raw(ptr as *mut $OpType) }
+                fn payload_from_erased(erased: IocpUserPayload) -> Self::UserPayload {
+                    match erased {
+                        IocpUserPayload::$OpType(p) => p,
+                        #[allow(unreachable_patterns)]
+                        _ => panic!("wrong payload type for {}", stringify!($OpType)),
+                    }
                 }
 
                 fn map_completion_result(
@@ -238,14 +246,6 @@ macro_rules! define_iocp_ops {
     (@destruct $user_payload:expr, ) => { *$user_payload };
     // Custom destruct
     (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
-
-    (@drop_raw_fn $OpType:ty) => {{
-        unsafe fn drop_raw(ptr: *mut ()) {
-            // SAFETY: ptr is guaranteed to be a valid pointer to $OpType.
-            unsafe { drop(Box::from_raw(ptr as *mut $OpType)) };
-        }
-        drop_raw
-    }};
 
     (@completion_type ) => { usize };
     (@completion_type $ty:ty) => { $ty };

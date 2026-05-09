@@ -17,7 +17,12 @@ use crate::error::{IocpError, IocpResult, from_io_error};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);
-    while cur != SlotTable::<crate::op::IocpOp, crate::op::OverlappedEntry>::NULL_INDEX {
+    while cur != SlotTable::<
+        crate::op::IocpOp,
+        crate::op::IocpUserPayload,
+        crate::op::OverlappedEntry,
+    >::NULL_INDEX
+    {
         if cur == needle {
             return true;
         }

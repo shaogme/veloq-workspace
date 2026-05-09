@@ -81,9 +81,14 @@ pub(crate) struct RioContext<'a> {
 }
 
 pub(crate) struct RioCompletionContext<'a> {
-    pub(crate) ops: &'a mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
+    pub(crate) ops: &'a mut OpRegistry<
+        IocpOp,
+        crate::op::IocpUserPayload,
+        IocpOpState,
+        crate::op::OverlappedEntry,
+    >,
     pub(crate) events: &'a SharedCompletionQueue,
-    pub(crate) table: &'a SharedCompletionTable,
+    pub(crate) table: &'a SharedCompletionTable<crate::op::IocpUserPayload>,
 }
 
 pub(crate) struct RioState {

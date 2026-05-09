@@ -14,19 +14,19 @@ use crate::common::{completion_record, iocp_fallback_event_res, push_completion_
 use crate::driver::{CompletionSidecar, IocpDriver, IocpOpState};
 use crate::error::{IocpError, IocpResult, IocpResultExt};
 use crate::op::slot::Slot;
-use crate::op::{IocpOp, OverlappedEntry, SubmitContext, submit};
+use crate::op::{IocpOp, IocpUserPayload, OverlappedEntry, SubmitContext, submit};
 
 pub(crate) struct SubmitContextInternal<'a> {
     pub(crate) port: &'a crate::win32::IoCompletionPort,
     pub(crate) wheel: &'a mut veloq_wheel::Wheel<usize>,
     pub(crate) completion_events: &'a SharedCompletionQueue,
-    pub(crate) completion_table: &'a SharedCompletionTable,
+    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
 }
 
 impl IocpDriver {
     #[inline]
     pub(crate) fn prep_op_slot(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
         user_data: usize,
         op: IocpOp,
     ) -> IocpResult<Slot<'_, Reserved>> {
@@ -56,7 +56,7 @@ impl IocpDriver {
     }
 
     pub(crate) fn handle_offload(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
         ctx: SubmitContextInternal<'_>,
         user_data: usize,
         task: BlockingTask,
@@ -95,7 +95,7 @@ impl IocpDriver {
     }
 
     pub(crate) fn on_submit_res(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
         ctx: SubmitContextInternal<'_>,
         result: DriverResult<submit::SubmissionResult>,
         user_data: usize,
@@ -149,7 +149,7 @@ impl IocpDriver {
     }
 
     pub(crate) fn handle_post_to_queue(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
         ctx: SubmitContextInternal<'_>,
         user_data: usize,
         op_in: &mut Option<IocpOp>,
@@ -181,7 +181,7 @@ impl IocpDriver {
     }
 
     pub(crate) fn handle_timer_sub(
-        ops: &mut OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
         ctx: SubmitContextInternal<'_>,
         user_data: usize,
         duration: Duration,

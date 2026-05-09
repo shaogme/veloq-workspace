@@ -547,20 +547,30 @@ impl RioState {
 
     pub(crate) fn process_completions(
         &mut self,
-        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
+        ops: &mut OpRegistry<
+            IocpOp,
+            crate::op::IocpUserPayload,
+            IocpOpState,
+            crate::op::OverlappedEntry,
+        >,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
-        completion_table: &SharedCompletionTable,
+        completion_table: &SharedCompletionTable<crate::op::IocpUserPayload>,
     ) -> RioResult<usize> {
         self.process_completions_internal(ops, registrar, completion_events, completion_table)
     }
 
     fn process_completions_internal(
         &mut self,
-        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
+        ops: &mut OpRegistry<
+            IocpOp,
+            crate::op::IocpUserPayload,
+            IocpOpState,
+            crate::op::OverlappedEntry,
+        >,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
-        completion_table: &SharedCompletionTable,
+        completion_table: &SharedCompletionTable<crate::op::IocpUserPayload>,
     ) -> RioResult<usize> {
         const MAX_RIO_RESULTS: usize = 128;
         // SAFETY: RIORESULT is a POD struct and safe to zero-initialize.

@@ -24,13 +24,21 @@ pub(crate) use payload::{
 // VTable Definition
 // ============================================================================
 
-pub(crate) type MakeSqeFn =
-    unsafe fn(op: &mut UringKernelOp, driver: &mut UringDriver) -> DriverResult<squeue::Entry>;
-pub(crate) type OnCompleteFn =
-    unsafe fn(op: &mut UringKernelOp, result: i32) -> DriverResult<usize>;
+pub(crate) type MakeSqeFn = unsafe fn(
+    op: &mut UringKernelOp,
+    driver: &mut UringDriver,
+    user_data: usize,
+) -> DriverResult<squeue::Entry>;
+pub(crate) type OnCompleteFn = unsafe fn(
+    op: &mut UringKernelOp,
+    payload: &mut UringUserPayload,
+    result: i32,
+) -> DriverResult<usize>;
 pub(crate) type DropFn = unsafe fn(op: &mut UringKernelOp);
-pub(crate) type GetTimeoutFn = unsafe fn(op: &UringKernelOp) -> Option<Duration>;
-pub(crate) type ResolveChunksFn = unsafe fn(op: &UringKernelOp, chunks: &mut [u16]) -> usize;
+pub(crate) type GetTimeoutFn =
+    unsafe fn(op: &UringKernelOp, payload: &UringUserPayload) -> Option<Duration>;
+pub(crate) type ResolveChunksFn =
+    unsafe fn(op: &UringKernelOp, payload: &UringUserPayload, chunks: &mut [u16]) -> usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionStrategy {
@@ -60,7 +68,7 @@ pub struct UringKernelOp {
     /// Virtual Table for dynamic dispatch
     pub(crate) vtable: &'static OpVTable,
 
-    /// Type-erased payload
+    /// Type-erased payload (kernel-side data)
     pub(crate) payload: UringOpPayload,
 }
 
@@ -98,9 +106,16 @@ macro_rules! define_uring_ops {
             }
         ),+ $(,)?
     ) => {
+        pub enum UringUserPayload {
+            $( $OpType($OpType), )+
+        }
+
+        unsafe impl Send for UringUserPayload {}
+
         $(
             impl IntoPlatformOp<UringOp> for $OpType {
-                type UserPayload = Box<$OpType>;
+                type UserPayload = $OpType;
+                type ErasedPayload = UringUserPayload;
                 type Completion = define_uring_ops!(@completion_type $($completion)?);
                 type DriverCompletion = usize;
                 const PAYLOAD_KIND: OpKind = $kind;
@@ -115,9 +130,10 @@ macro_rules! define_uring_ops {
                         resolve_chunks: define_uring_ops!(@resolve_chunks $($resolve_chunks)?),
                     };
 
-                    let mut user = Box::new(self);
-                    let user_ptr = std::ptr::NonNull::from(user.as_mut());
-                    let payload = define_uring_ops!(@construct user_ptr, $($construct)?, $OpType $(, $Payload)?);
+                    let user = self;
+                    // We can't get the pointer yet because it's not in the slot.
+                    // The vtable functions will get it via driver + user_data.
+                    let payload = define_uring_ops!(@construct_dummy $OpType $(, $Payload)?);
 
                     let op = UringKernelOp {
                         vtable: &TABLE,
@@ -127,19 +143,19 @@ macro_rules! define_uring_ops {
                 }
 
                 fn from_user_payload(payload: Self::UserPayload) -> Self {
-                    define_uring_ops!(@destruct payload, $($destruct)?)
+                    payload
                 }
 
-                fn payload_into_erased(payload: Self::UserPayload) -> veloq_driver_core::slot::ErasedPayload {
-                    veloq_driver_core::slot::ErasedPayload {
-                        ptr: Box::into_raw(payload) as *mut (),
-                        kind: <$OpType as IntoPlatformOp<UringOp>>::PAYLOAD_KIND as u16,
-                        drop_fn: define_uring_ops!(@drop_raw_fn $OpType),
+                fn payload_into_erased(payload: Self::UserPayload) -> UringUserPayload {
+                    UringUserPayload::$OpType(payload)
+                }
+
+                fn payload_from_erased(erased: UringUserPayload) -> Self::UserPayload {
+                    match erased {
+                        UringUserPayload::$OpType(p) => p,
+                        #[allow(unreachable_patterns)]
+                        _ => panic!("wrong payload type for {}", stringify!($OpType)),
                     }
-                }
-
-                unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload {
-                    unsafe { Box::from_raw(ptr as *mut $OpType) }
                 }
 
                 fn map_completion_result(
@@ -164,18 +180,8 @@ macro_rules! define_uring_ops {
     (@resolve_chunks ) => { crate::op::submit::resolve_chunks_none };
     (@resolve_chunks $func:expr) => { $func };
 
-    (@construct $user_ptr:expr, , $OpType:ty) => { crate::op::payload::KernelRef { user: $user_ptr } };
-    (@construct $user_ptr:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user_ptr) };
-
-    (@destruct $user_payload:expr, ) => { *$user_payload };
-    (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
-
-    (@drop_raw_fn $OpType:ty) => {{
-        unsafe fn drop_raw(ptr: *mut ()) {
-            unsafe { drop(Box::from_raw(ptr as *mut $OpType)) };
-        }
-        drop_raw
-    }};
+    (@construct_dummy $OpType:ty) => { crate::op::payload::KernelRef { _marker: std::marker::PhantomData } };
+    (@construct_dummy $OpType:ty, $Payload:ty) => { unsafe { std::mem::zeroed() } };
 
     (@on_complete ) => { crate::op::submit::on_complete_default };
     (@on_complete $func:path) => { $func };

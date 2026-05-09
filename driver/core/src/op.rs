@@ -33,6 +33,7 @@ pub trait OpLifecycle: Sized {
 /// Trait to convert a user-facing operation to a platform-specific driver operation.
 pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     type UserPayload: std::marker::Send;
+    type ErasedPayload: std::marker::Send;
     type Completion;
     type DriverCompletion: crate::driver::CompletionValue;
     const PAYLOAD_KIND: OpKind;
@@ -41,11 +42,9 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
 
     fn from_user_payload(payload: Self::UserPayload) -> Self;
 
-    fn payload_into_erased(payload: Self::UserPayload) -> crate::slot::ErasedPayload;
+    fn payload_into_erased(payload: Self::UserPayload) -> Self::ErasedPayload;
 
-    /// # Safety
-    /// `ptr` must originate from the matching `Self::payload_into_erased` implementation.
-    unsafe fn payload_from_raw(ptr: *mut ()) -> Self::UserPayload;
+    fn payload_from_erased(erased: Self::ErasedPayload) -> Self::UserPayload;
 
     fn map_completion_result(
         &self,
@@ -65,7 +64,8 @@ impl<T> Op<T> {
 
     pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Completion>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion> + std::marker::Send,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
+            + std::marker::Send,
         D: Driver,
     {
         let data = self.data;
@@ -100,18 +100,14 @@ impl<T> Op<T> {
                     Err((e, status)) => {
                         trace!("Submit failed synchronously: {} (status={:?})", e, status);
                         if status == SubmitStatus::Void {
-                            let payload_any = driver
-                                .slot_take_payload(user_data)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
-                                        user_data, status, e
-                                    )
-                                });
-                            if payload_any.kind != T::PAYLOAD_KIND as u16 {
-                                panic!("DetachedOp payload kind mismatch on submit recovery");
-                            }
-                            let payload = unsafe { T::payload_from_raw(payload_any.leak_ptr()) };
+                            let payload_erased = driver.slot_take_payload(user_data).unwrap_or_else(|| {
+                                panic!(
+                                    "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
+                                    user_data, status, e
+                                )
+                            });
+
+                            let payload = T::payload_from_erased(payload_erased);
                             if let Some(op) = op_platform.take() {
                                 drop(op);
                             }
@@ -150,7 +146,7 @@ impl<T> Op<T> {
 
     pub fn submit_local<D>(self, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion>,
+        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
         D: Driver,
     {
         LocalOp::new(self.data, driver)

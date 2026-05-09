@@ -21,7 +21,7 @@ use veloq_driver_core::driver::{
     CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver, RegisterFd,
     RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
-use veloq_driver_core::slot::{DetachedCancelTable, ErasedPayload, SlotTable};
+use veloq_driver_core::slot::{DetachedCancelTable, SlotTable};
 use veloq_driver_core::{
     DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
 };
@@ -30,7 +30,7 @@ use veloq_wheel::{Wheel, WheelConfig};
 use crate::common::IocpWaker;
 use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, RegisteredHandle};
 use crate::error::{IocpError, IocpResult};
-use crate::op::{IocpOp, IocpOpPayload, OverlappedEntry};
+use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload, OverlappedEntry};
 use crate::rio::RioState;
 
 // ============================================================================
@@ -40,7 +40,7 @@ use crate::rio::RioState;
 /// The IOCP driver implementation that manages I/O completion ports and operations.
 pub struct IocpDriver {
     pub(crate) port: Arc<crate::win32::IoCompletionPort>,
-    pub(crate) ops: OpRegistry<IocpOp, IocpOpState, OverlappedEntry>,
+    pub(crate) ops: OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
@@ -50,7 +50,7 @@ pub struct IocpDriver {
     pub(crate) free_slots: Vec<usize>,
     pub(crate) is_notified: Arc<AtomicBool>,
     pub(crate) completion_events: SharedCompletionQueue,
-    pub(crate) completion_table: SharedCompletionTable,
+    pub(crate) completion_table: SharedCompletionTable<IocpUserPayload>,
     pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
 
     // RIO Support (required)
@@ -85,7 +85,7 @@ pub enum CloseMode {
     Strict { timeout: Duration },
 }
 
-pub(crate) type CompletionSidecar = CoreCompletionSidecar;
+pub(crate) type CompletionSidecar = CoreCompletionSidecar<IocpUserPayload>;
 
 impl IocpDriver {
     /// Checks if the provided operation is a RIO-based operation.
@@ -141,7 +141,7 @@ impl IocpDriver {
                 .attach_note(format!("{e:#}"))
         })?;
         let ops = OpRegistry::new(entries as usize);
-        let completion_table: SharedCompletionTable = ops.shared.clone();
+        let completion_table: SharedCompletionTable<IocpUserPayload> = ops.shared.clone();
         Ok(Self {
             port: Arc::new(port_val),
             ops,
@@ -188,6 +188,7 @@ impl IocpDriver {
 
 impl Driver for IocpDriver {
     type Op = crate::op::IocpOp;
+    type UP = IocpUserPayload;
     type Raw = IocpHandle;
     type Sidecar = crate::op::OverlappedEntry;
     type Completion = usize;
@@ -207,7 +208,7 @@ impl Driver for IocpDriver {
         Ok((user_data, generation))
     }
 
-    fn slot_table(&self) -> Arc<SlotTable<Self::Op, Self::Sidecar>> {
+    fn slot_table(&self) -> Arc<SlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion>> {
         self.ops.shared.clone()
     }
 
@@ -215,7 +216,7 @@ impl Driver for IocpDriver {
         self.detached_cancel_table.clone()
     }
 
-    fn slot_set_payload(&mut self, user_data: usize, payload: ErasedPayload) {
+    fn slot_set_payload(&mut self, user_data: usize, payload: Self::UP) {
         let _ =
             self.ops
                 .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
@@ -223,7 +224,7 @@ impl Driver for IocpDriver {
                 });
     }
 
-    fn slot_take_payload(&mut self, user_data: usize) -> Option<ErasedPayload> {
+    fn slot_take_payload(&mut self, user_data: usize) -> Option<Self::UP> {
         use std::sync::atomic::Ordering;
         let payload = self
             .ops
@@ -345,7 +346,7 @@ impl Driver for IocpDriver {
         self.completion_events.clone()
     }
 
-    fn completion_table(&self) -> SharedCompletionTable {
+    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion> {
         self.completion_table.clone()
     }
 

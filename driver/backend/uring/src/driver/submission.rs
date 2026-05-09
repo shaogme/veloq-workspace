@@ -7,10 +7,10 @@ use crate::driver::lifecycle::UringOpState;
 use crate::driver::{UringDriver, invalid_input, invalid_state, map_uring_error, unsupported};
 use crate::error::{UringError, UringResult, from_io_error};
 use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
-use crate::op::{SubmissionStrategy, UringOp};
+use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 
 use veloq_driver_core::driver::registry::{AllocResult, OpHandle};
-use veloq_driver_core::driver::{Outcome, SubmitBinder, SubmitStatus};
+use veloq_driver_core::driver::{Driver, Outcome, SubmitBinder, SubmitStatus};
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
@@ -41,20 +41,27 @@ impl UringDriver {
                 let mut chunks = [0u16; 4];
                 let (count, sqe) = {
                     let driver_ptr = driver as *mut UringDriver;
-                    let op = sub_guard
-                        .slot
+                    let slot = sub_guard.slot.as_mut().ok_or_else(|| {
+                        invalid_state(
+                            "driver.submit_from_slot_raw",
+                            "submission guard slot missing",
+                        )
+                    })?;
+                    let payload = slot.storage.payload.as_mut().ok_or_else(|| {
+                        invalid_state(
+                            "driver.submit_from_slot_raw",
+                            "submission guard payload missing",
+                        )
+                    })?;
+
+                    let op = slot
+                        .op
                         .as_mut()
-                        .ok_or_else(|| {
-                            invalid_state(
-                                "driver.submit_from_slot_raw",
-                                "submission guard slot missing",
-                            )
-                        })?
-                        .op_mut();
+                        .expect("slot in InFlight state must contain an op");
                     let vtable = op.vtable;
-                    let count = unsafe { (vtable.resolve_chunks)(op, &mut chunks) };
+                    let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
                     let sqe = unsafe {
-                        (vtable.make_sqe)(op, &mut *driver_ptr)
+                        (vtable.make_sqe)(op, &mut *driver_ptr, user_data)
                             .map_err(|e| {
                                 Report::new(UringError::Submission).attach_note(format!(
                                     "driver.submit_from_slot_raw.make_sqe: {e:#}"
@@ -128,8 +135,15 @@ impl UringDriver {
                             "submission guard slot missing",
                         )
                     })?;
-                    let vtable = slot.op_mut().vtable;
-                    unsafe { (vtable.get_timeout)(slot.op_mut()) }
+                    let payload = slot.storage.payload.as_mut().ok_or_else(|| {
+                        invalid_state(
+                            "driver.submit_from_slot_raw.timer",
+                            "submission guard payload missing",
+                        )
+                    })?;
+                    let op = slot.op.as_mut().expect("timer op missing");
+                    let vtable = op.vtable;
+                    unsafe { (vtable.get_timeout)(op, payload) }
                 };
                 if let Some(duration) = duration_opt {
                     let task_id = driver.wheel.insert(user_data, duration);
@@ -199,7 +213,7 @@ impl UringDriver {
         }) = result
         {
             self.waker_token = Some(user_data);
-            self.waker_payload = Some(payload);
+            self.slot_set_payload(user_data, UringUserPayload::Wakeup(payload));
 
             let driver_ptr = self as *mut UringDriver;
             let slot = self

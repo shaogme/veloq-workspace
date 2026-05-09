@@ -5,8 +5,10 @@ use std::sync::atomic::Ordering;
 use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::CompletionSidecar;
 
-use crate::op::slot::{Slot, SlotState, SlotView, UringOpRegistryExt};
-use veloq_driver_core::slot::ErasedPayload;
+use crate::op::{
+    UringUserPayload,
+    slot::{Slot, SlotState, SlotView, UringOpRegistryExt},
+};
 
 #[derive(Clone, Default)]
 pub struct UringOpState {
@@ -44,7 +46,7 @@ impl UringDriver {
 
                         (
                             tid,
-                            CompletionSidecar {
+                            CompletionSidecar::<UringUserPayload> {
                                 user_data,
                                 generation,
                                 res: -libc::ECANCELED,
@@ -161,17 +163,17 @@ impl UringDriver {
 fn cancel_slot_immediate<'a, S: SlotState>(
     slot: Slot<'a, S>,
     user_data: usize,
-) -> CompletionSidecar {
+) -> CompletionSidecar<UringUserPayload> {
     let generation = slot.entry.generation(Ordering::Acquire);
     let (payload, detail) = slot.storage.with_mut(
         |_op: &mut Option<crate::op::UringOp>,
          result: &mut Option<DriverResult<usize>>,
-         payload: &mut Option<ErasedPayload>,
+         payload: &mut Option<UringUserPayload>,
          _sidecar| (payload.take(), result.take()),
     );
     let _ = slot.op.take();
 
-    CompletionSidecar {
+    CompletionSidecar::<UringUserPayload> {
         user_data,
         generation,
         res: -libc::ECANCELED,

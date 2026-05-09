@@ -382,6 +382,7 @@ where
     T: IntoPlatformOp<
             <PlatformDriver as Driver>::Op,
             DriverCompletion = <PlatformDriver as Driver>::Completion,
+            ErasedPayload = <PlatformDriver as Driver>::UP,
         > + Send,
     <S as OpSubmitter>::Future<T>: 'a,
 {
@@ -411,6 +412,7 @@ where
     T: IntoPlatformOp<
             <PlatformDriver as Driver>::Op,
             DriverCompletion = <PlatformDriver as Driver>::Completion,
+            ErasedPayload = <PlatformDriver as Driver>::UP,
         > + Send,
 {
     if veloq_runtime::runtime::current_worker_id() == worker_id {

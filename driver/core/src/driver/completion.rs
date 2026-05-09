@@ -29,12 +29,12 @@ impl CompletionValue for usize {
     }
 }
 
-pub struct CompletionSidecar<R = usize> {
+pub struct CompletionSidecar<UP, R = usize> {
     pub user_data: usize,
     pub generation: u32,
     pub res: i32,
     pub flags: u32,
-    pub payload: Option<slot::ErasedPayload>,
+    pub payload: Option<UP>,
     pub detail: Option<DriverResult<R>>,
 }
 
@@ -50,36 +50,36 @@ pub struct CompletionEvent {
 }
 
 pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
-pub type SharedCompletionTable<R = usize> = Arc<dyn CompletionAccess<R>>;
+pub type SharedCompletionTable<UP, R = usize> = Arc<dyn CompletionAccess<UP, R>>;
 
-pub struct CompletionRecord<R = usize> {
+pub struct CompletionRecord<UP, R = usize> {
     pub event: CompletionEvent,
-    pub payload: Option<slot::ErasedPayload>,
+    pub payload: Option<UP>,
     pub detail: Option<DriverResult<R>>,
 }
 
 /// Result of a completion poll, enabling detection of recycled slots.
-pub enum PollRecordResult<R = usize> {
+pub enum PollRecordResult<UP, R = usize> {
     /// Operation completed successfully or with an error.
-    Ready(CompletionRecord<R>),
+    Ready(CompletionRecord<UP, R>),
     /// Operation is still in flight.
     Pending,
     /// Operation lost because the slot has been recycled for a newer generation.
     Stale,
 }
 
-pub trait CompletionAccess<R = usize>: Send + Sync {
+pub trait CompletionAccess<UP, R = usize>: Send + Sync {
     fn record_completion_with_data(
         &self,
         event: CompletionEvent,
-        payload: Option<slot::ErasedPayload>,
+        payload: Option<UP>,
         detail: Option<DriverResult<R>>,
     );
 
-    fn try_take_record(&self, token: u64) -> PollRecordResult<R>;
+    fn try_take_record(&self, token: u64) -> PollRecordResult<UP, R>;
 
     #[inline]
-    fn try_take(&self, token: u64) -> PollRecordResult<R> {
+    fn try_take(&self, token: u64) -> PollRecordResult<UP, R> {
         self.try_take_record(token)
     }
 
@@ -116,12 +116,14 @@ pub const CELL_STATE_READY: u8 = 2;
 pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
 
-impl<Op: PlatformOp, S: SlotSidecar, R: Send> CompletionAccess<R> for slot::SlotTable<Op, S, R> {
+impl<Op: PlatformOp, UP: Send, S: SlotSidecar, R: Send> CompletionAccess<UP, R>
+    for slot::SlotTable<Op, UP, S, R>
+{
     #[inline]
     fn record_completion_with_data(
         &self,
         event: CompletionEvent,
-        mut payload: Option<slot::ErasedPayload>,
+        mut payload: Option<UP>,
         mut detail: Option<DriverResult<R>>,
     ) {
         let (idx, generation) = decode_completion_token(event.user_data);
@@ -251,7 +253,7 @@ impl<Op: PlatformOp, S: SlotSidecar, R: Send> CompletionAccess<R> for slot::Slot
     }
 
     #[inline]
-    fn try_take_record(&self, token: u64) -> PollRecordResult<R> {
+    fn try_take_record(&self, token: u64) -> PollRecordResult<UP, R> {
         let (idx, generation) = decode_completion_token(token);
         if idx >= self.slots.len() {
             return PollRecordResult::Pending;
