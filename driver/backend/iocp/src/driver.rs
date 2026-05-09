@@ -31,9 +31,9 @@ use veloq_wheel::TaskId;
 use crate::common::{completion_record, iocp_fallback_event_res, push_completion_shared};
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
 use crate::error::{IocpError, IocpResult, IocpResultExt, from_io_error};
-use crate::ops::slot::Slot;
-use crate::ops::submit::common::resolve_fd_borrowed;
-use crate::ops::{IocpOp, OverlappedEntry, SubmitContext, submit};
+use crate::op::slot::Slot;
+use crate::op::submit::common::resolve_fd_borrowed;
+use crate::op::{IocpOp, OverlappedEntry, SubmitContext, submit};
 use crate::rio::error::RioResultExt;
 pub use inner::IocpDriver;
 use inner::RIO_EVENT_KEY;
@@ -367,8 +367,8 @@ impl IocpDriver {
             .with_op_mut(|op| {
                 matches!(
                     op.payload,
-                    crate::ops::IocpOpPayload::UdpRecvStream(_)
-                        | crate::ops::IocpOpPayload::UdpRecv(_)
+                    crate::op::IocpOpPayload::UdpRecvStream(_)
+                        | crate::op::IocpOpPayload::UdpRecv(_)
                 )
             })
             .unwrap_or(false);

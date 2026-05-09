@@ -16,7 +16,7 @@ pub(crate) mod runtime;
 use crate::BufferRegistrationMode;
 use crate::IocpOpState;
 use crate::config::SocketKey;
-use crate::ops::IocpOp;
+use crate::op::IocpOp;
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
 use veloq_driver_core::driver::registry::OpRegistry;
@@ -81,7 +81,7 @@ pub(crate) struct RioContext<'a> {
 }
 
 pub(crate) struct RioCompletionContext<'a> {
-    pub(crate) ops: &'a mut OpRegistry<IocpOp, IocpOpState, crate::ops::OverlappedEntry>,
+    pub(crate) ops: &'a mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
     pub(crate) events: &'a SharedCompletionQueue,
     pub(crate) table: &'a SharedCompletionTable,
 }

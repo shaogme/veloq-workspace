@@ -10,12 +10,12 @@ use crate::config::BorrowedRawHandle;
 use crate::error::{IocpError, IocpResult, from_io_error};
 use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
-use crate::ops::submit::common::{
+use crate::op::submit::common::{
     AcceptExArgs, ConnectExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex,
     iocp_submit_connect_ex, mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle,
     unpack_kernel_ref,
 };
-use crate::ops::{
+use crate::op::{
     ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv,
     SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvStream, UdpSend,
 };

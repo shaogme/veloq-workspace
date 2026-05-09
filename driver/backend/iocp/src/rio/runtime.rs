@@ -5,7 +5,7 @@ pub(crate) mod pool;
 
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
-use crate::ops::SubmissionResult;
+use crate::op::SubmissionResult;
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, SocketLifecycleState, SocketRuntimeMode, SocketRuntimeState};
 use diagweave::report::ResultReportExt;
@@ -46,7 +46,7 @@ pub(crate) struct RioUdpRecvArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
     pub(crate) recv_op: &'a mut UdpRecv,
-    pub(crate) sidecar: &'a mut crate::ops::OverlappedEntry,
+    pub(crate) sidecar: &'a mut crate::op::OverlappedEntry,
 }
 
 impl RioState {

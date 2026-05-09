@@ -3,7 +3,7 @@
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::driver::IocpOpState;
-use crate::ops::IocpOp;
+use crate::op::IocpOp;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
@@ -547,7 +547,7 @@ impl RioState {
 
     pub(crate) fn process_completions(
         &mut self,
-        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::ops::OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable,
@@ -557,7 +557,7 @@ impl RioState {
 
     fn process_completions_internal(
         &mut self,
-        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::ops::OverlappedEntry>,
+        ops: &mut OpRegistry<IocpOp, IocpOpState, crate::op::OverlappedEntry>,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable,

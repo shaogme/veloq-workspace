@@ -2,7 +2,7 @@ use crate::config::{IoFd, IocpConfig};
 use crate::driver::IocpDriver;
 use crate::net::addr::{SockAddrStorage, socket_addr_to_storage};
 use crate::net::socket::Socket;
-use crate::ops::IocpOp;
+use crate::op::IocpOp;
 use crate::tests::{completion_os_error_code, remote_free_contains, wait_completion};
 use std::io::Write;
 use std::net::TcpListener;

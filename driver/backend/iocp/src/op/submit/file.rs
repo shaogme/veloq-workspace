@@ -3,11 +3,11 @@ use veloq_blocking::blocking_ops::windows::{BlockingOps, CompletionInfo};
 use veloq_buf::FixedBuf;
 
 use crate::error::{IocpError, IocpResult};
-use crate::ops::submit::common::{
+use crate::op::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write,
     mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle, unpack_kernel_ref,
 };
-use crate::ops::{
+use crate::op::{
     Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, KernelRef, OpenPayload, OverlappedEntry,
     ReadFixed, ReadRaw, SubmitContext, SyncFileRange, SyncFileRangeRaw, WriteFixed, WriteRaw,
 };
@@ -175,8 +175,8 @@ fn make_blocking_completion(ctx: &SubmitContext<'_>, user_data: usize) -> Comple
         port: ctx.port.as_raw() as usize,
         user_data,
         overlapped: ctx.overlapped as usize,
-        store_result: crate::ops::overlapped::store_blocking_result,
-        clear_result: crate::ops::overlapped::clear_blocking_result,
+        store_result: crate::op::overlapped::store_blocking_result,
+        clear_result: crate::op::overlapped::clear_blocking_result,
     }
 }
 

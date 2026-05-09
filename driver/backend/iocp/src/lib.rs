@@ -4,7 +4,7 @@ pub mod driver;
 pub mod error;
 pub mod ext;
 pub mod net;
-pub mod ops;
+pub mod op;
 pub mod rio;
 pub mod win32;
 

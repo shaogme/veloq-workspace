@@ -7,7 +7,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 use crate::config::{BorrowedRawHandle, IoFd, IocpHandle, RegisteredHandle};
 use crate::error::{IocpError, IocpResult, from_io_error};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
-use crate::ops::{KernelRef, OverlappedEntry};
+use crate::op::{KernelRef, OverlappedEntry};
 use crate::win32::Overlapped;
 
 // ============================================================================

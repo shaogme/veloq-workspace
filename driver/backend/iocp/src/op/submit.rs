@@ -3,7 +3,7 @@ pub(crate) mod file;
 pub(crate) mod net;
 
 use crate::error::IocpResult;
-use crate::ops::{
+use crate::op::{
     AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend, OpenPayload, Recv,
     SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecv, UdpRecvStream,
     UdpSend, Wakeup,
@@ -31,16 +31,16 @@ macro_rules! impl_get_fd {
 
 impl_get_fd!(
     get_fd_read_fixed,
-    KernelRef<crate::ops::ReadFixed>,
+    KernelRef<crate::op::ReadFixed>,
     direct_fd
 );
-impl_get_fd!(get_fd_read_raw, KernelRef<crate::ops::ReadRaw>, no_fd);
+impl_get_fd!(get_fd_read_raw, KernelRef<crate::op::ReadRaw>, no_fd);
 impl_get_fd!(
     get_fd_write_fixed,
-    KernelRef<crate::ops::WriteFixed>,
+    KernelRef<crate::op::WriteFixed>,
     direct_fd
 );
-impl_get_fd!(get_fd_write_raw, KernelRef<crate::ops::WriteRaw>, no_fd);
+impl_get_fd!(get_fd_write_raw, KernelRef<crate::op::WriteRaw>, no_fd);
 impl_get_fd!(get_fd_recv, KernelRef<Recv>, direct_fd);
 impl_get_fd!(get_fd_send, KernelRef<OpSend>, direct_fd);
 impl_get_fd!(get_fd_udp_recv, KernelRef<UdpRecv>, direct_fd);
@@ -54,17 +54,17 @@ impl_get_fd!(get_fd_udp_recv_stream, KernelRef<UdpRecvStream>, direct_fd);
 
 impl_get_fd!(get_fd_close, KernelRef<Close>, direct_fd);
 impl_get_fd!(get_fd_fsync, KernelRef<Fsync>, direct_fd);
-impl_get_fd!(get_fd_fsync_raw, KernelRef<crate::ops::FsyncRaw>, no_fd);
+impl_get_fd!(get_fd_fsync_raw, KernelRef<crate::op::FsyncRaw>, no_fd);
 impl_get_fd!(get_fd_sync_range, KernelRef<SyncFileRange>, direct_fd);
 impl_get_fd!(
     get_fd_sync_range_raw,
-    KernelRef<crate::ops::SyncFileRangeRaw>,
+    KernelRef<crate::op::SyncFileRangeRaw>,
     no_fd
 );
 impl_get_fd!(get_fd_fallocate, KernelRef<Fallocate>, direct_fd);
 impl_get_fd!(
     get_fd_fallocate_raw,
-    KernelRef<crate::ops::FallocateRaw>,
+    KernelRef<crate::op::FallocateRaw>,
     no_fd
 );
 impl_get_fd!(get_fd_timeout, KernelRef<Timeout>, no_fd);
@@ -78,7 +78,7 @@ impl_get_fd!(get_fd_wakeup, KernelRef<Wakeup>, no_fd);
 ///
 /// The caller must ensure that header, payload, and ctx are valid.
 pub(crate) fn submit_wakeup(
-    _header: &mut crate::ops::OverlappedEntry,
+    _header: &mut crate::op::OverlappedEntry,
     _payload: &mut KernelRef<Wakeup>,
     _ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
@@ -89,7 +89,7 @@ pub(crate) fn submit_wakeup(
 ///
 /// The caller must ensure that header, payload, and ctx are valid.
 pub(crate) fn submit_timeout(
-    _header: &mut crate::ops::OverlappedEntry,
+    _header: &mut crate::op::OverlappedEntry,
     payload: &mut KernelRef<Timeout>,
     _ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {

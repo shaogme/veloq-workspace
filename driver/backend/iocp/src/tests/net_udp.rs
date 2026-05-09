@@ -1,7 +1,7 @@
 use crate::config::{IoFd, IocpConfig};
 use crate::driver::IocpDriver;
 use crate::net::socket::Socket;
-use crate::ops::IocpOp;
+use crate::op::IocpOp;
 use crate::tests::{completion_os_error_code, wait_completion};
 use std::time::Duration;
 use veloq_buf::BufPool;

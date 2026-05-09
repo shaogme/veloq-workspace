@@ -423,7 +423,7 @@ impl OverlappedId {
     /// The pointer must be a valid pointer to an Overlapped structure that is
     /// embedded at the start of an OverlappedEntry.
     pub unsafe fn from_ptr(ptr: *const Overlapped) -> Self {
-        use crate::ops::OverlappedEntry;
+        use crate::op::OverlappedEntry;
         // SAFETY: The `inner` field is at the start of `OverlappedEntry` due to `#[repr(C)]`.
         let user_data = unsafe { (*(ptr as *const OverlappedEntry)).user_data };
         Self(user_data)

@@ -1,6 +1,6 @@
 use crate::config::IocpConfig;
 use crate::driver::IocpDriver;
-use crate::ops::IocpOp;
+use crate::op::IocpOp;
 use crate::tests::wait_completion;
 use veloq_driver_core::driver::{Driver, SubmitBinder};
 use veloq_driver_core::op::IntoPlatformOp;

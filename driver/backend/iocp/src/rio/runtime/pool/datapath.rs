@@ -5,9 +5,9 @@ use super::{
     UdpWaiterKind,
 };
 use crate::net::addr::{SockAddrStorage, to_socket_addr};
-use crate::ops::IocpOpPayload;
-use crate::ops::slot::Slot;
-use crate::ops::submit::SubmissionResult;
+use crate::op::IocpOpPayload;
+use crate::op::slot::Slot;
+use crate::op::submit::SubmissionResult;
 use crate::rio::core::submit_ops::{RioDispatch, RioExConfig, RioProvider, RioRq};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioCompletionContext, RioContext, RioState};

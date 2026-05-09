@@ -21,8 +21,8 @@ use crate::common::{
 use crate::config::{BufferRegistrationMode, IocpConfig, IocpHandle, RegisteredHandle, SocketKey};
 use crate::driver::{CompletionSidecar, IocpOpState};
 use crate::error::{IocpError, IocpResult, from_io_error};
-use crate::ops::slot::Slot;
-use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
+use crate::op::slot::Slot;
+use crate::op::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
 use crate::rio::RioState;
 use crate::win32::Overlapped;
 use veloq_driver_core::slot::{DetachedCancelTable, InFlightWaiting, SlotRegistryExt, SlotView};
@@ -410,14 +410,14 @@ impl IocpDriver {
                     });
                 } else if matches!(
                     &iocp_op.payload,
-                    crate::ops::IocpOpPayload::Open(_)
-                        | crate::ops::IocpOpPayload::Close(_)
-                        | crate::ops::IocpOpPayload::Fsync(_)
-                        | crate::ops::IocpOpPayload::FsyncRaw(_)
-                        | crate::ops::IocpOpPayload::SyncRange(_)
-                        | crate::ops::IocpOpPayload::SyncRangeRaw(_)
-                        | crate::ops::IocpOpPayload::Fallocate(_)
-                        | crate::ops::IocpOpPayload::FallocateRaw(_)
+                    crate::op::IocpOpPayload::Open(_)
+                        | crate::op::IocpOpPayload::Close(_)
+                        | crate::op::IocpOpPayload::Fsync(_)
+                        | crate::op::IocpOpPayload::FsyncRaw(_)
+                        | crate::op::IocpOpPayload::SyncRange(_)
+                        | crate::op::IocpOpPayload::SyncRangeRaw(_)
+                        | crate::op::IocpOpPayload::Fallocate(_)
+                        | crate::op::IocpOpPayload::FallocateRaw(_)
                 ) {
                     io_result = Err(diagweave::report::Report::new(IocpError::CompletionWait)
                         .attach_note("missing blocking result for offloaded file completion"));
