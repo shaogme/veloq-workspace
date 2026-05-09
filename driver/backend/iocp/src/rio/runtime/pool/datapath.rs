@@ -1,8 +1,8 @@
 use super::{
     SlotKey, UDP_RECV_POOL_CHUNK_SIZE, UDP_RECV_POOL_INITIAL_CREDITS, UDP_RECV_POOL_MAX_CREDITS,
     UDP_RECV_POOL_MIN_CREDITS, UDP_RECV_POOL_QUEUE_CAP, UDP_RECV_POOL_SLAB_CHUNKS, UdpBufferSlab,
-    UdpMailbox, UdpPoolPacket, UdpPoolState, UdpRecvPool, UdpRecvPoolSlot, UdpWaiter,
-    UdpWaiterKind,
+    UdpMailbox, UdpPoolPacket, UdpPoolState, UdpRecvPool, UdpRecvPoolSlot, UdpSlabLeaseState,
+    UdpWaiter, UdpWaiterKind,
 };
 use crate::net::addr::{SockAddrStorage, to_socket_addr};
 use crate::op::IocpOpPayload;
@@ -15,10 +15,12 @@ use diagweave::report::ResultReportExt;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::collections::{VecDeque, hash_map};
-use veloq_buf::{FixedBuf, FixedBufView};
+use std::ptr::NonNull;
+use std::sync::Arc;
+use veloq_buf::FixedBuf;
 use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
 use veloq_driver_core::op::{
-    UdpRecv as OpUdpRecv, UdpRecvPacket as OpUdpRecvPacket, UdpRecvStream,
+    UdpRecv as OpUdpRecv, UdpRecvPacket as OpUdpRecvPacket, UdpRecvPacketBuf, UdpRecvStream,
 };
 use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
 
@@ -139,9 +141,9 @@ impl UdpPoolManager {
         let total_nz = std::num::NonZeroUsize::new(total)
             .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
             .attach_note("UDP slab total size must be > 0")?;
-        let backing = FixedBuf::alloc_heap(total_nz).map_err(|e| {
+        let backing = Arc::new(FixedBuf::alloc_heap(total_nz).map_err(|e| {
             diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string())
-        })?;
+        })?);
 
         let rio_id = ctx
             .env
@@ -149,24 +151,22 @@ impl UdpPoolManager {
             .register_buffer(backing.as_ptr(), backing.capacity() as u32)
             .attach_note("RIORegisterBuffer failed for UDP slab backing")?;
 
-        let mut chunks = Vec::with_capacity(chunk_count);
-        for idx in 0..chunk_count {
-            let start = idx * chunk_size;
-            let end = start + chunk_size;
-            chunks.push(FixedBufView::new(&backing, start..end).into_fixed_buf());
-        }
-
         let mut free_indices = VecDeque::with_capacity(chunk_count);
         for idx in 0..chunk_count {
             free_indices.push_back(idx as u32);
         }
+        let lease_state = Arc::new(UdpSlabLeaseState::new(
+            backing.clone(),
+            chunk_count,
+            free_indices,
+        ));
 
         Ok(UdpBufferSlab {
-            _backing: backing,
+            backing,
+            lease_state,
             rio_id,
             chunk_size,
-            chunks,
-            free_indices,
+            chunk_count,
         })
     }
 
@@ -303,7 +303,7 @@ impl UdpRecvPool {
         }
         self.target_credits = 0;
         if let Some(slab) = self.slab.as_mut() {
-            slab.free_indices.clear();
+            slab.clear_free_indices();
         }
         for (_, slot) in &mut self.slots {
             if slot.in_flight {
@@ -404,7 +404,7 @@ impl UdpRecvPool {
     ) -> RioResult<usize> {
         let mut submissions = 0;
         while self.state == UdpPoolState::Running && self.slots.len() < target {
-            let idx = match self.slab.as_mut().and_then(|s| s.free_indices.pop_front()) {
+            let idx = match self.slab.as_ref().and_then(UdpBufferSlab::pop_free_index) {
                 Some(i) => i,
                 None => break,
             };
@@ -412,8 +412,8 @@ impl UdpRecvPool {
             let slot = match self.create_slot(idx, ctx.env.dispatch) {
                 Ok(s) => s,
                 Err(e) => {
-                    if let Some(slab) = self.slab.as_mut() {
-                        slab.free_indices.push_front(idx);
+                    if let Some(slab) = self.slab.as_ref() {
+                        slab.push_free_index_front(idx);
                     }
                     return Err(e);
                 }
@@ -437,9 +437,9 @@ impl UdpRecvPool {
                 ctx.env.dispatch.deregister_buffer(s.addr_buf_id);
             }
             if self.state == UdpPoolState::Running
-                && let Some(slab) = self.slab.as_mut()
+                && let Some(slab) = self.slab.as_ref()
             {
-                slab.free_indices.push_front(s.current_idx);
+                slab.push_free_index_front(s.current_idx);
             }
         }
     }
@@ -546,7 +546,11 @@ impl UdpRecvPool {
         let mut total_submissions = 0;
 
         if let Some(datagram) = mailbox.queue.pop_front() {
-            stream_op.result = Some(UdpPoolManager::into_op_datagram(datagram)?);
+            let slab = self.slab.as_ref().ok_or_else(|| {
+                diagweave::report::Report::new(RioError::Internal)
+                    .attach_note("UDP slab missing while delivering queued stream datagram")
+            })?;
+            stream_op.result = Some(UdpPoolManager::into_op_datagram(slab, datagram)?);
             total_submissions += self.rebalance(mailbox, ctx, registry)?;
             return Ok((SubmissionResult::PostToQueue, total_submissions));
         }
@@ -590,7 +594,16 @@ impl UdpRecvPool {
         let mut total_submissions = 0;
 
         if let Some(datagram) = mailbox.queue.pop_front() {
-            let copied = UdpPoolManager::copy_data_to_recv_op(recv_op, datagram.buf.as_slice());
+            let slab = self.slab.as_ref().ok_or_else(|| {
+                diagweave::report::Report::new(RioError::Internal)
+                    .attach_note("UDP slab missing while delivering queued recv datagram")
+            })?;
+            let data = slab
+                .chunk_view(datagram.idx, datagram.len)
+                .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+                .attach_note("queued UDP datagram chunk missing")?;
+            let copied = UdpPoolManager::copy_data_to_recv_op(recv_op, data.as_slice());
+            slab.push_free_index_back(datagram.idx);
             total_submissions += self.rebalance(mailbox, ctx, registry)?;
             return Ok((
                 SubmissionResult::PostToQueue,
@@ -677,7 +690,7 @@ impl UdpRecvPool {
             diagweave::report::Report::new(RioError::Internal)
                 .attach_note("UDP recv pool slot missing in try_fast_deliver")
         })?;
-        let slab = self.slab.as_mut().ok_or_else(|| {
+        let slab = self.slab.as_ref().ok_or_else(|| {
             diagweave::report::Report::new(RioError::Internal)
                 .attach_note("UDP slab missing in try_fast_deliver")
         })?;
@@ -694,7 +707,7 @@ impl UdpRecvPool {
             );
         }
 
-        let Some(next_idx) = slab.free_indices.pop_front() else {
+        let Some(next_idx) = slab.pop_free_index() else {
             mailbox.waiters.push_front(waiter);
             return Ok(None);
         };
@@ -717,7 +730,7 @@ impl UdpRecvPool {
                 FastDeliverPayload::Recv { idx, len } => {
                     let Some(buf) = slab.chunk_view(idx, len) else {
                         mailbox.waiters.push_front(waiter);
-                        slab.free_indices.push_front(slot.current_idx);
+                        slab.push_free_index_front(slot.current_idx);
                         slot.current_idx = idx;
                         return Ok(None);
                     };
@@ -729,22 +742,29 @@ impl UdpRecvPool {
                 FastDeliverPayload::Stream { idx, len } => {
                     let Some(buf) = slab.chunk_view(idx, len) else {
                         mailbox.waiters.push_front(waiter);
-                        slab.free_indices.push_front(slot.current_idx);
+                        slab.push_free_index_front(slot.current_idx);
                         slot.current_idx = idx;
                         return Ok(None);
                     };
-                    let buf = buf.into_fixed_buf();
                     let addr = UdpPoolManager::parse_rio_address(
                         &slot.addr,
                         std::mem::size_of::<SockAddrStorage>() as i32,
                     )?;
-                    match UdpPoolManager::deliver_to_stream_waiter_raw(comp, waiter, buf, addr) {
+                    let datagram = UdpPoolPacket {
+                        idx,
+                        len: buf.len(),
+                        addr: *slot.addr,
+                        addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
+                    };
+                    match UdpPoolManager::deliver_to_stream_waiter_raw(
+                        comp, waiter, slab, datagram, addr,
+                    )? {
                         Ok(()) => {
                             slot.in_flight = false;
                             delivered = true;
                         }
-                        Err(_returned_buf) => {
-                            slab.free_indices.push_front(slot.current_idx);
+                        Err(_returned_datagram) => {
+                            slab.push_free_index_front(slot.current_idx);
                             slot.current_idx = idx;
                             slot.in_flight = false;
                             delivered = false;
@@ -756,7 +776,7 @@ impl UdpRecvPool {
 
         if delivered {
             if matches!(waiter.kind, UdpWaiterKind::Recv) {
-                slab.free_indices.push_back(completed_idx);
+                slab.push_free_index_back(completed_idx);
             }
 
             let resubmit = !slot.stop_requested && slots_len <= self.target_credits;
@@ -815,40 +835,66 @@ impl UdpPoolManager {
             .attach_note("failed to parse rio udp source address")
     }
 
-    fn into_op_datagram(datagram: UdpPoolPacket) -> RioResult<OpUdpRecvPacket> {
-        let addr = Self::parse_rio_address(&datagram.addr, datagram.addr_len)?;
-        Ok(OpUdpRecvPacket {
-            buf: datagram.buf,
-            addr,
-        })
+    fn into_op_datagram(
+        slab: &UdpBufferSlab,
+        datagram: UdpPoolPacket,
+    ) -> RioResult<OpUdpRecvPacket> {
+        let addr = match Self::parse_rio_address(&datagram.addr, datagram.addr_len) {
+            Ok(addr) => addr,
+            Err(e) => {
+                slab.push_free_index_back(datagram.idx);
+                return Err(e);
+            }
+        };
+        let Some(view) = slab.chunk_view(datagram.idx, datagram.len) else {
+            slab.push_free_index_back(datagram.idx);
+            return Err(diagweave::report::Report::new(RioError::Internal))
+                .attach_note("UDP datagram chunk missing while creating packet");
+        };
+        let ptr = unsafe { NonNull::new_unchecked(view.as_ptr() as *mut u8) };
+        let buf = unsafe {
+            UdpRecvPacketBuf::from_leased_parts(
+                ptr,
+                view.len(),
+                slab.chunk_capacity(),
+                datagram.idx,
+                slab.lease_state.clone(),
+            )
+        };
+        Ok(OpUdpRecvPacket { buf, addr })
     }
 
     fn deliver_to_stream_waiter_raw(
         comp: &mut RioCompletionContext<'_>,
         waiter: UdpWaiter,
-        buf: FixedBuf,
+        slab: &UdpBufferSlab,
+        datagram: UdpPoolPacket,
         addr: std::net::SocketAddr,
-    ) -> Result<(), FixedBuf> {
+    ) -> RioResult<Result<(), UdpPoolPacket>> {
         let user_data = waiter.user_data;
         let generation = waiter.generation;
         let ops = &mut comp.ops;
         if user_data >= ops.local.len() {
-            return Err(buf);
+            return Ok(Err(datagram));
         }
         let Some(SlotView::InFlightWaiting(mut slot)) = ops.slot_view(user_data) else {
-            return Err(buf);
+            return Ok(Err(datagram));
         };
         if slot.platform_mut().generation != generation {
-            return Err(buf);
+            return Ok(Err(datagram));
         }
 
         let mut guard = slot;
-        let d_len = buf.len();
+        let d_len = datagram.len;
 
         let stream_op = Self::get_stream_op_mut(&mut guard);
         if let Some(stream_op) = stream_op {
+            let packet = Self::into_op_datagram(slab, datagram)?;
             stream_op.buf = None;
-            stream_op.result = Some(OpUdpRecvPacket { buf, addr });
+            stream_op.result = Some(OpUdpRecvPacket {
+                buf: packet.buf,
+                addr,
+            });
             guard.platform_mut().rio_pool_waiting = false;
 
             let event = CompletionEvent {
@@ -865,9 +911,9 @@ impl UdpPoolManager {
             let _ = guard.take_op();
             let _ = std::mem::take(guard.platform_mut());
             comp.ops.shared.push_free(user_data);
-            Ok(())
+            Ok(Ok(()))
         } else {
-            Err(buf)
+            Ok(Err(datagram))
         }
     }
 
@@ -938,21 +984,17 @@ impl UdpPoolManager {
     fn deliver_to_stream_waiter(
         comp: &mut RioCompletionContext<'_>,
         waiter: UdpWaiter,
+        slab: &UdpBufferSlab,
         datagram: &mut Option<UdpPoolPacket>,
     ) -> RioResult<bool> {
         let Some(d) = datagram.take() else {
             return Ok(false);
         };
         let addr = Self::parse_rio_address(&d.addr, d.addr_len)?;
-        match Self::deliver_to_stream_waiter_raw(comp, waiter, d.buf, addr) {
+        match Self::deliver_to_stream_waiter_raw(comp, waiter, slab, d, addr)? {
             Ok(()) => Ok(true),
-            Err(buf) => {
-                *datagram = Some(UdpPoolPacket {
-                    buf,
-                    idx: d.idx,
-                    addr: d.addr,
-                    addr_len: d.addr_len,
-                });
+            Err(returned_datagram) => {
+                *datagram = Some(returned_datagram);
                 Ok(false)
             }
         }
@@ -961,13 +1003,17 @@ impl UdpPoolManager {
     fn deliver_to_recv_waiter(
         comp: &mut RioCompletionContext<'_>,
         waiter: UdpWaiter,
+        slab: &UdpBufferSlab,
         datagram: &mut Option<UdpPoolPacket>,
     ) -> bool {
-        let data = match datagram.as_ref() {
-            Some(d) => d.buf.as_slice(),
+        let data = match datagram
+            .as_ref()
+            .and_then(|d| slab.chunk_view(d.idx, d.len))
+        {
+            Some(view) => view,
             None => return false,
         };
-        if Self::deliver_to_recv_waiter_raw(comp, waiter, data) {
+        if Self::deliver_to_recv_waiter_raw(comp, waiter, data.as_slice()) {
             let _ = datagram.take();
             true
         } else {
@@ -996,25 +1042,36 @@ impl UdpPoolManager {
 
             let kind = waiter.kind;
             let idx = datagram.as_ref().map(|d| d.idx);
+            let Some(slab) = pool.slab.as_ref() else {
+                mailbox
+                    .queue
+                    .push_front(datagram.expect("datagram must exist"));
+                mailbox.waiters.push_front(waiter);
+                return Err(diagweave::report::Report::new(RioError::Internal))
+                    .attach_note("UDP slab missing while dispatching waiters");
+            };
 
             let delivered = match kind {
                 UdpWaiterKind::Stream => {
-                    Self::deliver_to_stream_waiter(comp, waiter, &mut datagram)?
+                    Self::deliver_to_stream_waiter(comp, waiter, slab, &mut datagram)?
                 }
-                UdpWaiterKind::Recv => Self::deliver_to_recv_waiter(comp, waiter, &mut datagram),
+                UdpWaiterKind::Recv => {
+                    Self::deliver_to_recv_waiter(comp, waiter, slab, &mut datagram)
+                }
             };
 
             if delivered
                 && matches!(kind, UdpWaiterKind::Recv)
                 && let Some(idx) = idx
-                && let Some(slab) = pool.slab.as_mut()
             {
-                slab.free_indices.push_back(idx);
+                slab.push_free_index_back(idx);
             } else if let Some(returned_datagram) = datagram {
                 mailbox.queue.push_front(returned_datagram);
                 mailbox.waiters.push_front(waiter);
                 if mailbox.queue.len() > UDP_RECV_POOL_QUEUE_CAP {
-                    let _ = mailbox.queue.pop_back();
+                    if let Some(dropped) = mailbox.queue.pop_back() {
+                        slab.push_free_index_back(dropped.idx);
+                    }
                 }
                 return Ok(());
             }

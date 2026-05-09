@@ -9,7 +9,9 @@ use crate::net::addr::SockAddrStorage;
 use crate::rio::core::submit_ops::RioBufferId;
 use slotmap::{SlotMap, new_key_type};
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard};
 use veloq_buf::{FixedBuf, FixedBufView};
+use veloq_driver_core::op::UdpRecvPacketBufLeaseOwner;
 use windows_sys::Win32::Networking::WinSock::{RIORESULT, WSAEMSGSIZE};
 
 new_key_type! {
@@ -28,18 +30,73 @@ pub(crate) const UDP_RECV_POOL_SLAB_CHUNKS: usize = 512;
 pub(crate) const POOL_CTX_TAG: usize = 1;
 
 pub(crate) struct UdpPoolPacket {
-    pub(crate) buf: FixedBuf,
     pub(crate) idx: u32,
+    pub(crate) len: usize,
     pub(crate) addr: SockAddrStorage,
     pub(crate) addr_len: i32,
 }
 
 pub(crate) struct UdpBufferSlab {
-    pub(crate) _backing: FixedBuf,
+    pub(crate) backing: Arc<FixedBuf>,
+    pub(crate) lease_state: Arc<UdpSlabLeaseState>,
     pub(crate) rio_id: RioBufferId,
     pub(crate) chunk_size: usize,
-    pub(crate) chunks: Vec<FixedBuf>,
-    pub(crate) free_indices: VecDeque<u32>,
+    pub(crate) chunk_count: usize,
+}
+
+pub(crate) struct UdpSlabLeaseState {
+    #[allow(dead_code)]
+    backing: Arc<FixedBuf>,
+    chunk_count: usize,
+    free_indices: Mutex<VecDeque<u32>>,
+}
+
+impl UdpSlabLeaseState {
+    pub(crate) fn new(
+        backing: Arc<FixedBuf>,
+        chunk_count: usize,
+        free_indices: VecDeque<u32>,
+    ) -> Self {
+        Self {
+            backing,
+            chunk_count,
+            free_indices: Mutex::new(free_indices),
+        }
+    }
+
+    fn free_indices(&self) -> MutexGuard<'_, VecDeque<u32>> {
+        self.free_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[inline]
+    pub(crate) fn pop_free_index(&self) -> Option<u32> {
+        self.free_indices().pop_front()
+    }
+
+    #[inline]
+    pub(crate) fn push_free_index_front(&self, idx: u32) {
+        self.free_indices().push_front(idx);
+    }
+
+    #[inline]
+    pub(crate) fn push_free_index_back(&self, idx: u32) {
+        self.free_indices().push_back(idx);
+    }
+
+    #[inline]
+    pub(crate) fn clear_free_indices(&self) {
+        self.free_indices().clear();
+    }
+}
+
+impl UdpRecvPacketBufLeaseOwner for UdpSlabLeaseState {
+    fn release(&self, idx: u32) {
+        if (idx as usize) < self.chunk_count {
+            self.push_free_index_back(idx);
+        }
+    }
 }
 
 impl UdpBufferSlab {
@@ -57,11 +114,31 @@ impl UdpBufferSlab {
 
     #[inline]
     pub(crate) fn chunk_view(&self, idx: u32, len: usize) -> Option<FixedBufView<'_>> {
-        let chunk = self.chunks.get(idx as usize)?;
-        if len > chunk.capacity() {
+        if idx as usize >= self.chunk_count || len > self.chunk_size {
             return None;
         }
-        Some(chunk.view(0..len))
+        let start = idx as usize * self.chunk_size;
+        Some(self.backing.view(start..start + len))
+    }
+
+    #[inline]
+    pub(crate) fn pop_free_index(&self) -> Option<u32> {
+        self.lease_state.pop_free_index()
+    }
+
+    #[inline]
+    pub(crate) fn push_free_index_front(&self, idx: u32) {
+        self.lease_state.push_free_index_front(idx);
+    }
+
+    #[inline]
+    pub(crate) fn push_free_index_back(&self, idx: u32) {
+        self.lease_state.push_free_index_back(idx);
+    }
+
+    #[inline]
+    pub(crate) fn clear_free_indices(&self) {
+        self.lease_state.clear_free_indices();
     }
 }
 
@@ -173,25 +250,27 @@ impl UdpRecvPool {
             return PoolCompletionEvent::ReceivedNoDatagram;
         }
 
-        if mailbox.queue.len() >= UDP_RECV_POOL_QUEUE_CAP {
-            let _ = mailbox.queue.pop_front();
-        }
-
-        let Some(slab) = self.slab.as_mut() else {
+        let Some(slab) = self.slab.as_ref() else {
             return PoolCompletionEvent::ReceivedNoDatagram;
         };
+        if mailbox.queue.len() >= UDP_RECV_POOL_QUEUE_CAP
+            && let Some(dropped) = mailbox.queue.pop_front()
+        {
+            slab.push_free_index_back(dropped.idx);
+        }
+
         let bytes = res.BytesTransferred as usize;
         if bytes > slab.chunk_capacity() {
             return PoolCompletionEvent::ReceivedNoDatagram;
         }
-        let Some(next_idx) = slab.free_indices.pop_front() else {
+        let Some(next_idx) = slab.pop_free_index() else {
             return PoolCompletionEvent::ReceivedNoDatagram;
         };
         let completed_idx = std::mem::replace(&mut slot.current_idx, next_idx);
         if let Some(buf) = slab.chunk_view(completed_idx, bytes) {
             mailbox.queue.push_back(UdpPoolPacket {
-                buf: buf.into_fixed_buf(),
                 idx: completed_idx,
+                len: buf.len(),
                 addr: *slot.addr,
                 addr_len: std::mem::size_of::<SockAddrStorage>() as i32,
             });
@@ -200,6 +279,7 @@ impl UdpRecvPool {
             };
         }
 
+        slab.push_free_index_back(completed_idx);
         PoolCompletionEvent::ReceivedNoDatagram
     }
 

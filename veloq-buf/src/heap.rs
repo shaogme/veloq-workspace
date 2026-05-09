@@ -22,7 +22,6 @@ use parking_lot::{Mutex, RwLock};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::{io, num::NonZeroUsize, ptr, ptr::NonNull, sync::Arc};
 
 /// 2MB minimum memory per thread (Huge Page aligned)
@@ -300,10 +299,6 @@ pub struct Chunk {
 
     /// Number of slots per shard
     slots_per_shard: usize,
-
-    /// Shadow Reference Count Table (one per slot)
-    /// Only the count at the head slot of an allocation is used.
-    ref_counts: Box<[AtomicU32]>,
 }
 
 impl Chunk {
@@ -365,9 +360,6 @@ impl Chunk {
             .map(|_| CachePadded::new(SuperblockState::new()))
             .collect();
 
-        // 5. Initialize Ref Counts
-        let ref_counts: Vec<AtomicU32> = (0..total_slots).map(|_| AtomicU32::new(0)).collect();
-
         Ok(Self {
             id,
             shards: shards.into_boxed_slice(),
@@ -375,7 +367,6 @@ impl Chunk {
             // memory MUST be after shards/superblocks in struct definition
             memory: chunk,
             slots_per_shard,
-            ref_counts: ref_counts.into_boxed_slice(),
         })
     }
 
@@ -643,9 +634,6 @@ impl GlobalSlotPool {
                 });
             }
 
-            // Initialize reference count for the allocated block head
-            self.increment_ref_count(chunk_id, idx, Ordering::Relaxed);
-
             return Some((chunk_id, idx, ptr));
         }
 
@@ -719,25 +707,12 @@ impl GlobalSlotPool {
         if let Some(chunk) = chunks.get(chunk_id as usize) {
             // Verify ID just in case
             debug_assert_eq!(chunk.id, chunk_id);
-
-            // Decrement Ref Count. Only deallocate if it reaches 0.
-            if chunk.ref_counts[index.0].fetch_sub(1, Ordering::Release) == 1 {
-                std::sync::atomic::fence(Ordering::Acquire);
-                unsafe {
-                    chunk.dealloc_slots(index, order);
-                }
+            unsafe {
+                chunk.dealloc_slots(index, order);
             }
         } else {
             // This can happen if we have a logic error or if we support unloading chunks (unlikely for now)
             panic!("GlobalSlotPool: Dealloc on invalid chunk_id {}", chunk_id);
-        }
-    }
-
-    /// Internal: Increment ref count for a slot head.
-    pub(crate) fn increment_ref_count(&self, chunk_id: u16, index: SlotIndex, ordering: Ordering) {
-        let chunks = self.chunks.read();
-        if let Some(chunk) = chunks.get(chunk_id as usize) {
-            chunk.ref_counts[index.0].fetch_add(1, ordering);
         }
     }
 

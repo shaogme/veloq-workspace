@@ -41,7 +41,7 @@ pub type UdpRecvStream = veloq_driver_core::op::UdpRecvStream;
 
 pub use veloq_driver_core::op::{
     DetachedOp, DetachedSubmitter, IntoPlatformOp, LocalSubmitter, Op, OpKind, OpLifecycle,
-    OpResult, Open, Timeout, UdpRecvPacket,
+    OpResult, Open, Timeout, UdpRecvPacket, UdpRecvPacketBuf,
 };
 
 pub type LocalOp<T> = veloq_driver_core::op::LocalOp<T, PlatformDriver>;

@@ -12,7 +12,7 @@ use veloq_driver_native::Socket;
 use veloq_driver_native::driver::Driver;
 use veloq_driver_native::op::{
     DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpConnect, UdpRecv as OpUdpRecv,
-    UdpRecvPacket, UdpRecvStream, UdpSend as OpUdpSend,
+    UdpRecvPacket, UdpRecvPacketBuf, UdpRecvStream, UdpSend as OpUdpSend,
 };
 
 #[derive(Clone)]
@@ -120,7 +120,7 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
             ))
         })?;
         Ok(UdpRecvPacket {
-            buf: recv_buf,
+            buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
             addr,
         })
     }
@@ -272,7 +272,7 @@ impl UdpSocket {
             ))
         })?;
         Ok(UdpRecvPacket {
-            buf: recv_buf,
+            buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
             addr,
         })
     }

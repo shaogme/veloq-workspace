@@ -1,4 +1,6 @@
 use crate::{IoFd, RawHandleMeta, SockAddr};
+use std::ptr::NonNull;
+use std::sync::Arc;
 use veloq_buf::FixedBuf;
 
 #[repr(u16)]
@@ -208,6 +210,134 @@ pub struct UdpRecvStream {
 
 /// A received UDP datagram.
 pub struct UdpRecvPacket {
-    pub buf: FixedBuf,
+    pub buf: UdpRecvPacketBuf,
     pub addr: std::net::SocketAddr,
+}
+
+pub enum UdpRecvPacketBuf {
+    Owned(FixedBuf),
+    Leased(UdpRecvPacketBufLease),
+}
+
+impl UdpRecvPacketBuf {
+    #[inline]
+    pub fn from_fixed_buf(buf: FixedBuf) -> Self {
+        Self::Owned(buf)
+    }
+
+    /// # Safety
+    /// `ptr..ptr+len` must remain readable until the returned buffer is dropped.
+    /// `owner` must keep the backing allocation alive and make `release(idx)` safe.
+    #[inline]
+    pub unsafe fn from_leased_parts(
+        ptr: NonNull<u8>,
+        len: usize,
+        capacity: usize,
+        idx: u32,
+        owner: Arc<dyn UdpRecvPacketBufLeaseOwner>,
+    ) -> Self {
+        Self::Leased(UdpRecvPacketBufLease::new(ptr, len, capacity, idx, owner))
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(buf) => buf.as_slice(),
+            Self::Leased(buf) => buf.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(buf) => buf.len(),
+            Self::Leased(buf) => buf.len(),
+        }
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        match self {
+            Self::Owned(buf) => buf.capacity(),
+            Self::Leased(buf) => buf.capacity(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn into_fixed_buf(self) -> Option<FixedBuf> {
+        match self {
+            Self::Owned(buf) => Some(buf),
+            Self::Leased(_) => None,
+        }
+    }
+}
+
+pub trait UdpRecvPacketBufLeaseOwner: std::marker::Send + Sync {
+    fn release(&self, idx: u32);
+}
+
+pub struct UdpRecvPacketBufLease {
+    ptr: NonNull<u8>,
+    len: u32,
+    capacity: u32,
+    idx: u32,
+    owner: Arc<dyn UdpRecvPacketBufLeaseOwner>,
+}
+
+unsafe impl std::marker::Send for UdpRecvPacketBufLease {}
+
+impl UdpRecvPacketBufLease {
+    #[inline]
+    fn new(
+        ptr: NonNull<u8>,
+        len: usize,
+        capacity: usize,
+        idx: u32,
+        owner: Arc<dyn UdpRecvPacketBufLeaseOwner>,
+    ) -> Self {
+        assert!(len <= capacity, "len must be <= capacity");
+        assert!(
+            capacity <= u32::MAX as usize,
+            "UDP recv packet buffer only supports capacity <= u32::MAX"
+        );
+
+        Self {
+            ptr,
+            len: len as u32,
+            capacity: capacity as u32,
+            idx,
+            owner,
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len()) }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Drop for UdpRecvPacketBufLease {
+    fn drop(&mut self) {
+        self.owner.release(self.idx);
+    }
 }
