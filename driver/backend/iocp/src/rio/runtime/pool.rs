@@ -9,7 +9,7 @@ use crate::net::addr::SockAddrStorage;
 use crate::rio::core::submit_ops::RioBufferId;
 use slotmap::{SlotMap, new_key_type};
 use std::collections::VecDeque;
-use veloq_buf::FixedBuf;
+use veloq_buf::{FixedBuf, FixedBufView};
 use windows_sys::Win32::Networking::WinSock::{RIORESULT, WSAEMSGSIZE};
 
 new_key_type! {
@@ -56,12 +56,12 @@ impl UdpBufferSlab {
     }
 
     #[inline]
-    pub(crate) fn chunk_view(&self, idx: u32, len: usize) -> Option<FixedBuf> {
+    pub(crate) fn chunk_view(&self, idx: u32, len: usize) -> Option<FixedBufView<'_>> {
         let chunk = self.chunks.get(idx as usize)?;
         if len > chunk.capacity() {
             return None;
         }
-        Some(chunk.slice(0..len))
+        Some(chunk.view(0..len))
     }
 }
 
@@ -190,7 +190,7 @@ impl UdpRecvPool {
         let completed_idx = std::mem::replace(&mut slot.current_idx, next_idx);
         if let Some(buf) = slab.chunk_view(completed_idx, bytes) {
             mailbox.queue.push_back(UdpPoolPacket {
-                buf,
+                buf: buf.into_fixed_buf(),
                 idx: completed_idx,
                 addr: *slot.addr,
                 addr_len: std::mem::size_of::<SockAddrStorage>() as i32,

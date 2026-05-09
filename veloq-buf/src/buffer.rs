@@ -49,6 +49,7 @@ use std::{
     alloc::LayoutError,
     cell::Cell,
     num::{NonZeroU16, NonZeroUsize},
+    ops::Range,
     ptr::NonNull,
     sync::Arc,
 };
@@ -365,26 +366,6 @@ pub struct FixedBuf {
     cap: u32,
 }
 
-impl Clone for FixedBuf {
-    fn clone(&self) -> Self {
-        match self.pool_kind() {
-            PoolKind::SlotBased => unsafe {
-                slot_based_increment(self.pool_data, self.context.raw_payload());
-            },
-            PoolKind::Heap => unsafe {
-                heap_increment(self.pool_data);
-            },
-        }
-        Self {
-            ptr: self.ptr,
-            pool_data: self.pool_data,
-            context: self.context,
-            len: self.len,
-            cap: self.cap,
-        }
-    }
-}
-
 const _: [(); 32] = [(); std::mem::size_of::<FixedBuf>()];
 const _: [(); 32] = [(); std::mem::align_of::<FixedBuf>()];
 
@@ -407,6 +388,29 @@ impl FixedBuf {
         self.cap as usize
     }
 
+    #[inline(always)]
+    unsafe fn from_parts(
+        ptr: NonNull<u8>,
+        pool_data: NonNull<()>,
+        context: PackedContext,
+        len: usize,
+        cap: usize,
+    ) -> Self {
+        assert!(len <= cap, "len must be <= capacity");
+        assert!(
+            cap <= u32::MAX as usize,
+            "FixedBuf only supports capacity <= u32::MAX"
+        );
+
+        Self {
+            ptr,
+            pool_data,
+            context,
+            len: len as u32,
+            cap: cap as u32,
+        }
+    }
+
     /// # Safety
     /// `ptr` must be valid and allocated by the pool associated with `pool_kind`.
     #[inline(always)]
@@ -425,13 +429,7 @@ impl FixedBuf {
         let mut context = PackedContext::from(context);
         context.set_pool_kind(pool_kind);
 
-        Self {
-            ptr,
-            pool_data,
-            context,
-            len: cap.get() as u32,
-            cap: cap.get() as u32,
-        }
+        unsafe { Self::from_parts(ptr, pool_data, context, cap.get(), cap.get()) }
     }
 
     /// Resolve which region this buffer belongs to and its offset.
@@ -498,6 +496,14 @@ impl FixedBuf {
         self.len = len as u32;
     }
 
+    /// Create a borrowed sub-view of the buffer.
+    ///
+    /// The returned view borrows `self` and does not change ownership.
+    #[inline(always)]
+    pub fn view(&self, range: Range<usize>) -> FixedBufView<'_> {
+        FixedBufView::new(self, range)
+    }
+
     /// Allocate a buffer from the system heap (not from a pool).
     ///
     /// This is used as a fallback when the pool is full.
@@ -534,23 +540,85 @@ impl FixedBuf {
             )
         })
     }
+}
 
-    /// Create a new sub-view of the buffer that shares the same underlying memory.
-    ///
-    /// The new buffer will have its own length and offset, but it will keep the
-    /// original allocation alive until all views are dropped.
+#[derive(Debug, Clone)]
+pub struct FixedBufView<'a> {
+    buf: &'a FixedBuf,
+    range: Range<usize>,
+}
+
+impl<'a> FixedBufView<'a> {
     #[inline(always)]
-    pub fn slice(&self, range: std::ops::Range<usize>) -> Self {
-        let mut new_buf = self.clone();
+    pub fn new(buf: &'a FixedBuf, range: Range<usize>) -> Self {
         let start = range.start;
         let end = range.end;
-        assert!(start <= end, "slice start must be <= end");
-        assert!(end <= self.len as usize, "slice end must be <= buffer len");
+        assert!(start <= end, "view start must be <= end");
+        assert!(end <= buf.len(), "view end must be <= buffer len");
 
-        new_buf.ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(start)) };
-        new_buf.len = (end - start) as u32;
-        new_buf.cap = (end - start) as u32; // Slice has its own independent capacity
-        new_buf
+        Self { buf, range }
+    }
+
+    #[inline(always)]
+    pub fn buf(&self) -> &'a FixedBuf {
+        self.buf
+    }
+
+    #[inline(always)]
+    pub fn range(&self) -> &Range<usize> {
+        &self.range
+    }
+
+    #[inline(always)]
+    pub fn start(&self) -> usize {
+        self.range.start
+    }
+
+    #[inline(always)]
+    pub fn end(&self) -> usize {
+        self.range.end
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.range.end - self.range.start
+    }
+
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        self.len()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const u8 {
+        unsafe { self.buf.as_ptr().add(self.start()) }
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &'a [u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
+    }
+
+    #[inline(always)]
+    pub fn into_fixed_buf(self) -> FixedBuf {
+        match self.buf.pool_kind() {
+            PoolKind::SlotBased => unsafe {
+                slot_based_increment(self.buf.pool_data, self.buf.context.raw_payload());
+            },
+            PoolKind::Heap => unsafe {
+                heap_increment(self.buf.pool_data);
+            },
+        }
+
+        let len = self.len();
+        let ptr = unsafe { NonNull::new_unchecked(self.as_ptr() as *mut u8) };
+
+        unsafe { FixedBuf::from_parts(ptr, self.buf.pool_data, self.buf.context, len, len) }
     }
 }
 
@@ -1051,5 +1119,77 @@ unsafe fn slot_based_resolve_region_info(pool_data: NonNull<()>, buf: &FixedBuf)
         id: chunk_id,
         offset: ptr.saturating_sub(base),
         cookie: 0, // Cookies are currently only used for heap buffers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn heap_view_preserves_borrow_semantics_until_owned_handle_is_requested() {
+        let buf = FixedBuf::alloc_heap(NonZeroUsize::new(16).expect("non-zero length"))
+            .expect("heap allocation failed");
+        let mut buf = buf;
+
+        for (idx, byte) in buf.as_slice_mut().iter_mut().enumerate() {
+            *byte = idx as u8;
+        }
+
+        let control = buf.pool_data.as_ptr() as *const HeapControlBlock;
+        assert_eq!(unsafe { (*control).ref_count.load(Ordering::Relaxed) }, 1);
+
+        let owned = {
+            let view = buf.view(4..12);
+            assert_eq!(unsafe { (*control).ref_count.load(Ordering::Relaxed) }, 1);
+            assert_eq!(view.as_ptr(), unsafe { buf.as_ptr().add(4) });
+            assert_eq!(view.len(), 8);
+            assert_eq!(view.capacity(), 8);
+            assert_eq!(view.as_slice(), &[4, 5, 6, 7, 8, 9, 10, 11]);
+            view.into_fixed_buf()
+        };
+
+        assert_eq!(unsafe { (*control).ref_count.load(Ordering::Relaxed) }, 2);
+        drop(buf);
+        assert_eq!(unsafe { (*control).ref_count.load(Ordering::Relaxed) }, 1);
+        assert_eq!(owned.as_slice(), &[4, 5, 6, 7, 8, 9, 10, 11]);
+        drop(owned);
+    }
+
+    #[test]
+    fn heap_view_supports_zero_length_owned_handles() {
+        let buf = FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero length"))
+            .expect("heap allocation failed");
+        let control = buf.pool_data.as_ptr() as *const HeapControlBlock;
+
+        let owned = {
+            let view = buf.view(0..0);
+            assert_eq!(unsafe { (*control).ref_count.load(Ordering::Relaxed) }, 1);
+            assert_eq!(view.len(), 0);
+            assert_eq!(view.capacity(), 0);
+            assert!(view.as_slice().is_empty());
+            view.into_fixed_buf()
+        };
+
+        assert_eq!(unsafe { (*control).ref_count.load(Ordering::Relaxed) }, 2);
+        drop(buf);
+        assert_eq!(unsafe { (*control).ref_count.load(Ordering::Relaxed) }, 1);
+        assert!(owned.as_slice().is_empty());
+        drop(owned);
+    }
+
+    #[test]
+    fn heap_view_rejects_invalid_range_without_retaining() {
+        let buf = FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero length"))
+            .expect("heap allocation failed");
+        let control = buf.pool_data.as_ptr() as *const HeapControlBlock;
+
+        let result = catch_unwind(AssertUnwindSafe(|| buf.view(3..2)));
+        assert!(result.is_err());
+        assert_eq!(unsafe { (*control).ref_count.load(Ordering::Relaxed) }, 1);
+
+        drop(buf);
     }
 }

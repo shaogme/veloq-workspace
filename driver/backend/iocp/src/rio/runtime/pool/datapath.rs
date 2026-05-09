@@ -15,7 +15,7 @@ use diagweave::report::ResultReportExt;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::collections::{VecDeque, hash_map};
-use veloq_buf::FixedBuf;
+use veloq_buf::{FixedBuf, FixedBufView};
 use veloq_driver_core::driver::{CompletionEvent, encode_completion_token};
 use veloq_driver_core::op::{
     UdpRecv as OpUdpRecv, UdpRecvPacket as OpUdpRecvPacket, UdpRecvStream,
@@ -153,7 +153,7 @@ impl UdpPoolManager {
         for idx in 0..chunk_count {
             let start = idx * chunk_size;
             let end = start + chunk_size;
-            chunks.push(backing.slice(start..end));
+            chunks.push(FixedBufView::new(&backing, start..end).into_fixed_buf());
         }
 
         let mut free_indices = VecDeque::with_capacity(chunk_count);
@@ -727,13 +727,13 @@ impl UdpRecvPool {
                     }
                 }
                 FastDeliverPayload::Stream { idx, len } => {
-                    let Some(mut buf) = slab.chunk_view(idx, len) else {
+                    let Some(buf) = slab.chunk_view(idx, len) else {
                         mailbox.waiters.push_front(waiter);
                         slab.free_indices.push_front(slot.current_idx);
                         slot.current_idx = idx;
                         return Ok(None);
                     };
-                    buf.set_len(len);
+                    let buf = buf.into_fixed_buf();
                     let addr = UdpPoolManager::parse_rio_address(
                         &slot.addr,
                         std::mem::size_of::<SockAddrStorage>() as i32,
