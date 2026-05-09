@@ -172,7 +172,7 @@ impl Runner {
         let workspace_root = workspace_root()?;
         let mode = determine_mode(config.target, &workspace_root)?;
 
-        let windows_target = if cfg!(target_os = "windows") {
+        let windows_target = if cfg!(target_os = "windows") || config.target != Target::Windows {
             None
         } else {
             // 在非 Windows 环境下（如 Linux），探测已安装的 Windows target
@@ -182,27 +182,33 @@ impl Runner {
                     vec!["target".into(), "list".into(), "--installed".into()],
                 ),
                 &workspace_root,
-            )?;
-            let installed = String::from_utf8_lossy(&output.stdout);
-            let mut targets: Vec<_> = installed.lines().map(|l| l.trim().to_string()).collect();
+            );
 
-            // 优先选择 x86_64-pc-windows-msvc，其次是 gnu
-            targets.sort_by_key(|t| {
-                if t == "x86_64-pc-windows-msvc" {
-                    0
-                } else if t == "x86_64-pc-windows-gnu" {
-                    1
-                } else if t.contains("-windows-") {
-                    2
-                } else {
-                    3
+            match output {
+                Ok(output) if output.status.success() => {
+                    let installed = String::from_utf8_lossy(&output.stdout);
+                    let mut targets: Vec<_> =
+                        installed.lines().map(|l| l.trim().to_string()).collect();
+
+                    targets.sort_by_key(|t| {
+                        if t == "x86_64-pc-windows-msvc" {
+                            0
+                        } else if t == "x86_64-pc-windows-gnu" {
+                            1
+                        } else if t.contains("-windows-") {
+                            2
+                        } else {
+                            3
+                        }
+                    });
+
+                    targets
+                        .into_iter()
+                        .find(|t| t.contains("-windows-"))
+                        .or_else(|| Some("x86_64-pc-windows-gnu".to_string()))
                 }
-            });
-
-            targets
-                .into_iter()
-                .find(|t| t.contains("-windows-"))
-                .or_else(|| Some("x86_64-pc-windows-gnu".to_string()))
+                _ => Some("x86_64-pc-windows-gnu".to_string()),
+            }
         };
 
         let runner = Self {
@@ -557,6 +563,12 @@ fn command_status(
     command: &CommandSpec,
     workspace_root: &Path,
 ) -> io::Result<std::process::ExitStatus> {
+    if !workspace_root.exists() {
+        return Err(io::Error::other(format!(
+            "Workspace root does not exist: {:?}",
+            workspace_root
+        )));
+    }
     let mut process = Command::new(&command.program);
     process
         .args(&command.args)
@@ -566,6 +578,12 @@ fn command_status(
 }
 
 fn command_output(command: &CommandSpec, workspace_root: &Path) -> io::Result<Output> {
+    if !workspace_root.exists() {
+        return Err(io::Error::other(format!(
+            "Workspace root does not exist: {:?}",
+            workspace_root
+        )));
+    }
     let mut process = Command::new(&command.program);
     process
         .args(&command.args)

@@ -15,18 +15,18 @@ use crate::config::{
 };
 use crate::error::{UringError, UringResult, UringResultExt, from_io_error};
 use crate::op::{SubmissionStrategy, UringOp};
+use veloq_driver_core::driver::registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, DriveMode, DriveOutcome, Driver, Outcome, RegisterFd,
     RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
     drain_cancel_requests, encode_completion_token,
 };
-use veloq_driver_core::error::{
+use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
+use veloq_driver_core::slot::DetachedCancelTable;
+use veloq_driver_core::{
     DriverErrorKind, DriverErrorReport, DriverResult, driver_error,
     driver_error_report_to_event_res, driver_os_error,
 };
-use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
-use veloq_driver_core::op_registry::{AllocResult, OpEntry, OpHandle, OpRegistry};
-use veloq_driver_core::slot::DetachedCancelTable;
 
 mod lifecycle;
 mod registration;

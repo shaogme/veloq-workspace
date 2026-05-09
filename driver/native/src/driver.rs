@@ -1,7 +1,3 @@
-pub mod op_registry {
-    pub use veloq_driver_core::op_registry::*;
-}
-
 pub mod slot {
     pub use veloq_driver_core::slot::*;
 }

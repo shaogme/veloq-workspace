@@ -17,12 +17,12 @@ use crate::rio::{ActorKey, RioCompletionContext, RioContext, RioEnv, RioState, S
 use diagweave::report::ResultReportExt;
 use slotmap::SlotMap;
 use tracing::error;
+use veloq_driver_core::driver::registry::OpRegistry;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
-use veloq_driver_core::error::{DriverErrorKind, driver_os_error};
-use veloq_driver_core::op_registry::OpRegistry;
 use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
+use veloq_driver_core::{DriverErrorKind, driver_os_error};
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

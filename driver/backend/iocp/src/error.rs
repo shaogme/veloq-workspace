@@ -1,5 +1,5 @@
 use diagweave::{report::Report, set};
-use veloq_driver_core::error::{DriverErrorKind, DriverResult, ResultAsDriverExt};
+use veloq_driver_core::{DriverErrorKind, DriverResult, ResultAsDriverExt};
 
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]

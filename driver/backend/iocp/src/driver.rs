@@ -12,6 +12,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use veloq_blocking::{BlockingTask, get_blocking_pool};
+use veloq_driver_core::driver::registry::{OpEntry, OpRegistry};
 #[cfg(feature = "test-hooks")]
 pub use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 use veloq_driver_core::driver::{
@@ -19,12 +20,11 @@ use veloq_driver_core::driver::{
     RegisterFd, RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder,
     SubmitStatus,
 };
-use veloq_driver_core::error::{
-    DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
-};
-use veloq_driver_core::op_registry::{OpEntry, OpRegistry};
 use veloq_driver_core::slot::{
     DetachedCancelTable, ErasedPayload, Reserved, SlotRegistryExt, SlotTable, SlotView,
+};
+use veloq_driver_core::{
+    DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
 };
 use veloq_wheel::TaskId;
 

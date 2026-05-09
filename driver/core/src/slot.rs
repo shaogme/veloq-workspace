@@ -1,445 +1,15 @@
+use crate::DriverResult;
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
-use crate::error::DriverResult;
-use crate::op_registry::OpRegistry;
-use crossbeam_utils::CachePadded;
+use crate::driver::registry::OpRegistry;
 use std::marker::PhantomData;
-use veloq_atomic_waker::AtomicWaker;
-use veloq_shim::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use veloq_shim::sync::Mutex;
+use veloq_shim::atomic::Ordering;
 
-use bilge::prelude::*;
+mod core;
+mod table;
 
-/// Manual payload container: raw pointer + static kind + drop fn.
-#[derive(Debug)]
-pub struct ErasedPayload {
-    pub ptr: *mut (),
-    pub kind: u16,
-    pub drop_fn: unsafe fn(*mut ()),
-}
-
-unsafe impl Send for ErasedPayload {}
-
-impl ErasedPayload {
-    #[inline]
-    pub fn leak_ptr(self) -> *mut () {
-        let this = std::mem::ManuallyDrop::new(self);
-        this.ptr
-    }
-}
-
-impl Drop for ErasedPayload {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe { (self.drop_fn)(self.ptr) };
-            self.ptr = std::ptr::null_mut();
-        }
-    }
-}
-
-#[bitsize(8)]
-#[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotState {
-    Idle,
-    Reserved,
-    InFlightWaiting,
-    InFlightReady,
-    InFlightOrphaned,
-    Finalizing,
-    #[fallback]
-    ReservedValue,
-}
-
-#[bitsize(64)]
-#[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
-pub struct PackedCoreState {
-    pub generation: u32,
-    pub state: SlotState,
-    pub flags: u24,
-}
-
-impl PackedCoreState {
-    #[inline]
-    pub fn with_state(mut self, state: SlotState) -> Self {
-        self.set_state(state);
-        self
-    }
-
-    #[inline]
-    pub fn with_generation(mut self, generation: u32) -> Self {
-        self.set_generation(generation);
-        self
-    }
-}
-
-pub struct AtomicPackedCoreState(AtomicU64);
-
-impl AtomicPackedCoreState {
-    #[inline]
-    pub fn new(state: PackedCoreState) -> Self {
-        Self(AtomicU64::new(u64::from(state)))
-    }
-
-    #[inline]
-    pub fn load(&self, order: Ordering) -> PackedCoreState {
-        PackedCoreState::from(self.0.load(order))
-    }
-
-    #[inline]
-    pub fn store(&self, state: PackedCoreState, order: Ordering) {
-        self.0.store(u64::from(state), order);
-    }
-
-    #[inline]
-    pub fn compare_exchange(
-        &self,
-        current: PackedCoreState,
-        new: PackedCoreState,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<PackedCoreState, PackedCoreState> {
-        self.0
-            .compare_exchange(u64::from(current), u64::from(new), success, failure)
-            .map(PackedCoreState::from)
-            .map_err(PackedCoreState::from)
-    }
-
-    #[inline]
-    pub fn compare_exchange_weak(
-        &self,
-        current: PackedCoreState,
-        new: PackedCoreState,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<PackedCoreState, PackedCoreState> {
-        self.0
-            .compare_exchange_weak(u64::from(current), u64::from(new), success, failure)
-            .map(PackedCoreState::from)
-            .map_err(PackedCoreState::from)
-    }
-}
-
-pub struct SlotStorage<Op, S: SlotSidecar, R = usize> {
-    op: Option<Op>,
-    result: Option<DriverResult<R>>,
-    payload: Option<ErasedPayload>,
-    sidecar: S,
-}
-
-impl<Op, S: SlotSidecar, R> SlotStorage<Op, S, R> {
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            op: None,
-            result: None,
-            payload: None,
-            sidecar: S::default(),
-        }
-    }
-
-    #[inline]
-    pub fn reset(&mut self) {
-        *self = Self::new();
-    }
-
-    #[inline]
-    pub fn with_mut<F, X>(&mut self, f: F) -> X
-    where
-        F: FnOnce(
-            &mut Option<Op>,
-            &mut Option<DriverResult<R>>,
-            &mut Option<ErasedPayload>,
-            &mut S,
-        ) -> X,
-    {
-        f(
-            &mut self.op,
-            &mut self.result,
-            &mut self.payload,
-            &mut self.sidecar,
-        )
-    }
-}
-
-impl<Op, S: SlotSidecar, R> Default for SlotStorage<Op, S, R> {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct SlotData<Op, S: SlotSidecar, R = usize> {
-    pub(crate) core_state: AtomicPackedCoreState,
-    pub next_free: AtomicUsize,
-    pub(crate) completion_res: AtomicI32,
-    pub(crate) completion_flags: AtomicU32,
-    pub(crate) completion_data: Mutex<CompletionData<R>>,
-    pub(crate) completion_waker: AtomicWaker,
-    _marker: PhantomData<fn() -> (Op, S)>,
-}
-
-#[derive(Debug)]
-pub(crate) struct CompletionData<R = usize> {
-    pub payload: Option<ErasedPayload>,
-    pub detail: Option<DriverResult<R>>,
-}
-
-impl<R> Default for CompletionData<R> {
-    fn default() -> Self {
-        Self {
-            payload: None,
-            detail: None,
-        }
-    }
-}
-
-impl<Op, S: SlotSidecar, R> SlotData<Op, S, R> {
-    const NULL_INDEX: usize = usize::MAX;
-
-    pub fn new() -> Self {
-        Self {
-            core_state: AtomicPackedCoreState::new(PackedCoreState::new(
-                0,
-                SlotState::Idle,
-                u24::new(0),
-            )),
-            next_free: AtomicUsize::new(Self::NULL_INDEX),
-            completion_res: AtomicI32::new(0),
-            completion_flags: AtomicU32::new(0),
-            completion_data: Mutex::new(CompletionData::default()),
-            completion_waker: AtomicWaker::new(),
-            _marker: PhantomData,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn state(&self, ordering: Ordering) -> SlotState {
-        self.core_state.load(ordering).state()
-    }
-
-    #[inline]
-    pub fn generation(&self, ordering: Ordering) -> u32 {
-        self.core_state.load(ordering).generation()
-    }
-
-    #[inline]
-    pub(crate) fn load_core_state(&self, ordering: Ordering) -> PackedCoreState {
-        self.core_state.load(ordering)
-    }
-
-    #[inline]
-    pub(crate) fn set_state(&self, state: SlotState, ordering: Ordering) {
-        let mut current = self.core_state.load(Ordering::Acquire);
-        loop {
-            let new = current.with_state(state);
-            match self
-                .core_state
-                .compare_exchange_weak(current, new, ordering, Ordering::Acquire)
-            {
-                Ok(_) => return,
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    pub(crate) fn reset(&self, generation: u32) {
-        self.core_state.store(
-            PackedCoreState::new(generation, SlotState::Idle, u24::new(0)),
-            Ordering::Release,
-        );
-    }
-
-    pub(crate) fn free(&self) {
-        let mut current = self.core_state.load(Ordering::Acquire);
-        loop {
-            // Preserve READY state so detached completion can still be consumed.
-            let target = if current.state() == SlotState::InFlightReady {
-                SlotState::InFlightReady
-            } else {
-                SlotState::Idle
-            };
-            let new = current.with_state(target);
-            match self.core_state.compare_exchange_weak(
-                current,
-                new,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    #[inline]
-    pub(crate) fn completion_with_data<F, X>(&self, f: F) -> X
-    where
-        F: FnOnce(&mut Option<ErasedPayload>, &mut Option<DriverResult<R>>) -> X,
-    {
-        let mut data = self.completion_data.lock();
-        let CompletionData { payload, detail } = &mut *data;
-        f(payload, detail)
-    }
-}
-
-impl<Op, S: SlotSidecar, R> Default for SlotData<Op, S, R> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub type SlotEntry<Op, S, R = usize> = CachePadded<SlotData<Op, S, R>>;
-
-pub struct DetachedCancelTable {
-    slot_count: usize,
-    cancel_words: Box<[CachePadded<AtomicU64>]>,
-    cancel_generations: Box<[CachePadded<AtomicU64>]>,
-}
-
-impl DetachedCancelTable {
-    pub fn new(capacity: usize) -> Self {
-        let word_count = capacity.div_ceil(64);
-        let mut cancel_words = Vec::with_capacity(word_count);
-        for _ in 0..word_count {
-            cancel_words.push(CachePadded::new(AtomicU64::new(0)));
-        }
-        let mut cancel_generations = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            cancel_generations.push(CachePadded::new(AtomicU64::new(0)));
-        }
-        Self {
-            slot_count: capacity,
-            cancel_words: cancel_words.into_boxed_slice(),
-            cancel_generations: cancel_generations.into_boxed_slice(),
-        }
-    }
-
-    #[inline]
-    pub fn request_cancel(&self, token: u64) {
-        let (idx, generation) = crate::driver::decode_completion_token(token);
-        if idx >= self.slot_count {
-            return;
-        }
-
-        let generation = generation as u64;
-        let cell = &self.cancel_generations[idx];
-        let mut current = cell.load(Ordering::Acquire);
-        while generation > current {
-            match cell.compare_exchange_weak(
-                current,
-                generation,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(next) => current = next,
-            }
-        }
-
-        let word_idx = idx / 64;
-        let bit_idx = idx % 64;
-        self.cancel_words[word_idx].fetch_or(1u64 << bit_idx, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn cancel_word_count(&self) -> usize {
-        self.cancel_words.len()
-    }
-
-    #[inline]
-    pub fn take_cancel_word(&self, word_idx: usize) -> u64 {
-        self.cancel_words[word_idx].fetch_and(0, Ordering::AcqRel)
-    }
-
-    #[inline]
-    pub(crate) fn cancel_generation(&self, idx: usize) -> u64 {
-        self.cancel_generations[idx].load(Ordering::Acquire)
-    }
-}
-
-pub struct SlotTable<Op, S: SlotSidecar, R = usize> {
-    pub slots: Box<[SlotEntry<Op, S, R>]>,
-    pub remote_free_head: AtomicUsize,
-    ready_completion_count: AtomicUsize,
-}
-
-unsafe impl<Op, S: SlotSidecar, R> Sync for SlotTable<Op, S, R> {}
-
-impl<Op, S: SlotSidecar, R> SlotTable<Op, S, R> {
-    pub const NULL_INDEX: usize = usize::MAX;
-
-    pub fn new(capacity: usize) -> Self {
-        let mut slots = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            slots.push(CachePadded::new(SlotData::new()));
-        }
-        Self {
-            slots: slots.into_boxed_slice(),
-            remote_free_head: AtomicUsize::new(Self::NULL_INDEX),
-            ready_completion_count: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn push_free(&self, idx: usize) {
-        let slot = &self.slots[idx];
-        let mut head = self.remote_free_head.load(Ordering::Relaxed);
-        loop {
-            slot.next_free.store(head, Ordering::Relaxed);
-            match self.remote_free_head.compare_exchange_weak(
-                head,
-                idx,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => head = current,
-            }
-        }
-    }
-
-    pub fn pop_all(&self) -> usize {
-        self.remote_free_head
-            .swap(Self::NULL_INDEX, Ordering::Acquire)
-    }
-
-    #[inline]
-    pub(crate) fn slot_snapshot(&self, idx: usize) -> Option<(u32, SlotState)> {
-        self.slots.get(idx).map(|slot| {
-            let core = slot.load_core_state(Ordering::Acquire);
-            (core.generation(), core.state())
-        })
-    }
-
-    /// 检查是否存在已完成但尚未被消费的完成项。
-    #[inline]
-    pub fn has_ready_completion(&self) -> bool {
-        self.ready_completion_count.load(Ordering::Acquire) > 0
-    }
-
-    #[inline]
-    pub(crate) fn note_ready_completion(&self) {
-        self.ready_completion_count.fetch_add(1, Ordering::Release);
-    }
-
-    #[inline]
-    pub(crate) fn clear_ready_completion(&self) {
-        let mut current = self.ready_completion_count.load(Ordering::Acquire);
-        loop {
-            if current == 0 {
-                return;
-            }
-            match self.ready_completion_count.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(next) => current = next,
-            }
-        }
-    }
-}
+pub use core::*;
+pub use table::*;
 
 pub trait SlotMarker: sealed::Sealed {}
 
@@ -473,7 +43,7 @@ pub struct Slot<'a, State: SlotMarker, Op: PlatformOp, P, S: SlotSidecar, R = us
 
 impl<'a, State: SlotMarker, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, State, Op, P, S, R> {
     #[inline]
-    fn new_internal(
+    pub(crate) fn new_internal(
         entry: &'a SlotEntry<Op, S, R>,
         op: &'a mut Option<Op>,
         storage: &'a mut SlotStorage<Op, S, R>,
@@ -503,7 +73,7 @@ pub fn is_runnable_state(state: SlotState) -> bool {
 
 impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, Reserved, Op, P, S, R> {
     #[inline]
-    fn try_bind(
+    pub(crate) fn try_bind(
         entry: &'a SlotEntry<Op, S, R>,
         op: &'a mut Option<Op>,
         storage: &'a mut SlotStorage<Op, S, R>,
@@ -580,7 +150,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, Reserved, Op, P, S, R> {
 
 impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, InFlightWaiting, Op, P, S, R> {
     #[inline]
-    fn try_bind(
+    pub(crate) fn try_bind(
         entry: &'a SlotEntry<Op, S, R>,
         op: &'a mut Option<Op>,
         storage: &'a mut SlotStorage<Op, S, R>,
@@ -680,7 +250,7 @@ impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, Completed, Op, P, S, R> 
 
 impl<'a, Op: PlatformOp, P, S: SlotSidecar, R> Slot<'a, InFlightOrphaned, Op, P, S, R> {
     #[inline]
-    fn try_bind(
+    pub(crate) fn try_bind(
         entry: &'a SlotEntry<Op, S, R>,
         op: &'a mut Option<Op>,
         storage: &'a mut SlotStorage<Op, S, R>,
@@ -790,31 +360,5 @@ impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> SlotRegistryExt<Op, P, S, R>
             .expect("slot missing in registry during reserve");
         entry.set_state(SlotState::Reserved, Ordering::Release);
         Slot::new_internal(entry, op, storage, &mut op_entry.platform_data, index)
-    }
-}
-
-#[cfg(all(test, not(feature = "loom")))]
-mod tests {
-    use super::*;
-    use crate::driver::encode_completion_token;
-
-    #[test]
-    fn request_cancel_sets_bit_and_generation() {
-        let cancel_table = DetachedCancelTable::new(64);
-        cancel_table.request_cancel(encode_completion_token(5, 7));
-
-        assert_eq!(cancel_table.take_cancel_word(0), 1u64 << 5);
-        assert_eq!(cancel_table.cancel_generation(5), 7);
-    }
-
-    #[test]
-    fn request_cancel_keeps_newest_generation() {
-        let cancel_table = DetachedCancelTable::new(64);
-
-        cancel_table.request_cancel(encode_completion_token(5, 7));
-        cancel_table.request_cancel(encode_completion_token(5, 11));
-        cancel_table.request_cancel(encode_completion_token(5, 9));
-
-        assert_eq!(cancel_table.cancel_generation(5), 11);
     }
 }

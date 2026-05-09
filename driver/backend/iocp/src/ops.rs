@@ -20,8 +20,8 @@ use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioState;
 
+use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::PlatformOp;
-use veloq_driver_core::error::DriverResult;
 use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
     FallocateRaw as FallocateRawBase, Fsync as FsyncBase, FsyncRaw as FsyncRawBase, IntoPlatformOp,

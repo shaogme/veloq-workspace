@@ -19,8 +19,8 @@ use crate::config::SocketKey;
 use crate::ops::IocpOp;
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
+use veloq_driver_core::driver::registry::OpRegistry;
 use veloq_driver_core::driver::{SharedCompletionQueue, SharedCompletionTable};
-use veloq_driver_core::op_registry::OpRegistry;
 
 use self::core::registry::RioRegistry;
 use self::core::submit_ops::{RioCq, RioDispatch, RioKernel, RioRq};

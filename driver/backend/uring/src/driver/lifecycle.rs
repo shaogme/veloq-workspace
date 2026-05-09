@@ -1,8 +1,8 @@
 use crate::driver::{CANCEL_USER_DATA, UringDriver};
 use io_uring::opcode;
 use std::sync::atomic::Ordering;
+use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::CompletionSidecar;
-use veloq_driver_core::error::DriverResult;
 
 use crate::op::slot::{Slot, SlotState, SlotView, UringOpRegistryExt};
 use veloq_driver_core::slot::ErasedPayload;

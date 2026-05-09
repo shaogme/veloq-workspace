@@ -7,7 +7,7 @@ use crate::rio::error::RioError;
 use crate::rio::runtime::pool::POOL_CTX_TAG;
 use crate::rio::{ActorKey, RioState};
 use diagweave::report::Report;
-use veloq_driver_core::error::{
+use veloq_driver_core::{
     DriverErrorKind, DriverResult, driver_error_report_to_event_res, driver_os_error,
 };
 

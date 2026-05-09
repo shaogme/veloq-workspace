@@ -5,8 +5,8 @@ use crate::driver::UringDriver;
 use crate::{OwnedRawHandle, RawHandle};
 use io_uring::squeue;
 use std::time::Duration;
+use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::PlatformOp;
-use veloq_driver_core::error::DriverResult;
 use veloq_driver_core::op::{IntoPlatformOp, OpKind};
 
 mod payload;

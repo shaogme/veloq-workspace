@@ -1,6 +1,6 @@
+use crate::DriverResult;
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
-use crate::error::DriverResult;
 use crate::slot::{ErasedPayload, SlotEntry, SlotState, SlotStorage, SlotTable};
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ impl<P> OpEntry<P> {
 }
 
 pub struct LocalSlot<Op, P, S: SlotSidecar, R = usize> {
-    op: Option<Op>,
+    pub(crate) op: Option<Op>,
     pub entry: OpEntry<P>,
     pub storage: SlotStorage<Op, S, R>,
 }
@@ -30,7 +30,7 @@ impl<Op, P: Default, S: SlotSidecar, R> LocalSlot<Op, P, S, R> {
             entry: OpEntry {
                 platform_data: P::default(),
             },
-            storage: SlotStorage::new(),
+            storage: SlotStorage::<Op, S, R>::new(),
         }
     }
 }
@@ -52,19 +52,20 @@ pub struct AllocResult {
     pub handle: OpHandle,
 }
 
-type SlotEntryOpBundle<'a, Op, P, S, R = usize> = (
+pub type SlotEntryOpBundle<'a, Op, P, S, R = usize> = (
     &'a SlotEntry<Op, S, R>,
     &'a mut OpEntry<P>,
     &'a mut Option<Op>,
     &'a mut SlotStorage<Op, S, R>,
 );
 
-type SlotEntryAndOpEntry<'a, Op, P, S, R = usize> = (&'a SlotEntry<Op, S, R>, &'a mut OpEntry<P>);
+pub type SlotEntryAndOpEntry<'a, Op, P, S, R = usize> =
+    (&'a SlotEntry<Op, S, R>, &'a mut OpEntry<P>);
 
 impl<Op: PlatformOp, P: Default, S: SlotSidecar, R> OpRegistry<Op, P, S, R> {
     pub fn new(capacity: usize) -> Self {
         let shared = Arc::new(SlotTable::new(capacity));
-        let mut local = Vec::with_capacity(capacity);
+        let mut local: Vec<LocalSlot<Op, P, S, R>> = Vec::with_capacity(capacity);
 
         for _ in 0..capacity {
             local.push(LocalSlot::new());

@@ -5,7 +5,7 @@ use diagweave::report::Report;
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use veloq_driver_core::net::{PlatformSocket, SocketAddrCodec};
+use veloq_driver_core::{PlatformSocket, SocketAddrCodec};
 
 pub struct Socket {
     fd: OwnedRawHandle,

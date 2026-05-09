@@ -3,7 +3,7 @@ use crate::config::{IocpHandle, OwnedRawHandle, RawHandle};
 use crate::error::{IocpError, IocpResult, from_io_error};
 use crate::win32::SafeSocket;
 use std::net::SocketAddr;
-use veloq_driver_core::net::PlatformSocket;
+use veloq_driver_core::PlatformSocket;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, INVALID_SOCKET, IP_TTL, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, SO_BROADCAST,
     SO_KEEPALIVE, SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF, SOCK_DGRAM, SOCK_STREAM, SOCKADDR,

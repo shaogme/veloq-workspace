@@ -11,7 +11,7 @@ use veloq_driver_core::driver::{
     CompletionEvent, CompletionRecord, CompletionSidecar, RemoteWaker, SharedCompletionQueue,
     SharedCompletionTable, encode_completion_token,
 };
-use veloq_driver_core::error::{DriverErrorKind, DriverResult};
+use veloq_driver_core::{DriverErrorKind, DriverResult};
 
 // ============================================================================
 // Error Context & Logic

@@ -1,7 +1,7 @@
 use crate::error::{IocpError, IocpResult};
 use std::mem::offset_of;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use veloq_driver_core::net::SocketAddrCodec;
+use veloq_driver_core::SocketAddrCodec;
 use veloq_pod::{Pod, Zeroable, bytes_of, bytes_of_mut, from_bytes, from_bytes_mut, zeroed};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,

@@ -8,10 +8,10 @@ use tracing::debug;
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
 use veloq_buf::{BufferRegistrar, NoopRegistrar};
+use veloq_driver_core::driver::registry::OpRegistry;
 use veloq_driver_core::driver::{
     RemoteWaker, SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
 };
-use veloq_driver_core::op_registry::OpRegistry;
 use veloq_wheel::{Wheel, WheelConfig};
 
 use crate::common::{
@@ -25,8 +25,8 @@ use crate::ops::slot::Slot;
 use crate::ops::{IocpOp, IocpOpPayload, OverlappedEntry, submit};
 use crate::rio::RioState;
 use crate::win32::Overlapped;
-use veloq_driver_core::error::{DriverErrorKind, driver_error};
 use veloq_driver_core::slot::{DetachedCancelTable, InFlightWaiting, SlotRegistryExt, SlotView};
+use veloq_driver_core::{DriverErrorKind, driver_error};
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 
