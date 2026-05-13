@@ -1,4 +1,4 @@
-use crate::heap::slot::{SLOT_SIZE, SlotIndex};
+use crate::heap::units::{SLOT_SIZE, SlotIndex};
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::pin::Pin;
@@ -97,31 +97,26 @@ impl BuddyAllocator {
         allocator
     }
 
-    #[inline(always)]
     fn ptr_from_index(&self, index: SlotIndex) -> NonNull<u8> {
         assert!(index.0 < self.total_slots, "Slot index out of bounds");
         // SAFETY: base_ptr is valid for total_slots, index is checked above.
         unsafe { NonNull::new_unchecked(self.base_ptr.as_ptr().add(index.offset())) }
     }
 
-    #[inline(always)]
     fn get_free_node_ptr(&self, index: SlotIndex) -> NonNull<FreeNode> {
         self.ptr_from_index(index).cast()
     }
 
-    #[inline(always)]
     unsafe fn get_free_node(&self, index: SlotIndex) -> &FreeNode {
         let ptr = self.ptr_from_index(index);
         unsafe { &*(ptr.as_ptr() as *const FreeNode) }
     }
 
-    #[inline(always)]
     unsafe fn index_from_ptr(&self, ptr: NonNull<u8>) -> SlotIndex {
         let offset = unsafe { ptr.as_ptr().offset_from(self.base_ptr.as_ptr()) as usize };
         SlotIndex::from_offset(offset)
     }
 
-    #[inline(always)]
     fn buddy_index(&self, index: SlotIndex, order: usize) -> SlotIndex {
         // Buddy index is XORed by the size of the block (in slots)
         SlotIndex(index.0 ^ (1 << order))

@@ -425,6 +425,9 @@ pub mod cell {
             self.inner.get_mut().with(|ptr| ptr)
         }
 
+        /// # Safety
+        ///
+        /// The caller must ensure that there are no mutable references to the underlying data while the closure is executing.
         pub unsafe fn with<F, R>(&self, f: F) -> R
         where
             F: FnOnce(&T) -> R,
@@ -434,6 +437,9 @@ pub mod cell {
             self.inner.get().with(|ptr| unsafe { f(&*ptr) })
         }
 
+        /// # Safety
+        ///
+        /// The caller must ensure that there are no other references to the underlying data while the closure is executing.
         pub unsafe fn with_mut<F, R>(&self, f: F) -> R
         where
             F: FnOnce(&mut T) -> R,
