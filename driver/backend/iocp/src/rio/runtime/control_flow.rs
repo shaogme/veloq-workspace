@@ -121,6 +121,7 @@ impl<'a> RioCompletionRouter<'a> {
                     let res_code = rio_result_to_event_res(&completion);
                     {
                         let mut guard = slot.complete();
+                        let _ = guard.take_op();
                         let (payload, detail) = guard.take_completion_data();
                         let event = CompletionEvent {
                             user_data: encode_completion_token(user_data, generation),
@@ -146,8 +147,8 @@ impl<'a> RioCompletionRouter<'a> {
                     }
 
                     let mut guard = slot.complete();
-                    let _ = guard.take_completion_data();
                     let _ = guard.take_op();
+                    let _ = guard.take_completion_data();
                     let _ = std::mem::take(guard.platform_mut());
                     self.comp.ops.recycle(user_data, generation.wrapping_add(1));
                 }

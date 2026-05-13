@@ -1,19 +1,19 @@
 use crate::config::{IoFd, IocpConfig};
 use crate::driver::IocpDriver;
-use crate::error::IocpResultExt;
 use crate::net::addr::{SockAddrStorage, socket_addr_to_storage};
 use crate::net::socket::Socket;
-use crate::op::IocpOp;
-use crate::tests::{completion_os_error_code, remote_free_contains, wait_completion};
+use crate::tests::{
+    complete_from_record, completion_os_error_code, remote_free_contains, submit_test_op,
+    wait_completion, wait_completion_record,
+};
 use std::io::Write;
 use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::time::Duration;
 use veloq_buf::BufPool;
 use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
-use veloq_driver_core::DriverErrorKind;
-use veloq_driver_core::driver::{DriveMode, Driver, RegisterFd, SubmitBinder};
-use veloq_driver_core::op::{Accept, Connect, IntoPlatformOp, Recv};
+use veloq_driver_core::driver::{DriveMode, Driver, RegisterFd};
+use veloq_driver_core::op::{Accept, Connect, Recv};
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
     let handle = socket.into_owned_raw();
@@ -53,16 +53,7 @@ fn test_iocp_accept() {
         remote_addr: None,
     };
 
-    let (iocp_kernel, accept_payload) =
-        IntoPlatformOp::<IocpOp>::into_kernel_and_payload(accept_op);
-    let mut accept_payload = Some(accept_payload);
-    let mut iocp_op = Some(iocp_kernel);
-
-    let (user_data, generation) = driver.reserve_op().unwrap();
-    let _ = driver
-        .submit(user_data, &mut iocp_op, SubmitBinder::new())
-        .into_inner()
-        .expect("submit accept failed");
+    let (user_data, generation) = submit_test_op(&mut driver, accept_op);
 
     // Connect Client in background
     std::thread::spawn(move || {
@@ -70,20 +61,16 @@ fn test_iocp_accept() {
         std::net::TcpStream::connect(addr).expect("Client connect failed");
     });
 
-    let res = wait_completion(
+    let record = wait_completion_record(
         &mut driver,
         user_data,
         generation,
         std::time::Duration::from_secs(5),
-    );
-    assert!(res.is_ok(), "Accept failed: {:?}", res.err());
-    let completion = <Accept<SockAddrStorage> as IntoPlatformOp<IocpOp>>::complete(
-        accept_payload
-            .take()
-            .expect("accept payload missing on completion"),
-        res.to_driver_result(DriverErrorKind::Completion, "test", "wait completion"),
-    );
-    let op = completion.output;
+    )
+    .expect("Accept failed");
+    let completion = complete_from_record::<Accept<SockAddrStorage>>(record);
+    let (accepted, op) = completion.into_parts();
+    let _accepted = accepted.expect("Accept failed");
     assert!(op.remote_addr.is_some(), "Remote addr should be populated");
 
     driver.unregister_files(vec![listen_fd]).unwrap();
@@ -110,14 +97,7 @@ fn test_iocp_connect() {
         addr_len: addr_len as u32,
     };
 
-    let (iocp_kernel, _connect_payload) =
-        IntoPlatformOp::<IocpOp>::into_kernel_and_payload(connect_op);
-    let mut iocp_op = Some(iocp_kernel);
-    let (user_data, generation) = driver.reserve_op().unwrap();
-    let _ = driver
-        .submit(user_data, &mut iocp_op, SubmitBinder::new())
-        .into_inner()
-        .expect("submit connect failed");
+    let (user_data, generation) = submit_test_op(&mut driver, connect_op);
 
     let res = wait_completion(
         &mut driver,
@@ -156,14 +136,7 @@ fn test_iocp_recv_with_buffer_pool() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_kernel, _connect_payload) =
-        IntoPlatformOp::<IocpOp>::into_kernel_and_payload(connect_op);
-    let mut connect_iocp_op = Some(connect_kernel);
-    let connect_user_data = driver.reserve_op().unwrap().0;
-    let _ = driver
-        .submit(connect_user_data, &mut connect_iocp_op, SubmitBinder::new())
-        .into_inner()
-        .expect("submit connect failed");
+    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
 
     let server_thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -185,14 +158,10 @@ fn test_iocp_recv_with_buffer_pool() {
         .expect("register chunk failed");
 
     // Poll connect completion before issuing recv.
-    let connect_gen = driver.ops.local[connect_user_data]
-        .entry
-        .platform_data
-        .generation;
     let connect_res = wait_completion(
         &mut driver,
         connect_user_data,
-        connect_gen,
+        connect_generation,
         std::time::Duration::from_secs(5),
     );
     assert!(
@@ -208,27 +177,16 @@ fn test_iocp_recv_with_buffer_pool() {
         buf_offset: 0,
     };
 
-    let (iocp_kernel, recv_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(recv_op);
-    let mut recv_payload = Some(recv_payload);
-    let mut iocp_op = Some(iocp_kernel);
-    let (user_data, generation) = driver.reserve_op().unwrap();
-    let _ = driver
-        .submit(user_data, &mut iocp_op, SubmitBinder::new())
-        .into_inner()
-        .expect("submit recv failed");
+    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
 
-    let res = wait_completion(
+    let record = wait_completion_record(
         &mut driver,
         user_data,
         generation,
         std::time::Duration::from_secs(5),
-    );
-    let completion = <Recv as IntoPlatformOp<IocpOp>>::complete(
-        recv_payload
-            .take()
-            .expect("recv payload missing on completion"),
-        res.to_driver_result(DriverErrorKind::Completion, "test", "wait completion"),
-    );
+    )
+    .expect("recv completion missing");
+    let completion = complete_from_record::<Recv>(record);
     let (result, mut op) = completion.into_parts();
     let bytes_read = result.expect("Recv failed");
     assert_eq!(bytes_read, 12);
@@ -268,14 +226,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_kernel, _connect_payload) =
-        IntoPlatformOp::<IocpOp>::into_kernel_and_payload(connect_op);
-    let mut connect_iocp_op = Some(connect_kernel);
-    let (connect_user_data, connect_generation) = driver.reserve_op().unwrap();
-    let _ = driver
-        .submit(connect_user_data, &mut connect_iocp_op, SubmitBinder::new())
-        .into_inner()
-        .expect("submit connect failed");
+    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
 
     let connect_res = wait_completion(
         &mut driver,
@@ -305,13 +256,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         buf,
         buf_offset: 0,
     };
-    let (iocp_kernel, _recv_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(recv_op);
-    let mut iocp_op = Some(iocp_kernel);
-    let (user_data, generation) = driver.reserve_op().unwrap();
-    let _ = driver
-        .submit(user_data, &mut iocp_op, SubmitBinder::new())
-        .into_inner()
-        .expect("submit recv failed");
+    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
 
     driver.cancel_op(user_data);
 
@@ -356,14 +301,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_kernel, _connect_payload) =
-        IntoPlatformOp::<IocpOp>::into_kernel_and_payload(connect_op);
-    let mut connect_iocp_op = Some(connect_kernel);
-    let (connect_user_data, connect_generation) = driver.reserve_op().unwrap();
-    let _ = driver
-        .submit(connect_user_data, &mut connect_iocp_op, SubmitBinder::new())
-        .into_inner()
-        .expect("submit connect failed");
+    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
 
     let connect_res = wait_completion(
         &mut driver,
@@ -393,13 +331,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         buf,
         buf_offset: 0,
     };
-    let (iocp_kernel, _recv_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(recv_op);
-    let mut iocp_op = Some(iocp_kernel);
-    let (user_data, generation) = driver.reserve_op().unwrap();
-    let _ = driver
-        .submit(user_data, &mut iocp_op, SubmitBinder::new())
-        .into_inner()
-        .expect("submit recv failed");
+    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
 
     driver.cancel_op(user_data);
 

@@ -368,8 +368,8 @@ impl IocpDriver {
                     return;
                 };
                 let mut completed = slot.complete();
-                let (payload, detail) = completed.take_completion_data();
                 let _ = completed.take_op();
+                let (payload, detail) = completed.take_completion_data();
                 push_completion_shared(
                     &self.completion_events,
                     &self.completion_table,
@@ -491,6 +491,9 @@ impl IocpDriver {
                 let _data = std::mem::take(guard.platform_mut());
                 should_free = true;
             } else {
+                if let Some(op) = guard.op.as_mut() {
+                    op.unbind_user_payload();
+                }
                 let (payload, detail) = guard.take_completion_data();
                 sidecar_to_push = Some(CompletionSidecar {
                     user_data,

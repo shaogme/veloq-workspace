@@ -101,7 +101,7 @@ macro_rules! define_iocp_ops {
     ) => {
         pub enum IocpUserPayload {
             $(
-                $OpType(Box<$OpType>),
+                $OpType($OpType),
             )+
         }
 
@@ -134,6 +134,28 @@ macro_rules! define_iocp_ops {
         impl PlatformOp for IocpKernelOp {}
 
         impl IocpKernelOp {
+            pub(crate) fn bind_user_payload(&mut self, erased: &mut IocpUserPayload) -> IocpResult<()> {
+                match (&mut self.payload, erased) {
+                    $(
+                        (IocpOpPayload::$Variant(payload), IocpUserPayload::$OpType(user)) => {
+                            payload.user.bind(NonNull::from(user));
+                            Ok(())
+                        },
+                    )+
+                    _ => Err(diagweave::report::Report::new(IocpError::InvalidState).attach_note(
+                        "variant mismatch while binding IOCP user payload",
+                    )),
+                }
+            }
+
+            pub(crate) fn unbind_user_payload(&mut self) {
+                match &mut self.payload {
+                    $(
+                        IocpOpPayload::$Variant(payload) => payload.user.clear(),
+                    )+
+                }
+            }
+
             pub(crate) fn get_fd(&self) -> Option<IoFd> {
                 unsafe { (self.vtable.as_ref().get_fd)(self) }
             }
@@ -153,7 +175,7 @@ macro_rules! define_iocp_ops {
 
         $(
             impl IntoPlatformOp<IocpOp> for $OpType {
-                type UserPayload = Box<$OpType>;
+                type UserPayload = $OpType;
                 type ErasedPayload = IocpUserPayload;
                 type Output = $OpType;
                 type Completion = define_iocp_ops!(@completion_type $($completion)?);
@@ -182,9 +204,7 @@ macro_rules! define_iocp_ops {
                         },
                     };
 
-                    let mut user = Box::new(self);
-                    let user_ptr = std::ptr::NonNull::from(user.as_mut());
-                    let payload = define_iocp_ops!(@construct user_ptr, $($construct)?, $OpType $(, $Payload)?);
+                    let payload = define_iocp_ops!(@construct &self, $($construct)?, $OpType $(, $Payload)?);
 
                     let op = IocpKernelOp {
                         // SAFETY: TABLE is a static and its address is guaranteed to be non-null.
@@ -192,7 +212,7 @@ macro_rules! define_iocp_ops {
                         header: OverlappedEntry::new(0),
                         payload: IocpOpPayload::$Variant(payload),
                     };
-                    (op, user)
+                    (op, self)
                 }
 
                 fn payload_into_erased(payload: Self::UserPayload) -> IocpUserPayload {
@@ -211,7 +231,7 @@ macro_rules! define_iocp_ops {
                     payload: Self::UserPayload,
                     res: DriverResult<usize>,
                 ) -> OpCompletion<Self::Output, Self::Completion> {
-                    let completion = define_iocp_ops!(@map_completion &*payload, res, $($map_completion)?);
+                    let completion = define_iocp_ops!(@map_completion &payload, res, $($map_completion)?);
                     let output = define_iocp_ops!(@destruct payload, $($destruct)?);
                     OpCompletion::new(completion, output)
                 }
@@ -237,12 +257,12 @@ macro_rules! define_iocp_ops {
     };
 
     // Default construct: keep only a pointer to user payload
-    (@construct $user_ptr:expr, , $OpType:ty) => { KernelRef { user: $user_ptr } };
+    (@construct $user:expr, , $OpType:ty) => { KernelRef { user: PayloadRef::unbound() } };
     // Custom construct
-    (@construct $user_ptr:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user_ptr) };
+    (@construct $user:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user) };
 
     // Default destruct: return user payload
-    (@destruct $user_payload:expr, ) => { *$user_payload };
+    (@destruct $user_payload:expr, ) => { $user_payload };
     // Custom destruct
     (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
 
@@ -258,8 +278,43 @@ macro_rules! define_iocp_ops {
 // ============================================================================
 
 /// Reference to a kernel operation.
+pub(crate) struct PayloadRef<T> {
+    user: Option<NonNull<T>>,
+}
+
+impl<T> PayloadRef<T> {
+    #[inline]
+    pub(crate) const fn unbound() -> Self {
+        Self { user: None }
+    }
+
+    #[inline]
+    pub(crate) fn bind(&mut self, user: NonNull<T>) {
+        self.user = Some(user);
+    }
+
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.user = None;
+    }
+
+    #[inline]
+    pub(crate) unsafe fn as_ref(&self) -> &T {
+        let user = self.user.expect("IOCP user payload used before binding");
+        // SAFETY: the payload is bound to the live slot payload before submission.
+        unsafe { user.as_ref() }
+    }
+
+    #[inline]
+    pub(crate) unsafe fn as_mut(&mut self) -> &mut T {
+        let mut user = self.user.expect("IOCP user payload used before binding");
+        // SAFETY: the payload is bound to the live slot payload before submission.
+        unsafe { user.as_mut() }
+    }
+}
+
 pub(crate) struct KernelRef<T> {
-    pub(crate) user: NonNull<T>,
+    pub(crate) user: PayloadRef<T>,
 }
 
 /// Payload for the socket accept operation.
@@ -267,27 +322,27 @@ pub(crate) const ACCEPT_EX_ADDR_SECTION_LEN: usize = std::mem::size_of::<SOCKADD
 pub(crate) const ACCEPT_EX_OUTPUT_BUFFER_LEN: usize = ACCEPT_EX_ADDR_SECTION_LEN * 2;
 
 pub(crate) struct AcceptPayload {
-    pub(crate) user: NonNull<Accept>,
+    pub(crate) user: PayloadRef<Accept>,
     pub(crate) accept_buffer: [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN],
     pub(crate) accept_socket: Option<OwnedRawHandle>,
 }
 
 /// Payload for the socket send-to operation.
 pub(crate) struct SendToPayload {
-    pub(crate) user: NonNull<SendTo>,
+    pub(crate) user: PayloadRef<SendTo>,
     pub(crate) addr: SockAddrStorage,
     pub(crate) addr_len: i32,
 }
 
 /// Payload for the socket recv-from operation.
 pub(crate) struct UdpRecvFromPayload {
-    pub(crate) user: NonNull<UdpRecvFrom>,
+    pub(crate) user: PayloadRef<UdpRecvFrom>,
     pub(crate) addr: SockAddrStorage,
 }
 
 /// Payload for the file open operation.
 pub(crate) struct OpenPayload {
-    pub(crate) user: NonNull<Open>,
+    pub(crate) user: PayloadRef<Open>,
 }
 
 /// Alias for the platform-specific IOCP kernel operation.
@@ -421,14 +476,13 @@ define_iocp_ops! {
             })
         },
         get_fd: submit::get_fd_accept,
-        construct: |user: std::ptr::NonNull<Accept>| {
+        construct: |_user: &Accept| {
             AcceptPayload {
-                user,
+                user: PayloadRef::unbound(),
                 accept_buffer: [0; ACCEPT_EX_OUTPUT_BUFFER_LEN],
                 accept_socket: None,
             }
         },
-        destruct: |user: Box<Accept>| *user,
     },
     SendTo {
         variant: SendTo,
@@ -436,21 +490,18 @@ define_iocp_ops! {
         kind: OpKind::SendTo,
         submit: submit::submit_send_to,
         get_fd: submit::get_fd_send_to,
-        construct: |user: std::ptr::NonNull<SendTo>| {
-            // SAFETY: user pointer is valid and points to a valid SendTo.
-            let op = unsafe { user.as_ref() };
-            let (addr, _raw_addr_len) = crate::net::addr::socket_addr_to_storage(op.addr);
-            let addr_len = match op.addr {
+        construct: |user: &SendTo| {
+            let (addr, _raw_addr_len) = crate::net::addr::socket_addr_to_storage(user.addr);
+            let addr_len = match user.addr {
                 std::net::SocketAddr::V4(_) => std::mem::size_of::<SOCKADDR_IN>() as i32,
                 std::net::SocketAddr::V6(_) => std::mem::size_of::<SOCKADDR_IN6>() as i32,
             };
             SendToPayload {
-                user,
+                user: PayloadRef::unbound(),
                 addr,
                 addr_len,
             }
         },
-        destruct: |user: Box<SendTo>| *user,
     },
     UdpRecvFrom {
         variant: UdpRecvFrom,
@@ -459,13 +510,12 @@ define_iocp_ops! {
         submit: submit::submit_udp_recv_from,
         on_complete: submit::on_complete_udp_recv_from,
         get_fd: submit::get_fd_udp_recv_from,
-        construct: |user: std::ptr::NonNull<UdpRecvFrom>| {
+        construct: |_user: &UdpRecvFrom| {
             UdpRecvFromPayload {
-                user,
+                user: PayloadRef::unbound(),
                 addr: SockAddrStorage::default(),
             }
         },
-        destruct: |user: Box<UdpRecvFrom>| *user,
     },
     Open {
         variant: Open,
@@ -479,14 +529,14 @@ define_iocp_ops! {
             })
         },
         get_fd: submit::get_fd_open,
-        construct: |user| OpenPayload { user },
-        destruct: |user: Box<Open>| *user,
+        construct: |_user: &Open| OpenPayload {
+            user: PayloadRef::unbound(),
+        },
     },
     Wakeup {
         variant: Wakeup,
         kind: OpKind::Wakeup,
         submit: submit::submit_wakeup,
         get_fd: submit::get_fd_wakeup,
-        destruct: |user: Box<Wakeup>| *user,
     },
 }

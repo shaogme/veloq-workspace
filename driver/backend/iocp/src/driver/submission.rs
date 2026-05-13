@@ -52,6 +52,16 @@ impl IocpDriver {
                     .attach_note("Op missing in prep_op_slot")
             })?;
 
+        let user_payload = guard.storage.payload.as_mut().ok_or_else(|| {
+            diagweave::report::Report::new(IocpError::InvalidState)
+                .attach_note("User payload missing in prep_op_slot")
+        })?;
+        let op_ref = guard.op.as_mut().ok_or_else(|| {
+            diagweave::report::Report::new(IocpError::InvalidState)
+                .attach_note("Op missing while binding user payload in prep_op_slot")
+        })?;
+        op_ref.bind_user_payload(user_payload)?;
+
         Ok(guard)
     }
 
@@ -64,8 +74,8 @@ impl IocpDriver {
         if get_blocking_pool().execute(task).is_err() {
             if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                 let mut guard = slot.complete();
-                let (payload, detail) = guard.take_completion_data();
                 let _ = guard.take_op();
+                let (payload, detail) = guard.take_completion_data();
                 let sidecar = CompletionSidecar {
                     user_data,
                     generation: guard.entry.generation(Ordering::Acquire),

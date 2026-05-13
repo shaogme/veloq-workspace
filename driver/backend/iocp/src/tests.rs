@@ -7,13 +7,16 @@ use core::convert::TryFrom;
 use diagweave::report::Report;
 use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::{
-    DriveMode, Driver, PollRecordResult, encode_completion_token, event_res_to_result,
+    CompletionRecord, DriveMode, Driver, PollRecordResult, encode_completion_token,
+    event_res_to_result,
 };
 use veloq_driver_core::driver_error_report_to_event_res;
+use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
 use veloq_driver_core::slot::SlotTable;
 
 use crate::driver::IocpDriver;
 use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::op::{IocpOp, IocpUserPayload};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);
@@ -33,12 +36,45 @@ pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     false
 }
 
-pub(crate) fn wait_completion(
+pub(crate) fn submit_test_op<T>(driver: &mut IocpDriver, data: T) -> (usize, u32)
+where
+    T: IntoPlatformOp<IocpOp, DriverCompletion = usize, ErasedPayload = IocpUserPayload>,
+{
+    let (iocp_kernel, payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(data);
+    let mut iocp_op = Some(iocp_kernel);
+    let (user_data, generation) = driver.reserve_op().expect("reserve op failed");
+    driver.slot_set_payload(user_data, T::payload_into_erased(payload));
+    let _ = driver
+        .submit(
+            user_data,
+            &mut iocp_op,
+            veloq_driver_core::driver::SubmitBinder::new(),
+        )
+        .into_inner()
+        .expect("submit op failed");
+    (user_data, generation)
+}
+
+pub(crate) fn complete_from_record<T>(
+    record: CompletionRecord<IocpUserPayload>,
+) -> OpCompletion<T::Output, T::Completion>
+where
+    T: IntoPlatformOp<IocpOp, DriverCompletion = usize, ErasedPayload = IocpUserPayload>,
+{
+    let payload_erased = record.payload.expect("completion payload missing");
+    let payload = T::payload_from_erased(payload_erased);
+    let res = record
+        .detail
+        .unwrap_or_else(|| event_res_to_result(record.event.res));
+    T::complete(payload, res)
+}
+
+pub(crate) fn wait_completion_record(
     driver: &mut IocpDriver,
     user_data: usize,
     generation: u32,
     timeout: std::time::Duration,
-) -> IocpResult<usize> {
+) -> IocpResult<CompletionRecord<IocpUserPayload>> {
     let start = std::time::Instant::now();
     let token = encode_completion_token(user_data, generation);
     loop {
@@ -50,18 +86,8 @@ pub(crate) fn wait_completion(
         }
         let _ = driver.drive(DriveMode::Poll);
         let completion_table = driver.completion_table();
-        match completion_table.try_take(token) {
-            PollRecordResult::Ready(record) => {
-                return event_res_to_result(record.event.res).map_err(|e| {
-                    let code = driver_error_report_to_event_res(&e);
-                    let io_error = std::io::Error::from_raw_os_error(-code);
-                    from_io_error(
-                        IocpError::CompletionWait,
-                        "iocp.tests.wait_completion",
-                        io_error,
-                    )
-                });
-            }
+        match completion_table.try_take_record(token) {
+            PollRecordResult::Ready(record) => return Ok(record),
             PollRecordResult::Stale => {
                 return Err(Report::new(IocpError::CompletionWait)
                     .attach_note("stale completion record (generation mismatch)"));
@@ -70,6 +96,24 @@ pub(crate) fn wait_completion(
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+}
+
+pub(crate) fn wait_completion(
+    driver: &mut IocpDriver,
+    user_data: usize,
+    generation: u32,
+    timeout: std::time::Duration,
+) -> IocpResult<usize> {
+    let record = wait_completion_record(driver, user_data, generation, timeout)?;
+    event_res_to_result(record.event.res).map_err(|e| {
+        let code = driver_error_report_to_event_res(&e);
+        let io_error = std::io::Error::from_raw_os_error(-code);
+        from_io_error(
+            IocpError::CompletionWait,
+            "iocp.tests.wait_completion",
+            io_error,
+        )
+    })
 }
 
 pub(crate) fn completion_os_error_code(err: &Report<IocpError>) -> Option<i32> {

@@ -1,18 +1,18 @@
 use crate::config::{IoFd, IocpConfig};
 use crate::driver::IocpDriver;
-use crate::error::IocpResultExt;
 use crate::net::socket::Socket;
-use crate::op::IocpOp;
-use crate::tests::{completion_os_error_code, wait_completion};
+use crate::tests::{
+    complete_from_record, completion_os_error_code, submit_test_op, wait_completion,
+    wait_completion_record,
+};
 use std::time::Duration;
 use veloq_buf::{BufPool, FixedBuf};
 use veloq_buf::{
     PoolTopology, UniformSlot,
     heap::{GlobalSlotPool, ThreadMemoryMultiplier},
 };
-use veloq_driver_core::DriverErrorKind;
-use veloq_driver_core::driver::{Driver, RegisterFd, SubmitBinder};
-use veloq_driver_core::op::{IntoPlatformOp, SendTo, UdpRecvFrom};
+use veloq_driver_core::driver::{Driver, RegisterFd};
+use veloq_driver_core::op::{SendTo, UdpRecvFrom};
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
     let handle = socket.into_owned_raw();
@@ -90,34 +90,16 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         addr: server_addr,
     };
 
-    let (recv_kernel, recv_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(recv_op);
-    let mut recv_payload = Some(recv_payload);
-    let mut recv_iocp = Some(recv_kernel);
-    let (recv_ud, recv_gen) = driver.reserve_op().expect("reserve recv op failed");
-    let _ = driver
-        .submit(recv_ud, &mut recv_iocp, SubmitBinder::new())
-        .into_inner()
-        .expect("submit udp_recv_from failed");
-
-    let (send_kernel, _send_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(send_op);
-    let mut send_iocp = Some(send_kernel);
-    let (send_ud, send_gen) = driver.reserve_op().expect("reserve send op failed");
-    let _ = driver
-        .submit(send_ud, &mut send_iocp, SubmitBinder::new())
-        .into_inner()
-        .expect("submit send_to failed");
+    let (recv_ud, recv_gen) = submit_test_op(&mut driver, recv_op);
+    let (send_ud, send_gen) = submit_test_op(&mut driver, send_op);
 
     let sent = wait_completion(&mut driver, send_ud, send_gen, Duration::from_secs(5))
         .expect("send_to completion failed");
     assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
-    let recv_completion =
-        <UdpRecvFrom as IntoPlatformOp<IocpOp>>::complete(
-            recv_payload
-                .take()
-                .expect("udp_recv_from payload missing on completion"),
-            wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
-                .to_driver_result(DriverErrorKind::Completion, "test", "wait completion"),
-        );
+    let recv_completion = complete_from_record::<UdpRecvFrom>(
+        wait_completion_record(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
+            .expect("udp_recv_from completion missing"),
+    );
     let (recv_result, recv_out) = recv_completion.into_parts();
     let bytes = recv_result.expect("udp_recv_from completion failed");
     let recv_addr = recv_out.addr.expect("recv_from addr missing");
@@ -182,34 +164,16 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         addr: server_addr,
     };
 
-    let (recv_kernel, recv_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(recv_op);
-    let mut recv_payload = Some(recv_payload);
-    let mut recv_iocp = Some(recv_kernel);
-    let (recv_ud, recv_gen) = driver.reserve_op().expect("reserve recv op failed");
-    let _ = driver
-        .submit(recv_ud, &mut recv_iocp, SubmitBinder::new())
-        .into_inner()
-        .expect("submit udp_recv_from failed");
-
-    let (send_kernel, _send_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(send_op);
-    let mut send_iocp = Some(send_kernel);
-    let (send_ud, send_gen) = driver.reserve_op().expect("reserve send op failed");
-    let _ = driver
-        .submit(send_ud, &mut send_iocp, SubmitBinder::new())
-        .into_inner()
-        .expect("submit send_to failed");
+    let (recv_ud, recv_gen) = submit_test_op(&mut driver, recv_op);
+    let (send_ud, send_gen) = submit_test_op(&mut driver, send_op);
 
     let sent = wait_completion(&mut driver, send_ud, send_gen, Duration::from_secs(5))
         .expect("send_to completion failed");
     assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
-    let recv_completion =
-        <UdpRecvFrom as IntoPlatformOp<IocpOp>>::complete(
-            recv_payload
-                .take()
-                .expect("udp_recv_from payload missing on completion"),
-            wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
-                .to_driver_result(DriverErrorKind::Completion, "test", "wait completion"),
-        );
+    let recv_completion = complete_from_record::<UdpRecvFrom>(
+        wait_completion_record(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
+            .expect("udp_recv_from completion missing"),
+    );
     let (recv_result, recv_out) = recv_completion.into_parts();
     let bytes = recv_result.expect("udp_recv_from completion failed");
     let recv_addr = recv_out.addr.expect("recv_from addr missing");
@@ -244,22 +208,9 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
         buf_offset: 0,
         addr: None,
     };
-    let (iocp_kernel, recv_payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(recv_op);
-    let mut recv_payload = Some(recv_payload);
-    let mut iocp_op = Some(iocp_kernel);
-    let (ud, generation) = driver.reserve_op().expect("reserve recv op failed");
-    let _ = driver
-        .submit(ud, &mut iocp_op, SubmitBinder::new())
-        .into_inner()
-        .expect("submit udp_recv_from failed");
+    let (ud, generation) = submit_test_op(&mut driver, recv_op);
 
     driver.cancel_op(ud);
-    let _ = <UdpRecvFrom as IntoPlatformOp<IocpOp>>::complete(
-        recv_payload
-            .take()
-            .expect("udp_recv_from payload missing after cancel"),
-        Ok(0),
-    );
     let err = wait_completion(
         &mut driver,
         ud,
