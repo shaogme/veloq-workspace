@@ -37,11 +37,11 @@ pub type Accept = veloq_driver_core::op::Accept<SockAddrStorage>;
 pub type SendTo = veloq_driver_core::op::SendTo;
 pub type SyncFileRange = veloq_driver_core::op::SyncFileRange;
 pub type Fallocate = veloq_driver_core::op::Fallocate;
-pub type UdpRecvStream = veloq_driver_core::op::UdpRecvStream;
+pub type UdpRecvFrom = veloq_driver_core::op::UdpRecvFrom;
 
 pub use veloq_driver_core::op::{
     DetachedOp, DetachedSubmitter, IntoPlatformOp, LocalSubmitter, Op, OpKind, OpLifecycle,
-    OpResult, Open, Timeout, UdpRecvPacket,
+    OpResult, Open, Timeout, UdpRecvPacket, UdpRecvPacketBuf,
 };
 
 pub type LocalOp<T> = veloq_driver_core::op::LocalOp<T, PlatformDriver>;
@@ -53,7 +53,12 @@ pub trait OpSubmitter: Clone + std::marker::Send + Sync {
                 DriverCompletion = <PlatformDriver as Driver>::Completion,
                 ErasedPayload = <PlatformDriver as Driver>::UP,
             > + std::marker::Send,
-    >: Future<Output = OpResult<T, <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion>>;
+    >: Future<
+        Output = OpResult<
+            T::Output,
+            <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion,
+        >,
+    >;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
     where

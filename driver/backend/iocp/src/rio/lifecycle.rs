@@ -4,9 +4,9 @@ use crate::config::SocketKey;
 use crate::rio::ActorKey;
 use crate::rio::RioState;
 use crate::rio::core::RioCompletionKind;
+use crate::rio::core::RioOpCtxGuard;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
-use crate::rio::core::{RioOpCtxGuard, RioPoolCtxGuard};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::control_flow::RioSocketActor;
 use rustc_hash::FxHashMap;
@@ -72,14 +72,6 @@ fn reaper_sender() -> Option<&'static std::sync::mpsc::Sender<DeferredRioCleanup
 impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) {
         match Self::decode_req_ctx(res.RequestContext) {
-            Some(RioCompletionKind::Pool {
-                actor_key,
-                generation,
-                ctx_ptr,
-            }) => {
-                let _ctx_guard = RioPoolCtxGuard(ctx_ptr);
-                let _ = self.mark_pool_done(actor_key, generation);
-            }
             Some(RioCompletionKind::Op { ctx_ptr, .. }) => {
                 let _ctx_guard = RioOpCtxGuard(ctx_ptr);
             }
@@ -130,8 +122,7 @@ impl RioState {
     }
 
     fn finalize_cleanup(&mut self) {
-        self.forget_udp_contexts();
-        self.shutdown_rio_actors(&veloq_buf::NoopRegistrar);
+        self.shutdown_rio_actors();
         if let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)

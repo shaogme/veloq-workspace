@@ -19,7 +19,6 @@ use crate::driver::{CloseMode, CompletionSidecar, IocpDriver, IocpOpState, RIO_E
 use crate::error::{IocpError, IocpResult, from_io_error};
 use crate::op::slot::Slot;
 use crate::op::{IocpOp, IocpUserPayload, OverlappedEntry, submit};
-use veloq_buf::BufferRegistrar;
 
 pub(crate) struct EmitContext<'a> {
     pub(crate) completion_events: &'a SharedCompletionQueue,
@@ -28,8 +27,6 @@ pub(crate) struct EmitContext<'a> {
 
 pub(crate) struct CancelContext<'a> {
     pub(crate) registered_files: &'a [Option<crate::config::RegisteredHandle>],
-    pub(crate) rio_state: &'a mut crate::rio::RioState,
-    pub(crate) registrar: &'a dyn BufferRegistrar,
     pub(crate) completion_events: &'a SharedCompletionQueue,
     pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
 }
@@ -104,10 +101,14 @@ impl IocpDriver {
                         .rio_state
                         .process_completions(
                             &mut self.ops,
+                            &self.extensions,
                             &*self.registrar,
                             &self.completion_events,
                             &self.completion_table,
                         )
+                        .inspect(|_| {
+                            self.drain_deferred_socket_cleanup();
+                        })
                         .map_err(|e| {
                             Self::with_report_detail(
                                 DriverErrorKind::Completion,
@@ -186,10 +187,14 @@ impl IocpDriver {
                     self.rio_state
                         .process_completions(
                             &mut self.ops,
+                            &self.extensions,
                             &*self.registrar,
                             &self.completion_events,
                             &self.completion_table,
                         )
+                        .inspect(|_| {
+                            self.drain_deferred_socket_cleanup();
+                        })
                         .map_err(|e| {
                             diagweave::report::Report::new(IocpError::CompletionWait)
                                 .attach_note(format!("{e:#}"))
@@ -363,8 +368,8 @@ impl IocpDriver {
                     return;
                 };
                 let mut completed = slot.complete();
-                let (payload, detail) = completed.take_completion_data();
                 let _ = completed.take_op();
+                let (payload, detail) = completed.take_completion_data();
                 push_completion_shared(
                     &self.completion_events,
                     &self.completion_table,
@@ -476,9 +481,8 @@ impl IocpDriver {
     ) {
         let mut should_free = false;
         let mut sidecar_to_push = None;
-        let handled = Self::with_inflight_slot(ops, user_data, |mut guard| {
+        let handled = Self::with_inflight_slot(ops, user_data, |guard| {
             let completion_res = io_result_to_event_res(&io_result);
-            guard.platform_mut().rio_pool_waiting = false;
             let mut guard = guard.complete();
 
             if guard.platform_mut().is_background {
@@ -487,6 +491,9 @@ impl IocpDriver {
                 let _data = std::mem::take(guard.platform_mut());
                 should_free = true;
             } else {
+                if let Some(op) = guard.op.as_mut() {
+                    op.unbind_user_payload();
+                }
                 let (payload, detail) = guard.take_completion_data();
                 sidecar_to_push = Some(CompletionSidecar {
                     user_data,
@@ -549,8 +556,6 @@ impl IocpDriver {
             Some(SlotView::InFlightWaiting(_)) => {
                 let ctx = CancelContext {
                     registered_files: &self.registered_files,
-                    rio_state: &mut self.rio_state,
-                    registrar: &*self.registrar,
                     completion_events: &self.completion_events,
                     completion_table: &self.completion_table,
                 };
@@ -588,14 +593,10 @@ impl IocpDriver {
                         .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                         .unwrap_or(false);
 
-                    if guard.platform_mut().rio_pool_waiting || is_rio {
-                        if guard.platform_mut().rio_pool_waiting {
-                            ctx.rio_state.cancel_udp_waiter(
-                                raw_handle.actor_key(),
-                                (user_data, guard.platform_mut().generation),
-                                ctx.registrar,
-                            );
-                        }
+                    if is_rio {
+                        let _ = guard.with_op_mut(|iocp_op| {
+                            iocp_op.header.in_flight = false;
+                        });
                         should_emit_aborted = true;
                         aborted_socket_key =
                             raw_handle.is_socket().then_some(raw_handle.actor_key());

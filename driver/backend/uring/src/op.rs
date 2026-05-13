@@ -7,7 +7,7 @@ use io_uring::squeue;
 use std::time::Duration;
 use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::PlatformOp;
-use veloq_driver_core::op::{IntoPlatformOp, OpKind};
+use veloq_driver_core::op::{IntoPlatformOp, OpCompletion, OpKind};
 
 mod payload;
 pub(crate) mod slot;
@@ -17,7 +17,7 @@ pub(crate) use payload::UringOpPayload;
 pub(crate) use payload::{
     Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ReadFixed,
     ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
-    UdpRecvStream, UdpSend, Wakeup, WriteFixed, WriteRaw,
+    UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw,
 };
 
 // ============================================================================
@@ -116,6 +116,7 @@ macro_rules! define_uring_ops {
             impl IntoPlatformOp<UringOp> for $OpType {
                 type UserPayload = $OpType;
                 type ErasedPayload = UringUserPayload;
+                type Output = $OpType;
                 type Completion = define_uring_ops!(@completion_type $($completion)?);
                 type DriverCompletion = usize;
                 const PAYLOAD_KIND: OpKind = $kind;
@@ -142,10 +143,6 @@ macro_rules! define_uring_ops {
                     (op, user)
                 }
 
-                fn from_user_payload(payload: Self::UserPayload) -> Self {
-                    payload
-                }
-
                 fn payload_into_erased(payload: Self::UserPayload) -> UringUserPayload {
                     UringUserPayload::$OpType(payload)
                 }
@@ -158,11 +155,12 @@ macro_rules! define_uring_ops {
                     }
                 }
 
-                fn map_completion_result(
-                    &self,
+                fn complete(
+                    payload: Self::UserPayload,
                     res: DriverResult<usize>,
-                ) -> DriverResult<Self::Completion> {
-                    define_uring_ops!(@map_completion self, res, $($map_completion)?)
+                ) -> OpCompletion<Self::Output, Self::Completion> {
+                    let completion = define_uring_ops!(@map_completion &payload, res, $($map_completion)?);
+                    OpCompletion::new(completion, payload)
                 }
             }
         )+
@@ -189,8 +187,8 @@ macro_rules! define_uring_ops {
     (@completion_type ) => { usize };
     (@completion_type $ty:ty) => { $ty };
 
-    (@map_completion $this:ident, $res:ident, ) => { $res };
-    (@map_completion $this:ident, $res:ident, $expr:expr) => { ($expr)($this, $res) };
+    (@map_completion $this:expr, $res:expr, ) => { $res };
+    (@map_completion $this:expr, $res:expr, $expr:expr) => { ($expr)($this, $res) };
 }
 
 // ============================================================================
@@ -360,20 +358,20 @@ define_uring_ops! {
         },
         destruct: |user: Box<SendTo>| *user,
     },
-    UdpRecvStream {
-        field: UdpRecvStream,
-        payload: payload::UdpRecvStreamPayload,
-        kind: OpKind::UdpRecvStream,
-        make_sqe: submit::make_sqe_udp_recv_stream,
-        on_complete: submit::on_complete_udp_recv_stream,
-        drop: submit::drop_udp_recv_stream,
-        construct: |user| payload::UdpRecvStreamPayload {
+    UdpRecvFrom {
+        field: UdpRecvFrom,
+        payload: payload::UdpRecvFromPayload,
+        kind: OpKind::UdpRecvFrom,
+        make_sqe: submit::make_sqe_udp_recv_from,
+        on_complete: submit::on_complete_udp_recv_from,
+        drop: submit::drop_udp_recv_from,
+        construct: |user| payload::UdpRecvFromPayload {
             user,
             msg_name: unsafe { std::mem::zeroed() },
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
         },
-        destruct: |user: Box<UdpRecvStream>| *user,
+        destruct: |user: Box<UdpRecvFrom>| *user,
     },
     Open {
         field: Open,

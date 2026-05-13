@@ -34,22 +34,21 @@ pub trait OpLifecycle: Sized {
 pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     type UserPayload: std::marker::Send;
     type ErasedPayload: std::marker::Send;
+    type Output;
     type Completion;
     type DriverCompletion: crate::driver::CompletionValue;
     const PAYLOAD_KIND: OpKind;
 
     fn into_kernel_and_payload(self) -> (O, Self::UserPayload);
 
-    fn from_user_payload(payload: Self::UserPayload) -> Self;
-
     fn payload_into_erased(payload: Self::UserPayload) -> Self::ErasedPayload;
 
     fn payload_from_erased(erased: Self::ErasedPayload) -> Self::UserPayload;
 
-    fn map_completion_result(
-        &self,
+    fn complete(
+        payload: Self::UserPayload,
         res: DriverResult<Self::DriverCompletion>,
-    ) -> DriverResult<Self::Completion>;
+    ) -> OpCompletion<Self::Output, Self::Completion>;
 }
 
 /// A generic wrapper for IO operation data.
@@ -116,7 +115,7 @@ impl<T> Op<T> {
                                 cancel_signal: None,
                                 cancel_waker: None,
                                 token: 0,
-                                immediate_failure: Some((e, T::from_user_payload(payload))),
+                                immediate_failure: Some((e, payload)),
                                 _phantom: std::marker::PhantomData,
                             }
                         } else {
@@ -133,14 +132,18 @@ impl<T> Op<T> {
                     }
                 }
             }
-            Err(e) => DetachedOp {
-                completion_table: None,
-                cancel_signal: None,
-                cancel_waker: None,
-                token: 0,
-                immediate_failure: Some((e, data)),
-                _phantom: std::marker::PhantomData,
-            },
+            Err(e) => {
+                let (kernel_op, payload) = data.into_kernel_and_payload();
+                drop(kernel_op);
+                DetachedOp {
+                    completion_table: None,
+                    cancel_signal: None,
+                    cancel_waker: None,
+                    token: 0,
+                    immediate_failure: Some((e, payload)),
+                    _phantom: std::marker::PhantomData,
+                }
+            }
         }
     }
 

@@ -5,7 +5,7 @@ pub(crate) mod net;
 use crate::error::IocpResult;
 use crate::op::{
     AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend, OpenPayload, Recv,
-    SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecv, UdpRecvStream,
+    SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecv, UdpRecvFromPayload,
     UdpSend, Wakeup,
 };
 
@@ -50,7 +50,7 @@ impl_get_fd!(get_fd_udp_connect, KernelRef<UdpConnect>, direct_fd);
 impl_get_fd!(get_fd_accept, AcceptPayload, direct_fd);
 impl_get_fd!(get_fd_send_to, SendToPayload, direct_fd);
 impl_get_fd!(get_fd_open, OpenPayload, no_fd); // Open does not have a direct fd in payload
-impl_get_fd!(get_fd_udp_recv_stream, KernelRef<UdpRecvStream>, direct_fd);
+impl_get_fd!(get_fd_udp_recv_from, UdpRecvFromPayload, direct_fd);
 
 impl_get_fd!(get_fd_close, KernelRef<Close>, direct_fd);
 impl_get_fd!(get_fd_fsync, KernelRef<Fsync>, direct_fd);

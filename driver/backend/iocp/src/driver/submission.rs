@@ -52,6 +52,16 @@ impl IocpDriver {
                     .attach_note("Op missing in prep_op_slot")
             })?;
 
+        let user_payload = guard.storage.payload.as_mut().ok_or_else(|| {
+            diagweave::report::Report::new(IocpError::InvalidState)
+                .attach_note("User payload missing in prep_op_slot")
+        })?;
+        let op_ref = guard.op.as_mut().ok_or_else(|| {
+            diagweave::report::Report::new(IocpError::InvalidState)
+                .attach_note("Op missing while binding user payload in prep_op_slot")
+        })?;
+        op_ref.bind_user_payload(user_payload)?;
+
         Ok(guard)
     }
 
@@ -61,14 +71,11 @@ impl IocpDriver {
         user_data: usize,
         task: BlockingTask,
     ) -> DriverResult<Poll<()>> {
-        if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-            op_entry.platform_data.rio_pool_waiting = false;
-        }
         if get_blocking_pool().execute(task).is_err() {
             if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                 let mut guard = slot.complete();
-                let (payload, detail) = guard.take_completion_data();
                 let _ = guard.take_op();
+                let (payload, detail) = guard.take_completion_data();
                 let sidecar = CompletionSidecar {
                     user_data,
                     generation: guard.entry.generation(Ordering::Acquire),
@@ -101,17 +108,11 @@ impl IocpDriver {
         user_data: usize,
         op_in: &mut Option<IocpOp>,
         binder: SubmitBinder,
-        is_rio_pool_waiting: bool,
     ) -> veloq_driver_core::driver::Outcome<
         Result<Poll<()>, (veloq_driver_core::DriverErrorReport, SubmitStatus)>,
     > {
         match result {
-            Ok(submit::SubmissionResult::Pending) => {
-                if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-                    op_entry.platform_data.rio_pool_waiting = is_rio_pool_waiting;
-                }
-                binder.ok(Poll::Pending)
-            }
+            Ok(submit::SubmissionResult::Pending) => binder.ok(Poll::Pending),
             Ok(submit::SubmissionResult::PostToQueue) => {
                 Self::handle_post_to_queue(ops, ctx, user_data, op_in, binder)
             }
@@ -173,9 +174,6 @@ impl IocpDriver {
                 SubmitStatus::Void,
             )
         } else {
-            if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-                op_entry.platform_data.rio_pool_waiting = false;
-            }
             binder.ok(Poll::Pending)
         }
     }
@@ -193,7 +191,6 @@ impl IocpDriver {
         if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
             op_entry.platform_data.timer_id = Some(timeout);
             op_entry.platform_data.timer_deadline = Some(Instant::now() + duration);
-            op_entry.platform_data.rio_pool_waiting = false;
         }
         binder.ok(Poll::Pending)
     }
@@ -202,7 +199,7 @@ impl IocpDriver {
         &mut self,
         user_data: usize,
         op: IocpOp,
-    ) -> DriverResult<(bool, DriverResult<submit::SubmissionResult>)> {
+    ) -> DriverResult<DriverResult<submit::SubmissionResult>> {
         let slots_per_page = self.ops.local.len();
         let (slab_ptr, slab_len) = self.ops.get_page_slice(0).ok_or_else(|| {
             driver_error(
@@ -212,7 +209,7 @@ impl IocpDriver {
             )
         })?;
 
-        let mut guard = Self::prep_op_slot(&mut self.ops, user_data, op).map_err(|e| {
+        let guard = Self::prep_op_slot(&mut self.ops, user_data, op).map_err(|e| {
             driver_error(
                 DriverErrorKind::InvalidState,
                 "iocp/driver",
@@ -220,15 +217,6 @@ impl IocpDriver {
             )
         })?;
 
-        let is_rio_pool_waiting = guard
-            .with_op_mut(|op| {
-                matches!(
-                    op.payload,
-                    crate::op::IocpOpPayload::UdpRecvStream(_)
-                        | crate::op::IocpOpPayload::UdpRecv(_)
-                )
-            })
-            .unwrap_or(false);
         let overlapped = guard.storage.with_mut(|_op, _result, _payload, sidecar| {
             &mut sidecar.inner as *mut crate::win32::Overlapped
         });
@@ -301,6 +289,6 @@ impl IocpDriver {
             self.track_socket_submit_pending(socket_key);
         }
 
-        Ok((is_rio_pool_waiting, result))
+        Ok(result)
     }
 }

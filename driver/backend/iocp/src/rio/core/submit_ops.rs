@@ -153,7 +153,7 @@ impl RioState {
             registration_mode: self.registration_mode,
         };
         let outstanding_snapshot = self.outstanding_count;
-        let (rq, actor_state) = {
+        let rq = {
             let actor = self
                 .ensure_actor((fd, handle), env)
                 .map_err(|e| {
@@ -166,7 +166,7 @@ impl RioState {
                 })
                 .attach_note("failed to ensure RIO actor")?;
 
-            (actor.rq, format!("{:?}", actor.state))
+            actor.rq
         };
         if self.is_iocp_fallback(handle.raw().actor_key()) {
             return Err(diagweave::report::Report::new(RioError::NotSupported))
@@ -182,14 +182,13 @@ impl RioState {
         if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
             let diag = format!(
-                "submit_send_internal: fd={fd:?}, handle={:?}, rq_raw=0x{:x}, buffer_id=0x{:x}, buffer_offset={}, buffer_length={}, outstanding_count={}, actor_state={}",
+                "submit_send_internal: fd={fd:?}, handle={:?}, rq_raw=0x{:x}, buffer_id=0x{:x}, buffer_offset={}, buffer_length={}, outstanding_count={}",
                 handle.raw().as_handle(),
                 rq.0 as usize,
                 rio_buf.BufferId as usize,
                 rio_buf.Offset,
                 rio_buf.Length,
                 self.outstanding_count,
-                actor_state.clone(),
             );
             error!(
                 fd = ?fd,
@@ -199,7 +198,6 @@ impl RioState {
                 buffer_offset = rio_buf.Offset,
                 buffer_length = rio_buf.Length,
                 outstanding_count = self.outstanding_count,
-                actor_state = %actor_state,
                 rio_error = %e,
                 "RIOSend submit failed diagnostics"
             );

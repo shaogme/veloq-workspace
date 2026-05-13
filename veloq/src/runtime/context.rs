@@ -406,7 +406,7 @@ pub async fn submit_to<T>(
         <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion,
         veloq_driver_native::error::DriverErrorReport,
     >,
-    T,
+    T::Output,
 )>
 where
     T: IntoPlatformOp<

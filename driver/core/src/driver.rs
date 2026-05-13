@@ -76,13 +76,6 @@ pub trait Driver {
 
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()>;
 
-    fn warmup_udp_socket(
-        &mut self,
-        fd: IoFd,
-        buf_capacity: std::num::NonZeroUsize,
-        credits: usize,
-    ) -> DriverResult<()>;
-
     fn create_waker(&self) -> Arc<dyn RemoteWaker>;
 
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);

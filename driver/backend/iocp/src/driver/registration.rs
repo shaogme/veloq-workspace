@@ -1,5 +1,4 @@
 use crate::rio::error::RioResultExt;
-use std::num::NonZeroUsize;
 use windows_sys::Win32::Networking::WinSock::{
     SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
 };
@@ -9,7 +8,7 @@ use veloq_driver_core::{DriverErrorKind, DriverResult, driver_error};
 
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
 use crate::driver::IocpDriver;
-use crate::error::{IocpError, IocpResult, IocpResultExt, from_io_error};
+use crate::error::{IocpError, IocpResult, from_io_error};
 
 pub(crate) struct DeferredSocketCleanup {
     pub(crate) handle: SocketKey,
@@ -195,27 +194,5 @@ impl IocpDriver {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn warmup_udp_socket_impl(
-        &mut self,
-        fd: IoFd,
-        buf_capacity: NonZeroUsize,
-        credits: usize,
-    ) -> DriverResult<()> {
-        use crate::op::submit::common::resolve_fd_borrowed;
-        let handle = resolve_fd_borrowed(&fd, &self.registered_files).to_driver_result(
-            DriverErrorKind::Registration,
-            "iocp/driver.warmup_udp_socket",
-            "resolve fd for UDP warmup",
-        )?;
-        self.rio_state
-            .warmup_udp_socket((fd, handle), buf_capacity.get(), credits, &*self.registrar)
-            .map(|_| ())
-            .to_driver_result(
-                DriverErrorKind::Internal,
-                "iocp/driver.warmup_udp_socket",
-                "warm up UDP recv pool",
-            )
     }
 }

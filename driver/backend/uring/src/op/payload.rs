@@ -4,7 +4,7 @@ use veloq_driver_core::op::{
     ReadFixed as CoreReadFixed, ReadRaw as CoreReadRaw, Recv as CoreRecv, Send as CoreSend,
     SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange,
     SyncFileRangeRaw as CoreSyncFileRangeRaw, UdpConnect as CoreUdpConnect, UdpRecv as CoreUdpRecv,
-    UdpRecvStream as CoreUdpRecvStream, UdpSend as CoreUdpSend, Wakeup as CoreWakeup,
+    UdpRecvFrom as CoreUdpRecvFrom, UdpSend as CoreUdpSend, Wakeup as CoreWakeup,
     WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
 };
 
@@ -32,7 +32,7 @@ pub(crate) type Fallocate = CoreFallocate;
 pub(crate) type FallocateRaw = CoreFallocateRaw<UringRawHandle>;
 pub(crate) type Accept = CoreAccept<SockAddrStorage>;
 pub(crate) type SendTo = CoreSendTo;
-pub(crate) type UdpRecvStream = CoreUdpRecvStream;
+pub(crate) type UdpRecvFrom = CoreUdpRecvFrom;
 pub(crate) type Wakeup = CoreWakeup;
 
 pub(crate) struct KernelRef<T> {
@@ -48,7 +48,7 @@ pub(crate) struct SendToPayload {
     pub(crate) msghdr: libc::msghdr,
 }
 
-pub(crate) struct UdpRecvStreamPayload {
+pub(crate) struct UdpRecvFromPayload {
     pub(crate) msg_name: libc::sockaddr_storage,
     pub(crate) iovec: [libc::iovec; 1],
     pub(crate) msghdr: libc::msghdr,
@@ -84,7 +84,7 @@ pub(crate) enum UringOpPayload {
     FallocateRaw(KernelRef<FallocateRaw>),
     Accept(AcceptPayload),
     SendTo(SendToPayload),
-    UdpRecvStream(UdpRecvStreamPayload),
+    UdpRecvFrom(UdpRecvFromPayload),
     Open(OpenPayload),
     Wakeup(WakeupPayload),
     Timeout(TimeoutPayload),

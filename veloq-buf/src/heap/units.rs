@@ -1,4 +1,76 @@
+//! Core units and configuration for the heap allocator.
+
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// 2MB minimum memory per thread (Huge Page aligned)
+pub const MIN_THREAD_MEMORY: NonZeroUsize = crate::nz!(2 * 1024 * 1024);
+
+/// Multiplier for thread memory scaling.
+/// Each unit represents `MIN_THREAD_MEMORY` (2MB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadMemoryMultiplier(pub NonZeroUsize);
+
+/// Configuration for GlobalSlotPool
+#[derive(Debug, Clone)]
+pub struct GlobalAllocatorConfig {
+    /// Total memory size in bytes to allocate for the global pool.
+    pub total_memory: usize,
+}
+
+/// Information about a memory chunk (God View)
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkInfo {
+    pub id: u16,
+    pub ptr: NonNull<u8>,
+    pub len: NonZeroUsize,
+}
+
+// Guarantee thread safety for the info pointing to shared memory
+unsafe impl Send for ChunkInfo {}
+unsafe impl Sync for ChunkInfo {}
+
+// --- From slot.rs ---
+
+/// Standard Slot Size: 4KB
+/// Aligned with the physical page size of most architectures (x86_64/AArch64)
+pub const SLOT_SIZE: usize = 4096;
+
+/// Calculate the number of slots required for a given size
+#[inline]
+pub const fn slots_needed(size: usize) -> usize {
+    size.div_ceil(SLOT_SIZE)
+}
+
+/// Slot Index
+///
+/// Represents the index of a Slot in the global continuous memory area (Arena).
+/// Range: [0, total_slots)
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct SlotIndex(pub usize);
+
+impl fmt::Debug for SlotIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Slot(#{})", self.0)
+    }
+}
+
+impl SlotIndex {
+    /// Calculate the memory offset (byte offset) corresponding to the Slot
+    pub fn offset(&self) -> usize {
+        self.0 * SLOT_SIZE
+    }
+
+    /// Convert from byte offset to Slot Index
+    pub fn from_offset(offset: usize) -> Self {
+        Self(offset / SLOT_SIZE)
+    }
+}
+
+// --- From superblock.rs ---
 
 /// Order of the Superblock (64 Slots = 2^6)
 pub const SUPERBLOCK_ORDER: usize = 6;
