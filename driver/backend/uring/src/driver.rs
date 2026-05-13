@@ -2,7 +2,6 @@ use diagweave::report::Report;
 use io_uring::IoUring;
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
@@ -415,15 +414,6 @@ impl Driver for UringDriver {
                 "unregister fixed fd",
             )?;
         }
-        Ok(())
-    }
-
-    fn warmup_udp_socket(
-        &mut self,
-        _fd: IoFd,
-        _buf_capacity: NonZeroUsize,
-        _credits: usize,
-    ) -> DriverResult<()> {
         Ok(())
     }
 

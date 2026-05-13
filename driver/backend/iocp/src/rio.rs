@@ -23,13 +23,12 @@ use veloq_driver_core::driver::registry::OpRegistry;
 use veloq_driver_core::driver::{SharedCompletionQueue, SharedCompletionTable};
 
 use self::core::registry::RioRegistry;
-use self::core::submit_ops::{RioCq, RioDispatch, RioKernel, RioRq};
+use self::core::submit_ops::{RioCq, RioDispatch, RioKernel};
 use self::runtime::control_flow::RioSocketActor;
 
 pub(crate) use self::runtime::RioSendToArgs;
 pub(crate) use self::runtime::RioTarget;
-pub(crate) use self::runtime::RioUdpRecvArgs;
-pub(crate) use self::runtime::RioUdpStreamArgs;
+pub(crate) use self::runtime::RioUdpRecvFromArgs;
 
 new_key_type! {
     pub(crate) struct ActorKey;
@@ -74,12 +73,6 @@ pub(crate) struct RioEnv<'a> {
     pub(crate) registration_mode: BufferRegistrationMode,
 }
 
-pub(crate) struct RioContext<'a> {
-    pub(crate) env: RioEnv<'a>,
-    pub(crate) actor_key: ActorKey,
-    pub(crate) rq: RioRq,
-}
-
 pub(crate) struct RioCompletionContext<'a> {
     pub(crate) ops: &'a mut OpRegistry<
         IocpOp,
@@ -87,6 +80,7 @@ pub(crate) struct RioCompletionContext<'a> {
         IocpOpState,
         crate::op::OverlappedEntry,
     >,
+    pub(crate) ext: &'a crate::ext::Extensions,
     pub(crate) events: &'a SharedCompletionQueue,
     pub(crate) table: &'a SharedCompletionTable<crate::op::IocpUserPayload>,
 }

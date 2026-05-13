@@ -17,7 +17,7 @@ pub(crate) use payload::UringOpPayload;
 pub(crate) use payload::{
     Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ReadFixed,
     ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
-    UdpRecvStream, UdpSend, Wakeup, WriteFixed, WriteRaw,
+    UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw,
 };
 
 // ============================================================================
@@ -360,20 +360,20 @@ define_uring_ops! {
         },
         destruct: |user: Box<SendTo>| *user,
     },
-    UdpRecvStream {
-        field: UdpRecvStream,
-        payload: payload::UdpRecvStreamPayload,
-        kind: OpKind::UdpRecvStream,
-        make_sqe: submit::make_sqe_udp_recv_stream,
-        on_complete: submit::on_complete_udp_recv_stream,
-        drop: submit::drop_udp_recv_stream,
-        construct: |user| payload::UdpRecvStreamPayload {
+    UdpRecvFrom {
+        field: UdpRecvFrom,
+        payload: payload::UdpRecvFromPayload,
+        kind: OpKind::UdpRecvFrom,
+        make_sqe: submit::make_sqe_udp_recv_from,
+        on_complete: submit::on_complete_udp_recv_from,
+        drop: submit::drop_udp_recv_from,
+        construct: |user| payload::UdpRecvFromPayload {
             user,
             msg_name: unsafe { std::mem::zeroed() },
             iovec: [unsafe { std::mem::zeroed() }],
             msghdr: unsafe { std::mem::zeroed() },
         },
-        destruct: |user: Box<UdpRecvStream>| *user,
+        destruct: |user: Box<UdpRecvFrom>| *user,
     },
     Open {
         field: Open,

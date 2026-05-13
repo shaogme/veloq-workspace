@@ -1,15 +1,15 @@
 //! Runtime datapath: hot path buffer/pool state and UDP submissions.
 
 pub(crate) mod control_flow;
-pub(crate) mod pool;
 
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::op::SubmissionResult;
+use crate::rio::core::submit_ops::{RioExConfig, RioProvider};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, SocketLifecycleState, SocketRuntimeMode, SocketRuntimeState};
 use diagweave::report::ResultReportExt;
-use veloq_driver_core::op::{UdpRecv, UdpRecvStream};
+use veloq_driver_core::op::UdpRecvFrom;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, RIO_BUF, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
 };
@@ -34,19 +34,14 @@ pub(crate) struct RioSendToArgs<'a> {
     pub(crate) buf_offset: usize,
 }
 
-pub(crate) struct RioUdpStreamArgs<'a> {
+pub(crate) struct RioUdpRecvFromArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) stream_op: &'a mut UdpRecvStream,
+    pub(crate) recv_from_op: &'a mut UdpRecvFrom,
+    pub(crate) addr_ptr: *mut std::ffi::c_void,
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
-}
-
-pub(crate) struct RioUdpRecvArgs<'a> {
-    pub(crate) fd: IoFd,
-    pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) recv_op: &'a mut UdpRecv,
-    pub(crate) sidecar: &'a mut crate::op::OverlappedEntry,
+    pub(crate) page_idx: usize,
 }
 
 impl RioState {
@@ -136,6 +131,28 @@ impl RioState {
         Ok((rio_addr_len as u32, (addr_addr - base_addr) as u32 as usize))
     }
 
+    fn validate_rio_addr_output(
+        addr_ptr: *mut std::ffi::c_void,
+        rio_addr_len: u32,
+        base_addr: usize,
+        slab_len: usize,
+        page_idx: usize,
+    ) -> RioResult<usize> {
+        if addr_ptr.is_null() {
+            return Err(diagweave::report::Report::new(RioError::Internal))
+                .attach_note("RIO recv_from received null address buffer");
+        }
+        let addr_addr = addr_ptr as usize;
+        let slab_end = base_addr.saturating_add(slab_len);
+        if addr_addr < base_addr || addr_addr.saturating_add(rio_addr_len as usize) > slab_end {
+            return Err(diagweave::report::Report::new(RioError::Internal)).attach_note(format!(
+                "RIO recv_from address outside slab: page={page_idx}"
+            ));
+        }
+
+        Ok((addr_addr - base_addr) as u32 as usize)
+    }
+
     pub(crate) fn try_submit_send_to(
         &mut self,
         args: RioSendToArgs<'_>,
@@ -217,25 +234,29 @@ impl RioState {
         Ok(SubmissionResult::Pending)
     }
 
-    pub(crate) fn try_submit_pool_recv(
+    pub(crate) fn try_submit_recv_from(
         &mut self,
-        args: RioUdpStreamArgs<'_>,
+        args: RioUdpRecvFromArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
+        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> RioResult<SubmissionResult> {
-        self.try_submit_pool_recv_internal(args, registrar)
+        self.try_submit_recv_from_internal(args, registrar, slab_resolver)
     }
 
-    fn try_submit_pool_recv_internal(
+    fn try_submit_recv_from_internal(
         &mut self,
-        args: RioUdpStreamArgs<'_>,
+        args: RioUdpRecvFromArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
+        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> RioResult<SubmissionResult> {
-        let RioUdpStreamArgs {
+        let RioUdpRecvFromArgs {
             fd,
             handle,
-            stream_op,
+            recv_from_op,
+            addr_ptr,
             user_data,
             generation,
+            page_idx,
         } = args;
         let dispatch = self
             .kernel
@@ -248,98 +269,54 @@ impl RioState {
             cq: self.kernel.cq,
             registration_mode: self.registration_mode,
         };
-        self.ensure_actor((fd, handle), env)?;
-        let socket_key = handle.raw().actor_key();
-        if self.is_iocp_fallback(socket_key) {
-            return Err(diagweave::report::Report::new(RioError::NotSupported))
-                .attach_note("Socket is marked for IOCP fallback");
-        }
-        let key = self
-            .actor_by_handle
-            .get(&socket_key)
-            .copied()
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
-            .attach_note("actor not found")?;
-        let actor = self
-            .actors
-            .get_mut(key)
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
-            .attach_note("actor not found")?;
-        let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
-        let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-        let (res, pool_submissions) = pool_manager
-            .try_submit_pool_recv(udp_mailbox, stream_op, (user_data, generation), &mut ctx)
-            .map_err(|e| {
-                diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string())
-            })
-            .attach_note("pool submission failed")?;
-
-        self.outstanding_count += pool_submissions;
-        Ok(res)
-    }
-
-    pub(crate) fn try_submit_pool_recv_for_recv(
-        &mut self,
-        args: RioUdpRecvArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> RioResult<SubmissionResult> {
-        self.try_submit_pool_recv_for_recv_internal(args, registrar)
-    }
-
-    fn try_submit_pool_recv_for_recv_internal(
-        &mut self,
-        args: RioUdpRecvArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-    ) -> RioResult<SubmissionResult> {
-        let RioUdpRecvArgs {
-            fd,
-            handle,
-            recv_op,
-            sidecar,
-        } = args;
-        let dispatch = self
-            .kernel
-            .dispatch
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
-            .attach_note("lost RIO context")?;
-        let env = RioEnv {
-            registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
-            registration_mode: self.registration_mode,
+        let rq = {
+            let actor = self.ensure_actor((fd, handle), env)?;
+            actor.rq
         };
-        self.ensure_actor((fd, handle), env)?;
         let socket_key = handle.raw().actor_key();
         if self.is_iocp_fallback(socket_key) {
             return Err(diagweave::report::Report::new(RioError::NotSupported))
                 .attach_note("Socket is marked for IOCP fallback");
         }
-        let key = self
-            .actor_by_handle
-            .get(&socket_key)
-            .copied()
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
-            .attach_note("actor not found")?;
-        let actor = self
-            .actors
-            .get_mut(key)
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
-            .attach_note("actor not found")?;
-        let mut ctx = Self::build_ctx(&mut self.registry, env, (key, actor.rq));
-        let user_data = sidecar.user_data;
-        let generation = sidecar.generation;
-        let (pool_manager, udp_mailbox) = (&mut actor.pool_manager, &mut actor.udp_mailbox);
-        let (res, pool_submissions, immediate_copied) = pool_manager
-            .try_submit_pool_recv_recv(udp_mailbox, recv_op, (user_data, generation), &mut ctx)
-            .map_err(|e| {
-                diagweave::report::Report::new(RioError::Internal).attach_note(e.to_string())
-            })
-            .attach_note("pool submission failed")?;
+        let buf_offset = recv_from_op.buf_offset;
+        let buf_len = recv_from_op.buf.capacity().saturating_sub(buf_offset) as u32;
+        let data_buf =
+            self.registry
+                .prepare_submission(&recv_from_op.buf, buf_offset, buf_len, env)?;
+        self.registry
+            .ensure_page_reg(page_idx, slab_resolver, env)?;
 
-        if let Some(copied) = immediate_copied {
-            sidecar.blocking_result = Some(Ok(copied));
+        let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>() as u32;
+        let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx]
+            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .attach_note("missing slab page")?;
+        let addr_offset =
+            Self::validate_rio_addr_output(addr_ptr, rio_addr_len, base_addr, slab_len, page_idx)?;
+        let addr_buf = RIO_BUF {
+            BufferId: addr_buf_id.0,
+            Offset: addr_offset as u32,
+            Length: rio_addr_len,
+        };
+        let request_context = Self::encode_req_ctx(user_data, generation);
+
+        if let Err(e) = dispatch.receive_ex(RioExConfig {
+            rq,
+            data_buf: &data_buf,
+            data_buf_count: 1,
+            local_addr: std::ptr::null(),
+            remote_addr: &addr_buf,
+            control_buf: std::ptr::null(),
+            flags_buf: std::ptr::null(),
+            flags: 0,
+            context: request_context,
+        }) {
+            Self::free_op_req_ctx(request_context as u64);
+            return Err(e.attach_note(format!(
+                "RIOReceiveEx failed for fd={fd:?}, user_data={user_data}, generation={generation}, page_idx={page_idx}"
+            )));
         }
-        self.outstanding_count += pool_submissions;
-        Ok(res)
+
+        self.outstanding_count += 1;
+        Ok(SubmissionResult::Pending)
     }
 }

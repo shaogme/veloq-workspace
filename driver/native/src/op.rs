@@ -37,7 +37,7 @@ pub type Accept = veloq_driver_core::op::Accept<SockAddrStorage>;
 pub type SendTo = veloq_driver_core::op::SendTo;
 pub type SyncFileRange = veloq_driver_core::op::SyncFileRange;
 pub type Fallocate = veloq_driver_core::op::Fallocate;
-pub type UdpRecvStream = veloq_driver_core::op::UdpRecvStream;
+pub type UdpRecvFrom = veloq_driver_core::op::UdpRecvFrom;
 
 pub use veloq_driver_core::op::{
     DetachedOp, DetachedSubmitter, IntoPlatformOp, LocalSubmitter, Op, OpKind, OpLifecycle,

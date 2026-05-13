@@ -17,9 +17,9 @@ use crate::op::submit::common::{
 };
 use crate::op::{
     ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv,
-    SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvStream, UdpSend,
+    SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvFromPayload, UdpSend,
 };
-use crate::rio::RioTarget;
+use crate::rio::{RioTarget, RioUdpRecvFromArgs};
 use crate::win32::SafeSocket;
 
 // ============================================================================
@@ -48,24 +48,27 @@ pub(crate) fn submit_recv(
     header.resolved_handle = Some(resolve_fd_handle(&fd, ctx.registered_files)?);
     let user_data = header.user_data;
     let generation = header.generation;
-    ctx.rio
-        .try_submit_recv(
-            RioTarget {
-                fd,
-                handle,
-                user_data,
-                generation,
-                buf_offset: val.buf_offset,
-            },
-            &mut val.buf,
-            ctx.registrar,
-        )
-        .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_recv", e).attach_note(format!(
-                "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, user_data, generation
-            ))
-        })
+    mark_header_in_flight(
+        header,
+        ctx.rio
+            .try_submit_recv(
+                RioTarget {
+                    fd,
+                    handle,
+                    user_data,
+                    generation,
+                    buf_offset: val.buf_offset,
+                },
+                &mut val.buf,
+                ctx.registrar,
+            )
+            .map_err(|e| {
+                from_io_error(IocpError::Submission, "submit_recv", e).attach_note(format!(
+                    "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, user_data, generation
+                ))
+            }),
+    )
 }
 
 pub(crate) fn submit_udp_recv(
@@ -80,22 +83,29 @@ pub(crate) fn submit_udp_recv(
     let fd = val.fd;
     let handle = resolve_fd_borrowed(&fd, ctx.registered_files)?;
     header.resolved_handle = Some(resolve_fd_handle(&fd, ctx.registered_files)?);
-    ctx.rio
-        .try_submit_pool_recv_for_recv(
-            crate::rio::RioUdpRecvArgs {
-                fd,
-                handle,
-                recv_op: val,
-                sidecar: header,
-            },
-            ctx.registrar,
-        )
-        .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_udp_recv", e).attach_note(format!(
-                "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, header.user_data, header.generation
-            ))
-        })
+    let user_data = header.user_data;
+    let generation = header.generation;
+    mark_header_in_flight(
+        header,
+        ctx.rio
+            .try_submit_recv(
+                RioTarget {
+                    fd,
+                    handle,
+                    user_data,
+                    generation,
+                    buf_offset: val.buf_offset,
+                },
+                &mut val.buf,
+                ctx.registrar,
+            )
+            .map_err(|e| {
+                from_io_error(IocpError::Submission, "submit_udp_recv", e).attach_note(format!(
+                    "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, header.user_data, header.generation
+                ))
+            }),
+    )
 }
 
 pub(crate) fn submit_send(
@@ -111,24 +121,27 @@ pub(crate) fn submit_send(
     header.resolved_handle = Some(resolve_fd_handle(&val.fd, ctx.registered_files)?);
     let user_data = header.user_data;
     let generation = header.generation;
-    ctx.rio
-        .try_submit_send(
-            RioTarget {
-                fd: val.fd,
-                handle,
-                user_data,
-                generation,
-                buf_offset: val.buf_offset,
-            },
-            &val.buf,
-            ctx.registrar,
-        )
-        .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_send", e).attach_note(format!(
-                "RIO send submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, user_data, generation
-            ))
-        })
+    mark_header_in_flight(
+        header,
+        ctx.rio
+            .try_submit_send(
+                RioTarget {
+                    fd: val.fd,
+                    handle,
+                    user_data,
+                    generation,
+                    buf_offset: val.buf_offset,
+                },
+                &val.buf,
+                ctx.registrar,
+            )
+            .map_err(|e| {
+                from_io_error(IocpError::Submission, "submit_send", e).attach_note(format!(
+                    "RIO send submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, user_data, generation
+                ))
+            }),
+    )
 }
 
 pub(crate) fn submit_udp_send(
@@ -144,24 +157,27 @@ pub(crate) fn submit_udp_send(
     header.resolved_handle = Some(resolve_fd_handle(&val.fd, ctx.registered_files)?);
     let user_data = header.user_data;
     let generation = header.generation;
-    ctx.rio
-        .try_submit_send(
-            RioTarget {
-                fd: val.fd,
-                handle,
-                user_data,
-                generation,
-                buf_offset: val.buf_offset,
-            },
-            &val.buf,
-            ctx.registrar,
-        )
-        .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_udp_send", e).attach_note(format!(
-                "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, user_data, generation
-            ))
-        })
+    mark_header_in_flight(
+        header,
+        ctx.rio
+            .try_submit_send(
+                RioTarget {
+                    fd: val.fd,
+                    handle,
+                    user_data,
+                    generation,
+                    buf_offset: val.buf_offset,
+                },
+                &val.buf,
+                ctx.registrar,
+            )
+            .map_err(|e| {
+                from_io_error(IocpError::Submission, "submit_udp_send", e).attach_note(format!(
+                    "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
+                    val.fd, user_data, generation
+                ))
+            }),
+    )
 }
 
 pub(crate) fn submit_connect(
@@ -493,64 +509,81 @@ pub(crate) fn submit_send_to(
         page_idx,
         buf_offset: user.buf_offset,
     };
-    ctx.rio
-        .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
-        .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_send_to", e).attach_note(format!(
-                "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
-                user.fd, header.user_data, header.generation, page_idx
-            ))
-        })
+    mark_header_in_flight(
+        header,
+        ctx.rio
+            .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
+            .map_err(|e| {
+                from_io_error(IocpError::Submission, "submit_send_to", e).attach_note(format!(
+                    "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
+                    user.fd, header.user_data, header.generation, page_idx
+                ))
+            }),
+    )
 }
 
 // ============================================================================
-// UDP RIO Pool (Stream)
+// UDP RIO RecvFrom
 // ============================================================================
 
-pub(crate) fn submit_udp_recv_stream(
+pub(crate) fn submit_udp_recv_from(
     header: &mut OverlappedEntry,
-    payload: &mut KernelRef<UdpRecvStream>,
+    payload: &mut UdpRecvFromPayload,
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
-    // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    // SAFETY: payload.user and overlapped come from the in-flight slot.
+    let (val, overlapped) = unsafe {
+        let user = payload.user.as_mut();
+        (user, &mut *ctx.overlapped)
+    };
     overlapped.set_offset(0);
     let fd = val.fd;
     let handle = resolve_fd_borrowed(&fd, ctx.registered_files)?;
     header.resolved_handle = Some(resolve_fd_handle(&fd, ctx.registered_files)?);
+    let page_idx = header.user_data / ctx.slots_per_page;
 
-    let args = crate::rio::RioUdpStreamArgs {
+    let args = RioUdpRecvFromArgs {
         fd,
         handle,
-        stream_op: val,
+        recv_from_op: val,
+        addr_ptr: (&mut payload.addr as *mut SockAddrStorage).cast::<std::ffi::c_void>(),
         user_data: header.user_data,
         generation: header.generation,
+        page_idx,
     };
-    ctx.rio
-        .try_submit_pool_recv(args, ctx.registrar)
-        .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_udp_recv_stream", e).attach_note(format!(
-                "RIO udp_recv_stream submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, header.user_data, header.generation
+    mark_header_in_flight(
+        header,
+        ctx.rio
+            .try_submit_recv_from(args, ctx.registrar, ctx.slab_resolver)
+            .map_err(|e| {
+            from_io_error(IocpError::Submission, "submit_udp_recv_from", e).attach_note(format!(
+                "RIO udp_recv_from submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
+                fd, header.user_data, header.generation, page_idx
             ))
-        })
+        }),
+    )
 }
 
 /// # Safety
 ///
 /// The caller must ensure that header and payload are valid.
-pub(crate) unsafe fn on_udp_stream_complete(
+pub(crate) unsafe fn on_complete_udp_recv_from(
     _header: &mut OverlappedEntry,
-    payload: &mut KernelRef<UdpRecvStream>,
+    payload: &mut UdpRecvFromPayload,
     result: usize,
     _ext: &Extensions,
 ) -> IocpResult<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let val = unsafe { payload.user.as_mut() };
-    if result == 0
-        && let Some(datagram) = val.result.as_ref()
-    {
-        return Ok(datagram.buf.len());
-    }
+    let addr_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&payload.addr as *const SockAddrStorage).cast::<u8>(),
+            std::mem::size_of::<SockAddrStorage>(),
+        )
+    };
+    val.addr = Some(addr::to_socket_addr(addr_bytes).map_err(|_| {
+        diagweave::report::Report::new(IocpError::InvalidState)
+            .attach_note("failed to parse RIO udp_recv_from source address")
+    })?);
     Ok(result)
 }

@@ -523,7 +523,7 @@ pub(crate) unsafe fn make_sqe_send_to(
 impl_default_completion!(on_complete_send_to);
 impl_lifecycle!(drop_send_to, SendTo, nested_fd);
 
-pub(crate) unsafe fn make_sqe_udp_recv_stream(
+pub(crate) unsafe fn make_sqe_udp_recv_from(
     op: &mut UringOp,
     driver: &mut UringDriver,
     user_data: usize,
@@ -531,43 +531,34 @@ pub(crate) unsafe fn make_sqe_udp_recv_stream(
     let storage = driver
         .ops
         .slot_storage_mut(user_data)
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_recv_stream"))?;
+        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_recv_from"))?;
     let payload = storage
         .payload
         .as_mut()
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_recv_stream"))?;
+        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_recv_from"))?;
     let user = match payload {
-        crate::op::UringUserPayload::UdpRecvStream(p) => p,
+        crate::op::UringUserPayload::UdpRecvFrom(p) => p,
         _ => {
             return Err(payload_variant_mismatch(
-                "uring.op.submit.make_sqe_udp_recv_stream",
+                "uring.op.submit.make_sqe_udp_recv_from",
             ));
         }
     };
 
     let kernel = match &mut op.payload {
-        UringOpPayload::UdpRecvStream(p) => p,
+        UringOpPayload::UdpRecvFrom(p) => p,
         _ => {
             return Err(payload_variant_mismatch(
-                "uring.op.submit.make_sqe_udp_recv_stream",
+                "uring.op.submit.make_sqe_udp_recv_from",
             ));
         }
     };
 
     let fd = user.fd;
-    let recv_buf = match user.buf.as_mut() {
-        Some(buf) => buf,
-        None => {
-            return Err(driver_error(
-                DriverErrorKind::InvalidInput,
-                "uring.op.submit.make_sqe_udp_recv_stream",
-                "UdpRecvStream buffer missing",
-            ));
-        }
-    };
+    let recv_buf = &mut user.buf;
 
-    kernel.iovec[0].iov_base = recv_buf.as_mut_ptr() as *mut _;
-    kernel.iovec[0].iov_len = recv_buf.capacity();
+    kernel.iovec[0].iov_base = unsafe { recv_buf.as_mut_ptr().add(user.buf_offset) } as *mut _;
+    kernel.iovec[0].iov_len = recv_buf.capacity().saturating_sub(user.buf_offset);
 
     kernel.msghdr.msg_name = &mut kernel.msg_name as *mut _ as *mut libc::c_void;
     kernel.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
@@ -578,7 +569,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_stream(
     Ok(opcode::RecvMsg::new(types::Fixed(idx), &mut kernel.msghdr as *mut _).build())
 }
 
-pub(crate) unsafe fn on_complete_udp_recv_stream(
+pub(crate) unsafe fn on_complete_udp_recv_from(
     op: &mut UringOp,
     payload: &mut UringUserPayload,
     result: i32,
@@ -586,26 +577,26 @@ pub(crate) unsafe fn on_complete_udp_recv_stream(
     if result < 0 {
         return Err(driver_os_error(
             DriverErrorKind::Completion,
-            "uring.op.submit.on_complete_udp_recv_stream",
+            "uring.op.submit.on_complete_udp_recv_from",
             -result,
             "kernel completion returned error",
         ));
     }
 
     let user = match payload {
-        crate::op::UringUserPayload::UdpRecvStream(p) => p,
+        crate::op::UringUserPayload::UdpRecvFrom(p) => p,
         _ => {
             return Err(driver_error(
                 DriverErrorKind::InvalidState,
-                "uring.op.submit.on_complete_udp_recv_stream",
-                "payload variant mismatch for udp_recv_stream",
+                "uring.op.submit.on_complete_udp_recv_from",
+                "payload variant mismatch for udp_recv_from",
             ));
         }
     };
 
     let kernel = match &mut op.payload {
-        UringOpPayload::UdpRecvStream(p) => p,
-        _ => return Err(payload_variant_mismatch("on_complete_udp_recv_stream")),
+        UringOpPayload::UdpRecvFrom(p) => p,
+        _ => return Err(payload_variant_mismatch("on_complete_udp_recv_from")),
     };
 
     let len = kernel.msghdr.msg_namelen as usize;
@@ -617,7 +608,7 @@ pub(crate) unsafe fn on_complete_udp_recv_stream(
     Ok(result as usize)
 }
 
-impl_lifecycle!(drop_udp_recv_stream, UdpRecvStream, direct_fd);
+impl_lifecycle!(drop_udp_recv_from, UdpRecvFrom, direct_fd);
 
 pub(crate) unsafe fn make_sqe_close(
     _op: &mut UringOp,

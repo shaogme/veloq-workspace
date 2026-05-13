@@ -28,7 +28,7 @@ use veloq_driver_core::op::{
     OpKind, Open, ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase, Recv as RecvBase,
     Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
     SyncFileRangeRaw as SyncFileRangeRawBase, Timeout, UdpConnect as UdpConnectBase,
-    UdpRecv as UdpRecvBase, UdpRecvStream as UdpRecvStreamBase, UdpSend as UdpSendBase,
+    UdpRecv as UdpRecvBase, UdpRecvFrom as UdpRecvFromBase, UdpSend as UdpSendBase,
     Wakeup as WakeupBase, WriteFixed as WriteFixedBase, WriteRaw as WriteRawBase,
 };
 
@@ -57,7 +57,7 @@ pub(crate) type SyncFileRange = SyncFileRangeBase;
 pub(crate) type SyncFileRangeRaw = SyncFileRangeRawBase<IocpHandle>;
 pub(crate) type Fallocate = FallocateBase;
 pub(crate) type FallocateRaw = FallocateRawBase<IocpHandle>;
-pub(crate) type UdpRecvStream = UdpRecvStreamBase;
+pub(crate) type UdpRecvFrom = UdpRecvFromBase;
 pub(crate) type Wakeup = WakeupBase;
 
 // ============================================================================
@@ -280,6 +280,12 @@ pub(crate) struct SendToPayload {
     pub(crate) addr_len: i32,
 }
 
+/// Payload for the socket recv-from operation.
+pub(crate) struct UdpRecvFromPayload {
+    pub(crate) user: NonNull<UdpRecvFrom>,
+    pub(crate) addr: SockAddrStorage,
+}
+
 /// Payload for the file open operation.
 pub(crate) struct OpenPayload {
     pub(crate) user: NonNull<Open>,
@@ -447,12 +453,20 @@ define_iocp_ops! {
         },
         destruct: |user: Box<SendTo>| *user,
     },
-    UdpRecvStream {
-        variant: UdpRecvStream,
-        kind: OpKind::UdpRecvStream,
-        submit: submit::submit_udp_recv_stream,
-        on_complete: submit::on_udp_stream_complete,
-        get_fd: submit::get_fd_udp_recv_stream,
+    UdpRecvFrom {
+        variant: UdpRecvFrom,
+        payload: UdpRecvFromPayload,
+        kind: OpKind::UdpRecvFrom,
+        submit: submit::submit_udp_recv_from,
+        on_complete: submit::on_complete_udp_recv_from,
+        get_fd: submit::get_fd_udp_recv_from,
+        construct: |user: std::ptr::NonNull<UdpRecvFrom>| {
+            UdpRecvFromPayload {
+                user,
+                addr: SockAddrStorage::default(),
+            }
+        },
+        destruct: |user: Box<UdpRecvFrom>| *user,
     },
     Open {
         variant: Open,

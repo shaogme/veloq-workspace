@@ -6,7 +6,6 @@ pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
 use std::collections::VecDeque;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::task::Poll;
@@ -72,8 +71,6 @@ pub struct IocpOpState {
     // 1) user has consumed completion; 2) late RIO CQE has been drained.
     pub(crate) rio_needs_drain: bool,
     pub(crate) rio_drained: bool,
-    // recv_from served by internal RIO UDP pre-post pool; no per-op kernel I/O in flight.
-    pub(crate) rio_pool_waiting: bool,
 }
 
 /// Closing mode for the driver or operations.
@@ -97,7 +94,7 @@ impl IocpDriver {
                 | IocpOpPayload::UdpRecv(_)
                 | IocpOpPayload::UdpSend(_)
                 | IocpOpPayload::SendTo(_)
-                | IocpOpPayload::UdpRecvStream(_)
+                | IocpOpPayload::UdpRecvFrom(_)
         )
     }
 
@@ -269,7 +266,7 @@ impl Driver for IocpDriver {
             }
         };
 
-        let (is_rio_pool_waiting, result) = match self.call_op_submit(user_data, op) {
+        let result = match self.call_op_submit(user_data, op) {
             Ok(res) => res,
             Err(e) => {
                 return binder.err(
@@ -291,15 +288,7 @@ impl Driver for IocpDriver {
             completion_table: &self.completion_table,
         };
 
-        Self::on_submit_res(
-            &mut self.ops,
-            ctx,
-            result,
-            user_data,
-            op_in,
-            binder,
-            is_rio_pool_waiting,
-        )
+        Self::on_submit_res(&mut self.ops, ctx, result, user_data, op_in, binder)
     }
 
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
@@ -374,15 +363,6 @@ impl Driver for IocpDriver {
 
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
         IocpDriver::unregister_files(self, files)
-    }
-
-    fn warmup_udp_socket(
-        &mut self,
-        fd: IoFd,
-        buf_capacity: NonZeroUsize,
-        credits: usize,
-    ) -> DriverResult<()> {
-        self.warmup_udp_socket_impl(fd, buf_capacity, credits)
     }
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {

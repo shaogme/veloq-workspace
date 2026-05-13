@@ -1,6 +1,5 @@
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -9,10 +8,9 @@ use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::runtime::context::{submit, submit_to};
 use veloq_buf::FixedBuf;
 use veloq_driver_native::Socket;
-use veloq_driver_native::driver::Driver;
 use veloq_driver_native::op::{
     DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpConnect, UdpRecv as OpUdpRecv,
-    UdpRecvPacket, UdpRecvPacketBuf, UdpRecvStream, UdpSend as OpUdpSend,
+    UdpRecvFrom, UdpRecvPacket, UdpRecvPacketBuf, UdpSend as OpUdpSend,
 };
 
 #[derive(Clone)]
@@ -53,23 +51,6 @@ fn bind_inner<A: ToSocketAddrs, P: SocketTokenPtr>(addr: A) -> VeloqResult<Inner
 }
 
 impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
-    pub async fn recv_ready(&self, buf_capacity: NonZeroUsize, credits: usize) -> VeloqResult<()> {
-        if credits == 0 {
-            return Ok(());
-        }
-
-        if let Some(ctx) = crate::runtime::context::try_current() {
-            ctx.registrar().sync_to_driver();
-            let driver = ctx.driver();
-            return driver
-                .borrow_mut()
-                .warmup_udp_socket(self.inner.fd(), buf_capacity, credits)
-                .map_err(from_driver_report);
-        }
-
-        Ok(())
-    }
-
     pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
         self.inner.local_addr()
     }
@@ -92,31 +73,23 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
         Ok((res.map_err(from_driver_report)?, buf))
     }
 
-    async fn recv_stream_direct(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
-        let op = UdpRecvStream {
+    async fn recv_from_direct(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
+        let op = UdpRecvFrom {
             fd: self.inner.fd(),
-            buf: Some(buf),
+            buf,
+            buf_offset: 0,
             addr: None,
-            result: None,
         };
         let (res, op_back_opt) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let mut op_back =
-            op_back_opt.ok_or_else(|| from_io_error(io::Error::other("UdpRecvStream op lost")))?;
+        let op_back =
+            op_back_opt.ok_or_else(|| from_io_error(io::Error::other("UdpRecvFrom op lost")))?;
         let n = res.map_err(from_driver_report)?;
-
-        if let Some(datagram) = op_back.result.take() {
-            return Ok(datagram);
-        }
-
-        let mut recv_buf = op_back
-            .buf
-            .take()
-            .ok_or_else(|| from_io_error(io::Error::other("udp recv_stream buffer missing")))?;
+        let mut recv_buf = op_back.buf;
         recv_buf.set_len(n);
         let addr = op_back.addr.ok_or_else(|| {
             from_io_error(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "driver must populate UdpRecvStream::addr before completion",
+                "driver must populate UdpRecvFrom::addr before completion",
             ))
         })?;
         Ok(UdpRecvPacket {
@@ -188,8 +161,8 @@ impl LocalUdpSocket {
         self.send_to_direct(buf, target).await
     }
 
-    pub async fn recv_stream(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
-        self.recv_stream_direct(buf).await
+    pub async fn recv_from(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
+        self.recv_from_direct(buf).await
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> VeloqResult<()> {
@@ -245,30 +218,22 @@ impl UdpSocket {
         Ok((res.map_err(from_driver_report)?, op.buf))
     }
 
-    pub async fn recv_stream(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
+    pub async fn recv_from(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
         let owner = self.inner.owner_worker_id();
-        let op = UdpRecvStream {
+        let op = UdpRecvFrom {
             fd: self.inner.fd(),
-            buf: Some(buf),
+            buf,
+            buf_offset: 0,
             addr: None,
-            result: None,
         };
-        let (res, mut op) = submit_to(owner, Op::new(op)).await?;
+        let (res, op) = submit_to(owner, Op::new(op)).await?;
         let n = res.map_err(from_driver_report)?;
-
-        if let Some(datagram) = op.result.take() {
-            return Ok(datagram);
-        }
-
-        let mut recv_buf = op
-            .buf
-            .take()
-            .ok_or_else(|| from_io_error(io::Error::other("udp recv_stream buffer missing")))?;
+        let mut recv_buf = op.buf;
         recv_buf.set_len(n);
         let addr = op.addr.ok_or_else(|| {
             from_io_error(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "driver must populate UdpRecvStream::addr before completion",
+                "driver must populate UdpRecvFrom::addr before completion",
             ))
         })?;
         Ok(UdpRecvPacket {

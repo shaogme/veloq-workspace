@@ -17,7 +17,7 @@ pub enum OpKind {
     Fallocate = 9,
     Accept = 10,
     SendTo = 11,
-    UdpRecvStream = 12,
+    UdpRecvFrom = 12,
     Open = 13,
     Wakeup = 14,
     Timeout = 15,
@@ -197,15 +197,12 @@ pub struct FallocateRaw<H: RawHandleMeta> {
     pub len: u64,
 }
 
-/// Receive data as UDP datagram stream.
-pub struct UdpRecvStream {
+/// Receive a UDP datagram together with its source address.
+pub struct UdpRecvFrom {
     pub fd: IoFd,
-    /// Unix io_uring path uses this provided buffer; Windows can leave it as None.
-    pub buf: Option<FixedBuf>,
-    /// Unix io_uring path: source address parsed from recvmsg.
+    pub buf: FixedBuf,
+    pub buf_offset: usize,
     pub addr: Option<std::net::SocketAddr>,
-    /// Windows RIO path: resulting datagram, populated on completion.
-    pub result: Option<UdpRecvPacket>,
 }
 
 /// A received UDP datagram.
