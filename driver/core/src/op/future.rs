@@ -89,6 +89,25 @@ impl<T, R> OpResult<T, R> {
     }
 }
 
+/// The completion projection for a submitted operation.
+#[derive(Debug)]
+pub struct OpCompletion<T, R = usize> {
+    pub result: DriverResult<R>,
+    pub output: T,
+}
+
+impl<T, R> OpCompletion<T, R> {
+    #[inline]
+    pub fn new(result: DriverResult<R>, output: T) -> Self {
+        Self { result, output }
+    }
+
+    #[inline]
+    pub fn into_parts(self) -> (DriverResult<R>, T) {
+        (self.result, self.output)
+    }
+}
+
 #[inline]
 pub(crate) fn payload_missing_error() -> OpError {
     OpError::new(
@@ -116,7 +135,7 @@ pub(crate) fn generation_mismatch_error() -> OpError {
 #[inline]
 pub(crate) fn completion_record_to_result<T, O, UP, C>(
     record: CompletionRecord<UP, C>,
-) -> Poll<OpResult<T, T::Completion>>
+) -> Poll<OpResult<T::Output, T::Completion>>
 where
     UP: Send,
     O: PlatformOp,
@@ -132,17 +151,16 @@ where
         return Poll::Ready(OpResult::ResourceLost(payload_missing_error()));
     };
     let payload = T::payload_from_erased(payload_erased);
-    let data = T::from_user_payload(payload);
     let res = detail.unwrap_or_else(|| event_res_to_result::<C>(event.res));
-    let completion = data.map_completion_result(res);
-    Poll::Ready(OpResult::Completed(completion, data))
+    let completion = T::complete(payload, res);
+    Poll::Ready(OpResult::Completed(completion.result, completion.output))
 }
 
 #[inline]
 pub(crate) fn poll_completion_table_once<T, O, UP, C>(
     table: &dyn crate::driver::CompletionAccess<UP, C>,
     token: u64,
-) -> Poll<OpResult<T, T::Completion>>
+) -> Poll<OpResult<T::Output, T::Completion>>
 where
     UP: Send,
     O: PlatformOp,
@@ -151,7 +169,7 @@ where
 {
     match table.try_take_record(token) {
         PollRecordResult::Ready(record) => completion_record_to_result::<T, O, UP, C>(record),
-        PollRecordResult::Stale => Poll::Ready(OpResult::<T, T::Completion>::ResourceLost(
+        PollRecordResult::Stale => Poll::Ready(OpResult::<T::Output, T::Completion>::ResourceLost(
             generation_mismatch_error(),
         )),
         PollRecordResult::Pending => Poll::Pending,
@@ -171,7 +189,7 @@ where
     pub(crate) cancel_signal: Option<Arc<DetachedCancelTable>>,
     pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker>>,
     pub(crate) token: u64,
-    pub(crate) immediate_failure: Option<(DriverErrorReport, T)>,
+    pub(crate) immediate_failure: Option<(DriverErrorReport, T::UserPayload)>,
     pub(crate) _phantom: std::marker::PhantomData<DetachedOpMarker<T, T::ErasedPayload, C, O>>,
 }
 
@@ -210,13 +228,14 @@ where
     C: crate::driver::CompletionValue,
     T: IntoPlatformOp<O, DriverCompletion = C>,
 {
-    type Output = OpResult<T, T::Completion>;
+    type Output = OpResult<T::Output, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Some((e, data)) = this.immediate_failure.take() {
-            return Poll::Ready(OpResult::Completed(Err(e), data));
+        if let Some((e, payload)) = this.immediate_failure.take() {
+            let completion = T::complete(payload, Err(e));
+            return Poll::Ready(OpResult::Completed(completion.result, completion.output));
         }
 
         let table = this
@@ -275,7 +294,7 @@ where
     D: Driver,
     T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
 {
-    type Output = OpResult<T, T::Completion>;
+    type Output = OpResult<T::Output, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let op = unsafe { self.get_unchecked_mut() };
@@ -295,7 +314,8 @@ where
                 Ok(v) => v,
                 Err(e) => {
                     drop(driver_op);
-                    return Poll::Ready(OpResult::Completed(Err(e), T::from_user_payload(payload)));
+                    let completion = T::complete(payload, Err(e));
+                    return Poll::Ready(OpResult::Completed(completion.result, completion.output));
                 }
             };
             op.user_data = user_data;
@@ -329,7 +349,6 @@ where
                             )
                         });
                         let payload = T::payload_from_erased(payload_erased);
-                        let data = T::from_user_payload(payload);
                         trace!(
                             op = %std::any::type_name::<T>(),
                             user_data = user_data,
@@ -337,7 +356,11 @@ where
                             error = %e,
                             "LocalOp::poll: submit failed synchronously"
                         );
-                        return Poll::Ready(OpResult::Completed(Err(e), data));
+                        let completion = T::complete(payload, Err(e));
+                        return Poll::Ready(OpResult::Completed(
+                            completion.result,
+                            completion.output,
+                        ));
                     } else {
                         op.state = LocalState::Submitted;
                         trace!(
@@ -426,7 +449,7 @@ pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync {
     type Future<
         T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
             + std::marker::Send,
-    >: Future<Output = OpResult<T, <T as IntoPlatformOp<D::Op>>::Completion>>;
+    >: Future<Output = OpResult<T::Output, <T as IntoPlatformOp<D::Op>>::Completion>>;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
     where

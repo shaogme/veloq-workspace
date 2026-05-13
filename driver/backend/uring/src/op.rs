@@ -7,7 +7,7 @@ use io_uring::squeue;
 use std::time::Duration;
 use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::PlatformOp;
-use veloq_driver_core::op::{IntoPlatformOp, OpKind};
+use veloq_driver_core::op::{IntoPlatformOp, OpCompletion, OpKind};
 
 mod payload;
 pub(crate) mod slot;
@@ -116,6 +116,7 @@ macro_rules! define_uring_ops {
             impl IntoPlatformOp<UringOp> for $OpType {
                 type UserPayload = $OpType;
                 type ErasedPayload = UringUserPayload;
+                type Output = $OpType;
                 type Completion = define_uring_ops!(@completion_type $($completion)?);
                 type DriverCompletion = usize;
                 const PAYLOAD_KIND: OpKind = $kind;
@@ -142,10 +143,6 @@ macro_rules! define_uring_ops {
                     (op, user)
                 }
 
-                fn from_user_payload(payload: Self::UserPayload) -> Self {
-                    payload
-                }
-
                 fn payload_into_erased(payload: Self::UserPayload) -> UringUserPayload {
                     UringUserPayload::$OpType(payload)
                 }
@@ -158,11 +155,12 @@ macro_rules! define_uring_ops {
                     }
                 }
 
-                fn map_completion_result(
-                    &self,
+                fn complete(
+                    payload: Self::UserPayload,
                     res: DriverResult<usize>,
-                ) -> DriverResult<Self::Completion> {
-                    define_uring_ops!(@map_completion self, res, $($map_completion)?)
+                ) -> OpCompletion<Self::Output, Self::Completion> {
+                    let completion = define_uring_ops!(@map_completion &payload, res, $($map_completion)?);
+                    OpCompletion::new(completion, payload)
                 }
             }
         )+
@@ -189,8 +187,8 @@ macro_rules! define_uring_ops {
     (@completion_type ) => { usize };
     (@completion_type $ty:ty) => { $ty };
 
-    (@map_completion $this:ident, $res:ident, ) => { $res };
-    (@map_completion $this:ident, $res:ident, $expr:expr) => { ($expr)($this, $res) };
+    (@map_completion $this:expr, $res:expr, ) => { $res };
+    (@map_completion $this:expr, $res:expr, $expr:expr) => { ($expr)($this, $res) };
 }
 
 // ============================================================================

@@ -53,7 +53,12 @@ pub trait OpSubmitter: Clone + std::marker::Send + Sync {
                 DriverCompletion = <PlatformDriver as Driver>::Completion,
                 ErasedPayload = <PlatformDriver as Driver>::UP,
             > + std::marker::Send,
-    >: Future<Output = OpResult<T, <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion>>;
+    >: Future<
+        Output = OpResult<
+            T::Output,
+            <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion,
+        >,
+    >;
 
     fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<PlatformDriver>>) -> Self::Future<T>
     where

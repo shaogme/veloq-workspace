@@ -1,5 +1,6 @@
 use crate::config::{IoFd, IocpConfig};
 use crate::driver::IocpDriver;
+use crate::error::IocpResultExt;
 use crate::net::addr::{SockAddrStorage, socket_addr_to_storage};
 use crate::net::socket::Socket;
 use crate::op::IocpOp;
@@ -10,6 +11,7 @@ use std::os::windows::io::IntoRawSocket;
 use std::time::Duration;
 use veloq_buf::BufPool;
 use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+use veloq_driver_core::DriverErrorKind;
 use veloq_driver_core::driver::{DriveMode, Driver, RegisterFd, SubmitBinder};
 use veloq_driver_core::op::{Accept, Connect, IntoPlatformOp, Recv};
 
@@ -75,11 +77,13 @@ fn test_iocp_accept() {
         std::time::Duration::from_secs(5),
     );
     assert!(res.is_ok(), "Accept failed: {:?}", res.err());
-    let op = Accept::from_user_payload(
+    let completion = <Accept<SockAddrStorage> as IntoPlatformOp<IocpOp>>::complete(
         accept_payload
             .take()
             .expect("accept payload missing on completion"),
+        res.to_driver_result(DriverErrorKind::Completion, "test", "wait completion"),
     );
+    let op = completion.output;
     assert!(op.remote_addr.is_some(), "Remote addr should be populated");
 
     driver.unregister_files(vec![listen_fd]).unwrap();
@@ -219,15 +223,15 @@ fn test_iocp_recv_with_buffer_pool() {
         generation,
         std::time::Duration::from_secs(5),
     );
-    assert!(res.is_ok(), "Recv failed: {:?}", res.err());
-    let bytes_read = res.unwrap();
-    assert_eq!(bytes_read, 12);
-
-    let mut op = Recv::from_user_payload(
+    let completion = <Recv as IntoPlatformOp<IocpOp>>::complete(
         recv_payload
             .take()
             .expect("recv payload missing on completion"),
+        res.to_driver_result(DriverErrorKind::Completion, "test", "wait completion"),
     );
+    let (result, mut op) = completion.into_parts();
+    let bytes_read = result.expect("Recv failed");
+    assert_eq!(bytes_read, 12);
     op.buf.set_len(bytes_read);
     assert_eq!(&op.buf.as_slice()[..12], b"Hello Buffer");
 

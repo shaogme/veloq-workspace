@@ -25,8 +25,8 @@ use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
     FallocateRaw as FallocateRawBase, Fsync as FsyncBase, FsyncRaw as FsyncRawBase, IntoPlatformOp,
-    OpKind, Open, ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase, Recv as RecvBase,
-    Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
+    OpCompletion, OpKind, Open, ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase,
+    Recv as RecvBase, Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
     SyncFileRangeRaw as SyncFileRangeRawBase, Timeout, UdpConnect as UdpConnectBase,
     UdpRecv as UdpRecvBase, UdpRecvFrom as UdpRecvFromBase, UdpSend as UdpSendBase,
     Wakeup as WakeupBase, WriteFixed as WriteFixedBase, WriteRaw as WriteRawBase,
@@ -155,6 +155,7 @@ macro_rules! define_iocp_ops {
             impl IntoPlatformOp<IocpOp> for $OpType {
                 type UserPayload = Box<$OpType>;
                 type ErasedPayload = IocpUserPayload;
+                type Output = $OpType;
                 type Completion = define_iocp_ops!(@completion_type $($completion)?);
                 type DriverCompletion = usize;
                 const PAYLOAD_KIND: OpKind = $kind;
@@ -194,10 +195,6 @@ macro_rules! define_iocp_ops {
                     (op, user)
                 }
 
-                fn from_user_payload(payload: Self::UserPayload) -> Self {
-                    define_iocp_ops!(@destruct payload, $($destruct)?)
-                }
-
                 fn payload_into_erased(payload: Self::UserPayload) -> IocpUserPayload {
                     IocpUserPayload::$OpType(payload)
                 }
@@ -210,11 +207,13 @@ macro_rules! define_iocp_ops {
                     }
                 }
 
-                fn map_completion_result(
-                    &self,
+                fn complete(
+                    payload: Self::UserPayload,
                     res: DriverResult<usize>,
-                ) -> DriverResult<Self::Completion> {
-                    define_iocp_ops!(@map_completion self, res, $($map_completion)?)
+                ) -> OpCompletion<Self::Output, Self::Completion> {
+                    let completion = define_iocp_ops!(@map_completion &*payload, res, $($map_completion)?);
+                    let output = define_iocp_ops!(@destruct payload, $($destruct)?);
+                    OpCompletion::new(completion, output)
                 }
             }
         )+
@@ -250,8 +249,8 @@ macro_rules! define_iocp_ops {
     (@completion_type ) => { usize };
     (@completion_type $ty:ty) => { $ty };
 
-    (@map_completion $this:ident, $res:ident, ) => { $res };
-    (@map_completion $this:ident, $res:ident, $expr:expr) => { ($expr)($this, $res) };
+    (@map_completion $this:expr, $res:expr, ) => { $res };
+    (@map_completion $this:expr, $res:expr, $expr:expr) => { ($expr)($this, $res) };
 }
 
 // ============================================================================

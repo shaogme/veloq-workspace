@@ -1,5 +1,6 @@
 use crate::config::{IoFd, IocpConfig};
 use crate::driver::IocpDriver;
+use crate::error::IocpResultExt;
 use crate::net::socket::Socket;
 use crate::op::IocpOp;
 use crate::tests::{completion_os_error_code, wait_completion};
@@ -9,6 +10,7 @@ use veloq_buf::{
     PoolTopology, UniformSlot,
     heap::{GlobalSlotPool, ThreadMemoryMultiplier},
 };
+use veloq_driver_core::DriverErrorKind;
 use veloq_driver_core::driver::{Driver, RegisterFd, SubmitBinder};
 use veloq_driver_core::op::{IntoPlatformOp, SendTo, UdpRecvFrom};
 
@@ -108,13 +110,16 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     let sent = wait_completion(&mut driver, send_ud, send_gen, Duration::from_secs(5))
         .expect("send_to completion failed");
     assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
-    let bytes = wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
-        .expect("udp_recv_from completion failed");
-    let recv_out = UdpRecvFrom::from_user_payload(
-        recv_payload
-            .take()
-            .expect("udp_recv_from payload missing on completion"),
-    );
+    let recv_completion =
+        <UdpRecvFrom as IntoPlatformOp<IocpOp>>::complete(
+            recv_payload
+                .take()
+                .expect("udp_recv_from payload missing on completion"),
+            wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
+                .to_driver_result(DriverErrorKind::Completion, "test", "wait completion"),
+        );
+    let (recv_result, recv_out) = recv_completion.into_parts();
+    let bytes = recv_result.expect("udp_recv_from completion failed");
     let recv_addr = recv_out.addr.expect("recv_from addr missing");
     assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
     assert_eq!(&recv_out.buf.as_slice()[..bytes], test_data);
@@ -197,13 +202,16 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     let sent = wait_completion(&mut driver, send_ud, send_gen, Duration::from_secs(5))
         .expect("send_to completion failed");
     assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
-    let bytes = wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
-        .expect("udp_recv_from completion failed");
-    let recv_out = UdpRecvFrom::from_user_payload(
-        recv_payload
-            .take()
-            .expect("udp_recv_from payload missing on completion"),
-    );
+    let recv_completion =
+        <UdpRecvFrom as IntoPlatformOp<IocpOp>>::complete(
+            recv_payload
+                .take()
+                .expect("udp_recv_from payload missing on completion"),
+            wait_completion(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
+                .to_driver_result(DriverErrorKind::Completion, "test", "wait completion"),
+        );
+    let (recv_result, recv_out) = recv_completion.into_parts();
+    let bytes = recv_result.expect("udp_recv_from completion failed");
     let recv_addr = recv_out.addr.expect("recv_from addr missing");
     assert_eq!(bytes, test_data.len(), "recv_from bytes mismatch");
     assert_eq!(&recv_out.buf.as_slice()[..bytes], test_data);
@@ -246,10 +254,11 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
         .expect("submit udp_recv_from failed");
 
     driver.cancel_op(ud);
-    let _ = UdpRecvFrom::from_user_payload(
+    let _ = <UdpRecvFrom as IntoPlatformOp<IocpOp>>::complete(
         recv_payload
             .take()
             .expect("udp_recv_from payload missing after cancel"),
+        Ok(0),
     );
     let err = wait_completion(
         &mut driver,
