@@ -1,6 +1,5 @@
-use crate::utils::storage::{AtomicStorage, StateInt, StateLock, StateOptionPtr, Storage};
+use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
 use std::alloc::{Layout, alloc, dealloc};
-use std::cell::Cell;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::Ordering;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
@@ -46,16 +45,6 @@ pub(crate) struct GenericDropNode<S: Storage> {
 intrusive_adapter!(pub(crate) DropAdapter<S> = GenericDropNode<S> { link: Link } where S: Storage);
 intrusive_adapter!(pub(crate) ChunkAdapter<S> = GenericChunk<S> { link: Link } where S: Storage);
 
-// TLB 缓存，专门为 AtomicStorage 设计以减少竞争
-#[derive(Clone, Copy)]
-struct TlbCache {
-    arena_ptr: *const (),
-    chunk: NonNull<GenericChunk<AtomicStorage>>,
-}
-
-thread_local! {
-    static ATOMIC_TLB: Cell<Option<TlbCache>> = const { Cell::new(None) };
-}
 
 impl<S: Storage> GenericArena<S> {
     pub fn new() -> Self {
@@ -164,16 +153,6 @@ impl<S: Storage> GenericArena<S> {
             Ordering::Acquire,
         );
 
-        // 如果是 AtomicStorage，尝试从当前线程 TLB 中移除
-        if S::strategy_id() == AtomicStorage::strategy_id() {
-            ATOMIC_TLB.with(|tlb| {
-                if let Some(cache) = tlb.get()
-                    && cache.chunk.as_ptr() == chunk_ptr as *mut _
-                {
-                    tlb.set(None);
-                }
-            });
-        }
 
         let mut chunks = self.chunks.lock();
         unsafe {
@@ -186,31 +165,10 @@ impl<S: Storage> GenericArena<S> {
         }
     }
 
-    #[inline]
     fn try_alloc_fast(&self, layout: Layout) -> Option<(*mut u8, *mut GenericChunk<S>)> {
-        // 针对 AtomicStorage，优先尝试 TLB
-        if S::strategy_id() == AtomicStorage::strategy_id()
-            && let Some(cache) = ATOMIC_TLB.with(|tlb| tlb.get())
-            && cache.arena_ptr == self as *const _ as *const ()
-        {
-            let p = unsafe { cache.chunk.as_ref().try_alloc(layout) };
-            if !p.is_null() {
-                return Some((p, cache.chunk.as_ptr() as *mut _));
-            }
-        }
-
         if let Some(chunk_ptr) = self.active_chunk.load(Ordering::Acquire) {
             let p = unsafe { chunk_ptr.as_ref().try_alloc(layout) };
             if !p.is_null() {
-                // 如果是 AtomicStorage，更新 TLB
-                if S::strategy_id() == AtomicStorage::strategy_id() {
-                    ATOMIC_TLB.with(|tlb| {
-                        tlb.set(Some(TlbCache {
-                            arena_ptr: self as *const _ as *const (),
-                            chunk: unsafe { NonNull::new_unchecked(chunk_ptr.as_ptr() as *mut _) },
-                        }));
-                    });
-                }
                 return Some((p, chunk_ptr.as_ptr()));
             }
         }
