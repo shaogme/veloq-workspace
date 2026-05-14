@@ -1,10 +1,8 @@
 pub mod context;
 
-pub use veloq_runtime::{scope, scope_local};
-
 use std::cell::RefCell;
-use std::future::Future;
 use std::num::NonZeroUsize;
+use std::ops::AsyncFnOnce;
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
@@ -16,6 +14,8 @@ use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
 use crate::config::Config;
 use crate::runtime::context::{DriverCommandDispatcher, init_worker_driver_command_state};
 use crate::runtime::context::{DriverRegistrar, RegistrarMessage};
+
+pub use veloq_runtime::runtime::RuntimeScopeContext;
 
 pub struct RuntimeBuilder<T: PoolTopology> {
     topology: T,
@@ -125,7 +125,10 @@ impl<T: PoolTopology> Runtime<T> {
         self.worker_count
     }
 
-    pub fn block_on<F: Future>(self, future: F) -> F::Output {
+    pub fn block_on<R, F>(self, f: F) -> R
+    where
+        F: AsyncFnOnce(RuntimeScopeContext) -> R,
+    {
         let Runtime {
             worker_count,
             topology,
@@ -213,6 +216,6 @@ impl<T: PoolTopology> Runtime<T> {
             })
             .build();
 
-        runtime.block_on(future)
+        runtime.block_on(f)
     }
 }

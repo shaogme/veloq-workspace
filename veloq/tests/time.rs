@@ -6,7 +6,7 @@ use veloq::time::{
     MissedTickBehavior, interval, sleep, sleep_local, sleep_until, timeout, timeout_at,
 };
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
-use veloq_runtime::{scope, scope_local, select};
+use veloq_runtime::select;
 
 fn build_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
@@ -19,7 +19,7 @@ fn build_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
 fn test_sleep_basic() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let start = Instant::now();
         sleep(Duration::from_millis(100)).await;
         let elapsed = start.elapsed();
@@ -31,8 +31,8 @@ fn test_sleep_basic() {
 fn test_sleep_local_basic() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
-        scope_local!(s, {
+    runtime.block_on(async |ctx| {
+        ctx.scope_local(async |s| {
             let handle = s.spawn_boxed_local(async {
                 let start = Instant::now();
                 sleep_local(Duration::from_millis(100)).await;
@@ -41,7 +41,8 @@ fn test_sleep_local_basic() {
 
             let elapsed = handle.await.expect("local sleep task failed");
             assert!(elapsed >= Duration::from_millis(100));
-        });
+        })
+        .await;
     });
 }
 
@@ -49,7 +50,7 @@ fn test_sleep_local_basic() {
 fn test_sleep_until() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let deadline = Instant::now() + Duration::from_millis(200);
         sleep_until(deadline).await;
         assert!(Instant::now() >= deadline);
@@ -60,7 +61,7 @@ fn test_sleep_until() {
 fn test_sleep_zero_duration() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let start = Instant::now();
         sleep(Duration::ZERO).await;
         let elapsed = start.elapsed();
@@ -72,7 +73,7 @@ fn test_sleep_zero_duration() {
 fn test_sleep_reset() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let mut s = sleep(Duration::from_secs(10));
         let start = Instant::now();
 
@@ -89,7 +90,7 @@ fn test_sleep_reset() {
 fn test_timeout_success() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let result = timeout(Duration::from_secs(1), async { "success" }).await;
         assert_eq!(result.expect("timeout should not elapse"), "success");
     });
@@ -99,7 +100,7 @@ fn test_timeout_success() {
 fn test_timeout_elapsed() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let result = timeout(Duration::from_millis(50), async {
             sleep(Duration::from_secs(1)).await;
             "never"
@@ -114,7 +115,7 @@ fn test_timeout_elapsed() {
 fn test_timeout_at() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let deadline = Instant::now() + Duration::from_millis(50);
         let result = timeout_at(deadline, async {
             sleep(Duration::from_secs(1)).await;
@@ -129,7 +130,7 @@ fn test_timeout_at() {
 fn test_interval_basic_burst() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let start = Instant::now();
         let mut interval = interval(Duration::from_millis(20));
 
@@ -146,7 +147,7 @@ fn test_interval_basic_burst() {
 fn test_interval_missed_burst() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let mut interval = interval(Duration::from_millis(10));
         interval.set_missed_tick_behavior(MissedTickBehavior::Burst);
 
@@ -170,7 +171,7 @@ fn test_interval_missed_burst() {
 fn test_interval_missed_delay() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let mut interval = interval(Duration::from_millis(20));
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -190,7 +191,7 @@ fn test_interval_missed_delay() {
 fn test_interval_missed_skip() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let mut interval = interval(Duration::from_millis(20));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -209,8 +210,8 @@ fn test_interval_missed_skip() {
 fn test_concurrent_sleeps() {
     let runtime = build_runtime(4);
 
-    runtime.block_on(async {
-        scope!(s, {
+    runtime.block_on(async |ctx| {
+        ctx.scope(async |s| {
             let mut handles = Vec::new();
             for i in 0..10 {
                 handles.push(s.spawn_boxed(async move {
@@ -224,7 +225,8 @@ fn test_concurrent_sleeps() {
                 let dur = h.await.expect("sleep task failed");
                 let _ = dur;
             }
-        });
+        })
+        .await;
     });
 }
 
@@ -232,22 +234,24 @@ fn test_concurrent_sleeps() {
 fn test_mixed_local_and_sync_sleeps() {
     let runtime = build_runtime(2);
 
-    runtime.block_on(async {
-        scope!(s, {
+    runtime.block_on(async |ctx| {
+        ctx.scope(async |s| {
             let h_sync = s.spawn_boxed(async {
                 sleep(Duration::from_millis(50)).await;
                 "sync"
             });
             assert_eq!(h_sync.await.expect("sync task failed"), "sync");
-        });
+        })
+        .await;
 
-        scope_local!(s, {
+        ctx.scope_local(async |s| {
             let h_local = s.spawn_boxed_local(async {
                 sleep_local(Duration::from_millis(50)).await;
                 "local"
             });
             assert_eq!(h_local.await.expect("local task failed"), "local");
-        });
+        })
+        .await;
     });
 }
 
@@ -255,7 +259,7 @@ fn test_mixed_local_and_sync_sleeps() {
 fn test_select_timeout() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let res = select! {
             _ = sleep(Duration::from_millis(100)) => "timeout",
             _ = async { 42 } => "value",

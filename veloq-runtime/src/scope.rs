@@ -552,23 +552,3 @@ impl<'scope, M> GenericAsyncScope<'scope, LocalStorage, RcOwnership, M> {
         self.spawn_boxed_local(future)
     }
 }
-
-#[macro_export]
-macro_rules! scope {
-    ($scope_name:ident, $body:block) => {{
-        let $scope_name = $crate::scope::AsyncScope::__private_new();
-        let res = $body;
-        $scope_name.wait_all().await;
-        res
-    }};
-}
-
-#[macro_export]
-macro_rules! scope_local {
-    ($scope_name:ident, $body:block) => {{
-        let $scope_name = $crate::scope::LocalAsyncScope::__private_new();
-        let res = $body;
-        $scope_name.wait_all().await;
-        res
-    }};
-}

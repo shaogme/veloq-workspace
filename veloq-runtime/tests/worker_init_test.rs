@@ -23,7 +23,7 @@ fn worker_init_runs_for_each_worker() {
         })
         .build();
 
-    runtime.block_on(async {});
+    runtime.block_on(async |_ctx| {});
 
     assert_eq!(worker_init_calls.load(Ordering::Acquire), 3);
 }

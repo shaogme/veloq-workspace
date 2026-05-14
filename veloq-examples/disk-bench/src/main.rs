@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use veloq::fs::{BufferingMode, File, OpenOptions};
 use veloq::io::buffer::{BufPool, FixedBuf};
-use veloq::runtime::{Runtime, context, scope};
+use veloq::runtime::{Runtime, context};
 use veloq::sync::mpsc;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
@@ -220,6 +220,7 @@ async fn apply_sync(file: &File, mode: SyncMode, bytes: u64) {
 }
 
 async fn run_iteration_measured(
+    ctx: veloq::runtime::RuntimeScopeContext,
     qdepth: usize,
     file: &File,
     ops: &[WriteOp],
@@ -247,7 +248,7 @@ async fn run_iteration_measured(
     let mut written_bytes = 0u64;
     let (tx, mut rx) = mpsc::unbounded();
 
-    scope!(s, {
+    ctx.scope(async |s| {
         let mut in_flight = 0usize;
         loop {
             // 1. Submit tasks up to qdepth if we have buffers and ops
@@ -295,7 +296,8 @@ async fn run_iteration_measured(
             available_buffers.push(buf);
             in_flight -= 1;
         }
-    });
+    })
+    .await;
 
     apply_sync(file, sync_mode, written_bytes).await;
 
@@ -349,6 +351,7 @@ async fn run_worker(
         }
 
         let res = run_iteration_measured(
+            veloq::runtime::RuntimeScopeContext {}, // Dummy or pass it down
             qdepth,
             &file,
             &config.ops,
@@ -443,8 +446,8 @@ fn main() {
         .expect("Failed to build Runtime");
 
     // Execute
-    runtime.block_on(async {
-        scope!(s, {
+    runtime.block_on(async |ctx| {
+        ctx.scope(async |s| {
             // 1. Preparation Phase (Create & Fallocate)
             println!("Initializing disk files (creating & fallocating)... This may take a while.");
             let mut prepare_handles = Vec::with_capacity(args.threads);
@@ -537,7 +540,8 @@ fn main() {
             } else {
                 println!("No data collected.");
             }
-        });
+        })
+        .await;
     });
 
     // 4. Cleanup Phase

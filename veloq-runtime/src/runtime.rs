@@ -11,8 +11,7 @@ use crate::utils::storage::AtomicStorage;
 use std::cell::RefCell;
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::ops::AsyncFn;
-use std::pin::Pin;
+use std::ops::{AsyncFn, AsyncFnOnce};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
@@ -27,8 +26,9 @@ pub use primitives::{
 pub use context::WorkerTickHook;
 pub(crate) use context::with_current_runtime;
 pub use context::{
-    IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, WorkerInitContext,
-    clear_current_runtime_context, current_worker_id, set_current_runtime_context, wake_worker,
+    IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext,
+    WorkerInitContext, clear_current_runtime_context, current_worker_id,
+    set_current_runtime_context, wake_worker,
 };
 pub use route::{RoutedFuture, execute_on_owner, route_to_worker};
 pub(crate) use shared::RuntimeShared;
@@ -93,7 +93,10 @@ where
         self.worker_count
     }
 
-    pub fn block_on<F: Future>(self, fut: F) -> F::Output {
+    pub fn block_on<T, F>(self, f: F) -> T
+    where
+        F: AsyncFnOnce(RuntimeScopeContext) -> T,
+    {
         let Runtime {
             shared,
             local_receivers,
@@ -212,8 +215,8 @@ where
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());
             let mut cx = Context::from_waker(&waker);
-            let mut fut = fut;
-            let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+            let ctx = RuntimeScopeContext {};
+            let mut fut = std::pin::pin!(f(ctx));
 
             let init_ctx = WorkerInitContext::new(0, worker_count);
             let init_fut = std::pin::pin!(worker_init(init_ctx));

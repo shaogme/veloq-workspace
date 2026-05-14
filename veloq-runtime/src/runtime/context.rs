@@ -1,11 +1,16 @@
-use super::shared::RuntimeShared;
-use crate::task::{LocalTaskRef, SendTaskRef};
-use crate::utils::FastRand;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
+use std::ops::AsyncFnOnce;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
+
+use super::shared::RuntimeShared;
+use crate::scope::{AsyncScope, GenericAsyncScope, LocalAsyncScope};
+use crate::task::{LocalTaskRef, SendTaskRef};
+use crate::utils::FastRand;
+use crate::utils::ownership::{ArcOwnership, RcOwnership};
+use crate::utils::storage::{AtomicStorage, LocalStorage};
 
 /// Worker 空闲时的等待策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +76,38 @@ pub struct RuntimeContext {
     pub(crate) rand: RefCell<FastRand>,
     pub(crate) idle_hook: Option<IdleHook>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
+}
+
+/// A context handle provided to the `block_on` async closure, allowing creation of scopes.
+#[derive(Clone, Copy)]
+pub struct RuntimeScopeContext {}
+
+impl RuntimeScopeContext {
+    /// Creates a new thread-safe (Send) asynchronous scope.
+    pub async fn scope<T, F>(&self, f: F) -> T
+    where
+        F: for<'a, 's, 'm> AsyncFnOnce(
+            &'a GenericAsyncScope<'s, AtomicStorage, ArcOwnership, &'m ()>,
+        ) -> T,
+    {
+        let s = AsyncScope::__private_new();
+        let res = f(&s).await;
+        s.wait_all().await;
+        res
+    }
+
+    /// Creates a new thread-local asynchronous scope.
+    pub async fn scope_local<T, F>(&self, f: F) -> T
+    where
+        F: for<'a, 's, 'm> AsyncFnOnce(
+            &'a GenericAsyncScope<'s, LocalStorage, RcOwnership, *const &'m ()>,
+        ) -> T,
+    {
+        let s = LocalAsyncScope::__private_new();
+        let res = f(&s).await;
+        s.wait_all().await;
+        res
+    }
 }
 
 pub type IdleHook = fn() -> IdleDecision;

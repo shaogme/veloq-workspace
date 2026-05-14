@@ -1,21 +1,21 @@
 use veloq_runtime::runtime::Runtime;
-use veloq_runtime::scope;
 use veloq_runtime::task::yield_now;
 
 #[test]
 fn test_panic_propagation() {
     let rt = Runtime::default();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on(async {
+        rt.block_on(async |ctx| {
             println!("开始测试 Panic 传播...");
-            scope!(s, {
+            ctx.scope(async |s| {
                 s.spawn_boxed(async {
                     yield_now().await;
                     println!("子任务即将 Panic...");
                     panic!("BOOM!");
                 });
                 println!("主任务等待 scope 结束...");
-            });
+            })
+            .await;
             println!("如果不传播，这里会被打印");
         });
     }));

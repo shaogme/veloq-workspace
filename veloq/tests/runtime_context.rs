@@ -9,7 +9,7 @@ fn runtime_binds_buf_pool_to_current_thread() {
         .build()
         .expect("failed to build runtime");
 
-    runtime.block_on(async {
+    runtime.block_on(async |_| {
         let pool = context::current_pool().expect("buffer pool should be bound");
         assert!(pool.alloc(nz!(64)).is_some());
     });

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use veloq::fs::{BufferingMode, File};
-use veloq::runtime::{Runtime, context, scope, scope_local};
+use veloq::runtime::{Runtime, context};
 use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
 use veloq_runtime::runtime::current_worker_id;
 
@@ -140,6 +140,7 @@ fn create_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
 }
 
 async fn run_1gb_iteration(
+    ctx: veloq_runtime::runtime::RuntimeScopeContext,
     phase: BenchPhase,
     buffering_mode: BufferingMode,
     sync_mode: BenchSyncMode,
@@ -161,7 +162,7 @@ async fn run_1gb_iteration(
 
     let concurrency_limit = 32;
 
-    scope_local!(s, {
+    ctx.scope_local(async |s| {
         let mut tasks = VecDeque::new();
         let mut offset: u64 = 0;
 
@@ -199,7 +200,8 @@ async fn run_1gb_iteration(
                 .expect("Write failed");
             let _ = n;
         }
-    });
+    })
+    .await;
 
     let flush_start = matches!(phase, BenchPhase::Flush).then(Instant::now);
     apply_sync(&file, TOTAL_SIZE, sync_mode).await;
@@ -310,8 +312,9 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
                         let runtime = create_runtime(1);
-                        let elapsed = runtime.block_on(async {
-                            run_1gb_iteration(BenchPhase::Total, buffering_mode, sync_mode).await
+                        let elapsed = runtime.block_on(async |ctx| {
+                            run_1gb_iteration(ctx, BenchPhase::Total, buffering_mode, sync_mode)
+                                .await
                         });
                         total_elapsed += elapsed;
                     }
@@ -325,8 +328,9 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
                         let runtime = create_runtime(1);
-                        let elapsed = runtime.block_on(async {
-                            run_1gb_iteration(BenchPhase::Write, buffering_mode, sync_mode).await
+                        let elapsed = runtime.block_on(async |ctx| {
+                            run_1gb_iteration(ctx, BenchPhase::Write, buffering_mode, sync_mode)
+                                .await
                         });
                         total_elapsed += elapsed;
                     }
@@ -340,8 +344,9 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
                         let runtime = create_runtime(1);
-                        let elapsed = runtime.block_on(async {
-                            run_1gb_iteration(BenchPhase::Flush, buffering_mode, sync_mode).await
+                        let elapsed = runtime.block_on(async |ctx| {
+                            run_1gb_iteration(ctx, BenchPhase::Flush, buffering_mode, sync_mode)
+                                .await
                         });
                         total_elapsed += elapsed;
                     }
@@ -382,12 +387,12 @@ fn benchmark_32_files_write(c: &mut Criterion) {
             let mut total_elapsed = Duration::ZERO;
             for _ in 0..iters {
                 let runtime = create_runtime(WORKER_COUNT);
-                let elapsed = runtime.block_on(async {
+                let elapsed = runtime.block_on(async |ctx| {
                     let start = Instant::now();
                     let base_dir = bench_base_dir();
                     let pid = std::process::id();
 
-                    scope!(s, {
+                    ctx.scope(async |s| {
                         let mut prepare_handles = Vec::with_capacity(WORKER_COUNT);
                         for worker_id in 0..WORKER_COUNT {
                             let prepare_path_names: Vec<PathBuf> = (0..FILES_PER_WORKER)
@@ -437,7 +442,8 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                         }
 
                         assert_eq!(total_bytes, TOTAL_SIZE);
-                    });
+                    })
+                    .await;
 
                     start.elapsed()
                 });
