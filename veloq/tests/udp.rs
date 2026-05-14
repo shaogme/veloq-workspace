@@ -88,54 +88,53 @@ fn udp_echo() {
 
         let server_addr = server.local_addr().expect("Failed to get server address");
 
-        ctx.clone()
-            .scope(async |s| {
-                s.spawn_boxed(async move {
-                    let datagram = server
-                        .recv_from(context::alloc(nz!(1024)))
-                        .await
-                        .expect("Server recv_from failed");
-                    let from_addr = datagram.addr;
-                    let bytes = datagram.buf.len();
-                    let mut echo_buf = context::alloc(nz!(1024));
-                    echo_buf.spare_capacity_mut()[..bytes]
-                        .copy_from_slice(&datagram.buf.as_slice()[..bytes]);
-                    echo_buf.set_len(bytes);
-                    server
-                        .send_to(echo_buf, from_addr)
-                        .await
-                        .expect("Server send_to failed");
-                });
+        ctx.scope(async |s| {
+            s.spawn_boxed(async move {
+                let datagram = server
+                    .recv_from(context::alloc(nz!(1024)))
+                    .await
+                    .expect("Server recv_from failed");
+                let from_addr = datagram.addr;
+                let bytes = datagram.buf.len();
+                let mut echo_buf = context::alloc(nz!(1024));
+                echo_buf.spare_capacity_mut()[..bytes]
+                    .copy_from_slice(&datagram.buf.as_slice()[..bytes]);
+                echo_buf.set_len(bytes);
+                server
+                    .send_to(echo_buf, from_addr)
+                    .await
+                    .expect("Server send_to failed");
+            });
 
-                s.spawn_boxed(async move {
-                    let recv_client = client.clone();
-                    ctx.scope(async |client_scope| {
-                        client_scope.spawn_boxed(async move {
-                            let data = b"Echo this message!";
-                            let datagram = recv_client
-                                .recv_from(context::alloc(nz!(1024)))
-                                .await
-                                .expect("Client recv_from failed");
-                            assert_eq!(datagram.addr, server_addr);
-                            assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
-                        });
+            s.spawn_boxed(async move {
+                let recv_client = client.clone();
+                ctx.scope(async |client_scope| {
+                    client_scope.spawn_boxed(async move {
+                        let data = b"Echo this message!";
+                        let datagram = recv_client
+                            .recv_from(context::alloc(nz!(1024)))
+                            .await
+                            .expect("Client recv_from failed");
+                        assert_eq!(datagram.addr, server_addr);
+                        assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
+                    });
 
-                        client_scope.spawn_boxed(async move {
-                            let mut send_buf = context::alloc(nz!(1024));
-                            let data = b"Echo this message!";
-                            send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
-                            send_buf.set_len(data.len());
-                            allow_udp_recv_to_arm().await;
-                            client
-                                .send_to(send_buf, server_addr)
-                                .await
-                                .expect("Client send_to failed");
-                        });
-                    })
-                    .await;
-                });
-            })
-            .await;
+                    client_scope.spawn_boxed(async move {
+                        let mut send_buf = context::alloc(nz!(1024));
+                        let data = b"Echo this message!";
+                        send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
+                        send_buf.set_len(data.len());
+                        allow_udp_recv_to_arm().await;
+                        client
+                            .send_to(send_buf, server_addr)
+                            .await
+                            .expect("Client send_to failed");
+                    });
+                })
+                .await;
+            });
+        })
+        .await;
     });
 }
 
@@ -405,64 +404,63 @@ fn multithread_udp_echo() {
         let (addr_tx, mut addr_rx) = mpsc::unbounded::<std::net::SocketAddr>();
         let (done_tx, mut done_rx) = mpsc::unbounded::<()>();
 
-        ctx.clone()
-            .scope(async |s| {
-                s.spawn_boxed(async move {
-                    let socket = bind_udp_socket("127.0.0.1:0");
-                    let server_addr = socket.local_addr().expect("Failed to get server address");
-                    addr_tx.send(server_addr).unwrap();
-                    let datagram = socket
-                        .recv_from(context::alloc(nz!(1024)))
-                        .await
-                        .expect("Server recv_from failed");
-                    let from_addr = datagram.addr;
-                    let bytes = datagram.buf.len();
-                    let mut echo_buf = context::alloc(nz!(1024));
-                    echo_buf.spare_capacity_mut()[..bytes]
-                        .copy_from_slice(&datagram.buf.as_slice()[..bytes]);
-                    echo_buf.set_len(bytes);
+        ctx.scope(async |s| {
+            s.spawn_boxed(async move {
+                let socket = bind_udp_socket("127.0.0.1:0");
+                let server_addr = socket.local_addr().expect("Failed to get server address");
+                addr_tx.send(server_addr).unwrap();
+                let datagram = socket
+                    .recv_from(context::alloc(nz!(1024)))
+                    .await
+                    .expect("Server recv_from failed");
+                let from_addr = datagram.addr;
+                let bytes = datagram.buf.len();
+                let mut echo_buf = context::alloc(nz!(1024));
+                echo_buf.spare_capacity_mut()[..bytes]
+                    .copy_from_slice(&datagram.buf.as_slice()[..bytes]);
+                echo_buf.set_len(bytes);
 
-                    socket
-                        .send_to(echo_buf, from_addr)
-                        .await
-                        .expect("Server send_to failed");
+                socket
+                    .send_to(echo_buf, from_addr)
+                    .await
+                    .expect("Server send_to failed");
 
-                    done_rx.recv().await.expect("Client done channel closed");
-                });
+                done_rx.recv().await.expect("Client done channel closed");
+            });
 
-                s.spawn_boxed(async move {
-                    let server_addr = addr_rx.recv().await.expect("Channel closed");
-                    let client = bind_udp_socket("127.0.0.1:0");
-                    let recv_client = client.clone();
-                    ctx.scope(async |client_scope| {
-                        client_scope.spawn_boxed(async move {
-                            let data = b"Hello from worker 2!";
-                            let datagram = recv_client
-                                .recv_from(context::alloc(nz!(1024)))
-                                .await
-                                .expect("Client recv_from failed");
-                            assert_eq!(datagram.addr, server_addr);
-                            assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
-                        });
+            s.spawn_boxed(async move {
+                let server_addr = addr_rx.recv().await.expect("Channel closed");
+                let client = bind_udp_socket("127.0.0.1:0");
+                let recv_client = client.clone();
+                ctx.scope(async |client_scope| {
+                    client_scope.spawn_boxed(async move {
+                        let data = b"Hello from worker 2!";
+                        let datagram = recv_client
+                            .recv_from(context::alloc(nz!(1024)))
+                            .await
+                            .expect("Client recv_from failed");
+                        assert_eq!(datagram.addr, server_addr);
+                        assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
+                    });
 
-                        client_scope.spawn_boxed(async move {
-                            let data = b"Hello from worker 2!";
-                            let mut send_buf = context::alloc(nz!(1024));
-                            send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
-                            send_buf.set_len(data.len());
-                            allow_udp_recv_to_arm().await;
-                            client
-                                .send_to(send_buf, server_addr)
-                                .await
-                                .expect("Client send_to failed");
-                        });
-                    })
-                    .await;
+                    client_scope.spawn_boxed(async move {
+                        let data = b"Hello from worker 2!";
+                        let mut send_buf = context::alloc(nz!(1024));
+                        send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
+                        send_buf.set_len(data.len());
+                        allow_udp_recv_to_arm().await;
+                        client
+                            .send_to(send_buf, server_addr)
+                            .await
+                            .expect("Client send_to failed");
+                    });
+                })
+                .await;
 
-                    done_tx.send(()).unwrap();
-                });
-            })
-            .await;
+                done_tx.send(()).unwrap();
+            });
+        })
+        .await;
     });
 }
 
@@ -476,59 +474,57 @@ fn multithread_udp_cross_worker_drop_is_routed() {
         let (ready_tx, mut ready_rx) = mpsc::unbounded::<()>();
         let (done_tx, mut done_rx) = mpsc::unbounded::<()>();
 
-        ctx.clone()
-            .scope(async |s| {
-                s.spawn_boxed(async move {
-                    let socket = bind_udp_socket("127.0.0.1:0");
-                    clone_tx.send(socket.clone()).unwrap();
-                    drop(socket);
-                    ready_tx.send(()).unwrap();
+        ctx.scope(async |s| {
+            s.spawn_boxed(async move {
+                let socket = bind_udp_socket("127.0.0.1:0");
+                clone_tx.send(socket.clone()).unwrap();
+                drop(socket);
+                ready_tx.send(()).unwrap();
 
-                    done_rx.recv().await.expect("cross-worker drop ack missing");
-                    yield_now().await;
-                    yield_now().await;
+                done_rx.recv().await.expect("cross-worker drop ack missing");
+                yield_now().await;
+                yield_now().await;
 
-                    let probe_server = bind_udp_socket("127.0.0.1:0");
-                    let probe_client =
-                        UdpSocket::bind("127.0.0.1:0").expect("probe client dummy bind");
-                    let probe_addr = probe_server
-                        .local_addr()
-                        .expect("Failed to get probe server address");
-                    ctx.scope(async |probe_scope| {
-                        let probe_server_task = probe_server.clone();
-                        probe_scope.spawn_boxed(async move {
-                            let data = b"probe";
-                            let datagram = probe_server_task
-                                .recv_from(context::alloc(nz!(1024)))
-                                .await
-                                .expect("probe recv_from failed");
-                            assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
-                        });
+                let probe_server = bind_udp_socket("127.0.0.1:0");
+                let probe_client = UdpSocket::bind("127.0.0.1:0").expect("probe client dummy bind");
+                let probe_addr = probe_server
+                    .local_addr()
+                    .expect("Failed to get probe server address");
+                ctx.scope(async |probe_scope| {
+                    let probe_server_task = probe_server.clone();
+                    probe_scope.spawn_boxed(async move {
+                        let data = b"probe";
+                        let datagram = probe_server_task
+                            .recv_from(context::alloc(nz!(1024)))
+                            .await
+                            .expect("probe recv_from failed");
+                        assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
+                    });
 
-                        probe_scope.spawn_boxed(async move {
-                            let data = b"probe";
-                            let mut send_buf = context::alloc(nz!(1024));
-                            send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
-                            send_buf.set_len(data.len());
-                            allow_udp_recv_to_arm().await;
+                    probe_scope.spawn_boxed(async move {
+                        let data = b"probe";
+                        let mut send_buf = context::alloc(nz!(1024));
+                        send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
+                        send_buf.set_len(data.len());
+                        allow_udp_recv_to_arm().await;
 
-                            probe_client
-                                .send_to(send_buf, probe_addr)
-                                .await
-                                .expect("probe send_to failed");
-                        });
-                    })
-                    .await;
-                });
+                        probe_client
+                            .send_to(send_buf, probe_addr)
+                            .await
+                            .expect("probe send_to failed");
+                    });
+                })
+                .await;
+            });
 
-                s.spawn_boxed(async move {
-                    let socket = clone_rx.recv().await.expect("clone channel closed");
-                    ready_rx.recv().await.expect("ready channel closed");
-                    drop(socket);
-                    done_tx.send(()).unwrap();
-                });
-            })
-            .await;
+            s.spawn_boxed(async move {
+                let socket = clone_rx.recv().await.expect("clone channel closed");
+                ready_rx.recv().await.expect("ready channel closed");
+                drop(socket);
+                done_tx.send(()).unwrap();
+            });
+        })
+        .await;
     });
 }
 

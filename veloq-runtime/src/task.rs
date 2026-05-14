@@ -62,6 +62,7 @@ impl IntoAnyScope for ScopeCompletionRef<AtomicStorage> {
 
 pub trait RuntimeContextExt {
     fn is_cancelled(&self) -> bool;
+    fn scope_completion(&self) -> Option<AnyScopeCompletionRef>;
 }
 
 impl RuntimeContextExt for Context<'_> {
@@ -76,6 +77,26 @@ impl RuntimeContextExt for Context<'_> {
                 return h.is_cancelled();
             }
             false
+        }
+    }
+
+    fn scope_completion(&self) -> Option<AnyScopeCompletionRef> {
+        unsafe {
+            if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
+                let ptr = h.scope_ptr.load(Ordering::Acquire)?;
+                let vtable_ptr = h.scope_vtable.load(Ordering::Acquire)?;
+                let scope_ref = ScopeCompletionRef::from_parts(ptr, vtable_ptr.as_ref());
+                return Some(scope_ref.into_any());
+            }
+            if let Some(h) =
+                LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
+            {
+                let ptr = h.scope_ptr.load(Ordering::Acquire)?;
+                let vtable_ptr = h.scope_vtable.load(Ordering::Acquire)?;
+                let scope_ref = ScopeCompletionRef::from_parts(ptr, vtable_ptr.as_ref());
+                return Some(scope_ref.into_any());
+            }
+            None
         }
     }
 }

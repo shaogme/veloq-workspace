@@ -95,7 +95,7 @@ where
 
     pub fn block_on<T, F>(self, f: F) -> T
     where
-        F: AsyncFnOnce(RuntimeScopeContext) -> T,
+        F: AsyncFnOnce(&RuntimeScopeContext) -> T,
     {
         let Runtime {
             shared,
@@ -216,7 +216,7 @@ where
             let waker = create_waker(signal.clone());
             let mut cx = Context::from_waker(&waker);
             let ctx = RuntimeScopeContext { parent: None };
-            let mut fut = std::pin::pin!(f(ctx));
+            let mut fut = std::pin::pin!(f(&ctx));
 
             let init_ctx = WorkerInitContext::new(0, worker_count);
             let init_fut = std::pin::pin!(worker_init(init_ctx));

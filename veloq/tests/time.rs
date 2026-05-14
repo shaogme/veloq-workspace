@@ -235,15 +235,14 @@ fn test_mixed_local_and_sync_sleeps() {
     let runtime = build_runtime(2);
 
     runtime.block_on(async |ctx| {
-        ctx.clone()
-            .scope(async |s| {
-                let h_sync = s.spawn_boxed(async {
-                    sleep(Duration::from_millis(50)).await;
-                    "sync"
-                });
-                assert_eq!(h_sync.await.expect("sync task failed"), "sync");
-            })
-            .await;
+        ctx.scope(async |s| {
+            let h_sync = s.spawn_boxed(async {
+                sleep(Duration::from_millis(50)).await;
+                "sync"
+            });
+            assert_eq!(h_sync.await.expect("sync task failed"), "sync");
+        })
+        .await;
 
         ctx.scope_local(async |s| {
             let h_local = s.spawn_boxed_local(async {

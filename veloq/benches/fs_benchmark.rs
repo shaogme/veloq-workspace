@@ -140,7 +140,7 @@ fn create_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
 }
 
 async fn run_1gb_iteration(
-    ctx: veloq_runtime::runtime::RuntimeScopeContext,
+    ctx: &veloq_runtime::runtime::RuntimeScopeContext,
     phase: BenchPhase,
     buffering_mode: BufferingMode,
     sync_mode: BenchSyncMode,

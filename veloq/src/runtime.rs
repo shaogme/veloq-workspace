@@ -127,7 +127,7 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn block_on<R, F>(self, f: F) -> R
     where
-        F: AsyncFnOnce(RuntimeScopeContext) -> R,
+        F: AsyncFnOnce(&RuntimeScopeContext) -> R,
     {
         let Runtime {
             worker_count,

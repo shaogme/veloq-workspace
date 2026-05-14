@@ -49,18 +49,20 @@ pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
     wakers: S::Lock<Vec<Waker>>,
     cancel_token: GenericCancellationToken<S, O>,
     panic_info: S::Lock<Option<Box<dyn Any + Send + 'static>>>,
+    parent: Option<crate::task::AnyScopeCompletionRef>,
 }
 
 pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
 pub type LocalScopeCompletion = GenericScopeCompletion<LocalStorage, RcOwnership>;
 
 impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
-    pub fn new() -> O::Shared<Self> {
+    pub fn new(parent: Option<crate::task::AnyScopeCompletionRef>) -> O::Shared<Self> {
         O::new(Self {
             remaining: S::Usize::new(0),
             wakers: S::Lock::new(Vec::new()),
             cancel_token: GenericCancellationToken::<S, O>::new(),
             panic_info: S::Lock::new(None),
+            parent,
         })
     }
 
@@ -128,6 +130,10 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     pub fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
         self.panic_info.lock().take()
     }
+
+    pub fn parent(&self) -> &Option<crate::task::AnyScopeCompletionRef> {
+        &self.parent
+    }
 }
 
 pub trait ScopeProvider<'scope> {
@@ -187,7 +193,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
     pub fn __private_new(parent: Option<crate::task::AnyScopeCompletionRef>) -> Self {
         let runtime = with_current_runtime(|runtime| runtime.clone())
             .expect("Scope must be created inside Runtime::block_on");
-        let completion = GenericScopeCompletion::<S, O>::new();
+        let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
         if let Some(parent) = parent {
             parent.try_link_child(&crate::task::ErasedCancellationToken::new::<S, O>(

@@ -1,13 +1,15 @@
 use std::cell::RefCell;
+use std::future::poll_fn;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::task::Poll;
 use std::time::Duration;
 
 use super::shared::RuntimeShared;
 use crate::scope::{AsyncScope, GenericAsyncScope, LocalAsyncScope};
-use crate::task::{LocalTaskRef, SendTaskRef};
+use crate::task::{AnyScopeCompletionRef, LocalTaskRef, RuntimeContextExt, SendTaskRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::{ArcOwnership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage};
@@ -81,31 +83,44 @@ pub struct RuntimeContext {
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
 #[derive(Clone)]
 pub struct RuntimeScopeContext {
-    pub(crate) parent: Option<crate::task::AnyScopeCompletionRef>,
+    pub(crate) parent: Option<AnyScopeCompletionRef>,
 }
 
 impl RuntimeScopeContext {
+    /// 尝试从当前异步执行环境中恢复作用域上下文。
+    pub async fn current() -> Self {
+        let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
+        Self { parent }
+    }
     /// Creates a new thread-safe (Send) asynchronous scope.
-    pub async fn scope<T, F>(self, f: F) -> T
+    pub async fn scope<T, F>(&self, f: F) -> T
     where
         F: for<'a, 's, 'm> AsyncFnOnce(
             &'a GenericAsyncScope<'s, AtomicStorage, ArcOwnership, &'m ()>,
         ) -> T,
     {
-        let s = AsyncScope::__private_new(self.parent.clone());
+        let parent = match &self.parent {
+            Some(p) => Some(p.clone()),
+            None => poll_fn(|cx| Poll::Ready(cx.scope_completion())).await,
+        };
+        let s = AsyncScope::__private_new(parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
     }
 
     /// Creates a new thread-local asynchronous scope.
-    pub async fn scope_local<T, F>(self, f: F) -> T
+    pub async fn scope_local<T, F>(&self, f: F) -> T
     where
         F: for<'a, 's, 'm> AsyncFnOnce(
             &'a GenericAsyncScope<'s, LocalStorage, RcOwnership, *const &'m ()>,
         ) -> T,
     {
-        let s = LocalAsyncScope::__private_new(self.parent.clone());
+        let parent = match &self.parent {
+            Some(p) => Some(p.clone()),
+            None => poll_fn(|cx| Poll::Ready(cx.scope_completion())).await,
+        };
+        let s = LocalAsyncScope::__private_new(parent);
         let res = f(&s).await;
         s.wait_all().await;
         res

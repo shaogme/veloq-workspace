@@ -54,6 +54,7 @@ pub struct ScopeVTable<S: Storage> {
     report_panic: unsafe fn(NonNull<OpaqueScope>, Box<dyn Any + Send + 'static>),
     is_cancelled: unsafe fn(NonNull<OpaqueScope>) -> bool,
     try_link_child: unsafe fn(NonNull<OpaqueScope>, &ErasedCancellationToken) -> bool,
+    parent: unsafe fn(NonNull<OpaqueScope>) -> Option<AnyScopeCompletionRef>,
     clone: unsafe fn(NonNull<OpaqueScope>) -> ScopeCompletionRef<S>,
     drop: unsafe fn(NonNull<OpaqueScope>),
     _marker: std::marker::PhantomData<S>,
@@ -119,6 +120,11 @@ impl<S: Storage> ScopeCompletionRef<S> {
     pub fn is_cancelled(&self) -> bool {
         unsafe { (self.vtable.is_cancelled)(self.ptr) }
     }
+
+    #[inline]
+    pub fn parent(&self) -> Option<AnyScopeCompletionRef> {
+        unsafe { (self.vtable.parent)(self.ptr) }
+    }
 }
 
 impl<S: Storage> Clone for ScopeCompletionRef<S> {
@@ -163,6 +169,10 @@ impl<S: Storage, O: Ownership> VTableContainer<S, O> {
                 .try_link_child_raw(child_token.ptr.as_ptr());
             true
         },
+        parent: |ptr| unsafe {
+            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
+            scope.parent().clone()
+        },
         clone: |ptr| unsafe {
             O::increment_strong_count(
                 ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>
@@ -201,6 +211,14 @@ impl AnyScopeCompletionRef {
         match self {
             Self::Local(s) => s.try_link_child(child_token),
             Self::Send(s) => s.try_link_child(child_token),
+        }
+    }
+
+    #[inline]
+    pub fn parent(&self) -> Option<AnyScopeCompletionRef> {
+        match self {
+            Self::Local(s) => s.parent(),
+            Self::Send(s) => s.parent(),
         }
     }
 }
