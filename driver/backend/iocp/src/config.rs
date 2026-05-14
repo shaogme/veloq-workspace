@@ -1,6 +1,4 @@
-use std::cell::Cell;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
 use veloq_buf::nz;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
@@ -78,49 +76,6 @@ unsafe impl Send for IocpHandle {}
 // SAFETY: Windows HANDLEs can be accessed from multiple threads simultaneously.
 unsafe impl Sync for IocpHandle {}
 
-static NEXT_THREAD_TAG: AtomicU32 = AtomicU32::new(1);
-
-thread_local! {
-    #[allow(clippy::missing_const_for_thread_local)]
-    static LOCAL_SOCKET_COUNTER: Cell<u32> = const { Cell::new(1) };
-}
-
-thread_local! {
-    #[allow(clippy::missing_const_for_thread_local)]
-    static LOCAL_THREAD_TAG: Cell<u32> = const { Cell::new(0) };
-}
-
-#[inline]
-fn alloc_thread_tag() -> u32 {
-    let tag = NEXT_THREAD_TAG.fetch_add(1, Ordering::Relaxed);
-    if tag == 0 { 1 } else { tag }
-}
-
-#[inline]
-fn current_thread_tag() -> u32 {
-    LOCAL_THREAD_TAG.with(|tag| {
-        let current = tag.get();
-        if current != 0 {
-            return current;
-        }
-        let allocated = alloc_thread_tag();
-        tag.set(allocated);
-        allocated
-    })
-}
-
-#[inline]
-fn alloc_socket_generation() -> u64 {
-    let thread_tag = current_thread_tag();
-    let local_counter = LOCAL_SOCKET_COUNTER.with(|counter| {
-        let current = counter.get();
-        let next = current.wrapping_add(1);
-        counter.set(if next == 0 { 1 } else { next });
-        current
-    });
-    ((thread_tag as u64) << 32) | local_counter as u64
-}
-
 impl IocpHandle {
     #[inline]
     pub const fn for_file(handle: HANDLE) -> Self {
@@ -128,10 +83,10 @@ impl IocpHandle {
     }
 
     #[inline]
-    pub fn for_socket(handle: HANDLE) -> Self {
+    pub const fn for_socket(handle: HANDLE) -> Self {
         Self::Socket {
             handle,
-            generation: alloc_socket_generation(),
+            generation: 0,
         }
     }
 

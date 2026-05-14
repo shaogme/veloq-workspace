@@ -128,7 +128,7 @@ impl IocpDriver {
                 RegisterFd::Owned(h) => (h.into_raw(), true),
             };
             // Trust enum semantics first; only probe file-tagged handles as fallback.
-            let canonical = match handle.kind() {
+            let mut canonical = match handle.kind() {
                 RawHandleKind::Socket => handle,
                 RawHandleKind::File => {
                     if Self::detect_socket_from_file_handle(handle).map_err(|e| {
@@ -146,6 +146,18 @@ impl IocpDriver {
             };
             let kind = canonical.kind();
             if kind == RawHandleKind::Socket {
+                let mut raw = canonical.raw();
+                if let IocpHandle::Socket { generation: g, .. } = &mut raw
+                    && *g == 0
+                {
+                    *g = self.socket_generation_counter;
+                    self.socket_generation_counter = self.socket_generation_counter.wrapping_add(1);
+                    if self.socket_generation_counter == 0 {
+                        self.socket_generation_counter = 1;
+                    }
+                }
+                canonical = RawHandle::new(raw);
+
                 self.rio_state
                     .mark_socket_registered(canonical.raw().actor_key());
             }

@@ -58,6 +58,7 @@ pub struct IocpDriver {
     pub(crate) shutting_down: bool,
     pub(crate) closed: bool,
     pub(crate) deferred_socket_cleanup: VecDeque<registration::DeferredSocketCleanup>,
+    pub(crate) socket_generation_counter: u64,
 }
 
 /// State associated with an IOCP operation.
@@ -117,6 +118,14 @@ impl IocpDriver {
         port_val: PreInit,
         registration_mode: BufferRegistrationMode,
     ) -> IocpResult<Self> {
+        use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+        // SAFETY: WSAStartup is required for networking on Windows.
+        // It is called here to avoid global static initialization.
+        unsafe {
+            let mut data: WSADATA = std::mem::zeroed();
+            let _ = WSAStartup(0x0202, &mut data);
+        }
+
         let port_handle = port_val.as_raw();
         debug!(port = ?port_handle, "Initializing IocpDriver");
         let extensions = crate::ext::Extensions::new().map_err(|e| {
@@ -158,6 +167,7 @@ impl IocpDriver {
             shutting_down: false,
             closed: false,
             deferred_socket_cleanup: VecDeque::new(),
+            socket_generation_counter: 1,
         })
     }
 
