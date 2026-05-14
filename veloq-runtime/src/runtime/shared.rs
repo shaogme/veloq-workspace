@@ -5,7 +5,7 @@ use crate::scope::GenericScopeCompletion;
 use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::Storage;
-use crate::utils::{AtomicOptionPtr, Deque, Steal};
+use crate::utils::{AtomicOptionPtr, Deque, FastRand, Steal};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -278,6 +278,7 @@ impl TaskScheduler {
         thief_id: usize,
         registry: &WorkerRegistry,
         topo: &TopologyContext,
+        rand: &FastRand,
     ) -> Option<SendTaskRef> {
         let thief_worker = &registry.workers[thief_id];
         let num_workers = registry.workers.len();
@@ -289,12 +290,7 @@ impl TaskScheduler {
         let group = &topo.groups[group_idx];
 
         if group.worker_ids.len() > 1 {
-            let start = CONTEXT.with(|ctx| {
-                ctx.borrow()
-                    .as_ref()
-                    .map(|c| c.rand.borrow_mut().next_u32(group.worker_ids.len() as u32) as usize)
-                    .unwrap_or(0)
-            });
+            let start = rand.next_u32(group.worker_ids.len() as u32) as usize;
 
             for i in 0..group.worker_ids.len() {
                 let victim = group.worker_ids[(start + i) % group.worker_ids.len()];
@@ -306,7 +302,7 @@ impl TaskScheduler {
                     .steal_batch(&thief_worker.deque)
                 {
                     Steal::Success(task) => return Some(task),
-                    Steal::Retry => return self.steal_send(thief_id, registry, topo),
+                    Steal::Retry => return self.steal_send(thief_id, registry, topo, rand),
                     Steal::Empty => continue,
                 }
             }
@@ -316,12 +312,7 @@ impl TaskScheduler {
             return Some(task);
         }
 
-        let start_group = CONTEXT.with(|ctx| {
-            ctx.borrow()
-                .as_ref()
-                .map(|c| c.rand.borrow_mut().next_u32(topo.groups.len() as u32) as usize)
-                .unwrap_or(0)
-        });
+        let start_group = rand.next_u32(topo.groups.len() as u32) as usize;
 
         for i in 0..topo.groups.len() {
             let other_group_idx = (start_group + i) % topo.groups.len();
@@ -335,7 +326,7 @@ impl TaskScheduler {
                     .steal_batch(&thief_worker.deque)
                 {
                     Steal::Success(task) => return Some(task),
-                    Steal::Retry => return self.steal_send(thief_id, registry, topo),
+                    Steal::Retry => return self.steal_send(thief_id, registry, topo, rand),
                     Steal::Empty => continue,
                 }
             }
@@ -581,9 +572,9 @@ impl RuntimeShared {
         self.scheduler.pop_global()
     }
 
-    fn steal_send(&self, thief_id: usize) -> Option<SendTaskRef> {
+    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef> {
         self.scheduler
-            .steal_send(thief_id, &self.registry, &self.topo)
+            .steal_send(thief_id, &self.registry, &self.topo, rand)
     }
 
     fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
@@ -696,7 +687,7 @@ impl RuntimeShared {
                     .searching_workers
                     .fetch_add(1, Ordering::Relaxed);
                 for _ in 0..4 {
-                    if let Some(task) = self.steal_send(worker_id) {
+                    if let Some(task) = self.steal_send(worker_id, &ctx.rand) {
                         self.poll_send_task(worker_id, task);
                         progressed = true;
                         break;

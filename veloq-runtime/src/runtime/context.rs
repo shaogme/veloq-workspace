@@ -75,7 +75,7 @@ pub struct RuntimeContext {
     pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) remote_rx: Receiver<SendTaskRef>,
     pub(crate) pinned_rx: Receiver<SendTaskRef>,
-    pub(crate) rand: RefCell<FastRand>,
+    pub(crate) rand: FastRand,
     pub(crate) idle_hook: Option<IdleHook>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }

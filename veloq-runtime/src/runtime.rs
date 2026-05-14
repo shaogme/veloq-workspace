@@ -8,7 +8,6 @@ use crate::task::{LocalTaskRef, SendTaskRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::ArcOwnership;
 use crate::utils::storage::AtomicStorage;
-use std::cell::RefCell;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::{AsyncFn, AsyncFnOnce};
@@ -155,7 +154,7 @@ where
                         local_rx: lrx,
                         remote_rx: rrx,
                         pinned_rx: prx,
-                        rand: RefCell::new(FastRand::new(worker_id as u64)),
+                        rand: FastRand::new(worker_id as u64),
                         idle_hook,
                         worker_tick_hook,
                     });
@@ -197,7 +196,7 @@ where
                 local_rx: lrx0,
                 remote_rx: rrx0,
                 pinned_rx: prx0,
-                rand: RefCell::new(FastRand::new(0)),
+                rand: FastRand::new(0),
                 idle_hook,
                 worker_tick_hook,
             });
