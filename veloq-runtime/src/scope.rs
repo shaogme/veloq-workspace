@@ -1,7 +1,6 @@
 use crate::runtime::{
     GenericCancellationToken, RuntimeShared, current_worker_id, with_current_runtime,
 };
-use crate::task::IntoAnyScope;
 use crate::task::{
     Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef, SendTask, SendTaskRef, Task,
     TaskError, TaskHandleRef,
@@ -206,16 +205,6 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
             arena: GenericArena::new(),
             completion,
             _marker: std::marker::PhantomData,
-        }
-    }
-
-    pub fn context(&self) -> crate::runtime::RuntimeScopeContext
-    where
-        crate::task::ScopeCompletionRef<S>: crate::task::IntoAnyScope,
-    {
-        let completion_ref = crate::task::ScopeCompletionRef::<S>::new::<O>(&self.completion);
-        crate::runtime::RuntimeScopeContext {
-            parent: Some(completion_ref.into_any()),
         }
     }
 

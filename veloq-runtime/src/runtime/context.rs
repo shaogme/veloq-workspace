@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::shared::RuntimeShared;
 use crate::scope::{AsyncScope, GenericAsyncScope, LocalAsyncScope};
-use crate::task::{AnyScopeCompletionRef, LocalTaskRef, RuntimeContextExt, SendTaskRef};
+use crate::task::{LocalTaskRef, RuntimeContextExt, SendTaskRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::{ArcOwnership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage};
@@ -82,16 +82,9 @@ pub struct RuntimeContext {
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
 #[derive(Clone)]
-pub struct RuntimeScopeContext {
-    pub(crate) parent: Option<AnyScopeCompletionRef>,
-}
+pub struct RuntimeScopeContext {}
 
 impl RuntimeScopeContext {
-    /// 尝试从当前异步执行环境中恢复作用域上下文。
-    pub async fn current() -> Self {
-        let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        Self { parent }
-    }
     /// Creates a new thread-safe (Send) asynchronous scope.
     pub async fn scope<T, F>(&self, f: F) -> T
     where
@@ -99,10 +92,7 @@ impl RuntimeScopeContext {
             &'a GenericAsyncScope<'s, AtomicStorage, ArcOwnership, &'m ()>,
         ) -> T,
     {
-        let parent = match &self.parent {
-            Some(p) => Some(p.clone()),
-            None => poll_fn(|cx| Poll::Ready(cx.scope_completion())).await,
-        };
+        let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = AsyncScope::__private_new(parent);
         let res = f(&s).await;
         s.wait_all().await;
@@ -116,10 +106,7 @@ impl RuntimeScopeContext {
             &'a GenericAsyncScope<'s, LocalStorage, RcOwnership, *const &'m ()>,
         ) -> T,
     {
-        let parent = match &self.parent {
-            Some(p) => Some(p.clone()),
-            None => poll_fn(|cx| Poll::Ready(cx.scope_completion())).await,
-        };
+        let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = LocalAsyncScope::__private_new(parent);
         let res = f(&s).await;
         s.wait_all().await;

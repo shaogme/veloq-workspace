@@ -474,10 +474,9 @@ fn main() {
                 let worker_sync = sync_mode;
                 let t_idx = config.thread_index;
 
-                let worker_ctx = s.context();
                 worker_handles.push(s.spawn_boxed_to(t_idx, async move || {
                     run_worker(
-                        &worker_ctx,
+                        &ctx,
                         qdepth,
                         duration_limit,
                         min_iters,
