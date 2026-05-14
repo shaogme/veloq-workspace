@@ -215,7 +215,7 @@ where
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());
             let mut cx = Context::from_waker(&waker);
-            let ctx = RuntimeScopeContext {};
+            let ctx = RuntimeScopeContext { parent: None };
             let mut fut = std::pin::pin!(f(ctx));
 
             let init_ctx = WorkerInitContext::new(0, worker_count);

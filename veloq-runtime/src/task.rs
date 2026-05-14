@@ -11,8 +11,7 @@ pub use header::{
 };
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
-    AnyScopeCompletionRef, CURRENT_SCOPE, ErasedCancellationToken, OpaqueScope, OpaqueToken,
-    ScopeCompletionRef, ScopeGuard,
+    AnyScopeCompletionRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, ScopeCompletionRef,
 };
 
 use crate::utils::ownership::Ownership;
@@ -75,9 +74,6 @@ impl RuntimeContextExt for Context<'_> {
                 LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
             {
                 return h.is_cancelled();
-            }
-            if let Some(scope) = scope::CURRENT_SCOPE.with(|s| s.borrow().clone()) {
-                return scope.is_cancelled();
             }
             false
         }
@@ -252,20 +248,6 @@ where
         PollStatus::Complete => return true,
     }
 
-    // 设置当前作用域上下文，用于嵌套作用域自动建立父子关系
-    let _scope_guard = match (
-        header.scope_ptr.load(Ordering::Acquire),
-        header.scope_vtable.load(Ordering::Acquire),
-    ) {
-        (Some(ptr), Some(vtable_ptr)) => {
-            let scope_ref =
-                unsafe { ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref()) };
-            let guard = scope::ScopeGuard::enter(scope_ref.clone().into_any());
-            std::mem::forget(scope_ref);
-            Some(guard)
-        }
-        _ => None,
-    };
     loop {
         if header.is_cancelled() {
             finalizer.complete(Err(TaskError::Cancelled), is_local);

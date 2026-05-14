@@ -1,7 +1,6 @@
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicStorage, LocalStorage, Storage, StrategyId};
 use std::any::Any;
-use std::cell::RefCell;
 use std::ptr::NonNull;
 
 /// 不透明的作用域句柄
@@ -203,29 +202,5 @@ impl AnyScopeCompletionRef {
             Self::Local(s) => s.try_link_child(child_token),
             Self::Send(s) => s.try_link_child(child_token),
         }
-    }
-}
-
-std::thread_local! {
-    #[allow(clippy::missing_const_for_thread_local)]
-    pub static CURRENT_SCOPE: RefCell<Option<AnyScopeCompletionRef>> = const { RefCell::new(None) };
-}
-
-pub struct ScopeGuard {
-    prev: Option<AnyScopeCompletionRef>,
-}
-
-impl ScopeGuard {
-    pub fn enter(scope: AnyScopeCompletionRef) -> Self {
-        let prev = CURRENT_SCOPE.with(|s| s.replace(Some(scope)));
-        Self { prev }
-    }
-}
-
-impl Drop for ScopeGuard {
-    fn drop(&mut self) {
-        CURRENT_SCOPE.with(|s| {
-            s.replace(self.prev.take());
-        });
     }
 }

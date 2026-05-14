@@ -79,31 +79,33 @@ pub struct RuntimeContext {
 }
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
-#[derive(Clone, Copy)]
-pub struct RuntimeScopeContext {}
+#[derive(Clone)]
+pub struct RuntimeScopeContext {
+    pub(crate) parent: Option<crate::task::AnyScopeCompletionRef>,
+}
 
 impl RuntimeScopeContext {
     /// Creates a new thread-safe (Send) asynchronous scope.
-    pub async fn scope<T, F>(&self, f: F) -> T
+    pub async fn scope<T, F>(self, f: F) -> T
     where
         F: for<'a, 's, 'm> AsyncFnOnce(
             &'a GenericAsyncScope<'s, AtomicStorage, ArcOwnership, &'m ()>,
         ) -> T,
     {
-        let s = AsyncScope::__private_new();
+        let s = AsyncScope::__private_new(self.parent.clone());
         let res = f(&s).await;
         s.wait_all().await;
         res
     }
 
     /// Creates a new thread-local asynchronous scope.
-    pub async fn scope_local<T, F>(&self, f: F) -> T
+    pub async fn scope_local<T, F>(self, f: F) -> T
     where
         F: for<'a, 's, 'm> AsyncFnOnce(
             &'a GenericAsyncScope<'s, LocalStorage, RcOwnership, *const &'m ()>,
         ) -> T,
     {
-        let s = LocalAsyncScope::__private_new();
+        let s = LocalAsyncScope::__private_new(self.parent.clone());
         let res = f(&s).await;
         s.wait_all().await;
         res

@@ -310,6 +310,7 @@ async fn run_iteration_measured(
 }
 
 async fn run_worker(
+    ctx: veloq::runtime::RuntimeScopeContext,
     qdepth: usize,
     min_duration: Duration,
     min_iters: usize,
@@ -351,7 +352,7 @@ async fn run_worker(
         }
 
         let res = run_iteration_measured(
-            veloq::runtime::RuntimeScopeContext {}, // Dummy or pass it down
+            ctx.clone(), // Pass it down
             qdepth,
             &file,
             &config.ops,
@@ -473,8 +474,10 @@ fn main() {
                 let worker_sync = sync_mode;
                 let t_idx = config.thread_index;
 
+                let worker_ctx = s.context();
                 worker_handles.push(s.spawn_boxed_to(t_idx, async move || {
                     run_worker(
+                        worker_ctx,
                         qdepth,
                         duration_limit,
                         min_iters,

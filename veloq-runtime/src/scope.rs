@@ -1,6 +1,7 @@
 use crate::runtime::{
     GenericCancellationToken, RuntimeShared, current_worker_id, with_current_runtime,
 };
+use crate::task::IntoAnyScope;
 use crate::task::{
     Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef, SendTask, SendTaskRef, Task,
     TaskError, TaskHandleRef,
@@ -183,14 +184,12 @@ impl<'scope, S: Storage, O: Ownership, M> ScopeProvider<'scope>
 }
 
 impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
-    pub fn __private_new() -> Self {
+    pub fn __private_new(parent: Option<crate::task::AnyScopeCompletionRef>) -> Self {
         let runtime = with_current_runtime(|runtime| runtime.clone())
             .expect("Scope must be created inside Runtime::block_on");
         let completion = GenericScopeCompletion::<S, O>::new();
 
-        // 自动发现当前正在运行的任务所属的作用域，建立父子层级关系
-        let current_scope = crate::task::CURRENT_SCOPE.with(|s| s.borrow().clone());
-        if let Some(parent) = current_scope {
+        if let Some(parent) = parent {
             parent.try_link_child(&crate::task::ErasedCancellationToken::new::<S, O>(
                 completion.cancel_token(),
             ));
@@ -201,6 +200,16 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
             arena: GenericArena::new(),
             completion,
             _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn context(&self) -> crate::runtime::RuntimeScopeContext
+    where
+        crate::task::ScopeCompletionRef<S>: crate::task::IntoAnyScope,
+    {
+        let completion_ref = crate::task::ScopeCompletionRef::<S>::new::<O>(&self.completion);
+        crate::runtime::RuntimeScopeContext {
+            parent: Some(completion_ref.into_any()),
         }
     }
 
