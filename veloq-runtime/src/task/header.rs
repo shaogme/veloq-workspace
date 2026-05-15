@@ -231,23 +231,22 @@ impl<S: Storage> GenericTaskHeader<S> {
             node.waker.wake_by_ref();
         }
     }
-    /// Sets the runtime information for the task.
-    ///
-    /// # Safety
-    /// The `runtime_ptr` must be a valid pointer to a `RuntimeSharedBase` object, or null.
-    /// If not null, the caller must ensure that the pointer remains valid until the task is dropped.
-    pub unsafe fn set_runtime_info(
+    pub fn set_runtime_info(
         &self,
-        runtime_ptr: *const crate::runtime::shared::RuntimeSharedBase,
+        runtime: Option<&std::sync::Arc<crate::runtime::shared::RuntimeSharedBase>>,
         worker_id: usize,
     ) {
-        if !runtime_ptr.is_null() {
+        if let Some(runtime) = runtime {
             unsafe {
-                std::sync::Arc::increment_strong_count(runtime_ptr);
+                std::sync::Arc::increment_strong_count(std::sync::Arc::as_ptr(runtime));
             }
+            self.runtime_ptr.store(
+                NonNull::new(std::sync::Arc::as_ptr(runtime) as *mut _),
+                Ordering::Release,
+            );
+        } else {
+            self.runtime_ptr.store(None, Ordering::Release);
         }
-        self.runtime_ptr
-            .store(NonNull::new(runtime_ptr as *mut _), Ordering::Release);
         self.worker_id.store(worker_id, Ordering::Release);
     }
 

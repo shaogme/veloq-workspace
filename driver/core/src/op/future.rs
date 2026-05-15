@@ -333,12 +333,13 @@ where
 
                 let mut fallback_payload = None;
                 if let Err((_, status)) = &result
-                    && *status == SubmitStatus::Void {
-                        if let Some(val) = driver_op_opt.take() {
-                            drop(val);
-                        }
-                        fallback_payload = Some(driver.slot_take_payload(user_data).unwrap());
+                    && *status == SubmitStatus::Void
+                {
+                    if let Some(val) = driver_op_opt.take() {
+                        drop(val);
                     }
+                    fallback_payload = Some(driver.slot_take_payload(user_data).unwrap());
+                }
                 Ok((user_data, token, result, fallback_payload))
             });
 

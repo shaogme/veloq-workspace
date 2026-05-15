@@ -33,7 +33,6 @@ fn tcp_connect_smoke() {
                 assert!(peer.ip().is_ipv4());
             });
 
-            
             s.spawn_boxed(async move {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
@@ -54,7 +53,6 @@ fn tcp_read_exact_write_all() {
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
         ctx.scope(async |s| {
-            
             s.spawn_boxed(async move {
                 let (stream, _) = listener.accept().await.expect("Accept failed");
                 let mut read_buf = ctx.alloc(nz!(DATA.len()));
@@ -72,7 +70,6 @@ fn tcp_read_exact_write_all() {
                     .expect("Server write_all failed");
             });
 
-            
             s.spawn_boxed(async move {
                 let client = TcpStream::connect(ctx, listen_addr)
                     .await
@@ -145,7 +142,6 @@ fn tcp_ipv6() {
                 assert!(peer.is_ipv6());
             });
 
-            
             s.spawn_boxed(async move {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
@@ -170,7 +166,6 @@ fn tcp_recv_zero_bytes() {
                 drop(stream);
             });
 
-            
             s.spawn_boxed(async move {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
@@ -205,7 +200,6 @@ fn tcp_heap_buffer() {
                 assert_eq!(&buf.as_slice()[..n], b"Hello from heap!");
             });
 
-            
             s.spawn_boxed(async move {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
@@ -239,7 +233,6 @@ fn tcp_multiple_connections() {
                 }
             });
 
-            
             s.spawn_boxed(async move {
                 for i in 0..NUM_CONNECTIONS {
                     let stream = TcpStream::connect(ctx, listen_addr)
@@ -265,12 +258,10 @@ fn multithread_tcp_connections() {
             for worker_id in 0..NUM_WORKERS {
                 let counter = connection_count.clone();
                 let (addr_tx, mut addr_rx) = mpsc::unbounded::<SocketAddr>();
-                
-                
 
                 s.spawn_boxed(async move {
-                    let listener = TcpListener::bind(ctx, "127.0.0.1:0")
-                        .expect("Failed to bind listener");
+                    let listener =
+                        TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
                     let listen_addr = listener.local_addr().expect("Failed to get local address");
                     addr_tx.send(listen_addr).unwrap();
 
@@ -303,7 +294,6 @@ fn multithread_tcp_echo() {
         let (done_tx, mut done_rx) = mpsc::unbounded::<()>();
 
         ctx.scope(async |s| {
-            
             s.spawn_boxed(async move {
                 let listener =
                     TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
@@ -339,7 +329,6 @@ fn multithread_tcp_echo() {
                 done_rx.recv().await.expect("Client done channel closed");
             });
 
-            
             s.spawn_boxed(async move {
                 let listen_addr = addr_rx.recv().await.expect("Channel closed");
 
@@ -393,7 +382,6 @@ fn multithread_concurrent_tcp_clients() {
 
             let mut client_handles = Vec::with_capacity(NUM_CLIENTS);
             for client_id in 0..NUM_CLIENTS {
-                
                 client_handles.push(s.spawn_boxed(async move {
                     let stream = TcpStream::connect(ctx, listen_addr)
                         .await
@@ -427,7 +415,6 @@ fn tcp_cancel_recv() {
                 veloq_runtime::task::yield_now().await;
             });
 
-            
             s.spawn_boxed(async move {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await

@@ -436,12 +436,7 @@ pub(crate) fn submit_control_task(
     });
 
     task.header.set_pinned();
-    unsafe {
-        task.header.set_runtime_info(
-            shared.base() as *const veloq_runtime::runtime::shared::RuntimeSharedBase,
-            worker_id,
-        );
-    }
+    task.header.set_runtime_info(Some(&shared.base), worker_id);
 
     let ptr = Box::into_raw(task);
     let task_ref = unsafe { veloq_runtime::task::SendTaskRef::from_concrete(ptr) };

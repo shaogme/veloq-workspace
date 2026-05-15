@@ -350,7 +350,7 @@ pub struct RuntimeSharedBase {
 }
 
 pub struct RuntimeShared<T> {
-    pub(crate) base: Arc<RuntimeSharedBase>,
+    pub base: Arc<RuntimeSharedBase>,
     pub(crate) idle_hook: Option<IdleHook<T>>,
     pub context_tls: veloq_tls::Tls<crate::runtime::context::RuntimeContext<T>>,
 }

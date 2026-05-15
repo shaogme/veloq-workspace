@@ -9,7 +9,7 @@ use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, St
 use std::any::Any;
 use std::ops::AsyncFnOnce;
 use std::ptr::NonNull;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::atomic::Ordering;
 use std::task::Waker;
 
 mod join;
@@ -223,11 +223,9 @@ where
 
         let worker_id = self.context.worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
-        unsafe {
-            task_ref
-                .header()
-                .set_runtime_info(Arc::as_ptr(&self.context.shared.base), worker_id)
-        };
+        task_ref
+            .header()
+            .set_runtime_info(Some(&self.context.shared.base), worker_id);
         self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
@@ -268,11 +266,9 @@ where
 
         let worker_id = self.context.worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
-        unsafe {
-            task_ref
-                .header()
-                .set_runtime_info(Arc::as_ptr(&self.context.shared.base), worker_id)
-        };
+        task_ref
+            .header()
+            .set_runtime_info(Some(&self.context.shared.base), worker_id);
         self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
@@ -338,9 +334,7 @@ where
 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
         let header = task_ref.header();
-        unsafe {
-            header.set_runtime_info(Arc::as_ptr(&self.context.shared.base), worker_id);
-        }
+        header.set_runtime_info(Some(&self.context.shared.base), worker_id);
         self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(
@@ -393,10 +387,8 @@ where
 
                 let task = unsafe { task_ptr.as_ref() };
                 task.header().set_pinned();
-                unsafe {
-                    task.header()
-                        .set_runtime_info(Arc::as_ptr(&runtime.base), worker_id);
-                }
+                task.header()
+                    .set_runtime_info(Some(&runtime.base), worker_id);
                 task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(completion.clone()));
 
                 let task_ref = unsafe { SendTaskRef::from_concrete(task) };
@@ -460,11 +452,9 @@ where
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-        unsafe {
-            task_ref
-                .header()
-                .set_runtime_info(Arc::as_ptr(&self.context.shared.base), worker_id)
-        };
+        task_ref
+            .header()
+            .set_runtime_info(Some(&self.context.shared.base), worker_id);
         self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(

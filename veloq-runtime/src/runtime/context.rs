@@ -189,10 +189,8 @@ impl<T: RuntimeContextExtra> RuntimeScopeContext<T> {
         });
 
         task.header.set_pinned();
-        unsafe {
-            task.header
-                .set_runtime_info(Arc::as_ptr(&self.shared.base), worker_id);
-        }
+        task.header
+            .set_runtime_info(Some(&self.shared.base), worker_id);
 
         let ptr = Box::into_raw(task);
         let task_ref = unsafe { crate::task::SendTaskRef::from_concrete(ptr) };
