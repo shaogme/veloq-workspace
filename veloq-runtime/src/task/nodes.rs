@@ -109,6 +109,7 @@ where
             let node = &*(data.as_ptr() as *const Self);
             node.poll_raw(worker_id)
         },
+        drop: |_| {},
     };
 
     pub fn new(future: F) -> Self {

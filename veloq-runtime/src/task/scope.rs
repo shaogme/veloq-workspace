@@ -4,12 +4,25 @@ use std::any::Any;
 use std::ptr::NonNull;
 
 /// 不透明的作用域句柄
+#[repr(C)]
 pub struct OpaqueScope {
     _private: [u8; 0],
 }
 /// 不透明的取消令牌句柄
+#[repr(C)]
 pub struct OpaqueToken {
     _private: [u8; 0],
+}
+
+impl OpaqueScope {
+    /// # Safety
+    /// The pointer must be a valid pointer to a `GenericScopeCompletion<S, O>`.
+    #[inline]
+    pub unsafe fn as_concrete<'a, S: Storage, O: Ownership>(
+        ptr: NonNull<Self>,
+    ) -> &'a crate::scope::GenericScopeCompletion<S, O> {
+        unsafe { &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>) }
+    }
 }
 
 pub struct ErasedCancellationToken {
@@ -144,33 +157,27 @@ struct VTableContainer<S: Storage, O: Ownership>(std::marker::PhantomData<(S, O)
 impl<S: Storage, O: Ownership> VTableContainer<S, O> {
     const VTABLE: ScopeVTable<S> = ScopeVTable::<S> {
         task_done: |ptr| unsafe {
-            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
-            scope.task_done();
+            OpaqueScope::as_concrete::<S, O>(ptr).task_done();
         },
         cancel: |ptr| unsafe {
-            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
-            scope.cancel();
+            OpaqueScope::as_concrete::<S, O>(ptr).cancel();
         },
         report_panic: |ptr, payload| unsafe {
-            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
-            scope.report_panic(payload);
+            OpaqueScope::as_concrete::<S, O>(ptr).report_panic(payload);
         },
-        is_cancelled: |ptr| unsafe {
-            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
-            scope.is_cancelled()
-        },
+        is_cancelled: |ptr| unsafe { OpaqueScope::as_concrete::<S, O>(ptr).is_cancelled() },
         try_link_child: |ptr, child_token| unsafe {
             if child_token.s_id != S::strategy_id() || child_token.o_id != O::strategy_id() {
                 return false;
             }
-            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
+            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
             scope
                 .cancel_token()
                 .try_link_child_raw(child_token.ptr.as_ptr());
             true
         },
         parent: |ptr| unsafe {
-            let scope = &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>);
+            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
             scope.parent().clone()
         },
         clone: |ptr| unsafe {

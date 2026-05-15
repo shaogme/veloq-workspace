@@ -24,6 +24,7 @@ pub struct TaskVTable<S: Storage> {
     pub wake: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
     pub wake_by_ref: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
     pub poll: unsafe fn(data: NonNull<GenericTaskHeader<S>>, worker_id: usize) -> bool,
+    pub drop: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
 }
 
 pub struct GenericWakerNode<S: Storage> {
@@ -43,7 +44,7 @@ pub struct GenericTaskHeader<S: Storage> {
     pub(crate) runtime_ptr: S::OptionPtr<crate::runtime::shared::RuntimeSharedBase>,
     pub(crate) worker_id: S::Usize,
     pub(crate) injector_next: S::OptionPtr<GenericTaskHeader<S>>,
-    pub(crate) vtable: &'static TaskVTable<S>,
+    pub vtable: &'static TaskVTable<S>,
 }
 
 impl<S: Storage> GenericTaskHeader<S> {

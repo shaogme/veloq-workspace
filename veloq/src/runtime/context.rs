@@ -405,8 +405,8 @@ pub(crate) fn submit_control_task(
             }
             self.header.mark_completed_and_notify();
             unsafe {
-                let ptr = self as *const Self as *mut Self;
-                let _ = Box::from_raw(ptr);
+                let header_ptr = std::ptr::NonNull::from(&self.header);
+                (self.header.vtable.drop)(header_ptr);
             }
             true
         }
@@ -425,6 +425,10 @@ pub(crate) fn submit_control_task(
             poll: |data, worker_id| unsafe {
                 let node = &*(data.as_ptr() as *const Self);
                 veloq_runtime::task::RawTask::poll_raw(node, worker_id)
+            },
+            drop: |data| unsafe {
+                let ptr = data.as_ptr() as *mut Self;
+                let _ = Box::from_raw(ptr);
             },
         };
     }

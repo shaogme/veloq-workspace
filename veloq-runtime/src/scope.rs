@@ -358,7 +358,6 @@ where
 
         let runtime = self.context.shared.clone();
         let completion = self.completion.clone();
-        let task_ptr = SendPtr::new(NonNull::from(task));
         let state_for_job = state.clone();
 
         self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
@@ -373,7 +372,6 @@ where
                     return;
                 }
 
-                let task = unsafe { task_ptr.as_ref() };
                 task.header().set_pinned();
                 task.header()
                     .set_runtime_info(Some(&runtime.base), worker_id);
@@ -388,7 +386,7 @@ where
 
                 state_for_job.set_ready(self::join::RoutedSpawnReady {
                     task: task_ref,
-                    access: self::join::make_spawn_to_access::<T, S_>(task_ptr.0),
+                    access: self::join::make_spawn_to_access::<T, S_>(NonNull::from(task)),
                 });
             },
         );

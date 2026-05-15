@@ -1,6 +1,7 @@
 use std::future::poll_fn;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
+use std::ptr::NonNull;
 use std::sync::{Arc, mpsc::Receiver};
 use std::task::Poll;
 use std::time::Duration;
@@ -155,8 +156,8 @@ impl<T: RuntimeContextExtra> RuntimeScopeContext<T> {
                 // Mark as completed before self-destruct
                 self.header.mark_completed_and_notify();
                 unsafe {
-                    let ptr = self as *const Self as *mut Self;
-                    let _ = Box::from_raw(ptr);
+                    let header_ptr = NonNull::from(&self.header);
+                    (self.header.vtable.drop)(header_ptr);
                 }
                 true
             }
@@ -178,6 +179,10 @@ impl<T: RuntimeContextExtra> RuntimeScopeContext<T> {
                     poll: |data, worker_id| unsafe {
                         let node = &*(data.as_ptr() as *const Self);
                         crate::task::RawTask::poll_raw(node, worker_id)
+                    },
+                    drop: |data| unsafe {
+                        let ptr = data.as_ptr() as *mut Self;
+                        let _ = Box::from_raw(ptr);
                     },
                 };
         }
