@@ -84,7 +84,7 @@ impl<T> Tls<T> {
 
         match self.key.set(new_key) {
             Ok(()) => Ok(new_key),
-            Err(existing_key) => {
+            Err(_) => {
                 // Another thread initialized it first, free the redundant key.
                 #[cfg(windows)]
                 unsafe {
@@ -94,7 +94,7 @@ impl<T> Tls<T> {
                 unsafe {
                     pthread_key_delete(new_key);
                 }
-                Ok(existing_key)
+                Ok(*self.key.get().expect("OnceLock should be initialized"))
             }
         }
     }
@@ -189,21 +189,22 @@ mod tests {
 
     #[test]
     fn test_thread_isolation() {
+        let dangling = std::ptr::dangling_mut::<i32>() as usize;
         TEST_TLS
             .set(Some(NonNull::new(std::ptr::dangling_mut::<i32>()).unwrap()))
             .unwrap();
 
-        thread::spawn(|| {
+        thread::spawn(move || {
             assert!(TEST_TLS.get().is_none());
             TEST_TLS
                 .set(Some(NonNull::new(std::ptr::dangling_mut::<i32>()).unwrap()))
                 .unwrap();
-            assert_eq!(TEST_TLS.get().unwrap().as_ptr() as usize, usize::MAX);
+            assert_eq!(TEST_TLS.get().unwrap().as_ptr() as usize, dangling);
         })
         .join()
         .unwrap();
 
-        assert_eq!(TEST_TLS.get().unwrap().as_ptr() as usize, usize::MAX);
+        assert_eq!(TEST_TLS.get().unwrap().as_ptr() as usize, dangling);
         TEST_TLS.set(None).unwrap();
     }
 
