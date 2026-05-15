@@ -212,6 +212,7 @@ pub(crate) fn dispatch_routed<
     T,
     F,
 >(
+    context: &crate::runtime::RuntimeScopeContext<'scope>,
     completion: &O::Shared<super::GenericScopeCompletion<S, O>>,
     state: Arc<RoutedSpawnState<'scope, T>>,
     worker_id: usize,
@@ -223,7 +224,7 @@ pub(crate) fn dispatch_routed<
     let completion_for_job = completion.clone();
     let state_for_job = state.clone();
 
-    if !crate::runtime::route::dispatch_worker_route_job(worker_id, move || {
+    if context.route_to(worker_id, move || {
         let state_err = state_for_job.clone();
         let completion_err = completion_for_job.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -234,7 +235,8 @@ pub(crate) fn dispatch_routed<
             state_err.fail(TaskError::Panic);
             completion_err.task_done();
         }
-    }) {
+        std::future::ready(())
+    }).is_err() {
         completion.task_done();
         state.fail(TaskError::Panic);
         panic!("failed to dispatch routed pinned task");

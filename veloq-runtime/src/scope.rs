@@ -155,7 +155,7 @@ pub(crate) type CancelTokenSlot<S, O> =
 
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
 pub struct GenericAsyncScope<'scope, S: Storage, O: Ownership, M = &'scope ()> {
-    runtime: &'scope RuntimeShared,
+    context: crate::runtime::RuntimeScopeContext<'scope>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
     _marker: std::marker::PhantomData<(&'scope (), M)>,
@@ -173,7 +173,7 @@ impl<'scope, S: Storage, O: Ownership, M> ScopeProvider<'scope>
     type Arena = GenericArena<S>;
     #[inline]
     fn runtime(&self) -> &RuntimeShared {
-        self.runtime
+        self.context.shared
     }
     #[inline]
     fn arena(&self) -> &Self::Arena {
@@ -187,7 +187,7 @@ impl<'scope, S: Storage, O: Ownership, M> ScopeProvider<'scope>
 
 impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
     pub fn __private_new(
-        runtime: &'scope RuntimeShared,
+        context: crate::runtime::RuntimeScopeContext<'scope>,
         parent: Option<crate::task::AnyScopeCompletionRef>,
     ) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
@@ -199,7 +199,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
         }
 
         Self {
-            runtime,
+            context,
             arena: GenericArena::new(),
             completion,
             _marker: std::marker::PhantomData,
@@ -220,8 +220,8 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
         let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
         task_ref
             .header()
-            .set_runtime_info(self.runtime as *const RuntimeShared, worker_id);
-        self.runtime.enqueue_local(worker_id, task_ref);
+            .set_runtime_info(self.context.shared as *const RuntimeShared, worker_id);
+        self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -262,8 +262,8 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
         task_ref
             .header()
-            .set_runtime_info(self.runtime as *const RuntimeShared, worker_id);
-        self.runtime.enqueue_local(worker_id, task_ref);
+            .set_runtime_info(self.context.shared as *const RuntimeShared, worker_id);
+        self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -281,7 +281,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
     }
 
     pub async fn wait_all(&self) {
-        self.runtime.drive_worker(Some(&self.completion));
+        self.context.shared.drive_worker(Some(&self.completion));
         if let Some(panic_info) = self.completion.take_panic() {
             std::panic::resume_unwind(panic_info);
         }
@@ -307,7 +307,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         S_: SendTask<T> + Sized + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count().get(),
+            worker_id < self.context.shared.worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -316,8 +316,8 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
         let header = task_ref.header();
-        header.set_runtime_info(self.runtime as *const RuntimeShared, worker_id);
-        self.runtime.enqueue_send(worker_id, task_ref);
+        header.set_runtime_info(self.context.shared as *const RuntimeShared, worker_id);
+        self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -342,7 +342,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         S_: SendTask<T> + Sized + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count().get(),
+            worker_id < self.context.shared.worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -350,12 +350,13 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let state = self::join::RoutedSpawnState::new();
         self.completion.add_task();
 
-        let runtime = self.runtime;
+        let runtime = self.context.shared;
         let completion = self.completion.clone();
         let task_ptr = SendPtr::new(NonNull::from(task));
         let state_for_job = state.clone();
 
         self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _>(
+            &self.context,
             &self.completion,
             state.clone(),
             worker_id,
@@ -396,7 +397,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         S_: SendTask<T> + Sized + 'scope,
     {
-        self.spawn_send_impl(self.runtime.choose_worker(), task)
+        self.spawn_send_impl(self.context.shared.choose_worker(), task)
     }
 
     fn spawn_boxed_send_impl<T: Send + 'scope, F>(
@@ -408,7 +409,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         F: Future<Output = T> + Send + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count().get(),
+            worker_id < self.context.shared.worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -434,8 +435,8 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
         task_ref
             .header()
-            .set_runtime_info(self.runtime as *const RuntimeShared, worker_id);
-        self.runtime.enqueue_send(worker_id, task_ref);
+            .set_runtime_info(self.context.shared as *const RuntimeShared, worker_id);
+        self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -458,7 +459,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         F: AsyncFnOnce() -> T + Send + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count().get(),
+            worker_id < self.context.shared.worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -466,7 +467,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let state = self::join::RoutedSpawnState::new();
         self.completion.add_task();
 
-        let runtime = self.runtime;
+        let runtime = self.context.shared;
         let completion = self.completion.clone();
         let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
         let state_for_job = state.clone();
@@ -484,6 +485,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
             SendPtr::new(unsafe { NonNull::new_unchecked(job_ptr) });
 
         self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _>(
+            &self.context,
             &self.completion,
             state.clone(),
             worker_id,
@@ -528,7 +530,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         F: Future<Output = T> + Send + 'scope,
     {
-        self.spawn_boxed_send_impl(self.runtime.choose_worker(), future)
+        self.spawn_boxed_send_impl(self.context.shared.choose_worker(), future)
     }
 }
 

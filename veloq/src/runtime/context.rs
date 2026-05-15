@@ -410,7 +410,8 @@ pub async fn yield_now() {
     veloq_runtime::task::yield_now().await;
 }
 
-pub async fn submit_to<T>(
+pub async fn submit_to<'a, T>(
+    ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>,
     worker_id: usize,
     op: Op<T>,
 ) -> VeloqResult<(
@@ -425,14 +426,14 @@ where
             <PlatformDriver as Driver>::Op,
             DriverCompletion = <PlatformDriver as Driver>::Completion,
             ErasedPayload = <PlatformDriver as Driver>::UP,
-        > + Send,
+        > + Send + 'a,
 {
     if veloq_runtime::runtime::current_worker_id() == worker_id {
         let (res, op_back) = submit(&DetachedSubmitter::new(), op).await.into_inner();
         let op = op_back.expect("Op lost in local submit");
         Ok((res, op))
     } else {
-        let routed = veloq_runtime::runtime::route::route_to_worker(worker_id, move || {
+        let routed = ctx.route_to(worker_id, move || {
             let ctx = current();
             let driver_rc = ctx.driver();
             let mut driver = driver_rc.borrow_mut();

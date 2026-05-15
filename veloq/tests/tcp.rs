@@ -28,7 +28,7 @@ fn tcp_connect_smoke() {
 
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
-                let (_stream, peer) = listener.accept().await.expect("Accept failed");
+                let (_stream, peer) = listener.accept(&ctx).await.expect("Accept failed");
                 assert!(peer.ip().is_ipv4());
             });
 
@@ -45,7 +45,6 @@ fn tcp_connect_smoke() {
 
 #[test]
 fn tcp_read_exact_write_all() {
-    use veloq::io::{AsyncBufRead, AsyncBufWrite};
 
     const DATA: &[u8] = b"TCP Echo World!";
     let runtime = create_runtime();
@@ -55,18 +54,18 @@ fn tcp_read_exact_write_all() {
 
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
-                let (stream, _) = listener.accept().await.expect("Accept failed");
+                let (stream, _) = listener.accept(&ctx).await.expect("Accept failed");
                 let mut read_buf = context::alloc(nz!(DATA.len()));
                 read_buf.set_len(DATA.len());
 
                 let (_, buf) = stream
-                    .read_exact(read_buf)
+                    .read_exact(&ctx, read_buf)
                     .await
                     .expect("Server read_exact failed");
                 assert_eq!(buf.as_slice(), DATA);
 
                 stream
-                    .write_all(buf)
+                    .write_all(&ctx, buf)
                     .await
                     .expect("Server write_all failed");
             });
@@ -80,14 +79,14 @@ fn tcp_read_exact_write_all() {
                 write_buf.set_len(DATA.len());
 
                 client
-                    .write_all(write_buf)
+                    .write_all(&ctx, write_buf)
                     .await
                     .expect("Client write_all failed");
 
                 let mut read_buf = context::alloc(nz!(DATA.len()));
                 read_buf.set_len(DATA.len());
                 let (_, buf) = client
-                    .read_exact(read_buf)
+                    .read_exact(&ctx, read_buf)
                     .await
                     .expect("Client read_exact failed");
                 assert_eq!(buf.as_slice(), DATA);
@@ -139,7 +138,7 @@ fn tcp_ipv6() {
 
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
-                let (_stream, peer) = listener.accept().await.expect("Accept failed");
+                let (_stream, peer) = listener.accept(&ctx).await.expect("Accept failed");
                 assert!(peer.is_ipv6());
             });
 
@@ -163,7 +162,7 @@ fn tcp_recv_zero_bytes() {
 
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
-                let (stream, _) = listener.accept().await.expect("Accept failed");
+                let (stream, _) = listener.accept(&ctx).await.expect("Accept failed");
                 drop(stream);
             });
 
@@ -172,7 +171,7 @@ fn tcp_recv_zero_bytes() {
                     .await
                     .expect("Failed to connect");
                 let buf = context::alloc(nz!(1024));
-                let result = stream.recv(buf).await;
+                let result = stream.recv(&ctx, buf).await;
                 match result {
                     Ok((bytes, _buf)) => {
                         assert_eq!(bytes, 0, "Should receive 0 bytes on closed connection");
@@ -194,10 +193,10 @@ fn tcp_heap_buffer() {
 
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
-                let (stream, _) = listener.accept().await.expect("Accept failed");
+                let (stream, _) = listener.accept(&ctx).await.expect("Accept failed");
                 let buf =
                     veloq_buf::FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
-                let (n, buf) = stream.recv(buf).await.expect("Server recv failed");
+                let (n, buf) = stream.recv(&ctx, buf).await.expect("Server recv failed");
                 assert_eq!(&buf.as_slice()[..n], b"Hello from heap!");
             });
 
@@ -211,7 +210,7 @@ fn tcp_heap_buffer() {
                 buf.as_slice_mut()[..data.len()].copy_from_slice(data);
                 buf.set_len(data.len());
 
-                stream.send(buf).await.expect("Client send failed");
+                stream.send(&ctx, buf).await.expect("Client send failed");
             });
         })
         .await;
@@ -229,7 +228,7 @@ fn tcp_multiple_connections() {
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 for i in 0..NUM_CONNECTIONS {
-                    let (_stream, peer) = listener.accept().await.expect("Accept failed");
+                    let (_stream, peer) = listener.accept(&ctx).await.expect("Accept failed");
                     println!("Accepted connection {} from {}", i, peer);
                 }
             });
@@ -266,7 +265,7 @@ fn multithread_tcp_connections() {
                     let listen_addr = listener.local_addr().expect("Failed to get local address");
                     addr_tx.send(listen_addr).unwrap();
 
-                    let (_stream, peer) = listener.accept().await.expect("Accept failed");
+                    let (_stream, peer) = listener.accept(&ctx).await.expect("Accept failed");
                     println!("Worker {} accepted from {}", worker_id, peer);
                     counter.fetch_add(1, Ordering::SeqCst);
                 });
@@ -300,12 +299,12 @@ fn multithread_tcp_echo() {
                 let listen_addr = listener.local_addr().expect("Failed to get local address");
                 addr_tx.send(listen_addr).unwrap();
 
-                let (stream, _) = listener.accept().await.expect("Accept failed");
+                let (stream, _) = listener.accept(&ctx).await.expect("Accept failed");
                 let expect = b"Hello from worker 1!";
                 let mut recv_buf = context::alloc(nz!(1024));
                 let mut received = Vec::with_capacity(expect.len());
                 while received.len() < expect.len() {
-                    let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
+                    let (n, buf) = stream.recv(&ctx, recv_buf).await.expect("Recv failed");
                     recv_buf = buf;
                     assert!(n > 0, "Peer closed before sending full request");
                     let remain = expect.len() - received.len();
@@ -321,7 +320,7 @@ fn multithread_tcp_echo() {
                     echo_buf.spare_capacity_mut()[..chunk].copy_from_slice(&remain[..chunk]);
                     echo_buf.set_len(chunk);
 
-                    let (n, _) = stream.send(echo_buf).await.expect("Send failed");
+                    let (n, _) = stream.send(&ctx, echo_buf).await.expect("Send failed");
                     assert!(n > 0, "Send returned 0 before echo completed");
                     sent += n;
                 }
@@ -340,13 +339,13 @@ fn multithread_tcp_echo() {
                 send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
                 send_buf.set_len(data.len());
 
-                let (sent, _) = stream.send(send_buf).await.expect("Send failed");
+                let (sent, _) = stream.send(&ctx, send_buf).await.expect("Send failed");
                 assert_eq!(sent, data.len());
 
                 let mut recv_buf = context::alloc(nz!(1024));
                 let mut echoed = Vec::with_capacity(data.len());
                 while echoed.len() < data.len() {
-                    let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
+                    let (n, buf) = stream.recv(&ctx, recv_buf).await.expect("Recv failed");
                     recv_buf = buf;
                     assert!(n > 0, "Peer closed before echo completed");
                     let remain = data.len() - echoed.len();
@@ -374,7 +373,7 @@ fn multithread_concurrent_tcp_clients() {
             let connection_count = connection_count.clone();
             let server_h = s.spawn_boxed(async move {
                 for i in 0..NUM_CLIENTS {
-                    let (_stream, peer) = listener.accept().await.expect("Accept failed");
+                    let (_stream, peer) = listener.accept(&ctx).await.expect("Accept failed");
                     println!("Server accepted connection {} from {}", i, peer);
                     connection_count.fetch_add(1, Ordering::SeqCst);
                 }
@@ -411,7 +410,7 @@ fn tcp_cancel_recv() {
 
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
-                let (_stream, _) = listener.accept().await.expect("Accept failed");
+                let (_stream, _) = listener.accept(&ctx).await.expect("Accept failed");
                 veloq_runtime::task::yield_now().await;
             });
 
@@ -421,7 +420,7 @@ fn tcp_cancel_recv() {
                     .expect("Failed to connect");
                 let buf = context::alloc(nz!(1024));
                 veloq_runtime::select! {
-                    _ = stream.recv(buf) => {
+                    _ = stream.recv(&ctx, buf) => {
                         panic!("Recv should have been cancelled, but it completed (unexpectedly)");
                     },
                     _ = veloq_runtime::task::yield_now() => {

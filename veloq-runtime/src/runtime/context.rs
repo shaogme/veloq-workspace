@@ -103,6 +103,95 @@ impl<'a> RuntimeScopeContext<'a> {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    pub fn route_to<F, Fut>(&self, worker_id: usize, job: F) -> std::io::Result<crate::runtime::route::RoutedFuture<'a, Fut>>
+    where
+        F: FnOnce() -> Fut + Send + 'a,
+        Fut: std::future::Future + Send + 'a,
+    {
+        let slot = crate::runtime::route::RouteCell::new();
+        let slot_for_job = slot.clone();
+
+        struct RouteJobTask<F, Fut> {
+            header: crate::task::TaskHeader,
+            job: core::cell::UnsafeCell<Option<F>>,
+            slot: std::sync::Arc<crate::runtime::route::RouteCell<Fut>>,
+        }
+
+        impl<F, Fut> crate::task::RawTask for RouteJobTask<F, Fut>
+        where
+            F: FnOnce() -> Fut + Send,
+            Fut: std::future::Future + Send,
+        {
+            type Storage = crate::utils::storage::AtomicStorage;
+
+            fn poll_raw(&self, _worker_id: usize) -> bool {
+                let job = unsafe { &mut *self.job.get() }.take().expect("job already taken");
+                let fut = job();
+                self.slot.set(fut);
+                // Mark as completed before self-destruct
+                self.header.mark_completed_and_notify();
+                unsafe {
+                    let ptr = self as *const Self as *mut Self;
+                    let _ = Box::from_raw(ptr);
+                }
+                true
+            }
+
+            fn header(&self) -> &crate::task::GenericTaskHeader<Self::Storage> {
+                &self.header
+            }
+        }
+
+        impl<F, Fut> RouteJobTask<F, Fut>
+        where
+            F: FnOnce() -> Fut + Send,
+            Fut: std::future::Future + Send,
+        {
+            const VTABLE: &'static crate::task::TaskVTable<crate::utils::storage::AtomicStorage> = &crate::task::TaskVTable {
+                wake: |_| {},
+                wake_by_ref: |_| {},
+                poll: |data, worker_id| unsafe {
+                    let node = &*(data.as_ptr() as *const Self);
+                    crate::task::RawTask::poll_raw(node, worker_id)
+                },
+            };
+        }
+
+        let task = Box::new(RouteJobTask {
+            header: crate::task::TaskHeader::new(RouteJobTask::<F, Fut>::VTABLE),
+            job: core::cell::UnsafeCell::new(Some(job)),
+            slot: slot_for_job,
+        });
+
+        task.header.set_pinned();
+        task.header.set_runtime_info(self.shared as *const RuntimeShared, worker_id);
+
+        let ptr = Box::into_raw(task);
+        let task_ref = unsafe { crate::task::SendTaskRef::from_concrete(ptr) };
+
+        if !self.shared.enqueue_pinned(worker_id, task_ref) {
+            unsafe { let _ = Box::from_raw(ptr); }
+            return Err(std::io::Error::other("failed to dispatch job to worker"));
+        }
+
+        Ok(crate::runtime::route::RoutedFuture::new(slot))
+    }
+
+    pub async fn execute_on_owner<F, Fut, R>(
+        &self,
+        task: &impl crate::task::TaskHandleRef,
+        f: F,
+    ) -> std::io::Result<R>
+    where
+        F: FnOnce() -> Fut + Send + 'a,
+        Fut: std::future::Future<Output = R> + Send + 'a,
+        R: Send + 'a,
+    {
+        use std::sync::atomic::Ordering;
+        let worker_id = crate::utils::storage::StateInt::load(&task.header().worker_id, Ordering::Acquire);
+        Ok(self.route_to(worker_id, f)?.await)
+    }
+
     /// Creates a new thread-safe (Send) asynchronous scope.
     pub async fn scope<T, F>(&self, f: F) -> T
     where
@@ -111,7 +200,7 @@ impl<'a> RuntimeScopeContext<'a> {
         ) -> T,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = AsyncScope::__private_new(self.shared, parent);
+        let s = AsyncScope::__private_new(RuntimeScopeContext { shared: self.shared }, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
@@ -125,7 +214,7 @@ impl<'a> RuntimeScopeContext<'a> {
         ) -> T,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = LocalAsyncScope::__private_new(self.shared, parent);
+        let s = LocalAsyncScope::__private_new(RuntimeScopeContext { shared: self.shared }, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res

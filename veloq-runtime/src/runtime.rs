@@ -2,13 +2,12 @@ use std::num::NonZeroUsize;
 use std::ops::{AsyncFn, AsyncFnOnce};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::task::{Context, Poll};
 use std::thread;
 
 use crate::utils::FastRand;
 use crate::utils::ownership::ArcOwnership;
-use crate::utils::storage::{AtomicStorage, StaticTransfer};
+use crate::utils::storage::AtomicStorage;
 
 pub mod context;
 pub mod coordinator;
@@ -81,18 +80,7 @@ where
 
         let shared = RuntimeShared::new(components);
 
-        let mut route_senders = Vec::with_capacity(worker_count.get());
-        let mut route_receivers = Vec::with_capacity(worker_count.get());
-        for _ in 0..worker_count.get() {
-            let (tx, rx) = mpsc::channel();
-            route_senders.push(tx);
-            route_receivers.push(rx);
-        }
-        let route_receivers = Arc::new(StaticTransfer::new(route_receivers));
-        let route_dispatcher = route::WorkerRouteDispatcher::new(
-            route_senders,
-            RuntimeScopeContext { shared: &shared },
-        );
+
 
         thread::scope(|scope| {
             struct ShutdownGuard<'a>(&'a RuntimeShared);
@@ -107,9 +95,7 @@ where
                 let lrx = local_receivers.pop().expect("local receivers exhausted");
                 let rrx = remote_receivers.pop().expect("remote receivers exhausted");
                 let prx = pinned_receivers.pop().expect("pinned receivers exhausted");
-                let route_rx = route_receivers.take(worker_id);
                 let shared_ref = &shared;
-                let route_dispatcher = route_dispatcher.clone();
                 let worker_init_ref = &worker_init;
 
                 scope.spawn(move || {
@@ -124,17 +110,7 @@ where
                     };
                     let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
                         .expect("failed to set runtime context");
-                    let route_state =
-                        route::WorkerRouteState::new(route_rx, route_dispatcher.clone());
-                    route::init_worker_route_state(&route_state);
 
-                    struct ClearRouteState;
-                    impl Drop for ClearRouteState {
-                        fn drop(&mut self) {
-                            route::clear_worker_route_state();
-                        }
-                    }
-                    let _clear_route_state = ClearRouteState;
 
                     let init_ctx = WorkerInitContext::new(shared_ref, worker_id, worker_count);
                     let init_fut = std::pin::pin!(worker_init_ref(init_ctx));
@@ -154,7 +130,7 @@ where
             let prx0 = pinned_receivers
                 .pop()
                 .expect("main worker pinned receiver exhausted");
-            let route_rx0 = route_receivers.take(0);
+
 
             let mut context = RuntimeContext {
                 worker_id: 0,
@@ -167,16 +143,7 @@ where
             };
             let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
                 .expect("failed to set runtime context");
-            let route_state = route::WorkerRouteState::new(route_rx0, route_dispatcher.clone());
-            route::init_worker_route_state(&route_state);
 
-            struct ClearRouteState;
-            impl Drop for ClearRouteState {
-                fn drop(&mut self) {
-                    route::clear_worker_route_state();
-                }
-            }
-            let _clear_route_state = ClearRouteState;
 
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());
@@ -189,7 +156,7 @@ where
 
             let mut fut = std::pin::pin!(f(&runtime_ctx));
             loop {
-                route::drain_pending_worker_route_jobs();
+
                 match fut.as_mut().poll(&mut cx) {
                     Poll::Ready(res) => {
                         break res;

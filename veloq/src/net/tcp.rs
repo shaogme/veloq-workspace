@@ -185,7 +185,7 @@ impl TcpListener {
         })
     }
 
-    pub async fn accept(&self) -> VeloqResult<(TcpStream, SocketAddr)> {
+    pub async fn accept<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>) -> VeloqResult<(TcpStream, SocketAddr)> {
         let owner = self.inner.owner_worker_id();
         let op = Accept {
             fd: self.inner.fd(),
@@ -194,7 +194,7 @@ impl TcpListener {
             remote_addr: None,
         };
 
-        let (res, op) = submit_to(owner, Op::new(op)).await?;
+        let (res, op) = submit_to(ctx, owner, Op::new(op)).await?;
         let accepted = res.map_err(from_driver_report)?;
         let addr = op.remote_addr.ok_or_else(|| {
             from_io_error(io::Error::new(
@@ -244,28 +244,29 @@ impl LocalTcpStream {
 }
 
 impl TcpStream {
-    pub async fn connect(addr: SocketAddr) -> VeloqResult<Self> {
+    pub async fn connect<'a>(addr: SocketAddr) -> VeloqResult<Self> {
         let inner = new_stream_inner(&addr)?;
         Self::connect_from_inner_direct(inner, DetachedSubmitter::new(), addr).await
     }
 
-    pub(crate) async fn connect_from_inner(
+    pub(crate) async fn connect_from_inner<'a>(
         inner: InnerSocket<Arc<SocketToken>>,
         addr: SocketAddr,
     ) -> VeloqResult<Self> {
         Self::connect_from_inner_direct(inner, DetachedSubmitter::new(), addr).await
     }
 
-    pub async fn recv(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
-        self.recv_subset(buf, 0).await
+    pub async fn recv<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
+        self.recv_subset(ctx, buf, 0).await
     }
 
-    pub async fn send(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
-        self.send_subset(buf, 0).await
+    pub async fn send<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
+        self.send_subset(ctx, buf, 0).await
     }
 
-    pub async fn recv_subset(
+    pub async fn recv_subset<'a>(
         &self,
+        ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>,
         buf: FixedBuf,
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
@@ -275,12 +276,13 @@ impl TcpStream {
             buf,
             buf_offset,
         };
-        let (res, op) = submit_to(owner, Op::new(op)).await?;
+        let (res, op) = submit_to(ctx, owner, Op::new(op)).await?;
         Ok((res.map_err(from_driver_report)?, op.buf))
     }
 
-    pub async fn send_subset(
+    pub async fn send_subset<'a>(
         &self,
+        ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>,
         buf: FixedBuf,
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
@@ -290,7 +292,7 @@ impl TcpStream {
             buf,
             buf_offset,
         };
-        let (res, op) = submit_to(owner, Op::new(op)).await?;
+        let (res, op) = submit_to(ctx, owner, Op::new(op)).await?;
         Ok((res.map_err(from_driver_report)?, op.buf))
     }
 }
@@ -318,16 +320,12 @@ impl crate::io::AsyncBufRead for LocalTcpStream {
     }
 }
 
-impl crate::io::AsyncBufRead for TcpStream {
-    async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
-        self.recv(buf).await.map_err(to_io_error)
-    }
-
-    async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+impl TcpStream {
+    pub async fn read_exact<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.recv_subset(buf, total).await.map_err(to_io_error)?;
+            let (n, b) = self.recv_subset(ctx, buf, total).await.map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -372,16 +370,12 @@ impl crate::io::AsyncBufWrite for LocalTcpStream {
     }
 }
 
-impl crate::io::AsyncBufWrite for TcpStream {
-    async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
-        self.send(buf).await.map_err(to_io_error)
-    }
-
-    async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+impl TcpStream {
+    pub async fn write_all<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.send_subset(buf, total).await.map_err(to_io_error)?;
+            let (n, b) = self.send_subset(ctx, buf, total).await.map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -392,13 +386,5 @@ impl crate::io::AsyncBufWrite for TcpStream {
             total += n;
         }
         Ok((total, buf))
-    }
-
-    async fn flush(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> io::Result<()> {
-        Ok(())
     }
 }
