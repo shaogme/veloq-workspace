@@ -473,11 +473,11 @@ where
         header: &crate::task::GenericTaskHeader<St>,
         cx: &mut Context<'_>,
     ) {
-        if let Some(node_ptr) = waker_node {
+        if let Some(mut node_ptr) = *waker_node {
             let node = unsafe { node_ptr.as_mut() };
             if !node.waker.will_wake(cx.waker()) {
                 node.waker = cx.waker().clone();
-                unsafe { header.register_completion(node_ptr.as_ptr()) };
+                unsafe { header.register_completion(node_ptr) };
             }
         } else {
             let node_ptr = unsafe {
@@ -486,9 +486,10 @@ where
                     Some(|ptr| std::ptr::drop_in_place(ptr as *mut GenericWakerNode<St>)),
                 ) as *mut GenericWakerNode<St>
             };
+            let node_ptr = NonNull::new(node_ptr).expect("arena allocation failed");
             unsafe {
                 std::ptr::write(
-                    node_ptr,
+                    node_ptr.as_ptr(),
                     GenericWakerNode {
                         waker: cx.waker().clone(),
                         link: Link::new(),
@@ -496,7 +497,7 @@ where
                     },
                 );
             }
-            *waker_node = NonNull::new(node_ptr);
+            *waker_node = Some(node_ptr);
             unsafe { header.register_completion(node_ptr) };
         }
     }

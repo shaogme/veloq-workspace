@@ -231,13 +231,7 @@ where
         JoinHandle::new_direct(
             self,
             task_ref,
-            unsafe {
-                NonNull::new_unchecked(
-                    task as &dyn crate::task::TaskJoinGate<T>
-                        as *const dyn crate::task::TaskJoinGate<T>
-                        as *mut dyn crate::task::TaskJoinGate<T>,
-                )
-            },
+            NonNull::from(task as &dyn crate::task::TaskJoinGate<T>),
             None,
         )
     }
@@ -340,13 +334,7 @@ where
         JoinHandle::new_direct(
             self,
             task_ref,
-            unsafe {
-                NonNull::new_unchecked(
-                    task as &dyn crate::task::TaskJoinGate<T>
-                        as *const dyn crate::task::TaskJoinGate<T>
-                        as *mut dyn crate::task::TaskJoinGate<T>,
-                )
-            },
+            NonNull::from(task as &dyn crate::task::TaskJoinGate<T>),
             None,
         )
     }
@@ -357,7 +345,7 @@ where
         task: &'scope S_,
     ) -> JoinHandle<'scope, '_, T, SendTaskRef, Self, TExtra>
     where
-        S_: SendTask<T> + Sized + 'scope,
+        S_: SendTask<T> + Sized + Sync + 'scope,
     {
         debug_assert!(
             worker_id < self.context.shared.worker_count().get(),
@@ -489,7 +477,6 @@ where
 
         let runtime = self.context.shared.clone();
         let completion = self.completion.clone();
-        let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
         let state_for_job = state.clone();
         let job_layout = std::alloc::Layout::new::<self::join::RoutedJobCell<'scope, F>>();
         let job_ptr = unsafe {
@@ -504,6 +491,7 @@ where
         let mut job_ptr: SendPtr<self::join::RoutedJobCell<'scope, F>> =
             SendPtr::new(unsafe { NonNull::new_unchecked(job_ptr) });
 
+        let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
         self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
             &self.context,
             &self.completion,

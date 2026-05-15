@@ -199,21 +199,23 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     /// # Safety
     /// The `node` pointer must be a valid pointer to a `GenericWakerNode`.
-    pub unsafe fn register_completion(&self, node: *mut GenericWakerNode<S>) {
+    pub unsafe fn register_completion(&self, node: NonNull<GenericWakerNode<S>>) {
         if self.is_completed() {
-            unsafe { (&*node).waker.wake_by_ref() };
+            unsafe { node.as_ref().waker.wake_by_ref() };
             return;
         }
 
         let mut wakers = self.wakers.lock();
         if self.is_completed() {
             drop(wakers);
-            unsafe { (&*node).waker.wake_by_ref() };
+            unsafe { node.as_ref().waker.wake_by_ref() };
             return;
         }
 
         unsafe {
-            wakers.push_back(std::pin::Pin::new_unchecked(&mut *node));
+            wakers.push_back(std::pin::Pin::new_unchecked(
+                node.as_ptr().as_mut().unwrap(),
+            ));
         }
     }
 

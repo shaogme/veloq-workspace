@@ -298,7 +298,7 @@ where
 macro_rules! define_task_infrastructure {
     ($ref_name:ident, $storage:ty) => {
         pub struct $ref_name {
-            header: *const GenericTaskHeader<$storage>,
+            header: NonNull<GenericTaskHeader<$storage>>,
         }
 
         impl Copy for $ref_name {}
@@ -317,26 +317,26 @@ macro_rules! define_task_infrastructure {
                 U: RawTask<Storage = $storage>,
             {
                 Self {
-                    header: unsafe { (&*ptr).header() as *const GenericTaskHeader<$storage> },
+                    header: unsafe { NonNull::from((&*ptr).header()) },
                 }
             }
 
             /// # Safety
             /// The `header` pointer must be a valid pointer to a `GenericTaskHeader`.
             pub unsafe fn from_header(header: *const GenericTaskHeader<$storage>) -> Self {
-                Self { header }
+                Self {
+                    header: unsafe { NonNull::new_unchecked(header as *mut _) },
+                }
             }
 
             pub fn into_local(self) -> LocalTaskRef {
-                unsafe { LocalTaskRef::from_header(self.header as *const _) }
+                unsafe { LocalTaskRef::from_header(self.header.as_ptr() as *const _) }
             }
 
             #[inline]
             pub fn poll_task(&self, worker_id: usize) -> bool {
-                let header = unsafe { &*self.header };
-                unsafe {
-                    (header.vtable.poll)(NonNull::new_unchecked(self.header as *mut _), worker_id)
-                }
+                let header = unsafe { self.header.as_ref() };
+                unsafe { (header.vtable.poll)(self.header, worker_id) }
             }
         }
 
@@ -344,11 +344,13 @@ macro_rules! define_task_infrastructure {
             type Storage = $storage;
             #[inline]
             fn header(&self) -> &GenericTaskHeader<$storage> {
-                unsafe { &*self.header }
+                unsafe { self.header.as_ref() }
             }
             #[inline]
             unsafe fn from_header(header: *const GenericTaskHeader<$storage>) -> Self {
-                Self { header }
+                Self {
+                    header: unsafe { NonNull::new_unchecked(header as *mut _) },
+                }
             }
         }
     };

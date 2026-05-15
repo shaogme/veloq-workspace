@@ -191,10 +191,9 @@ where
             let scope_ref = crate::task::ScopeCompletionRef::new::<O>(&scope);
             let (ptr, vtable) = scope_ref.into_parts();
             self.header.scope_ptr.store(Some(ptr), Ordering::Release);
-            self.header.scope_vtable.store(
-                Some(NonNull::new(vtable as *const _ as *mut _).unwrap()),
-                Ordering::Release,
-            );
+            self.header
+                .scope_vtable
+                .store(Some(NonNull::from(vtable).cast()), Ordering::Release);
         } else {
             self.header.scope_ptr.store(None, Ordering::Release);
             self.header.scope_vtable.store(None, Ordering::Release);
