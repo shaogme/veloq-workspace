@@ -1,4 +1,4 @@
-use crate::runtime::context;
+use crate::runtime::context::RuntimeContext;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -14,21 +14,23 @@ use veloq_driver_native::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
 /// Waits until `duration` has elapsed.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep(duration: Duration) -> Sleep {
-    sleep_until(Instant::now() + duration)
+pub fn sleep<'a>(ctx: &'a RuntimeContext, duration: Duration) -> Sleep<'a> {
+    sleep_until(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep_until(deadline: Instant) -> Sleep {
+pub fn sleep_until<'a>(ctx: &'a RuntimeContext, deadline: Instant) -> Sleep<'a> {
     Sleep {
+        ctx,
         deadline,
         inner: None,
     }
 }
 
-pub struct Sleep {
+pub struct Sleep<'a> {
+    ctx: &'a RuntimeContext,
     deadline: Instant,
     inner: Option<
         DetachedOp<
@@ -39,7 +41,7 @@ pub struct Sleep {
     >,
 }
 
-impl Sleep {
+impl<'a> Sleep<'a> {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -54,17 +56,18 @@ impl Sleep {
     }
 }
 
-impl Future for Sleep {
+impl<'a> Future for Sleep<'a> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
         loop {
-            if let Some(ref mut op) = self.inner {
+            if let Some(ref mut op) = this.inner {
                 let pinned = Pin::new(op);
                 match pinned.poll(cx) {
                     Poll::Ready(_) => {
-                        self.inner = None;
-                        if Instant::now() >= self.deadline {
+                        this.inner = None;
+                        if Instant::now() >= this.deadline {
                             return Poll::Ready(());
                         }
                     }
@@ -72,16 +75,16 @@ impl Future for Sleep {
                 }
             } else {
                 let now = Instant::now();
-                if now >= self.deadline {
+                if now >= this.deadline {
                     return Poll::Ready(());
                 }
 
-                let duration = self.deadline - now;
-                let driver = context::current().driver();
-                let mut driver_guard = driver.borrow_mut();
-                let op = Op::new(OpTimeout { duration }).submit_detached(&mut *driver_guard);
+                let duration = this.deadline - now;
+                let op = this
+                    .ctx
+                    .driver(|driver| Op::new(OpTimeout { duration }).submit_detached(driver));
 
-                self.inner = Some(op);
+                this.inner = Some(op);
             }
         }
     }
@@ -94,26 +97,28 @@ impl Future for Sleep {
 /// Waits until `duration` has elapsed (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_local(duration: Duration) -> LocalSleep {
-    sleep_until_local(Instant::now() + duration)
+pub fn sleep_local<'a>(ctx: &'a RuntimeContext, duration: Duration) -> LocalSleep<'a> {
+    sleep_until_local(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_until_local(deadline: Instant) -> LocalSleep {
+pub fn sleep_until_local<'a>(ctx: &'a RuntimeContext, deadline: Instant) -> LocalSleep<'a> {
     LocalSleep {
+        ctx,
         deadline,
         inner: None,
     }
 }
 
-pub struct LocalSleep {
+pub struct LocalSleep<'a> {
+    ctx: &'a RuntimeContext,
     deadline: Instant,
-    inner: Option<LocalOp<OpTimeout>>,
+    inner: Option<LocalOp<OpTimeout, RuntimeContext>>,
 }
 
-impl LocalSleep {
+impl<'a> LocalSleep<'a> {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -128,7 +133,7 @@ impl LocalSleep {
     }
 }
 
-impl Future for LocalSleep {
+impl<'a> Future for LocalSleep<'a> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -153,8 +158,7 @@ impl Future for LocalSleep {
                 }
 
                 let duration = this.deadline - now;
-                let driver = context::current().driver();
-                let op = Op::new(OpTimeout { duration }).submit_local(driver);
+                let op = Op::new(OpTimeout { duration }).submit_local(this.ctx.clone());
                 this.inner = Some(op);
             }
         }

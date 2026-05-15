@@ -352,7 +352,7 @@ pub struct RuntimeSharedBase {
 pub struct RuntimeShared<T> {
     pub(crate) base: Arc<RuntimeSharedBase>,
     pub(crate) idle_hook: Option<IdleHook<T>>,
-    pub(crate) context_tls: veloq_tls::Tls<crate::runtime::context::RuntimeContext<T>>,
+    pub context_tls: veloq_tls::Tls<crate::runtime::context::RuntimeContext<T>>,
 }
 
 pub(crate) struct RuntimeSharedComponents<T> {
@@ -681,38 +681,37 @@ impl<T: crate::runtime::context::RuntimeContextExtra> RuntimeShared<T> {
             .map(|ptr| unsafe { ptr.as_ref().worker_id })
             .unwrap_or(usize::MAX);
 
-        if current == worker_id
-            && task.header().try_mark_queued() {
-                self.base.idle.event_count.notify();
+        if current == worker_id && task.header().try_mark_queued() {
+            self.base.idle.event_count.notify();
 
-                let worker = &self.base.registry.workers[worker_id];
-                let header_ptr = task.header() as *const _ as *mut _;
-                if worker
-                    .lifo
-                    .compare_exchange(
-                        None,
-                        NonNull::new(header_ptr),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    self.wake_worker(worker_id);
-                    return;
-                }
-
-                if worker.deque.push(task).is_ok() {
-                    self.wake_worker(worker_id);
-                    return;
-                }
-
-                // Fallback to remote_tx if deque is full
-                if worker.remote_tx.send(task).is_err() {
-                    self.base.scheduler.injector.push(task);
-                }
+            let worker = &self.base.registry.workers[worker_id];
+            let header_ptr = task.header() as *const _ as *mut _;
+            if worker
+                .lifo
+                .compare_exchange(
+                    None,
+                    NonNull::new(header_ptr),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
                 self.wake_worker(worker_id);
                 return;
             }
+
+            if worker.deque.push(task).is_ok() {
+                self.wake_worker(worker_id);
+                return;
+            }
+
+            // Fallback to remote_tx if deque is full
+            if worker.remote_tx.send(task).is_err() {
+                self.base.scheduler.injector.push(task);
+            }
+            self.wake_worker(worker_id);
+            return;
+        }
 
         self.base.enqueue_send(worker_id, task);
     }

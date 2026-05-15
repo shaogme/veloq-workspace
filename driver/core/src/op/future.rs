@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::{
     future::Future,
@@ -261,38 +259,50 @@ pub enum LocalState {
 }
 
 /// A Future wrapper for asynchronous IO operations executed locally.
-pub struct LocalOp<T, D>
+pub struct LocalOp<T, P>
 where
-    D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
+    P: crate::op::DriverProvider,
+    T: IntoPlatformOp<
+            <P::Driver as Driver>::Op,
+            DriverCompletion = <P::Driver as Driver>::Completion,
+            ErasedPayload = <P::Driver as Driver>::UP,
+        >,
 {
     pub(crate) state: LocalState,
     pub(crate) data: Option<T>,
-    pub(crate) driver: Rc<RefCell<D>>,
+    pub(crate) provider: P,
     pub(crate) user_data: usize,
     pub(crate) token: u64,
 }
 
-impl<T, D> LocalOp<T, D>
+impl<T, P> LocalOp<T, P>
 where
-    D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
+    P: crate::op::DriverProvider,
+    T: IntoPlatformOp<
+            <P::Driver as Driver>::Op,
+            DriverCompletion = <P::Driver as Driver>::Completion,
+            ErasedPayload = <P::Driver as Driver>::UP,
+        >,
 {
-    pub fn new(data: T, driver: Rc<RefCell<D>>) -> Self {
+    pub fn new(data: T, provider: P) -> Self {
         Self {
             state: LocalState::Defined,
             data: Some(data),
-            driver,
+            provider,
             user_data: 0,
             token: 0,
         }
     }
 }
 
-impl<T, D> Future for LocalOp<T, D>
+impl<T, P> Future for LocalOp<T, P>
 where
-    D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
+    P: crate::op::DriverProvider,
+    T: IntoPlatformOp<
+            <P::Driver as Driver>::Op,
+            DriverCompletion = <P::Driver as Driver>::Completion,
+            ErasedPayload = <P::Driver as Driver>::UP,
+        >,
 {
     type Output = OpResult<T::Output, T::Completion>;
 
@@ -304,128 +314,139 @@ where
                 op = %std::any::type_name::<T>(),
                 "LocalOp::poll: submit begin"
             );
-            let mut driver = op.driver.borrow_mut();
 
-            // Submit to driver
             let data = op.data.take().expect("Op started without data");
             let (driver_op, payload) = data.into_kernel_and_payload();
 
-            let (user_data, generation) = match driver.reserve_op() {
-                Ok(v) => v,
-                Err(e) => {
+            let submit_res = op.provider.with_driver(|driver| {
+                let (user_data, generation) = match driver.reserve_op() {
+                    Ok(v) => v,
+                    Err(e) => return Err((e, driver_op, payload)),
+                };
+                let token = encode_completion_token(user_data, generation);
+                driver.slot_set_payload(user_data, T::payload_into_erased(payload));
+
+                let mut driver_op_opt = Some(driver_op);
+                let result = driver
+                    .submit(user_data, &mut driver_op_opt, SubmitBinder::new())
+                    .into_inner();
+
+                let mut fallback_payload = None;
+                if let Err((_, status)) = &result
+                    && *status == SubmitStatus::Void {
+                        if let Some(val) = driver_op_opt.take() {
+                            drop(val);
+                        }
+                        fallback_payload = Some(driver.slot_take_payload(user_data).unwrap());
+                    }
+                Ok((user_data, token, result, fallback_payload))
+            });
+
+            match submit_res {
+                Err((e, driver_op, payload)) => {
                     drop(driver_op);
                     let completion = T::complete(payload, Err(e));
                     return Poll::Ready(OpResult::Completed(completion.result, completion.output));
                 }
-            };
-            op.user_data = user_data;
-            op.token = encode_completion_token(user_data, generation);
-            driver.slot_set_payload(user_data, T::payload_into_erased(payload));
-
-            let mut driver_op_opt = Some(driver_op);
-            let result = driver
-                .submit(user_data, &mut driver_op_opt, SubmitBinder::new())
-                .into_inner();
-
-            match result {
-                Ok(_) => {
-                    op.state = LocalState::Submitted;
-                    trace!(
-                        op = %std::any::type_name::<T>(),
-                        user_data = op.user_data,
-                        token = op.token,
-                        "LocalOp::poll: submitted"
-                    );
-                }
-                Err((e, status)) => {
-                    if status == SubmitStatus::Void {
-                        if let Some(val) = driver_op_opt.take() {
-                            drop(val);
+                Ok((user_data, token, result, fallback_payload)) => {
+                    op.user_data = user_data;
+                    op.token = token;
+                    match result {
+                        Ok(_) => {
+                            op.state = LocalState::Submitted;
+                            trace!(
+                                op = %std::any::type_name::<T>(),
+                                user_data = op.user_data,
+                                token = op.token,
+                                "LocalOp::poll: submitted"
+                            );
                         }
-                        let payload_erased = driver.slot_take_payload(user_data).unwrap_or_else(|| {
-                            panic!(
-                                "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
-                                user_data, status, e
-                            )
-                        });
-                        let payload = T::payload_from_erased(payload_erased);
-                        trace!(
-                            op = %std::any::type_name::<T>(),
-                            user_data = user_data,
-                            status = ?status,
-                            error = %e,
-                            "LocalOp::poll: submit failed synchronously"
-                        );
-                        let completion = T::complete(payload, Err(e));
-                        return Poll::Ready(OpResult::Completed(
-                            completion.result,
-                            completion.output,
-                        ));
-                    } else {
-                        op.state = LocalState::Submitted;
-                        trace!(
-                            op = %std::any::type_name::<T>(),
-                            user_data = op.user_data,
-                            token = op.token,
-                            status = ?status,
-                            "LocalOp::poll: submitted in flight"
-                        );
+                        Err((e, status)) => {
+                            if status == SubmitStatus::Void {
+                                let payload_erased = fallback_payload.unwrap();
+                                let payload = T::payload_from_erased(payload_erased);
+                                trace!(
+                                    op = %std::any::type_name::<T>(),
+                                    user_data = op.user_data,
+                                    status = ?status,
+                                    error = %e,
+                                    "LocalOp::poll: submit failed synchronously"
+                                );
+                                let completion = T::complete(payload, Err(e));
+                                return Poll::Ready(OpResult::Completed(
+                                    completion.result,
+                                    completion.output,
+                                ));
+                            } else {
+                                op.state = LocalState::Submitted;
+                                trace!(
+                                    op = %std::any::type_name::<T>(),
+                                    user_data = op.user_data,
+                                    token = op.token,
+                                    status = ?status,
+                                    "LocalOp::poll: submitted in flight"
+                                );
+                            }
+                        }
                     }
                 }
             }
-
-            op.state = LocalState::Submitted;
         }
 
         if let LocalState::Submitted = op.state {
-            let mut driver = op.driver.borrow_mut();
-            match poll_completion_table_once::<T, D::Op, D::UP, D::Completion>(
-                &*driver.completion_table(),
-                op.token,
-            ) {
-                Poll::Ready(result) => {
-                    op.state = LocalState::Completed;
-                    trace!(
-                        op = %std::any::type_name::<T>(),
-                        user_data = op.user_data,
-                        token = op.token,
-                        "LocalOp::poll: completion ready"
-                    );
-                    Poll::Ready(result)
-                }
-                Poll::Pending => {
-                    driver.register_completion_waker(op.token, cx.waker());
-                    trace!(
-                        op = %std::any::type_name::<T>(),
-                        user_data = op.user_data,
-                        token = op.token,
-                        "LocalOp::poll: completion pending"
-                    );
-                    match poll_completion_table_once::<T, D::Op, D::UP, D::Completion>(
-                        &*driver.completion_table(),
-                        op.token,
-                    ) {
-                        Poll::Ready(result) => {
-                            op.state = LocalState::Completed;
-                            trace!(
-                                op = %std::any::type_name::<T>(),
-                                user_data = op.user_data,
-                                token = op.token,
-                                "LocalOp::poll: completion ready after register"
-                            );
-                            Poll::Ready(result)
-                        }
-                        Poll::Pending => {
-                            trace!(
-                                op = %std::any::type_name::<T>(),
-                                user_data = op.user_data,
-                                token = op.token,
-                                "LocalOp::poll: still pending"
-                            );
-                            Poll::Pending
+            let token = op.token;
+            let res = op.provider.with_driver(|driver| {
+                let mut is_ready = false;
+                let mut ready_val = None;
+
+                match poll_completion_table_once::<
+                    T,
+                    <P::Driver as Driver>::Op,
+                    <P::Driver as Driver>::UP,
+                    <P::Driver as Driver>::Completion,
+                >(&*driver.completion_table(), token)
+                {
+                    Poll::Ready(result) => {
+                        is_ready = true;
+                        ready_val = Some(result);
+                    }
+                    Poll::Pending => {
+                        driver.register_completion_waker(token, cx.waker());
+                        match poll_completion_table_once::<
+                            T,
+                            <P::Driver as Driver>::Op,
+                            <P::Driver as Driver>::UP,
+                            <P::Driver as Driver>::Completion,
+                        >(&*driver.completion_table(), token)
+                        {
+                            Poll::Ready(result) => {
+                                is_ready = true;
+                                ready_val = Some(result);
+                            }
+                            Poll::Pending => {}
                         }
                     }
                 }
+                (is_ready, ready_val)
+            });
+
+            if res.0 {
+                op.state = LocalState::Completed;
+                trace!(
+                    op = %std::any::type_name::<T>(),
+                    user_data = op.user_data,
+                    token = op.token,
+                    "LocalOp::poll: completion ready"
+                );
+                Poll::Ready(res.1.unwrap())
+            } else {
+                trace!(
+                    op = %std::any::type_name::<T>(),
+                    user_data = op.user_data,
+                    token = op.token,
+                    "LocalOp::poll: completion pending"
+                );
+                Poll::Pending
             }
         } else {
             panic!("Polled after completion");
@@ -433,52 +454,85 @@ where
     }
 }
 
-impl<T, D> Drop for LocalOp<T, D>
+impl<T, P> Drop for LocalOp<T, P>
 where
-    D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
+    P: crate::op::DriverProvider,
+    T: IntoPlatformOp<
+            <P::Driver as Driver>::Op,
+            DriverCompletion = <P::Driver as Driver>::Completion,
+            ErasedPayload = <P::Driver as Driver>::UP,
+        >,
 {
     fn drop(&mut self) {
         if let LocalState::Submitted = self.state {
-            self.driver.borrow_mut().cancel_op(self.user_data);
+            let user_data = self.user_data;
+            self.provider.with_driver(|driver| {
+                driver.cancel_op(user_data);
+            });
         }
     }
 }
 
-pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync {
+pub trait OpSubmitter<P: crate::op::DriverProvider>: Clone + std::marker::Send + Sync {
     type Future<
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
+        T: IntoPlatformOp<<P::Driver as Driver>::Op, DriverCompletion = <P::Driver as Driver>::Completion, ErasedPayload = <P::Driver as Driver>::UP>
             + std::marker::Send,
-    >: Future<Output = OpResult<T::Output, <T as IntoPlatformOp<D::Op>>::Completion>>;
+    >: Future<Output = OpResult<T::Output, <T as IntoPlatformOp<<P::Driver as Driver>::Op>>::Completion>>;
 
-    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
+    fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send;
+        T: IntoPlatformOp<
+                <P::Driver as Driver>::Op,
+                DriverCompletion = <P::Driver as Driver>::Completion,
+                ErasedPayload = <P::Driver as Driver>::UP,
+            > + std::marker::Send;
 
     fn from_current_context() -> Self;
 }
 
-#[derive(Clone, Copy)]
-pub struct LocalSubmitter;
+pub struct LocalSubmitter<P: crate::op::DriverProvider>(std::marker::PhantomData<fn() -> P>);
 
-impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
+impl<P: crate::op::DriverProvider> Clone for LocalSubmitter<P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<P: crate::op::DriverProvider> Copy for LocalSubmitter<P> {}
+
+impl<P: crate::op::DriverProvider> LocalSubmitter<P> {
+    pub fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+impl<P: crate::op::DriverProvider> Default for LocalSubmitter<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P: crate::op::DriverProvider> OpSubmitter<P> for LocalSubmitter<P> {
     type Future<
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send,
-    > = LocalOp<T, D>;
+        T: IntoPlatformOp<
+                <P::Driver as Driver>::Op,
+                DriverCompletion = <P::Driver as Driver>::Completion,
+                ErasedPayload = <P::Driver as Driver>::UP,
+            > + std::marker::Send,
+    > = LocalOp<T, P>;
 
-    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
+    fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<T, P>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send,
+        T: IntoPlatformOp<
+                <P::Driver as Driver>::Op,
+                DriverCompletion = <P::Driver as Driver>::Completion,
+                ErasedPayload = <P::Driver as Driver>::UP,
+            > + std::marker::Send,
     {
         trace!("Submitting local op");
-        op.submit_local(driver)
+        op.submit_local(provider)
     }
 
     fn from_current_context() -> Self {
-        Self
+        Self::new()
     }
 }
 
@@ -497,18 +551,24 @@ impl Default for DetachedSubmitter {
     }
 }
 
-impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
+impl<P: crate::op::DriverProvider> OpSubmitter<P> for DetachedSubmitter {
     type Future<
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send,
-    > = DetachedOp<T, D::Op, D::Completion>;
+        T: IntoPlatformOp<
+                <P::Driver as Driver>::Op,
+                DriverCompletion = <P::Driver as Driver>::Completion,
+                ErasedPayload = <P::Driver as Driver>::UP,
+            > + std::marker::Send,
+    > = DetachedOp<T, <P::Driver as Driver>::Op, <P::Driver as Driver>::Completion>;
 
-    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
+    fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send,
+        T: IntoPlatformOp<
+                <P::Driver as Driver>::Op,
+                DriverCompletion = <P::Driver as Driver>::Completion,
+                ErasedPayload = <P::Driver as Driver>::UP,
+            > + std::marker::Send,
     {
-        op.submit_detached(&mut *driver.borrow_mut())
+        provider.with_driver(|driver| op.submit_detached(driver))
     }
 
     fn from_current_context() -> Self {

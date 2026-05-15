@@ -2,9 +2,9 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
+use crate::runtime::context::RuntimeContext;
 use veloq_driver_native::Socket;
 use veloq_driver_native::op::DetachedSubmitter;
-use veloq_runtime::runtime::RuntimeScopeContext;
 
 use crate::net::common::InnerSocket;
 use crate::net::tcp::{GenericTcpListener, TcpListener, TcpStream};
@@ -95,21 +95,16 @@ impl TcpSocket {
     /// Listen for incoming connections.
     ///
     /// Consumes the `TcpSocket` and returns a `TcpListener`.
-    pub fn listen<'a>(
-        self,
-        ctx: &'a RuntimeScopeContext<()>,
-        backlog: u32,
-    ) -> VeloqResult<TcpListener<'a>> {
+    pub fn listen<'a>(self, ctx: &'a RuntimeContext, backlog: u32) -> VeloqResult<TcpListener<'a>> {
         let local_addr = self.inner.local_addr().map_err(from_driver_report)?;
         self.inner
             .listen(backlog as i32)
             .map_err(from_driver_report)?;
         Ok(GenericTcpListener {
             inner: InnerSocket::new(
+                ctx,
                 self.inner.into_owned_raw().into_raw(),
                 Some(local_addr),
-                ctx.worker_id(),
-                ctx.shared(),
             )?,
             submitter: DetachedSubmitter::new(),
             ctx,
@@ -121,15 +116,10 @@ impl TcpSocket {
     /// Consumes the `TcpSocket` and returns a `TcpStream` future.
     pub async fn connect<'a>(
         self,
-        ctx: &'a RuntimeScopeContext<()>,
+        ctx: &'a RuntimeContext,
         addr: SocketAddr,
     ) -> VeloqResult<TcpStream<'a>> {
-        let inner = InnerSocket::new(
-            self.inner.into_owned_raw().into_raw(),
-            None,
-            ctx.worker_id(),
-            ctx.shared(),
-        )?;
+        let inner = InnerSocket::new(ctx, self.inner.into_owned_raw().into_raw(), None)?;
         TcpStream::connect_from_inner(ctx, inner, addr).await
     }
 }
@@ -196,7 +186,7 @@ impl UdpSocketBuilder {
     /// Consumes the builder and returns a `UdpSocket`.
     pub fn bind<'a, A: ToSocketAddrs>(
         self,
-        ctx: &'a RuntimeScopeContext<()>,
+        ctx: &'a RuntimeContext,
         addr: A,
     ) -> VeloqResult<UdpSocket<'a>> {
         let addr = addr
@@ -214,10 +204,9 @@ impl UdpSocketBuilder {
 
         Ok(GenericUdpSocket {
             inner: InnerSocket::new(
+                ctx,
                 self.inner.into_owned_raw().into_raw(),
                 Some(local_addr),
-                ctx.worker_id(),
-                ctx.shared(),
             )?,
             submitter: DetachedSubmitter::new(),
             ctx,

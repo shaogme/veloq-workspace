@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::PathBuf;
 use veloq::fs::{File, LocalFile};
 use veloq::io::{AsyncBufRead, AsyncBufWrite};
-use veloq::runtime::{Runtime, context};
+use veloq::runtime::Runtime;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 struct CleanupGuard(PathBuf);
@@ -39,16 +39,16 @@ fn create_runtime() -> Runtime<UniformSlot> {
 fn test_file_integrity() {
     for size in [nz!(8192), nz!(16384), nz!(65536)] {
         let runtime = create_runtime();
-        runtime.block_on(async |_| {
+        runtime.block_on(async |ctx| {
             let file_path = format!("test_file_integrity_{:?}.tmp", size);
             let _guard = CleanupGuard::new(&file_path);
 
             {
-                let file = LocalFile::create(&file_path)
+                let file = LocalFile::create(ctx, &file_path)
                     .await
                     .expect("Failed to create");
 
-                let mut write_buf = context::alloc(size);
+                let mut write_buf = ctx.alloc(size);
                 let data = b"Hello World!";
                 write_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
 
@@ -59,8 +59,10 @@ fn test_file_integrity() {
             }
 
             {
-                let file = LocalFile::open(&file_path).await.expect("Failed to open");
-                let read_buf = context::alloc(size);
+                let file = LocalFile::open(ctx, &file_path)
+                    .await
+                    .expect("Failed to open");
+                let read_buf = ctx.alloc(size);
                 let (n, read_buf) = file.read_at(read_buf, 0).await.expect("Read failed");
                 assert_eq!(n, size.get());
                 assert_eq!(&read_buf.as_slice()[..12], b"Hello World!");
@@ -92,17 +94,17 @@ fn test_multithread_file_ops() {
                         .write(true)
                         .create(true)
                         .truncate(true)
-                        .open(&file_name)
+                        .open(ctx, &file_name)
                         .await
                         .expect("Failed to create file");
-                    let mut write_buf = context::alloc(len);
+                    let mut write_buf = ctx.alloc(len);
                     write_buf.set_len(len.get());
                     write_buf.as_slice_mut().copy_from_slice(content.as_bytes());
                     let (wrote, _) = file.write_at(write_buf, 0).await.expect("Write failed");
                     assert_eq!(wrote, len.get());
                     file.sync_all().await.expect("Sync failed");
 
-                    let read_buf = context::alloc(len);
+                    let read_buf = ctx.alloc(len);
                     let (n, read_buf) = file.read_at(read_buf, 0).await.expect("Read failed");
                     assert_eq!(n, len.get());
                     assert_eq!(&read_buf.as_slice()[..n], content.as_bytes());
@@ -123,16 +125,16 @@ fn test_multithread_file_ops() {
 fn test_fs_read_exact_write_all() {
     let runtime = create_runtime();
 
-    runtime.block_on(async |_| {
+    runtime.block_on(async |ctx| {
         let path = "test_fs_exact.tmp";
         let _guard = CleanupGuard::new(path);
 
-        let file = LocalFile::create(path)
+        let file = LocalFile::create(ctx, path)
             .await
             .expect("Failed to create file");
 
         const DATA: &[u8] = b"Hello Exact World!";
-        let mut write_buf = context::alloc(nz!(DATA.len()));
+        let mut write_buf = ctx.alloc(nz!(DATA.len()));
         write_buf.as_slice_mut()[..DATA.len()].copy_from_slice(DATA);
         write_buf.set_len(DATA.len());
 
@@ -140,8 +142,10 @@ fn test_fs_read_exact_write_all() {
         file.sync_all().await.expect("Sync failed");
         drop(file);
 
-        let file = LocalFile::open(path).await.expect("Failed to open file");
-        let mut read_buf = context::alloc(nz!(DATA.len()));
+        let file = LocalFile::open(ctx, path)
+            .await
+            .expect("Failed to open file");
+        let mut read_buf = ctx.alloc(nz!(DATA.len()));
         read_buf.set_len(DATA.len());
         let (n, read_buf) = file.read_exact(read_buf).await.expect("read_exact failed");
         assert_eq!(n, DATA.len());

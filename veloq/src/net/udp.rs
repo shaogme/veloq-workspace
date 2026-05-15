@@ -5,27 +5,27 @@ use std::sync::Arc;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
-use crate::runtime::context::{submit, submit_to};
+use crate::runtime::context::RuntimeContext;
 use veloq_buf::FixedBuf;
 use veloq_driver_native::Socket;
 use veloq_driver_native::op::{
     DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpConnect, UdpRecv as OpUdpRecv,
     UdpRecvFrom, UdpRecvPacket, UdpRecvPacketBuf, UdpSend as OpUdpSend,
 };
-use veloq_runtime::runtime::RuntimeScopeContext;
 
 #[derive(Clone)]
-pub struct GenericUdpSocket<'a, S: OpSubmitter, P: SocketTokenPtr<'a>> {
+pub struct GenericUdpSocket<'a, S: OpSubmitter<RuntimeContext>, P: SocketTokenPtr<'a>> {
     pub(crate) inner: InnerSocket<'a, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: &'a RuntimeScopeContext<()>,
+    pub(crate) ctx: &'a RuntimeContext,
 }
 
-pub type LocalUdpSocket<'a> = GenericUdpSocket<'a, LocalSubmitter, Rc<SocketToken<'a>>>;
+pub type LocalUdpSocket<'a> =
+    GenericUdpSocket<'a, LocalSubmitter<RuntimeContext>, Rc<SocketToken<'a>>>;
 pub type UdpSocket<'a> = GenericUdpSocket<'a, DetachedSubmitter, Arc<SocketToken<'a>>>;
 
 fn bind_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
-    ctx: &'a RuntimeScopeContext<()>,
+    ctx: &'a RuntimeContext,
     addr: A,
 ) -> VeloqResult<InnerSocket<'a, P>> {
     let addr = addr
@@ -48,15 +48,10 @@ fn bind_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
     socket.bind(addr).map_err(from_driver_report)?;
     let local_addr = socket.local_addr().map_err(from_driver_report)?;
 
-    InnerSocket::new(
-        socket.into_owned_raw().into_raw(),
-        Some(local_addr),
-        ctx.worker_id(),
-        ctx.shared(),
-    )
+    InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P> {
+impl<'a, S: OpSubmitter<RuntimeContext> + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P> {
     pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
         self.inner.local_addr()
     }
@@ -72,7 +67,11 @@ impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P
             buf_offset: 0,
             addr: target,
         };
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, op_back) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         let buf = op_back.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
@@ -86,7 +85,11 @@ impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P
             buf_offset: 0,
             addr: None,
         };
-        let (res, op_back_opt) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, op_back_opt) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         let op_back =
             op_back_opt.ok_or_else(|| from_io_error(io::Error::other("UdpRecvFrom op lost")))?;
         let n = res.map_err(from_driver_report)?;
@@ -112,7 +115,11 @@ impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P
             addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
-        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, _) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         res.map(|_| ()).map_err(from_driver_report)
     }
 
@@ -126,7 +133,11 @@ impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P
             buf,
             buf_offset,
         };
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, op_back) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         let buf = op_back.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
@@ -143,7 +154,11 @@ impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P
             buf,
             buf_offset,
         };
-        let (res, op_back) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, op_back) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         let buf = op_back.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
@@ -152,10 +167,10 @@ impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P
 }
 
 impl<'a> LocalUdpSocket<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext<()>, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
-            submitter: LocalSubmitter,
+            submitter: LocalSubmitter::new(),
             ctx,
         })
     }
@@ -202,7 +217,7 @@ impl<'a> LocalUdpSocket<'a> {
 }
 
 impl<'a> UdpSocket<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext<()>, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -222,7 +237,7 @@ impl<'a> UdpSocket<'a> {
             buf_offset: 0,
             addr: target,
         };
-        let (res, op) = submit_to(self.ctx, owner, Op::new(op)).await?;
+        let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         Ok((res.map_err(from_driver_report)?, op.buf))
     }
 
@@ -234,7 +249,7 @@ impl<'a> UdpSocket<'a> {
             buf_offset: 0,
             addr: None,
         };
-        let (res, op) = submit_to(self.ctx, owner, Op::new(op)).await?;
+        let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         let n = res.map_err(from_driver_report)?;
         let mut recv_buf = op.buf;
         recv_buf.set_len(n);
@@ -259,7 +274,7 @@ impl<'a> UdpSocket<'a> {
             addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
-        let (res, _) = submit_to(self.ctx, owner, Op::new(op)).await?;
+        let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
         res.map(|_| ()).map_err(from_driver_report)
     }
 
@@ -282,7 +297,7 @@ impl<'a> UdpSocket<'a> {
             buf,
             buf_offset,
         };
-        let (res, op) = submit_to(self.ctx, owner, Op::new(op)).await?;
+        let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         Ok((res.map_err(from_driver_report)?, op.buf))
     }
 
@@ -297,7 +312,7 @@ impl<'a> UdpSocket<'a> {
             buf,
             buf_offset,
         };
-        let (res, op) = submit_to(self.ctx, owner, Op::new(op)).await?;
+        let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         Ok((res.map_err(from_driver_report)?, op.buf))
     }
 }

@@ -1,9 +1,12 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 use tracing::trace;
 
 use crate::DriverResult;
 use crate::driver::{Driver, PlatformOp, SubmitBinder, SubmitStatus, encode_completion_token};
+
+pub trait DriverProvider: Clone + Unpin {
+    type Driver: crate::driver::Driver;
+    fn with_driver<R>(&self, f: impl FnOnce(&mut Self::Driver) -> R) -> R;
+}
 
 mod future;
 mod types;
@@ -147,11 +150,14 @@ impl<T> Op<T> {
         }
     }
 
-    pub fn submit_local<D>(self, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
+    pub fn submit_local<P: DriverProvider>(self, provider: P) -> LocalOp<T, P>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
-        D: Driver,
+        T: IntoPlatformOp<
+                <P::Driver as Driver>::Op,
+                DriverCompletion = <P::Driver as Driver>::Completion,
+                ErasedPayload = <P::Driver as Driver>::UP,
+            >,
     {
-        LocalOp::new(self.data, driver)
+        LocalOp::new(self.data, provider)
     }
 }

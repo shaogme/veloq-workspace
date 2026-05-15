@@ -93,25 +93,28 @@ impl OpenOptions {
         self
     }
 
-    pub async fn open_local(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::LocalFile> {
-        let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
-        use crate::runtime::context::submit;
+    pub async fn open_local<'a>(
+        &self,
+        ctx: &'a crate::runtime::context::RuntimeContext,
+        path: impl AsRef<Path>,
+    ) -> VeloqResult<super::file::LocalFile<'a>> {
+        let op = self.build_op(ctx, path.as_ref()).map_err(from_io_error)?;
         use veloq_driver_native::op::{LocalSubmitter, Op};
 
-        let submitter = LocalSubmitter;
-        let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
+        let submitter = LocalSubmitter::new();
+        let (res, _) = ctx.submit(&submitter, Op::new(op)).await.into_inner();
         let owned = res.map_err(from_driver_report)?;
         let fd = owned.into_raw();
-        let ctx = crate::runtime::context::try_current()
-            .ok_or_else(|| from_io_error(std::io::Error::other("runtime context not set")))?;
-        let driver = ctx.driver();
-        let fixed = driver
-            .borrow_mut()
-            .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
-            .map_err(from_driver_report)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| from_io_error(std::io::Error::other("register_files returned empty")))?;
+        let fixed = ctx.driver(|driver| {
+            driver
+                .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
+                .map_err(from_driver_report)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    from_io_error(std::io::Error::other("register_files returned empty"))
+                })
+        })?;
         use std::cell::Cell;
 
         Ok(super::file::LocalFile {
@@ -119,16 +122,21 @@ impl OpenOptions {
             fd: fixed,
             submitter,
             pos: Cell::new(0),
+            ctx,
         })
     }
 
-    pub async fn open(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::File> {
-        let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
-        use crate::runtime::context::submit;
+    pub async fn open<'a>(
+        &self,
+        ctx: &'a crate::runtime::context::RuntimeContext,
+        path: impl AsRef<Path>,
+    ) -> VeloqResult<super::file::File<'a>> {
+        let op = self.build_op(ctx, path.as_ref()).map_err(from_io_error)?;
         use veloq_driver_native::op::{DetachedSubmitter, Op};
 
         let submitter = DetachedSubmitter::new();
-        let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
+        let owner = ctx.scope.worker_id();
+        let (res, _) = ctx.submit_to(owner, Op::new(op)).await?;
         let owned = res.map_err(from_driver_report)?;
         let fd = owned.into_raw();
         use std::sync::atomic::AtomicU64;
@@ -137,11 +145,16 @@ impl OpenOptions {
             raw: fd,
             submitter,
             pos: AtomicU64::new(0),
+            ctx,
         })
     }
 
     #[cfg(unix)]
-    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+    fn build_op(
+        &self,
+        ctx: &crate::runtime::context::RuntimeContext,
+        path: &Path,
+    ) -> std::io::Result<Open> {
         use std::num::NonZeroUsize;
         use std::os::unix::ffi::OsStrExt;
 
@@ -149,7 +162,7 @@ impl OpenOptions {
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
 
-        let mut buf = crate::runtime::context::try_alloc(len_nz)?;
+        let mut buf = ctx.try_alloc(len_nz)?;
         let slice = buf.as_slice_mut();
         if slice.len() < len {
             return Err(std::io::Error::new(
@@ -201,7 +214,11 @@ impl OpenOptions {
     }
 
     #[cfg(windows)]
-    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+    fn build_op(
+        &self,
+        ctx: &crate::runtime::context::RuntimeContext,
+        path: &Path,
+    ) -> std::io::Result<Open> {
         use std::num::NonZeroUsize;
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
@@ -216,7 +233,7 @@ impl OpenOptions {
         path_w.push(0);
         let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
 
-        let mut buf = crate::runtime::context::try_alloc(len_bytes)?;
+        let mut buf = ctx.try_alloc(len_bytes)?;
         let slice = buf.as_slice_mut();
         if slice.len() < len_bytes.get() {
             return Err(std::io::Error::new(

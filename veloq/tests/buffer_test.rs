@@ -1,7 +1,9 @@
 use std::num::NonZeroUsize;
 
 use veloq::config::BufferRegistrationMode;
-use veloq::runtime::{Runtime, context};
+use veloq::runtime::Runtime;
+#[cfg(feature = "test-hooks")]
+use veloq::runtime::context::RuntimeContext;
 use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 #[cfg(feature = "test-hooks")]
@@ -16,17 +18,17 @@ fn build_runtime(worker_threads: usize, mode: BufferRegistrationMode) -> Runtime
 }
 
 #[cfg(feature = "test-hooks")]
-fn current_chunk_register_attempts() -> u64 {
-    let driver = context::current().driver();
-    let driver_ref = driver.borrow();
-    let hooks = &*driver_ref as &dyn DriverTestHooks;
-    hooks.debug_chunk_register_attempts()
+fn current_chunk_register_attempts(ctx: &RuntimeContext) -> u64 {
+    ctx.driver(|driver| {
+        let hooks = driver as &dyn DriverTestHooks;
+        hooks.debug_chunk_register_attempts()
+    })
 }
 
 fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
     let runtime = build_runtime(1, mode);
-    runtime.block_on(async |_| {
-        let pool = context::current_pool().expect("buffer pool not found");
+    runtime.block_on(async |ctx| {
+        let pool = ctx.buf_pool();
         let alloc_size = nz!(1024 * 1024);
 
         let mut bufs = Vec::new();
@@ -73,12 +75,12 @@ fn run_expansion_immediate_registration_check(
     _should_immediate: bool,
 ) {
     let runtime = build_runtime(1, mode);
-    runtime.block_on(async |_| {
-        let pool = context::current_pool().expect("buffer pool not found");
+    runtime.block_on(async |ctx| {
+        let pool = ctx.buf_pool();
         let alloc_size = nz!(1024 * 1024);
 
         #[cfg(feature = "test-hooks")]
-        let before = current_chunk_register_attempts();
+        let before = current_chunk_register_attempts(ctx);
 
         let mut bufs = Vec::new();
         let mut expanded = false;
@@ -100,12 +102,12 @@ fn run_expansion_immediate_registration_check(
 
         // Cross at least one executor budget boundary so check_for_memory_updates runs again.
         for _ in 0..128 {
-            context::yield_now().await;
+            ctx.yield_now().await;
         }
 
         #[cfg(feature = "test-hooks")]
         {
-            let after = current_chunk_register_attempts();
+            let after = current_chunk_register_attempts(ctx);
             if _should_immediate {
                 assert!(
                     after > before,
@@ -124,7 +126,7 @@ fn run_expansion_immediate_registration_check(
 fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
     let runtime = build_runtime(2, mode);
     runtime.block_on(async |ctx| {
-        let pool = context::current_pool().expect("no pool");
+        let pool = ctx.buf_pool();
         let alloc_size = nz!(1024 * 1024);
 
         let mut holding = Vec::new();
@@ -152,8 +154,8 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
             let mut handles = Vec::new();
             for _ in 0..4 {
                 handles.push(s.spawn_boxed(async move {
-                    context::yield_now().await;
-                    let pool = context::current_pool().expect("pool missing");
+                    ctx.yield_now().await;
+                    let pool = ctx.buf_pool();
                     let buf = pool.alloc(alloc_size).expect("worker allocation failed");
                     buf.resolve_region_info().id
                 }));

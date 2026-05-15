@@ -277,7 +277,7 @@ pub type WorkerTickHook = fn();
 
 /// Worker initialization context passed to the injected worker init step.
 pub struct WorkerInitContext<T> {
-    pub shared: Arc<RuntimeShared<T>>,
+    shared: Arc<RuntimeShared<T>>,
     worker_id: usize,
     worker_count: NonZeroUsize,
 }
@@ -303,6 +303,10 @@ impl<T: RuntimeContextExtra> WorkerInitContext<T> {
             worker_id,
             worker_count,
         }
+    }
+
+    pub fn shared(&self) -> &Arc<RuntimeShared<T>> {
+        &self.shared
     }
 
     /// Returns the current worker id.

@@ -1,9 +1,7 @@
 pub mod context;
 
-use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
-use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
 use veloq_blocking::init_blocking_pool;
@@ -15,7 +13,7 @@ use veloq_runtime::utils::storage::StaticTransfer;
 use crate::config::Config;
 use crate::runtime::context::{DriverRegistrar, RegistrarMessage};
 
-pub use veloq_runtime::runtime::RuntimeScopeContext;
+use veloq_runtime::runtime::RuntimeScopeContext;
 
 pub struct RuntimeBuilder<T: PoolTopology> {
     topology: T,
@@ -108,7 +106,7 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn block_on<R, F>(self, f: F) -> R
     where
-        F: AsyncFnOnce(&RuntimeScopeContext<()>) -> R,
+        F: AsyncFnOnce(&crate::runtime::context::RuntimeContext) -> R,
     {
         let Runtime {
             worker_count,
@@ -116,15 +114,6 @@ impl<T: PoolTopology> Runtime<T> {
             state,
             config,
         } = self;
-
-        struct ClearCurrentContext;
-        impl Drop for ClearCurrentContext {
-            fn drop(&mut self) {
-                context::clear_current_runtime_context();
-            }
-        }
-
-        let _clear = ClearCurrentContext;
 
         // 预先为每个 Worker 创建消息通道
         let mut senders = Vec::with_capacity(worker_count.get());
@@ -151,35 +140,44 @@ impl<T: PoolTopology> Runtime<T> {
             .with_worker_count(worker_count.get())
             .with_queue_capacity(config.get_queue_capacity().get())
             .with_idle_hook(crate::runtime::context::poll_current_driver)
-            .with_worker_init(async move |worker_ctx: WorkerInitContext<()>| {
-                let topology = topology.clone();
-                let state = state.clone();
-                let config = config.clone();
-                let receiver = receivers.take(worker_ctx.worker_id());
+            .with_worker_init(
+                async move |worker_ctx: WorkerInitContext<crate::runtime::context::WorkerState>| {
+                    let topology = topology.clone();
+                    let state = state.clone();
+                    let config = config.clone();
+                    let receiver = receivers.take(worker_ctx.worker_id());
 
-                let driver = Rc::new(RefCell::new(
-                    PlatformDriver::new(&config).expect("failed to create driver"),
-                ));
+                    let mut driver = PlatformDriver::new(&config).expect("failed to create driver");
+                    let registration_mode = config.registration_mode();
+                    let registrar =
+                        DriverRegistrar::new(worker_ctx.shared().clone(), registration_mode);
 
-                // 初始化 TLS 中的注册中心状态
-                context::init_worker_registrar_state(receiver);
+                    driver.set_registrar(Box::new(registrar.clone()));
 
-                let registration_mode = config.registration_mode();
-                let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
+                    let tls_ptr = worker_ctx.shared().context_tls.get().unwrap();
+                    let ctx = unsafe { &*tls_ptr.as_ptr() };
 
-                {
-                    let mut driver_ref = driver.borrow_mut();
-                    driver_ref.set_registrar(Box::new(registrar.clone()));
-                }
+                    // 必须在调用 topology.build 之前存入驱动，因为 Registrar 需要驱动来注册缓冲区
+                    *ctx.extra.driver.borrow_mut() = Some(driver);
 
-                let buf_pool =
-                    topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
-                context::set_current_runtime_context(context::RuntimeContext::new(
-                    driver, buf_pool, registrar,
-                ));
-            })
+                    let buf_pool =
+                        topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
+
+                    *ctx.extra.buf_pool.borrow_mut() = Some(buf_pool);
+                    *ctx.extra.registrar.borrow_mut() = Some(registrar);
+
+                    crate::runtime::context::init_worker_registrar_state(&ctx.extra, receiver);
+                },
+            )
             .build();
 
-        runtime.block_on(f)
+        runtime.block_on(
+            async move |scope: &RuntimeScopeContext<crate::runtime::context::WorkerState>| {
+                let ctx = crate::runtime::context::RuntimeContext {
+                    scope: scope.clone(),
+                };
+                f(&ctx).await
+            },
+        )
     }
 }

@@ -18,14 +18,13 @@ use veloq_runtime::runtime::shared::RuntimeShared;
 pub struct SocketToken<'a> {
     fd: IoFd,
     owner_worker_id: usize,
-    shared: &'a RuntimeShared<()>,
+    shared: &'a RuntimeShared<crate::runtime::context::WorkerState>,
 }
 
 impl<'a> SocketToken<'a> {
     pub(crate) fn new(
+        ctx: &'a crate::runtime::context::RuntimeContext,
         handle: RawHandle,
-        owner_worker_id: usize,
-        shared: &'a RuntimeShared<()>,
     ) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
             return Err(from_io_error(io::Error::new(
@@ -36,21 +35,20 @@ impl<'a> SocketToken<'a> {
 
         // SAFETY: caller transfers ownership via RawHandle created from OwnedRawHandle::into_raw.
         let owned = unsafe { OwnedRawHandle::from_raw_owned(handle) };
-        let ctx = crate::runtime::context::try_current()
-            .ok_or_else(|| from_io_error(io::Error::other("runtime context not set")))?;
-        let driver = ctx.driver();
-        let fd = driver
-            .borrow_mut()
-            .register_files(vec![RegisterFd::Owned(owned)])
-            .map_err(from_driver_report)
-            .and_then(|mut fds| {
-                fds.pop()
-                    .ok_or_else(|| from_io_error(io::Error::other("register_files returned empty")))
-            })?;
+        let fd = ctx.driver(|driver| {
+            driver
+                .register_files(vec![RegisterFd::Owned(owned)])
+                .map_err(from_driver_report)
+                .and_then(|mut fds| {
+                    fds.pop().ok_or_else(|| {
+                        from_io_error(io::Error::other("register_files returned empty"))
+                    })
+                })
+        })?;
         Ok(Self {
             fd,
-            owner_worker_id,
-            shared,
+            owner_worker_id: ctx.scope.worker_id(),
+            shared: ctx.scope.shared(),
         })
     }
 
@@ -64,8 +62,11 @@ impl<'a> Drop for SocketToken<'a> {
     fn drop(&mut self) {
         let current_worker_id = self.shared.worker_id();
         if current_worker_id == self.owner_worker_id {
-            if let Some(ctx) = crate::runtime::context::try_current() {
-                let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);
+            if let Some(tls) = self.shared.context_tls.get() {
+                let extra = unsafe { &tls.as_ref().extra };
+                if let Some(driver) = extra.driver.borrow_mut().as_mut() {
+                    let _ = driver.unregister_files(vec![self.fd]);
+                }
             }
         } else {
             submit_control_task(self.shared, self.owner_worker_id, self.fd);
@@ -102,13 +103,12 @@ pub struct InnerSocket<'a, P: SocketTokenPtr<'a>> {
 
 impl<'a, P: SocketTokenPtr<'a>> InnerSocket<'a, P> {
     pub fn new(
+        ctx: &'a crate::runtime::context::RuntimeContext,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
-        owner_worker_id: usize,
-        shared: &'a RuntimeShared<()>,
     ) -> VeloqResult<Self> {
         Ok(Self {
-            token: P::new_ptr(SocketToken::new(handle, owner_worker_id, shared)?),
+            token: P::new_ptr(SocketToken::new(ctx, handle)?),
             local_addr,
             _marker: std::marker::PhantomData,
         })

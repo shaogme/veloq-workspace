@@ -1,5 +1,5 @@
 use super::open_options::OpenOptions;
-use crate::runtime::context::submit;
+use crate::runtime::context::RuntimeContext;
 
 use veloq_buf::FixedBuf;
 use veloq_driver_native::driver::Driver;
@@ -46,39 +46,42 @@ fn close_raw_handle(raw: RawHandle) {
     }
 }
 
-fn unregister_fixed_fd(fd: IoFd) {
-    if let Some(ctx) = crate::runtime::context::try_current() {
-        let _ = ctx.driver().borrow_mut().unregister_files(vec![fd]);
-    }
-}
+// fn unregister_fixed_fd is no longer needed globally
 
-pub struct LocalFile {
+pub struct LocalFile<'a> {
     pub(crate) raw: RawHandle,
     pub(crate) fd: IoFd,
-    pub(crate) submitter: LocalSubmitter,
+    pub(crate) submitter: LocalSubmitter<RuntimeContext>,
     pub(crate) pos: Cell<u64>,
+    pub(crate) ctx: &'a RuntimeContext,
 }
 
-pub struct File {
+pub struct File<'a> {
     pub(crate) raw: RawHandle,
     pub(crate) submitter: DetachedSubmitter,
     pub(crate) pos: AtomicU64,
+    pub(crate) ctx: &'a RuntimeContext,
 }
 
-impl Drop for LocalFile {
+impl<'a> Drop for LocalFile<'a> {
     fn drop(&mut self) {
-        unregister_fixed_fd(self.fd);
+        if let Some(tls) = self.ctx.scope.shared().context_tls.get() {
+            let extra = unsafe { &tls.as_ref().extra };
+            if let Some(driver) = extra.driver.borrow_mut().as_mut() {
+                let _ = driver.unregister_files(vec![self.fd]);
+            }
+        }
         close_raw_handle(self.raw);
     }
 }
 
-impl Drop for File {
+impl<'a> Drop for File<'a> {
     fn drop(&mut self) {
         close_raw_handle(self.raw);
     }
 }
 
-impl LocalFile {
+impl<'a> LocalFile<'a> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -112,7 +115,11 @@ impl LocalFile {
             buf_offset,
         };
 
-        let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, op) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         let buf = op.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
@@ -132,7 +139,11 @@ impl LocalFile {
             buf_offset,
         };
 
-        let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, op) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         let buf = op.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
@@ -145,7 +156,11 @@ impl LocalFile {
             datasync: false,
         };
 
-        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, _) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         res.map(|_| ()).map_err(from_driver_report)
     }
 
@@ -155,7 +170,11 @@ impl LocalFile {
             datasync: true,
         };
 
-        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, _) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         res.map(|_| ()).map_err(from_driver_report)
     }
 
@@ -167,12 +186,16 @@ impl LocalFile {
             len,
         };
 
-        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let (res, _) = self
+            .ctx
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
         res.map(|_| ()).map_err(from_driver_report)
     }
 }
 
-impl crate::io::AsyncBufRead for LocalFile {
+impl<'a> crate::io::AsyncBufRead for LocalFile<'a> {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
         let (n, buf) = self.read_at(buf, offset).await.map_err(to_io_error)?;
@@ -203,7 +226,7 @@ impl crate::io::AsyncBufRead for LocalFile {
     }
 }
 
-impl crate::io::AsyncBufWrite for LocalFile {
+impl<'a> crate::io::AsyncBufWrite for LocalFile<'a> {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
         let (n, buf) = self.write_at(buf, offset).await.map_err(to_io_error)?;
@@ -242,7 +265,7 @@ impl crate::io::AsyncBufWrite for LocalFile {
     }
 }
 
-impl File {
+impl<'a> File<'a> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -276,10 +299,9 @@ impl File {
             buf_offset,
         };
 
-        let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let buf = op.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
+        let owner = self.ctx.scope.worker_id();
+        let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
+        let buf = op.buf;
         Ok((res.map_err(from_driver_report)?, buf))
     }
 
@@ -296,10 +318,9 @@ impl File {
             buf_offset,
         };
 
-        let (res, op) = submit(&self.submitter, Op::new(op)).await.into_inner();
-        let buf = op.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
+        let owner = self.ctx.scope.worker_id();
+        let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
+        let buf = op.buf;
         Ok((res.map_err(from_driver_report)?, buf))
     }
 
@@ -309,7 +330,8 @@ impl File {
             datasync: false,
         };
 
-        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let owner = self.ctx.scope.worker_id();
+        let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
         res.map(|_| ()).map_err(from_driver_report)
     }
 
@@ -319,7 +341,8 @@ impl File {
             datasync: true,
         };
 
-        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let owner = self.ctx.scope.worker_id();
+        let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
         res.map(|_| ()).map_err(from_driver_report)
     }
 
@@ -331,7 +354,8 @@ impl File {
             len,
         };
 
-        let (res, _) = submit(&self.submitter, Op::new(op)).await.into_inner();
+        let owner = self.ctx.scope.worker_id();
+        let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
         res.map(|_| ()).map_err(from_driver_report)
     }
 
@@ -341,7 +365,7 @@ impl File {
 }
 
 pub struct SyncRangeBuilder<'a> {
-    file: &'a File,
+    file: &'a File<'a>,
     offset: u64,
     nbytes: u64,
     flags: u32,
@@ -414,16 +438,17 @@ impl<'a> IntoFuture for SyncRangeBuilder<'a> {
         };
 
         SyncRangeFuture {
-            inner: submit(&self.file.submitter, Op::new(op)),
+            inner: self.file.ctx.submit(&self.file.submitter, Op::new(op)),
             _marker: std::marker::PhantomData,
         }
     }
 }
 
 pub struct SyncRangeFuture<'a> {
-    inner:
-        <DetachedSubmitter as veloq_driver_native::op::OpSubmitter>::Future<FileSyncFileRangeRaw>,
-    _marker: std::marker::PhantomData<&'a File>,
+    inner: <DetachedSubmitter as veloq_driver_native::op::OpSubmitter<RuntimeContext>>::Future<
+        FileSyncFileRangeRaw,
+    >,
+    _marker: std::marker::PhantomData<&'a File<'a>>,
 }
 
 impl<'a> Future for SyncRangeFuture<'a> {
@@ -445,7 +470,7 @@ impl<'a> Future for SyncRangeFuture<'a> {
     }
 }
 
-impl crate::io::AsyncBufRead for File {
+impl<'a> crate::io::AsyncBufRead for File<'a> {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.load(Ordering::Relaxed);
         let (n, buf) = self.read_at(buf, offset).await.map_err(to_io_error)?;
@@ -476,7 +501,7 @@ impl crate::io::AsyncBufRead for File {
     }
 }
 
-impl crate::io::AsyncBufWrite for File {
+impl<'a> crate::io::AsyncBufWrite for File<'a> {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.load(Ordering::Relaxed);
         let (n, buf) = self.write_at(buf, offset).await.map_err(to_io_error)?;
@@ -515,32 +540,38 @@ impl crate::io::AsyncBufWrite for File {
     }
 }
 
-impl LocalFile {
-    pub async fn open(path: impl AsRef<Path>) -> VeloqResult<LocalFile> {
-        OpenOptions::new().read(true).open_local(path).await
+impl<'a> LocalFile<'a> {
+    pub async fn open(
+        ctx: &'a RuntimeContext,
+        path: impl AsRef<Path>,
+    ) -> VeloqResult<LocalFile<'a>> {
+        OpenOptions::new().read(true).open_local(ctx, path).await
     }
 
-    pub async fn create(path: impl AsRef<Path>) -> VeloqResult<LocalFile> {
+    pub async fn create(
+        ctx: &'a RuntimeContext,
+        path: impl AsRef<Path>,
+    ) -> VeloqResult<LocalFile<'a>> {
         OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open_local(path)
+            .open_local(ctx, path)
             .await
     }
 }
 
-impl File {
-    pub async fn open(path: impl AsRef<Path>) -> VeloqResult<File> {
-        OpenOptions::new().read(true).open(path).await
+impl<'a> File<'a> {
+    pub async fn open(ctx: &'a RuntimeContext, path: impl AsRef<Path>) -> VeloqResult<File<'a>> {
+        OpenOptions::new().read(true).open(ctx, path).await
     }
 
-    pub async fn create(path: impl AsRef<Path>) -> VeloqResult<File> {
+    pub async fn create(ctx: &'a RuntimeContext, path: impl AsRef<Path>) -> VeloqResult<File<'a>> {
         OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)
+            .open(ctx, path)
             .await
     }
 }
