@@ -50,8 +50,8 @@ impl<'scope, F> RoutedJobCell<'scope, F> {
 }
 
 struct SpawnToAccess<'scope, T, S_> {
-    task: NonNull<S_>,
-    _marker: std::marker::PhantomData<(&'scope (), T)>,
+    task: &'scope S_,
+    _marker: std::marker::PhantomData<T>,
 }
 
 impl<'scope, T, S_> RoutedTaskAccess<T> for SpawnToAccess<'scope, T, S_>
@@ -59,12 +59,7 @@ where
     S_: crate::task::SendTask<T> + Sized + 'scope,
 {
     fn take_result(&self) -> Result<T, TaskError> {
-        unsafe {
-            self.task
-                .as_ref()
-                .take_result()
-                .expect("task result already taken")
-        }
+        self.task.take_result().expect("task result already taken")
     }
 
     fn reclaim(self: Box<Self>, _arena: &dyn crate::task::Arena) {}
@@ -76,7 +71,7 @@ unsafe impl<'scope, T, S_> Send for SpawnToAccess<'scope, T, S_> where
 }
 
 pub(crate) fn make_spawn_to_access<'scope, T, S_>(
-    task: NonNull<S_>,
+    task: &'scope S_,
 ) -> Box<dyn RoutedTaskAccess<T> + 'scope>
 where
     T: 'scope,
@@ -89,8 +84,8 @@ where
 }
 
 struct BoxedTaskAccess<'scope, T, Fut> {
-    node: NonNull<crate::task::SendBoxedTaskNode<'scope, T, Fut>>,
-    _marker: std::marker::PhantomData<(&'scope (), T, Fut)>,
+    node: &'scope crate::task::SendBoxedTaskNode<'scope, T, Fut>,
+    _marker: std::marker::PhantomData<T>,
 }
 
 impl<'scope, T, Fut> RoutedTaskAccess<T> for BoxedTaskAccess<'scope, T, Fut>
@@ -99,18 +94,13 @@ where
     Fut: Future<Output = T> + 'scope,
 {
     fn take_result(&self) -> Result<T, TaskError> {
-        unsafe {
-            self.node
-                .as_ref()
-                .take_result()
-                .expect("task result already taken")
-        }
+        self.node.take_result().expect("task result already taken")
     }
 
     fn reclaim(self: Box<Self>, arena: &dyn crate::task::Arena) {
         let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'scope, T, Fut>>();
         unsafe {
-            arena.drop_object_raw(self.node.as_ptr() as *mut u8, layout);
+            arena.drop_object_raw(self.node as *const _ as *mut u8, layout);
         }
     }
 }
@@ -123,7 +113,7 @@ where
 }
 
 pub(crate) fn make_boxed_task_access<'scope, T, Fut>(
-    node: NonNull<crate::task::SendBoxedTaskNode<'scope, T, Fut>>,
+    node: &'scope crate::task::SendBoxedTaskNode<'scope, T, Fut>,
 ) -> Box<dyn RoutedTaskAccess<T> + 'scope>
 where
     T: Send + 'scope,
@@ -295,7 +285,7 @@ pub(crate) fn install_routed_pinned_task<'scope, T, Fut, TExtra>(
 
     state.set_ready(RoutedSpawnReady {
         task: task_ref,
-        access: make_boxed_task_access(unsafe { NonNull::new_unchecked(node_ptr) }),
+        access: make_boxed_task_access(node_ref),
     });
 }
 

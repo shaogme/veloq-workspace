@@ -336,7 +336,7 @@ macro_rules! define_task_infrastructure {
             #[inline]
             pub fn poll_task(&self, worker_id: usize) -> bool {
                 let header = unsafe { self.header.as_ref() };
-                unsafe { (header.vtable.poll)(self.header, worker_id) }
+                unsafe { (header.vtable.poll)(header, worker_id) }
             }
         }
 

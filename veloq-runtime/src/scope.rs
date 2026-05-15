@@ -389,7 +389,7 @@ where
 
                 state_for_job.set_ready(self::join::RoutedSpawnReady {
                     task: task_ref,
-                    access: self::join::make_spawn_to_access::<T, S_>(NonNull::from(task)),
+                    access: self::join::make_spawn_to_access::<T, S_>(task),
                 });
             },
         );

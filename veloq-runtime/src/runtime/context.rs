@@ -176,8 +176,11 @@ impl<T: RuntimeContextExtra> RuntimeScopeContext<T> {
                 &crate::task::TaskVTable {
                     wake: |_| {},
                     wake_by_ref: |_| {},
-                    poll: |data, worker_id| unsafe {
-                        let node = &*(data.as_ptr() as *const Self);
+                    poll: |header, worker_id| unsafe {
+                        let node = &*(header
+                            as *const crate::task::GenericTaskHeader<
+                                crate::utils::storage::AtomicStorage,
+                            > as *const Self);
                         crate::task::RawTask::poll_raw(node, worker_id)
                     },
                     drop: |data| unsafe {

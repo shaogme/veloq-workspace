@@ -422,8 +422,11 @@ pub(crate) fn submit_control_task(
         > = &veloq_runtime::task::TaskVTable {
             wake: |_| {},
             wake_by_ref: |_| {},
-            poll: |data, worker_id| unsafe {
-                let node = &*(data.as_ptr() as *const Self);
+            poll: |header, worker_id| unsafe {
+                let node = &*(header
+                    as *const veloq_runtime::task::GenericTaskHeader<
+                        veloq_runtime::utils::storage::AtomicStorage,
+                    > as *const Self);
                 veloq_runtime::task::RawTask::poll_raw(node, worker_id)
             },
             drop: |data| unsafe {

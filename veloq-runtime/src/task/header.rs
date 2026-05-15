@@ -22,8 +22,8 @@ pub enum PollStatus {
 
 pub struct TaskVTable<S: Storage> {
     pub wake: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
-    pub wake_by_ref: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
-    pub poll: unsafe fn(data: NonNull<GenericTaskHeader<S>>, worker_id: usize) -> bool,
+    pub wake_by_ref: unsafe fn(data: &GenericTaskHeader<S>),
+    pub poll: unsafe fn(data: &GenericTaskHeader<S>, worker_id: usize) -> bool,
     pub drop: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
 }
 
@@ -328,7 +328,7 @@ pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     },
     |data| unsafe {
         let header = GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
-        (header.as_ref().vtable.wake_by_ref)(header);
+        (header.as_ref().vtable.wake_by_ref)(header.as_ref());
     },
     |_data| {},
 );
@@ -341,7 +341,7 @@ pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     },
     |data| unsafe {
         let header = GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
-        (header.as_ref().vtable.wake_by_ref)(header);
+        (header.as_ref().vtable.wake_by_ref)(header.as_ref());
     },
     |_data| {},
 );

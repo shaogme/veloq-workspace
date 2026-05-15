@@ -93,20 +93,20 @@ where
                 S::enqueue(runtime, worker_id, data);
             }
         },
-        wake_by_ref: |data| unsafe {
-            let header = data.as_ref();
+        wake_by_ref: |header| unsafe {
             if let Some(runtime) = header.runtime_shared() {
                 let worker_id = header.worker_id.load(Ordering::Acquire);
                 if !S::IS_LOCAL && header.is_pinned() {
-                    let task = SendTaskRef::from_header(data.as_ptr() as *const _);
+                    let task =
+                        SendTaskRef::from_header(header as *const GenericTaskHeader<S> as *const _);
                     runtime.enqueue_pinned(worker_id, task);
                     return;
                 }
-                S::enqueue(runtime, worker_id, data);
+                S::enqueue(runtime, worker_id, NonNull::from(header));
             }
         },
-        poll: |data, worker_id| unsafe {
-            let node = &*(data.as_ptr() as *const Self);
+        poll: |header, worker_id| unsafe {
+            let node = &*(header as *const GenericTaskHeader<S> as *const Self);
             node.poll_raw(worker_id)
         },
         drop: |_| {},
