@@ -232,12 +232,14 @@ where
     fn finalize(&self, is_local: bool) {
         self.header.mark_completed_and_notify();
         
-        if self.header.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.header.acknowledge_completion();
-        }
+        let should_acknowledge = self.header.ref_count.fetch_sub(1, Ordering::AcqRel) == 1;
 
         if !is_local {
             self.header.exit_poll();
+        }
+
+        if should_acknowledge {
+            self.header.acknowledge_completion();
         }
     }
 }

@@ -83,10 +83,7 @@ impl<S: Storage> GenericArena<S> {
 
         let (ptr, chunk_ptr) = res.unwrap();
 
-        // 4. 增加活跃对象计数
-        unsafe {
-            (*chunk_ptr).active_count.fetch_add(1, Ordering::Relaxed);
-        }
+        // 4. 增加活跃对象计数 (已经在 try_alloc_fast/alloc_slow 中处理)
 
         // 5. 如果需要销毁，初始化 DropNode 并压入块内链表
         if let Some(drop_fn) = drop_fn {
@@ -138,20 +135,12 @@ impl<S: Storage> GenericArena<S> {
         }
 
         // 3. 减少计数并检查回收
-        if unsafe { (*chunk_ptr).active_count.fetch_sub(1, Ordering::AcqRel) == 1 } {
+        if unsafe { (*chunk_ptr).active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 } {
             self.reclaim_chunk(chunk_ptr);
         }
     }
 
     fn reclaim_chunk(&self, chunk_ptr: *mut GenericChunk<S>) {
-        // 如果是当前的活跃块，先尝试将其置为空
-        let _ = self.active_chunk.compare_exchange(
-            NonNull::new(chunk_ptr),
-            None,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
         let mut chunks = self.chunks.lock();
         unsafe {
             let mut cursor = chunks.cursor_mut_from_ptr(NonNull::new_unchecked(chunk_ptr));
@@ -165,9 +154,17 @@ impl<S: Storage> GenericArena<S> {
 
     fn try_alloc_fast(&self, layout: Layout) -> Option<(*mut u8, *mut GenericChunk<S>)> {
         if let Some(chunk_ptr) = self.active_chunk.load(Ordering::Acquire) {
-            let p = unsafe { chunk_ptr.as_ref().try_alloc(layout) };
-            if !p.is_null() {
-                return Some((p, chunk_ptr.as_ptr()));
+            let chunk = unsafe { chunk_ptr.as_ref() };
+            // 增加计数以确保在分配期间块不被回收
+            if chunk.active_count.fetch_add(1usize, Ordering::AcqRel) > 0 {
+                let p = chunk.try_alloc(layout);
+                if !p.is_null() {
+                    return Some((p, chunk_ptr.as_ptr()));
+                }
+                // 分配失败，减少计数
+                if chunk.active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 {
+                    self.reclaim_chunk(chunk_ptr.as_ptr());
+                }
             }
         }
         None
@@ -177,9 +174,16 @@ impl<S: Storage> GenericArena<S> {
     fn alloc_slow(&self, layout: Layout) -> (*mut u8, *mut GenericChunk<S>) {
         // Double-check
         if let Some(current_active) = self.active_chunk.load(Ordering::Acquire) {
-            let p = unsafe { current_active.as_ref().try_alloc(layout) };
-            if !p.is_null() {
-                return (p, current_active.as_ptr());
+            let a_ref = unsafe { current_active.as_ref() };
+            if a_ref.active_count.fetch_add(1usize, Ordering::AcqRel) > 0 {
+                let p = a_ref.try_alloc(layout);
+                if !p.is_null() {
+                    return (p, current_active.as_ptr());
+                }
+                // 分配失败，减少计数
+                if a_ref.active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 {
+                    self.reclaim_chunk(current_active.as_ptr());
+                }
             }
         }
 
@@ -196,12 +200,14 @@ impl<S: Storage> GenericArena<S> {
             ptr: NonNull::new(ptr).unwrap(),
             layout: new_chunk_layout,
             used: S::Usize::new(0),
-            active_count: S::Usize::new(0),
+            active_count: S::Usize::new(1), // 初始计数为 1，代表被 Arena 的 active_chunk 引用
             drop_head: S::Lock::new(LinkedList::new(DropAdapter::<S>::new())),
         });
 
-        let allocated_ptr = new_chunk.try_alloc(layout);
-        let chunk_ptr = Box::into_raw(new_chunk);
+        let chunk_ptr: *mut GenericChunk<S> = Box::into_raw(new_chunk);
+        let allocated_ptr = unsafe { (*chunk_ptr).try_alloc(layout) };
+        // 增加对象计数
+        unsafe { (*chunk_ptr).active_count.fetch_add(1usize, Ordering::Relaxed); }
 
         {
             let mut chunks = self.chunks.lock();
@@ -217,7 +223,25 @@ impl<S: Storage> GenericArena<S> {
                 let a_ref = unsafe { a.as_ref() };
                 let used = a_ref.used.load(Ordering::Acquire);
                 if a_ref.layout.size().saturating_sub(used) >= layout.size() + layout.align() {
-                    break;
+                    // 另一个线程已经提供了一个合适的 chunk。
+                    // 我们可以放弃当前的 new_chunk（减少其 active 引用）。
+                    unsafe {
+                        if (*chunk_ptr).active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 {
+                            self.reclaim_chunk(chunk_ptr);
+                        }
+                    }
+                    // 尝试从当前的 active 分配（需要锁定/引用）
+                    if a_ref.active_count.fetch_add(1usize, Ordering::AcqRel) > 0 {
+                        let p = a_ref.try_alloc(layout);
+                        if !p.is_null() {
+                            return (p, a.as_ptr());
+                        }
+                        // 分配失败，减少计数
+                        if a_ref.active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 {
+                            self.reclaim_chunk(a.as_ptr());
+                        }
+                    }
+                    // 如果分配失败，继续尝试将 new_chunk 设为 active
                 }
             }
             match self.active_chunk.compare_exchange_weak(
@@ -226,7 +250,16 @@ impl<S: Storage> GenericArena<S> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(old_active) => {
+                    if let Some(old) = old_active {
+                        unsafe {
+                            if old.as_ref().active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 {
+                                self.reclaim_chunk(old.as_ptr());
+                            }
+                        }
+                    }
+                    break;
+                }
                 Err(actual) => active = actual,
             }
         }
