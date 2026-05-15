@@ -31,7 +31,7 @@ impl Future for PendingFuture {
 #[test]
 fn test_select_basic() {
     let rt = Runtime::new();
-    rt.block_on(async {
+    rt.block_on(async |_| {
         let res = select! {
             val = ready(1) => val,
             _ = PendingFuture => 2,
@@ -44,7 +44,7 @@ fn test_select_basic() {
 fn test_select_biased() {
     // Both are ready immediately. First one should win.
     let rt = Runtime::new();
-    rt.block_on(async {
+    rt.block_on(async |_| {
         let res = select! {
             val = ready(10) => val,
             val2 = ready(20) => val2,
@@ -57,7 +57,7 @@ fn test_select_biased() {
 fn test_select_biased_reverse() {
     // Both are ready immediately. First one declared (which is ready(20)) should win.
     let rt = Runtime::new();
-    rt.block_on(async {
+    rt.block_on(async |_| {
         let res = select! {
             val = ready(20) => val,
             val2 = ready(10) => val2,
@@ -70,7 +70,7 @@ fn test_select_biased_reverse() {
 fn test_select_expression() {
     // Test using complex expressions in select
     let rt = Runtime::new();
-    rt.block_on(async {
+    rt.block_on(async |_| {
         let res = select! {
             v = async { 5 + 5 } => v,
             _ = PendingFuture => 0,
@@ -82,7 +82,7 @@ fn test_select_expression() {
 #[test]
 fn test_select_three_branches() {
     let rt = Runtime::new();
-    rt.block_on(async {
+    rt.block_on(async |_| {
         let res = select! {
             _ = PendingFuture => 1,
             _ = PendingFuture => 2,
@@ -94,12 +94,11 @@ fn test_select_three_branches() {
 
 #[test]
 fn test_select_cancellation() {
-    use veloq_runtime::scope;
     use veloq_runtime::task::TaskError;
 
     let rt = Runtime::new();
-    rt.block_on(async {
-        scope!(s, {
+    rt.block_on(async |ctx| {
+        ctx.scope(async |s| {
             let handle = s.spawn_boxed(async {
                 select! {
                     _ = PendingFuture => (),
@@ -115,6 +114,7 @@ fn test_select_cancellation() {
                 Err(TaskError::Cancelled) => {}
                 _ => panic!("Expected TaskError::Cancelled, got {:?}", res),
             }
-        });
+        })
+        .await;
     });
 }

@@ -1,11 +1,11 @@
-use super::context::{CONTEXT, current_worker_id};
+use super::context::{CONTEXT, IdleHook, WorkerTickHook, current_worker_id};
 use super::coordinator::RuntimeProgressCoordinator;
 use super::primitives::{self, EventCount, Unparker};
 use crate::scope::GenericScopeCompletion;
 use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::Storage;
-use crate::utils::{AtomicOptionPtr, Deque, Steal};
+use crate::utils::{AtomicOptionPtr, Deque, FastRand, Steal};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -278,6 +278,7 @@ impl TaskScheduler {
         thief_id: usize,
         registry: &WorkerRegistry,
         topo: &TopologyContext,
+        rand: &FastRand,
     ) -> Option<SendTaskRef> {
         let thief_worker = &registry.workers[thief_id];
         let num_workers = registry.workers.len();
@@ -289,12 +290,7 @@ impl TaskScheduler {
         let group = &topo.groups[group_idx];
 
         if group.worker_ids.len() > 1 {
-            let start = CONTEXT.with(|ctx| {
-                ctx.borrow()
-                    .as_ref()
-                    .map(|c| c.rand.borrow_mut().next_u32(group.worker_ids.len() as u32) as usize)
-                    .unwrap_or(0)
-            });
+            let start = rand.next_u32(group.worker_ids.len() as u32) as usize;
 
             for i in 0..group.worker_ids.len() {
                 let victim = group.worker_ids[(start + i) % group.worker_ids.len()];
@@ -306,7 +302,7 @@ impl TaskScheduler {
                     .steal_batch(&thief_worker.deque)
                 {
                     Steal::Success(task) => return Some(task),
-                    Steal::Retry => return self.steal_send(thief_id, registry, topo),
+                    Steal::Retry => return self.steal_send(thief_id, registry, topo, rand),
                     Steal::Empty => continue,
                 }
             }
@@ -316,12 +312,7 @@ impl TaskScheduler {
             return Some(task);
         }
 
-        let start_group = CONTEXT.with(|ctx| {
-            ctx.borrow()
-                .as_ref()
-                .map(|c| c.rand.borrow_mut().next_u32(topo.groups.len() as u32) as usize)
-                .unwrap_or(0)
-        });
+        let start_group = rand.next_u32(topo.groups.len() as u32) as usize;
 
         for i in 0..topo.groups.len() {
             let other_group_idx = (start_group + i) % topo.groups.len();
@@ -335,7 +326,7 @@ impl TaskScheduler {
                     .steal_batch(&thief_worker.deque)
                 {
                     Steal::Success(task) => return Some(task),
-                    Steal::Retry => return self.steal_send(thief_id, registry, topo),
+                    Steal::Retry => return self.steal_send(thief_id, registry, topo, rand),
                     Steal::Empty => continue,
                 }
             }
@@ -356,17 +347,28 @@ pub struct RuntimeShared {
     pub(crate) scheduler: TaskScheduler,
     pub(crate) idle: IdleController,
     pub(crate) shutdown: AtomicBool,
+    pub(crate) idle_hook: Option<IdleHook>,
+    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 pub(crate) struct RuntimeSharedComponents {
-    pub(crate) shared: RuntimeShared,
+    pub(crate) registry: WorkerRegistry,
+    pub(crate) topo: TopologyContext,
     pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
     pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
+    pub(crate) worker_count: NonZeroUsize,
+    pub(crate) idle_hook: Option<IdleHook>,
+    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 impl RuntimeSharedComponents {
-    pub(crate) fn new(worker_count: NonZeroUsize, queue_capacity: NonZeroUsize) -> Self {
+    pub(crate) fn new(
+        worker_count: NonZeroUsize,
+        queue_capacity: NonZeroUsize,
+        idle_hook: Option<IdleHook>,
+        worker_tick_hook: Option<WorkerTickHook>,
+    ) -> Self {
         let worker_count_val = worker_count.get();
         let mut unparkers = Vec::with_capacity(worker_count_val);
         let mut parker_inners = Vec::with_capacity(worker_count_val);
@@ -430,37 +432,53 @@ impl RuntimeSharedComponents {
             }
         }
 
-        Self {
-            shared: RuntimeShared {
-                registry: WorkerRegistry {
-                    workers,
-                    unparkers,
-                    parker_inners,
-                },
-                topo: TopologyContext {
-                    groups,
-                    worker_to_group,
-                    next_idle,
-                },
-                scheduler: TaskScheduler {
-                    injector: GlobalInjector::new(),
-                    next_worker: AtomicUsize::new(0),
-                    searching_workers: AtomicUsize::new(0),
-                },
-                idle: IdleController {
-                    idle_mask: AtomicBitset::new(worker_count_val),
-                    event_count: EventCount::new(),
-                },
-                shutdown: AtomicBool::new(false),
+        RuntimeSharedComponents {
+            registry: WorkerRegistry {
+                workers,
+                unparkers,
+                parker_inners,
+            },
+            topo: TopologyContext {
+                groups,
+                worker_to_group,
+                next_idle,
             },
             local_receivers,
             remote_receivers,
             pinned_receivers,
+            worker_count,
+            idle_hook,
+            worker_tick_hook,
         }
     }
 }
 
 impl RuntimeShared {
+    pub(crate) fn new(components: RuntimeSharedComponents) -> Self {
+        Self {
+            registry: components.registry,
+            topo: components.topo,
+            scheduler: TaskScheduler {
+                injector: GlobalInjector::new(),
+                next_worker: AtomicUsize::new(0),
+                searching_workers: AtomicUsize::new(0),
+            },
+            idle: IdleController {
+                idle_mask: AtomicBitset::new(components.worker_count.get()),
+                event_count: EventCount::new(),
+            },
+            shutdown: AtomicBool::new(false),
+            idle_hook: components.idle_hook,
+            worker_tick_hook: components.worker_tick_hook,
+        }
+    }
+}
+
+impl RuntimeShared {
+    pub fn unparkers(&self) -> Vec<Unparker> {
+        self.registry.unparkers.clone()
+    }
+
     pub fn choose_worker(&self) -> usize {
         self.topo.choose_worker(&self.scheduler.next_worker)
     }
@@ -478,9 +496,15 @@ impl RuntimeShared {
         if task.header().try_mark_queued() {
             let worker = &self.registry.workers[worker_id];
             worker.local_count.fetch_add(1, Ordering::Release);
-            let _ = worker.local_tx.send(task);
-            self.idle.event_count.notify();
-            self.notify_work(worker_id);
+            if worker.local_tx.send(task).is_err() {
+                worker.local_count.fetch_sub(1, Ordering::Release);
+                if task.header().clear_queued() {
+                    task.header().acknowledge_completion();
+                }
+            } else {
+                self.idle.event_count.notify();
+                self.wake_worker(worker_id);
+            }
         }
     }
 
@@ -496,14 +520,18 @@ impl RuntimeShared {
             worker.pinned_count.fetch_add(1, Ordering::Release);
             if worker.pinned_tx.send(task).is_err() {
                 worker.pinned_count.fetch_sub(1, Ordering::Release);
+                if task.header().clear_queued() {
+                    task.header().acknowledge_completion();
+                }
                 return false;
             }
-            self.notify_work(worker_id);
+            self.wake_worker(worker_id);
         }
         true
     }
 
-    fn notify_work(&self, worker_id: usize) {
+    #[inline]
+    pub fn wake_worker(&self, worker_id: usize) {
         self.registry.unpark(worker_id);
     }
 
@@ -531,12 +559,12 @@ impl RuntimeShared {
                     )
                     .is_ok()
                 {
-                    self.notify_work(worker_id);
+                    self.wake_worker(worker_id);
                     return;
                 }
 
                 if worker.deque.push(task).is_ok() {
-                    self.notify_work(worker_id);
+                    self.wake_worker(worker_id);
                     return;
                 }
             }
@@ -545,7 +573,7 @@ impl RuntimeShared {
             if worker.remote_tx.send(task).is_err() {
                 self.scheduler.injector.push(task);
             }
-            self.notify_work(worker_id);
+            self.wake_worker(worker_id);
         }
     }
 
@@ -581,19 +609,25 @@ impl RuntimeShared {
         self.scheduler.pop_global()
     }
 
-    fn steal_send(&self, thief_id: usize) -> Option<SendTaskRef> {
+    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef> {
         self.scheduler
-            .steal_send(thief_id, &self.registry, &self.topo)
+            .steal_send(thief_id, &self.registry, &self.topo, rand)
     }
 
     fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
-        task.header().clear_queued();
-        let _ = task.poll_task(worker_id);
+        if task.header().clear_queued() {
+            task.header().acknowledge_completion();
+        } else {
+            let _ = task.poll_task(worker_id);
+        }
     }
 
     pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) {
-        task.header().clear_queued();
-        let _ = task.poll_task(worker_id);
+        if task.header().clear_queued() {
+            task.header().acknowledge_completion();
+        } else {
+            let _ = task.poll_task(worker_id);
+        }
     }
 
     pub fn shutdown(&self) {
@@ -617,103 +651,103 @@ impl RuntimeShared {
     ) {
         let worker_id = current_worker_id();
 
-        CONTEXT.with(|ctx| {
-            let ctx = ctx.borrow();
-            let ctx = ctx.as_ref().expect("runtime context missing");
-            let worker_tick_hook = ctx.worker_tick_hook;
+        let ctx = CONTEXT.get().expect("runtime context missing");
+        let ctx = unsafe { ctx.as_ref() };
 
-            let waker = primitives::create_unpark_waker(self.registry.unparkers[worker_id].clone());
-            let mut init_cx = Context::from_waker(&waker);
+        let worker_tick_hook = self.worker_tick_hook;
 
-            let mut tick = 0u32;
-            const INJECTOR_CHECK_INTERVAL: u32 = 61;
+        let waker = primitives::create_unpark_waker(self.registry.unparkers[worker_id].clone());
+        let mut init_cx = Context::from_waker(&waker);
 
-            while init_fut.is_some() || !self.shutdown.load(Ordering::Acquire) {
-                let mut progressed = false;
+        let mut tick = 0u32;
+        const INJECTOR_CHECK_INTERVAL: u32 = 61;
 
-                crate::runtime::route::drain_pending_worker_route_jobs();
+        while init_fut.is_some() || !self.shutdown.load(Ordering::Acquire) {
+            let mut progressed = false;
 
-                if let Some(hook) = worker_tick_hook {
-                    hook();
-                }
-
-                if let Some(fut) = init_fut.as_mut() {
-                    match fut.as_mut().poll(&mut init_cx) {
-                        Poll::Ready(()) => {
-                            init_fut = None;
-                            progressed = true;
-                            if completion.is_none() && worker_id == 0 {
-                                return;
-                            }
-                        }
-                        Poll::Pending => {}
-                    }
-                }
-
-                if init_fut.is_none() && completion.map(|c| c.is_done()).unwrap_or(false) {
-                    return;
-                }
-
-                if init_fut.is_none() && completion.is_none() && worker_id == 0 {
-                    return;
-                }
-
-                tick = tick.wrapping_add(1);
-
-                if let Some(task) = self.pop_send(worker_id) {
-                    self.poll_send_task(worker_id, task);
-                    progressed = true;
-                }
-
-                if !progressed && let Some(task) = self.pop_pinned(worker_id, &ctx.pinned_rx) {
-                    self.poll_send_task(worker_id, task);
-                    progressed = true;
-                }
-
-                if !progressed && let Some(task) = self.pop_local(worker_id, &ctx.local_rx) {
-                    self.poll_local_task(worker_id, task);
-                    progressed = true;
-                }
-
-                if !progressed
-                    && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
-                    && let Some(task) = self.pop_global()
-                {
-                    self.poll_send_task(worker_id, task);
-                    progressed = true;
-                }
-
-                if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
-                    self.poll_send_task(worker_id, task);
-                    progressed = true;
-                }
-
-                if progressed {
-                    continue;
-                }
-
-                self.scheduler
-                    .searching_workers
-                    .fetch_add(1, Ordering::Relaxed);
-                for _ in 0..4 {
-                    if let Some(task) = self.steal_send(worker_id) {
-                        self.poll_send_task(worker_id, task);
-                        progressed = true;
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
-                self.scheduler
-                    .searching_workers
-                    .fetch_sub(1, Ordering::Relaxed);
-
-                if progressed {
-                    continue;
-                }
-
-                RuntimeProgressCoordinator::new(self, worker_id).run(completion);
+            if let Some(hook) = worker_tick_hook {
+                hook();
             }
-        });
+
+            if let Some(fut) = init_fut.as_mut() {
+                match fut.as_mut().poll(&mut init_cx) {
+                    Poll::Ready(()) => {
+                        init_fut = None;
+                        progressed = true;
+                        if completion.is_none() && worker_id == 0 {
+                            return;
+                        }
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            if init_fut.is_none() && completion.map(|c| c.is_done()).unwrap_or(false) {
+                return;
+            }
+
+            if init_fut.is_none() && completion.is_none() && worker_id == 0 {
+                return;
+            }
+
+            tick = tick.wrapping_add(1);
+
+            if let Some(task) = self.pop_send(worker_id) {
+                self.poll_send_task(worker_id, task);
+                progressed = true;
+            }
+
+            if !progressed && let Some(task) = self.pop_pinned(worker_id, &ctx.pinned_rx) {
+                self.poll_send_task(worker_id, task);
+                progressed = true;
+            }
+
+            if !progressed && let Some(task) = self.pop_local(worker_id, &ctx.local_rx) {
+                self.poll_local_task(worker_id, task);
+                progressed = true;
+            }
+
+            if !progressed
+                && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
+                && let Some(task) = self.pop_global()
+            {
+                self.poll_send_task(worker_id, task);
+                progressed = true;
+            }
+
+            if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
+                self.poll_send_task(worker_id, task);
+                progressed = true;
+            }
+
+            if progressed {
+                continue;
+            }
+
+            self.scheduler
+                .searching_workers
+                .fetch_add(1, Ordering::Relaxed);
+            for _ in 0..4 {
+                if let Some(task) = self.steal_send(worker_id, &ctx.rand) {
+                    self.poll_send_task(worker_id, task);
+                    progressed = true;
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            self.scheduler
+                .searching_workers
+                .fetch_sub(1, Ordering::Relaxed);
+
+            if progressed {
+                continue;
+            }
+
+            if let Some(c) = completion {
+                c.register(&waker);
+            }
+            RuntimeProgressCoordinator::new(self, worker_id).run(completion);
+        }
     }
 
     pub(crate) fn has_work(&self, worker_id: usize) -> bool {

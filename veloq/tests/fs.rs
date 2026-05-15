@@ -7,7 +7,6 @@ use veloq::fs::{File, LocalFile};
 use veloq::io::{AsyncBufRead, AsyncBufWrite};
 use veloq::runtime::{Runtime, context};
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
-use veloq_runtime::scope;
 
 struct CleanupGuard(PathBuf);
 
@@ -40,7 +39,7 @@ fn create_runtime() -> Runtime<UniformSlot> {
 fn test_file_integrity() {
     for size in [nz!(8192), nz!(16384), nz!(65536)] {
         let runtime = create_runtime();
-        runtime.block_on(async move {
+        runtime.block_on(async |_| {
             let file_path = format!("test_file_integrity_{:?}.tmp", size);
             let _guard = CleanupGuard::new(&file_path);
 
@@ -77,8 +76,8 @@ fn test_multithread_file_ops() {
 
     let runtime = create_runtime();
     let completion_count_for_runtime = completion_count.clone();
-    runtime.block_on(async move {
-        scope!(s, {
+    runtime.block_on(async |ctx| {
+        ctx.scope(async |s| {
             for i in 0..NUM_TASKS {
                 let counter = completion_count_for_runtime.clone();
                 s.spawn_boxed(async move {
@@ -113,7 +112,8 @@ fn test_multithread_file_ops() {
                     counter.fetch_add(1, Ordering::SeqCst);
                 });
             }
-        });
+        })
+        .await;
     });
 
     assert_eq!(completion_count.load(Ordering::SeqCst), NUM_TASKS);
@@ -123,7 +123,7 @@ fn test_multithread_file_ops() {
 fn test_fs_read_exact_write_all() {
     let runtime = create_runtime();
 
-    runtime.block_on(async move {
+    runtime.block_on(async |_| {
         let path = "test_fs_exact.tmp";
         let _guard = CleanupGuard::new(path);
 

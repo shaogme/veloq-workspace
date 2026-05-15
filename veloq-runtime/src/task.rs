@@ -11,12 +11,13 @@ pub use header::{
 };
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
-    AnyScopeCompletionRef, CURRENT_SCOPE, ErasedCancellationToken, OpaqueScope, OpaqueToken,
-    ScopeCompletionRef, ScopeGuard,
+    AnyScopeCompletionRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, ScopeCompletionRef,
 };
 
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, StateOptionPtr, Storage};
+use crate::utils::storage::{
+    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage,
+};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -63,6 +64,7 @@ impl IntoAnyScope for ScopeCompletionRef<AtomicStorage> {
 
 pub trait RuntimeContextExt {
     fn is_cancelled(&self) -> bool;
+    fn scope_completion(&self) -> Option<AnyScopeCompletionRef>;
 }
 
 impl RuntimeContextExt for Context<'_> {
@@ -76,10 +78,27 @@ impl RuntimeContextExt for Context<'_> {
             {
                 return h.is_cancelled();
             }
-            if let Some(scope) = scope::CURRENT_SCOPE.with(|s| s.borrow().clone()) {
-                return scope.is_cancelled();
-            }
             false
+        }
+    }
+
+    fn scope_completion(&self) -> Option<AnyScopeCompletionRef> {
+        unsafe {
+            if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
+                let ptr = h.scope_ptr.load(Ordering::Acquire)?;
+                let vtable_ptr = h.scope_vtable.load(Ordering::Acquire)?;
+                let scope_ref = ScopeCompletionRef::from_parts(ptr, vtable_ptr.as_ref());
+                return Some(scope_ref.into_any());
+            }
+            if let Some(h) =
+                LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
+            {
+                let ptr = h.scope_ptr.load(Ordering::Acquire)?;
+                let vtable_ptr = h.scope_vtable.load(Ordering::Acquire)?;
+                let scope_ref = ScopeCompletionRef::from_parts(ptr, vtable_ptr.as_ref());
+                return Some(scope_ref.into_any());
+            }
+            None
         }
     }
 }
@@ -214,19 +233,15 @@ where
 
     fn finalize(&self, is_local: bool) {
         self.header.mark_completed_and_notify();
-        self.header.clear_queued();
-        let ptr = self.header.scope_ptr.swap(None, Ordering::AcqRel);
-        let vtable_ptr = self.header.scope_vtable.swap(None, Ordering::AcqRel);
 
-        if let (Some(ptr), Some(vtable_ptr)) = (ptr, vtable_ptr) {
-            unsafe {
-                let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
-                scope_ref.task_done();
-                drop(scope_ref);
-            }
-        }
+        let should_acknowledge = self.header.ref_count.fetch_sub(1, Ordering::AcqRel) == 1;
+
         if !is_local {
             self.header.exit_poll();
+        }
+
+        if should_acknowledge {
+            self.header.acknowledge_completion();
         }
     }
 }
@@ -252,20 +267,6 @@ where
         PollStatus::Complete => return true,
     }
 
-    // 设置当前作用域上下文，用于嵌套作用域自动建立父子关系
-    let _scope_guard = match (
-        header.scope_ptr.load(Ordering::Acquire),
-        header.scope_vtable.load(Ordering::Acquire),
-    ) {
-        (Some(ptr), Some(vtable_ptr)) => {
-            let scope_ref =
-                unsafe { ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref()) };
-            let guard = scope::ScopeGuard::enter(scope_ref.clone().into_any());
-            std::mem::forget(scope_ref);
-            Some(guard)
-        }
-        _ => None,
-    };
     loop {
         if header.is_cancelled() {
             finalizer.complete(Err(TaskError::Cancelled), is_local);

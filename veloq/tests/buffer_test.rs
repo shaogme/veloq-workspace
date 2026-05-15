@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 
 use veloq::config::BufferRegistrationMode;
-use veloq::runtime::{Runtime, context, scope};
+use veloq::runtime::{Runtime, context};
 use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 #[cfg(feature = "test-hooks")]
@@ -25,7 +25,7 @@ fn current_chunk_register_attempts() -> u64 {
 
 fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
     let runtime = build_runtime(1, mode);
-    runtime.block_on(async move {
+    runtime.block_on(async |_| {
         let pool = context::current_pool().expect("buffer pool not found");
         let alloc_size = nz!(1024 * 1024);
 
@@ -73,7 +73,7 @@ fn run_expansion_immediate_registration_check(
     _should_immediate: bool,
 ) {
     let runtime = build_runtime(1, mode);
-    runtime.block_on(async move {
+    runtime.block_on(async |_| {
         let pool = context::current_pool().expect("buffer pool not found");
         let alloc_size = nz!(1024 * 1024);
 
@@ -123,7 +123,7 @@ fn run_expansion_immediate_registration_check(
 
 fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
     let runtime = build_runtime(2, mode);
-    runtime.block_on(async move {
+    runtime.block_on(async |ctx| {
         let pool = context::current_pool().expect("no pool");
         let alloc_size = nz!(1024 * 1024);
 
@@ -148,7 +148,7 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
         }
         let expanded_id = expanded_chunk_id.expect("worker0 did not trigger pool auto expansion");
 
-        scope!(s, {
+        ctx.scope(async |s| {
             let mut handles = Vec::new();
             for _ in 0..4 {
                 handles.push(s.spawn_boxed(async move {
@@ -168,7 +168,8 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
                     "worker chunk_id should be on or after expanded chunk"
                 );
             }
-        });
+        })
+        .await;
     });
 }
 

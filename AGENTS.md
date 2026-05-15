@@ -15,19 +15,6 @@ When making modifications to this repository, please adhere to the following str
 5. **绝对路径**：使用文件修改工具时（如 `write_to_file`、`replace_file_content`），**必须**使用**绝对路径**。
 6. **Rust Edition 2024**：充分利用 Rust 2024 新特性，特别是异步闭包和 `AsyncFnOnce` / `AsyncFnMut` / `AsyncFn`，避免手动装箱 `Future`。
 
-## alloy-check 使用规范 (Alloy Check Usage)
-
-- **Windows 运行方法**：`alloy-check` 在 Windows 下运行的唯一正确方式是：
-  ```powershell
-  $out = (alloy-check | Out-String); if($out.Length -gt 10000){$out.Substring(0,10000) + "...[Truncated]"}else{$out}
-  ```
-- **文档说明**：`alloy-check` 不需要任何额外文档，以运行结果为准。
-- **搜索限制**：严禁在当前目录搜索 `alloy` 或 `alloy-check` 关键字。
-- **禁止操作**：
-  - 严禁运行 `Get-Command alloy-check`。
-  - 严禁直接运行 `alloy-check`。
-  - 未明确要求时，严禁运行任何包含 `alloy-check` 的命令。
-
 ## 跨平台执行统一入口 (Unified Cross-Platform Entrypoint)
 
 所有 Linux/Windows 目标的 `test / clippy / check` **一律交给 `xtest-runner`**，并通过 `.cargo/config.toml` 别名调用，禁止自行拼接跨平台脚本命令。

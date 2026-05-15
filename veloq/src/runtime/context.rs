@@ -4,7 +4,7 @@ use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_driver_native::driver::{DriveMode, Driver, DriverControlCommand, PlatformDriver};
+use veloq_driver_native::driver::{DriveMode, Driver, PlatformDriver};
 use veloq_driver_native::op::{DetachedSubmitter, IntoPlatformOp, Op, OpSubmitter};
 
 use crate::config::{BufferRegistrationMode, Config};
@@ -17,9 +17,6 @@ thread_local! {
 
     /// 线程局部的注册中心状态
     static REGISTRAR_STATE: RefCell<Option<WorkerRegistrarState>> = const { RefCell::new(None) };
-
-    /// 线程局部的驱动控制命令状态
-    static DRIVER_COMMAND_STATE: RefCell<Option<WorkerDriverCommandState>> = const { RefCell::new(None) };
 }
 
 /// 驱动注册中心的消息类型
@@ -36,10 +33,6 @@ struct WorkerRegistrarState {
     chunks: Vec<veloq_buf::heap::ChunkInfo>,
 }
 
-struct WorkerDriverCommandState {
-    receiver: mpsc::Receiver<DriverControlCommand>,
-}
-
 /// 初始化当前 Worker 线程的注册中心状态
 pub(crate) fn init_worker_registrar_state(receiver: mpsc::Receiver<RegistrarMessage>) {
     REGISTRAR_STATE.with(|state| {
@@ -48,31 +41,6 @@ pub(crate) fn init_worker_registrar_state(receiver: mpsc::Receiver<RegistrarMess
             chunks: Vec::new(),
         });
     });
-}
-
-pub(crate) fn init_worker_driver_command_state(receiver: mpsc::Receiver<DriverControlCommand>) {
-    DRIVER_COMMAND_STATE.with(|state| {
-        *state.borrow_mut() = Some(WorkerDriverCommandState { receiver });
-    });
-}
-
-#[derive(Clone)]
-pub(crate) struct DriverCommandDispatcher {
-    senders: Vec<mpsc::Sender<DriverControlCommand>>,
-}
-
-impl DriverCommandDispatcher {
-    pub(crate) fn new(senders: Vec<mpsc::Sender<DriverControlCommand>>) -> Self {
-        Self { senders }
-    }
-
-    pub fn dispatch(&self, worker_id: usize, command: DriverControlCommand) {
-        if let Some(sender) = self.senders.get(worker_id)
-            && sender.send(command).is_ok()
-        {
-            veloq_runtime::runtime::wake_worker(worker_id);
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -231,7 +199,6 @@ pub struct RuntimeContext {
     driver: Rc<RefCell<PlatformDriver>>,
     config: Config,
     registrar: DriverRegistrar,
-    driver_commands: DriverCommandDispatcher,
 }
 
 impl RuntimeContext {
@@ -240,14 +207,12 @@ impl RuntimeContext {
         buf_pool: AnyBufPool,
         config: Config,
         registrar: DriverRegistrar,
-        driver_commands: DriverCommandDispatcher,
     ) -> Self {
         Self {
             buf_pool,
             driver,
             config,
             registrar,
-            driver_commands,
         }
     }
 
@@ -274,11 +239,6 @@ impl RuntimeContext {
     #[inline]
     pub(crate) fn driver_bridge(&self) -> RuntimeDriverBridge {
         RuntimeDriverBridge::new(self.driver.clone(), self.registrar.clone())
-    }
-
-    #[inline]
-    pub(crate) fn driver_commands(&self) -> DriverCommandDispatcher {
-        self.driver_commands.clone()
     }
 }
 
@@ -344,38 +304,6 @@ pub fn wait_current_driver() -> IdleDecision {
     ctx.driver_bridge().drive_wait()
 }
 
-pub(crate) fn drain_pending_driver_commands() {
-    let Some(ctx) = try_current() else {
-        return;
-    };
-
-    DRIVER_COMMAND_STATE.with(|state_cell| {
-        let mut state_opt = state_cell.borrow_mut();
-        let Some(state) = state_opt.as_mut() else {
-            return;
-        };
-
-        let mut pending = Vec::new();
-        while let Ok(command) = state.receiver.try_recv() {
-            pending.push(command);
-        }
-
-        if pending.is_empty() {
-            return;
-        }
-
-        let driver_rc = ctx.driver();
-        let mut driver = driver_rc.borrow_mut();
-        for command in pending {
-            match command {
-                DriverControlCommand::UnregisterFiles(files) => {
-                    let _ = driver.unregister_files(files);
-                }
-            }
-        }
-    });
-}
-
 pub fn submit<'a, S, T>(submitter: &'a S, op: Op<T>) -> S::Future<T>
 where
     S: OpSubmitter + Copy + 'a,
@@ -398,7 +326,8 @@ pub async fn yield_now() {
     veloq_runtime::task::yield_now().await;
 }
 
-pub async fn submit_to<T>(
+pub async fn submit_to<'a, T>(
+    ctx: &veloq_runtime::runtime::RuntimeScopeContext,
     worker_id: usize,
     op: Op<T>,
 ) -> VeloqResult<(
@@ -413,22 +342,90 @@ where
             <PlatformDriver as Driver>::Op,
             DriverCompletion = <PlatformDriver as Driver>::Completion,
             ErasedPayload = <PlatformDriver as Driver>::UP,
-        > + Send,
+        > + Send
+        + 'a,
 {
     if veloq_runtime::runtime::current_worker_id() == worker_id {
         let (res, op_back) = submit(&DetachedSubmitter::new(), op).await.into_inner();
         let op = op_back.expect("Op lost in local submit");
         Ok((res, op))
     } else {
-        let routed = veloq_runtime::runtime::route::route_to_worker(worker_id, move || {
-            let ctx = current();
-            let driver_rc = ctx.driver();
-            let mut driver = driver_rc.borrow_mut();
-            op.submit_detached(&mut *driver)
-        })
-        .map_err(from_io_error)?;
+        let routed = ctx
+            .route_to(worker_id, move || {
+                let ctx = current();
+                let driver_rc = ctx.driver();
+                let mut driver = driver_rc.borrow_mut();
+                op.submit_detached(&mut *driver)
+            })
+            .map_err(from_io_error)?;
         let (res, op_back) = routed.await.into_inner();
         let op = op_back.expect("Op lost in remote submit");
         Ok((res, op))
+    }
+}
+
+pub(crate) fn submit_control_task(
+    shared: &veloq_runtime::runtime::shared::RuntimeShared,
+    worker_id: usize,
+    fd: veloq_driver_native::op::IoFd,
+) {
+    struct UnregisterFileTask {
+        header: veloq_runtime::task::TaskHeader,
+        fd: veloq_driver_native::op::IoFd,
+    }
+
+    impl veloq_runtime::task::RawTask for UnregisterFileTask {
+        type Storage = veloq_runtime::utils::storage::AtomicStorage;
+
+        fn poll_raw(&self, _worker_id: usize) -> bool {
+            if let Some(ctx) = try_current() {
+                let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);
+            }
+            self.header.mark_completed_and_notify();
+            unsafe {
+                let ptr = self as *const Self as *mut Self;
+                let _ = Box::from_raw(ptr);
+            }
+            true
+        }
+
+        fn header(&self) -> &veloq_runtime::task::GenericTaskHeader<Self::Storage> {
+            &self.header
+        }
+    }
+
+    impl UnregisterFileTask {
+        const VTABLE: &'static veloq_runtime::task::TaskVTable<
+            veloq_runtime::utils::storage::AtomicStorage,
+        > = &veloq_runtime::task::TaskVTable {
+            wake: |_| {},
+            wake_by_ref: |_| {},
+            poll: |data, worker_id| unsafe {
+                let node = &*(data.as_ptr() as *const Self);
+                veloq_runtime::task::RawTask::poll_raw(node, worker_id)
+            },
+        };
+    }
+
+    let task = Box::new(UnregisterFileTask {
+        header: veloq_runtime::task::TaskHeader::new(UnregisterFileTask::VTABLE),
+        fd,
+    });
+
+    task.header.set_pinned();
+    unsafe {
+        task.header.set_runtime_info(
+            shared as *const veloq_runtime::runtime::shared::RuntimeShared,
+            worker_id,
+        );
+    }
+
+    let ptr = Box::into_raw(task);
+    let task_ref = unsafe { veloq_runtime::task::SendTaskRef::from_concrete(ptr) };
+
+    if !shared.enqueue_pinned(worker_id, task_ref) {
+        unsafe {
+            let _ = Box::from_raw(ptr);
+        }
     }
 }

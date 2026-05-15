@@ -1419,6 +1419,7 @@ dependencies = [
  "parking_lot",
  "veloq-atomic-waker",
  "veloq-intrusive-linklist",
+ "veloq-tls",
 ]
 
 [[package]]
@@ -1441,6 +1442,14 @@ dependencies = [
  "veloq-atomic-waker",
  "veloq-intrusive-linklist",
  "veloq-shim",
+]
+
+[[package]]
+name = "veloq-tls"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

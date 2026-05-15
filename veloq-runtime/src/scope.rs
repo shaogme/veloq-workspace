@@ -1,6 +1,5 @@
-use crate::runtime::{
-    GenericCancellationToken, RuntimeShared, current_worker_id, with_current_runtime,
-};
+use crate::runtime::primitives::GenericCancellationToken;
+use crate::runtime::{RuntimeShared, current_worker_id};
 use crate::task::{
     Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef, SendTask, SendTaskRef, Task,
     TaskError, TaskHandleRef,
@@ -8,11 +7,9 @@ use crate::task::{
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, Storage};
 use std::any::Any;
-use std::future::Future;
 use std::ops::AsyncFnOnce;
 use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 use std::task::Waker;
 
 mod join;
@@ -48,18 +45,20 @@ pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
     wakers: S::Lock<Vec<Waker>>,
     cancel_token: GenericCancellationToken<S, O>,
     panic_info: S::Lock<Option<Box<dyn Any + Send + 'static>>>,
+    parent: Option<crate::task::AnyScopeCompletionRef>,
 }
 
 pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
 pub type LocalScopeCompletion = GenericScopeCompletion<LocalStorage, RcOwnership>;
 
 impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
-    pub fn new() -> O::Shared<Self> {
+    pub fn new(parent: Option<crate::task::AnyScopeCompletionRef>) -> O::Shared<Self> {
         O::new(Self {
             remaining: S::Usize::new(0),
             wakers: S::Lock::new(Vec::new()),
             cancel_token: GenericCancellationToken::<S, O>::new(),
             panic_info: S::Lock::new(None),
+            parent,
         })
     }
 
@@ -127,13 +126,17 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     pub fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
         self.panic_info.lock().take()
     }
+
+    pub fn parent(&self) -> &Option<crate::task::AnyScopeCompletionRef> {
+        &self.parent
+    }
 }
 
 pub trait ScopeProvider<'scope> {
     type Storage: Storage;
     type Ownership: Ownership;
     type Arena: crate::task::Arena;
-    fn runtime(&self) -> &Arc<RuntimeShared>;
+    fn runtime(&self) -> &RuntimeShared;
     fn arena(&self) -> &Self::Arena;
     fn completion(
         &self,
@@ -152,7 +155,7 @@ pub(crate) type CancelTokenSlot<S, O> =
 
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
 pub struct GenericAsyncScope<'scope, S: Storage, O: Ownership, M = &'scope ()> {
-    runtime: Arc<RuntimeShared>,
+    context: crate::runtime::RuntimeScopeContext,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
     _marker: std::marker::PhantomData<(&'scope (), M)>,
@@ -169,8 +172,8 @@ impl<'scope, S: Storage, O: Ownership, M> ScopeProvider<'scope>
     type Ownership = O;
     type Arena = GenericArena<S>;
     #[inline]
-    fn runtime(&self) -> &Arc<RuntimeShared> {
-        &self.runtime
+    fn runtime(&self) -> &RuntimeShared {
+        self.context.shared.as_ref()
     }
     #[inline]
     fn arena(&self) -> &Self::Arena {
@@ -183,21 +186,20 @@ impl<'scope, S: Storage, O: Ownership, M> ScopeProvider<'scope>
 }
 
 impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
-    pub fn __private_new() -> Self {
-        let runtime = with_current_runtime(|runtime| runtime.clone())
-            .expect("Scope must be created inside Runtime::block_on");
-        let completion = GenericScopeCompletion::<S, O>::new();
+    pub fn __private_new(
+        context: crate::runtime::RuntimeScopeContext,
+        parent: Option<crate::task::AnyScopeCompletionRef>,
+    ) -> Self {
+        let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
-        // 自动发现当前正在运行的任务所属的作用域，建立父子层级关系
-        let current_scope = crate::task::CURRENT_SCOPE.with(|s| s.borrow().clone());
-        if let Some(parent) = current_scope {
+        if let Some(parent) = parent {
             parent.try_link_child(&crate::task::ErasedCancellationToken::new::<S, O>(
                 completion.cancel_token(),
             ));
         }
 
         Self {
-            runtime,
+            context,
             arena: GenericArena::new(),
             completion,
             _marker: std::marker::PhantomData,
@@ -216,10 +218,12 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
 
         let worker_id = current_worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
-        task_ref
-            .header()
-            .set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
-        self.runtime.enqueue_local(worker_id, task_ref);
+        unsafe {
+            task_ref
+                .header()
+                .set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id)
+        };
+        self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -258,10 +262,12 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
 
         let worker_id = current_worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
-        task_ref
-            .header()
-            .set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
-        self.runtime.enqueue_local(worker_id, task_ref);
+        unsafe {
+            task_ref
+                .header()
+                .set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id)
+        };
+        self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -279,7 +285,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
     }
 
     pub async fn wait_all(&self) {
-        self.runtime.drive_worker(Some(&self.completion));
+        self.context.shared.drive_worker(Some(&self.completion));
         if let Some(panic_info) = self.completion.take_panic() {
             std::panic::resume_unwind(panic_info);
         }
@@ -305,7 +311,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         S_: SendTask<T> + Sized + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count().get(),
+            worker_id < self.context.shared.worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -314,8 +320,10 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
         let header = task_ref.header();
-        header.set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
-        self.runtime.enqueue_send(worker_id, task_ref);
+        unsafe {
+            header.set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id);
+        }
+        self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -340,7 +348,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         S_: SendTask<T> + Sized + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count().get(),
+            worker_id < self.context.shared.worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -348,12 +356,13 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let state = self::join::RoutedSpawnState::new();
         self.completion.add_task();
 
-        let runtime = self.runtime.clone();
+        let runtime = self.context.shared.clone();
         let completion = self.completion.clone();
         let task_ptr = SendPtr::new(NonNull::from(task));
         let state_for_job = state.clone();
 
         self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _>(
+            &self.context,
             &self.completion,
             state.clone(),
             worker_id,
@@ -366,8 +375,10 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
                 let task = unsafe { task_ptr.as_ref() };
                 task.header().set_pinned();
-                task.header()
-                    .set_runtime_info(Arc::as_ptr(&runtime), worker_id);
+                unsafe {
+                    task.header()
+                        .set_runtime_info(Arc::as_ptr(&runtime), worker_id);
+                }
                 task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(completion.clone()));
 
                 let task_ref = unsafe { SendTaskRef::from_concrete(task) };
@@ -394,7 +405,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         S_: SendTask<T> + Sized + 'scope,
     {
-        self.spawn_send_impl(self.runtime.choose_worker(), task)
+        self.spawn_send_impl(self.context.shared.choose_worker(), task)
     }
 
     fn spawn_boxed_send_impl<T: Send + 'scope, F>(
@@ -406,7 +417,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         F: Future<Output = T> + Send + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count().get(),
+            worker_id < self.context.shared.worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -430,10 +441,12 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-        task_ref
-            .header()
-            .set_runtime_info(Arc::as_ptr(&self.runtime), worker_id);
-        self.runtime.enqueue_send(worker_id, task_ref);
+        unsafe {
+            task_ref
+                .header()
+                .set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id)
+        };
+        self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -456,7 +469,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         F: AsyncFnOnce() -> T + Send + 'scope,
     {
         debug_assert!(
-            worker_id < self.runtime.worker_count().get(),
+            worker_id < self.context.shared.worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -464,7 +477,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         let state = self::join::RoutedSpawnState::new();
         self.completion.add_task();
 
-        let runtime = self.runtime.clone();
+        let runtime = self.context.shared.clone();
         let completion = self.completion.clone();
         let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
         let state_for_job = state.clone();
@@ -482,6 +495,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
             SendPtr::new(unsafe { NonNull::new_unchecked(job_ptr) });
 
         self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _>(
+            &self.context,
             &self.completion,
             state.clone(),
             worker_id,
@@ -506,7 +520,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
                 }
 
                 self::join::install_routed_pinned_task(
-                    runtime,
+                    &runtime,
                     arena,
                     completion,
                     worker_id,
@@ -526,7 +540,7 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
     where
         F: Future<Output = T> + Send + 'scope,
     {
-        self.spawn_boxed_send_impl(self.runtime.choose_worker(), future)
+        self.spawn_boxed_send_impl(self.context.shared.choose_worker(), future)
     }
 }
 
@@ -551,24 +565,4 @@ impl<'scope, M> GenericAsyncScope<'scope, LocalStorage, RcOwnership, M> {
     {
         self.spawn_boxed_local(future)
     }
-}
-
-#[macro_export]
-macro_rules! scope {
-    ($scope_name:ident, $body:block) => {{
-        let $scope_name = $crate::scope::AsyncScope::__private_new();
-        let res = $body;
-        $scope_name.wait_all().await;
-        res
-    }};
-}
-
-#[macro_export]
-macro_rules! scope_local {
-    ($scope_name:ident, $body:block) => {{
-        let $scope_name = $crate::scope::LocalAsyncScope::__private_new();
-        let res = $body;
-        $scope_name.wait_all().await;
-        res
-    }};
 }

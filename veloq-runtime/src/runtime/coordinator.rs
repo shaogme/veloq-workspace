@@ -1,4 +1,4 @@
-use super::context::{self, IdleDecision, IdleWaitStrategy};
+use super::context::{IdleDecision, IdleWaitStrategy};
 use super::primitives::Parker;
 use super::shared::RuntimeShared;
 use crate::scope::GenericScopeCompletion;
@@ -20,7 +20,11 @@ impl<'a> RuntimeProgressCoordinator<'a> {
         &self,
         completion: Option<&GenericScopeCompletion<S, O>>,
     ) {
-        let idle_decision = context::run_worker_idle_hook();
+        let idle_decision = self
+            .shared
+            .idle_hook
+            .map(|h| h())
+            .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block));
         if idle_decision.is_continue() {
             std::thread::yield_now();
             return;

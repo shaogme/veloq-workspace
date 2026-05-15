@@ -3,11 +3,11 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use veloq::io::{AsyncBufRead, AsyncBufWrite};
 use veloq::net::{TcpListener, TcpStream};
 use veloq::runtime::{Runtime, context};
 use veloq::sync::mpsc;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
-use veloq_runtime::scope;
 
 fn create_runtime() -> Runtime<UniformSlot> {
     create_runtime_with_workers(1)
@@ -23,37 +23,36 @@ fn create_runtime_with_workers(worker_threads: usize) -> Runtime<UniformSlot> {
 #[test]
 fn tcp_connect_smoke() {
     let runtime = create_runtime();
-    runtime.block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+    runtime.block_on(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        scope!(s, {
+        ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let (_stream, peer) = listener.accept().await.expect("Accept failed");
                 assert!(peer.ip().is_ipv4());
             });
 
             s.spawn_boxed(async move {
-                let stream = TcpStream::connect(listen_addr)
+                let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
                 drop(stream);
             });
-        });
+        })
+        .await;
     });
 }
 
 #[test]
 fn tcp_read_exact_write_all() {
-    use veloq::io::{AsyncBufRead, AsyncBufWrite};
-
     const DATA: &[u8] = b"TCP Echo World!";
     let runtime = create_runtime();
-    runtime.block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+    runtime.block_on(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        scope!(s, {
+        ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let (stream, _) = listener.accept().await.expect("Accept failed");
                 let mut read_buf = context::alloc(nz!(DATA.len()));
@@ -72,7 +71,7 @@ fn tcp_read_exact_write_all() {
             });
 
             s.spawn_boxed(async move {
-                let client = TcpStream::connect(listen_addr)
+                let client = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
                 let mut write_buf = context::alloc(nz!(DATA.len()));
@@ -92,15 +91,16 @@ fn tcp_read_exact_write_all() {
                     .expect("Client read_exact failed");
                 assert_eq!(buf.as_slice(), DATA);
             });
-        });
+        })
+        .await;
     });
 }
 
 #[test]
 fn tcp_listener_local_addr() {
     let runtime = create_runtime();
-    runtime.block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+    runtime.block_on(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let addr = listener.local_addr().expect("Failed to get local address");
 
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
@@ -111,14 +111,14 @@ fn tcp_listener_local_addr() {
 #[test]
 fn tcp_connect_refused() {
     let runtime = create_runtime();
-    runtime.block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+    runtime.block_on(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let addr = listener
             .local_addr()
             .expect("Failed to get listener address");
         drop(listener);
 
-        let result = TcpStream::connect(addr).await;
+        let result = TcpStream::connect(ctx, addr).await;
         assert!(result.is_err());
     });
 }
@@ -126,8 +126,8 @@ fn tcp_connect_refused() {
 #[test]
 fn tcp_ipv6() {
     let runtime = create_runtime();
-    runtime.block_on(async {
-        let listener_result = TcpListener::bind("::1:0");
+    runtime.block_on(async |ctx| {
+        let listener_result = TcpListener::bind(ctx, "::1:0");
         if listener_result.is_err() {
             return;
         }
@@ -136,37 +136,38 @@ fn tcp_ipv6() {
         let listen_addr = listener.local_addr().expect("Failed to get local address");
         assert!(listen_addr.is_ipv6());
 
-        scope!(s, {
+        ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let (_stream, peer) = listener.accept().await.expect("Accept failed");
                 assert!(peer.is_ipv6());
             });
 
             s.spawn_boxed(async move {
-                let stream = TcpStream::connect(listen_addr)
+                let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect via IPv6");
                 drop(stream);
             });
-        });
+        })
+        .await;
     });
 }
 
 #[test]
 fn tcp_recv_zero_bytes() {
     let runtime = create_runtime();
-    runtime.block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+    runtime.block_on(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        scope!(s, {
+        ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let (stream, _) = listener.accept().await.expect("Accept failed");
                 drop(stream);
             });
 
             s.spawn_boxed(async move {
-                let stream = TcpStream::connect(listen_addr)
+                let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
                 let buf = context::alloc(nz!(1024));
@@ -178,18 +179,19 @@ fn tcp_recv_zero_bytes() {
                     Err(_e) => {}
                 }
             });
-        });
+        })
+        .await;
     });
 }
 
 #[test]
 fn tcp_heap_buffer() {
     let runtime = create_runtime();
-    runtime.block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+    runtime.block_on(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        scope!(s, {
+        ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let (stream, _) = listener.accept().await.expect("Accept failed");
                 let buf =
@@ -199,7 +201,7 @@ fn tcp_heap_buffer() {
             });
 
             s.spawn_boxed(async move {
-                let stream = TcpStream::connect(listen_addr)
+                let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
                 let mut buf =
@@ -210,19 +212,20 @@ fn tcp_heap_buffer() {
 
                 stream.send(buf).await.expect("Client send failed");
             });
-        });
+        })
+        .await;
     });
 }
 
 #[test]
 fn tcp_multiple_connections() {
     let runtime = create_runtime();
-    runtime.block_on(async {
+    runtime.block_on(async |ctx| {
         const NUM_CONNECTIONS: usize = 5;
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        scope!(s, {
+        ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 for i in 0..NUM_CONNECTIONS {
                     let (_stream, peer) = listener.accept().await.expect("Accept failed");
@@ -232,32 +235,33 @@ fn tcp_multiple_connections() {
 
             s.spawn_boxed(async move {
                 for i in 0..NUM_CONNECTIONS {
-                    let stream = TcpStream::connect(listen_addr)
+                    let stream = TcpStream::connect(ctx, listen_addr)
                         .await
                         .expect("Failed to connect");
                     println!("Client {} connected", i);
                     drop(stream);
                 }
             });
-        });
+        })
+        .await;
     });
 }
 
 #[test]
 fn multithread_tcp_connections() {
     let runtime = create_runtime_with_workers(3);
-    runtime.block_on(async {
+    runtime.block_on(async |ctx| {
         const NUM_WORKERS: usize = 3;
         let connection_count = Arc::new(AtomicUsize::new(0));
 
-        scope!(s, {
+        ctx.scope(async |s| {
             for worker_id in 0..NUM_WORKERS {
                 let counter = connection_count.clone();
                 let (addr_tx, mut addr_rx) = mpsc::unbounded::<SocketAddr>();
 
                 s.spawn_boxed(async move {
                     let listener =
-                        TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                        TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
                     let listen_addr = listener.local_addr().expect("Failed to get local address");
                     addr_tx.send(listen_addr).unwrap();
 
@@ -268,14 +272,15 @@ fn multithread_tcp_connections() {
 
                 s.spawn_boxed(async move {
                     let listen_addr = addr_rx.recv().await.expect("Channel closed");
-                    let stream = TcpStream::connect(listen_addr)
+                    let stream = TcpStream::connect(ctx, listen_addr)
                         .await
                         .expect("Failed to connect");
                     println!("Worker {} connected to self", worker_id);
                     drop(stream);
                 });
             }
-        });
+        })
+        .await;
 
         assert_eq!(connection_count.load(Ordering::SeqCst), NUM_WORKERS);
     });
@@ -284,13 +289,14 @@ fn multithread_tcp_connections() {
 #[test]
 fn multithread_tcp_echo() {
     let runtime = create_runtime_with_workers(2);
-    runtime.block_on(async {
+    runtime.block_on(async |ctx| {
         let (addr_tx, mut addr_rx) = mpsc::unbounded::<SocketAddr>();
         let (done_tx, mut done_rx) = mpsc::unbounded::<()>();
 
-        scope!(s, {
+        ctx.scope(async |s| {
             s.spawn_boxed(async move {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+                let listener =
+                    TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
                 let listen_addr = listener.local_addr().expect("Failed to get local address");
                 addr_tx.send(listen_addr).unwrap();
 
@@ -326,7 +332,7 @@ fn multithread_tcp_echo() {
             s.spawn_boxed(async move {
                 let listen_addr = addr_rx.recv().await.expect("Channel closed");
 
-                let stream = TcpStream::connect(listen_addr)
+                let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
                 let data = b"Hello from worker 1!";
@@ -350,20 +356,21 @@ fn multithread_tcp_echo() {
 
                 done_tx.send(()).unwrap();
             });
-        });
+        })
+        .await;
     });
 }
 
 #[test]
 fn multithread_concurrent_tcp_clients() {
     let runtime = create_runtime_with_workers(4);
-    runtime.block_on(async {
+    runtime.block_on(async |ctx| {
         const NUM_CLIENTS: usize = 3;
         let connection_count = Arc::new(AtomicUsize::new(0));
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        scope!(s, {
+        ctx.scope(async |s| {
             let connection_count = connection_count.clone();
             let server_h = s.spawn_boxed(async move {
                 for i in 0..NUM_CLIENTS {
@@ -376,7 +383,7 @@ fn multithread_concurrent_tcp_clients() {
             let mut client_handles = Vec::with_capacity(NUM_CLIENTS);
             for client_id in 0..NUM_CLIENTS {
                 client_handles.push(s.spawn_boxed(async move {
-                    let stream = TcpStream::connect(listen_addr)
+                    let stream = TcpStream::connect(ctx, listen_addr)
                         .await
                         .expect("Failed to connect");
                     println!("Client {} connected", client_id);
@@ -388,7 +395,8 @@ fn multithread_concurrent_tcp_clients() {
                 handle.await.expect("client task failed");
             }
             server_h.await.expect("server task failed");
-        });
+        })
+        .await;
 
         assert_eq!(connection_count.load(Ordering::SeqCst), NUM_CLIENTS);
     });
@@ -397,18 +405,18 @@ fn multithread_concurrent_tcp_clients() {
 #[test]
 fn tcp_cancel_recv() {
     let runtime = create_runtime();
-    runtime.block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
+    runtime.block_on(async |ctx| {
+        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        scope!(s, {
+        ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let (_stream, _) = listener.accept().await.expect("Accept failed");
                 veloq_runtime::task::yield_now().await;
             });
 
             s.spawn_boxed(async move {
-                let stream = TcpStream::connect(listen_addr)
+                let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
                 let buf = context::alloc(nz!(1024));
@@ -421,6 +429,7 @@ fn tcp_cancel_recv() {
                     }
                 };
             });
-        });
+        })
+        .await;
     });
 }

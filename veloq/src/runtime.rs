@@ -1,10 +1,8 @@
 pub mod context;
 
-pub use veloq_runtime::{scope, scope_local};
-
 use std::cell::RefCell;
-use std::future::Future;
 use std::num::NonZeroUsize;
+use std::ops::AsyncFnOnce;
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 
@@ -12,10 +10,12 @@ use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::{Driver, PlatformDriver};
 use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
+use veloq_runtime::utils::storage::StaticTransfer;
 
 use crate::config::Config;
-use crate::runtime::context::{DriverCommandDispatcher, init_worker_driver_command_state};
 use crate::runtime::context::{DriverRegistrar, RegistrarMessage};
+
+pub use veloq_runtime::runtime::RuntimeScopeContext;
 
 pub struct RuntimeBuilder<T: PoolTopology> {
     topology: T,
@@ -85,25 +85,6 @@ pub struct Runtime<T: PoolTopology> {
     config: Config,
 }
 
-struct StaticTransfer<T>(Box<[Option<T>]>);
-
-unsafe impl<T: Send> Sync for StaticTransfer<T> {}
-
-impl<T> StaticTransfer<T> {
-    fn new(items: Vec<T>) -> Self {
-        Self(items.into_iter().map(Some).collect())
-    }
-
-    fn take(&self, index: usize) -> T {
-        unsafe {
-            let ptr = self.0.as_ptr() as *mut Option<T>;
-            (*ptr.add(index))
-                .take()
-                .expect("Worker item already taken or index out of bounds")
-        }
-    }
-}
-
 struct RegistrarDispatcher {
     senders: Vec<mpsc::Sender<RegistrarMessage>>,
 }
@@ -125,7 +106,10 @@ impl<T: PoolTopology> Runtime<T> {
         self.worker_count
     }
 
-    pub fn block_on<F: Future>(self, future: F) -> F::Output {
+    pub fn block_on<R, F>(self, f: F) -> R
+    where
+        F: AsyncFnOnce(&RuntimeScopeContext) -> R,
+    {
         let Runtime {
             worker_count,
             topology,
@@ -145,21 +129,14 @@ impl<T: PoolTopology> Runtime<T> {
         // 预先为每个 Worker 创建消息通道
         let mut senders = Vec::with_capacity(worker_count.get());
         let mut receivers = Vec::with_capacity(worker_count.get());
-        let mut command_senders = Vec::with_capacity(worker_count.get());
-        let mut command_receivers = Vec::with_capacity(worker_count.get());
         for _ in 0..worker_count.get() {
             let (tx, rx) = mpsc::channel();
             senders.push(tx);
             receivers.push(rx);
-            let (cmd_tx, cmd_rx) = mpsc::channel();
-            command_senders.push(cmd_tx);
-            command_receivers.push(cmd_rx);
         }
 
         let receivers = Arc::new(StaticTransfer::new(receivers));
-        let command_receivers = Arc::new(StaticTransfer::new(command_receivers));
         let dispatcher = Arc::new(RegistrarDispatcher { senders });
-        let command_dispatcher = DriverCommandDispatcher::new(command_senders);
 
         // 连接内存池监听器到分发器
         let dispatcher_clone = dispatcher.clone();
@@ -170,49 +147,39 @@ impl<T: PoolTopology> Runtime<T> {
             }),
         );
 
-        let runtime = async_runtime::Runtime::builder()
-            .worker_count(worker_count)
-            .queue_capacity(config.get_queue_capacity())
-            .idle_hook(crate::runtime::context::poll_current_driver)
-            .worker_tick_hook(crate::runtime::context::drain_pending_driver_commands)
-            .with_worker_init(move |worker_ctx: WorkerInitContext| {
+        let runtime = async_runtime::RuntimeBuilder::new()
+            .with_worker_count(worker_count.get())
+            .with_queue_capacity(config.get_queue_capacity().get())
+            .with_idle_hook(crate::runtime::context::poll_current_driver)
+            .with_worker_init(async move |worker_ctx: WorkerInitContext| {
                 let topology = topology.clone();
                 let state = state.clone();
                 let config = config.clone();
                 let receiver = receivers.take(worker_ctx.worker_id());
-                let command_receiver = command_receivers.take(worker_ctx.worker_id());
-                let command_dispatcher = command_dispatcher.clone();
 
-                async move {
-                    let driver = Rc::new(RefCell::new(
-                        PlatformDriver::new(&config).expect("failed to create driver"),
-                    ));
+                let driver = Rc::new(RefCell::new(
+                    PlatformDriver::new(&config).expect("failed to create driver"),
+                ));
 
-                    // 初始化 TLS 中的注册中心状态
-                    context::init_worker_registrar_state(receiver);
-                    init_worker_driver_command_state(command_receiver);
+                // 初始化 TLS 中的注册中心状态
+                context::init_worker_registrar_state(receiver);
 
-                    let registration_mode = config.registration_mode();
-                    let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
+                let registration_mode = config.registration_mode();
+                let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
 
-                    {
-                        let mut driver_ref = driver.borrow_mut();
-                        driver_ref.set_registrar(Box::new(registrar.clone()));
-                    }
-
-                    let buf_pool =
-                        topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
-                    context::set_current_runtime_context(context::RuntimeContext::new(
-                        driver,
-                        buf_pool,
-                        config,
-                        registrar,
-                        command_dispatcher,
-                    ));
+                {
+                    let mut driver_ref = driver.borrow_mut();
+                    driver_ref.set_registrar(Box::new(registrar.clone()));
                 }
+
+                let buf_pool =
+                    topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
+                context::set_current_runtime_context(context::RuntimeContext::new(
+                    driver, buf_pool, config, registrar,
+                ));
             })
             .build();
 
-        runtime.block_on(future)
+        runtime.block_on(f)
     }
 }

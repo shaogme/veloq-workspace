@@ -3,9 +3,20 @@ use crate::driver::IocpDriver;
 use crate::ext::Extensions;
 use std::os::windows::io::AsRawHandle;
 use veloq_driver_core::driver::RegisterFd;
+use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+
+fn init_winsock() {
+    // Ensure Winsock is initialized for the current process/thread.
+    // WSAStartup is reference-counted and safe to call multiple times.
+    unsafe {
+        let mut data: WSADATA = std::mem::zeroed();
+        let _ = WSAStartup(0x0202, &mut data);
+    }
+}
 
 #[test]
 fn test_extensions_load() {
+    init_winsock();
     let ext = Extensions::new();
     assert!(ext.is_ok(), "Extensions should load on Windows");
 }
@@ -57,5 +68,6 @@ fn test_register_borrowed_file_keeps_weak_ownership() {
 
 #[test]
 fn test_rio_extensions_load() {
+    init_winsock();
     let _ext = Extensions::new().expect("RIO Extensions should load");
 }
