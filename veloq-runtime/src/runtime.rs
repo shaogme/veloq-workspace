@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::ops::{AsyncFn, AsyncFnOnce};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::task::{Context, Poll};
@@ -16,12 +17,12 @@ pub mod route;
 pub mod shared;
 
 pub use context::{
-    IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext,
-    WorkerInitContext, WorkerTickHook, clear_current_runtime_context, current_worker_id,
-    run_worker_idle_hook, set_current_runtime_context,
+    CONTEXT, IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext,
+    WorkerInitContext, WorkerTickHook, current_worker_id, run_worker_idle_hook,
 };
 pub use primitives::GenericCancellationToken;
 pub use shared::RuntimeShared;
+use veloq_tls::TlsGuard;
 
 use primitives::{Signal, create_waker};
 use shared::RuntimeSharedComponents;
@@ -94,13 +95,6 @@ where
         );
 
         thread::scope(|scope| {
-            struct ClearContext;
-            impl Drop for ClearContext {
-                fn drop(&mut self) {
-                    clear_current_runtime_context();
-                }
-            }
-
             struct ShutdownGuard<'a>(&'a RuntimeShared);
             impl Drop for ShutdownGuard<'_> {
                 fn drop(&mut self) {
@@ -119,7 +113,7 @@ where
                 let worker_init_ref = &worker_init;
 
                 scope.spawn(move || {
-                    set_current_runtime_context(RuntimeContext {
+                    let mut context = RuntimeContext {
                         worker_id,
                         local_rx: lrx,
                         remote_rx: rrx,
@@ -127,8 +121,9 @@ where
                         rand: FastRand::new(worker_id as u64),
                         idle_hook,
                         worker_tick_hook,
-                    });
-                    let _clear_context = ClearContext;
+                    };
+                    let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
+                        .expect("failed to set runtime context");
                     let route_state =
                         route::WorkerRouteState::new(route_rx, route_dispatcher.clone());
                     route::init_worker_route_state(&route_state);
@@ -161,7 +156,7 @@ where
                 .expect("main worker pinned receiver exhausted");
             let route_rx0 = route_receivers.take(0);
 
-            set_current_runtime_context(RuntimeContext {
+            let mut context = RuntimeContext {
                 worker_id: 0,
                 local_rx: lrx0,
                 remote_rx: rrx0,
@@ -169,8 +164,9 @@ where
                 rand: FastRand::new(0),
                 idle_hook,
                 worker_tick_hook,
-            });
-            let _clear_context = ClearContext;
+            };
+            let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
+                .expect("failed to set runtime context");
             let route_state = route::WorkerRouteState::new(route_rx0, route_dispatcher.clone());
             route::init_worker_route_state(&route_state);
 

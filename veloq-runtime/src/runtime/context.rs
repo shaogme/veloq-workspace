@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::future::poll_fn;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
@@ -12,6 +11,8 @@ use crate::task::{LocalTaskRef, RuntimeContextExt, SendTaskRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::{ArcOwnership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage};
+
+use veloq_tls::Tls;
 
 /// Worker 空闲时的等待策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,9 +135,7 @@ impl<'a> RuntimeScopeContext<'a> {
 pub type IdleHook = fn() -> IdleDecision;
 pub type WorkerTickHook = fn();
 
-thread_local! {
-    pub(crate) static CONTEXT: RefCell<Option<RuntimeContext>> = const { RefCell::new(None) };
-}
+pub static CONTEXT: Tls<RuntimeContext> = Tls::new();
 
 /// Worker initialization context passed to the injected worker init step.
 #[derive(Clone, Copy)]
@@ -180,36 +179,20 @@ impl<'a> WorkerInitContext<'a> {
     }
 }
 
+#[inline(always)]
 pub fn current_worker_id() -> usize {
-    CONTEXT.with(|ctx| {
-        ctx.borrow()
-            .as_ref()
-            .map(|c| c.worker_id)
-            .unwrap_or(usize::MAX)
-    })
-}
-
-pub fn set_current_runtime_context(context: RuntimeContext) {
-    CONTEXT.with(|ctx| {
-        *ctx.borrow_mut() = Some(context);
-    });
-}
-
-pub fn clear_current_runtime_context() {
-    CONTEXT.with(|ctx| {
-        *ctx.borrow_mut() = None;
-    });
+    CONTEXT
+        .get()
+        .map(|ptr| unsafe { ptr.as_ref().worker_id })
+        .unwrap_or(usize::MAX)
 }
 
 pub fn run_worker_idle_hook() -> IdleDecision {
-    CONTEXT.with(|ctx| {
-        ctx.borrow()
-            .as_ref()
-            .map_or(IdleDecision::wait(IdleWaitStrategy::Block), |c| {
-                c.idle_hook
-                    .map_or(IdleDecision::wait(IdleWaitStrategy::Block), |h| h())
-            })
-    })
+    CONTEXT
+        .get()
+        .map(|ptr| unsafe { ptr.as_ref() })
+        .and_then(|c| c.idle_hook.map(|h| h()))
+        .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block))
 }
 
 #[cfg(test)]
