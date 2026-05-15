@@ -17,7 +17,7 @@ pub mod shared;
 
 pub use context::{
     CONTEXT, IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext,
-    WorkerInitContext, WorkerTickHook, current_worker_id, run_worker_idle_hook,
+    WorkerInitContext, WorkerTickHook, current_worker_id,
 };
 pub use primitives::GenericCancellationToken;
 pub use shared::RuntimeShared;
@@ -30,8 +30,6 @@ pub struct Runtime<I> {
     pub(crate) components: RuntimeSharedComponents,
     pub(crate) worker_count: NonZeroUsize,
     pub(crate) worker_init: Option<I>,
-    pub(crate) idle_hook: Option<IdleHook>,
-    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 pub fn noop_worker_init(_: WorkerInitContext) -> std::future::Ready<()> {
@@ -70,8 +68,6 @@ where
     {
         let worker_count = self.worker_count;
         let worker_init = self.worker_init.take().expect("worker_init already taken");
-        let idle_hook = self.idle_hook;
-        let worker_tick_hook = self.worker_tick_hook;
 
         let mut components = self.components;
         let mut local_receivers = std::mem::take(&mut components.local_receivers);
@@ -103,8 +99,6 @@ where
                         remote_rx: rrx,
                         pinned_rx: prx,
                         rand: FastRand::new(worker_id as u64),
-                        idle_hook,
-                        worker_tick_hook,
                     };
                     let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
                         .expect("failed to set runtime context");
@@ -135,8 +129,6 @@ where
                 remote_rx: rrx0,
                 pinned_rx: prx0,
                 rand: FastRand::new(0),
-                idle_hook,
-                worker_tick_hook,
             };
             let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
                 .expect("failed to set runtime context");
@@ -158,7 +150,11 @@ where
                     Poll::Ready(res) => {
                         break res;
                     }
-                    Poll::Pending => match run_worker_idle_hook() {
+                    Poll::Pending => match shared
+                        .idle_hook
+                        .map(|h| h())
+                        .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block))
+                    {
                         IdleDecision::Continue => thread::yield_now(),
                         IdleDecision::Wait(IdleWaitStrategy::Timeout(d)) => {
                             let _ = signal.wait_timeout(d);
@@ -245,13 +241,13 @@ impl<I> RuntimeBuilder<I> {
         let components = RuntimeSharedComponents::new(
             NonZeroUsize::new(count).expect("requested worker count must be non-zero"),
             NonZeroUsize::new(self.queue_capacity).expect("queue capacity must be non-zero"),
+            self.idle_hook,
+            self.worker_tick_hook,
         );
         Runtime {
             components,
             worker_count: NonZeroUsize::new(count).expect("final worker count must be non-zero"),
             worker_init: self.worker_init,
-            idle_hook: self.idle_hook,
-            worker_tick_hook: self.worker_tick_hook,
         }
     }
 }

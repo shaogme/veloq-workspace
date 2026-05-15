@@ -75,8 +75,6 @@ pub struct RuntimeContext {
     pub(crate) remote_rx: Receiver<SendTaskRef>,
     pub(crate) pinned_rx: Receiver<SendTaskRef>,
     pub(crate) rand: FastRand,
-    pub(crate) idle_hook: Option<IdleHook>,
-    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
@@ -304,14 +302,6 @@ pub fn current_worker_id() -> usize {
         .unwrap_or(usize::MAX)
 }
 
-pub fn run_worker_idle_hook() -> IdleDecision {
-    CONTEXT
-        .get()
-        .map(|ptr| unsafe { ptr.as_ref() })
-        .and_then(|c| c.idle_hook.map(|h| h()))
-        .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,13 +321,5 @@ mod tests {
             }
             _ => panic!("unexpected idle decision"),
         }
-    }
-
-    #[test]
-    fn idle_hook_defaults_to_block_without_context() {
-        assert!(matches!(
-            run_worker_idle_hook(),
-            IdleDecision::Wait(IdleWaitStrategy::Block)
-        ));
     }
 }

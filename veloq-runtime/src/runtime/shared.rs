@@ -1,4 +1,4 @@
-use super::context::{CONTEXT, current_worker_id};
+use super::context::{CONTEXT, IdleHook, WorkerTickHook, current_worker_id};
 use super::coordinator::RuntimeProgressCoordinator;
 use super::primitives::{self, EventCount, Unparker};
 use crate::scope::GenericScopeCompletion;
@@ -347,6 +347,8 @@ pub struct RuntimeShared {
     pub(crate) scheduler: TaskScheduler,
     pub(crate) idle: IdleController,
     pub(crate) shutdown: AtomicBool,
+    pub(crate) idle_hook: Option<IdleHook>,
+    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 pub(crate) struct RuntimeSharedComponents {
@@ -356,10 +358,17 @@ pub(crate) struct RuntimeSharedComponents {
     pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) worker_count: NonZeroUsize,
+    pub(crate) idle_hook: Option<IdleHook>,
+    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 impl RuntimeSharedComponents {
-    pub(crate) fn new(worker_count: NonZeroUsize, queue_capacity: NonZeroUsize) -> Self {
+    pub(crate) fn new(
+        worker_count: NonZeroUsize,
+        queue_capacity: NonZeroUsize,
+        idle_hook: Option<IdleHook>,
+        worker_tick_hook: Option<WorkerTickHook>,
+    ) -> Self {
         let worker_count_val = worker_count.get();
         let mut unparkers = Vec::with_capacity(worker_count_val);
         let mut parker_inners = Vec::with_capacity(worker_count_val);
@@ -438,6 +447,8 @@ impl RuntimeSharedComponents {
             remote_receivers,
             pinned_receivers,
             worker_count,
+            idle_hook,
+            worker_tick_hook,
         }
     }
 }
@@ -457,6 +468,8 @@ impl RuntimeShared {
                 event_count: EventCount::new(),
             },
             shutdown: AtomicBool::new(false),
+            idle_hook: components.idle_hook,
+            worker_tick_hook: components.worker_tick_hook,
         }
     }
 }
@@ -641,7 +654,7 @@ impl RuntimeShared {
         let ctx = CONTEXT.get().expect("runtime context missing");
         let ctx = unsafe { ctx.as_ref() };
 
-        let worker_tick_hook = ctx.worker_tick_hook;
+        let worker_tick_hook = self.worker_tick_hook;
 
         let waker = primitives::create_unpark_waker(self.registry.unparkers[worker_id].clone());
         let mut init_cx = Context::from_waker(&waker);
