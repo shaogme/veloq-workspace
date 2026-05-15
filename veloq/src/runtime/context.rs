@@ -59,18 +59,30 @@ pub(crate) fn init_worker_driver_command_state(receiver: mpsc::Receiver<DriverCo
 #[derive(Clone)]
 pub(crate) struct DriverCommandDispatcher {
     senders: Vec<mpsc::Sender<DriverControlCommand>>,
+    unparkers: Vec<veloq_runtime::runtime::primitives::Unparker>,
+    worker_count: usize,
 }
 
 impl DriverCommandDispatcher {
-    pub(crate) fn new(senders: Vec<mpsc::Sender<DriverControlCommand>>) -> Self {
-        Self { senders }
+    pub(crate) fn new(
+        senders: Vec<mpsc::Sender<DriverControlCommand>>,
+        unparkers: Vec<veloq_runtime::runtime::primitives::Unparker>,
+        worker_count: usize,
+    ) -> Self {
+        Self {
+            senders,
+            unparkers,
+            worker_count,
+        }
     }
 
     pub fn dispatch(&self, worker_id: usize, command: DriverControlCommand) {
         if let Some(sender) = self.senders.get(worker_id)
             && sender.send(command).is_ok()
+            && worker_id < self.worker_count
+            && let Some(unparker) = self.unparkers.get(worker_id)
         {
-            veloq_runtime::runtime::wake_worker(worker_id);
+            unparker.unpark();
         }
     }
 }

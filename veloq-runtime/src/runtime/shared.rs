@@ -350,10 +350,12 @@ pub struct RuntimeShared {
 }
 
 pub(crate) struct RuntimeSharedComponents {
-    pub(crate) shared: RuntimeShared,
+    pub(crate) registry: WorkerRegistry,
+    pub(crate) topo: TopologyContext,
     pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
     pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
+    pub(crate) worker_count: NonZeroUsize,
 }
 
 impl RuntimeSharedComponents {
@@ -421,37 +423,49 @@ impl RuntimeSharedComponents {
             }
         }
 
-        Self {
-            shared: RuntimeShared {
-                registry: WorkerRegistry {
-                    workers,
-                    unparkers,
-                    parker_inners,
-                },
-                topo: TopologyContext {
-                    groups,
-                    worker_to_group,
-                    next_idle,
-                },
-                scheduler: TaskScheduler {
-                    injector: GlobalInjector::new(),
-                    next_worker: AtomicUsize::new(0),
-                    searching_workers: AtomicUsize::new(0),
-                },
-                idle: IdleController {
-                    idle_mask: AtomicBitset::new(worker_count_val),
-                    event_count: EventCount::new(),
-                },
-                shutdown: AtomicBool::new(false),
+        RuntimeSharedComponents {
+            registry: WorkerRegistry {
+                workers,
+                unparkers,
+                parker_inners,
+            },
+            topo: TopologyContext {
+                groups,
+                worker_to_group,
+                next_idle,
             },
             local_receivers,
             remote_receivers,
             pinned_receivers,
+            worker_count,
         }
     }
 }
 
 impl RuntimeShared {
+    pub(crate) fn new(components: RuntimeSharedComponents) -> Self {
+        Self {
+            registry: components.registry,
+            topo: components.topo,
+            scheduler: TaskScheduler {
+                injector: GlobalInjector::new(),
+                next_worker: AtomicUsize::new(0),
+                searching_workers: AtomicUsize::new(0),
+            },
+            idle: IdleController {
+                idle_mask: AtomicBitset::new(components.worker_count.get()),
+                event_count: EventCount::new(),
+            },
+            shutdown: AtomicBool::new(false),
+        }
+    }
+}
+
+impl RuntimeShared {
+    pub fn unparkers(&self) -> Vec<Unparker> {
+        self.registry.unparkers.clone()
+    }
+
     pub fn choose_worker(&self) -> usize {
         self.topo.choose_worker(&self.scheduler.next_worker)
     }
@@ -471,7 +485,7 @@ impl RuntimeShared {
             worker.local_count.fetch_add(1, Ordering::Release);
             let _ = worker.local_tx.send(task);
             self.idle.event_count.notify();
-            self.notify_work(worker_id);
+            self.wake_worker(worker_id);
         }
     }
 
@@ -489,12 +503,13 @@ impl RuntimeShared {
                 worker.pinned_count.fetch_sub(1, Ordering::Release);
                 return false;
             }
-            self.notify_work(worker_id);
+            self.wake_worker(worker_id);
         }
         true
     }
 
-    fn notify_work(&self, worker_id: usize) {
+    #[inline]
+    pub fn wake_worker(&self, worker_id: usize) {
         self.registry.unpark(worker_id);
     }
 
@@ -522,12 +537,12 @@ impl RuntimeShared {
                     )
                     .is_ok()
                 {
-                    self.notify_work(worker_id);
+                    self.wake_worker(worker_id);
                     return;
                 }
 
                 if worker.deque.push(task).is_ok() {
-                    self.notify_work(worker_id);
+                    self.wake_worker(worker_id);
                     return;
                 }
             }
@@ -536,7 +551,7 @@ impl RuntimeShared {
             if worker.remote_tx.send(task).is_err() {
                 self.scheduler.injector.push(task);
             }
-            self.notify_work(worker_id);
+            self.wake_worker(worker_id);
         }
     }
 
@@ -702,6 +717,9 @@ impl RuntimeShared {
                     continue;
                 }
 
+                if let Some(c) = completion {
+                    c.register(&waker);
+                }
                 RuntimeProgressCoordinator::new(self, worker_id).run(completion);
             }
         });

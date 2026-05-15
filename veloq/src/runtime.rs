@@ -127,7 +127,7 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn block_on<R, F>(self, f: F) -> R
     where
-        F: AsyncFnOnce(&RuntimeScopeContext) -> R,
+        F: for<'a> AsyncFnOnce(&RuntimeScopeContext<'a>) -> R,
     {
         let Runtime {
             worker_count,
@@ -162,7 +162,6 @@ impl<T: PoolTopology> Runtime<T> {
         let receivers = Arc::new(StaticTransfer::new(receivers));
         let command_receivers = Arc::new(StaticTransfer::new(command_receivers));
         let dispatcher = Arc::new(RegistrarDispatcher { senders });
-        let command_dispatcher = DriverCommandDispatcher::new(command_senders);
 
         // 连接内存池监听器到分发器
         let dispatcher_clone = dispatcher.clone();
@@ -173,46 +172,50 @@ impl<T: PoolTopology> Runtime<T> {
             }),
         );
 
-        let runtime = async_runtime::Runtime::builder()
-            .worker_count(worker_count)
-            .queue_capacity(config.get_queue_capacity())
-            .idle_hook(crate::runtime::context::poll_current_driver)
-            .worker_tick_hook(crate::runtime::context::drain_pending_driver_commands)
-            .with_worker_init(move |worker_ctx: WorkerInitContext| {
+        let runtime = async_runtime::RuntimeBuilder::new()
+            .with_worker_count(worker_count.get())
+            .with_queue_capacity(config.get_queue_capacity().get())
+            .with_idle_hook(crate::runtime::context::poll_current_driver)
+            .with_worker_tick_hook(crate::runtime::context::drain_pending_driver_commands)
+            .with_worker_init(async move |worker_ctx: WorkerInitContext<'_>| {
                 let topology = topology.clone();
                 let state = state.clone();
                 let config = config.clone();
                 let receiver = receivers.take(worker_ctx.worker_id());
                 let command_receiver = command_receivers.take(worker_ctx.worker_id());
-                let command_dispatcher = command_dispatcher.clone();
+                let command_senders = command_senders.clone();
 
-                async move {
-                    let driver = Rc::new(RefCell::new(
-                        PlatformDriver::new(&config).expect("failed to create driver"),
-                    ));
+                let driver = Rc::new(RefCell::new(
+                    PlatformDriver::new(&config).expect("failed to create driver"),
+                ));
 
-                    // 初始化 TLS 中的注册中心状态
-                    context::init_worker_registrar_state(receiver);
-                    init_worker_driver_command_state(command_receiver);
+                // 初始化 TLS 中的注册中心状态
+                context::init_worker_registrar_state(receiver);
+                init_worker_driver_command_state(command_receiver);
 
-                    let registration_mode = config.registration_mode();
-                    let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
+                let registration_mode = config.registration_mode();
+                let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
 
-                    {
-                        let mut driver_ref = driver.borrow_mut();
-                        driver_ref.set_registrar(Box::new(registrar.clone()));
-                    }
+                let command_dispatcher = DriverCommandDispatcher::new(
+                    command_senders,
+                    worker_ctx.shared.unparkers(),
+                    worker_ctx.shared.worker_count().get(),
+                );
 
-                    let buf_pool =
-                        topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
-                    context::set_current_runtime_context(context::RuntimeContext::new(
-                        driver,
-                        buf_pool,
-                        config,
-                        registrar,
-                        command_dispatcher,
-                    ));
+                {
+                    let mut driver_ref = driver.borrow_mut();
+                    driver_ref.set_registrar(Box::new(registrar.clone()));
                 }
+
+                let buf_pool =
+                    topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
+                context::set_current_runtime_context(context::RuntimeContext::new(
+                    driver,
+                    buf_pool,
+                    config,
+                    registrar,
+                    command_dispatcher,
+                ));
             })
             .build();
 

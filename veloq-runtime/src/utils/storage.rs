@@ -686,3 +686,22 @@ impl<T: ?Sized> AtomicOptionArc<T> {
         self.0.compare_exchange_none(new, success, failure)
     }
 }
+
+pub struct StaticTransfer<T>(Box<[Option<T>]>);
+
+unsafe impl<T: Send> Sync for StaticTransfer<T> {}
+
+impl<T> StaticTransfer<T> {
+    pub fn new(items: Vec<T>) -> Self {
+        Self(items.into_iter().map(Some).collect())
+    }
+
+    pub fn take(&self, index: usize) -> T {
+        unsafe {
+            let ptr = self.0.as_ptr() as *mut Option<T>;
+            (*ptr.add(index))
+                .take()
+                .expect("Worker item already taken or index out of bounds")
+        }
+    }
+}

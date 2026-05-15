@@ -45,7 +45,6 @@ pub(crate) struct GenericDropNode<S: Storage> {
 intrusive_adapter!(pub(crate) DropAdapter<S> = GenericDropNode<S> { link: Link } where S: Storage);
 intrusive_adapter!(pub(crate) ChunkAdapter<S> = GenericChunk<S> { link: Link } where S: Storage);
 
-
 impl<S: Storage> GenericArena<S> {
     pub fn new() -> Self {
         Self {
@@ -152,7 +151,6 @@ impl<S: Storage> GenericArena<S> {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-
 
         let mut chunks = self.chunks.lock();
         unsafe {

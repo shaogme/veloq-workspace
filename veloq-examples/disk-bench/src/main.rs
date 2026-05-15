@@ -220,7 +220,7 @@ async fn apply_sync(file: &File, mode: SyncMode, bytes: u64) {
 }
 
 async fn run_iteration_measured(
-    ctx: &veloq::runtime::RuntimeScopeContext,
+    ctx: &veloq::runtime::RuntimeScopeContext<'_>,
     qdepth: usize,
     file: &File,
     ops: &[WriteOp],
@@ -310,7 +310,7 @@ async fn run_iteration_measured(
 }
 
 async fn run_worker(
-    ctx: &veloq::runtime::RuntimeScopeContext,
+    ctx: &veloq::runtime::RuntimeScopeContext<'_>,
     qdepth: usize,
     min_duration: Duration,
     min_iters: usize,
@@ -476,7 +476,7 @@ fn main() {
 
                 worker_handles.push(s.spawn_boxed_to(t_idx, async move || {
                     run_worker(
-                        &ctx,
+                        ctx,
                         qdepth,
                         duration_limit,
                         min_iters,

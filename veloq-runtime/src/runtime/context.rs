@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::future::poll_fn;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::task::Poll;
 use std::time::Duration;
@@ -70,7 +69,6 @@ impl IdleDecision {
 }
 
 pub struct RuntimeContext {
-    pub(crate) shared: Arc<RuntimeShared>,
     pub(crate) worker_id: usize,
     pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) remote_rx: Receiver<SendTaskRef>,
@@ -81,19 +79,38 @@ pub struct RuntimeContext {
 }
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
-#[derive(Clone)]
-pub struct RuntimeScopeContext {}
+#[derive(Clone, Copy)]
+pub struct RuntimeScopeContext<'a> {
+    pub(crate) shared: &'a RuntimeShared,
+}
 
-impl RuntimeScopeContext {
+impl<'a> RuntimeScopeContext<'a> {
+    /// Returns the total worker count in the runtime.
+    pub fn worker_count(&self) -> NonZeroUsize {
+        self.shared.worker_count()
+    }
+
+    /// Wakes up the specified worker.
+    pub fn wake_worker(&self, worker_id: usize) {
+        self.shared.wake_worker(worker_id);
+    }
+
+    /// Checks if the runtime is shutting down.
+    pub fn is_shutdown(&self) -> bool {
+        self.shared
+            .shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Creates a new thread-safe (Send) asynchronous scope.
     pub async fn scope<T, F>(&self, f: F) -> T
     where
-        F: for<'a, 's, 'm> AsyncFnOnce(
-            &'a GenericAsyncScope<'s, AtomicStorage, ArcOwnership, &'m ()>,
+        F: for<'b, 's, 'm> AsyncFnOnce(
+            &'b GenericAsyncScope<'s, AtomicStorage, ArcOwnership, &'m ()>,
         ) -> T,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = AsyncScope::__private_new(parent);
+        let s = AsyncScope::__private_new(self.shared, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
@@ -102,12 +119,12 @@ impl RuntimeScopeContext {
     /// Creates a new thread-local asynchronous scope.
     pub async fn scope_local<T, F>(&self, f: F) -> T
     where
-        F: for<'a, 's, 'm> AsyncFnOnce(
-            &'a GenericAsyncScope<'s, LocalStorage, RcOwnership, *const &'m ()>,
+        F: for<'b, 's, 'm> AsyncFnOnce(
+            &'b GenericAsyncScope<'s, LocalStorage, RcOwnership, *const &'m ()>,
         ) -> T,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = LocalAsyncScope::__private_new(parent);
+        let s = LocalAsyncScope::__private_new(self.shared, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
@@ -122,15 +139,21 @@ thread_local! {
 }
 
 /// Worker initialization context passed to the injected worker init step.
-#[derive(Debug, Clone, Copy)]
-pub struct WorkerInitContext {
+#[derive(Clone, Copy)]
+pub struct WorkerInitContext<'a> {
+    pub shared: &'a RuntimeShared,
     worker_id: usize,
     worker_count: NonZeroUsize,
 }
 
-impl WorkerInitContext {
-    pub(crate) fn new(worker_id: usize, worker_count: NonZeroUsize) -> Self {
+impl<'a> WorkerInitContext<'a> {
+    pub(crate) fn new(
+        shared: &'a RuntimeShared,
+        worker_id: usize,
+        worker_count: NonZeroUsize,
+    ) -> Self {
         Self {
+            shared,
             worker_id,
             worker_count,
         }
@@ -147,6 +170,14 @@ impl WorkerInitContext {
     pub fn worker_count(&self) -> NonZeroUsize {
         self.worker_count
     }
+
+    /// Returns the runtime scope context.
+    #[inline]
+    pub fn runtime_context(&self) -> RuntimeScopeContext<'_> {
+        RuntimeScopeContext {
+            shared: self.shared,
+        }
+    }
 }
 
 pub fn current_worker_id() -> usize {
@@ -156,14 +187,6 @@ pub fn current_worker_id() -> usize {
             .map(|c| c.worker_id)
             .unwrap_or(usize::MAX)
     })
-}
-
-pub fn wake_worker(worker_id: usize) {
-    CONTEXT.with(|ctx| {
-        if let Some(runtime) = ctx.borrow().as_ref() {
-            runtime.shared.registry.unpark(worker_id);
-        }
-    });
 }
 
 pub fn set_current_runtime_context(context: RuntimeContext) {
@@ -178,11 +201,7 @@ pub fn clear_current_runtime_context() {
     });
 }
 
-pub(crate) fn with_current_runtime<R>(f: impl FnOnce(&Arc<RuntimeShared>) -> R) -> Option<R> {
-    CONTEXT.with(|ctx| ctx.borrow().as_ref().map(|c| f(&c.shared)))
-}
-
-pub(crate) fn run_worker_idle_hook() -> IdleDecision {
+pub fn run_worker_idle_hook() -> IdleDecision {
     CONTEXT.with(|ctx| {
         ctx.borrow()
             .as_ref()
@@ -192,6 +211,7 @@ pub(crate) fn run_worker_idle_hook() -> IdleDecision {
             })
     })
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
