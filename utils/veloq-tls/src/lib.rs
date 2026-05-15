@@ -144,17 +144,17 @@ unsafe impl<T> Send for Tls<T> {}
 unsafe impl<T> Sync for Tls<T> {}
 
 /// A guard that clears the TLS slot when dropped.
-pub struct TlsGuard<'a, T> {
+pub struct TlsGuard<'a, 'b, T> {
     tls: &'a Tls<T>,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<&'b mut T>,
 }
 
-impl<'a, T> TlsGuard<'a, T> {
+impl<'a, 'b, T> TlsGuard<'a, 'b, T> {
     /// Creates a new `TlsGuard` and sets the TLS value.
     ///
     /// If TLS allocation or setting fails, this returns an error.
-    pub fn new(tls: &'a Tls<T>, ptr: NonNull<T>) -> Result<Self, TlsError> {
-        tls.set(Some(ptr))?;
+    pub fn new(tls: &'a Tls<T>, ptr: &'b mut T) -> Result<Self, TlsError> {
+        tls.set(Some(NonNull::from(ptr)))?;
         Ok(Self {
             tls,
             _marker: PhantomData,
@@ -162,7 +162,7 @@ impl<'a, T> TlsGuard<'a, T> {
     }
 }
 
-impl<T> Drop for TlsGuard<'_, T> {
+impl<T> Drop for TlsGuard<'_, '_, T> {
     fn drop(&mut self) {
         let _ = self.tls.set(None);
     }
@@ -213,7 +213,7 @@ mod tests {
         assert!(TEST_TLS.get().is_none());
         {
             let mut val = 100;
-            let _guard = TlsGuard::new(&TEST_TLS, NonNull::from(&mut val)).unwrap();
+            let _guard = TlsGuard::new(&TEST_TLS, &mut val).unwrap();
             assert_eq!(unsafe { *TEST_TLS.get().unwrap().as_ptr() }, 100);
         }
         assert!(TEST_TLS.get().is_none());

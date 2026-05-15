@@ -1,6 +1,5 @@
 use std::num::NonZeroUsize;
 use std::ops::{AsyncFn, AsyncFnOnce};
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
@@ -104,9 +103,10 @@ where
                         rand: FastRand::new(worker_id as u64),
                         extra: T::new(worker_id),
                     };
-                    let _guard =
-                        TlsGuard::new(&shared_clone.context_tls, NonNull::from(&mut context))
-                            .expect("failed to set runtime context");
+                    // SAFETY: context is valid for the entire duration of the worker thread's execution.
+                    // TlsGuard ensures the TLS slot is cleared when this thread scope ends.
+                    let _guard = TlsGuard::new(&shared_clone.context_tls, &mut context)
+                        .expect("failed to set runtime context");
 
                     let init_ctx =
                         WorkerInitContext::new(shared_clone.clone(), worker_id, worker_count);
@@ -136,7 +136,9 @@ where
                 rand: FastRand::new(0),
                 extra: T::new(0),
             };
-            let _guard = TlsGuard::new(&shared.context_tls, NonNull::from(&mut context))
+            // SAFETY: context is valid for the entire duration of the main worker's block_on execution.
+            // TlsGuard ensures the TLS slot is cleared when this scope ends.
+            let _guard = TlsGuard::new(&shared.context_tls, &mut context)
                 .expect("failed to set runtime context");
 
             let signal = Arc::new(Signal::new(true));
