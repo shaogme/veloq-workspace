@@ -10,9 +10,9 @@ use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::{Driver, PlatformDriver};
 use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
+use veloq_runtime::utils::storage::StaticTransfer;
 
 use crate::config::Config;
-use crate::runtime::context::{DriverCommandDispatcher, init_worker_driver_command_state};
 use crate::runtime::context::{DriverRegistrar, RegistrarMessage};
 
 pub use veloq_runtime::runtime::RuntimeScopeContext;
@@ -85,24 +85,6 @@ pub struct Runtime<T: PoolTopology> {
     config: Config,
 }
 
-struct StaticTransfer<T>(Box<[Option<T>]>);
-
-unsafe impl<T: Send> Sync for StaticTransfer<T> {}
-
-impl<T> StaticTransfer<T> {
-    fn new(items: Vec<T>) -> Self {
-        Self(items.into_iter().map(Some).collect())
-    }
-
-    fn take(&self, index: usize) -> T {
-        unsafe {
-            let ptr = self.0.as_ptr() as *mut Option<T>;
-            (*ptr.add(index))
-                .take()
-                .expect("Worker item already taken or index out of bounds")
-        }
-    }
-}
 
 struct RegistrarDispatcher {
     senders: Vec<mpsc::Sender<RegistrarMessage>>,
@@ -127,7 +109,7 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn block_on<R, F>(self, f: F) -> R
     where
-        F: for<'a> AsyncFnOnce(&RuntimeScopeContext<'a>) -> R,
+        F: AsyncFnOnce(&RuntimeScopeContext) -> R,
     {
         let Runtime {
             worker_count,
@@ -148,19 +130,13 @@ impl<T: PoolTopology> Runtime<T> {
         // 预先为每个 Worker 创建消息通道
         let mut senders = Vec::with_capacity(worker_count.get());
         let mut receivers = Vec::with_capacity(worker_count.get());
-        let mut command_senders = Vec::with_capacity(worker_count.get());
-        let mut command_receivers = Vec::with_capacity(worker_count.get());
         for _ in 0..worker_count.get() {
             let (tx, rx) = mpsc::channel();
             senders.push(tx);
             receivers.push(rx);
-            let (cmd_tx, cmd_rx) = mpsc::channel();
-            command_senders.push(cmd_tx);
-            command_receivers.push(cmd_rx);
         }
 
         let receivers = Arc::new(StaticTransfer::new(receivers));
-        let command_receivers = Arc::new(StaticTransfer::new(command_receivers));
         let dispatcher = Arc::new(RegistrarDispatcher { senders });
 
         // 连接内存池监听器到分发器
@@ -176,14 +152,11 @@ impl<T: PoolTopology> Runtime<T> {
             .with_worker_count(worker_count.get())
             .with_queue_capacity(config.get_queue_capacity().get())
             .with_idle_hook(crate::runtime::context::poll_current_driver)
-            .with_worker_tick_hook(crate::runtime::context::drain_pending_driver_commands)
-            .with_worker_init(async move |worker_ctx: WorkerInitContext<'_>| {
+            .with_worker_init(async move |worker_ctx: WorkerInitContext| {
                 let topology = topology.clone();
                 let state = state.clone();
                 let config = config.clone();
                 let receiver = receivers.take(worker_ctx.worker_id());
-                let command_receiver = command_receivers.take(worker_ctx.worker_id());
-                let command_senders = command_senders.clone();
 
                 let driver = Rc::new(RefCell::new(
                     PlatformDriver::new(&config).expect("failed to create driver"),
@@ -191,16 +164,9 @@ impl<T: PoolTopology> Runtime<T> {
 
                 // 初始化 TLS 中的注册中心状态
                 context::init_worker_registrar_state(receiver);
-                init_worker_driver_command_state(command_receiver);
 
                 let registration_mode = config.registration_mode();
                 let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
-
-                let command_dispatcher = DriverCommandDispatcher::new(
-                    command_senders,
-                    worker_ctx.shared.unparkers(),
-                    worker_ctx.shared.worker_count().get(),
-                );
 
                 {
                     let mut driver_ref = driver.borrow_mut();
@@ -214,7 +180,6 @@ impl<T: PoolTopology> Runtime<T> {
                     buf_pool,
                     config,
                     registrar,
-                    command_dispatcher,
                 ));
             })
             .build();

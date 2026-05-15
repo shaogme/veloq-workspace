@@ -12,7 +12,7 @@ fn worker_init_runs_for_each_worker() {
         .worker_count(NonZeroUsize::new(3).unwrap())
         .with_worker_init({
             let worker_init_calls = Arc::clone(&worker_init_calls);
-            async move |ctx: WorkerInitContext<'_>| {
+            async move |ctx: WorkerInitContext| {
                 assert_eq!(current_worker_id(), ctx.worker_id());
                 assert!(ctx.worker_id() < ctx.worker_count().get());
                 worker_init_calls.fetch_add(1, Ordering::AcqRel);

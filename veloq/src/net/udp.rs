@@ -12,17 +12,22 @@ use veloq_driver_native::op::{
     DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpConnect, UdpRecv as OpUdpRecv,
     UdpRecvFrom, UdpRecvPacket, UdpRecvPacketBuf, UdpSend as OpUdpSend,
 };
+use veloq_runtime::runtime::RuntimeScopeContext;
 
 #[derive(Clone)]
-pub struct GenericUdpSocket<S: OpSubmitter, P: SocketTokenPtr> {
-    pub(crate) inner: InnerSocket<P>,
+pub struct GenericUdpSocket<'a, S: OpSubmitter, P: SocketTokenPtr<'a>> {
+    pub(crate) inner: InnerSocket<'a, P>,
     pub(crate) submitter: S,
+    pub(crate) ctx: &'a RuntimeScopeContext,
 }
 
-pub type LocalUdpSocket = GenericUdpSocket<LocalSubmitter, Rc<SocketToken>>;
-pub type UdpSocket = GenericUdpSocket<DetachedSubmitter, Arc<SocketToken>>;
+pub type LocalUdpSocket<'a> = GenericUdpSocket<'a, LocalSubmitter, Rc<SocketToken<'a>>>;
+pub type UdpSocket<'a> = GenericUdpSocket<'a, DetachedSubmitter, Arc<SocketToken<'a>>>;
 
-fn bind_inner<A: ToSocketAddrs, P: SocketTokenPtr>(addr: A) -> VeloqResult<InnerSocket<P>> {
+fn bind_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
+    ctx: &'a RuntimeScopeContext,
+    addr: A,
+) -> VeloqResult<InnerSocket<'a, P>> {
     let addr = addr
         .to_socket_addrs()
         .map_err(from_io_error)?
@@ -47,10 +52,11 @@ fn bind_inner<A: ToSocketAddrs, P: SocketTokenPtr>(addr: A) -> VeloqResult<Inner
         socket.into_owned_raw().into_raw(),
         Some(local_addr),
         veloq_runtime::runtime::current_worker_id(),
+        ctx.shared(),
     )
 }
 
-impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
+impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P> {
     pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
         self.inner.local_addr()
     }
@@ -145,11 +151,12 @@ impl<S: OpSubmitter + Copy, P: SocketTokenPtr> GenericUdpSocket<S, P> {
     }
 }
 
-impl LocalUdpSocket {
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> VeloqResult<Self> {
+impl<'a> LocalUdpSocket<'a> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext, addr: A) -> VeloqResult<Self> {
         Ok(Self {
-            inner: bind_inner(addr)?,
+            inner: bind_inner(ctx, addr)?,
             submitter: LocalSubmitter,
+            ctx,
         })
     }
 
@@ -194,17 +201,17 @@ impl LocalUdpSocket {
     }
 }
 
-impl UdpSocket {
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> VeloqResult<Self> {
+impl<'a> UdpSocket<'a> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext, addr: A) -> VeloqResult<Self> {
         Ok(Self {
-            inner: bind_inner(addr)?,
+            inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
+            ctx,
         })
     }
 
-    pub async fn send_to<'a>(
+    pub async fn send_to(
         &self,
-        ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>,
         buf: FixedBuf,
         target: SocketAddr,
     ) -> VeloqResult<(usize, FixedBuf)> {
@@ -215,11 +222,11 @@ impl UdpSocket {
             buf_offset: 0,
             addr: target,
         };
-        let (res, op) = submit_to(ctx, owner, Op::new(op)).await?;
+        let (res, op) = submit_to(self.ctx, owner, Op::new(op)).await?;
         Ok((res.map_err(from_driver_report)?, op.buf))
     }
 
-    pub async fn recv_from<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
+    pub async fn recv_from(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
         let owner = self.inner.owner_worker_id();
         let op = UdpRecvFrom {
             fd: self.inner.fd(),
@@ -227,7 +234,7 @@ impl UdpSocket {
             buf_offset: 0,
             addr: None,
         };
-        let (res, op) = submit_to(ctx, owner, Op::new(op)).await?;
+        let (res, op) = submit_to(self.ctx, owner, Op::new(op)).await?;
         let n = res.map_err(from_driver_report)?;
         let mut recv_buf = op.buf;
         recv_buf.set_len(n);
@@ -243,7 +250,7 @@ impl UdpSocket {
         })
     }
 
-    pub async fn connect<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, addr: SocketAddr) -> VeloqResult<()> {
+    pub async fn connect(&self, addr: SocketAddr) -> VeloqResult<()> {
         let owner = self.inner.owner_worker_id();
         let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
@@ -252,21 +259,20 @@ impl UdpSocket {
             addr: raw_addr,
             addr_len: raw_addr_len as u32,
         };
-        let (res, _) = submit_to(ctx, owner, Op::new(op)).await?;
+        let (res, _) = submit_to(self.ctx, owner, Op::new(op)).await?;
         res.map(|_| ()).map_err(from_driver_report)
     }
 
-    pub async fn send<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
-        self.send_subset(ctx, buf, 0).await
+    pub async fn send(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
+        self.send_subset(buf, 0).await
     }
 
-    pub async fn recv<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
-        self.recv_subset(ctx, buf, 0).await
+    pub async fn recv(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
+        self.recv_subset(buf, 0).await
     }
 
-    pub async fn send_subset<'a>(
+    pub async fn send_subset(
         &self,
-        ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>,
         buf: FixedBuf,
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
@@ -276,13 +282,12 @@ impl UdpSocket {
             buf,
             buf_offset,
         };
-        let (res, op) = submit_to(ctx, owner, Op::new(op)).await?;
+        let (res, op) = submit_to(self.ctx, owner, Op::new(op)).await?;
         Ok((res.map_err(from_driver_report)?, op.buf))
     }
 
-    pub async fn recv_subset<'a>(
+    pub async fn recv_subset(
         &self,
-        ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>,
         buf: FixedBuf,
         buf_offset: usize,
     ) -> VeloqResult<(usize, FixedBuf)> {
@@ -292,12 +297,12 @@ impl UdpSocket {
             buf,
             buf_offset,
         };
-        let (res, op) = submit_to(ctx, owner, Op::new(op)).await?;
+        let (res, op) = submit_to(self.ctx, owner, Op::new(op)).await?;
         Ok((res.map_err(from_driver_report)?, op.buf))
     }
 }
 
-impl crate::io::AsyncBufRead for LocalUdpSocket {
+impl<'a> crate::io::AsyncBufRead for LocalUdpSocket<'a> {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.recv(buf).await.map_err(to_io_error)
     }
@@ -320,12 +325,16 @@ impl crate::io::AsyncBufRead for LocalUdpSocket {
     }
 }
 
-impl UdpSocket {
-    pub async fn read_exact<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+impl<'a> crate::io::AsyncBufRead for UdpSocket<'a> {
+    async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+        self.recv(buf).await.map_err(to_io_error)
+    }
+
+    async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.recv_subset(ctx, buf, total).await.map_err(to_io_error)?;
+            let (n, b) = self.recv_subset(buf, total).await.map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -339,7 +348,7 @@ impl UdpSocket {
     }
 }
 
-impl crate::io::AsyncBufWrite for LocalUdpSocket {
+impl<'a> crate::io::AsyncBufWrite for LocalUdpSocket<'a> {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.send(buf).await.map_err(to_io_error)
     }
@@ -370,12 +379,16 @@ impl crate::io::AsyncBufWrite for LocalUdpSocket {
     }
 }
 
-impl UdpSocket {
-    pub async fn write_all<'a>(&self, ctx: &veloq_runtime::runtime::RuntimeScopeContext<'a>, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+impl<'a> crate::io::AsyncBufWrite for UdpSocket<'a> {
+    async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+        self.send(buf).await.map_err(to_io_error)
+    }
+
+    async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.send_subset(ctx, buf, total).await.map_err(to_io_error)?;
+            let (n, b) = self.send_subset(buf, total).await.map_err(to_io_error)?;
             buf = b;
             if n == 0 {
                 return Err(io::Error::new(
@@ -386,5 +399,13 @@ impl UdpSocket {
             total += n;
         }
         Ok((total, buf))
+    }
+
+    async fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> io::Result<()> {
+        Ok(())
     }
 }

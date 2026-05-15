@@ -212,7 +212,7 @@ pub(crate) fn dispatch_routed<
     T,
     F,
 >(
-    context: &crate::runtime::RuntimeScopeContext<'scope>,
+    context: &crate::runtime::RuntimeScopeContext,
     completion: &O::Shared<super::GenericScopeCompletion<S, O>>,
     state: Arc<RoutedSpawnState<'scope, T>>,
     worker_id: usize,
@@ -244,7 +244,7 @@ pub(crate) fn dispatch_routed<
 }
 
 pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
-    runtime: &RuntimeShared,
+    runtime: &Arc<RuntimeShared>,
     arena: &crate::task::GenericArena<AtomicStorage>,
     completion: Arc<crate::scope::ScopeCompletion>,
     worker_id: usize,
@@ -274,7 +274,7 @@ pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
 
     let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
     let header = task_ref.header();
-    header.set_runtime_info(runtime as *const RuntimeShared, worker_id);
+    header.set_runtime_info(Arc::as_ptr(runtime), worker_id);
 
     if !runtime.enqueue_pinned(worker_id, task_ref) {
         unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };

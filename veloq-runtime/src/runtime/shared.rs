@@ -483,9 +483,15 @@ impl RuntimeShared {
         if task.header().try_mark_queued() {
             let worker = &self.registry.workers[worker_id];
             worker.local_count.fetch_add(1, Ordering::Release);
-            let _ = worker.local_tx.send(task);
-            self.idle.event_count.notify();
-            self.wake_worker(worker_id);
+            if worker.local_tx.send(task).is_err() {
+                worker.local_count.fetch_sub(1, Ordering::Release);
+                if task.header().clear_queued() {
+                    task.header().acknowledge_completion();
+                }
+            } else {
+                self.idle.event_count.notify();
+                self.wake_worker(worker_id);
+            }
         }
     }
 
@@ -501,6 +507,9 @@ impl RuntimeShared {
             worker.pinned_count.fetch_add(1, Ordering::Release);
             if worker.pinned_tx.send(task).is_err() {
                 worker.pinned_count.fetch_sub(1, Ordering::Release);
+                if task.header().clear_queued() {
+                    task.header().acknowledge_completion();
+                }
                 return false;
             }
             self.wake_worker(worker_id);
@@ -593,13 +602,19 @@ impl RuntimeShared {
     }
 
     fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
-        task.header().clear_queued();
-        let _ = task.poll_task(worker_id);
+        if task.header().clear_queued() {
+            task.header().acknowledge_completion();
+        } else {
+            let _ = task.poll_task(worker_id);
+        }
     }
 
     pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) {
-        task.header().clear_queued();
-        let _ = task.poll_task(worker_id);
+        if task.header().clear_queued() {
+            task.header().acknowledge_completion();
+        } else {
+            let _ = task.poll_task(worker_id);
+        }
     }
 
     pub fn shutdown(&self) {

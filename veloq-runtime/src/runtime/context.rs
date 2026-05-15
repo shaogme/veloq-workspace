@@ -1,7 +1,7 @@
 use std::future::poll_fn;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
-use std::sync::mpsc::Receiver;
+use std::sync::{Arc, mpsc::Receiver};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -80,12 +80,12 @@ pub struct RuntimeContext {
 }
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
-#[derive(Clone, Copy)]
-pub struct RuntimeScopeContext<'a> {
-    pub(crate) shared: &'a RuntimeShared,
+#[derive(Clone)]
+pub struct RuntimeScopeContext {
+    pub(crate) shared: Arc<RuntimeShared>,
 }
 
-impl<'a> RuntimeScopeContext<'a> {
+impl RuntimeScopeContext {
     /// Returns the total worker count in the runtime.
     pub fn worker_count(&self) -> NonZeroUsize {
         self.shared.worker_count()
@@ -103,10 +103,15 @@ impl<'a> RuntimeScopeContext<'a> {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub fn route_to<F, Fut>(&self, worker_id: usize, job: F) -> std::io::Result<crate::runtime::route::RoutedFuture<'a, Fut>>
+    /// Returns the shared runtime state.
+    pub fn shared(&self) -> &RuntimeShared {
+        self.shared.as_ref()
+    }
+
+    pub fn route_to<F, Fut>(&self, worker_id: usize, job: F) -> std::io::Result<crate::runtime::route::RoutedFuture<'_, Fut>>
     where
-        F: FnOnce() -> Fut + Send + 'a,
-        Fut: std::future::Future + Send + 'a,
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future + Send,
     {
         let slot = crate::runtime::route::RouteCell::new();
         let slot_for_job = slot.clone();
@@ -164,7 +169,7 @@ impl<'a> RuntimeScopeContext<'a> {
         });
 
         task.header.set_pinned();
-        task.header.set_runtime_info(self.shared as *const RuntimeShared, worker_id);
+        task.header.set_runtime_info(Arc::as_ptr(&self.shared), worker_id);
 
         let ptr = Box::into_raw(task);
         let task_ref = unsafe { crate::task::SendTaskRef::from_concrete(ptr) };
@@ -183,9 +188,9 @@ impl<'a> RuntimeScopeContext<'a> {
         f: F,
     ) -> std::io::Result<R>
     where
-        F: FnOnce() -> Fut + Send + 'a,
-        Fut: std::future::Future<Output = R> + Send + 'a,
-        R: Send + 'a,
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = R> + Send,
+        R: Send,
     {
         use std::sync::atomic::Ordering;
         let worker_id = crate::utils::storage::StateInt::load(&task.header().worker_id, Ordering::Acquire);
@@ -200,7 +205,7 @@ impl<'a> RuntimeScopeContext<'a> {
         ) -> T,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = AsyncScope::__private_new(RuntimeScopeContext { shared: self.shared }, parent);
+        let s = AsyncScope::__private_new(RuntimeScopeContext { shared: self.shared.clone() }, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
@@ -214,7 +219,7 @@ impl<'a> RuntimeScopeContext<'a> {
         ) -> T,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = LocalAsyncScope::__private_new(RuntimeScopeContext { shared: self.shared }, parent);
+        let s = LocalAsyncScope::__private_new(RuntimeScopeContext { shared: self.shared.clone() }, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
@@ -227,16 +232,16 @@ pub type WorkerTickHook = fn();
 pub static CONTEXT: Tls<RuntimeContext> = Tls::new();
 
 /// Worker initialization context passed to the injected worker init step.
-#[derive(Clone, Copy)]
-pub struct WorkerInitContext<'a> {
-    pub shared: &'a RuntimeShared,
+#[derive(Clone)]
+pub struct WorkerInitContext {
+    pub shared: Arc<RuntimeShared>,
     worker_id: usize,
     worker_count: NonZeroUsize,
 }
 
-impl<'a> WorkerInitContext<'a> {
+impl WorkerInitContext {
     pub(crate) fn new(
-        shared: &'a RuntimeShared,
+        shared: Arc<RuntimeShared>,
         worker_id: usize,
         worker_count: NonZeroUsize,
     ) -> Self {
@@ -261,9 +266,9 @@ impl<'a> WorkerInitContext<'a> {
 
     /// Returns the runtime scope context.
     #[inline]
-    pub fn runtime_context(&self) -> RuntimeScopeContext<'_> {
+    pub fn runtime_context(&self) -> RuntimeScopeContext {
         RuntimeScopeContext {
-            shared: self.shared,
+            shared: self.shared.clone(),
         }
     }
 }

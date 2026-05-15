@@ -5,22 +5,28 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
-use veloq_driver_native::driver::DriverControlCommand;
+use crate::runtime::context::submit_control_task;
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::IoFd;
 use veloq_driver_native::{OwnedRawHandle, RawHandle};
+use veloq_runtime::runtime::shared::RuntimeShared;
 
 // ============================================================================
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
-pub struct SocketToken {
+pub struct SocketToken<'a> {
     fd: IoFd,
     owner_worker_id: usize,
+    shared: &'a RuntimeShared,
 }
 
-impl SocketToken {
-    pub(crate) fn new(handle: RawHandle, owner_worker_id: usize) -> VeloqResult<Self> {
+impl<'a> SocketToken<'a> {
+    pub(crate) fn new(
+        handle: RawHandle,
+        owner_worker_id: usize,
+        shared: &'a RuntimeShared,
+    ) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
             return Err(from_io_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -44,6 +50,7 @@ impl SocketToken {
         Ok(Self {
             fd,
             owner_worker_id,
+            shared,
         })
     }
 
@@ -53,22 +60,16 @@ impl SocketToken {
     }
 }
 
-impl Drop for SocketToken {
+impl<'a> Drop for SocketToken<'a> {
     fn drop(&mut self) {
-        let Some(ctx) = crate::runtime::context::try_current() else {
-            return;
-        };
-
         let current_worker_id = veloq_runtime::runtime::current_worker_id();
         if current_worker_id == self.owner_worker_id {
-            let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);
-            return;
+            if let Some(ctx) = crate::runtime::context::try_current() {
+                let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);
+            }
+        } else {
+            submit_control_task(self.shared, self.owner_worker_id, self.fd);
         }
-
-        ctx.driver_commands().dispatch(
-            self.owner_worker_id,
-            DriverControlCommand::UnregisterFiles(vec![self.fd]),
-        );
     }
 }
 
@@ -76,37 +77,40 @@ impl Drop for SocketToken {
 // SocketTokenPtr Trait
 // ============================================================================
 
-pub trait SocketTokenPtr: Deref<Target = SocketToken> + Clone {
-    fn new_ptr(token: SocketToken) -> Self;
+pub trait SocketTokenPtr<'a>: Deref<Target = SocketToken<'a>> + Clone {
+    fn new_ptr(token: SocketToken<'a>) -> Self;
 }
 
-impl SocketTokenPtr for Rc<SocketToken> {
-    fn new_ptr(token: SocketToken) -> Self {
+impl<'a> SocketTokenPtr<'a> for Rc<SocketToken<'a>> {
+    fn new_ptr(token: SocketToken<'a>) -> Self {
         Rc::new(token)
     }
 }
 
-impl SocketTokenPtr for Arc<SocketToken> {
-    fn new_ptr(token: SocketToken) -> Self {
+impl<'a> SocketTokenPtr<'a> for Arc<SocketToken<'a>> {
+    fn new_ptr(token: SocketToken<'a>) -> Self {
         Arc::new(token)
     }
 }
 
 #[derive(Clone)]
-pub struct InnerSocket<P> {
+pub struct InnerSocket<'a, P: SocketTokenPtr<'a>> {
     token: P,
     local_addr: Option<SocketAddr>,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<P: SocketTokenPtr> InnerSocket<P> {
+impl<'a, P: SocketTokenPtr<'a>> InnerSocket<'a, P> {
     pub fn new(
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
         owner_worker_id: usize,
+        shared: &'a RuntimeShared,
     ) -> VeloqResult<Self> {
         Ok(Self {
-            token: P::new_ptr(SocketToken::new(handle, owner_worker_id)?),
+            token: P::new_ptr(SocketToken::new(handle, owner_worker_id, shared)?),
             local_addr,
+            _marker: std::marker::PhantomData,
         })
     }
 

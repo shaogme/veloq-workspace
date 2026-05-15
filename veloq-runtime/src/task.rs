@@ -15,7 +15,7 @@ pub use scope::{
 };
 
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, StateOptionPtr, Storage};
+use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -231,17 +231,11 @@ where
 
     fn finalize(&self, is_local: bool) {
         self.header.mark_completed_and_notify();
-        self.header.clear_queued();
-        let ptr = self.header.scope_ptr.swap(None, Ordering::AcqRel);
-        let vtable_ptr = self.header.scope_vtable.swap(None, Ordering::AcqRel);
-
-        if let (Some(ptr), Some(vtable_ptr)) = (ptr, vtable_ptr) {
-            unsafe {
-                let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
-                scope_ref.task_done();
-                drop(scope_ref);
-            }
+        
+        if self.header.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.header.acknowledge_completion();
         }
+
         if !is_local {
             self.header.exit_poll();
         }

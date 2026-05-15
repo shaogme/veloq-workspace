@@ -202,6 +202,15 @@ where
     }
 }
 
+impl<'scope, S: TaskStorage, T, F> Drop for GenericTaskNode<'scope, S, T, F>
+where
+    ScopeCompletionRef<S>: IntoAnyScope,
+{
+    fn drop(&mut self) {
+        self.header.release_runtime();
+    }
+}
+
 /// 栈上本地任务：future 本身不进行任何堆分配。
 pub type LocalTaskNode<'scope, 'future, T, F> =
     GenericTaskNode<'scope, LocalStorage, T, Pin<&'future mut F>>;

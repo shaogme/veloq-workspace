@@ -34,11 +34,11 @@ pub struct Runtime<I> {
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
-pub fn noop_worker_init(_: WorkerInitContext<'_>) -> std::future::Ready<()> {
+pub fn noop_worker_init(_: WorkerInitContext) -> std::future::Ready<()> {
     std::future::ready(())
 }
 
-pub type NoopWorkerInit = for<'a> fn(WorkerInitContext<'a>) -> std::future::Ready<()>;
+pub type NoopWorkerInit = fn(WorkerInitContext) -> std::future::Ready<()>;
 
 impl Runtime<NoopWorkerInit> {
     pub fn new() -> Self {
@@ -58,7 +58,7 @@ impl Default for Runtime<NoopWorkerInit> {
 
 impl<I> Runtime<I>
 where
-    I: for<'a> AsyncFn(WorkerInitContext<'a>) -> () + Send + Sync,
+    I: AsyncFn(WorkerInitContext) -> () + Send + Sync,
 {
     pub fn worker_count(&self) -> NonZeroUsize {
         self.worker_count
@@ -66,7 +66,7 @@ where
 
     pub fn block_on<T, F>(mut self, f: F) -> T
     where
-        F: for<'a> AsyncFnOnce(&RuntimeScopeContext<'a>) -> T,
+        F: AsyncFnOnce(&RuntimeScopeContext) -> T,
     {
         let worker_count = self.worker_count;
         let worker_init = self.worker_init.take().expect("worker_init already taken");
@@ -78,24 +78,22 @@ where
         let mut remote_receivers = std::mem::take(&mut components.remote_receivers);
         let mut pinned_receivers = std::mem::take(&mut components.pinned_receivers);
 
-        let shared = RuntimeShared::new(components);
-
-
+        let shared = Arc::new(RuntimeShared::new(components));
 
         thread::scope(|scope| {
-            struct ShutdownGuard<'a>(&'a RuntimeShared);
-            impl Drop for ShutdownGuard<'_> {
+            struct ShutdownGuard(Arc<RuntimeShared>);
+            impl Drop for ShutdownGuard {
                 fn drop(&mut self) {
                     self.0.shutdown();
                 }
             }
-            let _guard = ShutdownGuard(&shared);
+            let _guard = ShutdownGuard(shared.clone());
 
             for worker_id in (1..worker_count.get()).rev() {
                 let lrx = local_receivers.pop().expect("local receivers exhausted");
                 let rrx = remote_receivers.pop().expect("remote receivers exhausted");
                 let prx = pinned_receivers.pop().expect("pinned receivers exhausted");
-                let shared_ref = &shared;
+                let shared_clone = shared.clone();
                 let worker_init_ref = &worker_init;
 
                 scope.spawn(move || {
@@ -112,9 +110,9 @@ where
                         .expect("failed to set runtime context");
 
 
-                    let init_ctx = WorkerInitContext::new(shared_ref, worker_id, worker_count);
+                    let init_ctx = WorkerInitContext::new(shared_clone.clone(), worker_id, worker_count);
                     let init_fut = std::pin::pin!(worker_init_ref(init_ctx));
-                    shared_ref.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(
+                    shared_clone.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(
                         None,
                         Some(init_fut),
                     );
@@ -148,9 +146,9 @@ where
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());
             let mut cx = Context::from_waker(&waker);
-            let runtime_ctx = RuntimeScopeContext { shared: &shared };
+            let runtime_ctx = RuntimeScopeContext { shared: shared.clone() };
 
-            let init_ctx = WorkerInitContext::new(&shared, 0, worker_count);
+            let init_ctx = WorkerInitContext::new(shared.clone(), 0, worker_count);
             let init_fut = std::pin::pin!(worker_init(init_ctx));
             shared.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(None, Some(init_fut));
 

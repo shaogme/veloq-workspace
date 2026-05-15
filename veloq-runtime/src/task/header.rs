@@ -21,9 +21,9 @@ pub enum PollStatus {
 }
 
 pub struct TaskVTable<S: Storage> {
-    pub(crate) wake: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
-    pub(crate) wake_by_ref: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
-    pub(crate) poll: unsafe fn(data: NonNull<GenericTaskHeader<S>>, worker_id: usize) -> bool,
+    pub wake: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
+    pub wake_by_ref: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
+    pub poll: unsafe fn(data: NonNull<GenericTaskHeader<S>>, worker_id: usize) -> bool,
 }
 
 pub struct GenericWakerNode<S: Storage> {
@@ -36,6 +36,7 @@ intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } wher
 
 pub struct GenericTaskHeader<S: Storage> {
     pub(crate) state: S::Usize,
+    pub(crate) ref_count: S::Usize,
     pub(crate) wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     pub(crate) scope_ptr: S::OptionPtr<OpaqueScope>,
     pub(crate) scope_vtable: S::OptionPtr<ScopeVTable<S>>,
@@ -49,6 +50,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     pub fn new(vtable: &'static TaskVTable<S>) -> Self {
         Self {
             state: S::Usize::new(0),
+            ref_count: S::Usize::new(1),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
             scope_ptr: S::OptionPtr::new(None),
             scope_vtable: S::OptionPtr::new(None),
@@ -113,14 +115,21 @@ impl<S: Storage> GenericTaskHeader<S> {
                 )
                 .is_ok()
             {
+                self.ref_count.fetch_add(1, Ordering::Release);
                 return true;
             }
         }
     }
 
     #[inline]
-    pub fn clear_queued(&self) {
-        self.state.fetch_and(!STATE_QUEUED, Ordering::Release);
+    pub fn clear_queued(&self) -> bool {
+        let old_state = self.state.fetch_and(!STATE_QUEUED, Ordering::Release);
+        if old_state & STATE_QUEUED != 0 {
+            if self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+                return true;
+            }
+        }
+        false
     }
 
     /// 尝试进入 Poll 状态。
@@ -230,6 +239,11 @@ impl<S: Storage> GenericTaskHeader<S> {
         runtime_ptr: *const crate::runtime::RuntimeShared,
         worker_id: usize,
     ) {
+        if !runtime_ptr.is_null() {
+            unsafe {
+                std::sync::Arc::increment_strong_count(runtime_ptr);
+            }
+        }
         self.runtime_ptr
             .store(NonNull::new(runtime_ptr as *mut _), Ordering::Release);
         self.worker_id.store(worker_id, Ordering::Release);
@@ -240,6 +254,27 @@ impl<S: Storage> GenericTaskHeader<S> {
         self.runtime_ptr
             .load(Ordering::Acquire)
             .map(|p| unsafe { p.as_ref() })
+    }
+
+    pub fn acknowledge_completion(&self) {
+        let ptr = self.scope_ptr.swap(None, Ordering::AcqRel);
+        let vtable_ptr = self.scope_vtable.swap(None, Ordering::AcqRel);
+
+        if let (Some(ptr), Some(vtable_ptr)) = (ptr, vtable_ptr) {
+            unsafe {
+                let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
+                scope_ref.task_done();
+                drop(scope_ref);
+            }
+        }
+    }
+
+    pub fn release_runtime(&self) {
+        if let Some(ptr) = self.runtime_ptr.swap(None, Ordering::AcqRel) {
+            unsafe {
+                std::sync::Arc::decrement_strong_count(ptr.as_ptr());
+            }
+        }
     }
 
     pub fn is_ready(&self) -> bool {
