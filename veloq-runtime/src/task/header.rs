@@ -124,10 +124,8 @@ impl<S: Storage> GenericTaskHeader<S> {
     #[inline]
     pub fn clear_queued(&self) -> bool {
         let old_state = self.state.fetch_and(!STATE_QUEUED, Ordering::Release);
-        if old_state & STATE_QUEUED != 0 {
-            if self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-                return true;
-            }
+        if old_state & STATE_QUEUED != 0 && self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            return true;
         }
         false
     }
@@ -233,8 +231,12 @@ impl<S: Storage> GenericTaskHeader<S> {
             node.waker.wake_by_ref();
         }
     }
-
-    pub fn set_runtime_info(
+    /// Sets the runtime information for the task.
+    ///
+    /// # Safety
+    /// The `runtime_ptr` must be a valid pointer to a `RuntimeShared` object, or null.
+    /// If not null, the caller must ensure that the pointer remains valid until the task is dropped.
+    pub unsafe fn set_runtime_info(
         &self,
         runtime_ptr: *const crate::runtime::RuntimeShared,
         worker_id: usize,

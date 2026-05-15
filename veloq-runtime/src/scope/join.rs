@@ -224,19 +224,22 @@ pub(crate) fn dispatch_routed<
     let completion_for_job = completion.clone();
     let state_for_job = state.clone();
 
-    if context.route_to(worker_id, move || {
-        let state_err = state_for_job.clone();
-        let completion_err = completion_for_job.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            job();
-        }));
+    if context
+        .route_to(worker_id, move || {
+            let state_err = state_for_job.clone();
+            let completion_err = completion_for_job.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                job();
+            }));
 
-        if result.is_err() {
-            state_err.fail(TaskError::Panic);
-            completion_err.task_done();
-        }
-        std::future::ready(())
-    }).is_err() {
+            if result.is_err() {
+                state_err.fail(TaskError::Panic);
+                completion_err.task_done();
+            }
+            std::future::ready(())
+        })
+        .is_err()
+    {
         completion.task_done();
         state.fail(TaskError::Panic);
         panic!("failed to dispatch routed pinned task");
@@ -274,7 +277,7 @@ pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
 
     let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
     let header = task_ref.header();
-    header.set_runtime_info(Arc::as_ptr(runtime), worker_id);
+    unsafe { header.set_runtime_info(Arc::as_ptr(runtime), worker_id) };
 
     if !runtime.enqueue_pinned(worker_id, task_ref) {
         unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };

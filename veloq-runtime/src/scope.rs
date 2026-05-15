@@ -218,9 +218,11 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
 
         let worker_id = current_worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
-        task_ref
-            .header()
-            .set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id);
+        unsafe {
+            task_ref
+                .header()
+                .set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id)
+        };
         self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
@@ -260,9 +262,11 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
 
         let worker_id = current_worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
-        task_ref
-            .header()
-            .set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id);
+        unsafe {
+            task_ref
+                .header()
+                .set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id)
+        };
         self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
@@ -316,7 +320,9 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
         let header = task_ref.header();
-        header.set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id);
+        unsafe {
+            header.set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id);
+        }
         self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(
@@ -369,8 +375,10 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
 
                 let task = unsafe { task_ptr.as_ref() };
                 task.header().set_pinned();
-                task.header()
-                    .set_runtime_info(Arc::as_ptr(&runtime), worker_id);
+                unsafe {
+                    task.header()
+                        .set_runtime_info(Arc::as_ptr(&runtime), worker_id);
+                }
                 task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(completion.clone()));
 
                 let task_ref = unsafe { SendTaskRef::from_concrete(task) };
@@ -433,9 +441,11 @@ impl<'scope, M> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, M> {
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-        task_ref
-            .header()
-            .set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id);
+        unsafe {
+            task_ref
+                .header()
+                .set_runtime_info(Arc::as_ptr(&self.context.shared), worker_id)
+        };
         self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(

@@ -108,7 +108,11 @@ impl RuntimeScopeContext {
         self.shared.as_ref()
     }
 
-    pub fn route_to<F, Fut>(&self, worker_id: usize, job: F) -> std::io::Result<crate::runtime::route::RoutedFuture<'_, Fut>>
+    pub fn route_to<F, Fut>(
+        &self,
+        worker_id: usize,
+        job: F,
+    ) -> std::io::Result<crate::runtime::route::RoutedFuture<'_, Fut>>
     where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future + Send,
@@ -130,7 +134,9 @@ impl RuntimeScopeContext {
             type Storage = crate::utils::storage::AtomicStorage;
 
             fn poll_raw(&self, _worker_id: usize) -> bool {
-                let job = unsafe { &mut *self.job.get() }.take().expect("job already taken");
+                let job = unsafe { &mut *self.job.get() }
+                    .take()
+                    .expect("job already taken");
                 let fut = job();
                 self.slot.set(fut);
                 // Mark as completed before self-destruct
@@ -152,14 +158,15 @@ impl RuntimeScopeContext {
             F: FnOnce() -> Fut + Send,
             Fut: std::future::Future + Send,
         {
-            const VTABLE: &'static crate::task::TaskVTable<crate::utils::storage::AtomicStorage> = &crate::task::TaskVTable {
-                wake: |_| {},
-                wake_by_ref: |_| {},
-                poll: |data, worker_id| unsafe {
-                    let node = &*(data.as_ptr() as *const Self);
-                    crate::task::RawTask::poll_raw(node, worker_id)
-                },
-            };
+            const VTABLE: &'static crate::task::TaskVTable<crate::utils::storage::AtomicStorage> =
+                &crate::task::TaskVTable {
+                    wake: |_| {},
+                    wake_by_ref: |_| {},
+                    poll: |data, worker_id| unsafe {
+                        let node = &*(data.as_ptr() as *const Self);
+                        crate::task::RawTask::poll_raw(node, worker_id)
+                    },
+                };
         }
 
         let task = Box::new(RouteJobTask {
@@ -169,13 +176,18 @@ impl RuntimeScopeContext {
         });
 
         task.header.set_pinned();
-        task.header.set_runtime_info(Arc::as_ptr(&self.shared), worker_id);
+        unsafe {
+            task.header
+                .set_runtime_info(Arc::as_ptr(&self.shared), worker_id);
+        }
 
         let ptr = Box::into_raw(task);
         let task_ref = unsafe { crate::task::SendTaskRef::from_concrete(ptr) };
 
         if !self.shared.enqueue_pinned(worker_id, task_ref) {
-            unsafe { let _ = Box::from_raw(ptr); }
+            unsafe {
+                let _ = Box::from_raw(ptr);
+            }
             return Err(std::io::Error::other("failed to dispatch job to worker"));
         }
 
@@ -193,7 +205,8 @@ impl RuntimeScopeContext {
         R: Send,
     {
         use std::sync::atomic::Ordering;
-        let worker_id = crate::utils::storage::StateInt::load(&task.header().worker_id, Ordering::Acquire);
+        let worker_id =
+            crate::utils::storage::StateInt::load(&task.header().worker_id, Ordering::Acquire);
         Ok(self.route_to(worker_id, f)?.await)
     }
 
@@ -205,7 +218,12 @@ impl RuntimeScopeContext {
         ) -> T,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = AsyncScope::__private_new(RuntimeScopeContext { shared: self.shared.clone() }, parent);
+        let s = AsyncScope::__private_new(
+            RuntimeScopeContext {
+                shared: self.shared.clone(),
+            },
+            parent,
+        );
         let res = f(&s).await;
         s.wait_all().await;
         res
@@ -219,7 +237,12 @@ impl RuntimeScopeContext {
         ) -> T,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = LocalAsyncScope::__private_new(RuntimeScopeContext { shared: self.shared.clone() }, parent);
+        let s = LocalAsyncScope::__private_new(
+            RuntimeScopeContext {
+                shared: self.shared.clone(),
+            },
+            parent,
+        );
         let res = f(&s).await;
         s.wait_all().await;
         res

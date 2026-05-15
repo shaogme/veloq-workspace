@@ -85,7 +85,6 @@ pub struct Runtime<T: PoolTopology> {
     config: Config,
 }
 
-
 struct RegistrarDispatcher {
     senders: Vec<mpsc::Sender<RegistrarMessage>>,
 }
@@ -176,10 +175,7 @@ impl<T: PoolTopology> Runtime<T> {
                 let buf_pool =
                     topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
                 context::set_current_runtime_context(context::RuntimeContext::new(
-                    driver,
-                    buf_pool,
-                    config,
-                    registrar,
+                    driver, buf_pool, config, registrar,
                 ));
             })
             .build();

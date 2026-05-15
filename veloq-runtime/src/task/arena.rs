@@ -135,7 +135,12 @@ impl<S: Storage> GenericArena<S> {
         }
 
         // 3. 减少计数并检查回收
-        if unsafe { (*chunk_ptr).active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 } {
+        if unsafe {
+            (*chunk_ptr)
+                .active_count
+                .fetch_sub(1usize, Ordering::AcqRel)
+                == 1
+        } {
             self.reclaim_chunk(chunk_ptr);
         }
     }
@@ -207,7 +212,11 @@ impl<S: Storage> GenericArena<S> {
         let chunk_ptr: *mut GenericChunk<S> = Box::into_raw(new_chunk);
         let allocated_ptr = unsafe { (*chunk_ptr).try_alloc(layout) };
         // 增加对象计数
-        unsafe { (*chunk_ptr).active_count.fetch_add(1usize, Ordering::Relaxed); }
+        unsafe {
+            (*chunk_ptr)
+                .active_count
+                .fetch_add(1usize, Ordering::Relaxed);
+        }
 
         {
             let mut chunks = self.chunks.lock();
@@ -226,7 +235,11 @@ impl<S: Storage> GenericArena<S> {
                     // 另一个线程已经提供了一个合适的 chunk。
                     // 我们可以放弃当前的 new_chunk（减少其 active 引用）。
                     unsafe {
-                        if (*chunk_ptr).active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 {
+                        if (*chunk_ptr)
+                            .active_count
+                            .fetch_sub(1usize, Ordering::AcqRel)
+                            == 1
+                        {
                             self.reclaim_chunk(chunk_ptr);
                         }
                     }
@@ -253,7 +266,12 @@ impl<S: Storage> GenericArena<S> {
                 Ok(old_active) => {
                     if let Some(old) = old_active {
                         unsafe {
-                            if old.as_ref().active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 {
+                            if old
+                                .as_ref()
+                                .active_count
+                                .fetch_sub(1usize, Ordering::AcqRel)
+                                == 1
+                            {
                                 self.reclaim_chunk(old.as_ptr());
                             }
                         }

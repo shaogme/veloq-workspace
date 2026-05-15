@@ -46,7 +46,6 @@ fn tcp_connect_smoke() {
 
 #[test]
 fn tcp_read_exact_write_all() {
-
     const DATA: &[u8] = b"TCP Echo World!";
     let runtime = create_runtime();
     runtime.block_on(async |ctx| {
@@ -296,7 +295,8 @@ fn multithread_tcp_echo() {
 
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
-                let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+                let listener =
+                    TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
                 let listen_addr = listener.local_addr().expect("Failed to get local address");
                 addr_tx.send(listen_addr).unwrap();
 

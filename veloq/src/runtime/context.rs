@@ -342,20 +342,22 @@ where
             <PlatformDriver as Driver>::Op,
             DriverCompletion = <PlatformDriver as Driver>::Completion,
             ErasedPayload = <PlatformDriver as Driver>::UP,
-        > + Send + 'a,
+        > + Send
+        + 'a,
 {
     if veloq_runtime::runtime::current_worker_id() == worker_id {
         let (res, op_back) = submit(&DetachedSubmitter::new(), op).await.into_inner();
         let op = op_back.expect("Op lost in local submit");
         Ok((res, op))
     } else {
-        let routed = ctx.route_to(worker_id, move || {
-            let ctx = current();
-            let driver_rc = ctx.driver();
-            let mut driver = driver_rc.borrow_mut();
-            op.submit_detached(&mut *driver)
-        })
-        .map_err(from_io_error)?;
+        let routed = ctx
+            .route_to(worker_id, move || {
+                let ctx = current();
+                let driver_rc = ctx.driver();
+                let mut driver = driver_rc.borrow_mut();
+                op.submit_detached(&mut *driver)
+            })
+            .map_err(from_io_error)?;
         let (res, op_back) = routed.await.into_inner();
         let op = op_back.expect("Op lost in remote submit");
         Ok((res, op))
@@ -411,10 +413,12 @@ pub(crate) fn submit_control_task(
     });
 
     task.header.set_pinned();
-    task.header.set_runtime_info(
-        shared as *const veloq_runtime::runtime::shared::RuntimeShared,
-        worker_id,
-    );
+    unsafe {
+        task.header.set_runtime_info(
+            shared as *const veloq_runtime::runtime::shared::RuntimeShared,
+            worker_id,
+        );
+    }
 
     let ptr = Box::into_raw(task);
     let task_ref = unsafe { veloq_runtime::task::SendTaskRef::from_concrete(ptr) };

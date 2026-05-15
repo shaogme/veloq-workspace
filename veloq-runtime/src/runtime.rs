@@ -109,8 +109,8 @@ where
                     let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
                         .expect("failed to set runtime context");
 
-
-                    let init_ctx = WorkerInitContext::new(shared_clone.clone(), worker_id, worker_count);
+                    let init_ctx =
+                        WorkerInitContext::new(shared_clone.clone(), worker_id, worker_count);
                     let init_fut = std::pin::pin!(worker_init_ref(init_ctx));
                     shared_clone.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(
                         None,
@@ -129,7 +129,6 @@ where
                 .pop()
                 .expect("main worker pinned receiver exhausted");
 
-
             let mut context = RuntimeContext {
                 worker_id: 0,
                 local_rx: lrx0,
@@ -142,11 +141,12 @@ where
             let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
                 .expect("failed to set runtime context");
 
-
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());
             let mut cx = Context::from_waker(&waker);
-            let runtime_ctx = RuntimeScopeContext { shared: shared.clone() };
+            let runtime_ctx = RuntimeScopeContext {
+                shared: shared.clone(),
+            };
 
             let init_ctx = WorkerInitContext::new(shared.clone(), 0, worker_count);
             let init_fut = std::pin::pin!(worker_init(init_ctx));
@@ -154,7 +154,6 @@ where
 
             let mut fut = std::pin::pin!(f(&runtime_ctx));
             loop {
-
                 match fut.as_mut().poll(&mut cx) {
                     Poll::Ready(res) => {
                         break res;

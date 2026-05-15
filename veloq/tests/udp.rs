@@ -301,7 +301,6 @@ fn udp_cancel_recv_from() {
 
 #[test]
 fn udp_read_exact_write_all() {
-
     let runtime = create_runtime();
     runtime.block_on(async |ctx| {
         let socket_server = bind_udp_socket(ctx, "127.0.0.1:0");
@@ -486,7 +485,8 @@ fn multithread_udp_cross_worker_drop_is_routed() {
                 yield_now().await;
 
                 let probe_server = bind_udp_socket(ctx, "127.0.0.1:0");
-                let probe_client = UdpSocket::bind(ctx, "127.0.0.1:0").expect("probe client dummy bind");
+                let probe_client =
+                    UdpSocket::bind(ctx, "127.0.0.1:0").expect("probe client dummy bind");
                 let probe_addr = probe_server
                     .local_addr()
                     .expect("Failed to get probe server address");
