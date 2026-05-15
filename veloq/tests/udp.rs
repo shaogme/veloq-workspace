@@ -19,7 +19,7 @@ fn create_runtime_with_workers(worker_threads: usize) -> Runtime<UniformSlot> {
         .expect("failed to build runtime")
 }
 
-fn bind_udp_socket<'a>(ctx: &'a RuntimeScopeContext, bind_addr: &str) -> UdpSocket<'a> {
+fn bind_udp_socket<'a>(ctx: &'a RuntimeScopeContext<()>, bind_addr: &str) -> UdpSocket<'a> {
     UdpSocket::bind(ctx, bind_addr).expect("Failed to bind UDP socket")
 }
 

@@ -340,33 +340,37 @@ pub(crate) struct IdleController {
     pub(crate) event_count: EventCount,
 }
 
-pub struct RuntimeShared {
+pub struct RuntimeSharedBase {
     pub(crate) registry: WorkerRegistry,
     pub(crate) topo: TopologyContext,
     pub(crate) scheduler: TaskScheduler,
     pub(crate) idle: IdleController,
     pub(crate) shutdown: AtomicBool,
-    pub(crate) idle_hook: Option<IdleHook>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
-    pub(crate) context_tls: veloq_tls::Tls<crate::runtime::context::RuntimeContext>,
 }
 
-pub(crate) struct RuntimeSharedComponents {
+pub struct RuntimeShared<T> {
+    pub(crate) base: Arc<RuntimeSharedBase>,
+    pub(crate) idle_hook: Option<IdleHook<T>>,
+    pub(crate) context_tls: veloq_tls::Tls<crate::runtime::context::RuntimeContext<T>>,
+}
+
+pub(crate) struct RuntimeSharedComponents<T> {
     pub(crate) registry: WorkerRegistry,
     pub(crate) topo: TopologyContext,
     pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
     pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) worker_count: NonZeroUsize,
-    pub(crate) idle_hook: Option<IdleHook>,
+    pub(crate) idle_hook: Option<IdleHook<T>>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
-impl RuntimeSharedComponents {
+impl<T> RuntimeSharedComponents<T> {
     pub(crate) fn new(
         worker_count: NonZeroUsize,
         queue_capacity: NonZeroUsize,
-        idle_hook: Option<IdleHook>,
+        idle_hook: Option<IdleHook<T>>,
         worker_tick_hook: Option<WorkerTickHook>,
     ) -> Self {
         let worker_count_val = worker_count.get();
@@ -453,48 +457,37 @@ impl RuntimeSharedComponents {
     }
 }
 
-impl RuntimeShared {
-    pub(crate) fn new(components: RuntimeSharedComponents) -> Self {
+impl<T> RuntimeShared<T> {
+    pub fn base(&self) -> &RuntimeSharedBase {
+        self.base.as_ref()
+    }
+
+    pub(crate) fn new(components: RuntimeSharedComponents<T>) -> Self {
         Self {
-            registry: components.registry,
-            topo: components.topo,
-            scheduler: TaskScheduler {
-                injector: GlobalInjector::new(),
-                next_worker: AtomicUsize::new(0),
-                searching_workers: AtomicUsize::new(0),
-            },
-            idle: IdleController {
-                idle_mask: AtomicBitset::new(components.worker_count.get()),
-                event_count: EventCount::new(),
-            },
-            shutdown: AtomicBool::new(false),
+            base: Arc::new(RuntimeSharedBase {
+                registry: components.registry,
+                topo: components.topo,
+                scheduler: TaskScheduler {
+                    injector: GlobalInjector::new(),
+                    next_worker: AtomicUsize::new(0),
+                    searching_workers: AtomicUsize::new(0),
+                },
+                idle: IdleController {
+                    idle_mask: AtomicBitset::new(components.worker_count.get()),
+                    event_count: EventCount::new(),
+                },
+                shutdown: AtomicBool::new(false),
+                worker_tick_hook: components.worker_tick_hook,
+            }),
             idle_hook: components.idle_hook,
-            worker_tick_hook: components.worker_tick_hook,
             context_tls: veloq_tls::Tls::new(),
         }
     }
 }
 
-impl RuntimeShared {
-    pub fn worker_id(&self) -> usize {
-        self.context_tls
-            .get()
-            .map(|ptr| unsafe { ptr.as_ref().worker_id })
-            .unwrap_or(usize::MAX)
-    }
-
+impl RuntimeSharedBase {
     pub fn unparkers(&self) -> Vec<Unparker> {
         self.registry.unparkers.clone()
-    }
-
-    pub fn choose_worker(&self) -> usize {
-        let current = self
-            .context_tls
-            .get()
-            .map(|ptr| unsafe { ptr.as_ref().worker_id })
-            .unwrap_or(usize::MAX);
-        self.topo
-            .choose_worker_with_current(&self.scheduler.next_worker, current)
     }
 
     #[inline]
@@ -547,52 +540,6 @@ impl RuntimeShared {
     #[inline]
     pub fn wake_worker(&self, worker_id: usize) {
         self.registry.unpark(worker_id);
-    }
-
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
-        if task.header().is_completed() {
-            return;
-        }
-        let worker_count = self.registry.workers.len();
-        let worker_id = worker_id % worker_count;
-        if task.header().try_mark_queued() {
-            self.idle.event_count.notify();
-
-            let current = self
-                .context_tls
-                .get()
-                .map(|ptr| unsafe { ptr.as_ref().worker_id })
-                .unwrap_or(usize::MAX);
-
-            if current == worker_id {
-                let worker = &self.registry.workers[worker_id];
-                let header_ptr = task.header() as *const _ as *mut _;
-                if worker
-                    .lifo
-                    .compare_exchange(
-                        None,
-                        NonNull::new(header_ptr),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    self.wake_worker(worker_id);
-                    return;
-                }
-
-                if worker.deque.push(task).is_ok() {
-                    self.wake_worker(worker_id);
-                    return;
-                }
-            }
-
-            let worker = &self.registry.workers[worker_id];
-            if worker.remote_tx.send(task).is_err() {
-                self.scheduler.injector.push(task);
-            }
-            self.wake_worker(worker_id);
-        }
     }
 
     fn pop_local(&self, worker_id: usize, rx: &Receiver<LocalTaskRef>) -> Option<LocalTaskRef> {
@@ -655,6 +602,125 @@ impl RuntimeShared {
         }
     }
 
+    pub(crate) fn has_work(&self, worker_id: usize) -> bool {
+        let worker = &self.registry.workers[worker_id];
+        worker.lifo.load(Ordering::Acquire).is_some()
+            || !worker.deque.is_empty()
+            || worker.local_count.load(Ordering::Acquire) > 0
+            || worker.pinned_count.load(Ordering::Acquire) > 0
+    }
+
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+        if task.header().is_completed() {
+            return;
+        }
+        let worker_count = self.registry.workers.len();
+        let worker_id = worker_id % worker_count;
+        if task.header().try_mark_queued() {
+            self.idle.event_count.notify();
+            let worker = &self.registry.workers[worker_id];
+            if worker.remote_tx.send(task).is_err() {
+                self.scheduler.injector.push(task);
+            }
+            self.wake_worker(worker_id);
+        }
+    }
+}
+
+impl<T: crate::runtime::context::RuntimeContextExtra> RuntimeShared<T> {
+    pub fn worker_id(&self) -> usize {
+        self.context_tls
+            .get()
+            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .unwrap_or(usize::MAX)
+    }
+
+    pub fn unparkers(&self) -> Vec<Unparker> {
+        self.base.unparkers()
+    }
+
+    pub fn choose_worker(&self) -> usize {
+        let current = self
+            .context_tls
+            .get()
+            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .unwrap_or(usize::MAX);
+        self.base
+            .topo
+            .choose_worker_with_current(&self.base.scheduler.next_worker, current)
+    }
+
+    #[inline]
+    pub fn worker_count(&self) -> NonZeroUsize {
+        self.base.worker_count()
+    }
+
+    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
+        self.base.enqueue_local(worker_id, task)
+    }
+
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
+        self.base.enqueue_pinned(worker_id, task)
+    }
+
+    #[inline]
+    pub fn wake_worker(&self, worker_id: usize) {
+        self.base.wake_worker(worker_id)
+    }
+
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+        if task.header().is_completed() {
+            return;
+        }
+        let worker_count = self.base.registry.workers.len();
+        let worker_id = worker_id % worker_count;
+
+        let current = self
+            .context_tls
+            .get()
+            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .unwrap_or(usize::MAX);
+
+        if current == worker_id
+            && task.header().try_mark_queued() {
+                self.base.idle.event_count.notify();
+
+                let worker = &self.base.registry.workers[worker_id];
+                let header_ptr = task.header() as *const _ as *mut _;
+                if worker
+                    .lifo
+                    .compare_exchange(
+                        None,
+                        NonNull::new(header_ptr),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    self.wake_worker(worker_id);
+                    return;
+                }
+
+                if worker.deque.push(task).is_ok() {
+                    self.wake_worker(worker_id);
+                    return;
+                }
+
+                // Fallback to remote_tx if deque is full
+                if worker.remote_tx.send(task).is_err() {
+                    self.base.scheduler.injector.push(task);
+                }
+                self.wake_worker(worker_id);
+                return;
+            }
+
+        self.base.enqueue_send(worker_id, task);
+    }
+
+    pub fn shutdown(&self) {
+        self.base.shutdown();
+    }
+
     pub fn drive_worker<S: Storage, O: Ownership>(
         &self,
         completion: Option<&GenericScopeCompletion<S, O>>,
@@ -671,15 +737,16 @@ impl RuntimeShared {
         let ctx = unsafe { ctx_ptr.as_ref() };
         let worker_id = ctx.worker_id;
 
-        let worker_tick_hook = self.worker_tick_hook;
+        let worker_tick_hook = self.base.worker_tick_hook;
 
-        let waker = primitives::create_unpark_waker(self.registry.unparkers[worker_id].clone());
+        let waker =
+            primitives::create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
         let mut init_cx = Context::from_waker(&waker);
 
         let mut tick = 0u32;
         const INJECTOR_CHECK_INTERVAL: u32 = 61;
 
-        while init_fut.is_some() || !self.shutdown.load(Ordering::Acquire) {
+        while init_fut.is_some() || !self.base.shutdown.load(Ordering::Acquire) {
             let mut progressed = false;
 
             if let Some(hook) = worker_tick_hook {
@@ -709,31 +776,31 @@ impl RuntimeShared {
 
             tick = tick.wrapping_add(1);
 
-            if let Some(task) = self.pop_send(worker_id) {
-                self.poll_send_task(worker_id, task);
+            if let Some(task) = self.base.pop_send(worker_id) {
+                self.base.poll_send_task(worker_id, task);
                 progressed = true;
             }
 
-            if !progressed && let Some(task) = self.pop_pinned(worker_id, &ctx.pinned_rx) {
-                self.poll_send_task(worker_id, task);
+            if !progressed && let Some(task) = self.base.pop_pinned(worker_id, &ctx.pinned_rx) {
+                self.base.poll_send_task(worker_id, task);
                 progressed = true;
             }
 
-            if !progressed && let Some(task) = self.pop_local(worker_id, &ctx.local_rx) {
-                self.poll_local_task(worker_id, task);
+            if !progressed && let Some(task) = self.base.pop_local(worker_id, &ctx.local_rx) {
+                self.base.poll_local_task(worker_id, task);
                 progressed = true;
             }
 
             if !progressed
                 && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
-                && let Some(task) = self.pop_global()
+                && let Some(task) = self.base.pop_global()
             {
-                self.poll_send_task(worker_id, task);
+                self.base.poll_send_task(worker_id, task);
                 progressed = true;
             }
 
             if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
-                self.poll_send_task(worker_id, task);
+                self.base.poll_send_task(worker_id, task);
                 progressed = true;
             }
 
@@ -741,18 +808,20 @@ impl RuntimeShared {
                 continue;
             }
 
-            self.scheduler
+            self.base
+                .scheduler
                 .searching_workers
                 .fetch_add(1, Ordering::Relaxed);
             for _ in 0..4 {
-                if let Some(task) = self.steal_send(worker_id, &ctx.rand) {
-                    self.poll_send_task(worker_id, task);
+                if let Some(task) = self.base.steal_send(worker_id, &ctx.rand) {
+                    self.base.poll_send_task(worker_id, task);
                     progressed = true;
                     break;
                 }
                 std::hint::spin_loop();
             }
-            self.scheduler
+            self.base
+                .scheduler
                 .searching_workers
                 .fetch_sub(1, Ordering::Relaxed);
 
@@ -765,13 +834,5 @@ impl RuntimeShared {
             }
             RuntimeProgressCoordinator::new(self, worker_id).run(completion);
         }
-    }
-
-    pub(crate) fn has_work(&self, worker_id: usize) -> bool {
-        let worker = &self.registry.workers[worker_id];
-        worker.lifo.load(Ordering::Acquire).is_some()
-            || !worker.deque.is_empty()
-            || worker.local_count.load(Ordering::Acquire) > 0
-            || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 }

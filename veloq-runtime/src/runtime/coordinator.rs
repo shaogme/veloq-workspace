@@ -6,13 +6,13 @@ use crate::utils::ownership::Ownership;
 use crate::utils::storage::Storage;
 use std::time::Duration;
 
-pub(crate) struct RuntimeProgressCoordinator<'a> {
-    shared: &'a RuntimeShared,
+pub(crate) struct RuntimeProgressCoordinator<'a, T> {
+    shared: &'a RuntimeShared<T>,
     worker_id: usize,
 }
 
-impl<'a> RuntimeProgressCoordinator<'a> {
-    pub(crate) fn new(shared: &'a RuntimeShared, worker_id: usize) -> Self {
+impl<'a, T: crate::runtime::context::RuntimeContextExtra> RuntimeProgressCoordinator<'a, T> {
+    pub(crate) fn new(shared: &'a RuntimeShared<T>, worker_id: usize) -> Self {
         Self { shared, worker_id }
     }
 
@@ -23,30 +23,29 @@ impl<'a> RuntimeProgressCoordinator<'a> {
         let idle_decision = self
             .shared
             .idle_hook
-            .map(|h| h())
+            .map(|h| h(self.shared))
             .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block));
         if idle_decision.is_continue() {
             std::thread::yield_now();
             return;
         }
 
-        let group_idx = self.shared.topo.worker_to_group[self.worker_id];
-        let group = &self.shared.topo.groups[group_idx];
-        let seq = self.shared.idle.event_count.load();
+        let base = &self.shared.base;
+        let group_idx = base.topo.worker_to_group[self.worker_id];
+        let group = &base.topo.groups[group_idx];
+        let seq = base.idle.event_count.load();
 
-        self.shared.idle.idle_mask.set(self.worker_id);
-        group
-            .idle_stack
-            .push(self.worker_id, &self.shared.topo.next_idle);
+        base.idle.idle_mask.set(self.worker_id);
+        group.idle_stack.push(self.worker_id, &base.topo.next_idle);
 
         if self.should_retry(seq, completion) {
             self.leave_idle(group_idx);
             return;
         }
 
-        if let Some(task) = self.shared.scheduler.pop_global() {
+        if let Some(task) = base.scheduler.pop_global() {
             self.leave_idle(group_idx);
-            self.shared.poll_send_task(self.worker_id, task);
+            base.poll_send_task(self.worker_id, task);
             return;
         }
 
@@ -59,12 +58,10 @@ impl<'a> RuntimeProgressCoordinator<'a> {
         seq: usize,
         completion: Option<&GenericScopeCompletion<S, O>>,
     ) -> bool {
-        self.shared.idle.event_count.load() != seq
-            || self.shared.has_work(self.worker_id)
-            || self
-                .shared
-                .shutdown
-                .load(std::sync::atomic::Ordering::Acquire)
+        let base = &self.shared.base;
+        base.idle.event_count.load() != seq
+            || base.has_work(self.worker_id)
+            || base.shutdown.load(std::sync::atomic::Ordering::Acquire)
             || completion.map(|c| c.is_done()).unwrap_or(false)
     }
 
@@ -73,7 +70,8 @@ impl<'a> RuntimeProgressCoordinator<'a> {
         idle_decision: IdleDecision,
         completion: Option<&GenericScopeCompletion<S, O>>,
     ) {
-        let parker = Parker::from_inner(self.shared.registry.parker_inners[self.worker_id].clone());
+        let base = &self.shared.base;
+        let parker = Parker::from_inner(base.registry.parker_inners[self.worker_id].clone());
         match idle_decision {
             IdleDecision::Wait(IdleWaitStrategy::Timeout(duration)) => {
                 let _ = parker.park_timeout(duration);
@@ -90,9 +88,10 @@ impl<'a> RuntimeProgressCoordinator<'a> {
     }
 
     fn leave_idle(&self, group_idx: usize) {
-        let _ = self.shared.topo.groups[group_idx]
+        let base = &self.shared.base;
+        let _ = base.topo.groups[group_idx]
             .idle_stack
-            .pop(&self.shared.topo.next_idle);
-        self.shared.idle.idle_mask.clear(self.worker_id);
+            .pop(&base.topo.next_idle);
+        base.idle.idle_mask.clear(self.worker_id);
     }
 }

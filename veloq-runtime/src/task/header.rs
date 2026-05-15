@@ -40,7 +40,7 @@ pub struct GenericTaskHeader<S: Storage> {
     pub(crate) wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     pub(crate) scope_ptr: S::OptionPtr<OpaqueScope>,
     pub(crate) scope_vtable: S::OptionPtr<ScopeVTable<S>>,
-    pub(crate) runtime_ptr: S::OptionPtr<crate::runtime::RuntimeShared>,
+    pub(crate) runtime_ptr: S::OptionPtr<crate::runtime::shared::RuntimeSharedBase>,
     pub(crate) worker_id: S::Usize,
     pub(crate) injector_next: S::OptionPtr<GenericTaskHeader<S>>,
     pub(crate) vtable: &'static TaskVTable<S>,
@@ -234,11 +234,11 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// Sets the runtime information for the task.
     ///
     /// # Safety
-    /// The `runtime_ptr` must be a valid pointer to a `RuntimeShared` object, or null.
+    /// The `runtime_ptr` must be a valid pointer to a `RuntimeSharedBase` object, or null.
     /// If not null, the caller must ensure that the pointer remains valid until the task is dropped.
     pub unsafe fn set_runtime_info(
         &self,
-        runtime_ptr: *const crate::runtime::RuntimeShared,
+        runtime_ptr: *const crate::runtime::shared::RuntimeSharedBase,
         worker_id: usize,
     ) {
         if !runtime_ptr.is_null() {
@@ -252,7 +252,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn runtime_shared(&self) -> Option<&crate::runtime::RuntimeShared> {
+    pub fn runtime_shared(&self) -> Option<&crate::runtime::shared::RuntimeSharedBase> {
         self.runtime_ptr
             .load(Ordering::Acquire)
             .map(|p| unsafe { p.as_ref() })

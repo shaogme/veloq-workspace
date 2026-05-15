@@ -4,7 +4,11 @@ use veloq_runtime::{task, task_local};
 
 // --- 测试用例 ---
 
-async fn work(ctx: veloq_runtime::runtime::RuntimeScopeContext, id: String, steps: u32) -> String {
+async fn work(
+    ctx: veloq_runtime::runtime::RuntimeScopeContext<()>,
+    id: String,
+    steps: u32,
+) -> String {
     for i in 1..=steps {
         yield_now().await;
         let worker_id = ctx.worker_id();

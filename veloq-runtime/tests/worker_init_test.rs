@@ -8,11 +8,11 @@ use veloq_runtime::runtime::{Runtime, WorkerInitContext};
 fn worker_init_runs_for_each_worker() {
     let worker_init_calls = Arc::new(AtomicUsize::new(0));
 
-    let runtime = Runtime::builder()
+    let runtime = Runtime::<_, ()>::builder()
         .worker_count(NonZeroUsize::new(3).unwrap())
         .with_worker_init({
             let worker_init_calls = Arc::clone(&worker_init_calls);
-            async move |ctx: WorkerInitContext| {
+            async move |ctx: WorkerInitContext<()>| {
                 assert!(ctx.worker_id() < ctx.worker_count().get());
                 worker_init_calls.fetch_add(1, Ordering::AcqRel);
             }

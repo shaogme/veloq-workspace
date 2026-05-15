@@ -211,8 +211,9 @@ pub(crate) fn dispatch_routed<
     O: crate::utils::ownership::Ownership,
     T,
     F,
+    TExtra,
 >(
-    context: &crate::runtime::RuntimeScopeContext,
+    context: &crate::runtime::RuntimeScopeContext<TExtra>,
     completion: &O::Shared<super::GenericScopeCompletion<S, O>>,
     state: Arc<RoutedSpawnState<'scope, T>>,
     worker_id: usize,
@@ -220,6 +221,7 @@ pub(crate) fn dispatch_routed<
 ) where
     O::Shared<super::GenericScopeCompletion<S, O>>: Send + 'scope,
     F: FnOnce() + Send + 'scope,
+    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     let completion_for_job = completion.clone();
     let state_for_job = state.clone();
@@ -246,8 +248,8 @@ pub(crate) fn dispatch_routed<
     }
 }
 
-pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
-    runtime: &Arc<RuntimeShared>,
+pub(crate) fn install_routed_pinned_task<'scope, T, Fut, TExtra>(
+    runtime: &Arc<RuntimeShared<TExtra>>,
     arena: &crate::task::GenericArena<AtomicStorage>,
     completion: Arc<crate::scope::ScopeCompletion>,
     worker_id: usize,
@@ -256,6 +258,7 @@ pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
 ) where
     T: Send + 'scope,
     Fut: Future<Output = T> + 'scope,
+    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     let node = crate::task::SendBoxedTaskNode::new(future);
     let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'scope, T, Fut>>();
@@ -277,7 +280,7 @@ pub(crate) fn install_routed_pinned_task<'scope, T, Fut>(
 
     let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
     let header = task_ref.header();
-    unsafe { header.set_runtime_info(Arc::as_ptr(runtime), worker_id) };
+    unsafe { header.set_runtime_info(Arc::as_ptr(&runtime.base), worker_id) };
 
     if !runtime.enqueue_pinned(worker_id, task_ref) {
         unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };
@@ -312,35 +315,65 @@ pub(crate) enum JoinSource<'scope, T, R: TaskHandleRef> {
     },
 }
 
-pub struct JoinHandle<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>> {
+pub struct JoinHandle<
+    'scope,
+    'scope_ref,
+    T,
+    R: TaskHandleRef,
+    S: ScopeProvider<'scope, TExtra>,
+    TExtra,
+> {
     pub(crate) source: JoinSource<'scope, T, R>,
     pub(crate) scope: &'scope_ref S,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<NonNull<GenericWakerNode<R::Storage>>>,
     pub(crate) reclaim: Option<ReclaimFn<'scope, T, S::Arena>>,
+    pub(crate) _marker: std::marker::PhantomData<TExtra>,
 }
 
-unsafe impl<'scope, 'scope_ref, T> Send
-    for JoinHandle<'scope, 'scope_ref, T, SendTaskRef, crate::scope::AsyncScope<'scope>>
+unsafe impl<'scope, 'scope_ref, T, TExtra> Send
+    for JoinHandle<
+        'scope,
+        'scope_ref,
+        T,
+        SendTaskRef,
+        crate::scope::AsyncScope<'scope, TExtra>,
+        TExtra,
+    >
 where
     T: Send + 'scope,
 {
 }
 
-pub type LocalJoinHandle<'scope, 'scope_ref, T> =
-    JoinHandle<'scope, 'scope_ref, T, crate::task::LocalTaskRef, crate::scope::AsyncScope<'scope>>;
-pub type SendJoinHandle<'scope, 'scope_ref, T> =
-    JoinHandle<'scope, 'scope_ref, T, SendTaskRef, crate::scope::AsyncScope<'scope>>;
-pub type LocalAsyncJoinHandle<'scope, 'scope_ref, T> = JoinHandle<
+pub type LocalJoinHandle<'scope, 'scope_ref, T, TExtra> = JoinHandle<
     'scope,
     'scope_ref,
     T,
     crate::task::LocalTaskRef,
-    crate::scope::LocalAsyncScope<'scope>,
+    crate::scope::AsyncScope<'scope, TExtra>,
+    TExtra,
+>;
+pub type SendJoinHandle<'scope, 'scope_ref, T, TExtra> = JoinHandle<
+    'scope,
+    'scope_ref,
+    T,
+    SendTaskRef,
+    crate::scope::AsyncScope<'scope, TExtra>,
+    TExtra,
+>;
+pub type LocalAsyncJoinHandle<'scope, 'scope_ref, T, TExtra> = JoinHandle<
+    'scope,
+    'scope_ref,
+    T,
+    crate::task::LocalTaskRef,
+    crate::scope::LocalAsyncScope<'scope, TExtra>,
+    TExtra,
 >;
 
-impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>>
-    JoinHandle<'scope, 'scope_ref, T, R, S>
+impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope, TExtra>, TExtra>
+    JoinHandle<'scope, 'scope_ref, T, R, S, TExtra>
+where
+    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     pub fn cancel(&self) {
         let mut cancel_slot = self.cancel_token.lock();
@@ -413,6 +446,7 @@ impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>>
             cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
             waker_node: None,
             reclaim,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -429,6 +463,7 @@ impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>>
             cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
             waker_node: None,
             reclaim: None,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -467,8 +502,10 @@ impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>>
     }
 }
 
-impl<'scope, 'scope_ref, T: 'scope, S: ScopeProvider<'scope>> Future
-    for JoinHandle<'scope, 'scope_ref, T, crate::task::LocalTaskRef, S>
+impl<'scope, 'scope_ref, T: 'scope, S: ScopeProvider<'scope, TExtra>, TExtra> Future
+    for JoinHandle<'scope, 'scope_ref, T, crate::task::LocalTaskRef, S, TExtra>
+where
+    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     type Output = Result<T, TaskError>;
 
@@ -509,8 +546,10 @@ impl<'scope, 'scope_ref, T: 'scope, S: ScopeProvider<'scope>> Future
     }
 }
 
-impl<'scope, 'scope_ref, T: 'scope, S: ScopeProvider<'scope>> Future
-    for JoinHandle<'scope, 'scope_ref, T, SendTaskRef, S>
+impl<'scope, 'scope_ref, T: 'scope, S: ScopeProvider<'scope, TExtra>, TExtra> Future
+    for JoinHandle<'scope, 'scope_ref, T, SendTaskRef, S, TExtra>
+where
+    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     type Output = Result<T, TaskError>;
 
@@ -592,8 +631,8 @@ impl<'scope, 'scope_ref, T: 'scope, S: ScopeProvider<'scope>> Future
     }
 }
 
-impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope>> Drop
-    for JoinHandle<'scope, 'scope_ref, T, R, S>
+impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope, TExtra>, TExtra> Drop
+    for JoinHandle<'scope, 'scope_ref, T, R, S, TExtra>
 {
     fn drop(&mut self) {
         if let Some(node_ptr) = self.waker_node {

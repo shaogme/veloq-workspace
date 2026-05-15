@@ -18,14 +18,14 @@ use veloq_runtime::runtime::RuntimeScopeContext;
 pub struct GenericUdpSocket<'a, S: OpSubmitter, P: SocketTokenPtr<'a>> {
     pub(crate) inner: InnerSocket<'a, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: &'a RuntimeScopeContext,
+    pub(crate) ctx: &'a RuntimeScopeContext<()>,
 }
 
 pub type LocalUdpSocket<'a> = GenericUdpSocket<'a, LocalSubmitter, Rc<SocketToken<'a>>>;
 pub type UdpSocket<'a> = GenericUdpSocket<'a, DetachedSubmitter, Arc<SocketToken<'a>>>;
 
 fn bind_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
-    ctx: &'a RuntimeScopeContext,
+    ctx: &'a RuntimeScopeContext<()>,
     addr: A,
 ) -> VeloqResult<InnerSocket<'a, P>> {
     let addr = addr
@@ -152,7 +152,7 @@ impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P
 }
 
 impl<'a> LocalUdpSocket<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext<()>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: LocalSubmitter,
@@ -202,7 +202,7 @@ impl<'a> LocalUdpSocket<'a> {
 }
 
 impl<'a> UdpSocket<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext<()>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),

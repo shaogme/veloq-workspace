@@ -20,7 +20,7 @@ where
     const IS_LOCAL: bool;
     const WAKER_VTABLE: &'static RawWakerVTable;
     fn enqueue(
-        runtime: &crate::runtime::RuntimeShared,
+        runtime: &crate::runtime::RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
     );
@@ -30,7 +30,7 @@ impl TaskStorage for LocalStorage {
     const IS_LOCAL: bool = true;
     const WAKER_VTABLE: &'static RawWakerVTable = &LOCAL_INTRUSIVE_WAKER_VTABLE;
     fn enqueue(
-        runtime: &crate::runtime::RuntimeShared,
+        runtime: &crate::runtime::RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
     ) {
@@ -42,7 +42,7 @@ impl TaskStorage for AtomicStorage {
     const IS_LOCAL: bool = false;
     const WAKER_VTABLE: &'static RawWakerVTable = &INTRUSIVE_WAKER_VTABLE;
     fn enqueue(
-        runtime: &crate::runtime::RuntimeShared,
+        runtime: &crate::runtime::RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
     ) {

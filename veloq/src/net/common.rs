@@ -18,14 +18,14 @@ use veloq_runtime::runtime::shared::RuntimeShared;
 pub struct SocketToken<'a> {
     fd: IoFd,
     owner_worker_id: usize,
-    shared: &'a RuntimeShared,
+    shared: &'a RuntimeShared<()>,
 }
 
 impl<'a> SocketToken<'a> {
     pub(crate) fn new(
         handle: RawHandle,
         owner_worker_id: usize,
-        shared: &'a RuntimeShared,
+        shared: &'a RuntimeShared<()>,
     ) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
             return Err(from_io_error(io::Error::new(
@@ -105,7 +105,7 @@ impl<'a, P: SocketTokenPtr<'a>> InnerSocket<'a, P> {
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
         owner_worker_id: usize,
-        shared: &'a RuntimeShared,
+        shared: &'a RuntimeShared<()>,
     ) -> VeloqResult<Self> {
         Ok(Self {
             token: P::new_ptr(SocketToken::new(handle, owner_worker_id, shared)?),

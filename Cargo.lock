@@ -1277,6 +1277,7 @@ dependencies = [
  "veloq-local",
  "veloq-runtime",
  "veloq-sync",
+ "veloq-tls",
  "windows-sys 0.61.2",
 ]
 

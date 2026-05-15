@@ -7,9 +7,9 @@ use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver_native::driver::{DriveMode, Driver, PlatformDriver};
 use veloq_driver_native::op::{DetachedSubmitter, IntoPlatformOp, Op, OpSubmitter};
 
-use crate::config::{BufferRegistrationMode, Config};
+use crate::config::BufferRegistrationMode;
 use crate::error::{Result as VeloqResult, from_io_error};
-use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy};
+use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy, RuntimeShared};
 
 thread_local! {
     /// 线程局部的运行时上下文
@@ -197,7 +197,6 @@ impl RuntimeDriverBridge {
 pub struct RuntimeContext {
     buf_pool: AnyBufPool,
     driver: Rc<RefCell<PlatformDriver>>,
-    config: Config,
     registrar: DriverRegistrar,
 }
 
@@ -205,13 +204,11 @@ impl RuntimeContext {
     pub(crate) fn new(
         driver: Rc<RefCell<PlatformDriver>>,
         buf_pool: AnyBufPool,
-        config: Config,
         registrar: DriverRegistrar,
     ) -> Self {
         Self {
             buf_pool,
             driver,
-            config,
             registrar,
         }
     }
@@ -224,11 +221,6 @@ impl RuntimeContext {
     #[inline]
     pub fn driver(&self) -> Rc<RefCell<PlatformDriver>> {
         self.driver.clone()
-    }
-
-    #[inline]
-    pub fn config(&self) -> Config {
-        self.config.clone()
     }
 
     #[inline]
@@ -279,7 +271,7 @@ pub fn alloc(size: NonZeroUsize) -> FixedBuf {
     try_alloc(size).expect("failed to allocate buffer")
 }
 
-pub fn poll_current_driver() -> IdleDecision {
+pub fn poll_current_driver(_: &RuntimeShared<()>) -> IdleDecision {
     let Some(ctx) = try_current() else {
         return IdleDecision::wait(IdleWaitStrategy::block());
     };
@@ -327,7 +319,7 @@ pub async fn yield_now() {
 }
 
 pub async fn submit_to<'a, T>(
-    ctx: &veloq_runtime::runtime::RuntimeScopeContext,
+    ctx: &veloq_runtime::runtime::RuntimeScopeContext<()>,
     worker_id: usize,
     op: Op<T>,
 ) -> VeloqResult<(
@@ -365,7 +357,7 @@ where
 }
 
 pub(crate) fn submit_control_task(
-    shared: &veloq_runtime::runtime::shared::RuntimeShared,
+    shared: &veloq_runtime::runtime::shared::RuntimeShared<()>,
     worker_id: usize,
     fd: veloq_driver_native::op::IoFd,
 ) {
@@ -415,7 +407,7 @@ pub(crate) fn submit_control_task(
     task.header.set_pinned();
     unsafe {
         task.header.set_runtime_info(
-            shared as *const veloq_runtime::runtime::shared::RuntimeShared,
+            shared.base() as *const veloq_runtime::runtime::shared::RuntimeSharedBase,
             worker_id,
         );
     }

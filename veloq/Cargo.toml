@@ -23,6 +23,7 @@ veloq-blocking.workspace = true
 veloq-sync.workspace = true
 veloq-local.workspace = true
 veloq-atomic-waker.workspace = true
+veloq-tls.workspace = true
 tracing.workspace = true
 diagweave.workspace = true
 

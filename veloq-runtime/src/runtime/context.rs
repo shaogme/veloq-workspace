@@ -67,21 +67,37 @@ impl IdleDecision {
     }
 }
 
-pub struct RuntimeContext {
+pub trait RuntimeContextExtra: Sized + 'static {
+    fn new(worker_id: usize) -> Self;
+}
+
+impl RuntimeContextExtra for () {
+    fn new(_worker_id: usize) -> Self {}
+}
+
+pub struct RuntimeContext<T> {
     pub(crate) worker_id: usize,
     pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) remote_rx: Receiver<SendTaskRef>,
     pub(crate) pinned_rx: Receiver<SendTaskRef>,
     pub(crate) rand: FastRand,
+    pub extra: T,
 }
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
-#[derive(Clone)]
-pub struct RuntimeScopeContext {
-    pub(crate) shared: Arc<RuntimeShared>,
+pub struct RuntimeScopeContext<T> {
+    pub(crate) shared: Arc<RuntimeShared<T>>,
 }
 
-impl RuntimeScopeContext {
+impl<T> Clone for RuntimeScopeContext<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl<T: RuntimeContextExtra> RuntimeScopeContext<T> {
     /// Returns the total worker count in the runtime.
     pub fn worker_count(&self) -> NonZeroUsize {
         self.shared.worker_count()
@@ -95,12 +111,13 @@ impl RuntimeScopeContext {
     /// Checks if the runtime is shutting down.
     pub fn is_shutdown(&self) -> bool {
         self.shared
+            .base
             .shutdown
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns the shared runtime state.
-    pub fn shared(&self) -> &RuntimeShared {
+    pub fn shared(&self) -> &RuntimeShared<T> {
         self.shared.as_ref()
     }
 
@@ -174,7 +191,7 @@ impl RuntimeScopeContext {
         task.header.set_pinned();
         unsafe {
             task.header
-                .set_runtime_info(Arc::as_ptr(&self.shared), worker_id);
+                .set_runtime_info(Arc::as_ptr(&self.shared.base), worker_id);
         }
 
         let ptr = Box::into_raw(task);
@@ -199,6 +216,7 @@ impl RuntimeScopeContext {
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = R> + Send,
         R: Send,
+        T: RuntimeContextExtra,
     {
         use std::sync::atomic::Ordering;
         let worker_id =
@@ -207,11 +225,11 @@ impl RuntimeScopeContext {
     }
 
     /// Creates a new thread-safe (Send) asynchronous scope.
-    pub async fn scope<T, F>(&self, f: F) -> T
+    pub async fn scope<R, F>(&self, f: F) -> R
     where
         F: for<'b, 's, 'm> AsyncFnOnce(
-            &'b GenericAsyncScope<'s, AtomicStorage, ArcOwnership, &'m ()>,
-        ) -> T,
+            &'b GenericAsyncScope<'s, AtomicStorage, ArcOwnership, T, &'m ()>,
+        ) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = AsyncScope::__private_new(
@@ -226,11 +244,11 @@ impl RuntimeScopeContext {
     }
 
     /// Creates a new thread-local asynchronous scope.
-    pub async fn scope_local<T, F>(&self, f: F) -> T
+    pub async fn scope_local<R, F>(&self, f: F) -> R
     where
         F: for<'b, 's, 'm> AsyncFnOnce(
-            &'b GenericAsyncScope<'s, LocalStorage, RcOwnership, *const &'m ()>,
-        ) -> T,
+            &'b GenericAsyncScope<'s, LocalStorage, RcOwnership, T, *const &'m ()>,
+        ) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = LocalAsyncScope::__private_new(
@@ -254,20 +272,29 @@ impl RuntimeScopeContext {
     }
 }
 
-pub type IdleHook = fn() -> IdleDecision;
+pub type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
 pub type WorkerTickHook = fn();
 
 /// Worker initialization context passed to the injected worker init step.
-#[derive(Clone)]
-pub struct WorkerInitContext {
-    pub shared: Arc<RuntimeShared>,
+pub struct WorkerInitContext<T> {
+    pub shared: Arc<RuntimeShared<T>>,
     worker_id: usize,
     worker_count: NonZeroUsize,
 }
 
-impl WorkerInitContext {
+impl<T> Clone for WorkerInitContext<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            worker_id: self.worker_id,
+            worker_count: self.worker_count,
+        }
+    }
+}
+
+impl<T: RuntimeContextExtra> WorkerInitContext<T> {
     pub(crate) fn new(
-        shared: Arc<RuntimeShared>,
+        shared: Arc<RuntimeShared<T>>,
         worker_id: usize,
         worker_count: NonZeroUsize,
     ) -> Self {
@@ -292,10 +319,21 @@ impl WorkerInitContext {
 
     /// Returns the runtime scope context.
     #[inline]
-    pub fn runtime_context(&self) -> RuntimeScopeContext {
+    pub fn scope(&self) -> RuntimeScopeContext<T> {
         RuntimeScopeContext {
             shared: self.shared.clone(),
         }
+    }
+
+    /// Returns the custom worker extra state.
+    #[inline]
+    pub fn extra(&self) -> &T {
+        let ptr = self
+            .shared
+            .context_tls
+            .get()
+            .expect("RuntimeContext missing in TLS");
+        unsafe { &ptr.as_ref().extra }
     }
 }
 

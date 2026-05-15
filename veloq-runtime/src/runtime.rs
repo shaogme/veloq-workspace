@@ -20,51 +20,54 @@ pub use context::{
     WorkerInitContext, WorkerTickHook,
 };
 pub use primitives::GenericCancellationToken;
-pub use shared::RuntimeShared;
+pub use shared::{RuntimeShared, RuntimeSharedBase};
 use veloq_tls::TlsGuard;
 
 use primitives::{Signal, create_waker};
 use shared::RuntimeSharedComponents;
 
-pub struct Runtime<I> {
-    pub(crate) components: RuntimeSharedComponents,
+pub struct Runtime<I, T> {
+    pub(crate) components: RuntimeSharedComponents<T>,
     pub(crate) worker_count: NonZeroUsize,
     pub(crate) worker_init: Option<I>,
 }
 
-pub fn noop_worker_init(_: WorkerInitContext) -> std::future::Ready<()> {
+pub fn noop_worker_init<T: context::RuntimeContextExtra>(
+    _: WorkerInitContext<T>,
+) -> std::future::Ready<()> {
     std::future::ready(())
 }
 
-pub type NoopWorkerInit = fn(WorkerInitContext) -> std::future::Ready<()>;
+pub type NoopWorkerInit<T> = fn(WorkerInitContext<T>) -> std::future::Ready<()>;
 
-impl Runtime<NoopWorkerInit> {
+impl<T: context::RuntimeContextExtra> Runtime<NoopWorkerInit<T>, T> {
     pub fn new() -> Self {
-        RuntimeBuilder::new().build()
+        RuntimeBuilder::<NoopWorkerInit<T>, T>::new().build()
     }
 
-    pub fn builder() -> RuntimeBuilder<NoopWorkerInit> {
-        RuntimeBuilder::new()
+    pub fn builder() -> RuntimeBuilder<NoopWorkerInit<T>, T> {
+        RuntimeBuilder::<NoopWorkerInit<T>, T>::new()
     }
 }
 
-impl Default for Runtime<NoopWorkerInit> {
+impl<T: context::RuntimeContextExtra> Default for Runtime<NoopWorkerInit<T>, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I> Runtime<I>
+impl<I, T> Runtime<I, T>
 where
-    I: AsyncFn(WorkerInitContext) -> () + Send + Sync,
+    I: AsyncFn(WorkerInitContext<T>) -> () + Send + Sync,
+    T: context::RuntimeContextExtra,
 {
     pub fn worker_count(&self) -> NonZeroUsize {
         self.worker_count
     }
 
-    pub fn block_on<T, F>(mut self, f: F) -> T
+    pub fn block_on<R, F>(mut self, f: F) -> R
     where
-        F: AsyncFnOnce(&RuntimeScopeContext) -> T,
+        F: AsyncFnOnce(&RuntimeScopeContext<T>) -> R,
     {
         let worker_count = self.worker_count;
         let worker_init = self.worker_init.take().expect("worker_init already taken");
@@ -77,8 +80,8 @@ where
         let shared = Arc::new(RuntimeShared::new(components));
 
         thread::scope(|scope| {
-            struct ShutdownGuard(Arc<RuntimeShared>);
-            impl Drop for ShutdownGuard {
+            struct ShutdownGuard<T: context::RuntimeContextExtra>(Arc<RuntimeShared<T>>);
+            impl<T: context::RuntimeContextExtra> Drop for ShutdownGuard<T> {
                 fn drop(&mut self) {
                     self.0.shutdown();
                 }
@@ -99,6 +102,7 @@ where
                         remote_rx: rrx,
                         pinned_rx: prx,
                         rand: FastRand::new(worker_id as u64),
+                        extra: T::new(worker_id),
                     };
                     let _guard =
                         TlsGuard::new(&shared_clone.context_tls, NonNull::from(&mut context))
@@ -130,6 +134,7 @@ where
                 remote_rx: rrx0,
                 pinned_rx: prx0,
                 rand: FastRand::new(0),
+                extra: T::new(0),
             };
             let _guard = TlsGuard::new(&shared.context_tls, NonNull::from(&mut context))
                 .expect("failed to set runtime context");
@@ -153,7 +158,7 @@ where
                     }
                     Poll::Pending => match shared
                         .idle_hook
-                        .map(|h| h())
+                        .map(|h| h(&shared))
                         .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block))
                     {
                         IdleDecision::Continue => thread::yield_now(),
@@ -168,15 +173,16 @@ where
     }
 }
 
-pub struct RuntimeBuilder<I> {
+pub struct RuntimeBuilder<I, T> {
     worker_count: Option<usize>,
     queue_capacity: usize,
     worker_init: Option<I>,
-    idle_hook: Option<IdleHook>,
+    idle_hook: Option<IdleHook<T>>,
     worker_tick_hook: Option<WorkerTickHook>,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl RuntimeBuilder<NoopWorkerInit> {
+impl<T: context::RuntimeContextExtra> RuntimeBuilder<NoopWorkerInit<T>, T> {
     pub fn new() -> Self {
         RuntimeBuilder {
             worker_count: None,
@@ -184,17 +190,18 @@ impl RuntimeBuilder<NoopWorkerInit> {
             worker_init: Some(noop_worker_init),
             idle_hook: None,
             worker_tick_hook: None,
+            _phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl Default for RuntimeBuilder<NoopWorkerInit> {
+impl<T: context::RuntimeContextExtra> Default for RuntimeBuilder<NoopWorkerInit<T>, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I> RuntimeBuilder<I> {
+impl<I, T: context::RuntimeContextExtra> RuntimeBuilder<I, T> {
     pub fn worker_count(mut self, count: NonZeroUsize) -> Self {
         self.worker_count = Some(count.get());
         self
@@ -215,7 +222,7 @@ impl<I> RuntimeBuilder<I> {
         self
     }
 
-    pub fn with_idle_hook(mut self, hook: IdleHook) -> Self {
+    pub fn with_idle_hook(mut self, hook: IdleHook<T>) -> Self {
         self.idle_hook = Some(hook);
         self
     }
@@ -225,17 +232,18 @@ impl<I> RuntimeBuilder<I> {
         self
     }
 
-    pub fn with_worker_init<NI>(self, init: NI) -> RuntimeBuilder<NI> {
+    pub fn with_worker_init<NI>(self, init: NI) -> RuntimeBuilder<NI, T> {
         RuntimeBuilder {
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
             worker_init: Some(init),
             idle_hook: self.idle_hook,
             worker_tick_hook: self.worker_tick_hook,
+            _phantom: std::marker::PhantomData,
         }
     }
 
-    pub fn build(self) -> Runtime<I> {
+    pub fn build(self) -> Runtime<I, T> {
         let count = self
             .worker_count
             .unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()));

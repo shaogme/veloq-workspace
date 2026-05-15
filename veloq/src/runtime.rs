@@ -108,7 +108,7 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn block_on<R, F>(self, f: F) -> R
     where
-        F: AsyncFnOnce(&RuntimeScopeContext) -> R,
+        F: AsyncFnOnce(&RuntimeScopeContext<()>) -> R,
     {
         let Runtime {
             worker_count,
@@ -151,7 +151,7 @@ impl<T: PoolTopology> Runtime<T> {
             .with_worker_count(worker_count.get())
             .with_queue_capacity(config.get_queue_capacity().get())
             .with_idle_hook(crate::runtime::context::poll_current_driver)
-            .with_worker_init(async move |worker_ctx: WorkerInitContext| {
+            .with_worker_init(async move |worker_ctx: WorkerInitContext<()>| {
                 let topology = topology.clone();
                 let state = state.clone();
                 let config = config.clone();
@@ -175,7 +175,7 @@ impl<T: PoolTopology> Runtime<T> {
                 let buf_pool =
                     topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
                 context::set_current_runtime_context(context::RuntimeContext::new(
-                    driver, buf_pool, config, registrar,
+                    driver, buf_pool, registrar,
                 ));
             })
             .build();
