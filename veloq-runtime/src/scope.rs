@@ -231,7 +231,7 @@ where
         JoinHandle::new_direct(
             self,
             task_ref,
-            NonNull::from(task as &dyn crate::task::TaskJoinGate<T>),
+            task as &dyn crate::task::TaskJoinGate<T>,
             None,
         )
     }
@@ -268,10 +268,13 @@ where
         JoinHandle::new_direct(
             self,
             task_ref,
-            unsafe { NonNull::new_unchecked(node_ptr as *mut dyn crate::task::TaskJoinGate<T>) },
+            unsafe { &*(node_ptr as *mut dyn crate::task::TaskJoinGate<T>) },
             Some(|arena, gate| unsafe {
                 let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<'scope, T, F>>();
-                arena.drop_object_raw(gate.as_ptr() as *mut u8, layout);
+                arena.drop_object_raw(
+                    gate as *const dyn crate::task::TaskJoinGate<T> as *mut u8,
+                    layout,
+                );
             }),
         )
     }
@@ -334,7 +337,7 @@ where
         JoinHandle::new_direct(
             self,
             task_ref,
-            NonNull::from(task as &dyn crate::task::TaskJoinGate<T>),
+            task as &dyn crate::task::TaskJoinGate<T>,
             None,
         )
     }
@@ -446,11 +449,14 @@ where
         JoinHandle::new_direct(
             self,
             task_ref,
-            unsafe { NonNull::new_unchecked(node_ptr as *mut dyn crate::task::TaskJoinGate<T>) },
+            unsafe { &*(node_ptr as *mut dyn crate::task::TaskJoinGate<T>) },
             Some(|arena, gate| unsafe {
                 let layout =
                     std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'scope, T, F>>();
-                arena.drop_object_raw(gate.as_ptr() as *mut u8, layout);
+                arena.drop_object_raw(
+                    gate as *const dyn crate::task::TaskJoinGate<T> as *mut u8,
+                    layout,
+                );
             }),
         )
     }

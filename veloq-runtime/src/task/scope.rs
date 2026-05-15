@@ -3,7 +3,10 @@ use crate::utils::storage::{AtomicStorage, LocalStorage, Storage, StrategyId};
 use std::any::Any;
 use std::ptr::NonNull;
 
-/// 不透明的作用域句柄
+/// 不透明的作用域句柄。
+///
+/// 该类型作为一个类型擦除的标记，用于在不暴露具体 `Storage` 和 `Ownership` 策略的情况下传递作用域引用。
+/// 实际指向的是 `crate::scope::GenericScopeCompletion<S, O>`。
 #[repr(C)]
 pub struct OpaqueScope {
     _private: [u8; 0],
@@ -15,8 +18,12 @@ pub struct OpaqueToken {
 }
 
 impl OpaqueScope {
+    /// 将不透明指针转换为具体类型的引用。
+    ///
     /// # Safety
-    /// The pointer must be a valid pointer to a `GenericScopeCompletion<S, O>`.
+    ///
+    /// 调用者必须确保 `ptr` 确实指向一个 `GenericScopeCompletion<S, O>` 实例，
+    /// 且 `S` 和 `O` 与调用处的泛型参数匹配。通常通过 `ScopeVTable` 或 `StrategyId` 进行校验。
     #[inline]
     pub unsafe fn as_concrete<'a, S: Storage, O: Ownership>(
         ptr: NonNull<Self>,

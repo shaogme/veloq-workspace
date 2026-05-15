@@ -12,7 +12,7 @@ use veloq_intrusive_linklist::Link;
 use super::{CancelTokenSlot, ScopeProvider};
 
 pub(crate) type ReclaimFn<'scope, T, A> =
-    unsafe fn(&A, NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>);
+    unsafe fn(&A, &'scope (dyn crate::task::TaskJoinGate<T> + 'scope));
 
 pub(crate) trait RoutedTaskAccess<T>: Send {
     fn take_result(&self) -> Result<T, TaskError>;
@@ -307,7 +307,7 @@ pub(crate) struct ResolvedRoutedTask<'scope, T, R: TaskHandleRef> {
 pub(crate) enum JoinSource<'scope, T, R: TaskHandleRef> {
     Direct {
         task: R,
-        gate: NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>,
+        gate: &'scope (dyn crate::task::TaskJoinGate<T> + 'scope),
     },
     Routed {
         state: Arc<RoutedSpawnState<'scope, T>>,
@@ -326,7 +326,7 @@ pub struct JoinHandle<
     pub(crate) source: JoinSource<'scope, T, R>,
     pub(crate) scope: &'scope_ref S,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
-    pub(crate) waker_node: Option<NonNull<GenericWakerNode<R::Storage>>>,
+    pub(crate) waker_node: Option<Pin<&'scope mut GenericWakerNode<R::Storage>>>,
     pub(crate) reclaim: Option<ReclaimFn<'scope, T, S::Arena>>,
     pub(crate) _marker: std::marker::PhantomData<TExtra>,
 }
@@ -437,7 +437,7 @@ where
     pub(crate) fn new_direct(
         scope: &'scope_ref S,
         task: R,
-        gate: NonNull<dyn crate::task::TaskJoinGate<T> + 'scope>,
+        gate: &'scope (dyn crate::task::TaskJoinGate<T> + 'scope),
         reclaim: Option<ReclaimFn<'scope, T, S::Arena>>,
     ) -> Self {
         Self {
@@ -468,16 +468,18 @@ where
     }
 
     fn register_waker_on<St: crate::utils::storage::Storage>(
-        waker_node: &mut Option<NonNull<GenericWakerNode<St>>>,
+        waker_node: &mut Option<Pin<&'scope mut GenericWakerNode<St>>>,
         arena: &dyn crate::task::Arena,
         header: &crate::task::GenericTaskHeader<St>,
         cx: &mut Context<'_>,
     ) {
-        if let Some(mut node_ptr) = *waker_node {
-            let node = unsafe { node_ptr.as_mut() };
+        if let Some(node) = waker_node {
+            let mut node = node.as_mut();
             if !node.waker.will_wake(cx.waker()) {
-                node.waker = cx.waker().clone();
-                unsafe { header.register_completion(node_ptr) };
+                unsafe {
+                    node.as_mut().get_unchecked_mut().waker = cx.waker().clone();
+                    header.register_completion(node.as_mut());
+                }
             }
         } else {
             let node_ptr = unsafe {
@@ -497,8 +499,11 @@ where
                     },
                 );
             }
-            *waker_node = Some(node_ptr);
-            unsafe { header.register_completion(node_ptr) };
+            let node_ref = unsafe { Pin::new_unchecked(&mut *node_ptr.as_ptr()) };
+            *waker_node = Some(node_ref);
+            unsafe {
+                header.register_completion(waker_node.as_mut().unwrap().as_mut());
+            }
         }
     }
 }
@@ -525,7 +530,8 @@ where
             JoinSource::Direct { task, gate } => {
                 let header = task.header();
                 if header.is_completed() {
-                    let res = unsafe { gate.as_ref().take_result_erased() }
+                    let res = gate
+                        .take_result_erased()
                         .expect("task result already taken");
                     if let Some(reclaim) = reclaim {
                         unsafe { (reclaim)(arena, *gate) };
@@ -569,7 +575,8 @@ where
             JoinSource::Direct { task, gate } => {
                 let header = task.header();
                 if header.is_completed() {
-                    let res = unsafe { gate.as_ref().take_result_erased() }
+                    let res = gate
+                        .take_result_erased()
                         .expect("task result already taken");
                     if let Some(reclaim) = reclaim {
                         unsafe { (reclaim)(arena, *gate) };
@@ -636,7 +643,8 @@ impl<'scope, 'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<'scope, TExtra>, 
     for JoinHandle<'scope, 'scope_ref, T, R, S, TExtra>
 {
     fn drop(&mut self) {
-        if let Some(node_ptr) = self.waker_node {
+        if let Some(node) = self.waker_node.as_mut() {
+            let node_ptr = unsafe { NonNull::from(node.as_mut().get_unchecked_mut()) };
             let task = match &self.source {
                 JoinSource::Direct { task, .. } => Some(*task),
                 JoinSource::Routed { resolved, .. } => resolved.as_ref().map(|r| r.task),

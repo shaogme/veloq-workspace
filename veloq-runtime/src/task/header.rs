@@ -199,24 +199,24 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     /// # Safety
-    /// The `node` pointer must be a valid pointer to a `GenericWakerNode`.
-    pub unsafe fn register_completion(&self, node: NonNull<GenericWakerNode<S>>) {
+    ///
+    /// The caller must ensure that the `node` remains valid and pinned at its current memory location
+    /// until it is either woken or explicitly removed from the task's waker list.
+    pub unsafe fn register_completion(&self, node: std::pin::Pin<&mut GenericWakerNode<S>>) {
         if self.is_completed() {
-            unsafe { node.as_ref().waker.wake_by_ref() };
+            node.waker.wake_by_ref();
             return;
         }
 
         let mut wakers = self.wakers.lock();
         if self.is_completed() {
             drop(wakers);
-            unsafe { node.as_ref().waker.wake_by_ref() };
+            node.waker.wake_by_ref();
             return;
         }
 
         unsafe {
-            wakers.push_back(std::pin::Pin::new_unchecked(
-                node.as_ptr().as_mut().unwrap(),
-            ));
+            wakers.push_back(node);
         }
     }
 
@@ -240,11 +240,9 @@ impl<S: Storage> GenericTaskHeader<S> {
         worker_id: usize,
     ) {
         if let Some(runtime) = runtime {
-            unsafe {
-                std::sync::Arc::increment_strong_count(std::sync::Arc::as_ptr(runtime));
-            }
+            let arc = runtime.clone();
             self.runtime_ptr.store(
-                NonNull::new(std::sync::Arc::as_ptr(runtime) as *mut _),
+                NonNull::new(std::sync::Arc::into_raw(arc) as *mut _),
                 Ordering::Release,
             );
         } else {
@@ -276,7 +274,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     pub fn release_runtime(&self) {
         if let Some(ptr) = self.runtime_ptr.swap(None, Ordering::AcqRel) {
             unsafe {
-                std::sync::Arc::decrement_strong_count(ptr.as_ptr());
+                let _ = std::sync::Arc::from_raw(ptr.as_ptr());
             }
         }
     }
