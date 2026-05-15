@@ -4,7 +4,7 @@ use veloq_runtime::{task, task_local};
 
 // --- 测试用例 ---
 
-async fn work(ctx: &veloq_runtime::runtime::RuntimeScopeContext, id: String, steps: u32) -> String {
+async fn work(ctx: veloq_runtime::runtime::RuntimeScopeContext, id: String, steps: u32) -> String {
     for i in 1..=steps {
         yield_now().await;
         let worker_id = ctx.worker_id();
@@ -21,8 +21,11 @@ fn main() {
     rt.block_on(async |ctx| {
         println!("--- 安全异步作用域执行开始 ---");
 
-        task_local!(static_node, work(ctx, "栈任务-Static".to_string(), 2));
-        task!(send_node, work(ctx, "栈Send任务".to_string(), 2));
+        task_local!(
+            static_node,
+            work(ctx.clone(), "栈任务-Static".to_string(), 2)
+        );
+        task!(send_node, work(ctx.clone(), "栈Send任务".to_string(), 2));
 
         ctx.scope(async |my_scope| {
             let res_send = my_scope.spawn(&send_node).await.unwrap();
@@ -30,7 +33,7 @@ fn main() {
 
             let mut handles = Vec::new();
             for i in 1..=3 {
-                let h = my_scope.spawn_boxed(work(ctx, format!("堆任务-{}", i), i + 1));
+                let h = my_scope.spawn_boxed(work(ctx.clone(), format!("堆任务-{}", i), i + 1));
                 handles.push(h);
             }
 
