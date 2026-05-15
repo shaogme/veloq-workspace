@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use veloq::fs::{BufferingMode, File};
 use veloq::runtime::{Runtime, context};
 use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
-use veloq_runtime::runtime::current_worker_id;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchSyncMode {
@@ -214,13 +213,14 @@ async fn run_1gb_iteration(
 }
 
 async fn run_worker_iteration(
+    ctx: &veloq_runtime::runtime::RuntimeScopeContext,
     files: Vec<File>,
     file_size: u64,
     chunk_size: NonZeroUsize,
     sync_mode: BenchSyncMode,
 ) -> u64 {
     let pool = context::current_pool().expect("Worker should have bound pool");
-    let worker_id = current_worker_id();
+    let worker_id = ctx.worker_id();
     let concurrency_limit = 8;
     let mut offsets = vec![0u64; files.len()];
     let mut current_local_idx = 0usize;
@@ -417,6 +417,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                 }
 
                                 let bytes = run_worker_iteration(
+                                    ctx,
                                     files,
                                     FILE_SIZE,
                                     nz!(4 * 1024 * 1024),

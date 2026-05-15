@@ -1,4 +1,4 @@
-use super::context::{CONTEXT, IdleHook, WorkerTickHook, current_worker_id};
+use super::context::{IdleHook, WorkerTickHook};
 use super::coordinator::RuntimeProgressCoordinator;
 use super::primitives::{self, EventCount, Unparker};
 use crate::scope::GenericScopeCompletion;
@@ -171,13 +171,12 @@ pub(crate) struct TopologyContext {
 }
 
 impl TopologyContext {
-    fn choose_worker(&self, next_worker: &AtomicUsize) -> usize {
+    fn choose_worker_with_current(&self, next_worker: &AtomicUsize, current: usize) -> usize {
         let n = self.worker_to_group.len();
         if n <= 1 {
             return 0;
         }
 
-        let current = current_worker_id();
         if current < n {
             let group_idx = self.worker_to_group[current];
             let group = &self.groups[group_idx];
@@ -349,6 +348,7 @@ pub struct RuntimeShared {
     pub(crate) shutdown: AtomicBool,
     pub(crate) idle_hook: Option<IdleHook>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
+    pub(crate) context_tls: veloq_tls::Tls<crate::runtime::context::RuntimeContext>,
 }
 
 pub(crate) struct RuntimeSharedComponents {
@@ -470,17 +470,31 @@ impl RuntimeShared {
             shutdown: AtomicBool::new(false),
             idle_hook: components.idle_hook,
             worker_tick_hook: components.worker_tick_hook,
+            context_tls: veloq_tls::Tls::new(),
         }
     }
 }
 
 impl RuntimeShared {
+    pub fn worker_id(&self) -> usize {
+        self.context_tls
+            .get()
+            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .unwrap_or(usize::MAX)
+    }
+
     pub fn unparkers(&self) -> Vec<Unparker> {
         self.registry.unparkers.clone()
     }
 
     pub fn choose_worker(&self) -> usize {
-        self.topo.choose_worker(&self.scheduler.next_worker)
+        let current = self
+            .context_tls
+            .get()
+            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .unwrap_or(usize::MAX);
+        self.topo
+            .choose_worker_with_current(&self.scheduler.next_worker, current)
     }
 
     #[inline]
@@ -544,7 +558,11 @@ impl RuntimeShared {
         if task.header().try_mark_queued() {
             self.idle.event_count.notify();
 
-            let current = current_worker_id();
+            let current = self
+                .context_tls
+                .get()
+                .map(|ptr| unsafe { ptr.as_ref().worker_id })
+                .unwrap_or(usize::MAX);
 
             if current == worker_id {
                 let worker = &self.registry.workers[worker_id];
@@ -649,10 +667,9 @@ impl RuntimeShared {
         completion: Option<&GenericScopeCompletion<S, O>>,
         mut init_fut: Option<Pin<&mut F>>,
     ) {
-        let worker_id = current_worker_id();
-
-        let ctx = CONTEXT.get().expect("runtime context missing");
-        let ctx = unsafe { ctx.as_ref() };
+        let ctx_ptr = self.context_tls.get().expect("runtime context missing");
+        let ctx = unsafe { ctx_ptr.as_ref() };
+        let worker_id = ctx.worker_id;
 
         let worker_tick_hook = self.worker_tick_hook;
 

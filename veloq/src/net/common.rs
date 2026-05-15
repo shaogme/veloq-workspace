@@ -62,7 +62,7 @@ impl<'a> SocketToken<'a> {
 
 impl<'a> Drop for SocketToken<'a> {
     fn drop(&mut self) {
-        let current_worker_id = veloq_runtime::runtime::current_worker_id();
+        let current_worker_id = self.shared.worker_id();
         if current_worker_id == self.owner_worker_id {
             if let Some(ctx) = crate::runtime::context::try_current() {
                 let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);

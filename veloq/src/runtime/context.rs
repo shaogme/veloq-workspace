@@ -345,7 +345,7 @@ where
         > + Send
         + 'a,
 {
-    if veloq_runtime::runtime::current_worker_id() == worker_id {
+    if ctx.worker_id() == worker_id {
         let (res, op_back) = submit(&DetachedSubmitter::new(), op).await.into_inner();
         let op = op_back.expect("Op lost in local submit");
         Ok((res, op))

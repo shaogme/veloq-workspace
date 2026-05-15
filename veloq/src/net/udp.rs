@@ -51,7 +51,7 @@ fn bind_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
     InnerSocket::new(
         socket.into_owned_raw().into_raw(),
         Some(local_addr),
-        veloq_runtime::runtime::current_worker_id(),
+        ctx.worker_id(),
         ctx.shared(),
     )
 }

@@ -36,6 +36,7 @@ pub type TcpStream<'a> = GenericTcpStream<'a, DetachedSubmitter, Arc<SocketToken
 
 fn bind_listener_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
     addr: A,
+    worker_id: usize,
     shared: &'a RuntimeShared,
 ) -> VeloqResult<InnerSocket<'a, P>> {
     let addr = addr
@@ -62,13 +63,14 @@ fn bind_listener_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
     InnerSocket::new(
         socket.into_owned_raw().into_raw(),
         Some(local_addr),
-        veloq_runtime::runtime::current_worker_id(),
+        worker_id,
         shared,
     )
 }
 
 fn new_stream_inner<'a, P: SocketTokenPtr<'a>>(
     addr: &SocketAddr,
+    worker_id: usize,
     shared: &'a RuntimeShared,
 ) -> VeloqResult<InnerSocket<'a, P>> {
     let socket = if addr.is_ipv4() {
@@ -76,12 +78,7 @@ fn new_stream_inner<'a, P: SocketTokenPtr<'a>>(
     } else {
         Socket::new_tcp_v6().map_err(from_driver_report)?
     };
-    InnerSocket::new(
-        socket.into_owned_raw().into_raw(),
-        None,
-        veloq_runtime::runtime::current_worker_id(),
-        shared,
-    )
+    InnerSocket::new(socket.into_owned_raw().into_raw(), None, worker_id, shared)
 }
 
 impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericTcpListener<'a, S, P> {
@@ -188,7 +185,7 @@ impl<'a, S: OpSubmitter + Copy, P: SocketTokenPtr<'a>> GenericTcpStream<'a, S, P
 impl<'a> LocalTcpListener<'a> {
     pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext, addr: A) -> VeloqResult<Self> {
         Ok(Self {
-            inner: bind_listener_inner(addr, ctx.shared())?,
+            inner: bind_listener_inner(addr, ctx.worker_id(), ctx.shared())?,
             submitter: LocalSubmitter,
             ctx,
         })
@@ -202,7 +199,7 @@ impl<'a> LocalTcpListener<'a> {
 impl<'a> TcpListener<'a> {
     pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeScopeContext, addr: A) -> VeloqResult<Self> {
         Ok(Self {
-            inner: bind_listener_inner(addr, ctx.shared())?,
+            inner: bind_listener_inner(addr, ctx.worker_id(), ctx.shared())?,
             submitter: DetachedSubmitter::new(),
             ctx,
         })
@@ -238,7 +235,7 @@ impl<'a> TcpListener<'a> {
 
 impl<'a> LocalTcpStream<'a> {
     pub async fn connect(ctx: &'a RuntimeScopeContext, addr: SocketAddr) -> VeloqResult<Self> {
-        let inner = new_stream_inner(&addr, ctx.shared())?;
+        let inner = new_stream_inner(&addr, ctx.worker_id(), ctx.shared())?;
         Self::connect_from_inner_direct(inner, LocalSubmitter, ctx, addr).await
     }
 
@@ -269,7 +266,7 @@ impl<'a> LocalTcpStream<'a> {
 
 impl<'a> TcpStream<'a> {
     pub async fn connect(ctx: &'a RuntimeScopeContext, addr: SocketAddr) -> VeloqResult<Self> {
-        let inner = new_stream_inner(&addr, ctx.shared())?;
+        let inner = new_stream_inner(&addr, ctx.worker_id(), ctx.shared())?;
         Self::connect_from_inner_direct(inner, DetachedSubmitter::new(), ctx, addr).await
     }
 

@@ -12,8 +12,6 @@ use crate::utils::FastRand;
 use crate::utils::ownership::{ArcOwnership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage};
 
-use veloq_tls::Tls;
-
 /// Worker 空闲时的等待策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleWaitStrategy {
@@ -245,12 +243,19 @@ impl RuntimeScopeContext {
         s.wait_all().await;
         res
     }
+
+    /// Returns the current worker id.
+    pub fn worker_id(&self) -> usize {
+        self.shared
+            .context_tls
+            .get()
+            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .unwrap_or(usize::MAX)
+    }
 }
 
 pub type IdleHook = fn() -> IdleDecision;
 pub type WorkerTickHook = fn();
-
-pub static CONTEXT: Tls<RuntimeContext> = Tls::new();
 
 /// Worker initialization context passed to the injected worker init step.
 #[derive(Clone)]
@@ -292,14 +297,6 @@ impl WorkerInitContext {
             shared: self.shared.clone(),
         }
     }
-}
-
-#[inline(always)]
-pub fn current_worker_id() -> usize {
-    CONTEXT
-        .get()
-        .map(|ptr| unsafe { ptr.as_ref().worker_id })
-        .unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]

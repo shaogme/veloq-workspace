@@ -1,5 +1,5 @@
+use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
-use crate::runtime::{RuntimeShared, current_worker_id};
 use crate::task::{
     Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef, SendTask, SendTaskRef, Task,
     TaskError, TaskHandleRef,
@@ -216,7 +216,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
         task.set_scope_completion::<S, O>(Some(self.completion.clone()));
         self.completion.add_task();
 
-        let worker_id = current_worker_id();
+        let worker_id = self.context.worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
         unsafe {
             task_ref
@@ -260,7 +260,7 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
         node_ref.set_scope_completion::<S, O>(Some(self.completion.clone()));
         self.completion.add_task();
 
-        let worker_id = current_worker_id();
+        let worker_id = self.context.worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
         unsafe {
             task_ref
@@ -282,6 +282,10 @@ impl<'scope, S: Storage, O: Ownership, M> GenericAsyncScope<'scope, S, O, M> {
 
     pub fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
         self.completion.cancel_token()
+    }
+
+    pub fn worker_id(&self) -> usize {
+        self.context.worker_id()
     }
 
     pub async fn wait_all(&self) {

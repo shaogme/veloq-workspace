@@ -16,8 +16,8 @@ pub mod route;
 pub mod shared;
 
 pub use context::{
-    CONTEXT, IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext,
-    WorkerInitContext, WorkerTickHook, current_worker_id,
+    IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext,
+    WorkerInitContext, WorkerTickHook,
 };
 pub use primitives::GenericCancellationToken;
 pub use shared::RuntimeShared;
@@ -100,8 +100,9 @@ where
                         pinned_rx: prx,
                         rand: FastRand::new(worker_id as u64),
                     };
-                    let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
-                        .expect("failed to set runtime context");
+                    let _guard =
+                        TlsGuard::new(&shared_clone.context_tls, NonNull::from(&mut context))
+                            .expect("failed to set runtime context");
 
                     let init_ctx =
                         WorkerInitContext::new(shared_clone.clone(), worker_id, worker_count);
@@ -130,7 +131,7 @@ where
                 pinned_rx: prx0,
                 rand: FastRand::new(0),
             };
-            let _guard = TlsGuard::new(&CONTEXT, NonNull::from(&mut context))
+            let _guard = TlsGuard::new(&shared.context_tls, NonNull::from(&mut context))
                 .expect("failed to set runtime context");
 
             let signal = Arc::new(Signal::new(true));

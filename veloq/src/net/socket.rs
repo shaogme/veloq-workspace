@@ -4,7 +4,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
 use veloq_driver_native::Socket;
 use veloq_driver_native::op::DetachedSubmitter;
-use veloq_runtime::runtime::{RuntimeScopeContext, current_worker_id};
+use veloq_runtime::runtime::RuntimeScopeContext;
 
 use crate::net::common::InnerSocket;
 use crate::net::tcp::{GenericTcpListener, TcpListener, TcpStream};
@@ -108,7 +108,7 @@ impl TcpSocket {
             inner: InnerSocket::new(
                 self.inner.into_owned_raw().into_raw(),
                 Some(local_addr),
-                current_worker_id(),
+                ctx.worker_id(),
                 ctx.shared(),
             )?,
             submitter: DetachedSubmitter::new(),
@@ -127,7 +127,7 @@ impl TcpSocket {
         let inner = InnerSocket::new(
             self.inner.into_owned_raw().into_raw(),
             None,
-            current_worker_id(),
+            ctx.worker_id(),
             ctx.shared(),
         )?;
         TcpStream::connect_from_inner(ctx, inner, addr).await
@@ -216,7 +216,7 @@ impl UdpSocketBuilder {
             inner: InnerSocket::new(
                 self.inner.into_owned_raw().into_raw(),
                 Some(local_addr),
-                current_worker_id(),
+                ctx.worker_id(),
                 ctx.shared(),
             )?,
             submitter: DetachedSubmitter::new(),
