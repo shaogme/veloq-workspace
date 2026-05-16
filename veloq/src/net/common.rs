@@ -9,20 +9,19 @@ use crate::runtime::context::{RuntimeContext, submit_control_task};
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::IoFd;
 use veloq_driver_native::{OwnedRawHandle, RawHandle};
-use veloq_runtime::runtime::shared::RuntimeShared;
 
 // ============================================================================
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
-pub struct SocketToken<'a> {
+pub struct SocketToken<'state, 'ctx> {
     fd: IoFd,
     owner_worker_id: usize,
-    shared: &'a RuntimeShared<crate::runtime::context::WorkerState<'a>>,
+    ctx: RuntimeContext<'state, 'ctx>,
 }
 
-impl<'a> SocketToken<'a> {
-    pub(crate) fn new<'ctx>(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> VeloqResult<Self> {
+impl<'state, 'ctx> SocketToken<'state, 'ctx> {
+    pub(crate) fn new(ctx: RuntimeContext<'state, 'ctx>, handle: RawHandle) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
             return Err(from_io_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -45,7 +44,7 @@ impl<'a> SocketToken<'a> {
         Ok(Self {
             fd,
             owner_worker_id: ctx.scope.worker_id(),
-            shared: ctx.scope.shared(),
+            ctx,
         })
     }
 
@@ -55,18 +54,18 @@ impl<'a> SocketToken<'a> {
     }
 }
 
-impl<'a> Drop for SocketToken<'a> {
+impl<'state, 'ctx> Drop for SocketToken<'state, 'ctx> {
     fn drop(&mut self) {
-        let current_worker_id = self.shared.worker_id();
+        let current_worker_id = self.ctx.scope.worker_id();
         if current_worker_id == self.owner_worker_id {
-            if let Some(tls) = self.shared.context_tls.get() {
+            if let Some(tls) = self.ctx.scope.shared().context_tls.get() {
                 let extra = unsafe { &tls.as_ref().extra };
                 if let Some(driver) = extra.driver.borrow_mut().as_mut() {
                     let _ = driver.unregister_files(vec![self.fd]);
                 }
             }
         } else {
-            submit_control_task(self.shared, self.owner_worker_id, self.fd);
+            submit_control_task(self.ctx.scope.shared(), self.owner_worker_id, self.fd);
         }
     }
 }
@@ -75,32 +74,34 @@ impl<'a> Drop for SocketToken<'a> {
 // SocketTokenPtr Trait
 // ============================================================================
 
-pub trait SocketTokenPtr<'a>: Deref<Target = SocketToken<'a>> + Clone {
-    fn new_ptr(token: SocketToken<'a>) -> Self;
+pub trait SocketTokenPtr<'state: 'ctx, 'ctx>:
+    Deref<Target = SocketToken<'state, 'ctx>> + Clone
+{
+    fn new_ptr(token: SocketToken<'state, 'ctx>) -> Self;
 }
 
-impl<'a, 'ctx> SocketTokenPtr<'a> for Rc<SocketToken<'a>> {
-    fn new_ptr(token: SocketToken<'a>) -> Self {
+impl<'state, 'ctx> SocketTokenPtr<'state, 'ctx> for Rc<SocketToken<'state, 'ctx>> {
+    fn new_ptr(token: SocketToken<'state, 'ctx>) -> Self {
         Rc::new(token)
     }
 }
 
-impl<'a> SocketTokenPtr<'a> for Arc<SocketToken<'a>> {
-    fn new_ptr(token: SocketToken<'a>) -> Self {
+impl<'state, 'ctx> SocketTokenPtr<'state, 'ctx> for Arc<SocketToken<'state, 'ctx>> {
+    fn new_ptr(token: SocketToken<'state, 'ctx>) -> Self {
         Arc::new(token)
     }
 }
 
 #[derive(Clone)]
-pub struct InnerSocket<'a, P: SocketTokenPtr<'a>> {
+pub struct InnerSocket<'state: 'ctx, 'ctx, P: SocketTokenPtr<'state, 'ctx>> {
     token: P,
     local_addr: Option<SocketAddr>,
-    _marker: std::marker::PhantomData<&'a ()>,
+    _marker: std::marker::PhantomData<(&'state (), &'ctx ())>,
 }
 
-impl<'a, P: SocketTokenPtr<'a>> InnerSocket<'a, P> {
-    pub fn new<'ctx>(
-        ctx: RuntimeContext<'a, 'ctx>,
+impl<'state: 'ctx, 'ctx, P: SocketTokenPtr<'state, 'ctx>> InnerSocket<'state, 'ctx, P> {
+    pub fn new(
+        ctx: RuntimeContext<'state, 'ctx>,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
     ) -> VeloqResult<Self> {

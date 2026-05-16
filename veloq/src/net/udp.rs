@@ -14,25 +14,21 @@ use veloq_driver_native::op::{
 };
 
 #[derive(Clone)]
-pub struct GenericUdpSocket<
-    'a,
-    'ctx,
-    S: OpSubmitter<'a, RuntimeContext<'a, 'ctx>>,
-    P: SocketTokenPtr<'a>,
-> {
-    pub(crate) inner: InnerSocket<'a, P>,
+pub struct GenericUdpSocket<'a, 'ctx, S, P: SocketTokenPtr<'a, 'ctx>> {
+    pub(crate) inner: InnerSocket<'a, 'ctx, P>,
     pub(crate) submitter: S,
     pub(crate) ctx: RuntimeContext<'a, 'ctx>,
 }
 
 pub type LocalUdpSocket<'a, 'ctx> =
-    GenericUdpSocket<'a, 'ctx, LocalSubmitter<RuntimeContext<'a, 'ctx>>, Rc<SocketToken<'a>>>;
-pub type UdpSocket<'a, 'ctx> = GenericUdpSocket<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a>>>;
+    GenericUdpSocket<'a, 'ctx, LocalSubmitter<RuntimeContext<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
+pub type UdpSocket<'a, 'ctx> =
+    GenericUdpSocket<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a, 'ctx>>>;
 
-fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
+fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
     ctx: RuntimeContext<'a, 'ctx>,
     addr: A,
-) -> VeloqResult<InnerSocket<'a, P>> {
+) -> VeloqResult<InnerSocket<'a, 'ctx, P>> {
     let addr = addr
         .to_socket_addrs()
         .map_err(from_io_error)?
@@ -56,7 +52,7 @@ fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-impl<'a, 'ctx, S: OpSubmitter<'a, RuntimeContext<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a>>
+impl<'a, 'ctx, S: OpSubmitter<'a, RuntimeContext<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
     GenericUdpSocket<'a, 'ctx, S, P>
 {
     pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
