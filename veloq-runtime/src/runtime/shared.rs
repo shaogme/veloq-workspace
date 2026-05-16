@@ -120,9 +120,9 @@ impl<T> RuntimeSharedComponents<T> {
 
         RuntimeSharedComponents {
             registry: WorkerRegistry {
-                workers,
-                unparkers,
-                parker_inners,
+                workers: workers.into_boxed_slice(),
+                unparkers: unparkers.into_boxed_slice(),
+                parker_inners: parker_inners.into_boxed_slice(),
             },
             topo: TopologyContext {
                 groups,
@@ -168,7 +168,7 @@ impl<T> RuntimeShared<T> {
 }
 
 impl RuntimeSharedBase {
-    pub fn unparkers(&self) -> Vec<Unparker> {
+    pub fn unparkers(&self) -> Box<[Unparker]> {
         self.registry.unparkers.clone()
     }
 
@@ -317,7 +317,7 @@ impl<T: crate::runtime::context::RuntimeContextExtra> RuntimeShared<T> {
             .unwrap_or(usize::MAX)
     }
 
-    pub fn unparkers(&self) -> Vec<Unparker> {
+    pub fn unparkers(&self) -> Box<[Unparker]> {
         self.base.unparkers()
     }
 
