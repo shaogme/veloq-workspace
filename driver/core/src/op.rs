@@ -7,9 +7,11 @@ pub trait DriverProvider: Clone + Unpin {
     type Op: PlatformOp;
     type UP: std::marker::Send;
     type Completion: crate::driver::CompletionValue;
-    type Driver<'a>: crate::driver::Driver<Op = Self::Op, UP = Self::UP, Completion = Self::Completion>;
+    type Driver<'a>: crate::driver::Driver<Op = Self::Op, UP = Self::UP, Completion = Self::Completion>
+    where
+        Self: 'a;
 
-    fn with_driver<R>(&self, f: impl for<'a> FnOnce(Self::Driver<'a>) -> R) -> R;
+    fn with_driver<'a, R>(&'a self, f: impl FnOnce(Self::Driver<'a>) -> R) -> R;
 }
 
 mod future;

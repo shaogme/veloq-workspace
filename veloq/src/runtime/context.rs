@@ -182,19 +182,13 @@ impl<'ctx> veloq_driver_native::op::DriverProvider for RuntimeContext<'ctx> {
     type Op = veloq_driver_native::driver::PlatformOp;
     type UP = veloq_driver_native::driver::PlatformUP;
     type Completion = usize;
-    type Driver<'a> = &'a mut veloq_driver_native::driver::PlatformDriver<'a>;
+    type Driver<'a> = &'a mut veloq_driver_native::driver::PlatformDriver<'ctx>
+    where
+        Self: 'a;
 
     #[inline]
-    fn with_driver<R>(&self, f: impl for<'a> FnOnce(Self::Driver<'a>) -> R) -> R {
-        self.driver(|driver| {
-            let driver_a = unsafe {
-                std::mem::transmute::<
-                    &mut veloq_driver_native::driver::PlatformDriver<'ctx>,
-                    &mut veloq_driver_native::driver::PlatformDriver<'_>,
-                >(driver)
-            };
-            f(driver_a)
-        })
+    fn with_driver<'a, R>(&'a self, f: impl FnOnce(Self::Driver<'a>) -> R) -> R {
+        self.driver(move |driver| f(driver))
     }
 }
 
@@ -258,9 +252,13 @@ impl<'ctx> RuntimeContext<'ctx> {
             .expect("registrar missing")
     }
 
-    pub fn driver<R>(&self, f: impl FnOnce(&mut PlatformDriver<'ctx>) -> R) -> R {
+    pub fn driver<'a, R>(&'a self, f: impl FnOnce(&'a mut PlatformDriver<'ctx>) -> R) -> R {
         let mut driver_opt = self.extra().driver.borrow_mut();
-        f(driver_opt.as_mut().expect("driver missing"))
+        let driver = driver_opt.as_mut().expect("driver missing");
+        let driver: &'a mut PlatformDriver<'ctx> = unsafe {
+            &mut *(driver as *mut PlatformDriver<'ctx>)
+        };
+        f(driver)
     }
 
     #[inline]
