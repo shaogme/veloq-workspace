@@ -266,8 +266,8 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     pub fn worker_id(&self) -> usize {
         self.shared
             .context_tls
-            .get()
-            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .try_get()
+            .map(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX)
     }
 }
@@ -332,12 +332,7 @@ impl<'ctx, T> WorkerInitContext<'ctx, T> {
     /// Returns the custom worker extra state.
     #[inline]
     pub fn extra(&self) -> &T {
-        let ptr = self
-            .shared
-            .context_tls
-            .get()
-            .expect("RuntimeContext missing in TLS");
-        unsafe { &ptr.as_ref().extra }
+        &self.shared.context_tls.get().extra
     }
 }
 

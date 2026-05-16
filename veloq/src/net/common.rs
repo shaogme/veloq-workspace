@@ -58,11 +58,9 @@ impl<'ctx> Drop for SocketToken<'ctx> {
     fn drop(&mut self) {
         let current_worker_id = self.ctx.scope.worker_id();
         if current_worker_id == self.owner_worker_id {
-            if let Some(tls) = self.ctx.scope.shared().context_tls.get() {
-                let extra = unsafe { &tls.as_ref().extra };
-                let mut driver = extra.driver.borrow_mut();
-                let _ = driver.unregister_files(vec![self.fd]);
-            }
+            let ctx = self.ctx.scope.shared().context_tls.get();
+            let mut driver = ctx.extra.driver.borrow_mut();
+            let _ = driver.unregister_files(vec![self.fd]);
         } else {
             submit_control_task(self.ctx.scope.shared(), self.owner_worker_id, self.fd);
         }

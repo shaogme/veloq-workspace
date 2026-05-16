@@ -49,8 +49,7 @@ impl<'ctx> DriverRegistrar<'ctx> {
     }
 
     fn extra(&self) -> &WorkerState<'ctx> {
-        let tls_ptr = self.shared.context_tls.get().expect("Not in runtime");
-        unsafe { &tls_ptr.as_ref().extra }
+        &self.shared.context_tls.get().extra
     }
 
     pub fn sync_to_driver(&self) {
@@ -157,13 +156,7 @@ impl<'ctx> veloq_driver_native::op::DriverProvider for RuntimeContext<'ctx> {
 impl<'ctx> RuntimeContext<'ctx> {
     #[inline]
     fn extra(&self) -> &WorkerState<'ctx> {
-        let tls_ptr = self
-            .scope
-            .shared()
-            .context_tls
-            .get()
-            .expect("Not in runtime");
-        unsafe { &tls_ptr.as_ref().extra }
+        &self.scope.shared().context_tls.get().extra
     }
 
     pub async fn scope<R, F>(&self, f: F) -> R
@@ -311,10 +304,8 @@ impl<'ctx> RuntimeContext<'ctx> {
 }
 
 pub fn poll_current_driver<'ctx>(shared: &RuntimeShared<WorkerState<'ctx>>) -> IdleDecision {
-    let Some(tls_ptr) = shared.context_tls.get() else {
-        return IdleDecision::wait(IdleWaitStrategy::block());
-    };
-    let extra = unsafe { &tls_ptr.as_ref().extra };
+    let ctx = shared.context_tls.get();
+    let extra = &ctx.extra;
 
     // sync registrar
     extra.registrar.sync_to_driver();
@@ -350,8 +341,8 @@ pub(crate) fn submit_control_task<'ctx>(
 
         fn poll_raw(&self, _worker_id: usize) -> bool {
             let shared = unsafe { &*self.shared_ptr };
-            if let Some(ctx) = shared.context_tls.get() {
-                let extra = unsafe { &ctx.as_ref().extra };
+            if let Some(ctx) = shared.context_tls.try_get() {
+                let extra = &ctx.extra;
                 let mut driver = extra.driver.borrow_mut();
                 let _ = driver.unregister_files(vec![self.fd]);
             }

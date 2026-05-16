@@ -158,7 +158,9 @@ impl<T> RuntimeShared<T> {
                 worker_tick_hook,
             }),
             idle_hook,
-            context_tls: veloq_tls::Tls::new(),
+            context_tls: veloq_tls::Tls::new(|| {
+                panic!("RuntimeContext accessed outside of a worker thread")
+            }),
         }
     }
 }
@@ -308,8 +310,8 @@ impl RuntimeSharedBase {
 impl<T> RuntimeShared<T> {
     pub fn worker_id(&self) -> usize {
         self.context_tls
-            .get()
-            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .try_get()
+            .map(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX)
     }
 
@@ -320,8 +322,8 @@ impl<T> RuntimeShared<T> {
     pub fn choose_worker(&self) -> usize {
         let current = self
             .context_tls
-            .get()
-            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .try_get()
+            .map(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX);
         self.base
             .topo
@@ -355,8 +357,8 @@ impl<T> RuntimeShared<T> {
 
         let current = self
             .context_tls
-            .get()
-            .map(|ptr| unsafe { ptr.as_ref().worker_id })
+            .try_get()
+            .map(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX);
 
         if current == worker_id && task.header().try_mark_queued() {
@@ -410,8 +412,7 @@ impl<T> RuntimeShared<T> {
         completion: Option<&GenericScopeCompletion<S, O>>,
         mut init_fut: Option<Pin<&mut F>>,
     ) {
-        let ctx_ptr = self.context_tls.get().expect("runtime context missing");
-        let ctx = unsafe { ctx_ptr.as_ref() };
+        let ctx = self.context_tls.get();
         let worker_id = ctx.worker_id;
 
         let worker_tick_hook = self.base.worker_tick_hook;
