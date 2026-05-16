@@ -31,7 +31,7 @@ impl<'ctx> SocketToken<'ctx> {
 
         // SAFETY: caller transfers ownership via RawHandle created from OwnedRawHandle::into_raw.
         let owned = unsafe { OwnedRawHandle::from_raw_owned(handle) };
-        let fd = ctx.driver(|driver| {
+        let fd = ctx.driver(|mut driver| {
             driver
                 .register_files(vec![RegisterFd::Owned(owned)])
                 .map_err(from_driver_report)

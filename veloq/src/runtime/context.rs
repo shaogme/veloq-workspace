@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::mpsc;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_driver_native::driver::{DriveMode, Driver, PlatformDriver};
+use veloq_driver_native::driver::{DriveMode, Driver, DriverHandle, PlatformDriver};
 use veloq_driver_native::op::{DetachedSubmitter, IntoPlatformOp, Op};
 
 use crate::config::BufferRegistrationMode;
@@ -143,13 +143,14 @@ impl<'ctx> veloq_driver_native::op::DriverProvider for RuntimeContext<'ctx> {
     type UP = veloq_driver_native::driver::PlatformUP;
     type Completion = usize;
     type Driver<'a>
-        = &'a mut veloq_driver_native::driver::PlatformDriver<'ctx>
+        = DriverHandle<'a, PlatformDriver<'ctx>>
     where
         Self: 'a;
 
     #[inline]
     fn with_driver<'a, R>(&'a self, f: impl FnOnce(Self::Driver<'a>) -> R) -> R {
-        self.driver(move |driver| f(driver))
+        let guard = self.extra().driver.borrow_mut();
+        f(DriverHandle::new(guard))
     }
 }
 
@@ -199,11 +200,12 @@ impl<'ctx> RuntimeContext<'ctx> {
         self.extra().registrar.clone()
     }
 
-    pub fn driver<'a, R>(&'a self, f: impl FnOnce(&'a mut PlatformDriver<'ctx>) -> R) -> R {
-        let mut driver = self.extra().driver.borrow_mut();
-        let driver: &'a mut PlatformDriver<'ctx> =
-            unsafe { &mut *(&mut *driver as *mut PlatformDriver<'ctx>) };
-        f(driver)
+    pub fn driver<'a, R>(
+        &'a self,
+        f: impl FnOnce(DriverHandle<'a, PlatformDriver<'ctx>>) -> R,
+    ) -> R {
+        let guard = self.extra().driver.borrow_mut();
+        f(DriverHandle::new(guard))
     }
 
     #[inline]
@@ -229,7 +231,7 @@ impl<'ctx> RuntimeContext<'ctx> {
     /// 这个入口会优先利用驱动后端的阻塞等待能力，避免固定轮询兜底。
     pub fn drive_wait(&self) -> IdleDecision {
         self.sync_registrar();
-        self.driver(|driver| {
+        self.driver(|mut driver| {
             let outcome = driver
                 .drive(DriveMode::Wait)
                 .unwrap_or_else(|err| panic!("driver drive(Wait) failed: {err:#}"));
@@ -293,7 +295,7 @@ impl<'ctx> RuntimeContext<'ctx> {
                 .scope
                 .route_to(worker_id, move || {
                     let ctx = RuntimeContext { scope: scope_clone };
-                    ctx.driver(|driver| op.submit_detached(driver))
+                    ctx.driver(|mut driver| op.submit_detached(&mut driver))
                 })
                 .map_err(from_io_error)?;
             let (res, op_back) = routed.await.into_inner();

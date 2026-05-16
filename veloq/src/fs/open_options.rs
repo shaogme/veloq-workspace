@@ -106,7 +106,7 @@ impl OpenOptions {
         let (res, _) = ctx.submit(&submitter, Op::new(op)).await.into_inner();
         let owned = res.map_err(from_driver_report)?;
         let fd = owned.into_raw();
-        let fixed = ctx.driver(|driver| {
+        let fixed = ctx.driver(|mut driver| {
             driver
                 .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
                 .map_err(from_driver_report)?

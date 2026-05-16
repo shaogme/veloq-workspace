@@ -165,6 +165,118 @@ impl<D: Driver + ?Sized> Driver for &mut D {
     }
 }
 
+pub struct DriverHandle<'a, D: Driver + ?Sized> {
+    inner: std::cell::RefMut<'a, D>,
+}
+
+impl<'a, D: Driver + ?Sized> DriverHandle<'a, D> {
+    pub fn new(inner: std::cell::RefMut<'a, D>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<'a, D: Driver + ?Sized> std::ops::Deref for DriverHandle<'a, D> {
+    type Target = D;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a, D: Driver + ?Sized> std::ops::DerefMut for DriverHandle<'a, D> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<'a, D: Driver + ?Sized> Driver for DriverHandle<'a, D> {
+    type Op = D::Op;
+    type UP = D::UP;
+    type Raw = D::Raw;
+    type Sidecar = D::Sidecar;
+    type Completion = D::Completion;
+
+    #[inline]
+    fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
+        self.inner.reserve_op()
+    }
+
+    #[inline]
+    fn slot_table(&self) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion> {
+        self.inner.slot_table()
+    }
+
+    #[inline]
+    fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable> {
+        self.inner.detached_cancel_table()
+    }
+
+    #[inline]
+    fn slot_set_payload(&mut self, user_data: usize, payload: Self::UP) {
+        self.inner.slot_set_payload(user_data, payload)
+    }
+
+    #[inline]
+    fn slot_take_payload(&mut self, user_data: usize) -> Option<Self::UP> {
+        self.inner.slot_take_payload(user_data)
+    }
+
+    #[inline]
+    fn submit(
+        &mut self,
+        user_data: usize,
+        op_in: &mut Option<Self::Op>,
+        binder: SubmitBinder,
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+        self.inner.submit(user_data, op_in, binder)
+    }
+
+    #[inline]
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+        self.inner.drive(mode)
+    }
+
+    #[inline]
+    fn completion_queue(&self) -> SharedCompletionQueue {
+        self.inner.completion_queue()
+    }
+
+    #[inline]
+    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion> {
+        self.inner.completion_table()
+    }
+
+    #[inline]
+    fn cancel_op(&mut self, user_data: usize) {
+        self.inner.cancel_op(user_data)
+    }
+
+    #[inline]
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
+        self.inner.register_chunk(id, ptr, len)
+    }
+
+    #[inline]
+    fn register_files<'f>(
+        &mut self,
+        files: Vec<RegisterFd<'f, Self::Raw>>,
+    ) -> DriverResult<Vec<IoFd>> {
+        self.inner.register_files(files)
+    }
+
+    #[inline]
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
+        self.inner.unregister_files(files)
+    }
+
+    #[inline]
+    fn create_waker(&self) -> Arc<dyn RemoteWaker> {
+        self.inner.create_waker()
+    }
+}
+
 #[inline]
 pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
     let shared = driver.slot_table();

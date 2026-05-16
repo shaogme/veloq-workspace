@@ -80,9 +80,9 @@ impl<'ctx> Future for Sleep<'ctx> {
                 }
 
                 let duration = this.deadline - now;
-                let op = this
-                    .ctx
-                    .driver(|driver| Op::new(OpTimeout { duration }).submit_detached(driver));
+                let op = this.ctx.driver(|mut driver| {
+                    Op::new(OpTimeout { duration }).submit_detached(&mut driver)
+                });
 
                 this.inner = Some(op);
             }
