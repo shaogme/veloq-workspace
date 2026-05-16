@@ -149,21 +149,30 @@ impl<T: PoolTopology> Runtime<T> {
                 let registration_mode = config.registration_mode();
                 let registrar = DriverRegistrar::new(shared, registration_mode);
 
+                let registrar_state =
+                    std::cell::RefCell::new(crate::runtime::context::WorkerRegistrarState {
+                        receiver,
+                        chunks: Vec::new(),
+                    });
+
                 let driver = PlatformDriver::new(config.clone(), Box::new(registrar.clone()))
                     .expect("failed to create driver");
+                let driver_cell = std::cell::RefCell::new(driver);
 
-                let buf_pool = topology.build(&state, worker_id, Box::new(registrar.clone()));
+                let buf_pool = {
+                    let borrowed_registrar = crate::runtime::context::BorrowedRegistrar {
+                        driver: &driver_cell,
+                        state: &registrar_state,
+                        registration_mode,
+                    };
+                    topology.build(&state, worker_id, Box::new(borrowed_registrar))
+                };
 
                 WorkerState {
-                    driver: std::cell::RefCell::new(driver),
+                    driver: driver_cell,
                     buf_pool,
                     registrar,
-                    registrar_state: std::cell::RefCell::new(
-                        crate::runtime::context::WorkerRegistrarState {
-                            receiver,
-                            chunks: Vec::new(),
-                        },
-                    ),
+                    registrar_state,
                 }
             })
             .build();
