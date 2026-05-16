@@ -7,7 +7,7 @@ use std::sync::{Arc, mpsc};
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::PlatformDriver;
-use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
+use veloq_runtime::runtime::{self as async_runtime};
 use veloq_runtime::utils::storage::StaticTransfer;
 
 use crate::config::Config;
@@ -136,37 +136,35 @@ impl<T: PoolTopology> Runtime<T> {
             }),
         );
 
-        type InitContext<'ctx> = WorkerInitContext<'ctx, WorkerState<'ctx>>;
-
         let runtime = async_runtime::RuntimeBuilder::new()
             .with_worker_count(worker_count.get())
             .with_queue_capacity(config.get_queue_capacity().get())
             .with_idle_hook(crate::runtime::context::poll_current_driver)
-            .with_worker_init(async move |worker_ctx: InitContext<'_>| {
+            .with_worker_extra(move |worker_id, shared| {
                 let topology = topology.clone();
                 let state = state.clone();
                 let config = config.clone();
-                let receiver = receivers.take(worker_ctx.worker_id());
+                let receiver = receivers.take(worker_id);
 
                 let registration_mode = config.registration_mode();
-                let registrar = DriverRegistrar::new(worker_ctx.shared(), registration_mode);
+                let registrar = DriverRegistrar::new(shared, registration_mode);
 
                 let driver = PlatformDriver::new(config.clone(), Box::new(registrar.clone()))
                     .expect("failed to create driver");
 
-                let tls_ptr = worker_ctx.shared().context_tls.get().unwrap();
-                let ctx = unsafe { &*tls_ptr.as_ptr() };
+                let buf_pool = topology.build(&state, worker_id, Box::new(registrar.clone()));
 
-                // 必须在调用 topology.build 之前存入驱动，因为 Registrar 需要驱动来注册缓冲区
-                *ctx.extra.driver.borrow_mut() = Some(driver);
-
-                let buf_pool =
-                    topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
-
-                *ctx.extra.buf_pool.borrow_mut() = Some(buf_pool);
-                *ctx.extra.registrar.borrow_mut() = Some(registrar);
-
-                crate::runtime::context::init_worker_registrar_state(&ctx.extra, receiver);
+                WorkerState {
+                    driver: std::cell::RefCell::new(driver),
+                    buf_pool,
+                    registrar,
+                    registrar_state: std::cell::RefCell::new(
+                        crate::runtime::context::WorkerRegistrarState {
+                            receiver,
+                            chunks: Vec::new(),
+                        },
+                    ),
+                }
             })
             .build();
 

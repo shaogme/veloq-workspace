@@ -348,7 +348,7 @@ pub(crate) struct RuntimeProgressCoordinator<'a, T> {
     worker_id: usize,
 }
 
-impl<'a, T: crate::runtime::context::RuntimeContextExtra> RuntimeProgressCoordinator<'a, T> {
+impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     pub(crate) fn new(shared: &'a RuntimeShared<T>, worker_id: usize) -> Self {
         Self { shared, worker_id }
     }

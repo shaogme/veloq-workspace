@@ -8,7 +8,6 @@ use veloq_driver_native::op::{DetachedSubmitter, IntoPlatformOp, Op};
 
 use crate::config::BufferRegistrationMode;
 use crate::error::{Result as VeloqResult, from_io_error};
-use veloq_runtime::runtime::context::RuntimeContextExtra;
 use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared};
 
 /// 驱动注册中心的消息类型
@@ -26,31 +25,10 @@ pub struct WorkerRegistrarState {
 }
 
 pub struct WorkerState<'ctx> {
-    pub driver: RefCell<Option<PlatformDriver<'ctx>>>,
-    pub buf_pool: RefCell<Option<AnyBufPool>>,
-    pub registrar: RefCell<Option<DriverRegistrar<'ctx>>>,
-    pub registrar_state: RefCell<Option<WorkerRegistrarState>>,
-}
-
-impl RuntimeContextExtra for WorkerState<'_> {
-    fn new<'ctx>(_worker_id: usize, _ctx: RuntimeScopeContext<'ctx, Self>) -> Self {
-        Self {
-            driver: RefCell::new(None),
-            buf_pool: RefCell::new(None),
-            registrar: RefCell::new(None),
-            registrar_state: RefCell::new(None),
-        }
-    }
-}
-
-pub(crate) fn init_worker_registrar_state(
-    state: &WorkerState,
-    receiver: mpsc::Receiver<RegistrarMessage>,
-) {
-    *state.registrar_state.borrow_mut() = Some(WorkerRegistrarState {
-        receiver,
-        chunks: Vec::new(),
-    });
+    pub driver: RefCell<PlatformDriver<'ctx>>,
+    pub buf_pool: AnyBufPool,
+    pub registrar: DriverRegistrar<'ctx>,
+    pub registrar_state: RefCell<WorkerRegistrarState>,
 }
 
 #[derive(Clone)]
@@ -78,15 +56,8 @@ impl<'ctx> DriverRegistrar<'ctx> {
     pub fn sync_to_driver(&self) {
         let extra = self.extra();
 
-        let mut driver_opt = extra.driver.borrow_mut();
-        let Some(driver) = driver_opt.as_mut() else {
-            return;
-        };
-
-        let mut state_opt = extra.registrar_state.borrow_mut();
-        let state = state_opt
-            .as_mut()
-            .expect("Registrar state not initialized for current thread");
+        let mut driver = extra.driver.borrow_mut();
+        let mut state = extra.registrar_state.borrow_mut();
 
         let mut new_chunks = Vec::new();
         while let Ok(msg) = state.receiver.try_recv() {
@@ -120,11 +91,7 @@ impl<'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'ctx> {
         let mut new_chunks = Vec::with_capacity(regions.len());
 
         {
-            let mut driver_opt = extra.driver.borrow_mut();
-            let driver = driver_opt
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("driver missing"))?;
-
+            let mut driver = extra.driver.borrow_mut();
             for (idx, region) in regions.iter().enumerate() {
                 let chunk_idx = idx as u16;
                 driver
@@ -140,10 +107,8 @@ impl<'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'ctx> {
             }
         }
 
-        let mut state_opt = extra.registrar_state.borrow_mut();
-        if let Some(state) = state_opt.as_mut() {
-            state.chunks.extend(new_chunks);
-        }
+        let mut state = extra.registrar_state.borrow_mut();
+        state.chunks.extend(new_chunks);
 
         Ok(indices)
     }
@@ -153,10 +118,8 @@ impl<'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'ctx> {
 
         // 首先在本地快照中查找
         let found = {
-            let state_opt = extra.registrar_state.borrow();
-            state_opt
-                .as_ref()
-                .and_then(|state| state.chunks.iter().find(|c| c.id == chunk_id).copied())
+            let state = extra.registrar_state.borrow();
+            state.chunks.iter().find(|c| c.id == chunk_id).copied()
         };
 
         if let Some(chunk) = found {
@@ -166,10 +129,8 @@ impl<'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'ctx> {
         // 如果没找到，尝试同步一次消息队列后再查找
         self.sync_to_driver();
 
-        let state_opt = extra.registrar_state.borrow();
-        state_opt
-            .as_ref()
-            .and_then(|state| state.chunks.iter().find(|c| c.id == chunk_id).copied())
+        let state = extra.registrar_state.borrow();
+        state.chunks.iter().find(|c| c.id == chunk_id).copied()
     }
 }
 
@@ -182,7 +143,8 @@ impl<'ctx> veloq_driver_native::op::DriverProvider for RuntimeContext<'ctx> {
     type Op = veloq_driver_native::driver::PlatformOp;
     type UP = veloq_driver_native::driver::PlatformUP;
     type Completion = usize;
-    type Driver<'a> = &'a mut veloq_driver_native::driver::PlatformDriver<'ctx>
+    type Driver<'a>
+        = &'a mut veloq_driver_native::driver::PlatformDriver<'ctx>
     where
         Self: 'a;
 
@@ -236,28 +198,18 @@ impl<'ctx> RuntimeContext<'ctx> {
 
     #[inline]
     pub fn buf_pool(&self) -> AnyBufPool {
-        self.extra()
-            .buf_pool
-            .borrow()
-            .clone()
-            .expect("buf_pool missing")
+        self.extra().buf_pool.clone()
     }
 
     #[inline]
     pub fn registrar(&self) -> DriverRegistrar<'ctx> {
-        self.extra()
-            .registrar
-            .borrow()
-            .clone()
-            .expect("registrar missing")
+        self.extra().registrar.clone()
     }
 
     pub fn driver<'a, R>(&'a self, f: impl FnOnce(&'a mut PlatformDriver<'ctx>) -> R) -> R {
-        let mut driver_opt = self.extra().driver.borrow_mut();
-        let driver = driver_opt.as_mut().expect("driver missing");
-        let driver: &'a mut PlatformDriver<'ctx> = unsafe {
-            &mut *(driver as *mut PlatformDriver<'ctx>)
-        };
+        let mut driver = self.extra().driver.borrow_mut();
+        let driver: &'a mut PlatformDriver<'ctx> =
+            unsafe { &mut *(&mut *driver as *mut PlatformDriver<'ctx>) };
         f(driver)
     }
 
@@ -365,15 +317,9 @@ pub fn poll_current_driver<'ctx>(shared: &RuntimeShared<WorkerState<'ctx>>) -> I
     let extra = unsafe { &tls_ptr.as_ref().extra };
 
     // sync registrar
-    let registrar_opt = extra.registrar.borrow();
-    if let Some(registrar) = registrar_opt.as_ref() {
-        registrar.sync_to_driver();
-    }
+    extra.registrar.sync_to_driver();
 
-    let mut driver_opt = extra.driver.borrow_mut();
-    let Some(driver) = driver_opt.as_mut() else {
-        return IdleDecision::wait(IdleWaitStrategy::block());
-    };
+    let mut driver = extra.driver.borrow_mut();
 
     let outcome = driver
         .drive(DriveMode::Poll)
@@ -406,10 +352,8 @@ pub(crate) fn submit_control_task<'ctx>(
             let shared = unsafe { &*self.shared_ptr };
             if let Some(ctx) = shared.context_tls.get() {
                 let extra = unsafe { &ctx.as_ref().extra };
-                let mut driver_opt = extra.driver.borrow_mut();
-                if let Some(driver) = driver_opt.as_mut() {
-                    let _ = driver.unregister_files(vec![self.fd]);
-                }
+                let mut driver = extra.driver.borrow_mut();
+                let _ = driver.unregister_files(vec![self.fd]);
             }
             self.header.mark_completed_and_notify();
             unsafe {

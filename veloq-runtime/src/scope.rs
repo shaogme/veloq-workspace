@@ -186,10 +186,7 @@ impl<'ctx, S: Storage, O: Ownership, TExtra, M> ScopeProvider<'ctx, TExtra>
     }
 }
 
-impl<'ctx, S: Storage, O: Ownership, TExtra, M> GenericAsyncScope<'ctx, S, O, TExtra, M>
-where
-    TExtra: crate::runtime::context::RuntimeContextExtra,
-{
+impl<'ctx, S: Storage, O: Ownership, TExtra, M> GenericAsyncScope<'ctx, S, O, TExtra, M> {
     pub fn __private_new(
         context: crate::runtime::RuntimeScopeContext<'ctx, TExtra>,
         parent: Option<crate::task::AnyScopeCompletionRef>,
@@ -216,7 +213,6 @@ where
     ) -> JoinHandle<'ctx, '_, T, LocalTaskRef, Self, TExtra>
     where
         TTask: LocalTask<T> + Sized,
-        TExtra: crate::runtime::context::RuntimeContextExtra,
     {
         task.set_scope_completion::<S, O>(Some(self.completion.clone()));
         self.completion.add_task();
@@ -242,7 +238,6 @@ where
     ) -> JoinHandle<'ctx, '_, T, LocalTaskRef, Self, TExtra>
     where
         F: Future<Output = T> + 'ctx,
-        TExtra: crate::runtime::context::RuntimeContextExtra,
     {
         let node = LocalBoxedTaskNode::new(future);
         let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<'ctx, T, F>>();
@@ -287,10 +282,7 @@ where
         self.context.worker_id()
     }
 
-    pub async fn wait_all(&self)
-    where
-        TExtra: crate::runtime::context::RuntimeContextExtra,
-    {
+    pub async fn wait_all(&self) {
         self.context.shared.drive_worker(Some(&self.completion));
         if let Some(panic_info) = self.completion.take_panic() {
             std::panic::resume_unwind(panic_info);
@@ -307,10 +299,7 @@ impl<'ctx, S: Storage, O: Ownership, TExtra, M> Drop for GenericAsyncScope<'ctx,
 }
 
 // 线程安全作用域特有方法
-impl<'ctx, TExtra, M> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra, M>
-where
-    TExtra: crate::runtime::context::RuntimeContextExtra,
-{
+impl<'ctx, TExtra, M> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra, M> {
     fn spawn_send_impl<T: Send, S_>(
         &self,
         worker_id: usize,
@@ -412,7 +401,6 @@ where
     ) -> JoinHandle<'ctx, '_, T, SendTaskRef, Self, TExtra>
     where
         F: Future<Output = T> + Send + 'ctx,
-        TExtra: crate::runtime::context::RuntimeContextExtra,
     {
         debug_assert!(
             worker_id < self.context.shared.worker_count().get(),
@@ -466,7 +454,6 @@ where
     ) -> JoinHandle<'ctx, '_, T, SendTaskRef, Self, TExtra>
     where
         F: AsyncFnOnce() -> T + Send + 'ctx,
-        TExtra: crate::runtime::context::RuntimeContextExtra,
     {
         debug_assert!(
             worker_id < self.context.shared.worker_count().get(),
@@ -543,10 +530,7 @@ where
 }
 
 // 本地作用域特有方法
-impl<'ctx, TExtra, M> GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra, M>
-where
-    TExtra: crate::runtime::context::RuntimeContextExtra,
-{
+impl<'ctx, TExtra, M> GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra, M> {
     pub fn spawn<T: Send, S_>(
         &self,
         task: &'ctx S_,

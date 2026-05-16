@@ -3,7 +3,7 @@ use veloq_runtime::task_local;
 
 #[test]
 fn test_scope_local_basic() {
-    let rt = Runtime::<_, ()>::new();
+    let rt = Runtime::<_, (), _>::new();
     rt.block_on(async |ctx| {
         ctx.scope_local(async |local_scope| {
             let h1 = local_scope.spawn_boxed_local(async { 1 + 1 });
@@ -18,7 +18,7 @@ fn test_scope_local_basic() {
 
 #[test]
 fn test_scope_local_nested() {
-    let rt = Runtime::<_, ()>::new();
+    let rt = Runtime::<_, (), _>::new();
     rt.block_on(async |ctx| {
         ctx.scope_local(async |outer| {
             let h1 = outer.spawn_boxed_local(async {

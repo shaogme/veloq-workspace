@@ -3,7 +3,7 @@ use veloq_runtime::task::yield_now;
 
 #[test]
 fn test_panic_propagation() {
-    let rt = Runtime::<_, ()>::default();
+    let rt = Runtime::<_, (), _>::default();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(async |ctx| {
             println!("开始测试 Panic 传播...");

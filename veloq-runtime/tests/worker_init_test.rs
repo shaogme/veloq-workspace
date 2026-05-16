@@ -8,7 +8,7 @@ use veloq_runtime::runtime::{Runtime, WorkerInitContext};
 fn worker_init_runs_for_each_worker() {
     let worker_init_calls = Arc::new(AtomicUsize::new(0));
 
-    let runtime = Runtime::<_, ()>::builder()
+    let runtime = Runtime::<_, (), _>::builder()
         .worker_count(NonZeroUsize::new(3).unwrap())
         .with_worker_init({
             let worker_init_calls = Arc::clone(&worker_init_calls);

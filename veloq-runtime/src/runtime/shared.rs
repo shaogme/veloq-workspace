@@ -305,7 +305,7 @@ impl RuntimeSharedBase {
     }
 }
 
-impl<T: crate::runtime::context::RuntimeContextExtra> RuntimeShared<T> {
+impl<T> RuntimeShared<T> {
     pub fn worker_id(&self) -> usize {
         self.context_tls
             .get()

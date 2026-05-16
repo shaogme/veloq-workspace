@@ -71,14 +71,6 @@ impl IdleDecision {
     }
 }
 
-pub trait RuntimeContextExtra: Sized {
-    fn new<'ctx>(worker_id: usize, ctx: RuntimeScopeContext<'ctx, Self>) -> Self;
-}
-
-impl RuntimeContextExtra for () {
-    fn new<'ctx>(_worker_id: usize, _ctx: RuntimeScopeContext<'ctx, Self>) -> Self {}
-}
-
 pub struct RuntimeContext<T> {
     pub(crate) worker_id: usize,
     pub(crate) local_rx: Receiver<LocalTaskRef>,
@@ -101,7 +93,7 @@ impl<'ctx, T> Clone for RuntimeScopeContext<'ctx, T> {
     }
 }
 
-impl<'ctx, T: RuntimeContextExtra> RuntimeScopeContext<'ctx, T> {
+impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Returns the total worker count in the runtime.
     pub fn worker_count(&self) -> NonZeroUsize {
         self.shared.worker_count()
@@ -225,7 +217,6 @@ impl<'ctx, T: RuntimeContextExtra> RuntimeScopeContext<'ctx, T> {
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = R> + Send,
         R: Send,
-        T: RuntimeContextExtra,
     {
         use std::sync::atomic::Ordering;
         let worker_id =
@@ -301,7 +292,7 @@ impl<'ctx, T> Clone for WorkerInitContext<'ctx, T> {
     }
 }
 
-impl<'ctx, T: RuntimeContextExtra> WorkerInitContext<'ctx, T> {
+impl<'ctx, T> WorkerInitContext<'ctx, T> {
     pub(crate) fn new(
         shared: &'ctx RuntimeShared<T>,
         worker_id: usize,

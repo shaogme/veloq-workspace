@@ -3,7 +3,7 @@ use veloq_runtime::task_local;
 
 #[test]
 fn test_local_task_execution() {
-    let rt = Runtime::<_, ()>::new();
+    let rt = Runtime::<_, (), _>::new();
     rt.block_on(async |ctx| {
         ctx.scope(async |s| {
             task_local!(t, async { 1 + 1 });
@@ -16,7 +16,7 @@ fn test_local_task_execution() {
 
 #[test]
 fn test_local_task_with_yield() {
-    let rt = Runtime::<_, ()>::new();
+    let rt = Runtime::<_, (), _>::new();
     rt.block_on(async |ctx| {
         ctx.scope(async |s| {
             task_local!(t, async {

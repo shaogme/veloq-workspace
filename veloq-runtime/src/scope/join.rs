@@ -211,7 +211,6 @@ pub(crate) fn dispatch_routed<
 ) where
     O::Shared<super::GenericScopeCompletion<S, O>>: Send + 'ctx,
     F: FnOnce() + Send + 'ctx,
-    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     let completion_for_job = completion.clone();
     let state_for_job = state.clone();
@@ -248,7 +247,6 @@ pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
 ) where
     T: Send + 'ctx,
     Fut: Future<Output = T> + 'ctx,
-    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     let node = crate::task::SendBoxedTaskNode::new(future);
     let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'ctx, T, Fut>>();
@@ -342,8 +340,6 @@ pub type LocalAsyncJoinHandle<'ctx, 'scope, T, TExtra> = JoinHandle<
 
 impl<'ctx, 'scope, T, R: TaskHandleRef, S: ScopeProvider<'ctx, TExtra>, TExtra>
     JoinHandle<'ctx, 'scope, T, R, S, TExtra>
-where
-    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     pub fn cancel(&self) {
         let mut cancel_slot = self.cancel_token.lock();
@@ -477,8 +473,6 @@ where
 
 impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra> Future
     for JoinHandle<'ctx, 'scope, T, crate::task::LocalTaskRef, S, TExtra>
-where
-    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     type Output = Result<T, TaskError>;
 
@@ -522,8 +516,6 @@ where
 
 impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra> Future
     for JoinHandle<'ctx, 'scope, T, SendTaskRef, S, TExtra>
-where
-    TExtra: crate::runtime::context::RuntimeContextExtra,
 {
     type Output = Result<T, TaskError>;
 
