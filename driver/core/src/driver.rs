@@ -27,7 +27,7 @@ pub enum DriverControlCommand {
 
 pub type SharedSlotTable<Op, UP, S, C> = Arc<slot::SlotTable<Op, UP, S, C>>;
 
-pub trait Driver {
+pub trait Driver<'a> {
     type Op: PlatformOp;
     type UP: Send;
     type Raw: RawHandleMeta;
@@ -69,20 +69,20 @@ pub trait Driver {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()>;
 
-    fn register_files<'a>(
+    fn register_files<'f>(
         &mut self,
-        files: Vec<RegisterFd<'a, Self::Raw>>,
+        files: Vec<RegisterFd<'f, Self::Raw>>,
     ) -> DriverResult<Vec<IoFd>>;
 
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()>;
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker>;
 
-    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
+    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>);
 }
 
 #[inline]
-pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
+pub fn drain_cancel_requests<'a, D: Driver<'a>>(driver: &mut D) {
     let shared = driver.slot_table();
     let cancel_table = driver.detached_cancel_table();
     let word_count = cancel_table.cancel_word_count();

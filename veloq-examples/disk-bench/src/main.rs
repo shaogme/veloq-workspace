@@ -167,8 +167,8 @@ fn get_file_path(t_idx: usize) -> PathBuf {
 
 /// Prepare files Phase: Create and fallocate files
 /// This runs effectively in parallel per thread, but outside the measurement loop.
-async fn prepare_files_for_thread(
-    ctx: &RuntimeContext,
+async fn prepare_files_for_thread<'a, 'ctx>(
+    ctx: &'a RuntimeContext<'ctx>,
     file_size: u64,
     t_idx: usize,
     buffering_mode: BufferingMode,
@@ -205,7 +205,7 @@ fn cleanup_files(threads: usize) {
     }
 }
 
-async fn apply_sync(file: &File<'_>, mode: SyncMode, bytes: u64) {
+async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, mode: SyncMode, bytes: u64) {
     match mode {
         SyncMode::None => {}
         SyncMode::SyncRange => {
@@ -225,10 +225,10 @@ async fn apply_sync(file: &File<'_>, mode: SyncMode, bytes: u64) {
     }
 }
 
-async fn run_iteration_measured(
-    ctx: &RuntimeContext,
+async fn run_iteration_measured<'a, 'ctx>(
+    ctx: &'a RuntimeContext<'ctx>,
     qdepth: usize,
-    file: &File<'_>,
+    file: &File<'a, 'ctx>,
     ops: &[WriteOp],
     block_size: NonZeroUsize,
     sync_mode: SyncMode,
@@ -313,8 +313,8 @@ async fn run_iteration_measured(
     }
 }
 
-async fn run_worker(
-    ctx: &RuntimeContext,
+async fn run_worker<'a, 'ctx>(
+    ctx: &'a RuntimeContext<'ctx>,
     qdepth: usize,
     min_duration: Duration,
     min_iters: usize,

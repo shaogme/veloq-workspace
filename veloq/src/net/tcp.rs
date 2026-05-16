@@ -13,29 +13,29 @@ use veloq_driver_native::op::{
 };
 
 #[derive(Clone)]
-pub struct GenericTcpListener<'a, S: OpSubmitter<RuntimeContext>, P: SocketTokenPtr<'a>> {
+pub struct GenericTcpListener<'a, S: OpSubmitter<'a, RuntimeContext<'a>>, P: SocketTokenPtr<'a>> {
     pub(crate) inner: InnerSocket<'a, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: &'a RuntimeContext,
+    pub(crate) ctx: &'a RuntimeContext<'a>,
 }
 
 #[derive(Clone)]
-pub struct GenericTcpStream<'a, S: OpSubmitter<RuntimeContext>, P: SocketTokenPtr<'a>> {
+pub struct GenericTcpStream<'a, S: OpSubmitter<'a, RuntimeContext<'a>>, P: SocketTokenPtr<'a>> {
     pub(crate) inner: InnerSocket<'a, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: &'a RuntimeContext,
+    pub(crate) ctx: &'a RuntimeContext<'a>,
 }
 
 pub type LocalTcpListener<'a> =
-    GenericTcpListener<'a, LocalSubmitter<RuntimeContext>, Rc<SocketToken<'a>>>;
+    GenericTcpListener<'a, LocalSubmitter<RuntimeContext<'a>>, Rc<SocketToken<'a>>>;
 pub type LocalTcpStream<'a> =
-    GenericTcpStream<'a, LocalSubmitter<RuntimeContext>, Rc<SocketToken<'a>>>;
+    GenericTcpStream<'a, LocalSubmitter<RuntimeContext<'a>>, Rc<SocketToken<'a>>>;
 
 pub type TcpListener<'a> = GenericTcpListener<'a, DetachedSubmitter, Arc<SocketToken<'a>>>;
 pub type TcpStream<'a> = GenericTcpStream<'a, DetachedSubmitter, Arc<SocketToken<'a>>>;
 
 fn bind_listener_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
-    ctx: &'a RuntimeContext,
+    ctx: &'a RuntimeContext<'a>,
     addr: A,
 ) -> VeloqResult<InnerSocket<'a, P>> {
     let addr = addr
@@ -63,7 +63,7 @@ fn bind_listener_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
 }
 
 fn new_stream_inner<'a, P: SocketTokenPtr<'a>>(
-    ctx: &'a RuntimeContext,
+    ctx: &'a RuntimeContext<'a>,
     addr: &SocketAddr,
 ) -> VeloqResult<InnerSocket<'a, P>> {
     let socket = if addr.is_ipv4() {
@@ -74,7 +74,7 @@ fn new_stream_inner<'a, P: SocketTokenPtr<'a>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), None)
 }
 
-impl<'a, S: OpSubmitter<RuntimeContext> + Copy, P: SocketTokenPtr<'a>>
+impl<'a, S: OpSubmitter<'a, RuntimeContext<'a>> + Copy, P: SocketTokenPtr<'a>>
     GenericTcpListener<'a, S, P>
 {
     async fn accept_direct(&self) -> VeloqResult<(GenericTcpStream<'a, S, P>, SocketAddr)> {
@@ -116,11 +116,13 @@ impl<'a, S: OpSubmitter<RuntimeContext> + Copy, P: SocketTokenPtr<'a>>
     }
 }
 
-impl<'a, S: OpSubmitter<RuntimeContext> + Copy, P: SocketTokenPtr<'a>> GenericTcpStream<'a, S, P> {
+impl<'a, S: OpSubmitter<'a, RuntimeContext<'a>> + Copy, P: SocketTokenPtr<'a>>
+    GenericTcpStream<'a, S, P>
+{
     async fn connect_from_inner_direct(
         inner: InnerSocket<'a, P>,
         submitter: S,
-        ctx: &'a RuntimeContext,
+        ctx: &'a RuntimeContext<'a>,
         addr: SocketAddr,
     ) -> VeloqResult<Self> {
         let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
@@ -185,7 +187,7 @@ impl<'a, S: OpSubmitter<RuntimeContext> + Copy, P: SocketTokenPtr<'a>> GenericTc
 }
 
 impl<'a> LocalTcpListener<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext<'a>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_listener_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -199,7 +201,7 @@ impl<'a> LocalTcpListener<'a> {
 }
 
 impl<'a> TcpListener<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext<'a>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_listener_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -236,7 +238,7 @@ impl<'a> TcpListener<'a> {
 }
 
 impl<'a> LocalTcpStream<'a> {
-    pub async fn connect(ctx: &'a RuntimeContext, addr: SocketAddr) -> VeloqResult<Self> {
+    pub async fn connect(ctx: &'a RuntimeContext<'a>, addr: SocketAddr) -> VeloqResult<Self> {
         let inner = new_stream_inner(ctx, &addr)?;
         Self::connect_from_inner_direct(inner, LocalSubmitter::new(), ctx, addr).await
     }
@@ -267,13 +269,13 @@ impl<'a> LocalTcpStream<'a> {
 }
 
 impl<'a> TcpStream<'a> {
-    pub async fn connect(ctx: &'a RuntimeContext, addr: SocketAddr) -> VeloqResult<Self> {
+    pub async fn connect(ctx: &'a RuntimeContext<'a>, addr: SocketAddr) -> VeloqResult<Self> {
         let inner = new_stream_inner(ctx, &addr)?;
         Self::connect_from_inner_direct(inner, DetachedSubmitter::new(), ctx, addr).await
     }
 
     pub(crate) async fn connect_from_inner(
-        ctx: &'a RuntimeContext,
+        ctx: &'a RuntimeContext<'a>,
         inner: InnerSocket<'a, Arc<SocketToken<'a>>>,
         addr: SocketAddr,
     ) -> VeloqResult<Self> {

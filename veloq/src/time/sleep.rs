@@ -14,14 +14,14 @@ use veloq_driver_native::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
 /// Waits until `duration` has elapsed.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep<'a>(ctx: &'a RuntimeContext, duration: Duration) -> Sleep<'a> {
+pub fn sleep<'a>(ctx: &'a RuntimeContext<'a>, duration: Duration) -> Sleep<'a> {
     sleep_until(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep_until<'a>(ctx: &'a RuntimeContext, deadline: Instant) -> Sleep<'a> {
+pub fn sleep_until<'a>(ctx: &'a RuntimeContext<'a>, deadline: Instant) -> Sleep<'a> {
     Sleep {
         ctx,
         deadline,
@@ -30,13 +30,13 @@ pub fn sleep_until<'a>(ctx: &'a RuntimeContext, deadline: Instant) -> Sleep<'a> 
 }
 
 pub struct Sleep<'a> {
-    ctx: &'a RuntimeContext,
+    ctx: &'a RuntimeContext<'a>,
     deadline: Instant,
     inner: Option<
         DetachedOp<
             OpTimeout,
-            <PlatformDriver as Driver>::Op,
-            <PlatformDriver as Driver>::Completion,
+            <PlatformDriver<'a> as Driver<'a>>::Op,
+            <PlatformDriver<'a> as Driver<'a>>::Completion,
         >,
     >,
 }
@@ -97,14 +97,14 @@ impl<'a> Future for Sleep<'a> {
 /// Waits until `duration` has elapsed (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_local<'a>(ctx: &'a RuntimeContext, duration: Duration) -> LocalSleep<'a> {
+pub fn sleep_local<'a>(ctx: &'a RuntimeContext<'a>, duration: Duration) -> LocalSleep<'a> {
     sleep_until_local(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_until_local<'a>(ctx: &'a RuntimeContext, deadline: Instant) -> LocalSleep<'a> {
+pub fn sleep_until_local<'a>(ctx: &'a RuntimeContext<'a>, deadline: Instant) -> LocalSleep<'a> {
     LocalSleep {
         ctx,
         deadline,
@@ -113,9 +113,9 @@ pub fn sleep_until_local<'a>(ctx: &'a RuntimeContext, deadline: Instant) -> Loca
 }
 
 pub struct LocalSleep<'a> {
-    ctx: &'a RuntimeContext,
+    ctx: &'a RuntimeContext<'a>,
     deadline: Instant,
-    inner: Option<LocalOp<OpTimeout, RuntimeContext>>,
+    inner: Option<LocalOp<'a, OpTimeout, RuntimeContext<'a>>>,
 }
 
 impl<'a> LocalSleep<'a> {

@@ -13,7 +13,7 @@ use veloq_runtime::utils::storage::StaticTransfer;
 use crate::config::Config;
 use crate::runtime::context::{DriverRegistrar, RegistrarMessage};
 
-use veloq_runtime::runtime::RuntimeScopeContext;
+use crate::runtime::context::WorkerState;
 
 pub struct RuntimeBuilder<T: PoolTopology> {
     topology: T,
@@ -136,48 +136,44 @@ impl<T: PoolTopology> Runtime<T> {
             }),
         );
 
+        type InitContext<'ctx> = WorkerInitContext<'ctx, WorkerState<'ctx>>;
+
         let runtime = async_runtime::RuntimeBuilder::new()
             .with_worker_count(worker_count.get())
             .with_queue_capacity(config.get_queue_capacity().get())
             .with_idle_hook(crate::runtime::context::poll_current_driver)
-            .with_worker_init(
-                async move |worker_ctx: WorkerInitContext<crate::runtime::context::WorkerState>| {
-                    let topology = topology.clone();
-                    let state = state.clone();
-                    let config = config.clone();
-                    let receiver = receivers.take(worker_ctx.worker_id());
+            .with_worker_init(async move |worker_ctx: InitContext<'_>| {
+                let topology = topology.clone();
+                let state = state.clone();
+                let config = config.clone();
+                let receiver = receivers.take(worker_ctx.worker_id());
 
-                    let mut driver = PlatformDriver::new(&config).expect("failed to create driver");
-                    let registration_mode = config.registration_mode();
-                    let registrar =
-                        DriverRegistrar::new(worker_ctx.shared().clone(), registration_mode);
+                let mut driver =
+                    PlatformDriver::new(config.clone()).expect("failed to create driver");
+                let registration_mode = config.registration_mode();
+                let registrar = DriverRegistrar::new(worker_ctx.shared(), registration_mode);
 
-                    driver.set_registrar(Box::new(registrar.clone()));
+                driver.set_registrar(Box::new(registrar.clone()));
 
-                    let tls_ptr = worker_ctx.shared().context_tls.get().unwrap();
-                    let ctx = unsafe { &*tls_ptr.as_ptr() };
+                let tls_ptr = worker_ctx.shared().context_tls.get().unwrap();
+                let ctx = unsafe { &*tls_ptr.as_ptr() };
 
-                    // 必须在调用 topology.build 之前存入驱动，因为 Registrar 需要驱动来注册缓冲区
-                    *ctx.extra.driver.borrow_mut() = Some(driver);
+                // 必须在调用 topology.build 之前存入驱动，因为 Registrar 需要驱动来注册缓冲区
+                *ctx.extra.driver.borrow_mut() = Some(driver);
 
-                    let buf_pool =
-                        topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
+                let buf_pool =
+                    topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
 
-                    *ctx.extra.buf_pool.borrow_mut() = Some(buf_pool);
-                    *ctx.extra.registrar.borrow_mut() = Some(registrar);
+                *ctx.extra.buf_pool.borrow_mut() = Some(buf_pool);
+                *ctx.extra.registrar.borrow_mut() = Some(registrar);
 
-                    crate::runtime::context::init_worker_registrar_state(&ctx.extra, receiver);
-                },
-            )
+                crate::runtime::context::init_worker_registrar_state(&ctx.extra, receiver);
+            })
             .build();
 
-        runtime.block_on(
-            async move |scope: &RuntimeScopeContext<crate::runtime::context::WorkerState>| {
-                let ctx = crate::runtime::context::RuntimeContext {
-                    scope: scope.clone(),
-                };
-                f(&ctx).await
-            },
-        )
+        runtime.block_on(async move |scope| {
+            let ctx = crate::runtime::context::RuntimeContext { scope };
+            f(&ctx).await
+        })
     }
 }

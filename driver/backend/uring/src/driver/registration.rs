@@ -25,7 +25,7 @@ pub(crate) struct UringRegistrationStats {
     pub(crate) submission_missing_chunk_info: u64,
 }
 
-impl UringDriver {
+impl<'a> UringDriver<'a> {
     pub(crate) fn register_chunk_internal(
         &mut self,
         id: u16,

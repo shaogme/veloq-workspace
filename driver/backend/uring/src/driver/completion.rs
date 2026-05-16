@@ -13,7 +13,7 @@ use veloq_driver_core::driver::{
 };
 use veloq_driver_core::{DriverResult, driver_error_report_to_event_res};
 
-impl UringDriver {
+impl<'a> UringDriver<'a> {
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
         drain_cancel_requests(self);
         self.flush_cancellations();

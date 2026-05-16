@@ -98,7 +98,7 @@ pub(crate) fn map_uring_error(
         .attach_note(detail_text)
 }
 
-pub struct UringDriver {
+pub struct UringDriver<'a> {
     pub(crate) ring: IoUring,
     pub(crate) ops: OpRegistry<UringOp, UringUserPayload, UringOpState, ()>,
     pub(crate) backlog: VecDeque<usize>,
@@ -116,7 +116,7 @@ pub struct UringDriver {
     pub(crate) wheel: veloq_wheel::Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
     pub(crate) last_timer_poll: Instant,
-    pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
+    pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) chunk_register_failures_recent: HashMap<u16, Instant>,
@@ -126,7 +126,7 @@ pub struct UringDriver {
     pub(crate) file_table_initialized: bool,
 }
 
-impl UringDriver {
+impl<'a> UringDriver<'a> {
     fn new_internal(config: impl AsRef<UringConfig>) -> UringResult<Self> {
         let config = config.as_ref();
         let mut builder = IoUring::builder();
@@ -229,11 +229,11 @@ impl UringDriver {
     }
 }
 
-impl Drop for UringDriver {
+impl Drop for UringDriver<'_> {
     fn drop(&mut self) {}
 }
 
-impl Driver for UringDriver {
+impl<'a> Driver<'a> for UringDriver<'a> {
     type Op = UringOp;
     type UP = UringUserPayload;
     type Raw = UringRawHandle;
@@ -395,9 +395,9 @@ impl Driver for UringDriver {
         )
     }
 
-    fn register_files<'a>(
+    fn register_files<'f>(
         &mut self,
-        files: Vec<RegisterFd<'a, UringRawHandle>>,
+        files: Vec<RegisterFd<'f, UringRawHandle>>,
     ) -> DriverResult<Vec<IoFd>> {
         self.register_files_internal(files).to_driver_result(
             DriverErrorKind::Registration,
@@ -424,13 +424,13 @@ impl Driver for UringDriver {
         })
     }
 
-    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
+    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>) {
         self.registrar = registrar;
     }
 }
 
 #[cfg(feature = "test-hooks")]
-impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver {
+impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.registration_stats.chunk_register_attempts
     }

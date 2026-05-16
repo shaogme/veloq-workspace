@@ -15,15 +15,15 @@ use veloq_runtime::runtime::shared::RuntimeShared;
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
-pub struct SocketToken<'a> {
+pub struct SocketToken<'ctx> {
     fd: IoFd,
     owner_worker_id: usize,
-    shared: &'a RuntimeShared<crate::runtime::context::WorkerState>,
+    shared: &'ctx RuntimeShared<crate::runtime::context::WorkerState<'ctx>>,
 }
 
-impl<'a> SocketToken<'a> {
+impl<'ctx> SocketToken<'ctx> {
     pub(crate) fn new(
-        ctx: &'a crate::runtime::context::RuntimeContext,
+        ctx: &'ctx crate::runtime::context::RuntimeContext<'ctx>,
         handle: RawHandle,
     ) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
@@ -58,7 +58,7 @@ impl<'a> SocketToken<'a> {
     }
 }
 
-impl<'a> Drop for SocketToken<'a> {
+impl<'ctx> Drop for SocketToken<'ctx> {
     fn drop(&mut self) {
         let current_worker_id = self.shared.worker_id();
         if current_worker_id == self.owner_worker_id {
@@ -103,7 +103,7 @@ pub struct InnerSocket<'a, P: SocketTokenPtr<'a>> {
 
 impl<'a, P: SocketTokenPtr<'a>> InnerSocket<'a, P> {
     pub fn new(
-        ctx: &'a crate::runtime::context::RuntimeContext,
+        ctx: &'a crate::runtime::context::RuntimeContext<'a>,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
     ) -> VeloqResult<Self> {

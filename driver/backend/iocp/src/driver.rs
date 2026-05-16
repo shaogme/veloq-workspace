@@ -37,7 +37,7 @@ use crate::rio::RioState;
 // ============================================================================
 
 /// The IOCP driver implementation that manages I/O completion ports and operations.
-pub struct IocpDriver {
+pub struct IocpDriver<'a> {
     pub(crate) port: Arc<crate::win32::IoCompletionPort>,
     pub(crate) ops: OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
     pub(crate) extensions: crate::ext::Extensions,
@@ -54,7 +54,7 @@ pub struct IocpDriver {
 
     // RIO Support (required)
     pub(crate) rio_state: RioState,
-    pub(crate) registrar: Box<dyn BufferRegistrar>,
+    pub(crate) registrar: Box<dyn BufferRegistrar + 'a>,
     pub(crate) shutting_down: bool,
     pub(crate) closed: bool,
     pub(crate) deferred_socket_cleanup: VecDeque<registration::DeferredSocketCleanup>,
@@ -85,7 +85,7 @@ pub enum CloseMode {
 
 pub(crate) type CompletionSidecar = CoreCompletionSidecar<IocpUserPayload>;
 
-impl IocpDriver {
+impl<'a> IocpDriver<'a> {
     /// Checks if the provided operation is a RIO-based operation.
     pub(crate) fn is_rio_op(op: &IocpOp) -> bool {
         matches!(
@@ -193,7 +193,7 @@ impl IocpDriver {
     }
 }
 
-impl Driver for IocpDriver {
+impl<'a> Driver<'a> for IocpDriver<'a> {
     type Op = crate::op::IocpOp;
     type UP = IocpUserPayload;
     type Raw = IocpHandle;
@@ -364,9 +364,9 @@ impl Driver for IocpDriver {
         })
     }
 
-    fn register_files<'a>(
+    fn register_files<'f>(
         &mut self,
-        files: Vec<RegisterFd<'a, IocpHandle>>,
+        files: Vec<RegisterFd<'f, IocpHandle>>,
     ) -> DriverResult<Vec<IoFd>> {
         IocpDriver::register_files(self, files)
     }
@@ -379,12 +379,12 @@ impl Driver for IocpDriver {
         IocpDriver::create_waker(self)
     }
 
-    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
+    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>) {
         self.registrar = registrar;
     }
 }
 
-impl Drop for IocpDriver {
+impl Drop for IocpDriver<'_> {
     fn drop(&mut self) {
         debug!("Dropping IocpDriver");
         if let Err(e) = self.close_impl(CloseMode::Fast) {
@@ -394,7 +394,7 @@ impl Drop for IocpDriver {
 }
 
 #[cfg(feature = "test-hooks")]
-impl veloq_driver_core::driver::test_hooks::DriverTestHooks for IocpDriver {
+impl veloq_driver_core::driver::test_hooks::DriverTestHooks for IocpDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.rio_state
             .registry

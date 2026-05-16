@@ -13,11 +13,15 @@ pub enum MissedTickBehavior {
 // Sync/Send Interval
 // ============================================================================
 
-pub fn interval<'a>(ctx: &'a RuntimeContext, period: Duration) -> Interval<'a> {
+pub fn interval<'a>(ctx: &'a RuntimeContext<'a>, period: Duration) -> Interval<'a> {
     interval_at(ctx, Instant::now(), period)
 }
 
-pub fn interval_at<'a>(ctx: &'a RuntimeContext, start: Instant, period: Duration) -> Interval<'a> {
+pub fn interval_at<'a>(
+    ctx: &'a RuntimeContext<'a>,
+    start: Instant,
+    period: Duration,
+) -> Interval<'a> {
     Interval {
         period,
         next_tick: start,
@@ -80,12 +84,12 @@ impl<'a> Interval<'a> {
 // Local Interval
 // ============================================================================
 
-pub fn interval_local<'a>(ctx: &'a RuntimeContext, period: Duration) -> LocalInterval<'a> {
+pub fn interval_local<'a>(ctx: &'a RuntimeContext<'a>, period: Duration) -> LocalInterval<'a> {
     interval_at_local(ctx, Instant::now(), period)
 }
 
 pub fn interval_at_local<'a>(
-    ctx: &'a RuntimeContext,
+    ctx: &'a RuntimeContext<'a>,
     start: Instant,
     period: Duration,
 ) -> LocalInterval<'a> {

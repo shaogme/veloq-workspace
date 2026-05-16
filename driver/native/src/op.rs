@@ -42,85 +42,89 @@ pub use veloq_driver_core::op::{
     OpLifecycle, OpResult, Open, Timeout, UdpRecvPacket, UdpRecvPacketBuf,
 };
 
-pub type LocalOp<T, P> = veloq_driver_core::op::LocalOp<T, P>;
+pub type LocalOp<'a, T, P> = veloq_driver_core::op::LocalOp<'a, T, P>;
 
-pub trait OpSubmitter<P: DriverProvider<Driver = PlatformDriver>>:
+pub trait OpSubmitter<'a, P: DriverProvider<'a, Driver = PlatformDriver<'a>>>:
     Clone + std::marker::Send + Sync
 {
     type Future<
         T: IntoPlatformOp<
-                <PlatformDriver as Driver>::Op,
-                DriverCompletion = <PlatformDriver as Driver>::Completion,
-                ErasedPayload = <PlatformDriver as Driver>::UP,
+                <PlatformDriver<'a> as Driver<'a>>::Op,
+                DriverCompletion = <PlatformDriver<'a> as Driver<'a>>::Completion,
+                ErasedPayload = <PlatformDriver<'a> as Driver<'a>>::UP,
             > + std::marker::Send,
     >: Future<
         Output = OpResult<
             T::Output,
-            <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion,
+            <T as IntoPlatformOp<<PlatformDriver<'a> as Driver<'a>>::Op>>::Completion,
         >,
     >;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
         T: IntoPlatformOp<
-                <PlatformDriver as Driver>::Op,
-                DriverCompletion = <PlatformDriver as Driver>::Completion,
-                ErasedPayload = <PlatformDriver as Driver>::UP,
+                <PlatformDriver<'a> as Driver<'a>>::Op,
+                DriverCompletion = <PlatformDriver<'a> as Driver<'a>>::Completion,
+                ErasedPayload = <PlatformDriver<'a> as Driver<'a>>::UP,
             > + std::marker::Send;
 
     fn from_current_context() -> Self;
 }
 
-impl<P: veloq_driver_core::op::DriverProvider<Driver = PlatformDriver>> OpSubmitter<P>
-    for LocalSubmitter<P>
+impl<'a, P: veloq_driver_core::op::DriverProvider<'a, Driver = PlatformDriver<'a>>>
+    OpSubmitter<'a, P> for LocalSubmitter<P>
 {
     type Future<
         T: IntoPlatformOp<
-                <PlatformDriver as Driver>::Op,
-                DriverCompletion = <PlatformDriver as Driver>::Completion,
-                ErasedPayload = <PlatformDriver as Driver>::UP,
+                <PlatformDriver<'a> as Driver<'a>>::Op,
+                DriverCompletion = <PlatformDriver<'a> as Driver<'a>>::Completion,
+                ErasedPayload = <PlatformDriver<'a> as Driver<'a>>::UP,
             > + std::marker::Send,
-    > = LocalOp<T, P>;
+    > = LocalOp<'a, T, P>;
 
-    fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<T, P>
+    fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
     where
         T: IntoPlatformOp<
-                <PlatformDriver as Driver>::Op,
-                DriverCompletion = <PlatformDriver as Driver>::Completion,
-                ErasedPayload = <PlatformDriver as Driver>::UP,
+                <PlatformDriver<'a> as Driver<'a>>::Op,
+                DriverCompletion = <PlatformDriver<'a> as Driver<'a>>::Completion,
+                ErasedPayload = <PlatformDriver<'a> as Driver<'a>>::UP,
             > + std::marker::Send,
     {
-        <LocalSubmitter<P> as veloq_driver_core::op::OpSubmitter<P>>::submit(self, op, provider)
+        <LocalSubmitter<P> as veloq_driver_core::op::OpSubmitter<'a, P>>::submit(self, op, provider)
     }
 
     fn from_current_context() -> Self {
-        <LocalSubmitter<P> as veloq_driver_core::op::OpSubmitter<P>>::from_current_context()
+        <LocalSubmitter<P> as veloq_driver_core::op::OpSubmitter<'a, P>>::from_current_context()
     }
 }
 
-impl<P: veloq_driver_core::op::DriverProvider<Driver = PlatformDriver>> OpSubmitter<P>
-    for DetachedSubmitter
+impl<'a, P: veloq_driver_core::op::DriverProvider<'a, Driver = PlatformDriver<'a>>>
+    OpSubmitter<'a, P> for DetachedSubmitter
 {
     type Future<
         T: IntoPlatformOp<
-                <PlatformDriver as Driver>::Op,
-                DriverCompletion = <PlatformDriver as Driver>::Completion,
-                ErasedPayload = <PlatformDriver as Driver>::UP,
+                <PlatformDriver<'a> as Driver<'a>>::Op,
+                DriverCompletion = <PlatformDriver<'a> as Driver<'a>>::Completion,
+                ErasedPayload = <PlatformDriver<'a> as Driver<'a>>::UP,
             > + std::marker::Send,
-    > = DetachedOp<T, <PlatformDriver as Driver>::Op, <PlatformDriver as Driver>::Completion>;
+    > = DetachedOp<
+        T,
+        <PlatformDriver<'a> as Driver<'a>>::Op,
+        <PlatformDriver<'a> as Driver<'a>>::Completion,
+    >;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
         T: IntoPlatformOp<
-                <PlatformDriver as Driver>::Op,
-                DriverCompletion = <PlatformDriver as Driver>::Completion,
-                ErasedPayload = <PlatformDriver as Driver>::UP,
+                <PlatformDriver<'a> as Driver<'a>>::Op,
+                DriverCompletion = <PlatformDriver<'a> as Driver<'a>>::Completion,
+                ErasedPayload = <PlatformDriver<'a> as Driver<'a>>::UP,
             > + std::marker::Send,
     {
-        <DetachedSubmitter as veloq_driver_core::op::OpSubmitter<P>>::submit(self, op, provider)
+        <DetachedSubmitter as veloq_driver_core::op::OpSubmitter<'a, P>>::submit(self, op, provider)
     }
 
     fn from_current_context() -> Self {
-        <DetachedSubmitter as veloq_driver_core::op::OpSubmitter<P>>::from_current_context()
+        <DetachedSubmitter as veloq_driver_core::op::OpSubmitter<'a, P>>::from_current_context()
     }
 }

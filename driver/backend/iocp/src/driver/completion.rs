@@ -31,7 +31,7 @@ pub(crate) struct CancelContext<'a> {
     pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
 }
 
-impl IocpDriver {
+impl<'a> IocpDriver<'a> {
     pub(crate) fn shutdown_ops(&mut self) -> usize {
         if self.shutting_down {
             return 0;

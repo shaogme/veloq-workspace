@@ -95,7 +95,11 @@ impl TcpSocket {
     /// Listen for incoming connections.
     ///
     /// Consumes the `TcpSocket` and returns a `TcpListener`.
-    pub fn listen<'a>(self, ctx: &'a RuntimeContext, backlog: u32) -> VeloqResult<TcpListener<'a>> {
+    pub fn listen<'a>(
+        self,
+        ctx: &'a RuntimeContext<'a>,
+        backlog: u32,
+    ) -> VeloqResult<TcpListener<'a>> {
         let local_addr = self.inner.local_addr().map_err(from_driver_report)?;
         self.inner
             .listen(backlog as i32)
@@ -114,11 +118,11 @@ impl TcpSocket {
     /// Connect to the given address.
     ///
     /// Consumes the `TcpSocket` and returns a `TcpStream` future.
-    pub async fn connect<'a>(
+    pub async fn connect<'ctx>(
         self,
-        ctx: &'a RuntimeContext,
+        ctx: &'ctx RuntimeContext<'ctx>,
         addr: SocketAddr,
-    ) -> VeloqResult<TcpStream<'a>> {
+    ) -> VeloqResult<TcpStream<'ctx>> {
         let inner = InnerSocket::new(ctx, self.inner.into_owned_raw().into_raw(), None)?;
         TcpStream::connect_from_inner(ctx, inner, addr).await
     }
@@ -186,7 +190,7 @@ impl UdpSocketBuilder {
     /// Consumes the builder and returns a `UdpSocket`.
     pub fn bind<'a, A: ToSocketAddrs>(
         self,
-        ctx: &'a RuntimeContext,
+        ctx: &'a RuntimeContext<'a>,
         addr: A,
     ) -> VeloqResult<UdpSocket<'a>> {
         let addr = addr

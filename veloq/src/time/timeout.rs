@@ -10,14 +10,18 @@ use std::time::{Duration, Instant};
 // Sync/Send Timeout
 // ============================================================================
 
-pub fn timeout<'a, T>(ctx: &'a RuntimeContext, duration: Duration, future: T) -> Timeout<'a, T>
+pub fn timeout<'a, T>(ctx: &'a RuntimeContext<'a>, duration: Duration, future: T) -> Timeout<'a, T>
 where
     T: Future,
 {
     timeout_at(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at<'a, T>(ctx: &'a RuntimeContext, deadline: Instant, future: T) -> Timeout<'a, T>
+pub fn timeout_at<'a, T>(
+    ctx: &'a RuntimeContext<'a>,
+    deadline: Instant,
+    future: T,
+) -> Timeout<'a, T>
 where
     T: Future,
 {
@@ -64,7 +68,7 @@ where
 // ============================================================================
 
 pub fn timeout_local<'a, T>(
-    ctx: &'a RuntimeContext,
+    ctx: &'a RuntimeContext<'a>,
     duration: Duration,
     future: T,
 ) -> LocalTimeout<'a, T>
@@ -75,7 +79,7 @@ where
 }
 
 pub fn timeout_at_local<'a, T>(
-    ctx: &'a RuntimeContext,
+    ctx: &'a RuntimeContext<'a>,
     deadline: Instant,
     future: T,
 ) -> LocalTimeout<'a, T>

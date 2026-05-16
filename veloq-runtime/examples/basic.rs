@@ -4,8 +4,8 @@ use veloq_runtime::{task, task_local};
 
 // --- 测试用例 ---
 
-async fn work(
-    ctx: veloq_runtime::runtime::RuntimeScopeContext<()>,
+async fn work<'ctx>(
+    ctx: veloq_runtime::runtime::RuntimeScopeContext<'ctx, ()>,
     id: String,
     steps: u32,
 ) -> String {
@@ -25,11 +25,8 @@ fn main() {
     rt.block_on(async |ctx| {
         println!("--- 安全异步作用域执行开始 ---");
 
-        task_local!(
-            static_node,
-            work(ctx.clone(), "栈任务-Static".to_string(), 2)
-        );
-        task!(send_node, work(ctx.clone(), "栈Send任务".to_string(), 2));
+        task_local!(static_node, work(ctx, "栈任务-Static".to_string(), 2));
+        task!(send_node, work(ctx, "栈Send任务".to_string(), 2));
 
         ctx.scope(async |my_scope| {
             let res_send = my_scope.spawn(&send_node).await.unwrap();
@@ -37,7 +34,8 @@ fn main() {
 
             let mut handles = Vec::new();
             for i in 1..=3 {
-                let h = my_scope.spawn_boxed(work(ctx.clone(), format!("堆任务-{}", i), i + 1));
+                let h = my_scope
+                    .spawn_boxed(async move { work(ctx, format!("堆任务-{}", i), i + 1).await });
                 handles.push(h);
             }
 
@@ -174,8 +172,8 @@ fn main() {
 
                 parent_scope.spawn_boxed(async move {
                     println!("    [父作用域] 启动子作用域...");
-                    ctx.scope(async |child_scope| {
-                        child_scope.spawn_boxed(async {
+                    ctx.scope(async move |child_scope| {
+                        child_scope.spawn_boxed(async move {
                             for i in 1..=100 {
                                 yield_now().await;
                                 if i % 10 == 0 {

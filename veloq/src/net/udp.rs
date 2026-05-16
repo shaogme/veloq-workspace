@@ -14,18 +14,18 @@ use veloq_driver_native::op::{
 };
 
 #[derive(Clone)]
-pub struct GenericUdpSocket<'a, S: OpSubmitter<RuntimeContext>, P: SocketTokenPtr<'a>> {
+pub struct GenericUdpSocket<'a, S: OpSubmitter<'a, RuntimeContext<'a>>, P: SocketTokenPtr<'a>> {
     pub(crate) inner: InnerSocket<'a, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: &'a RuntimeContext,
+    pub(crate) ctx: &'a RuntimeContext<'a>,
 }
 
 pub type LocalUdpSocket<'a> =
-    GenericUdpSocket<'a, LocalSubmitter<RuntimeContext>, Rc<SocketToken<'a>>>;
+    GenericUdpSocket<'a, LocalSubmitter<RuntimeContext<'a>>, Rc<SocketToken<'a>>>;
 pub type UdpSocket<'a> = GenericUdpSocket<'a, DetachedSubmitter, Arc<SocketToken<'a>>>;
 
 fn bind_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
-    ctx: &'a RuntimeContext,
+    ctx: &'a RuntimeContext<'a>,
     addr: A,
 ) -> VeloqResult<InnerSocket<'a, P>> {
     let addr = addr
@@ -51,7 +51,9 @@ fn bind_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-impl<'a, S: OpSubmitter<RuntimeContext> + Copy, P: SocketTokenPtr<'a>> GenericUdpSocket<'a, S, P> {
+impl<'a, S: OpSubmitter<'a, RuntimeContext<'a>> + Copy, P: SocketTokenPtr<'a>>
+    GenericUdpSocket<'a, S, P>
+{
     pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
         self.inner.local_addr()
     }
@@ -167,7 +169,7 @@ impl<'a, S: OpSubmitter<RuntimeContext> + Copy, P: SocketTokenPtr<'a>> GenericUd
 }
 
 impl<'a> LocalUdpSocket<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext<'a>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -217,7 +219,7 @@ impl<'a> LocalUdpSocket<'a> {
 }
 
 impl<'a> UdpSocket<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext<'a>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),

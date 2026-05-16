@@ -21,7 +21,7 @@ impl UringOpState {
     }
 }
 
-impl UringDriver {
+impl<'a> UringDriver<'a> {
     pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
         let Some(slot) = self.ops.slot_view(user_data) else {
             return;

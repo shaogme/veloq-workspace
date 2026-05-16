@@ -259,13 +259,13 @@ pub enum LocalState {
 }
 
 /// A Future wrapper for asynchronous IO operations executed locally.
-pub struct LocalOp<T, P>
+pub struct LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: crate::op::DriverProvider<'a>,
     T: IntoPlatformOp<
-            <P::Driver as Driver>::Op,
-            DriverCompletion = <P::Driver as Driver>::Completion,
-            ErasedPayload = <P::Driver as Driver>::UP,
+            <P::Driver as Driver<'a>>::Op,
+            DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+            ErasedPayload = <P::Driver as Driver<'a>>::UP,
         >,
 {
     pub(crate) state: LocalState,
@@ -273,15 +273,16 @@ where
     pub(crate) provider: P,
     pub(crate) user_data: usize,
     pub(crate) token: u64,
+    pub(crate) _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<T, P> LocalOp<T, P>
+impl<'a, T, P> LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: crate::op::DriverProvider<'a>,
     T: IntoPlatformOp<
-            <P::Driver as Driver>::Op,
-            DriverCompletion = <P::Driver as Driver>::Completion,
-            ErasedPayload = <P::Driver as Driver>::UP,
+            <P::Driver as Driver<'a>>::Op,
+            DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+            ErasedPayload = <P::Driver as Driver<'a>>::UP,
         >,
 {
     pub fn new(data: T, provider: P) -> Self {
@@ -291,17 +292,18 @@ where
             provider,
             user_data: 0,
             token: 0,
+            _marker: std::marker::PhantomData,
         }
     }
 }
 
-impl<T, P> Future for LocalOp<T, P>
+impl<'a, T, P> Future for LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: crate::op::DriverProvider<'a>,
     T: IntoPlatformOp<
-            <P::Driver as Driver>::Op,
-            DriverCompletion = <P::Driver as Driver>::Completion,
-            ErasedPayload = <P::Driver as Driver>::UP,
+            <P::Driver as Driver<'a>>::Op,
+            DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+            ErasedPayload = <P::Driver as Driver<'a>>::UP,
         >,
 {
     type Output = OpResult<T::Output, T::Completion>;
@@ -402,9 +404,9 @@ where
 
                 match poll_completion_table_once::<
                     T,
-                    <P::Driver as Driver>::Op,
-                    <P::Driver as Driver>::UP,
-                    <P::Driver as Driver>::Completion,
+                    <P::Driver as Driver<'a>>::Op,
+                    <P::Driver as Driver<'a>>::UP,
+                    <P::Driver as Driver<'a>>::Completion,
                 >(&*driver.completion_table(), token)
                 {
                     Poll::Ready(result) => {
@@ -415,9 +417,9 @@ where
                         driver.register_completion_waker(token, cx.waker());
                         match poll_completion_table_once::<
                             T,
-                            <P::Driver as Driver>::Op,
-                            <P::Driver as Driver>::UP,
-                            <P::Driver as Driver>::Completion,
+                            <P::Driver as Driver<'a>>::Op,
+                            <P::Driver as Driver<'a>>::UP,
+                            <P::Driver as Driver<'a>>::Completion,
                         >(&*driver.completion_table(), token)
                         {
                             Poll::Ready(result) => {
@@ -455,13 +457,13 @@ where
     }
 }
 
-impl<T, P> Drop for LocalOp<T, P>
+impl<'a, T, P> Drop for LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: crate::op::DriverProvider<'a>,
     T: IntoPlatformOp<
-            <P::Driver as Driver>::Op,
-            DriverCompletion = <P::Driver as Driver>::Completion,
-            ErasedPayload = <P::Driver as Driver>::UP,
+            <P::Driver as Driver<'a>>::Op,
+            DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+            ErasedPayload = <P::Driver as Driver<'a>>::UP,
         >,
 {
     fn drop(&mut self) {
@@ -474,58 +476,60 @@ where
     }
 }
 
-pub trait OpSubmitter<P: crate::op::DriverProvider>: Clone + std::marker::Send + Sync {
+pub trait OpSubmitter<'a, P: crate::op::DriverProvider<'a>>:
+    Clone + std::marker::Send + Sync
+{
     type Future<
-        T: IntoPlatformOp<<P::Driver as Driver>::Op, DriverCompletion = <P::Driver as Driver>::Completion, ErasedPayload = <P::Driver as Driver>::UP>
+        T: IntoPlatformOp<<P::Driver as Driver<'a>>::Op, DriverCompletion = <P::Driver as Driver<'a>>::Completion, ErasedPayload = <P::Driver as Driver<'a>>::UP>
             + std::marker::Send,
-    >: Future<Output = OpResult<T::Output, <T as IntoPlatformOp<<P::Driver as Driver>::Op>>::Completion>>;
+    >: Future<Output = OpResult<T::Output, <T as IntoPlatformOp<<P::Driver as Driver<'a>>::Op>>::Completion>>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
         T: IntoPlatformOp<
-                <P::Driver as Driver>::Op,
-                DriverCompletion = <P::Driver as Driver>::Completion,
-                ErasedPayload = <P::Driver as Driver>::UP,
+                <P::Driver as Driver<'a>>::Op,
+                DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+                ErasedPayload = <P::Driver as Driver<'a>>::UP,
             > + std::marker::Send;
 
     fn from_current_context() -> Self;
 }
 
-pub struct LocalSubmitter<P: crate::op::DriverProvider>(std::marker::PhantomData<fn() -> P>);
+pub struct LocalSubmitter<P>(std::marker::PhantomData<fn() -> P>);
 
-impl<P: crate::op::DriverProvider> Clone for LocalSubmitter<P> {
+impl<P> Clone for LocalSubmitter<P> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<P: crate::op::DriverProvider> Copy for LocalSubmitter<P> {}
+impl<P> Copy for LocalSubmitter<P> {}
 
-impl<P: crate::op::DriverProvider> LocalSubmitter<P> {
+impl<P> LocalSubmitter<P> {
     pub fn new() -> Self {
         Self(std::marker::PhantomData)
     }
 }
-impl<P: crate::op::DriverProvider> Default for LocalSubmitter<P> {
+impl<P> Default for LocalSubmitter<P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<P: crate::op::DriverProvider> OpSubmitter<P> for LocalSubmitter<P> {
+impl<'a, P: crate::op::DriverProvider<'a>> OpSubmitter<'a, P> for LocalSubmitter<P> {
     type Future<
         T: IntoPlatformOp<
-                <P::Driver as Driver>::Op,
-                DriverCompletion = <P::Driver as Driver>::Completion,
-                ErasedPayload = <P::Driver as Driver>::UP,
+                <P::Driver as Driver<'a>>::Op,
+                DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+                ErasedPayload = <P::Driver as Driver<'a>>::UP,
             > + std::marker::Send,
-    > = LocalOp<T, P>;
+    > = LocalOp<'a, T, P>;
 
-    fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<T, P>
+    fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
     where
         T: IntoPlatformOp<
-                <P::Driver as Driver>::Op,
-                DriverCompletion = <P::Driver as Driver>::Completion,
-                ErasedPayload = <P::Driver as Driver>::UP,
+                <P::Driver as Driver<'a>>::Op,
+                DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+                ErasedPayload = <P::Driver as Driver<'a>>::UP,
             > + std::marker::Send,
     {
         trace!("Submitting local op");
@@ -552,21 +556,21 @@ impl Default for DetachedSubmitter {
     }
 }
 
-impl<P: crate::op::DriverProvider> OpSubmitter<P> for DetachedSubmitter {
+impl<'a, P: crate::op::DriverProvider<'a>> OpSubmitter<'a, P> for DetachedSubmitter {
     type Future<
         T: IntoPlatformOp<
-                <P::Driver as Driver>::Op,
-                DriverCompletion = <P::Driver as Driver>::Completion,
-                ErasedPayload = <P::Driver as Driver>::UP,
+                <P::Driver as Driver<'a>>::Op,
+                DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+                ErasedPayload = <P::Driver as Driver<'a>>::UP,
             > + std::marker::Send,
-    > = DetachedOp<T, <P::Driver as Driver>::Op, <P::Driver as Driver>::Completion>;
+    > = DetachedOp<T, <P::Driver as Driver<'a>>::Op, <P::Driver as Driver<'a>>::Completion>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
         T: IntoPlatformOp<
-                <P::Driver as Driver>::Op,
-                DriverCompletion = <P::Driver as Driver>::Completion,
-                ErasedPayload = <P::Driver as Driver>::UP,
+                <P::Driver as Driver<'a>>::Op,
+                DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+                ErasedPayload = <P::Driver as Driver<'a>>::UP,
             > + std::marker::Send,
     {
         provider.with_driver(|driver| op.submit_detached(driver))

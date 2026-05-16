@@ -39,7 +39,7 @@ pub trait PoolTopology: Clone + Send + Sync {
         &self,
         state: &Self::State,
         worker_idx: usize,
-        registrar: Box<dyn BufferRegistrar>,
+        registrar: Box<dyn BufferRegistrar + '_>,
     ) -> AnyBufPool;
 
     /// Connect a listener to the shared state to receive notifications about new memory chunks.
@@ -93,7 +93,7 @@ impl PoolTopology for UniformSlot {
         &self,
         pool: &Self::State,
         worker_idx: usize,
-        registrar: Box<dyn BufferRegistrar>,
+        registrar: Box<dyn BufferRegistrar + '_>,
     ) -> AnyBufPool {
         // 在 Slot 架构中，所有线程共享一个大的连续区域
         // Phase 1: For now, we only register the initial chunk (Chunk 0).

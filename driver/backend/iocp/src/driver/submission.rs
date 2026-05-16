@@ -23,7 +23,7 @@ pub(crate) struct SubmitContextInternal<'a> {
     pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
 }
 
-impl IocpDriver {
+impl<'a> IocpDriver<'a> {
     #[inline]
     pub(crate) fn prep_op_slot(
         ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,

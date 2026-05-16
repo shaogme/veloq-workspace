@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::mpsc;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
@@ -26,15 +25,15 @@ pub struct WorkerRegistrarState {
     pub chunks: Vec<veloq_buf::heap::ChunkInfo>,
 }
 
-pub struct WorkerState {
-    pub driver: RefCell<Option<PlatformDriver>>,
+pub struct WorkerState<'ctx> {
+    pub driver: RefCell<Option<PlatformDriver<'ctx>>>,
     pub buf_pool: RefCell<Option<AnyBufPool>>,
-    pub registrar: RefCell<Option<DriverRegistrar>>,
+    pub registrar: RefCell<Option<DriverRegistrar<'ctx>>>,
     pub registrar_state: RefCell<Option<WorkerRegistrarState>>,
 }
 
-impl RuntimeContextExtra for WorkerState {
-    fn new(_worker_id: usize) -> Self {
+impl RuntimeContextExtra for WorkerState<'_> {
+    fn new<'ctx>(_worker_id: usize, _ctx: RuntimeScopeContext<'ctx, Self>) -> Self {
         Self {
             driver: RefCell::new(None),
             buf_pool: RefCell::new(None),
@@ -55,14 +54,14 @@ pub(crate) fn init_worker_registrar_state(
 }
 
 #[derive(Clone)]
-pub struct DriverRegistrar {
-    shared: Arc<RuntimeShared<WorkerState>>,
+pub struct DriverRegistrar<'ctx> {
+    shared: &'ctx RuntimeShared<WorkerState<'ctx>>,
     registration_mode: BufferRegistrationMode,
 }
 
-impl DriverRegistrar {
+impl<'ctx> DriverRegistrar<'ctx> {
     pub(crate) fn new(
-        shared: Arc<RuntimeShared<WorkerState>>,
+        shared: &'ctx RuntimeShared<WorkerState<'ctx>>,
         registration_mode: BufferRegistrationMode,
     ) -> Self {
         Self {
@@ -71,7 +70,7 @@ impl DriverRegistrar {
         }
     }
 
-    fn extra(&self) -> &WorkerState {
+    fn extra(&self) -> &WorkerState<'ctx> {
         let tls_ptr = self.shared.context_tls.get().expect("Not in runtime");
         unsafe { &tls_ptr.as_ref().extra }
     }
@@ -113,7 +112,7 @@ impl DriverRegistrar {
     }
 }
 
-impl veloq_buf::BufferRegistrar for DriverRegistrar {
+impl<'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'ctx> {
     fn register(&self, regions: &[veloq_buf::BufferRegion]) -> std::io::Result<Vec<usize>> {
         let extra = self.extra();
 
@@ -175,12 +174,12 @@ impl veloq_buf::BufferRegistrar for DriverRegistrar {
 }
 
 #[derive(Clone)]
-pub struct RuntimeContext {
-    pub scope: RuntimeScopeContext<WorkerState>,
+pub struct RuntimeContext<'ctx> {
+    pub scope: RuntimeScopeContext<'ctx, WorkerState<'ctx>>,
 }
 
-impl veloq_driver_native::op::DriverProvider for RuntimeContext {
-    type Driver = veloq_driver_native::driver::PlatformDriver;
+impl<'ctx> veloq_driver_native::op::DriverProvider<'ctx> for RuntimeContext<'ctx> {
+    type Driver = veloq_driver_native::driver::PlatformDriver<'ctx>;
 
     #[inline]
     fn with_driver<R>(&self, f: impl FnOnce(&mut Self::Driver) -> R) -> R {
@@ -188,9 +187,9 @@ impl veloq_driver_native::op::DriverProvider for RuntimeContext {
     }
 }
 
-impl RuntimeContext {
+impl<'ctx> RuntimeContext<'ctx> {
     #[inline]
-    fn extra(&self) -> &WorkerState {
+    fn extra(&self) -> &WorkerState<'ctx> {
         let tls_ptr = self
             .scope
             .shared()
@@ -240,7 +239,7 @@ impl RuntimeContext {
     }
 
     #[inline]
-    pub fn registrar(&self) -> DriverRegistrar {
+    pub fn registrar(&self) -> DriverRegistrar<'ctx> {
         self.extra()
             .registrar
             .borrow()
@@ -248,7 +247,7 @@ impl RuntimeContext {
             .expect("registrar missing")
     }
 
-    pub fn driver<R>(&self, f: impl FnOnce(&mut PlatformDriver) -> R) -> R {
+    pub fn driver<R>(&self, f: impl FnOnce(&mut PlatformDriver<'ctx>) -> R) -> R {
         let mut driver_opt = self.extra().driver.borrow_mut();
         f(driver_opt.as_mut().expect("driver missing"))
     }
@@ -292,11 +291,11 @@ impl RuntimeContext {
 
     pub fn submit<'a, S, T>(&self, submitter: &'a S, op: Op<T>) -> S::Future<T>
     where
-        S: veloq_driver_native::op::OpSubmitter<RuntimeContext> + Copy + 'a,
+        S: veloq_driver_native::op::OpSubmitter<'ctx, RuntimeContext<'ctx>> + Copy + 'a,
         T: IntoPlatformOp<
-                <PlatformDriver as Driver>::Op,
-                DriverCompletion = <PlatformDriver as Driver>::Completion,
-                ErasedPayload = <PlatformDriver as Driver>::UP,
+                <PlatformDriver<'ctx> as Driver<'ctx>>::Op,
+                DriverCompletion = <PlatformDriver<'ctx> as Driver<'ctx>>::Completion,
+                ErasedPayload = <PlatformDriver<'ctx> as Driver<'ctx>>::UP,
             > + Send,
     {
         self.sync_registrar();
@@ -314,16 +313,16 @@ impl RuntimeContext {
         op: Op<T>,
     ) -> VeloqResult<(
         Result<
-            <T as IntoPlatformOp<<PlatformDriver as Driver>::Op>>::Completion,
+            <T as IntoPlatformOp<<PlatformDriver<'ctx> as Driver<'ctx>>::Op>>::Completion,
             veloq_driver_native::error::DriverErrorReport,
         >,
         T::Output,
     )>
     where
         T: IntoPlatformOp<
-                <PlatformDriver as Driver>::Op,
-                DriverCompletion = <PlatformDriver as Driver>::Completion,
-                ErasedPayload = <PlatformDriver as Driver>::UP,
+                <PlatformDriver<'ctx> as Driver<'ctx>>::Op,
+                DriverCompletion = <PlatformDriver<'ctx> as Driver<'ctx>>::Completion,
+                ErasedPayload = <PlatformDriver<'ctx> as Driver<'ctx>>::UP,
             > + Send
             + 'a,
     {
@@ -350,7 +349,7 @@ impl RuntimeContext {
     }
 }
 
-pub fn poll_current_driver(shared: &RuntimeShared<WorkerState>) -> IdleDecision {
+pub fn poll_current_driver<'ctx>(shared: &RuntimeShared<WorkerState<'ctx>>) -> IdleDecision {
     let Some(tls_ptr) = shared.context_tls.get() else {
         return IdleDecision::wait(IdleWaitStrategy::block());
     };
@@ -377,21 +376,21 @@ pub fn poll_current_driver(shared: &RuntimeShared<WorkerState>) -> IdleDecision 
     }
 }
 
-pub(crate) fn submit_control_task(
-    shared: &veloq_runtime::runtime::shared::RuntimeShared<WorkerState>,
+pub(crate) fn submit_control_task<'ctx>(
+    shared: &veloq_runtime::runtime::shared::RuntimeShared<WorkerState<'ctx>>,
     worker_id: usize,
     fd: veloq_driver_native::op::IoFd,
 ) {
-    struct UnregisterFileTask {
+    struct UnregisterFileTask<'ctx> {
         header: veloq_runtime::task::TaskHeader,
         fd: veloq_driver_native::op::IoFd,
-        shared_ptr: *const veloq_runtime::runtime::shared::RuntimeShared<WorkerState>,
+        shared_ptr: *const veloq_runtime::runtime::shared::RuntimeShared<WorkerState<'ctx>>,
     }
 
-    unsafe impl Send for UnregisterFileTask {}
-    unsafe impl Sync for UnregisterFileTask {}
+    unsafe impl<'ctx> Send for UnregisterFileTask<'ctx> {}
+    unsafe impl<'ctx> Sync for UnregisterFileTask<'ctx> {}
 
-    impl veloq_runtime::task::RawTask for UnregisterFileTask {
+    impl<'ctx> veloq_runtime::task::RawTask for UnregisterFileTask<'ctx> {
         type Storage = veloq_runtime::utils::storage::AtomicStorage;
 
         fn poll_raw(&self, _worker_id: usize) -> bool {
@@ -416,7 +415,7 @@ pub(crate) fn submit_control_task(
         }
     }
 
-    impl UnregisterFileTask {
+    impl<'ctx> UnregisterFileTask<'ctx> {
         const VTABLE: &'static veloq_runtime::task::TaskVTable<
             veloq_runtime::utils::storage::AtomicStorage,
         > = &veloq_runtime::task::TaskVTable {

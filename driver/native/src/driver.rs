@@ -7,12 +7,12 @@ pub use veloq_driver_core::driver::{
 };
 
 #[cfg(target_os = "linux")]
-pub use veloq_driver_uring::UringDriver as PlatformDriver;
+pub type PlatformDriver<'a> = veloq_driver_uring::UringDriver<'a>;
 
 #[cfg(target_os = "windows")]
 pub use veloq_driver_iocp::CloseMode;
 #[cfg(target_os = "windows")]
-pub use veloq_driver_iocp::IocpDriver as PlatformDriver;
+pub type PlatformDriver<'a> = veloq_driver_iocp::IocpDriver<'a>;
 
 #[cfg(feature = "test-hooks")]
 pub use veloq_driver_core::driver::test_hooks;

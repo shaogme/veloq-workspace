@@ -15,7 +15,7 @@ use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 
-impl UringDriver {
+impl<'a> UringDriver<'a> {
     pub(crate) unsafe fn submit_from_slot_raw(
         driver: *mut UringDriver,
         user_data: usize,

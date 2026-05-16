@@ -15,7 +15,7 @@ pub(crate) struct DeferredSocketCleanup {
     pub(crate) registered_fd: Option<IoFd>,
 }
 
-impl IocpDriver {
+impl<'a> IocpDriver<'a> {
     /// Fallback probe for potentially untrusted raw handles.
     ///
     /// We trust `RawHandle` enum semantics by default. Probe is only used when a
@@ -117,9 +117,9 @@ impl IocpDriver {
     }
 
     /// Registers a set of file/socket handles for use with the driver.
-    pub(crate) fn register_files<'a>(
+    pub(crate) fn register_files<'h>(
         &mut self,
-        files: Vec<RegisterFd<'a, IocpHandle>>,
+        files: Vec<RegisterFd<'h, IocpHandle>>,
     ) -> DriverResult<Vec<IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for file in files {

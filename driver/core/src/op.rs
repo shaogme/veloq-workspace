@@ -3,8 +3,8 @@ use tracing::trace;
 use crate::DriverResult;
 use crate::driver::{Driver, PlatformOp, SubmitBinder, SubmitStatus, encode_completion_token};
 
-pub trait DriverProvider: Clone + Unpin {
-    type Driver: crate::driver::Driver;
+pub trait DriverProvider<'a>: Clone + Unpin {
+    type Driver: crate::driver::Driver<'a>;
     fn with_driver<R>(&self, f: impl FnOnce(&mut Self::Driver) -> R) -> R;
 }
 
@@ -64,11 +64,11 @@ impl<T> Op<T> {
         Self { data }
     }
 
-    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Completion>
+    pub fn submit_detached<'a, D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Completion>
     where
         T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
             + std::marker::Send,
-        D: Driver,
+        D: Driver<'a>,
     {
         let data = self.data;
         trace!("Submitting detached op");
@@ -150,12 +150,12 @@ impl<T> Op<T> {
         }
     }
 
-    pub fn submit_local<P: DriverProvider>(self, provider: P) -> LocalOp<T, P>
+    pub fn submit_local<'a, P: DriverProvider<'a>>(self, provider: P) -> LocalOp<'a, T, P>
     where
         T: IntoPlatformOp<
-                <P::Driver as Driver>::Op,
-                DriverCompletion = <P::Driver as Driver>::Completion,
-                ErasedPayload = <P::Driver as Driver>::UP,
+                <P::Driver as Driver<'a>>::Op,
+                DriverCompletion = <P::Driver as Driver<'a>>::Completion,
+                ErasedPayload = <P::Driver as Driver<'a>>::UP,
             >,
     {
         LocalOp::new(self.data, provider)
