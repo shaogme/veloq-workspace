@@ -37,106 +37,96 @@ pub struct RuntimeShared<T> {
     pub context_tls: veloq_tls::Tls<RuntimeContext<T>>,
 }
 
-pub(crate) struct RuntimeSharedComponents<T> {
-    pub(crate) registry: WorkerRegistry,
-    pub(crate) topo: TopologyContext,
+pub(crate) struct Receivers {
     pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
     pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
-    pub(crate) worker_count: NonZeroUsize,
-    pub(crate) idle_hook: Option<IdleHook<T>>,
-    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
-impl<T> RuntimeSharedComponents<T> {
-    pub(crate) fn new(
-        worker_count: NonZeroUsize,
-        queue_capacity: NonZeroUsize,
-        idle_hook: Option<IdleHook<T>>,
-        worker_tick_hook: Option<WorkerTickHook>,
-    ) -> Self {
-        let worker_count_val = worker_count.get();
-        let mut unparkers = Vec::with_capacity(worker_count_val);
-        let mut parker_inners = Vec::with_capacity(worker_count_val);
-        let mut local_receivers = Vec::with_capacity(worker_count_val);
-        let mut remote_receivers = Vec::with_capacity(worker_count_val);
-        let mut pinned_receivers = Vec::with_capacity(worker_count_val);
-        let mut workers = Vec::with_capacity(worker_count_val);
-        let mut next_idle = Vec::with_capacity(worker_count_val);
+pub(crate) fn init_runtime_components(
+    worker_count: NonZeroUsize,
+    queue_capacity: NonZeroUsize,
+) -> (WorkerRegistry, TopologyContext, Receivers) {
+    let worker_count_val = worker_count.get();
+    let mut unparkers = Vec::with_capacity(worker_count_val);
+    let mut parker_inners = Vec::with_capacity(worker_count_val);
+    let mut local_receivers = Vec::with_capacity(worker_count_val);
+    let mut remote_receivers = Vec::with_capacity(worker_count_val);
+    let mut pinned_receivers = Vec::with_capacity(worker_count_val);
+    let mut workers = Vec::with_capacity(worker_count_val);
+    let mut next_idle = Vec::with_capacity(worker_count_val);
 
-        for _ in 0..worker_count_val {
-            let inner = Arc::new(primitives::ParkerInner {
-                state: AtomicU32::new(0),
+    for _ in 0..worker_count_val {
+        let inner = Arc::new(primitives::ParkerInner {
+            state: AtomicU32::new(0),
+        });
+        unparkers.push(Unparker::from_inner(inner.clone()));
+        parker_inners.push(inner);
+
+        let (ltx, lrx) = mpsc::channel();
+        let (rtx, rrx) = mpsc::channel();
+        let (ptx, prx) = mpsc::channel();
+        local_receivers.push(lrx);
+        remote_receivers.push(rrx);
+        pinned_receivers.push(prx);
+        workers.push(Arc::new(WorkerQueue::new(ltx, rtx, ptx, queue_capacity)));
+        next_idle.push(AtomicUsize::new(usize::MAX));
+    }
+
+    // NUMA detection
+    let topo_info = numaperf_topo::Topology::discover().ok();
+    let mut groups = Vec::new();
+    let mut worker_to_group = vec![0; worker_count_val];
+
+    match topo_info {
+        Some(t) if t.node_count() > 0 => {
+            let node_count = t.node_count();
+            let mut node_to_workers: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+
+            for (i, group) in worker_to_group
+                .iter_mut()
+                .enumerate()
+                .take(worker_count_val)
+            {
+                let node_idx = i % node_count;
+                node_to_workers[node_idx].push(i);
+                *group = node_idx;
+            }
+
+            for worker_ids in node_to_workers.into_iter() {
+                if !worker_ids.is_empty() {
+                    groups.push(NUMAGroup {
+                        worker_ids,
+                        idle_stack: IdleStack::new(),
+                    });
+                }
+            }
+        }
+        _ => {
+            groups.push(NUMAGroup {
+                worker_ids: (0..worker_count_val).collect(),
+                idle_stack: IdleStack::new(),
             });
-            unparkers.push(Unparker::from_inner(inner.clone()));
-            parker_inners.push(inner);
-
-            let (ltx, lrx) = mpsc::channel();
-            let (rtx, rrx) = mpsc::channel();
-            let (ptx, prx) = mpsc::channel();
-            local_receivers.push(lrx);
-            remote_receivers.push(rrx);
-            pinned_receivers.push(prx);
-            workers.push(Arc::new(WorkerQueue::new(ltx, rtx, ptx, queue_capacity)));
-            next_idle.push(AtomicUsize::new(usize::MAX));
         }
+    }
 
-        // NUMA detection
-        let topo_info = numaperf_topo::Topology::discover().ok();
-        let mut groups = Vec::new();
-        let mut worker_to_group = vec![0; worker_count_val];
-
-        match topo_info {
-            Some(t) if t.node_count() > 0 => {
-                let node_count = t.node_count();
-                let mut node_to_workers: Vec<Vec<usize>> = vec![Vec::new(); node_count];
-
-                for (i, group) in worker_to_group
-                    .iter_mut()
-                    .enumerate()
-                    .take(worker_count_val)
-                {
-                    let node_idx = i % node_count;
-                    node_to_workers[node_idx].push(i);
-                    *group = node_idx;
-                }
-
-                for worker_ids in node_to_workers.into_iter() {
-                    if !worker_ids.is_empty() {
-                        groups.push(NUMAGroup {
-                            worker_ids,
-                            idle_stack: IdleStack::new(),
-                        });
-                    }
-                }
-            }
-            _ => {
-                groups.push(NUMAGroup {
-                    worker_ids: (0..worker_count_val).collect(),
-                    idle_stack: IdleStack::new(),
-                });
-            }
-        }
-
-        RuntimeSharedComponents {
-            registry: WorkerRegistry {
-                workers: workers.into_boxed_slice(),
-                unparkers: unparkers.into_boxed_slice(),
-                parker_inners: parker_inners.into_boxed_slice(),
-            },
-            topo: TopologyContext {
-                groups,
-                worker_to_group,
-                next_idle,
-            },
+    (
+        WorkerRegistry {
+            workers: workers.into_boxed_slice(),
+            unparkers: unparkers.into_boxed_slice(),
+            parker_inners: parker_inners.into_boxed_slice(),
+        },
+        TopologyContext {
+            groups,
+            worker_to_group,
+            next_idle,
+        },
+        Receivers {
             local_receivers,
             remote_receivers,
             pinned_receivers,
-            worker_count,
-            idle_hook,
-            worker_tick_hook,
-        }
-    }
+        },
+    )
 }
 
 impl<T> RuntimeShared<T> {
@@ -144,24 +134,30 @@ impl<T> RuntimeShared<T> {
         self.base.as_ref()
     }
 
-    pub(crate) fn new(components: RuntimeSharedComponents<T>) -> Self {
+    pub(crate) fn new(
+        registry: WorkerRegistry,
+        topo: TopologyContext,
+        worker_count: NonZeroUsize,
+        idle_hook: Option<IdleHook<T>>,
+        worker_tick_hook: Option<WorkerTickHook>,
+    ) -> Self {
         Self {
             base: Arc::new(RuntimeSharedBase {
-                registry: components.registry,
-                topo: components.topo,
+                registry,
+                topo,
                 scheduler: TaskScheduler {
                     injector: GlobalInjector::new(),
                     next_worker: AtomicUsize::new(0),
                     searching_workers: AtomicUsize::new(0),
                 },
                 idle: IdleController {
-                    idle_mask: infra::AtomicBitset::new(components.worker_count.get()),
+                    idle_mask: infra::AtomicBitset::new(worker_count.get()),
                     event_count: primitives::EventCount::new(),
                 },
                 shutdown: AtomicBool::new(false),
-                worker_tick_hook: components.worker_tick_hook,
+                worker_tick_hook,
             }),
-            idle_hook: components.idle_hook,
+            idle_hook,
             context_tls: veloq_tls::Tls::new(),
         }
     }

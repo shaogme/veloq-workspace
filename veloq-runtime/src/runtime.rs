@@ -21,12 +21,16 @@ pub use shared::{RuntimeShared, RuntimeSharedBase};
 use veloq_tls::TlsGuard;
 
 use primitives::{Signal, create_waker};
-use shared::RuntimeSharedComponents;
+use shared::{Receivers, infra::TopologyContext, infra::WorkerRegistry, init_runtime_components};
 
 pub struct Runtime<I, T> {
-    pub(crate) components: RuntimeSharedComponents<T>,
+    pub(crate) registry: WorkerRegistry,
+    pub(crate) topo: TopologyContext,
+    pub(crate) receivers: Receivers,
     pub(crate) worker_count: NonZeroUsize,
     pub(crate) worker_init: Option<I>,
+    pub(crate) idle_hook: Option<IdleHook<T>>,
+    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 pub fn noop_worker_init<T: context::RuntimeContextExtra>(
@@ -62,19 +66,32 @@ where
         self.worker_count
     }
 
-    pub fn block_on<R, F>(mut self, f: F) -> R
+    pub fn block_on<R, F>(self, f: F) -> R
     where
         F: AsyncFnOnce(&RuntimeScopeContext<T>) -> R,
     {
-        let worker_count = self.worker_count;
-        let worker_init = self.worker_init.take().expect("worker_init already taken");
+        let Runtime {
+            registry,
+            topo,
+            receivers,
+            worker_count,
+            worker_init,
+            idle_hook,
+            worker_tick_hook,
+        } = self;
 
-        let mut components = self.components;
-        let mut local_receivers = std::mem::take(&mut components.local_receivers);
-        let mut remote_receivers = std::mem::take(&mut components.remote_receivers);
-        let mut pinned_receivers = std::mem::take(&mut components.pinned_receivers);
+        let worker_init = worker_init.expect("worker_init already taken");
+        let mut local_receivers = receivers.local_receivers;
+        let mut remote_receivers = receivers.remote_receivers;
+        let mut pinned_receivers = receivers.pinned_receivers;
 
-        let shared = Arc::new(RuntimeShared::new(components));
+        let shared = Arc::new(RuntimeShared::new(
+            registry,
+            topo,
+            worker_count,
+            idle_hook,
+            worker_tick_hook,
+        ));
 
         thread::scope(|scope| {
             struct ShutdownGuard<T: context::RuntimeContextExtra>(Arc<RuntimeShared<T>>);
@@ -247,16 +264,20 @@ impl<I, T: context::RuntimeContextExtra> RuntimeBuilder<I, T> {
         let count = self
             .worker_count
             .unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()));
-        let components = RuntimeSharedComponents::new(
-            NonZeroUsize::new(count).expect("requested worker count must be non-zero"),
+        let worker_count =
+            NonZeroUsize::new(count).expect("requested worker count must be non-zero");
+        let (registry, topo, receivers) = init_runtime_components(
+            worker_count,
             NonZeroUsize::new(self.queue_capacity).expect("queue capacity must be non-zero"),
-            self.idle_hook,
-            self.worker_tick_hook,
         );
         Runtime {
-            components,
-            worker_count: NonZeroUsize::new(count).expect("final worker count must be non-zero"),
+            registry,
+            topo,
+            receivers,
+            worker_count,
             worker_init: self.worker_init,
+            idle_hook: self.idle_hook,
+            worker_tick_hook: self.worker_tick_hook,
         }
     }
 }
