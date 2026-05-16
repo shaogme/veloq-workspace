@@ -2,6 +2,7 @@ use crate::config::IocpConfig;
 use crate::driver::IocpDriver;
 use crate::ext::Extensions;
 use std::os::windows::io::AsRawHandle;
+use veloq_buf::NoopRegistrar;
 use veloq_driver_core::driver::RegisterFd;
 use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
 
@@ -23,13 +24,13 @@ fn test_extensions_load() {
 
 #[test]
 fn test_driver_creation() {
-    let _driver = IocpDriver::new(IocpConfig::default());
+    let _driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar));
     assert!(_driver.is_ok(), "Driver should be created");
 }
 
 #[test]
 fn test_register_files() {
-    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
     let handle = std::fs::File::open("Cargo.toml").unwrap();
     let raw = crate::config::RawHandle::new(crate::config::IocpHandle::for_file(
         handle.as_raw_handle() as _,
@@ -43,7 +44,7 @@ fn test_register_files() {
 
 #[test]
 fn test_register_borrowed_file_keeps_weak_ownership() {
-    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
     let handle = std::fs::File::open("Cargo.toml").unwrap();
     let raw = crate::config::RawHandle::new(crate::config::IocpHandle::for_file(
         handle.as_raw_handle() as _,

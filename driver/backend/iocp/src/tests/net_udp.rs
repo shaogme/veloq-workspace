@@ -6,7 +6,7 @@ use crate::tests::{
     wait_completion_record,
 };
 use std::time::Duration;
-use veloq_buf::{BufPool, FixedBuf};
+use veloq_buf::{BufPool, FixedBuf, NoopRegistrar};
 use veloq_buf::{
     PoolTopology, UniformSlot,
     heap::{GlobalSlotPool, ThreadMemoryMultiplier},
@@ -41,7 +41,8 @@ fn register_buf_chunk(
 
 #[test]
 fn test_rio_udp_send_to_recv_from_address_path() {
-    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar))
+        .expect("Driver creation failed");
 
     let server = Socket::new_udp_v4().expect("server socket create failed");
     let client = Socket::new_udp_v4().expect("client socket create failed");
@@ -112,7 +113,8 @@ fn test_rio_udp_send_to_recv_from_address_path() {
 
 #[test]
 fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
-    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar))
+        .expect("Driver creation failed");
 
     let server = Socket::new_udp_v6().expect("server v6 socket create failed");
     let client = Socket::new_udp_v6().expect("client v6 socket create failed");
@@ -186,7 +188,8 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
 
 #[test]
 fn test_rio_udp_recv_from_cancel_reports_aborted() {
-    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar))
+        .expect("Driver creation failed");
     let server = Socket::new_udp_v4().expect("server socket create failed");
     server
         .bind("127.0.0.1:0".parse().unwrap())

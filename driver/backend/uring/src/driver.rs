@@ -127,7 +127,10 @@ pub struct UringDriver<'a> {
 }
 
 impl<'a> UringDriver<'a> {
-    fn new_internal(config: impl AsRef<UringConfig>) -> UringResult<Self> {
+    fn new_internal(
+        config: impl AsRef<UringConfig>,
+        registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
+    ) -> UringResult<Self> {
         let config = config.as_ref();
         let mut builder = IoUring::builder();
 
@@ -192,7 +195,7 @@ impl<'a> UringDriver<'a> {
             wheel: veloq_wheel::Wheel::new(veloq_wheel::WheelConfig::default()),
             timer_buffer: Vec::new(),
             last_timer_poll: Instant::now(),
-            registrar: Box::new(veloq_buf::NoopRegistrar),
+            registrar,
             registration_stats: UringRegistrationStats::default(),
             registration_mode: config.registration_mode,
             chunk_register_failures_recent: HashMap::new(),
@@ -220,8 +223,11 @@ impl<'a> UringDriver<'a> {
         Ok(driver)
     }
 
-    pub fn new(config: impl AsRef<UringConfig>) -> UringResult<Self> {
-        Self::new_internal(config).map_err(|e| e.attach_note("create uring driver"))
+    pub fn new(
+        config: impl AsRef<UringConfig>,
+        registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
+    ) -> UringResult<Self> {
+        Self::new_internal(config, registrar).map_err(|e| e.attach_note("create uring driver"))
     }
 
     fn has_active_ops_internal(&mut self) -> bool {
@@ -233,7 +239,7 @@ impl Drop for UringDriver<'_> {
     fn drop(&mut self) {}
 }
 
-impl<'a> Driver<'a> for UringDriver<'a> {
+impl<'a> Driver for UringDriver<'a> {
     type Op = UringOp;
     type UP = UringUserPayload;
     type Raw = UringRawHandle;
@@ -422,10 +428,6 @@ impl<'a> Driver<'a> for UringDriver<'a> {
             fd: self.waker_fd.clone(),
             is_waked: self.is_waked.clone(),
         })
-    }
-
-    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>) {
-        self.registrar = registrar;
     }
 }
 

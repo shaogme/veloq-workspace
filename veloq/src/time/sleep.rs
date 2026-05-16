@@ -35,8 +35,8 @@ pub struct Sleep<'ctx> {
     inner: Option<
         DetachedOp<
             OpTimeout,
-            <PlatformDriver<'ctx> as Driver<'ctx>>::Op,
-            <PlatformDriver<'ctx> as Driver<'ctx>>::Completion,
+            <PlatformDriver<'ctx> as Driver>::Op,
+            <PlatformDriver<'ctx> as Driver>::Completion,
         >,
     >,
 }

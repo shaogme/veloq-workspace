@@ -1,11 +1,13 @@
 use crate::config::IocpConfig;
 use crate::driver::IocpDriver;
 use crate::tests::{submit_test_op, wait_completion};
+use veloq_buf::NoopRegistrar;
 use veloq_driver_core::op::Timeout;
 
 #[test]
 fn test_iocp_timeout() {
-    let mut driver: IocpDriver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver: IocpDriver =
+        IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
 
     let timeout_op = Timeout {
         duration: std::time::Duration::from_millis(100),

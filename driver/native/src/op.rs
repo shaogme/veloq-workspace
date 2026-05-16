@@ -43,9 +43,7 @@ pub use veloq_driver_core::op::{
 
 pub type LocalOp<'a, T, P> = veloq_driver_core::op::LocalOp<'a, T, P>;
 
-pub trait OpSubmitter<'a, P: DriverProvider>:
-    Clone + std::marker::Send + Sync
-{
+pub trait OpSubmitter<'a, P: DriverProvider>: Clone + std::marker::Send + Sync {
     type Future<
         T: IntoPlatformOp<P::Op, DriverCompletion = P::Completion, ErasedPayload = P::UP>
             + std::marker::Send,

@@ -11,7 +11,7 @@ use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::time::Duration;
 use veloq_buf::BufPool;
-use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+use veloq_buf::{NoopRegistrar, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_driver_core::driver::{DriveMode, Driver, RegisterFd};
 use veloq_driver_core::op::{Accept, Connect, Recv};
 
@@ -27,8 +27,8 @@ fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
 
 #[test]
 fn test_iocp_accept() {
-    let mut driver: IocpDriver =
-        IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+    let mut driver: IocpDriver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar))
+        .expect("Driver creation failed");
 
     // Listener (Bind to random port)
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -78,7 +78,8 @@ fn test_iocp_accept() {
 
 #[test]
 fn test_iocp_connect() {
-    let mut driver: IocpDriver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver: IocpDriver =
+        IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
 
     // Listener
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -112,7 +113,7 @@ fn test_iocp_connect() {
 
 #[test]
 fn test_iocp_recv_with_buffer_pool() {
-    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
 
     // Setup GlobalAlloc
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
@@ -201,7 +202,7 @@ fn test_iocp_recv_with_buffer_pool() {
 fn test_rio_cancel_poll_returns_aborted_without_hang() {
     use std::sync::mpsc;
 
-    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
 
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
@@ -276,7 +277,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     use std::sync::mpsc;
 
-    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
 
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);

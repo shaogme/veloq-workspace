@@ -7,7 +7,7 @@ pub trait DriverProvider: Clone + Unpin {
     type Op: PlatformOp;
     type UP: std::marker::Send;
     type Completion: crate::driver::CompletionValue;
-    type Driver<'a>: crate::driver::Driver<'a, Op = Self::Op, UP = Self::UP, Completion = Self::Completion>;
+    type Driver<'a>: crate::driver::Driver<Op = Self::Op, UP = Self::UP, Completion = Self::Completion>;
 
     fn with_driver<R>(&self, f: impl for<'a> FnOnce(Self::Driver<'a>) -> R) -> R;
 }
@@ -68,11 +68,11 @@ impl<T> Op<T> {
         Self { data }
     }
 
-    pub fn submit_detached<'a, D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Completion>
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Completion>
     where
         T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
             + std::marker::Send,
-        D: Driver<'a>,
+        D: Driver,
     {
         let data = self.data;
         trace!("Submitting detached op");

@@ -393,8 +393,7 @@ where
                 match poll_completion_table_once::<T, P::Op, P::UP, P::Completion>(
                     &*driver.completion_table(),
                     token,
-                )
-                {
+                ) {
                     Poll::Ready(result) => {
                         is_ready = true;
                         ready_val = Some(result);
@@ -404,8 +403,7 @@ where
                         match poll_completion_table_once::<T, P::Op, P::UP, P::Completion>(
                             &*driver.completion_table(),
                             token,
-                        )
-                        {
+                        ) {
                             Poll::Ready(result) => {
                                 is_ready = true;
                                 ready_val = Some(result);
@@ -456,9 +454,7 @@ where
     }
 }
 
-pub trait OpSubmitter<'a, P: crate::op::DriverProvider>:
-    Clone + std::marker::Send + Sync
-{
+pub trait OpSubmitter<'a, P: crate::op::DriverProvider>: Clone + std::marker::Send + Sync {
     type Future<
         T: IntoPlatformOp<P::Op, DriverCompletion = P::Completion, ErasedPayload = P::UP>
             + std::marker::Send,

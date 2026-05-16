@@ -6,7 +6,7 @@ use std::sync::{Arc, mpsc};
 
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
-use veloq_driver_native::driver::{Driver, PlatformDriver};
+use veloq_driver_native::driver::PlatformDriver;
 use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
 use veloq_runtime::utils::storage::StaticTransfer;
 
@@ -148,12 +148,11 @@ impl<T: PoolTopology> Runtime<T> {
                 let config = config.clone();
                 let receiver = receivers.take(worker_ctx.worker_id());
 
-                let mut driver =
-                    PlatformDriver::new(config.clone()).expect("failed to create driver");
                 let registration_mode = config.registration_mode();
                 let registrar = DriverRegistrar::new(worker_ctx.shared(), registration_mode);
 
-                driver.set_registrar(Box::new(registrar.clone()));
+                let driver = PlatformDriver::new(config.clone(), Box::new(registrar.clone()))
+                    .expect("failed to create driver");
 
                 let tls_ptr = worker_ctx.shared().context_tls.get().unwrap();
                 let ctx = unsafe { &*tls_ptr.as_ptr() };

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
 
-use veloq_buf::{BufferRegistrar, NoopRegistrar};
+use veloq_buf::BufferRegistrar;
 use veloq_driver_core::driver::registry::{OpEntry, OpRegistry};
 use veloq_driver_core::driver::{
     CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver, RegisterFd,
@@ -106,10 +106,13 @@ impl<'a> IocpDriver<'a> {
     }
 
     /// Creates a new IOCP driver instance.
-    pub fn new(config: impl AsRef<IocpConfig>) -> IocpResult<Self> {
+    pub fn new(
+        config: impl AsRef<IocpConfig>,
+        registrar: Box<dyn BufferRegistrar + 'a>,
+    ) -> IocpResult<Self> {
         let cfg = config.as_ref();
         let pre = Self::create_pre_init()?;
-        Self::new_from_pre_init(cfg.entries.get(), pre, cfg.registration_mode)
+        Self::new_from_pre_init(cfg.entries.get(), pre, cfg.registration_mode, registrar)
     }
 
     /// Creates a new IOCP driver from a pre-initialized handle.
@@ -117,6 +120,7 @@ impl<'a> IocpDriver<'a> {
         entries: u32,
         port_val: PreInit,
         registration_mode: BufferRegistrationMode,
+        registrar: Box<dyn BufferRegistrar + 'a>,
     ) -> IocpResult<Self> {
         use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
         // SAFETY: WSAStartup is required for networking on Windows.
@@ -163,7 +167,7 @@ impl<'a> IocpDriver<'a> {
             completion_table,
             detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
             rio_state,
-            registrar: Box::new(NoopRegistrar),
+            registrar,
             shutting_down: false,
             closed: false,
             deferred_socket_cleanup: VecDeque::new(),
@@ -193,7 +197,7 @@ impl<'a> IocpDriver<'a> {
     }
 }
 
-impl<'a> Driver<'a> for IocpDriver<'a> {
+impl<'a> Driver for IocpDriver<'a> {
     type Op = crate::op::IocpOp;
     type UP = IocpUserPayload;
     type Raw = IocpHandle;
@@ -377,10 +381,6 @@ impl<'a> Driver<'a> for IocpDriver<'a> {
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
         IocpDriver::create_waker(self)
-    }
-
-    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>) {
-        self.registrar = registrar;
     }
 }
 
