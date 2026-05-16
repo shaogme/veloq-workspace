@@ -97,9 +97,7 @@ impl<'ctx, T> Copy for RuntimeScopeContext<'ctx, T> {}
 
 impl<'ctx, T> Clone for RuntimeScopeContext<'ctx, T> {
     fn clone(&self) -> Self {
-        Self {
-            shared: self.shared,
-        }
+        *self
     }
 }
 
@@ -123,7 +121,7 @@ impl<'ctx, T: RuntimeContextExtra> RuntimeScopeContext<'ctx, T> {
     }
 
     /// Returns the shared runtime state.
-    pub fn shared(&self) -> &RuntimeShared<T> {
+    pub fn shared(&self) -> &'ctx RuntimeShared<T> {
         self.shared
     }
 

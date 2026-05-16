@@ -173,13 +173,15 @@ impl<'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'ctx> {
     }
 }
 
-#[derive(Clone)]
-pub struct RuntimeContext<'ctx> {
-    pub scope: RuntimeScopeContext<'ctx, WorkerState<'ctx>>,
+#[derive(Clone, Copy)]
+pub struct RuntimeContext<'state, 'ctx> {
+    pub scope: RuntimeScopeContext<'ctx, WorkerState<'state>>,
 }
 
-impl<'ctx> veloq_driver_native::op::DriverProvider<'ctx> for RuntimeContext<'ctx> {
-    type Driver = veloq_driver_native::driver::PlatformDriver<'ctx>;
+impl<'state, 'ctx> veloq_driver_native::op::DriverProvider<'state>
+    for RuntimeContext<'state, 'ctx>
+{
+    type Driver = veloq_driver_native::driver::PlatformDriver<'state>;
 
     #[inline]
     fn with_driver<R>(&self, f: impl FnOnce(&mut Self::Driver) -> R) -> R {
@@ -187,9 +189,9 @@ impl<'ctx> veloq_driver_native::op::DriverProvider<'ctx> for RuntimeContext<'ctx
     }
 }
 
-impl<'ctx> RuntimeContext<'ctx> {
+impl<'state, 'ctx> RuntimeContext<'state, 'ctx> {
     #[inline]
-    fn extra(&self) -> &WorkerState<'ctx> {
+    fn extra(&self) -> &WorkerState<'state> {
         let tls_ptr = self
             .scope
             .shared()
@@ -239,7 +241,7 @@ impl<'ctx> RuntimeContext<'ctx> {
     }
 
     #[inline]
-    pub fn registrar(&self) -> DriverRegistrar<'ctx> {
+    pub fn registrar(&self) -> DriverRegistrar<'state> {
         self.extra()
             .registrar
             .borrow()
@@ -247,7 +249,7 @@ impl<'ctx> RuntimeContext<'ctx> {
             .expect("registrar missing")
     }
 
-    pub fn driver<R>(&self, f: impl FnOnce(&mut PlatformDriver<'ctx>) -> R) -> R {
+    pub fn driver<R>(&self, f: impl FnOnce(&mut PlatformDriver<'state>) -> R) -> R {
         let mut driver_opt = self.extra().driver.borrow_mut();
         f(driver_opt.as_mut().expect("driver missing"))
     }
@@ -291,7 +293,7 @@ impl<'ctx> RuntimeContext<'ctx> {
 
     pub fn submit<'a, S, T>(&self, submitter: &'a S, op: Op<T>) -> S::Future<T>
     where
-        S: veloq_driver_native::op::OpSubmitter<'ctx, RuntimeContext<'ctx>> + Copy + 'a,
+        S: veloq_driver_native::op::OpSubmitter<'state, RuntimeContext<'state, 'ctx>> + Copy + 'a,
         T: IntoPlatformOp<
                 <PlatformDriver<'ctx> as Driver<'ctx>>::Op,
                 DriverCompletion = <PlatformDriver<'ctx> as Driver<'ctx>>::Completion,
@@ -334,7 +336,7 @@ impl<'ctx> RuntimeContext<'ctx> {
             let op = op_back.expect("Op lost in local submit");
             Ok((res, op))
         } else {
-            let scope_clone = self.scope.clone();
+            let scope_clone = self.scope;
             let routed = self
                 .scope
                 .route_to(worker_id, move || {

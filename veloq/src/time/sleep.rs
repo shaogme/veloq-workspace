@@ -14,14 +14,14 @@ use veloq_driver_native::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
 /// Waits until `duration` has elapsed.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep<'a>(ctx: &'a RuntimeContext<'a>, duration: Duration) -> Sleep<'a> {
+pub fn sleep<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, duration: Duration) -> Sleep<'a, 'ctx> {
     sleep_until(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep_until<'a>(ctx: &'a RuntimeContext<'a>, deadline: Instant) -> Sleep<'a> {
+pub fn sleep_until<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, deadline: Instant) -> Sleep<'a, 'ctx> {
     Sleep {
         ctx,
         deadline,
@@ -29,8 +29,8 @@ pub fn sleep_until<'a>(ctx: &'a RuntimeContext<'a>, deadline: Instant) -> Sleep<
     }
 }
 
-pub struct Sleep<'a> {
-    ctx: &'a RuntimeContext<'a>,
+pub struct Sleep<'a, 'ctx> {
+    ctx: RuntimeContext<'a, 'ctx>,
     deadline: Instant,
     inner: Option<
         DetachedOp<
@@ -41,7 +41,7 @@ pub struct Sleep<'a> {
     >,
 }
 
-impl<'a> Sleep<'a> {
+impl<'a, 'ctx> Sleep<'a, 'ctx> {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -56,7 +56,7 @@ impl<'a> Sleep<'a> {
     }
 }
 
-impl<'a> Future for Sleep<'a> {
+impl<'a, 'ctx> Future for Sleep<'a, 'ctx> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -97,14 +97,20 @@ impl<'a> Future for Sleep<'a> {
 /// Waits until `duration` has elapsed (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_local<'a>(ctx: &'a RuntimeContext<'a>, duration: Duration) -> LocalSleep<'a> {
+pub fn sleep_local<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    duration: Duration,
+) -> LocalSleep<'a, 'ctx> {
     sleep_until_local(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_until_local<'a>(ctx: &'a RuntimeContext<'a>, deadline: Instant) -> LocalSleep<'a> {
+pub fn sleep_until_local<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    deadline: Instant,
+) -> LocalSleep<'a, 'ctx> {
     LocalSleep {
         ctx,
         deadline,
@@ -112,13 +118,13 @@ pub fn sleep_until_local<'a>(ctx: &'a RuntimeContext<'a>, deadline: Instant) -> 
     }
 }
 
-pub struct LocalSleep<'a> {
-    ctx: &'a RuntimeContext<'a>,
+pub struct LocalSleep<'a, 'ctx> {
+    ctx: RuntimeContext<'a, 'ctx>,
     deadline: Instant,
-    inner: Option<LocalOp<'a, OpTimeout, RuntimeContext<'a>>>,
+    inner: Option<LocalOp<'a, OpTimeout, RuntimeContext<'a, 'ctx>>>,
 }
 
-impl<'a> LocalSleep<'a> {
+impl<'a, 'ctx> LocalSleep<'a, 'ctx> {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -133,7 +139,7 @@ impl<'a> LocalSleep<'a> {
     }
 }
 
-impl<'a> Future for LocalSleep<'a> {
+impl<'a, 'ctx> Future for LocalSleep<'a, 'ctx> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

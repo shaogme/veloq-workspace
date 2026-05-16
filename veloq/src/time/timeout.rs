@@ -10,18 +10,22 @@ use std::time::{Duration, Instant};
 // Sync/Send Timeout
 // ============================================================================
 
-pub fn timeout<'a, T>(ctx: &'a RuntimeContext<'a>, duration: Duration, future: T) -> Timeout<'a, T>
+pub fn timeout<'a, 'ctx, T>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    duration: Duration,
+    future: T,
+) -> Timeout<'a, 'ctx, T>
 where
     T: Future,
 {
     timeout_at(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at<'a, T>(
-    ctx: &'a RuntimeContext<'a>,
+pub fn timeout_at<'a, 'ctx, T>(
+    ctx: RuntimeContext<'a, 'ctx>,
     deadline: Instant,
     future: T,
-) -> Timeout<'a, T>
+) -> Timeout<'a, 'ctx, T>
 where
     T: Future,
 {
@@ -31,12 +35,12 @@ where
     }
 }
 
-pub struct Timeout<'a, T> {
+pub struct Timeout<'a, 'ctx, T> {
     value: T,
-    delay: Sleep<'a>,
+    delay: Sleep<'a, 'ctx>,
 }
 
-impl<'a, T> Future for Timeout<'a, T>
+impl<'a, 'ctx, T> Future for Timeout<'a, 'ctx, T>
 where
     T: Future,
 {
@@ -67,22 +71,22 @@ where
 // Local Timeout
 // ============================================================================
 
-pub fn timeout_local<'a, T>(
-    ctx: &'a RuntimeContext<'a>,
+pub fn timeout_local<'a, 'ctx, T>(
+    ctx: RuntimeContext<'a, 'ctx>,
     duration: Duration,
     future: T,
-) -> LocalTimeout<'a, T>
+) -> LocalTimeout<'a, 'ctx, T>
 where
     T: Future,
 {
     timeout_at_local(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at_local<'a, T>(
-    ctx: &'a RuntimeContext<'a>,
+pub fn timeout_at_local<'a, 'ctx, T>(
+    ctx: RuntimeContext<'a, 'ctx>,
     deadline: Instant,
     future: T,
-) -> LocalTimeout<'a, T>
+) -> LocalTimeout<'a, 'ctx, T>
 where
     T: Future,
 {
@@ -92,12 +96,12 @@ where
     }
 }
 
-pub struct LocalTimeout<'a, T> {
+pub struct LocalTimeout<'a, 'ctx, T> {
     value: T,
-    delay: LocalSleep<'a>,
+    delay: LocalSleep<'a, 'ctx>,
 }
 
-impl<'a, T> Future for LocalTimeout<'a, T>
+impl<'a, 'ctx, T> Future for LocalTimeout<'a, 'ctx, T>
 where
     T: Future,
 {

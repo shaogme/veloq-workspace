@@ -18,7 +18,7 @@ fn build_runtime(worker_threads: usize, mode: BufferRegistrationMode) -> Runtime
 }
 
 #[cfg(feature = "test-hooks")]
-fn current_chunk_register_attempts(ctx: &RuntimeContext) -> u64 {
+fn current_chunk_register_attempts(ctx: RuntimeContext) -> u64 {
     ctx.driver(|driver| {
         let hooks = driver as &dyn DriverTestHooks;
         hooks.debug_chunk_register_attempts()

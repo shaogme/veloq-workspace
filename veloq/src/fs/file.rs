@@ -51,16 +51,16 @@ fn close_raw_handle(raw: RawHandle) {
 pub struct LocalFile<'a, 'ctx> {
     pub(crate) raw: RawHandle,
     pub(crate) fd: IoFd,
-    pub(crate) submitter: LocalSubmitter<RuntimeContext<'ctx>>,
+    pub(crate) submitter: LocalSubmitter<RuntimeContext<'a, 'ctx>>,
     pub(crate) pos: Cell<u64>,
-    pub(crate) ctx: &'a RuntimeContext<'ctx>,
+    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
 }
 
 pub struct File<'a, 'ctx> {
     pub(crate) raw: RawHandle,
     pub(crate) submitter: DetachedSubmitter,
     pub(crate) pos: AtomicU64,
-    pub(crate) ctx: &'a RuntimeContext<'ctx>,
+    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
 }
 
 impl<'a, 'ctx> Drop for LocalFile<'a, 'ctx> {
@@ -359,20 +359,20 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         res.map(|_| ()).map_err(from_driver_report)
     }
 
-    pub fn sync_range(&'a self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'a, 'ctx> {
+    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, 'a, 'ctx> {
         SyncRangeBuilder::new(self, offset, nbytes)
     }
 }
 
-pub struct SyncRangeBuilder<'a, 'ctx> {
-    file: &'a File<'a, 'ctx>,
+pub struct SyncRangeBuilder<'f, 'a, 'ctx> {
+    file: &'f File<'a, 'ctx>,
     offset: u64,
     nbytes: u64,
     flags: u32,
 }
 
-impl<'a, 'ctx> SyncRangeBuilder<'a, 'ctx> {
-    fn new(file: &'a File<'a, 'ctx>, offset: u64, nbytes: u64) -> Self {
+impl<'f, 'a, 'ctx> SyncRangeBuilder<'f, 'a, 'ctx> {
+    fn new(file: &'f File<'a, 'ctx>, offset: u64, nbytes: u64) -> Self {
         #[cfg(unix)]
         let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
             | libc::SYNC_FILE_RANGE_WRITE
@@ -425,9 +425,9 @@ impl<'a, 'ctx> SyncRangeBuilder<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> IntoFuture for SyncRangeBuilder<'a, 'ctx> {
+impl<'f, 'a, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'a, 'ctx> {
     type Output = io::Result<()>;
-    type IntoFuture = SyncRangeFuture<'a>;
+    type IntoFuture = SyncRangeFuture<'a, 'ctx>;
 
     fn into_future(self) -> Self::IntoFuture {
         let op: FileSyncFileRangeRaw = FileSyncFileRangeRaw {
@@ -443,14 +443,14 @@ impl<'a, 'ctx> IntoFuture for SyncRangeBuilder<'a, 'ctx> {
     }
 }
 
-pub struct SyncRangeFuture<'a> {
-    inner:
-        <DetachedSubmitter as veloq_driver_native::op::OpSubmitter<'a, RuntimeContext<'a>>>::Future<
-            FileSyncFileRangeRaw,
-        >,
+pub struct SyncRangeFuture<'a, 'ctx> {
+    inner: <DetachedSubmitter as veloq_driver_native::op::OpSubmitter<
+        'a,
+        RuntimeContext<'a, 'ctx>,
+    >>::Future<FileSyncFileRangeRaw>,
 }
 
-impl<'a> Future for SyncRangeFuture<'a> {
+impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -541,14 +541,14 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for File<'a, 'ctx> {
 
 impl<'a, 'ctx> LocalFile<'a, 'ctx> {
     pub async fn open(
-        ctx: &'a RuntimeContext<'ctx>,
+        ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> VeloqResult<LocalFile<'a, 'ctx>> {
         OpenOptions::new().read(true).open_local(ctx, path).await
     }
 
     pub async fn create(
-        ctx: &'a RuntimeContext<'ctx>,
+        ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> VeloqResult<LocalFile<'a, 'ctx>> {
         OpenOptions::new()
@@ -562,14 +562,14 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
 
 impl<'a, 'ctx> File<'a, 'ctx> {
     pub async fn open(
-        ctx: &'a RuntimeContext<'ctx>,
+        ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> VeloqResult<File<'a, 'ctx>> {
         OpenOptions::new().read(true).open(ctx, path).await
     }
 
     pub async fn create(
-        ctx: &'a RuntimeContext<'ctx>,
+        ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> VeloqResult<File<'a, 'ctx>> {
         OpenOptions::new()

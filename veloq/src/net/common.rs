@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
-use crate::runtime::context::submit_control_task;
+use crate::runtime::context::{RuntimeContext, submit_control_task};
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::IoFd;
 use veloq_driver_native::{OwnedRawHandle, RawHandle};
@@ -15,17 +15,14 @@ use veloq_runtime::runtime::shared::RuntimeShared;
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
-pub struct SocketToken<'ctx> {
+pub struct SocketToken<'a> {
     fd: IoFd,
     owner_worker_id: usize,
-    shared: &'ctx RuntimeShared<crate::runtime::context::WorkerState<'ctx>>,
+    shared: &'a RuntimeShared<crate::runtime::context::WorkerState<'a>>,
 }
 
-impl<'ctx> SocketToken<'ctx> {
-    pub(crate) fn new(
-        ctx: &'ctx crate::runtime::context::RuntimeContext<'ctx>,
-        handle: RawHandle,
-    ) -> VeloqResult<Self> {
+impl<'a> SocketToken<'a> {
+    pub(crate) fn new<'ctx>(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
             return Err(from_io_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -58,7 +55,7 @@ impl<'ctx> SocketToken<'ctx> {
     }
 }
 
-impl<'ctx> Drop for SocketToken<'ctx> {
+impl<'a> Drop for SocketToken<'a> {
     fn drop(&mut self) {
         let current_worker_id = self.shared.worker_id();
         if current_worker_id == self.owner_worker_id {
@@ -82,7 +79,7 @@ pub trait SocketTokenPtr<'a>: Deref<Target = SocketToken<'a>> + Clone {
     fn new_ptr(token: SocketToken<'a>) -> Self;
 }
 
-impl<'a> SocketTokenPtr<'a> for Rc<SocketToken<'a>> {
+impl<'a, 'ctx> SocketTokenPtr<'a> for Rc<SocketToken<'a>> {
     fn new_ptr(token: SocketToken<'a>) -> Self {
         Rc::new(token)
     }
@@ -102,8 +99,8 @@ pub struct InnerSocket<'a, P: SocketTokenPtr<'a>> {
 }
 
 impl<'a, P: SocketTokenPtr<'a>> InnerSocket<'a, P> {
-    pub fn new(
-        ctx: &'a crate::runtime::context::RuntimeContext<'a>,
+    pub fn new<'ctx>(
+        ctx: RuntimeContext<'a, 'ctx>,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
     ) -> VeloqResult<Self> {

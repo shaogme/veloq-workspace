@@ -116,7 +116,7 @@ async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, len: u64, mode: BenchSyncMo
 }
 
 async fn open_file<'a, 'ctx>(
-    ctx: &'a RuntimeContext<'ctx>,
+    ctx: RuntimeContext<'a, 'ctx>,
     path: &Path,
     buffering_mode: BufferingMode,
 ) -> File<'a, 'ctx> {
@@ -131,7 +131,7 @@ async fn open_file<'a, 'ctx>(
 }
 
 async fn open_and_fallocate<'a, 'ctx>(
-    ctx: &'a RuntimeContext<'ctx>,
+    ctx: RuntimeContext<'a, 'ctx>,
     path: &Path,
     buffering_mode: BufferingMode,
     len: u64,
@@ -149,7 +149,7 @@ fn create_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
 }
 
 async fn run_1gb_iteration<'a, 'ctx>(
-    ctx: &'a RuntimeContext<'ctx>,
+    ctx: RuntimeContext<'a, 'ctx>,
     phase: BenchPhase,
     buffering_mode: BufferingMode,
     sync_mode: BenchSyncMode,
@@ -222,7 +222,7 @@ async fn run_1gb_iteration<'a, 'ctx>(
 }
 
 async fn run_worker_iteration<'a, 'ctx>(
-    ctx: &'a RuntimeContext<'ctx>,
+    ctx: RuntimeContext<'a, 'ctx>,
     files: Vec<File<'a, 'ctx>>,
     file_size: u64,
     chunk_size: NonZeroUsize,

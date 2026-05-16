@@ -518,7 +518,7 @@ where
                 }
 
                 self::join::install_routed_pinned_task(
-                    &runtime,
+                    runtime,
                     arena,
                     completion,
                     worker_id,

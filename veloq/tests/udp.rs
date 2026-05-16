@@ -19,11 +19,14 @@ fn create_runtime_with_workers(worker_threads: usize) -> Runtime<UniformSlot> {
         .expect("failed to build runtime")
 }
 
-fn bind_udp_socket<'a>(ctx: &'a RuntimeContext, bind_addr: &str) -> UdpSocket<'a> {
+fn bind_udp_socket<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    bind_addr: &str,
+) -> UdpSocket<'a, 'ctx> {
     UdpSocket::bind(ctx, bind_addr).expect("Failed to bind UDP socket")
 }
 
-async fn allow_udp_recv_to_arm(ctx: &RuntimeContext) {
+async fn allow_udp_recv_to_arm(ctx: RuntimeContext<'_, '_>) {
     veloq::time::sleep(ctx, std::time::Duration::from_millis(5)).await;
 }
 

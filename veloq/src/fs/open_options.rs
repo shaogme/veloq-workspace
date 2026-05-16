@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
+use crate::runtime::context::RuntimeContext;
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::Open;
 
@@ -95,10 +96,10 @@ impl OpenOptions {
 
     pub async fn open_local<'a, 'ctx>(
         &self,
-        ctx: &'a crate::runtime::context::RuntimeContext<'ctx>,
+        ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> VeloqResult<super::file::LocalFile<'a, 'ctx>> {
-        let op = self.build_op(ctx, path.as_ref()).map_err(from_io_error)?;
+        let op = self.build_op(&ctx, path.as_ref()).map_err(from_io_error)?;
         use veloq_driver_native::op::{LocalSubmitter, Op};
 
         let submitter = LocalSubmitter::new();
@@ -128,10 +129,10 @@ impl OpenOptions {
 
     pub async fn open<'a, 'ctx>(
         &self,
-        ctx: &'a crate::runtime::context::RuntimeContext<'ctx>,
+        ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> VeloqResult<super::file::File<'a, 'ctx>> {
-        let op = self.build_op(ctx, path.as_ref()).map_err(from_io_error)?;
+        let op = self.build_op(&ctx, path.as_ref()).map_err(from_io_error)?;
         use veloq_driver_native::op::{DetachedSubmitter, Op};
 
         let submitter = DetachedSubmitter::new();

@@ -14,18 +14,23 @@ use veloq_driver_native::op::{
 };
 
 #[derive(Clone)]
-pub struct GenericUdpSocket<'a, S: OpSubmitter<'a, RuntimeContext<'a>>, P: SocketTokenPtr<'a>> {
+pub struct GenericUdpSocket<
+    'a,
+    'ctx,
+    S: OpSubmitter<'a, RuntimeContext<'a, 'ctx>>,
+    P: SocketTokenPtr<'a>,
+> {
     pub(crate) inner: InnerSocket<'a, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: &'a RuntimeContext<'a>,
+    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
 }
 
-pub type LocalUdpSocket<'a> =
-    GenericUdpSocket<'a, LocalSubmitter<RuntimeContext<'a>>, Rc<SocketToken<'a>>>;
-pub type UdpSocket<'a> = GenericUdpSocket<'a, DetachedSubmitter, Arc<SocketToken<'a>>>;
+pub type LocalUdpSocket<'a, 'ctx> =
+    GenericUdpSocket<'a, 'ctx, LocalSubmitter<RuntimeContext<'a, 'ctx>>, Rc<SocketToken<'a>>>;
+pub type UdpSocket<'a, 'ctx> = GenericUdpSocket<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a>>>;
 
-fn bind_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
-    ctx: &'a RuntimeContext<'a>,
+fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
+    ctx: RuntimeContext<'a, 'ctx>,
     addr: A,
 ) -> VeloqResult<InnerSocket<'a, P>> {
     let addr = addr
@@ -51,8 +56,8 @@ fn bind_inner<'a, A: ToSocketAddrs, P: SocketTokenPtr<'a>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-impl<'a, S: OpSubmitter<'a, RuntimeContext<'a>> + Copy, P: SocketTokenPtr<'a>>
-    GenericUdpSocket<'a, S, P>
+impl<'a, 'ctx, S: OpSubmitter<'a, RuntimeContext<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a>>
+    GenericUdpSocket<'a, 'ctx, S, P>
 {
     pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
         self.inner.local_addr()
@@ -168,8 +173,8 @@ impl<'a, S: OpSubmitter<'a, RuntimeContext<'a>> + Copy, P: SocketTokenPtr<'a>>
     }
 }
 
-impl<'a> LocalUdpSocket<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext<'a>, addr: A) -> VeloqResult<Self> {
+impl<'a, 'ctx> LocalUdpSocket<'a, 'ctx> {
+    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -218,8 +223,8 @@ impl<'a> LocalUdpSocket<'a> {
     }
 }
 
-impl<'a> UdpSocket<'a> {
-    pub fn bind<A: ToSocketAddrs>(ctx: &'a RuntimeContext<'a>, addr: A) -> VeloqResult<Self> {
+impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
+    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -319,7 +324,7 @@ impl<'a> UdpSocket<'a> {
     }
 }
 
-impl<'a> crate::io::AsyncBufRead for LocalUdpSocket<'a> {
+impl<'a, 'ctx> crate::io::AsyncBufRead for LocalUdpSocket<'a, 'ctx> {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.recv(buf).await.map_err(to_io_error)
     }
@@ -342,7 +347,7 @@ impl<'a> crate::io::AsyncBufRead for LocalUdpSocket<'a> {
     }
 }
 
-impl<'a> crate::io::AsyncBufRead for UdpSocket<'a> {
+impl<'a, 'ctx> crate::io::AsyncBufRead for UdpSocket<'a, 'ctx> {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.recv(buf).await.map_err(to_io_error)
     }
@@ -365,7 +370,7 @@ impl<'a> crate::io::AsyncBufRead for UdpSocket<'a> {
     }
 }
 
-impl<'a> crate::io::AsyncBufWrite for LocalUdpSocket<'a> {
+impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalUdpSocket<'a, 'ctx> {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.send(buf).await.map_err(to_io_error)
     }
@@ -396,7 +401,7 @@ impl<'a> crate::io::AsyncBufWrite for LocalUdpSocket<'a> {
     }
 }
 
-impl<'a> crate::io::AsyncBufWrite for UdpSocket<'a> {
+impl<'a, 'ctx> crate::io::AsyncBufWrite for UdpSocket<'a, 'ctx> {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.send(buf).await.map_err(to_io_error)
     }

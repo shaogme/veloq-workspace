@@ -11,7 +11,7 @@ use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
 use veloq_runtime::utils::storage::StaticTransfer;
 
 use crate::config::Config;
-use crate::runtime::context::{DriverRegistrar, RegistrarMessage};
+use crate::runtime::context::{DriverRegistrar, RegistrarMessage, RuntimeContext};
 
 use crate::runtime::context::WorkerState;
 
@@ -106,7 +106,7 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn block_on<R, F>(self, f: F) -> R
     where
-        F: AsyncFnOnce(&crate::runtime::context::RuntimeContext) -> R,
+        F: AsyncFnOnce(RuntimeContext) -> R,
     {
         let Runtime {
             worker_count,
@@ -173,7 +173,7 @@ impl<T: PoolTopology> Runtime<T> {
 
         runtime.block_on(async move |scope| {
             let ctx = crate::runtime::context::RuntimeContext { scope };
-            f(&ctx).await
+            f(ctx).await
         })
     }
 }
