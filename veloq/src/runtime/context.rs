@@ -178,17 +178,22 @@ pub struct RuntimeContext<'ctx> {
     pub scope: RuntimeScopeContext<'ctx, WorkerState<'ctx>>,
 }
 
-impl<'ctx, 'a> veloq_driver_native::op::DriverProvider<'a> for RuntimeContext<'ctx> {
-    type Driver = veloq_driver_native::driver::PlatformDriver<'a>;
+impl<'ctx> veloq_driver_native::op::DriverProvider for RuntimeContext<'ctx> {
+    type Op = veloq_driver_native::driver::PlatformOp;
+    type UP = veloq_driver_native::driver::PlatformUP;
+    type Completion = usize;
+    type Driver<'a> = &'a mut veloq_driver_native::driver::PlatformDriver<'a>;
 
     #[inline]
-    fn with_driver<R>(&self, f: impl FnOnce(&mut Self::Driver) -> R) -> R {
+    fn with_driver<R>(&self, f: impl for<'a> FnOnce(Self::Driver<'a>) -> R) -> R {
         self.driver(|driver| {
-            let driver = unsafe {
-                &mut *std::ptr::from_mut(driver)
-                    .cast::<veloq_driver_native::driver::PlatformDriver<'a>>()
+            let driver_a = unsafe {
+                std::mem::transmute::<
+                    &mut veloq_driver_native::driver::PlatformDriver<'ctx>,
+                    &mut veloq_driver_native::driver::PlatformDriver<'_>,
+                >(driver)
             };
-            f(driver)
+            f(driver_a)
         })
     }
 }

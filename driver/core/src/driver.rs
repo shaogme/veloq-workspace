@@ -81,6 +81,97 @@ pub trait Driver<'a> {
     fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>);
 }
 
+impl<'a, D: Driver<'a> + ?Sized> Driver<'a> for &mut D {
+    type Op = D::Op;
+    type UP = D::UP;
+    type Raw = D::Raw;
+    type Sidecar = D::Sidecar;
+    type Completion = D::Completion;
+
+    #[inline]
+    fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
+        (**self).reserve_op()
+    }
+
+    #[inline]
+    fn slot_table(&self) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion> {
+        (**self).slot_table()
+    }
+
+    #[inline]
+    fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable> {
+        (**self).detached_cancel_table()
+    }
+
+    #[inline]
+    fn slot_set_payload(&mut self, user_data: usize, payload: Self::UP) {
+        (**self).slot_set_payload(user_data, payload)
+    }
+
+    #[inline]
+    fn slot_take_payload(&mut self, user_data: usize) -> Option<Self::UP> {
+        (**self).slot_take_payload(user_data)
+    }
+
+    #[inline]
+    fn submit(
+        &mut self,
+        user_data: usize,
+        op_in: &mut Option<Self::Op>,
+        binder: SubmitBinder,
+    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+        (**self).submit(user_data, op_in, binder)
+    }
+
+    #[inline]
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+        (**self).drive(mode)
+    }
+
+    #[inline]
+    fn completion_queue(&self) -> SharedCompletionQueue {
+        (**self).completion_queue()
+    }
+
+    #[inline]
+    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion> {
+        (**self).completion_table()
+    }
+
+    #[inline]
+    fn cancel_op(&mut self, user_data: usize) {
+        (**self).cancel_op(user_data)
+    }
+
+    #[inline]
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
+        (**self).register_chunk(id, ptr, len)
+    }
+
+    #[inline]
+    fn register_files<'f>(
+        &mut self,
+        files: Vec<RegisterFd<'f, Self::Raw>>,
+    ) -> DriverResult<Vec<IoFd>> {
+        (**self).register_files(files)
+    }
+
+    #[inline]
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
+        (**self).unregister_files(files)
+    }
+
+    #[inline]
+    fn create_waker(&self) -> Arc<dyn RemoteWaker> {
+        (**self).create_waker()
+    }
+
+    #[inline]
+    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>) {
+        (**self).set_registrar(registrar)
+    }
+}
+
 #[inline]
 pub fn drain_cancel_requests<'a, D: Driver<'a>>(driver: &mut D) {
     let shared = driver.slot_table();

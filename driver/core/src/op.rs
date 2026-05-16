@@ -3,9 +3,13 @@ use tracing::trace;
 use crate::DriverResult;
 use crate::driver::{Driver, PlatformOp, SubmitBinder, SubmitStatus, encode_completion_token};
 
-pub trait DriverProvider<'a>: Clone + Unpin {
-    type Driver: crate::driver::Driver<'a>;
-    fn with_driver<R>(&self, f: impl FnOnce(&mut Self::Driver) -> R) -> R;
+pub trait DriverProvider: Clone + Unpin {
+    type Op: PlatformOp;
+    type UP: std::marker::Send;
+    type Completion: crate::driver::CompletionValue;
+    type Driver<'a>: crate::driver::Driver<'a, Op = Self::Op, UP = Self::UP, Completion = Self::Completion>;
+
+    fn with_driver<R>(&self, f: impl for<'a> FnOnce(Self::Driver<'a>) -> R) -> R;
 }
 
 mod future;
@@ -150,13 +154,9 @@ impl<T> Op<T> {
         }
     }
 
-    pub fn submit_local<'a, P: DriverProvider<'a>>(self, provider: P) -> LocalOp<'a, T, P>
+    pub fn submit_local<'a, P: DriverProvider>(self, provider: P) -> LocalOp<'a, T, P>
     where
-        T: IntoPlatformOp<
-                <P::Driver as Driver<'a>>::Op,
-                DriverCompletion = <P::Driver as Driver<'a>>::Completion,
-                ErasedPayload = <P::Driver as Driver<'a>>::UP,
-            >,
+        T: IntoPlatformOp<P::Op, DriverCompletion = P::Completion, ErasedPayload = P::UP>,
     {
         LocalOp::new(self.data, provider)
     }
