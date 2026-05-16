@@ -94,11 +94,11 @@ impl OpenOptions {
         self
     }
 
-    pub async fn open_local<'a, 'ctx>(
+    pub async fn open_local<'ctx>(
         &self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: RuntimeContext<'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<super::file::LocalFile<'a, 'ctx>> {
+    ) -> VeloqResult<super::file::LocalFile<'ctx>> {
         let op = self.build_op(&ctx, path.as_ref()).map_err(from_io_error)?;
         use veloq_driver_native::op::{LocalSubmitter, Op};
 
@@ -127,11 +127,11 @@ impl OpenOptions {
         })
     }
 
-    pub async fn open<'a, 'ctx>(
+    pub async fn open<'ctx>(
         &self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: RuntimeContext<'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<super::file::File<'a, 'ctx>> {
+    ) -> VeloqResult<super::file::File<'ctx>> {
         let op = self.build_op(&ctx, path.as_ref()).map_err(from_io_error)?;
         use veloq_driver_native::op::{DetachedSubmitter, Op};
 
@@ -153,7 +153,7 @@ impl OpenOptions {
     #[cfg(unix)]
     fn build_op(
         &self,
-        ctx: &crate::runtime::context::RuntimeContext,
+        ctx: &crate::runtime::context::RuntimeContext<'_>,
         path: &Path,
     ) -> std::io::Result<Open> {
         use std::num::NonZeroUsize;
@@ -217,7 +217,7 @@ impl OpenOptions {
     #[cfg(windows)]
     fn build_op(
         &self,
-        ctx: &crate::runtime::context::RuntimeContext,
+        ctx: &crate::runtime::context::RuntimeContext<'_>,
         path: &Path,
     ) -> std::io::Result<Open> {
         use std::num::NonZeroUsize;

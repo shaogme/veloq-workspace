@@ -95,7 +95,7 @@ fn bench_file_path(base_dir: &Path, name: impl AsRef<str>) -> PathBuf {
     base_dir.join(name.as_ref())
 }
 
-async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, len: u64, mode: BenchSyncMode) {
+async fn apply_sync<'ctx>(file: &File<'ctx>, len: u64, mode: BenchSyncMode) {
     match mode {
         BenchSyncMode::None => {}
         BenchSyncMode::SyncRange => {
@@ -115,11 +115,11 @@ async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, len: u64, mode: BenchSyncMo
     }
 }
 
-async fn open_file<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+async fn open_file<'ctx>(
+    ctx: RuntimeContext<'ctx>,
     path: &Path,
     buffering_mode: BufferingMode,
-) -> File<'a, 'ctx> {
+) -> File<'ctx> {
     File::options()
         .write(true)
         .create(true)
@@ -130,12 +130,12 @@ async fn open_file<'a, 'ctx>(
         .expect("Failed to create")
 }
 
-async fn open_and_fallocate<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+async fn open_and_fallocate<'ctx>(
+    ctx: RuntimeContext<'ctx>,
     path: &Path,
     buffering_mode: BufferingMode,
     len: u64,
-) -> File<'a, 'ctx> {
+) -> File<'ctx> {
     let file = open_file(ctx, path, buffering_mode).await;
     file.fallocate(0, len).await.expect("Fallocate failed");
     file
@@ -148,8 +148,8 @@ fn create_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
         .expect("failed to build runtime")
 }
 
-async fn run_1gb_iteration<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+async fn run_1gb_iteration<'ctx>(
+    ctx: RuntimeContext<'ctx>,
     phase: BenchPhase,
     buffering_mode: BufferingMode,
     sync_mode: BenchSyncMode,
@@ -221,9 +221,9 @@ async fn run_1gb_iteration<'a, 'ctx>(
     }
 }
 
-async fn run_worker_iteration<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
-    files: Vec<File<'a, 'ctx>>,
+async fn run_worker_iteration<'ctx>(
+    ctx: RuntimeContext<'ctx>,
+    files: Vec<File<'ctx>>,
     file_size: u64,
     chunk_size: NonZeroUsize,
     sync_mode: BenchSyncMode,

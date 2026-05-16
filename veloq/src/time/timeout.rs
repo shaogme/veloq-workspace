@@ -10,22 +10,22 @@ use std::time::{Duration, Instant};
 // Sync/Send Timeout
 // ============================================================================
 
-pub fn timeout<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn timeout<'ctx, T>(
+    ctx: RuntimeContext<'ctx>,
     duration: Duration,
     future: T,
-) -> Timeout<'a, 'ctx, T>
+) -> Timeout<'ctx, T>
 where
     T: Future,
 {
     timeout_at(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn timeout_at<'ctx, T>(
+    ctx: RuntimeContext<'ctx>,
     deadline: Instant,
     future: T,
-) -> Timeout<'a, 'ctx, T>
+) -> Timeout<'ctx, T>
 where
     T: Future,
 {
@@ -35,12 +35,12 @@ where
     }
 }
 
-pub struct Timeout<'a, 'ctx, T> {
+pub struct Timeout<'ctx, T> {
     value: T,
-    delay: Sleep<'a, 'ctx>,
+    delay: Sleep<'ctx>,
 }
 
-impl<'a, 'ctx, T> Future for Timeout<'a, 'ctx, T>
+impl<'ctx, T> Future for Timeout<'ctx, T>
 where
     T: Future,
 {
@@ -71,22 +71,22 @@ where
 // Local Timeout
 // ============================================================================
 
-pub fn timeout_local<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn timeout_local<'ctx, T>(
+    ctx: RuntimeContext<'ctx>,
     duration: Duration,
     future: T,
-) -> LocalTimeout<'a, 'ctx, T>
+) -> LocalTimeout<'ctx, T>
 where
     T: Future,
 {
     timeout_at_local(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at_local<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn timeout_at_local<'ctx, T>(
+    ctx: RuntimeContext<'ctx>,
     deadline: Instant,
     future: T,
-) -> LocalTimeout<'a, 'ctx, T>
+) -> LocalTimeout<'ctx, T>
 where
     T: Future,
 {
@@ -96,12 +96,12 @@ where
     }
 }
 
-pub struct LocalTimeout<'a, 'ctx, T> {
+pub struct LocalTimeout<'ctx, T> {
     value: T,
-    delay: LocalSleep<'a, 'ctx>,
+    delay: LocalSleep<'ctx>,
 }
 
-impl<'a, 'ctx, T> Future for LocalTimeout<'a, 'ctx, T>
+impl<'ctx, T> Future for LocalTimeout<'ctx, T>
 where
     T: Future,
 {

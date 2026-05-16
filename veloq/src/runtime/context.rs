@@ -174,24 +174,28 @@ impl<'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'ctx> {
 }
 
 #[derive(Clone, Copy)]
-pub struct RuntimeContext<'state, 'ctx> {
-    pub scope: RuntimeScopeContext<'ctx, WorkerState<'state>>,
+pub struct RuntimeContext<'ctx> {
+    pub scope: RuntimeScopeContext<'ctx, WorkerState<'ctx>>,
 }
 
-impl<'state, 'ctx> veloq_driver_native::op::DriverProvider<'state>
-    for RuntimeContext<'state, 'ctx>
-{
-    type Driver = veloq_driver_native::driver::PlatformDriver<'state>;
+impl<'ctx, 'a> veloq_driver_native::op::DriverProvider<'a> for RuntimeContext<'ctx> {
+    type Driver = veloq_driver_native::driver::PlatformDriver<'a>;
 
     #[inline]
     fn with_driver<R>(&self, f: impl FnOnce(&mut Self::Driver) -> R) -> R {
-        self.driver(f)
+        self.driver(|driver| {
+            let driver = unsafe {
+                &mut *std::ptr::from_mut(driver)
+                    .cast::<veloq_driver_native::driver::PlatformDriver<'a>>()
+            };
+            f(driver)
+        })
     }
 }
 
-impl<'state, 'ctx> RuntimeContext<'state, 'ctx> {
+impl<'ctx> RuntimeContext<'ctx> {
     #[inline]
-    fn extra(&self) -> &WorkerState<'state> {
+    fn extra(&self) -> &WorkerState<'ctx> {
         let tls_ptr = self
             .scope
             .shared()
@@ -241,7 +245,7 @@ impl<'state, 'ctx> RuntimeContext<'state, 'ctx> {
     }
 
     #[inline]
-    pub fn registrar(&self) -> DriverRegistrar<'state> {
+    pub fn registrar(&self) -> DriverRegistrar<'ctx> {
         self.extra()
             .registrar
             .borrow()
@@ -249,7 +253,7 @@ impl<'state, 'ctx> RuntimeContext<'state, 'ctx> {
             .expect("registrar missing")
     }
 
-    pub fn driver<R>(&self, f: impl FnOnce(&mut PlatformDriver<'state>) -> R) -> R {
+    pub fn driver<R>(&self, f: impl FnOnce(&mut PlatformDriver<'ctx>) -> R) -> R {
         let mut driver_opt = self.extra().driver.borrow_mut();
         f(driver_opt.as_mut().expect("driver missing"))
     }
@@ -293,7 +297,7 @@ impl<'state, 'ctx> RuntimeContext<'state, 'ctx> {
 
     pub fn submit<'a, S, T>(&self, submitter: &'a S, op: Op<T>) -> S::Future<T>
     where
-        S: veloq_driver_native::op::OpSubmitter<'state, RuntimeContext<'state, 'ctx>> + Copy + 'a,
+        S: veloq_driver_native::op::OpSubmitter<'ctx, RuntimeContext<'ctx>> + Copy + 'a,
         T: IntoPlatformOp<
                 <PlatformDriver<'ctx> as Driver<'ctx>>::Op,
                 DriverCompletion = <PlatformDriver<'ctx> as Driver<'ctx>>::Completion,
@@ -301,7 +305,7 @@ impl<'state, 'ctx> RuntimeContext<'state, 'ctx> {
             > + Send,
     {
         self.sync_registrar();
-        submitter.submit(op, self.clone())
+        submitter.submit(op, *self)
     }
 
     pub async fn yield_now(&self) {

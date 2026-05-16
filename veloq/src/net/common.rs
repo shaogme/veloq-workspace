@@ -14,14 +14,14 @@ use veloq_driver_native::{OwnedRawHandle, RawHandle};
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
-pub struct SocketToken<'state, 'ctx> {
+pub struct SocketToken<'ctx> {
     fd: IoFd,
     owner_worker_id: usize,
-    ctx: RuntimeContext<'state, 'ctx>,
+    ctx: RuntimeContext<'ctx>,
 }
 
-impl<'state, 'ctx> SocketToken<'state, 'ctx> {
-    pub(crate) fn new(ctx: RuntimeContext<'state, 'ctx>, handle: RawHandle) -> VeloqResult<Self> {
+impl<'ctx> SocketToken<'ctx> {
+    pub(crate) fn new(ctx: RuntimeContext<'ctx>, handle: RawHandle) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
             return Err(from_io_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -54,7 +54,7 @@ impl<'state, 'ctx> SocketToken<'state, 'ctx> {
     }
 }
 
-impl<'state, 'ctx> Drop for SocketToken<'state, 'ctx> {
+impl<'ctx> Drop for SocketToken<'ctx> {
     fn drop(&mut self) {
         let current_worker_id = self.ctx.scope.worker_id();
         if current_worker_id == self.owner_worker_id {
@@ -74,34 +74,32 @@ impl<'state, 'ctx> Drop for SocketToken<'state, 'ctx> {
 // SocketTokenPtr Trait
 // ============================================================================
 
-pub trait SocketTokenPtr<'state: 'ctx, 'ctx>:
-    Deref<Target = SocketToken<'state, 'ctx>> + Clone
-{
-    fn new_ptr(token: SocketToken<'state, 'ctx>) -> Self;
+pub trait SocketTokenPtr<'ctx>: Deref<Target = SocketToken<'ctx>> + Clone {
+    fn new_ptr(token: SocketToken<'ctx>) -> Self;
 }
 
-impl<'state, 'ctx> SocketTokenPtr<'state, 'ctx> for Rc<SocketToken<'state, 'ctx>> {
-    fn new_ptr(token: SocketToken<'state, 'ctx>) -> Self {
+impl<'ctx> SocketTokenPtr<'ctx> for Rc<SocketToken<'ctx>> {
+    fn new_ptr(token: SocketToken<'ctx>) -> Self {
         Rc::new(token)
     }
 }
 
-impl<'state, 'ctx> SocketTokenPtr<'state, 'ctx> for Arc<SocketToken<'state, 'ctx>> {
-    fn new_ptr(token: SocketToken<'state, 'ctx>) -> Self {
+impl<'ctx> SocketTokenPtr<'ctx> for Arc<SocketToken<'ctx>> {
+    fn new_ptr(token: SocketToken<'ctx>) -> Self {
         Arc::new(token)
     }
 }
 
 #[derive(Clone)]
-pub struct InnerSocket<'state: 'ctx, 'ctx, P: SocketTokenPtr<'state, 'ctx>> {
+pub struct InnerSocket<'ctx, P: SocketTokenPtr<'ctx>> {
     token: P,
     local_addr: Option<SocketAddr>,
-    _marker: std::marker::PhantomData<(&'state (), &'ctx ())>,
+    _marker: std::marker::PhantomData<&'ctx ()>,
 }
 
-impl<'state: 'ctx, 'ctx, P: SocketTokenPtr<'state, 'ctx>> InnerSocket<'state, 'ctx, P> {
+impl<'ctx, P: SocketTokenPtr<'ctx>> InnerSocket<'ctx, P> {
     pub fn new(
-        ctx: RuntimeContext<'state, 'ctx>,
+        ctx: RuntimeContext<'ctx>,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
     ) -> VeloqResult<Self> {

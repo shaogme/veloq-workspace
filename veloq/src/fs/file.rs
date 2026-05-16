@@ -48,22 +48,22 @@ fn close_raw_handle(raw: RawHandle) {
 
 // fn unregister_fixed_fd is no longer needed globally
 
-pub struct LocalFile<'a, 'ctx> {
+pub struct LocalFile<'ctx> {
     pub(crate) raw: RawHandle,
     pub(crate) fd: IoFd,
-    pub(crate) submitter: LocalSubmitter<RuntimeContext<'a, 'ctx>>,
+    pub(crate) submitter: LocalSubmitter<RuntimeContext<'ctx>>,
     pub(crate) pos: Cell<u64>,
-    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
+    pub(crate) ctx: RuntimeContext<'ctx>,
 }
 
-pub struct File<'a, 'ctx> {
+pub struct File<'ctx> {
     pub(crate) raw: RawHandle,
     pub(crate) submitter: DetachedSubmitter,
     pub(crate) pos: AtomicU64,
-    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
+    pub(crate) ctx: RuntimeContext<'ctx>,
 }
 
-impl<'a, 'ctx> Drop for LocalFile<'a, 'ctx> {
+impl<'ctx> Drop for LocalFile<'ctx> {
     fn drop(&mut self) {
         if let Some(tls) = self.ctx.scope.shared().context_tls.get() {
             let extra = unsafe { &tls.as_ref().extra };
@@ -75,13 +75,13 @@ impl<'a, 'ctx> Drop for LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> Drop for File<'a, 'ctx> {
+impl<'ctx> Drop for File<'ctx> {
     fn drop(&mut self) {
         close_raw_handle(self.raw);
     }
 }
 
-impl<'a, 'ctx> LocalFile<'a, 'ctx> {
+impl<'ctx> LocalFile<'ctx> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -195,7 +195,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufRead for LocalFile<'a, 'ctx> {
+impl<'ctx> crate::io::AsyncBufRead for LocalFile<'ctx> {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
         let (n, buf) = self.read_at(buf, offset).await.map_err(to_io_error)?;
@@ -226,7 +226,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalFile<'a, 'ctx> {
+impl<'ctx> crate::io::AsyncBufWrite for LocalFile<'ctx> {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
         let (n, buf) = self.write_at(buf, offset).await.map_err(to_io_error)?;
@@ -265,7 +265,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> File<'a, 'ctx> {
+impl<'ctx> File<'ctx> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -359,20 +359,20 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         res.map(|_| ()).map_err(from_driver_report)
     }
 
-    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, 'a, 'ctx> {
+    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, 'ctx> {
         SyncRangeBuilder::new(self, offset, nbytes)
     }
 }
 
-pub struct SyncRangeBuilder<'f, 'a, 'ctx> {
-    file: &'f File<'a, 'ctx>,
+pub struct SyncRangeBuilder<'f, 'ctx> {
+    file: &'f File<'ctx>,
     offset: u64,
     nbytes: u64,
     flags: u32,
 }
 
-impl<'f, 'a, 'ctx> SyncRangeBuilder<'f, 'a, 'ctx> {
-    fn new(file: &'f File<'a, 'ctx>, offset: u64, nbytes: u64) -> Self {
+impl<'f, 'ctx> SyncRangeBuilder<'f, 'ctx> {
+    fn new(file: &'f File<'ctx>, offset: u64, nbytes: u64) -> Self {
         #[cfg(unix)]
         let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
             | libc::SYNC_FILE_RANGE_WRITE
@@ -425,9 +425,9 @@ impl<'f, 'a, 'ctx> SyncRangeBuilder<'f, 'a, 'ctx> {
     }
 }
 
-impl<'f, 'a, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'a, 'ctx> {
+impl<'f, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'ctx> {
     type Output = io::Result<()>;
-    type IntoFuture = SyncRangeFuture<'a, 'ctx>;
+    type IntoFuture = SyncRangeFuture<'ctx>;
 
     fn into_future(self) -> Self::IntoFuture {
         let op: FileSyncFileRangeRaw = FileSyncFileRangeRaw {
@@ -443,14 +443,14 @@ impl<'f, 'a, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'a, 'ctx> {
     }
 }
 
-pub struct SyncRangeFuture<'a, 'ctx> {
+pub struct SyncRangeFuture<'ctx> {
     inner: <DetachedSubmitter as veloq_driver_native::op::OpSubmitter<
-        'a,
-        RuntimeContext<'a, 'ctx>,
+        'ctx,
+        RuntimeContext<'ctx>,
     >>::Future<FileSyncFileRangeRaw>,
 }
 
-impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
+impl<'ctx> Future for SyncRangeFuture<'ctx> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -469,7 +469,7 @@ impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufRead for File<'a, 'ctx> {
+impl<'ctx> crate::io::AsyncBufRead for File<'ctx> {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.load(Ordering::Relaxed);
         let (n, buf) = self.read_at(buf, offset).await.map_err(to_io_error)?;
@@ -500,7 +500,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for File<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufWrite for File<'a, 'ctx> {
+impl<'ctx> crate::io::AsyncBufWrite for File<'ctx> {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         let offset = self.pos.load(Ordering::Relaxed);
         let (n, buf) = self.write_at(buf, offset).await.map_err(to_io_error)?;
@@ -539,18 +539,18 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for File<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> LocalFile<'a, 'ctx> {
+impl<'ctx> LocalFile<'ctx> {
     pub async fn open(
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: RuntimeContext<'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<LocalFile<'a, 'ctx>> {
+    ) -> VeloqResult<LocalFile<'ctx>> {
         OpenOptions::new().read(true).open_local(ctx, path).await
     }
 
     pub async fn create(
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: RuntimeContext<'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<LocalFile<'a, 'ctx>> {
+    ) -> VeloqResult<LocalFile<'ctx>> {
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -560,18 +560,18 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> File<'a, 'ctx> {
+impl<'ctx> File<'ctx> {
     pub async fn open(
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: RuntimeContext<'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<File<'a, 'ctx>> {
+    ) -> VeloqResult<File<'ctx>> {
         OpenOptions::new().read(true).open(ctx, path).await
     }
 
     pub async fn create(
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: RuntimeContext<'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<File<'a, 'ctx>> {
+    ) -> VeloqResult<File<'ctx>> {
         OpenOptions::new()
             .write(true)
             .create(true)
