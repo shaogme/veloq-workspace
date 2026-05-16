@@ -21,16 +21,12 @@ pub use shared::{RuntimeShared, RuntimeSharedBase};
 use veloq_tls::TlsGuard;
 
 use primitives::{Signal, create_waker};
-use shared::{Receivers, infra::TopologyContext, infra::WorkerRegistry, init_runtime_components};
+use shared::{Receivers, init_runtime_components};
 
 pub struct Runtime<I, T> {
-    pub(crate) registry: WorkerRegistry,
-    pub(crate) topo: TopologyContext,
+    pub(crate) shared: Arc<RuntimeShared<T>>,
     pub(crate) receivers: Receivers,
-    pub(crate) worker_count: NonZeroUsize,
     pub(crate) worker_init: Option<I>,
-    pub(crate) idle_hook: Option<IdleHook<T>>,
-    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 pub fn noop_worker_init<T: context::RuntimeContextExtra>(
@@ -63,7 +59,7 @@ where
     T: context::RuntimeContextExtra,
 {
     pub fn worker_count(&self) -> NonZeroUsize {
-        self.worker_count
+        self.shared.worker_count()
     }
 
     pub fn block_on<R, F>(self, f: F) -> R
@@ -71,27 +67,16 @@ where
         F: AsyncFnOnce(&RuntimeScopeContext<T>) -> R,
     {
         let Runtime {
-            registry,
-            topo,
+            shared,
             receivers,
-            worker_count,
             worker_init,
-            idle_hook,
-            worker_tick_hook,
         } = self;
 
+        let worker_count = shared.worker_count();
         let worker_init = worker_init.expect("worker_init already taken");
         let mut local_receivers = receivers.local_receivers;
         let mut remote_receivers = receivers.remote_receivers;
         let mut pinned_receivers = receivers.pinned_receivers;
-
-        let shared = Arc::new(RuntimeShared::new(
-            registry,
-            topo,
-            worker_count,
-            idle_hook,
-            worker_tick_hook,
-        ));
 
         thread::scope(|scope| {
             struct ShutdownGuard<T: context::RuntimeContextExtra>(Arc<RuntimeShared<T>>);
@@ -270,14 +255,17 @@ impl<I, T: context::RuntimeContextExtra> RuntimeBuilder<I, T> {
             worker_count,
             NonZeroUsize::new(self.queue_capacity).expect("queue capacity must be non-zero"),
         );
-        Runtime {
+        let shared = Arc::new(RuntimeShared::new(
             registry,
             topo,
-            receivers,
             worker_count,
+            self.idle_hook,
+            self.worker_tick_hook,
+        ));
+        Runtime {
+            shared,
+            receivers,
             worker_init: self.worker_init,
-            idle_hook: self.idle_hook,
-            worker_tick_hook: self.worker_tick_hook,
         }
     }
 }
