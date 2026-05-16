@@ -1,9 +1,10 @@
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
+use std::pin::Pin;
 use std::ptr::NonNull;
-use std::sync::{Arc, mpsc::Receiver};
-use std::task::Poll;
+use std::sync::{Arc, Mutex, mpsc::Receiver};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::shared::RuntimeShared;
@@ -12,6 +13,8 @@ use crate::task::{LocalTaskRef, RuntimeContextExt, SendTaskRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::{ArcOwnership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage};
+
+use veloq_atomic_waker::AtomicWaker;
 
 /// Worker 空闲时的等待策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,18 +129,18 @@ impl<T: RuntimeContextExtra> RuntimeScopeContext<T> {
         &self,
         worker_id: usize,
         job: F,
-    ) -> std::io::Result<crate::runtime::route::RoutedFuture<'_, Fut>>
+    ) -> std::io::Result<RoutedFuture<'_, Fut>>
     where
         F: FnOnce() -> Fut + Send,
-        Fut: std::future::Future + Send,
+        Fut: Future + Send,
     {
-        let slot = crate::runtime::route::RouteCell::new();
+        let slot = RouteCell::new();
         let slot_for_job = slot.clone();
 
         struct RouteJobTask<F, Fut> {
             header: crate::task::TaskHeader,
             job: core::cell::UnsafeCell<Option<F>>,
-            slot: std::sync::Arc<crate::runtime::route::RouteCell<Fut>>,
+            slot: Arc<RouteCell<Fut>>,
         }
 
         impl<F, Fut> crate::task::RawTask for RouteJobTask<F, Fut>
@@ -210,7 +213,7 @@ impl<T: RuntimeContextExtra> RuntimeScopeContext<T> {
             return Err(std::io::Error::other("failed to dispatch job to worker"));
         }
 
-        Ok(crate::runtime::route::RoutedFuture::new(slot))
+        Ok(RoutedFuture::new(slot))
     }
 
     pub async fn execute_on_owner<F, Fut, R>(
@@ -344,6 +347,80 @@ impl<T: RuntimeContextExtra> WorkerInitContext<T> {
             .get()
             .expect("RuntimeContext missing in TLS");
         unsafe { &ptr.as_ref().extra }
+    }
+}
+
+pub struct RouteCell<T> {
+    value: Mutex<Option<T>>,
+    waker: AtomicWaker,
+}
+
+impl<T> RouteCell<T> {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            value: Mutex::new(None),
+            waker: AtomicWaker::new(),
+        })
+    }
+
+    pub(crate) fn set(&self, value: T) {
+        let mut slot = self.value.lock().expect("worker route slot poisoned");
+        debug_assert!(slot.is_none(), "worker route slot already populated");
+        *slot = Some(value);
+        self.waker.wake();
+    }
+
+    pub(crate) fn take(&self) -> Option<T> {
+        self.value
+            .lock()
+            .expect("worker route slot poisoned")
+            .take()
+    }
+
+    pub(crate) fn register(&self, waker: &Waker) {
+        self.waker.register(waker);
+    }
+}
+
+pub struct RoutedFuture<'a, F> {
+    slot: Arc<RouteCell<F>>,
+    inner: Option<F>,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, F> RoutedFuture<'a, F> {
+    pub(crate) fn new(slot: Arc<RouteCell<F>>) -> Self {
+        Self {
+            slot,
+            inner: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, F> Future for RoutedFuture<'a, F>
+where
+    F: Future,
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.inner.is_none() {
+            if let Some(op) = this.slot.take() {
+                this.inner = Some(op);
+            } else {
+                this.slot.register(cx.waker());
+                if let Some(op) = this.slot.take() {
+                    this.inner = Some(op);
+                } else {
+                    return Poll::Pending;
+                }
+            }
+        }
+        let inner = this.inner.as_mut().expect("route future missing inner op");
+        unsafe { Pin::new_unchecked(inner) }.poll(cx)
     }
 }
 
