@@ -8,11 +8,9 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::shared::RuntimeShared;
-use crate::scope::{AsyncScope, GenericAsyncScope, LocalAsyncScope};
+use crate::scope::{AsyncScope, LocalAsyncScope};
 use crate::task::{LocalTaskRef, RuntimeContextExt, SendTaskRef};
 use crate::utils::FastRand;
-use crate::utils::ownership::{ArcOwnership, RcOwnership};
-use crate::utils::storage::{AtomicStorage, LocalStorage};
 
 use veloq_atomic_waker::AtomicWaker;
 
@@ -227,12 +225,10 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-safe (Send) asynchronous scope.
     pub async fn scope<R, F>(&self, f: F) -> R
     where
-        F: for<'b, 'scope, 'm> AsyncFnOnce(
-            &'b GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, T, &'m ()>,
-        ) -> R,
+        F: for<'b, 'scope> AsyncFnOnce(&'b AsyncScope<'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = AsyncScope::__private_new(
+        let s = AsyncScope::new(
             RuntimeScopeContext {
                 shared: self.shared,
             },
@@ -246,12 +242,10 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-local asynchronous scope.
     pub async fn scope_local<R, F>(&self, f: F) -> R
     where
-        F: for<'b, 'scope, 'm> AsyncFnOnce(
-            &'b GenericAsyncScope<'scope, LocalStorage, RcOwnership, T, *const &'m ()>,
-        ) -> R,
+        F: for<'b, 'scope> AsyncFnOnce(&'b LocalAsyncScope<'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = LocalAsyncScope::__private_new(
+        let s = LocalAsyncScope::new(
             RuntimeScopeContext {
                 shared: self.shared,
             },
