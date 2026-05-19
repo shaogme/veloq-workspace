@@ -40,36 +40,22 @@ pub fn noop_worker_init<T>(_: WorkerInitContext<'_, T>) -> std::future::Ready<()
 pub type DefaultWorkerInit = fn(WorkerInitContext<'static, ()>) -> std::future::Ready<()>;
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
 
-impl<'ctx, T>
-    Runtime<
-        'ctx,
-        fn(WorkerInitContext<'ctx, T>) -> std::future::Ready<()>,
-        T,
-        fn(usize, &RuntimeShared<T>) -> T,
-    >
-{
+pub type DefaultWorkerInitFor<'ctx, T> = fn(WorkerInitContext<'ctx, T>) -> std::future::Ready<()>;
+pub type DefaultWorkerFactoryFor<T> = fn(usize, &RuntimeShared<T>) -> T;
+
+impl<'ctx, T> Runtime<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>> {
     pub fn new() -> Self {
-        RuntimeBuilder::<fn(WorkerInitContext<'ctx, T>) -> std::future::Ready<()>, T, _>::new()
-            .build()
+        RuntimeBuilder::<DefaultWorkerInitFor<'ctx, T>, T, _>::new().build()
     }
 
-    pub fn builder() -> RuntimeBuilder<
-        'ctx,
-        fn(WorkerInitContext<'ctx, T>) -> std::future::Ready<()>,
-        T,
-        fn(usize, &RuntimeShared<T>) -> T,
-    > {
+    pub fn builder()
+    -> RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>> {
         RuntimeBuilder::new()
     }
 }
 
 impl<'ctx, T> Default
-    for Runtime<
-        'ctx,
-        fn(WorkerInitContext<'ctx, T>) -> std::future::Ready<()>,
-        T,
-        fn(usize, &RuntimeShared<T>) -> T,
-    >
+    for Runtime<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>>
 {
     fn default() -> Self {
         Self::new()
@@ -226,14 +212,7 @@ pub struct RuntimeBuilder<'ctx, I, T, WF> {
     _phantom: std::marker::PhantomData<(&'ctx (), T)>,
 }
 
-impl<'ctx, T>
-    RuntimeBuilder<
-        'ctx,
-        fn(WorkerInitContext<'ctx, T>) -> std::future::Ready<()>,
-        T,
-        fn(usize, &RuntimeShared<T>) -> T,
-    >
-{
+impl<'ctx, T> RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>> {
     pub fn new() -> Self {
         RuntimeBuilder {
             worker_count: None,
@@ -248,12 +227,7 @@ impl<'ctx, T>
 }
 
 impl<'ctx, T> Default
-    for RuntimeBuilder<
-        'ctx,
-        fn(WorkerInitContext<'ctx, T>) -> std::future::Ready<()>,
-        T,
-        fn(usize, &RuntimeShared<T>) -> T,
-    >
+    for RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>>
 {
     fn default() -> Self {
         Self::new()
