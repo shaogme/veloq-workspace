@@ -165,33 +165,28 @@ impl<D: Driver + ?Sized> Driver for &mut D {
     }
 }
 
-pub struct DriverHandle<'a, D: Driver + ?Sized> {
-    inner: std::cell::RefMut<'a, D>,
+pub trait ContextDriverProvider<D: Driver + ?Sized> {
+    fn with_driver_mut<R>(&self, f: impl FnOnce(&mut D) -> R) -> R;
+    fn with_driver_ref<R>(&self, f: impl FnOnce(&D) -> R) -> R;
 }
 
-impl<'a, D: Driver + ?Sized> DriverHandle<'a, D> {
-    pub fn new(inner: std::cell::RefMut<'a, D>) -> Self {
-        Self { inner }
+pub struct RuntimeContextDriver<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> {
+    provider: &'a P,
+    _phantom: std::marker::PhantomData<fn() -> D>,
+}
+
+impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> RuntimeContextDriver<'a, D, P> {
+    pub fn new(provider: &'a P) -> Self {
+        Self {
+            provider,
+            _phantom: std::marker::PhantomData,
+        }
     }
 }
 
-impl<'a, D: Driver + ?Sized> std::ops::Deref for DriverHandle<'a, D> {
-    type Target = D;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<'a, D: Driver + ?Sized> std::ops::DerefMut for DriverHandle<'a, D> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl<'a, D: Driver + ?Sized> Driver for DriverHandle<'a, D> {
+impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
+    for RuntimeContextDriver<'a, D, P>
+{
     type Op = D::Op;
     type UP = D::UP;
     type Raw = D::Raw;
@@ -200,27 +195,29 @@ impl<'a, D: Driver + ?Sized> Driver for DriverHandle<'a, D> {
 
     #[inline]
     fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
-        self.inner.reserve_op()
+        self.provider.with_driver_mut(|d| d.reserve_op())
     }
 
     #[inline]
     fn slot_table(&self) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion> {
-        self.inner.slot_table()
+        self.provider.with_driver_ref(|d| d.slot_table())
     }
 
     #[inline]
     fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable> {
-        self.inner.detached_cancel_table()
+        self.provider.with_driver_ref(|d| d.detached_cancel_table())
     }
 
     #[inline]
     fn slot_set_payload(&mut self, user_data: usize, payload: Self::UP) {
-        self.inner.slot_set_payload(user_data, payload)
+        self.provider
+            .with_driver_mut(|d| d.slot_set_payload(user_data, payload))
     }
 
     #[inline]
     fn slot_take_payload(&mut self, user_data: usize) -> Option<Self::UP> {
-        self.inner.slot_take_payload(user_data)
+        self.provider
+            .with_driver_mut(|d| d.slot_take_payload(user_data))
     }
 
     #[inline]
@@ -230,32 +227,34 @@ impl<'a, D: Driver + ?Sized> Driver for DriverHandle<'a, D> {
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
     ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
-        self.inner.submit(user_data, op_in, binder)
+        self.provider
+            .with_driver_mut(|d| d.submit(user_data, op_in, binder))
     }
 
     #[inline]
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
-        self.inner.drive(mode)
+        self.provider.with_driver_mut(|d| d.drive(mode))
     }
 
     #[inline]
     fn completion_queue(&self) -> SharedCompletionQueue {
-        self.inner.completion_queue()
+        self.provider.with_driver_ref(|d| d.completion_queue())
     }
 
     #[inline]
     fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion> {
-        self.inner.completion_table()
+        self.provider.with_driver_ref(|d| d.completion_table())
     }
 
     #[inline]
     fn cancel_op(&mut self, user_data: usize) {
-        self.inner.cancel_op(user_data)
+        self.provider.with_driver_mut(|d| d.cancel_op(user_data))
     }
 
     #[inline]
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
-        self.inner.register_chunk(id, ptr, len)
+        self.provider
+            .with_driver_mut(|d| d.register_chunk(id, ptr, len))
     }
 
     #[inline]
@@ -263,17 +262,17 @@ impl<'a, D: Driver + ?Sized> Driver for DriverHandle<'a, D> {
         &mut self,
         files: Vec<RegisterFd<'f, Self::Raw>>,
     ) -> DriverResult<Vec<IoFd>> {
-        self.inner.register_files(files)
+        self.provider.with_driver_mut(|d| d.register_files(files))
     }
 
     #[inline]
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
-        self.inner.unregister_files(files)
+        self.provider.with_driver_mut(|d| d.unregister_files(files))
     }
 
     #[inline]
     fn create_waker(&self) -> Arc<dyn RemoteWaker> {
-        self.inner.create_waker()
+        self.provider.with_driver_ref(|d| d.create_waker())
     }
 }
 
@@ -367,5 +366,16 @@ impl SubmitBinder {
 pub mod test_hooks {
     pub trait DriverTestHooks {
         fn debug_chunk_register_attempts(&self) -> u64;
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl<'a, D: Driver + ?Sized + test_hooks::DriverTestHooks, P: ContextDriverProvider<D> + ?Sized>
+    test_hooks::DriverTestHooks for RuntimeContextDriver<'a, D, P>
+{
+    #[inline]
+    fn debug_chunk_register_attempts(&self) -> u64 {
+        self.provider
+            .with_driver_ref(|d| d.debug_chunk_register_attempts())
     }
 }

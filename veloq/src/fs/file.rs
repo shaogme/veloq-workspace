@@ -65,9 +65,10 @@ pub struct File<'ctx> {
 
 impl<'ctx> Drop for LocalFile<'ctx> {
     fn drop(&mut self) {
-        let ctx = self.ctx.scope.shared().context_tls.get();
-        let mut driver = ctx.extra.driver.borrow_mut();
-        let _ = driver.unregister_files(vec![self.fd]);
+        self.ctx.scope.shared().context_tls.with(|ctx| {
+            let mut driver = ctx.extra.driver.borrow_mut();
+            let _ = driver.unregister_files(vec![self.fd]);
+        });
         close_raw_handle(self.raw);
     }
 }

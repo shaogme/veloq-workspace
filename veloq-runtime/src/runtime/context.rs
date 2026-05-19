@@ -260,8 +260,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     pub fn worker_id(&self) -> usize {
         self.shared
             .context_tls
-            .try_get()
-            .map(|ctx| ctx.worker_id)
+            .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX)
     }
 }
@@ -325,8 +324,11 @@ impl<'ctx, T> WorkerInitContext<'ctx, T> {
 
     /// Returns the custom worker extra state.
     #[inline]
-    pub fn extra(&self) -> &T {
-        &self.shared.context_tls.get().extra
+    pub fn extra<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        self.shared
+            .context_tls
+            .try_with(|ctx| f(&ctx.extra))
+            .expect("RuntimeContext accessed outside of a worker thread")
     }
 }
 

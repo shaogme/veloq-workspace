@@ -13,4 +13,5 @@ readme.workspace = true
 
 [dependencies]
 libc = { workspace = true }
+once_cell = "1.21.4"
 windows-sys = { workspace = true, features = ["Win32_System_Threading"] }

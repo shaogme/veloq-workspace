@@ -1,7 +1,7 @@
+use once_cell::sync::OnceCell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::OnceLock;
 
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
@@ -37,9 +37,9 @@ const OWNED_TAG: usize = 1;
 
 /// A high-performance thread-local storage wrapper using platform-native TLS.
 ///
-/// This version supports an initialization closure and direct access to `&T`.
+/// This version supports an initialization closure and access to the value via a closure.
 pub struct Tls<T, F = fn() -> T> {
-    key: OnceLock<RawKey>,
+    key: OnceCell<RawKey>,
     init: F,
     _marker: PhantomData<T>,
 }
@@ -50,7 +50,7 @@ impl<T, F: Fn() -> T> Tls<T, F> {
     /// This should typically be stored in a `static` variable.
     pub const fn new(init: F) -> Self {
         Self {
-            key: OnceLock::new(),
+            key: OnceCell::new(),
             init,
             _marker: PhantomData,
         }
@@ -58,57 +58,51 @@ impl<T, F: Fn() -> T> Tls<T, F> {
 
     #[inline]
     fn get_key(&self) -> Result<RawKey, TlsError> {
-        if let Some(key) = self.key.get() {
-            return Ok(*key);
-        }
-
-        let new_key = {
-            #[cfg(windows)]
-            {
-                let key = unsafe { FlsAlloc(Some(tls_destructor::<T>)) };
-                if key == FLS_OUT_OF_INDEXES {
-                    return Err(TlsError::AllocationFailed);
-                }
-                key
-            }
-            #[cfg(unix)]
-            {
-                let mut key = 0;
-                let res = unsafe { pthread_key_create(&mut key, Some(tls_destructor::<T>)) };
-                if res != 0 {
-                    return Err(TlsError::AllocationFailed);
-                }
-                key
-            }
-        };
-
-        match self.key.set(new_key) {
-            Ok(()) => Ok(new_key),
-            Err(_) => {
-                // Another thread initialized it first, free the redundant key.
+        self.key
+            .get_or_try_init(|| {
                 #[cfg(windows)]
-                unsafe {
-                    FlsFree(new_key);
+                {
+                    let key = unsafe { FlsAlloc(Some(tls_destructor::<T>)) };
+                    if key == FLS_OUT_OF_INDEXES {
+                        return Err(TlsError::AllocationFailed);
+                    }
+                    Ok(key)
                 }
                 #[cfg(unix)]
-                unsafe {
-                    pthread_key_delete(new_key);
+                {
+                    let mut key = 0;
+                    let res = unsafe { pthread_key_create(&mut key, Some(tls_destructor::<T>)) };
+                    if res != 0 {
+                        return Err(TlsError::AllocationFailed);
+                    }
+                    Ok(key)
                 }
-                Ok(*self.key.get().expect("OnceLock should be initialized"))
-            }
-        }
+            })
+            .copied()
     }
 
-    /// Gets the value stored in TLS for the current thread.
+    /// Executes a closure with a reference to the value stored in TLS for the current thread.
     ///
     /// If no value has been set, the initialization closure is called.
     #[inline(always)]
-    pub fn get(&self) -> &T {
-        if let Some(val) = self.try_get() {
-            return val;
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let key = self.get_key().expect("TLS key allocation failed");
+        let raw_ptr = {
+            #[cfg(windows)]
+            unsafe {
+                FlsGetValue(key) as usize
+            }
+            #[cfg(unix)]
+            unsafe {
+                pthread_getspecific(key) as usize
+            }
+        };
+
+        if raw_ptr != 0 {
+            let actual_ptr = (raw_ptr & !OWNED_TAG) as *const T;
+            return f(unsafe { &*actual_ptr });
         }
 
-        let key = self.get_key().expect("TLS key allocation failed");
         // Initialize using the closure
         let val = (self.init)();
         let owned_ptr = Box::into_raw(Box::new(val)) as usize;
@@ -117,21 +111,29 @@ impl<T, F: Fn() -> T> Tls<T, F> {
 
         #[cfg(windows)]
         unsafe {
-            FlsSetValue(key, tagged_ptr as _);
+            let res = FlsSetValue(key, tagged_ptr as _);
+            if res == 0 {
+                let _ = Box::from_raw(owned_ptr as *mut T);
+                panic!("Failed to set TLS value");
+            }
         }
         #[cfg(unix)]
         unsafe {
-            pthread_getspecific(key, tagged_ptr as _);
+            let res = pthread_setspecific(key, tagged_ptr as _);
+            if res != 0 {
+                let _ = Box::from_raw(owned_ptr as *mut T);
+                panic!("Failed to set TLS value: error code {}", res);
+            }
         }
 
-        unsafe { &*(owned_ptr as *const T) }
+        f(unsafe { &*(owned_ptr as *const T) })
     }
 
-    /// Gets the value stored in TLS for the current thread without initializing it.
+    /// Executes a closure with a reference to the value stored in TLS for the current thread without initializing it.
     ///
     /// Returns `None` if no value has been set for this thread.
     #[inline(always)]
-    pub fn try_get(&self) -> Option<&T> {
+    pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
         let key = self.get_key().ok()?;
         let raw_ptr = {
             #[cfg(windows)]
@@ -148,7 +150,7 @@ impl<T, F: Fn() -> T> Tls<T, F> {
             None
         } else {
             let actual_ptr = (raw_ptr & !OWNED_TAG) as *const T;
-            Some(unsafe { &*actual_ptr })
+            Some(unsafe { f(&*actual_ptr) })
         }
     }
 
@@ -201,6 +203,21 @@ impl<T, F: Fn() -> T> Tls<T, F> {
 
 unsafe impl<T, F> Send for Tls<T, F> {}
 unsafe impl<T, F> Sync for Tls<T, F> {}
+
+impl<T, F> Drop for Tls<T, F> {
+    fn drop(&mut self) {
+        if let Some(&key) = self.key.get() {
+            #[cfg(windows)]
+            unsafe {
+                FlsFree(key);
+            }
+            #[cfg(unix)]
+            unsafe {
+                pthread_key_delete(key);
+            }
+        }
+    }
+}
 
 #[cfg(unix)]
 unsafe extern "C" fn tls_destructor<T>(ptr: *mut libc::c_void) {
@@ -259,31 +276,43 @@ mod tests {
 
     #[test]
     fn test_basic_get_init() {
-        assert_eq!(*TEST_TLS.get(), 42);
+        TEST_TLS.with(|v| {
+            assert_eq!(*v, 42);
+        });
     }
 
     #[test]
     fn test_set_override() {
         let mut val = 100;
         TEST_TLS.set(Some(NonNull::from(&mut val))).unwrap();
-        assert_eq!(*TEST_TLS.get(), 100);
+        TEST_TLS.with(|v| {
+            assert_eq!(*v, 100);
+        });
 
         TEST_TLS.set(None).unwrap();
-        assert_eq!(*TEST_TLS.get(), 42);
+        TEST_TLS.with(|v| {
+            assert_eq!(*v, 42);
+        });
     }
 
     #[test]
     fn test_thread_isolation() {
         thread::spawn(move || {
-            assert_eq!(*TEST_TLS.get(), 42);
+            TEST_TLS.with(|v| {
+                assert_eq!(*v, 42);
+            });
             let mut val = 200;
             TEST_TLS.set(Some(NonNull::from(&mut val))).unwrap();
-            assert_eq!(*TEST_TLS.get(), 200);
+            TEST_TLS.with(|v| {
+                assert_eq!(*v, 200);
+            });
         })
         .join()
         .unwrap();
 
-        assert_eq!(*TEST_TLS.get(), 42);
+        TEST_TLS.with(|v| {
+            assert_eq!(*v, 42);
+        });
     }
 
     #[test]
@@ -291,8 +320,12 @@ mod tests {
         {
             let mut val = 1000;
             let _guard = TlsGuard::new(&TEST_TLS, &mut val).unwrap();
-            assert_eq!(*TEST_TLS.get(), 1000);
+            TEST_TLS.with(|v| {
+                assert_eq!(*v, 1000);
+            });
         }
-        assert_eq!(*TEST_TLS.get(), 42);
+        TEST_TLS.with(|v| {
+            assert_eq!(*v, 42);
+        });
     }
 }

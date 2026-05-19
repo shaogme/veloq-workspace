@@ -3,7 +3,9 @@ use std::num::NonZeroUsize;
 use std::sync::mpsc;
 
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_driver_native::driver::{DriveMode, Driver, DriverHandle, PlatformDriver};
+use veloq_driver_native::driver::{
+    ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver,
+};
 use veloq_driver_native::op::{DetachedSubmitter, IntoPlatformOp, Op};
 
 use crate::config::BufferRegistrationMode;
@@ -48,34 +50,38 @@ impl<'ctx> DriverRegistrar<'ctx> {
         }
     }
 
-    fn extra(&self) -> &WorkerState<'ctx> {
-        &self.shared.context_tls.get().extra
+    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
+        self.shared
+            .context_tls
+            .try_with(|ctx| f(&ctx.extra))
+            .expect("RuntimeContext accessed outside of a worker thread")
     }
 
     pub fn sync_to_driver(&self) {
-        let extra = self.extra();
-        sync_to_driver_internal(
-            &extra.driver,
-            &extra.registrar_state,
-            self.registration_mode,
-        );
+        self.extra(|extra| {
+            sync_to_driver_internal(
+                &extra.driver,
+                &extra.registrar_state,
+                self.registration_mode,
+            );
+        })
     }
 }
 
 impl<'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'ctx> {
     fn register(&self, regions: &[veloq_buf::BufferRegion]) -> std::io::Result<Vec<usize>> {
-        let extra = self.extra();
-        register_internal(&extra.driver, &extra.registrar_state, regions)
+        self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
     }
 
     fn resolve_chunk_info(&self, chunk_id: u16) -> Option<veloq_buf::heap::ChunkInfo> {
-        let extra = self.extra();
-        resolve_chunk_info_internal(
-            &extra.driver,
-            &extra.registrar_state,
-            self.registration_mode,
-            chunk_id,
-        )
+        self.extra(|extra| {
+            resolve_chunk_info_internal(
+                &extra.driver,
+                &extra.registrar_state,
+                self.registration_mode,
+                chunk_id,
+            )
+        })
     }
 }
 
@@ -185,26 +191,41 @@ pub struct RuntimeContext<'ctx> {
     pub scope: RuntimeScopeContext<'ctx, WorkerState<'ctx>>,
 }
 
+impl<'ctx> ContextDriverProvider<PlatformDriver<'ctx>> for RuntimeContext<'ctx> {
+    #[inline]
+    fn with_driver_mut<R>(&self, f: impl FnOnce(&mut PlatformDriver<'ctx>) -> R) -> R {
+        self.extra(|extra| f(&mut extra.driver.borrow_mut()))
+    }
+
+    #[inline]
+    fn with_driver_ref<R>(&self, f: impl FnOnce(&PlatformDriver<'ctx>) -> R) -> R {
+        self.extra(|extra| f(&extra.driver.borrow()))
+    }
+}
+
 impl<'ctx> veloq_driver_native::op::DriverProvider for RuntimeContext<'ctx> {
     type Op = veloq_driver_native::driver::PlatformOp;
     type UP = veloq_driver_native::driver::PlatformUP;
     type Completion = usize;
     type Driver<'a>
-        = DriverHandle<'a, PlatformDriver<'ctx>>
+        = RuntimeContextDriver<'a, PlatformDriver<'ctx>, RuntimeContext<'ctx>>
     where
         Self: 'a;
 
     #[inline]
     fn with_driver<'a, R>(&'a self, f: impl FnOnce(Self::Driver<'a>) -> R) -> R {
-        let guard = self.extra().driver.borrow_mut();
-        f(DriverHandle::new(guard))
+        f(RuntimeContextDriver::new(self))
     }
 }
 
 impl<'ctx> RuntimeContext<'ctx> {
     #[inline]
-    fn extra(&self) -> &WorkerState<'ctx> {
-        &self.scope.shared().context_tls.get().extra
+    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
+        self.scope
+            .shared()
+            .context_tls
+            .try_with(|ctx| f(&ctx.extra))
+            .expect("RuntimeContext accessed outside of a worker thread")
     }
 
     pub async fn scope<R, F>(&self, f: F) -> R
@@ -227,20 +248,19 @@ impl<'ctx> RuntimeContext<'ctx> {
 
     #[inline]
     pub fn buf_pool(&self) -> AnyBufPool {
-        self.extra().buf_pool.clone()
+        self.extra(|extra| extra.buf_pool.clone())
     }
 
     #[inline]
     pub fn registrar(&self) -> DriverRegistrar<'ctx> {
-        self.extra().registrar.clone()
+        self.extra(|extra| extra.registrar.clone())
     }
 
     pub fn driver<'a, R>(
         &'a self,
-        f: impl FnOnce(DriverHandle<'a, PlatformDriver<'ctx>>) -> R,
+        f: impl FnOnce(RuntimeContextDriver<'a, PlatformDriver<'ctx>, RuntimeContext<'ctx>>) -> R,
     ) -> R {
-        let guard = self.extra().driver.borrow_mut();
-        f(DriverHandle::new(guard))
+        f(RuntimeContextDriver::new(self))
     }
 
     #[inline]
@@ -341,22 +361,23 @@ impl<'ctx> RuntimeContext<'ctx> {
 }
 
 pub fn poll_current_driver<'ctx>(shared: &RuntimeShared<WorkerState<'ctx>>) -> IdleDecision {
-    let ctx = shared.context_tls.get();
-    let extra = &ctx.extra;
+    shared.context_tls.with(|ctx| {
+        let extra = &ctx.extra;
 
-    // sync registrar
-    extra.registrar.sync_to_driver();
+        // sync registrar
+        extra.registrar.sync_to_driver();
 
-    let mut driver = extra.driver.borrow_mut();
+        let mut driver = extra.driver.borrow_mut();
 
-    let outcome = driver
-        .drive(DriveMode::Poll)
-        .unwrap_or_else(|err| panic!("driver drive(Poll) failed: {err:#}"));
-    match outcome.next_timeout_hint {
-        Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
-        None if outcome.pending_progress => IdleDecision::continue_now(),
-        None => IdleDecision::wait(IdleWaitStrategy::block()),
-    }
+        let outcome = driver
+            .drive(DriveMode::Poll)
+            .unwrap_or_else(|err| panic!("driver drive(Poll) failed: {err:#}"));
+        match outcome.next_timeout_hint {
+            Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
+            None if outcome.pending_progress => IdleDecision::continue_now(),
+            None => IdleDecision::wait(IdleWaitStrategy::block()),
+        }
+    })
 }
 
 pub(crate) fn submit_control_task<'ctx>(
@@ -378,11 +399,11 @@ pub(crate) fn submit_control_task<'ctx>(
 
         fn poll_raw(&self, _worker_id: usize) -> bool {
             let shared = unsafe { &*self.shared_ptr };
-            if let Some(ctx) = shared.context_tls.try_get() {
+            let _ = shared.context_tls.try_with(|ctx| {
                 let extra = &ctx.extra;
                 let mut driver = extra.driver.borrow_mut();
                 let _ = driver.unregister_files(vec![self.fd]);
-            }
+            });
             self.header.mark_completed_and_notify();
             unsafe {
                 let header_ptr = std::ptr::NonNull::from(&self.header);

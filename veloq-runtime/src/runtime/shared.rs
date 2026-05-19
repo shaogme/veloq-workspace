@@ -310,8 +310,7 @@ impl RuntimeSharedBase {
 impl<T> RuntimeShared<T> {
     pub fn worker_id(&self) -> usize {
         self.context_tls
-            .try_get()
-            .map(|ctx| ctx.worker_id)
+            .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX)
     }
 
@@ -322,8 +321,7 @@ impl<T> RuntimeShared<T> {
     pub fn choose_worker(&self) -> usize {
         let current = self
             .context_tls
-            .try_get()
-            .map(|ctx| ctx.worker_id)
+            .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX);
         self.base
             .topo
@@ -357,8 +355,7 @@ impl<T> RuntimeShared<T> {
 
         let current = self
             .context_tls
-            .try_get()
-            .map(|ctx| ctx.worker_id)
+            .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX);
 
         if current == worker_id && task.header().try_mark_queued() {
@@ -412,105 +409,106 @@ impl<T> RuntimeShared<T> {
         completion: Option<&GenericScopeCompletion<S, O>>,
         mut init_fut: Option<Pin<&mut F>>,
     ) {
-        let ctx = self.context_tls.get();
-        let worker_id = ctx.worker_id;
+        self.context_tls.with(|ctx| {
+            let worker_id = ctx.worker_id;
 
-        let worker_tick_hook = self.base.worker_tick_hook;
+            let worker_tick_hook = self.base.worker_tick_hook;
 
-        let waker =
-            primitives::create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
-        let mut init_cx = Context::from_waker(&waker);
+            let waker =
+                primitives::create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
+            let mut init_cx = Context::from_waker(&waker);
 
-        let mut tick = 0u32;
-        const INJECTOR_CHECK_INTERVAL: u32 = 61;
+            let mut tick = 0u32;
+            const INJECTOR_CHECK_INTERVAL: u32 = 61;
 
-        while init_fut.is_some() || !self.base.shutdown.load(Ordering::Acquire) {
-            let mut progressed = false;
+            while init_fut.is_some() || !self.base.shutdown.load(Ordering::Acquire) {
+                let mut progressed = false;
 
-            if let Some(hook) = worker_tick_hook {
-                hook();
-            }
-
-            if let Some(fut) = init_fut.as_mut() {
-                match fut.as_mut().poll(&mut init_cx) {
-                    Poll::Ready(()) => {
-                        init_fut = None;
-                        progressed = true;
-                        if completion.is_none() && worker_id == 0 {
-                            return;
-                        }
-                    }
-                    Poll::Pending => {}
+                if let Some(hook) = worker_tick_hook {
+                    hook();
                 }
-            }
 
-            if init_fut.is_none() && completion.map(|c| c.is_done()).unwrap_or(false) {
-                return;
-            }
+                if let Some(fut) = init_fut.as_mut() {
+                    match fut.as_mut().poll(&mut init_cx) {
+                        Poll::Ready(()) => {
+                            init_fut = None;
+                            progressed = true;
+                            if completion.is_none() && worker_id == 0 {
+                                return;
+                            }
+                        }
+                        Poll::Pending => {}
+                    }
+                }
 
-            if init_fut.is_none() && completion.is_none() && worker_id == 0 {
-                return;
-            }
+                if init_fut.is_none() && completion.map(|c| c.is_done()).unwrap_or(false) {
+                    return;
+                }
 
-            tick = tick.wrapping_add(1);
+                if init_fut.is_none() && completion.is_none() && worker_id == 0 {
+                    return;
+                }
 
-            if let Some(task) = self.base.pop_send(worker_id) {
-                self.base.poll_send_task(worker_id, task);
-                progressed = true;
-            }
+                tick = tick.wrapping_add(1);
 
-            if !progressed && let Some(task) = self.base.pop_pinned(worker_id, &ctx.pinned_rx) {
-                self.base.poll_send_task(worker_id, task);
-                progressed = true;
-            }
-
-            if !progressed && let Some(task) = self.base.pop_local(worker_id, &ctx.local_rx) {
-                self.base.poll_local_task(worker_id, task);
-                progressed = true;
-            }
-
-            if !progressed
-                && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
-                && let Some(task) = self.base.pop_global()
-            {
-                self.base.poll_send_task(worker_id, task);
-                progressed = true;
-            }
-
-            if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
-                self.base.poll_send_task(worker_id, task);
-                progressed = true;
-            }
-
-            if progressed {
-                continue;
-            }
-
-            self.base
-                .scheduler
-                .searching_workers
-                .fetch_add(1, Ordering::Relaxed);
-            for _ in 0..4 {
-                if let Some(task) = self.base.steal_send(worker_id, &ctx.rand) {
+                if let Some(task) = self.base.pop_send(worker_id) {
                     self.base.poll_send_task(worker_id, task);
                     progressed = true;
-                    break;
                 }
-                std::hint::spin_loop();
-            }
-            self.base
-                .scheduler
-                .searching_workers
-                .fetch_sub(1, Ordering::Relaxed);
 
-            if progressed {
-                continue;
-            }
+                if !progressed && let Some(task) = self.base.pop_pinned(worker_id, &ctx.pinned_rx) {
+                    self.base.poll_send_task(worker_id, task);
+                    progressed = true;
+                }
 
-            if let Some(c) = completion {
-                c.register(&waker);
+                if !progressed && let Some(task) = self.base.pop_local(worker_id, &ctx.local_rx) {
+                    self.base.poll_local_task(worker_id, task);
+                    progressed = true;
+                }
+
+                if !progressed
+                    && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
+                    && let Some(task) = self.base.pop_global()
+                {
+                    self.base.poll_send_task(worker_id, task);
+                    progressed = true;
+                }
+
+                if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
+                    self.base.poll_send_task(worker_id, task);
+                    progressed = true;
+                }
+
+                if progressed {
+                    continue;
+                }
+
+                self.base
+                    .scheduler
+                    .searching_workers
+                    .fetch_add(1, Ordering::Relaxed);
+                for _ in 0..4 {
+                    if let Some(task) = self.base.steal_send(worker_id, &ctx.rand) {
+                        self.base.poll_send_task(worker_id, task);
+                        progressed = true;
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                self.base
+                    .scheduler
+                    .searching_workers
+                    .fetch_sub(1, Ordering::Relaxed);
+
+                if progressed {
+                    continue;
+                }
+
+                if let Some(c) = completion {
+                    c.register(&waker);
+                }
+                RuntimeProgressCoordinator::new(self, worker_id).run(completion);
             }
-            RuntimeProgressCoordinator::new(self, worker_id).run(completion);
-        }
+        })
     }
 }
