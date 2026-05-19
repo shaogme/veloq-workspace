@@ -78,7 +78,15 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancel_token.is_cancelled()
+        if self.cancel_token.is_cancelled() {
+            return true;
+        }
+        if let Some(ref parent) = self.parent
+            && parent.is_cancelled()
+        {
+            return true;
+        }
+        false
     }
 
     pub fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
@@ -190,10 +198,14 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
     ) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
-        if let Some(parent) = parent {
-            parent.try_link_child(&crate::task::ErasedCancellationToken::new::<S, O>(
+        if let Some(ref parent) = parent {
+            let linked = parent.try_link_child(&crate::task::ErasedCancellationToken::new::<S, O>(
                 completion.cancel_token(),
             ));
+            if !linked && let crate::task::AnyScopeCompletionRef::Send(_) = parent {
+                let mut cross = completion.cancel_token().inner.cross_parent.lock();
+                *cross = Some(parent.clone());
+            }
         }
 
         Self {

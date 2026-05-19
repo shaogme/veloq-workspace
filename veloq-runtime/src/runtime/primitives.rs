@@ -7,7 +7,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
-use crate::task::OpaqueToken;
+use crate::task::{AnyScopeCompletionRef, OpaqueToken};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{StateInt, StateLock, StateWakerQueue, Storage};
 
@@ -378,7 +378,7 @@ impl Unparker {
 // --- 显式结构化取消系统 (CancellationToken) ---
 
 pub struct GenericCancellationToken<S: Storage, O: Ownership> {
-    inner: O::Shared<GenericCancellationTokenInner<S, O>>,
+    pub(crate) inner: O::Shared<GenericCancellationTokenInner<S, O>>,
 }
 
 pub type ChildList<S, O> = <S as Storage>::Lock<LinkedList<CancellationTokenAdapter<S, O>>>;
@@ -391,6 +391,7 @@ pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
     children: ChildList<S, O>,
     pub(crate) link: Link,
     parent: ParentSlot<S, O>,
+    pub(crate) cross_parent: S::Lock<Option<AnyScopeCompletionRef>>,
 }
 
 intrusive_adapter!(pub CancellationTokenAdapter<S, O> = GenericCancellationTokenInner<S, O> { link: Link } where S: Storage, O: Ownership);
@@ -432,6 +433,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
                 children: S::Lock::new(LinkedList::new(CancellationTokenAdapter::<S, O>::new())),
                 link: Link::new(),
                 parent: S::Lock::new(None),
+                cross_parent: S::Lock::new(None),
             }),
         }
     }
@@ -480,7 +482,32 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
 
     #[inline]
     pub fn is_cancelled(&self) -> bool {
-        self.inner.cancelled.load(Ordering::SeqCst) != 0
+        if self.inner.cancelled.load(Ordering::SeqCst) != 0 {
+            return true;
+        }
+        if let Some(ref parent) = *self.inner.cross_parent.lock()
+            && parent.is_cancelled()
+        {
+            return true;
+        }
+        false
+    }
+
+    pub fn register_waker(&self, waker: &Waker) {
+        if self.is_cancelled() {
+            waker.wake_by_ref();
+            return;
+        }
+        self.inner.wakers.push(waker.clone());
+        if let Some(ref parent) = *self.inner.cross_parent.lock() {
+            parent.register_cancel_waker(waker);
+        }
+        if self.is_cancelled() {
+            let wakers = self.inner.wakers.take_all();
+            for w in wakers {
+                w.wake();
+            }
+        }
     }
 
     pub fn cancelled(&self) -> CancelledFuture<S, O> {
@@ -536,17 +563,17 @@ impl<S: Storage, O: Ownership> std::future::Future for CancelledFuture<S, O> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         if self.token.is_cancelled() {
+            if self.token.inner.cancelled.load(Ordering::Relaxed) == 0 {
+                self.token.cancel();
+            }
             return std::task::Poll::Ready(());
         }
 
-        {
-            self.token.inner.wakers.push(cx.waker().clone());
-        }
+        self.token.register_waker(cx.waker());
 
         if self.token.is_cancelled() {
-            let wakers = self.token.inner.wakers.take_all();
-            for waker in wakers {
-                waker.wake();
+            if self.token.inner.cancelled.load(Ordering::Relaxed) == 0 {
+                self.token.cancel();
             }
             std::task::Poll::Ready(())
         } else {

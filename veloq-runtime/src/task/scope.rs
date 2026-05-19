@@ -77,6 +77,7 @@ pub struct ScopeVTable<S: Storage> {
     parent: unsafe fn(NonNull<OpaqueScope>) -> Option<AnyScopeCompletionRef>,
     clone: unsafe fn(NonNull<OpaqueScope>) -> ScopeCompletionRef<S>,
     drop: unsafe fn(NonNull<OpaqueScope>),
+    register_cancel_waker: unsafe fn(NonNull<OpaqueScope>, &std::task::Waker),
     _marker: std::marker::PhantomData<S>,
 }
 
@@ -145,6 +146,11 @@ impl<S: Storage> ScopeCompletionRef<S> {
     pub fn parent(&self) -> Option<AnyScopeCompletionRef> {
         unsafe { (self.vtable.parent)(self.ptr) }
     }
+
+    #[inline]
+    pub fn register_cancel_waker(&self, waker: &std::task::Waker) {
+        unsafe { (self.vtable.register_cancel_waker)(self.ptr, waker) }
+    }
 }
 
 impl<S: Storage> Clone for ScopeCompletionRef<S> {
@@ -201,6 +207,10 @@ impl<S: Storage, O: Ownership> VTableContainer<S, O> {
                 ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>
             );
         },
+        register_cancel_waker: |ptr, waker| unsafe {
+            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
+            scope.cancel_token().register_waker(waker);
+        },
         _marker: std::marker::PhantomData,
     };
 }
@@ -233,6 +243,14 @@ impl AnyScopeCompletionRef {
         match self {
             Self::Local(s) => s.parent(),
             Self::Send(s) => s.parent(),
+        }
+    }
+
+    #[inline]
+    pub fn register_cancel_waker(&self, waker: &std::task::Waker) {
+        match self {
+            Self::Local(s) => s.register_cancel_waker(waker),
+            Self::Send(s) => s.register_cancel_waker(waker),
         }
     }
 }

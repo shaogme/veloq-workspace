@@ -274,7 +274,11 @@ impl<T, F: Fn() -> T> TlsCell<T, F> {
     #[inline(never)]
     fn initialize_slow<R>(&self, key: RawKey, f: impl FnOnce(&T) -> R) -> R {
         // 摊销克制清理
-        if self.slow_path_count.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+        if self
+            .slow_path_count
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(64)
+        {
             self.prune_dead_nodes();
             reclaim_orphans();
         }
@@ -424,7 +428,11 @@ impl<T, F: Fn() -> T> TlsCell<T, F> {
             Ok(())
         } else {
             // 第一次设置前，也顺便触发一次剪枝和孤儿清理
-            if self.slow_path_count.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+            if self
+                .slow_path_count
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(64)
+            {
                 self.prune_dead_nodes();
                 reclaim_orphans();
             }
@@ -553,7 +561,6 @@ impl<T, F> Drop for TlsCell<T, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use AtomicUsize;
     use std::sync::Arc;
     use std::thread;
 
