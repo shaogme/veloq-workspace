@@ -1,7 +1,6 @@
 use once_cell::sync::OnceCell;
 use std::fmt;
 use std::marker::PhantomData;
-use std::ptr::NonNull;
 
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
@@ -32,8 +31,6 @@ impl fmt::Display for TlsError {
 }
 
 impl std::error::Error for TlsError {}
-
-const OWNED_TAG: usize = 1;
 
 /// A high-performance thread-local storage wrapper using platform-native TLS.
 ///
@@ -90,43 +87,40 @@ impl<T, F: Fn() -> T> Tls<T, F> {
         let raw_ptr = {
             #[cfg(windows)]
             unsafe {
-                FlsGetValue(key) as usize
+                FlsGetValue(key) as *const T
             }
             #[cfg(unix)]
             unsafe {
-                pthread_getspecific(key) as usize
+                pthread_getspecific(key) as *const T
             }
         };
 
-        if raw_ptr != 0 {
-            let actual_ptr = (raw_ptr & !OWNED_TAG) as *const T;
-            return f(unsafe { &*actual_ptr });
+        if !raw_ptr.is_null() {
+            return f(unsafe { &*raw_ptr });
         }
 
         // Initialize using the closure
         let val = (self.init)();
-        let owned_ptr = Box::into_raw(Box::new(val)) as usize;
-        // Tag it as owned
-        let tagged_ptr = owned_ptr | OWNED_TAG;
+        let owned_ptr = Box::into_raw(Box::new(val));
 
         #[cfg(windows)]
         unsafe {
-            let res = FlsSetValue(key, tagged_ptr as _);
+            let res = FlsSetValue(key, owned_ptr as _);
             if res == 0 {
-                let _ = Box::from_raw(owned_ptr as *mut T);
+                let _ = Box::from_raw(owned_ptr);
                 panic!("Failed to set TLS value");
             }
         }
         #[cfg(unix)]
         unsafe {
-            let res = pthread_setspecific(key, tagged_ptr as _);
+            let res = pthread_setspecific(key, owned_ptr as _);
             if res != 0 {
-                let _ = Box::from_raw(owned_ptr as *mut T);
+                let _ = Box::from_raw(owned_ptr);
                 panic!("Failed to set TLS value: error code {}", res);
             }
         }
 
-        f(unsafe { &*(owned_ptr as *const T) })
+        f(unsafe { &*owned_ptr })
     }
 
     /// Executes a closure with a reference to the value stored in TLS for the current thread without initializing it.
@@ -138,66 +132,99 @@ impl<T, F: Fn() -> T> Tls<T, F> {
         let raw_ptr = {
             #[cfg(windows)]
             unsafe {
-                FlsGetValue(key) as usize
+                FlsGetValue(key) as *const T
             }
             #[cfg(unix)]
             unsafe {
-                pthread_getspecific(key) as usize
+                pthread_getspecific(key) as *const T
             }
         };
 
-        if raw_ptr == 0 {
+        if raw_ptr.is_null() {
             None
         } else {
-            let actual_ptr = (raw_ptr & !OWNED_TAG) as *const T;
-            Some(unsafe { f(&*actual_ptr) })
+            Some(unsafe { f(&*raw_ptr) })
         }
     }
 
-    /// Sets the pointer stored in TLS for the current thread.
+    /// Sets an owned value into TLS for the current thread.
     ///
-    /// If a `Some(ptr)` is provided, it is stored as an unowned pointer.
-    /// If a previous value was owned by this `Tls` instance, it will be dropped.
+    /// If there was a previously stored value, it will be dropped.
     #[inline(always)]
-    pub fn set(&self, ptr: Option<NonNull<T>>) -> Result<(), TlsError> {
+    pub fn set_owned(&self, val: impl Into<Box<T>>) -> Result<(), TlsError> {
         let key = self.get_key()?;
-
-        // Check if we need to drop a previous owned value
         let old_ptr = {
             #[cfg(windows)]
             unsafe {
-                FlsGetValue(key) as usize
+                FlsGetValue(key) as *mut T
             }
             #[cfg(unix)]
             unsafe {
-                pthread_getspecific(key) as usize
+                pthread_getspecific(key) as *mut T
             }
         };
 
-        if old_ptr != 0 && (old_ptr & OWNED_TAG) != 0 {
-            let actual_old_ptr = (old_ptr & !OWNED_TAG) as *mut T;
+        if !old_ptr.is_null() {
             unsafe {
-                let _ = Box::from_raw(actual_old_ptr);
+                let _ = Box::from_raw(old_ptr);
             }
         }
 
-        let new_raw_ptr = ptr.map(|p| p.as_ptr() as usize).unwrap_or(0);
+        let owned_ptr = Box::into_raw(val.into());
 
         #[cfg(windows)]
         {
-            let res = unsafe { FlsSetValue(key, new_raw_ptr as _) };
+            let res = unsafe { FlsSetValue(key, owned_ptr as _) };
             if res == 0 {
-                return Err(TlsError::SetFailed(0));
+                unsafe {
+                    let _ = Box::from_raw(owned_ptr);
+                }
+                return Err(TlsError::AllocationFailed);
             }
         }
         #[cfg(unix)]
         {
-            let res = unsafe { pthread_setspecific(key, new_raw_ptr as _) };
+            let res = unsafe { pthread_setspecific(key, owned_ptr as _) };
             if res != 0 {
-                return Err(TlsError::SetFailed(res));
+                unsafe {
+                    let _ = Box::from_raw(owned_ptr);
+                }
+                return Err(TlsError::AllocationFailed);
             }
         }
+
         Ok(())
+    }
+
+    /// Takes the owned value out of the TLS for the current thread, returning it.
+    #[inline(always)]
+    pub fn take(&self) -> Option<Box<T>> {
+        let key = self.get_key().ok()?;
+        let old_ptr = {
+            #[cfg(windows)]
+            unsafe {
+                FlsGetValue(key) as *mut T
+            }
+            #[cfg(unix)]
+            unsafe {
+                pthread_getspecific(key) as *mut T
+            }
+        };
+
+        if old_ptr.is_null() {
+            None
+        } else {
+            #[cfg(windows)]
+            unsafe {
+                FlsSetValue(key, std::ptr::null_mut());
+            }
+            #[cfg(unix)]
+            unsafe {
+                pthread_setspecific(key, std::ptr::null_mut());
+            }
+
+            Some(unsafe { Box::from_raw(old_ptr) })
+        }
     }
 }
 
@@ -221,49 +248,19 @@ impl<T, F> Drop for Tls<T, F> {
 
 #[cfg(unix)]
 unsafe extern "C" fn tls_destructor<T>(ptr: *mut libc::c_void) {
-    let raw_ptr = ptr as usize;
-    if raw_ptr != 0 && (raw_ptr & OWNED_TAG) != 0 {
-        let actual_ptr = (raw_ptr & !OWNED_TAG) as *mut T;
+    if !ptr.is_null() {
         unsafe {
-            let _ = Box::from_raw(actual_ptr);
+            let _ = Box::from_raw(ptr as *mut T);
         }
     }
 }
 
 #[cfg(windows)]
 unsafe extern "system" fn tls_destructor<T>(ptr: *const std::ffi::c_void) {
-    let raw_ptr = ptr as usize;
-    if raw_ptr != 0 && (raw_ptr & OWNED_TAG) != 0 {
-        let actual_ptr = (raw_ptr & !OWNED_TAG) as *mut T;
+    if !ptr.is_null() {
         unsafe {
-            let _ = Box::from_raw(actual_ptr);
+            let _ = Box::from_raw(ptr as *mut T);
         }
-    }
-}
-
-/// A guard that clears the TLS slot when dropped.
-pub struct TlsGuard<'a, 'b, T, F = fn() -> T>
-where
-    F: Fn() -> T,
-{
-    tls: &'a Tls<T, F>,
-    _marker: PhantomData<&'b mut T>,
-}
-
-impl<'a, 'b, T, F: Fn() -> T> TlsGuard<'a, 'b, T, F> {
-    /// Creates a new `TlsGuard` and sets the TLS value.
-    pub fn new(tls: &'a Tls<T, F>, ptr: &'b mut T) -> Result<Self, TlsError> {
-        tls.set(Some(NonNull::from(ptr)))?;
-        Ok(Self {
-            tls,
-            _marker: PhantomData,
-        })
-    }
-}
-
-impl<T, F: Fn() -> T> Drop for TlsGuard<'_, '_, T, F> {
-    fn drop(&mut self) {
-        let _ = self.tls.set(None);
     }
 }
 
@@ -282,48 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn test_set_override() {
-        let mut val = 100;
-        TEST_TLS.set(Some(NonNull::from(&mut val))).unwrap();
-        TEST_TLS.with(|v| {
-            assert_eq!(*v, 100);
-        });
-
-        TEST_TLS.set(None).unwrap();
-        TEST_TLS.with(|v| {
-            assert_eq!(*v, 42);
-        });
-    }
-
-    #[test]
     fn test_thread_isolation() {
         thread::spawn(move || {
             TEST_TLS.with(|v| {
                 assert_eq!(*v, 42);
             });
-            let mut val = 200;
-            TEST_TLS.set(Some(NonNull::from(&mut val))).unwrap();
-            TEST_TLS.with(|v| {
-                assert_eq!(*v, 200);
-            });
         })
         .join()
         .unwrap();
 
-        TEST_TLS.with(|v| {
-            assert_eq!(*v, 42);
-        });
-    }
-
-    #[test]
-    fn test_guard() {
-        {
-            let mut val = 1000;
-            let _guard = TlsGuard::new(&TEST_TLS, &mut val).unwrap();
-            TEST_TLS.with(|v| {
-                assert_eq!(*v, 1000);
-            });
-        }
         TEST_TLS.with(|v| {
             assert_eq!(*v, 42);
         });

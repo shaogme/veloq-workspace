@@ -20,7 +20,6 @@ pub use context::{
 };
 pub use primitives::GenericCancellationToken;
 pub use shared::{RuntimeShared, RuntimeSharedBase};
-use veloq_tls::TlsGuard;
 
 use primitives::{Signal, create_waker};
 use shared::{Receivers, init_runtime_components};
@@ -132,7 +131,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 let worker_factory_ref = &worker_factory;
 
                 scope.spawn(move || {
-                    let mut context = RuntimeContext {
+                    let context = RuntimeContext {
                         worker_id,
                         local_rx: lrx,
                         remote_rx: rrx,
@@ -140,7 +139,9 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                         rand: FastRand::new(worker_id as u64),
                         extra: worker_factory_ref(worker_id, shared_ref),
                     };
-                    let _guard = TlsGuard::new(&shared_ref.context_tls, &mut context)
+                    shared_ref
+                        .context_tls
+                        .set_owned(context)
                         .expect("failed to set runtime context");
 
                     let init_ctx = WorkerInitContext::new(shared_ref, worker_id, worker_count);
@@ -162,7 +163,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 .pop()
                 .expect("main worker pinned receiver exhausted");
 
-            let mut context = RuntimeContext {
+            let context = RuntimeContext {
                 worker_id: 0,
                 local_rx: lrx0,
                 remote_rx: rrx0,
@@ -170,8 +171,18 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 rand: FastRand::new(0),
                 extra: worker_factory(0, shared_ref),
             };
-            let _guard = TlsGuard::new(&shared_ref.context_tls, &mut context)
+            shared_ref
+                .context_tls
+                .set_owned(context)
                 .expect("failed to set runtime context");
+
+            struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<RuntimeContext<T>>);
+            impl<'a, T> Drop for TlsCleanupGuard<'a, T> {
+                fn drop(&mut self) {
+                    let _ = self.0.take();
+                }
+            }
+            let _cleanup = TlsCleanupGuard(&shared_ref.context_tls);
 
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());
