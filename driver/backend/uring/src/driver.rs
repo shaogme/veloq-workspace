@@ -235,7 +235,7 @@ impl<'a> UringDriver<'a> {
     }
 }
 
-impl Drop for UringDriver<'_> {
+impl<'a> Drop for UringDriver<'a> {
     fn drop(&mut self) {}
 }
 

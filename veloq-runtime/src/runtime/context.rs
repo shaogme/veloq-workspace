@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::shared::RuntimeShared;
 use crate::scope::{AsyncScope, LocalAsyncScope};
-use crate::task::{LocalTaskRef, RuntimeContextExt, SendTaskRef};
+use crate::task::{RuntimeContextExt, SendTaskRef};
 use crate::utils::FastRand;
 
 use veloq_atomic_waker::AtomicWaker;
@@ -71,7 +71,6 @@ impl IdleDecision {
 
 pub struct RuntimeContext<T> {
     pub(crate) worker_id: usize,
-    pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) remote_rx: Receiver<SendTaskRef>,
     pub(crate) pinned_rx: Receiver<SendTaskRef>,
     pub(crate) rand: FastRand,

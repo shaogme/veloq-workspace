@@ -107,7 +107,7 @@ impl RuntimeContextExt for Context<'_> {
     }
 }
 
-pub trait TaskHandleRef: Copy + Send {
+pub trait TaskHandleRef: Copy {
     type Storage: Storage;
     fn header(&self) -> &GenericTaskHeader<Self::Storage>;
     /// # Safety
@@ -311,7 +311,6 @@ macro_rules! define_task_infrastructure {
                 *self
             }
         }
-        unsafe impl Send for $ref_name {}
 
         impl $ref_name {
             /// # Safety
@@ -362,6 +361,8 @@ macro_rules! define_task_infrastructure {
 
 define_task_infrastructure!(LocalTaskRef, LocalStorage);
 define_task_infrastructure!(SendTaskRef, AtomicStorage);
+
+unsafe impl Send for SendTaskRef {}
 
 macro_rules! impl_raw_task_common {
     ($is_local:expr, $storage:ty, $vtable:expr) => {

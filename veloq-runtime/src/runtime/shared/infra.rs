@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -14,11 +16,41 @@ use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicOptionPtr, Storage};
 use crate::utils::{Deque, FastRand, Steal};
 
+pub(crate) struct LocalWorkerState {
+    pub(crate) worker_id: usize,
+    pub(crate) queue: RefCell<VecDeque<LocalTaskRef>>,
+}
+
+pub(crate) static LOCAL_WORKER_STATE: veloq_tls::Tls<LocalWorkerState> =
+    veloq_tls::Tls::new(|| panic!("LocalWorkerState accessed outside of a worker thread"));
+
+impl LocalWorkerState {
+    pub(crate) fn new(worker_id: usize) -> Self {
+        Self {
+            worker_id,
+            queue: RefCell::new(VecDeque::new()),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&self, task: LocalTaskRef) {
+        self.queue.borrow_mut().push_back(task);
+    }
+
+    #[inline]
+    pub(crate) fn pop(&self) -> Option<LocalTaskRef> {
+        self.queue.borrow_mut().pop_front()
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.borrow().is_empty()
+    }
+}
+
 pub(crate) struct WorkerQueue {
-    pub(crate) local_tx: Sender<LocalTaskRef>,
     pub(crate) remote_tx: Sender<SendTaskRef>,
     pub(crate) pinned_tx: Sender<SendTaskRef>,
-    pub(crate) local_count: AtomicUsize,
     pub(crate) pinned_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
     pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
@@ -28,16 +60,13 @@ pub(crate) struct WorkerQueue {
 
 impl WorkerQueue {
     pub(crate) fn new(
-        local_tx: Sender<LocalTaskRef>,
         remote_tx: Sender<SendTaskRef>,
         pinned_tx: Sender<SendTaskRef>,
         queue_capacity: NonZeroUsize,
     ) -> Self {
         Self {
-            local_tx,
             remote_tx,
             pinned_tx,
-            local_count: AtomicUsize::new(0),
             pinned_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),
             deque: Deque::new(queue_capacity),

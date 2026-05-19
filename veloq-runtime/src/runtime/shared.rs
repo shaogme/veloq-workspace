@@ -17,6 +17,8 @@ use crate::utils::storage::Storage;
 
 pub(crate) mod infra;
 
+pub(crate) use infra::LOCAL_WORKER_STATE;
+
 use infra::{
     GlobalInjector, IdleController, IdleStack, NUMAGroup, RuntimeProgressCoordinator,
     TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
@@ -38,7 +40,6 @@ pub struct RuntimeShared<T> {
 }
 
 pub(crate) struct Receivers {
-    pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
     pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
 }
@@ -50,7 +51,6 @@ pub(crate) fn init_runtime_components(
     let worker_count_val = worker_count.get();
     let mut unparkers = Vec::with_capacity(worker_count_val);
     let mut parker_inners = Vec::with_capacity(worker_count_val);
-    let mut local_receivers = Vec::with_capacity(worker_count_val);
     let mut remote_receivers = Vec::with_capacity(worker_count_val);
     let mut pinned_receivers = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
@@ -63,13 +63,11 @@ pub(crate) fn init_runtime_components(
         unparkers.push(Unparker::from_inner(inner.clone()));
         parker_inners.push(inner);
 
-        let (ltx, lrx) = mpsc::channel();
         let (rtx, rrx) = mpsc::channel();
         let (ptx, prx) = mpsc::channel();
-        local_receivers.push(lrx);
         remote_receivers.push(rrx);
         pinned_receivers.push(prx);
-        workers.push(Arc::new(WorkerQueue::new(ltx, rtx, ptx, queue_capacity)));
+        workers.push(Arc::new(WorkerQueue::new(rtx, ptx, queue_capacity)));
         next_idle.push(AtomicUsize::new(usize::MAX));
     }
 
@@ -122,7 +120,6 @@ pub(crate) fn init_runtime_components(
             next_idle,
         },
         Receivers {
-            local_receivers,
             remote_receivers,
             pinned_receivers,
         },
@@ -180,19 +177,16 @@ impl RuntimeSharedBase {
         if task.header().is_completed() {
             return;
         }
-        if task.header().try_mark_queued() {
-            let worker = &self.registry.workers[worker_id];
-            worker.local_count.fetch_add(1, Ordering::Release);
-            if worker.local_tx.send(task).is_err() {
-                worker.local_count.fetch_sub(1, Ordering::Release);
-                if task.header().clear_queued() {
-                    task.header().acknowledge_completion();
-                }
-            } else {
+        LOCAL_WORKER_STATE.with(|state| {
+            assert_eq!(
+                state.worker_id, worker_id,
+                "local task enqueued to a non-owned worker"
+            );
+            if task.header().try_mark_queued() {
                 self.idle.event_count.notify();
-                self.wake_worker(worker_id);
+                state.push(task);
             }
-        }
+        });
     }
 
     pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
@@ -220,16 +214,6 @@ impl RuntimeSharedBase {
     #[inline]
     pub fn wake_worker(&self, worker_id: usize) {
         self.registry.unpark(worker_id);
-    }
-
-    fn pop_local(&self, worker_id: usize, rx: &Receiver<LocalTaskRef>) -> Option<LocalTaskRef> {
-        let res = rx.try_recv().ok();
-        if res.is_some() {
-            self.registry.workers[worker_id]
-                .local_count
-                .fetch_sub(1, Ordering::Release);
-        }
-        res
     }
 
     fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
@@ -284,9 +268,12 @@ impl RuntimeSharedBase {
 
     pub(crate) fn has_work(&self, worker_id: usize) -> bool {
         let worker = &self.registry.workers[worker_id];
+        let local_has_work = LOCAL_WORKER_STATE
+            .try_with(|state| state.worker_id == worker_id && !state.is_empty())
+            .unwrap_or(false);
         worker.lifo.load(Ordering::Acquire).is_some()
             || !worker.deque.is_empty()
-            || worker.local_count.load(Ordering::Acquire) > 0
+            || local_has_work
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 
@@ -411,6 +398,12 @@ impl<T> RuntimeShared<T> {
     ) {
         self.context_tls.with(|ctx| {
             let worker_id = ctx.worker_id;
+            LOCAL_WORKER_STATE.with(|state| {
+                assert_eq!(
+                    state.worker_id, worker_id,
+                    "local worker TLS is bound to a different worker"
+                );
+            });
 
             let worker_tick_hook = self.base.worker_tick_hook;
 
@@ -461,7 +454,9 @@ impl<T> RuntimeShared<T> {
                     progressed = true;
                 }
 
-                if !progressed && let Some(task) = self.base.pop_local(worker_id, &ctx.local_rx) {
+                if !progressed
+                    && let Some(task) = LOCAL_WORKER_STATE.try_with(|state| state.pop()).flatten()
+                {
                     self.base.poll_local_task(worker_id, task);
                     progressed = true;
                 }

@@ -139,9 +139,9 @@ impl<'a> UringDriver<'a> {
         Ok(())
     }
 
-    pub(crate) fn register_files_internal<'a>(
+    pub(crate) fn register_files_internal<'h>(
         &mut self,
-        files: Vec<RegisterFd<'a, UringRawHandle>>,
+        files: Vec<RegisterFd<'h, UringRawHandle>>,
     ) -> UringResult<Vec<IoFd>> {
         self.ensure_file_table_initialized()?;
 

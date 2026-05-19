@@ -1,4 +1,3 @@
-mod cell;
 mod error;
 mod shared;
 mod tls;
@@ -7,7 +6,6 @@ mod tls;
 pub(crate) use shared::{RawKey, ResetGuard, is_sentinel, sentinel_ptr};
 
 // Public exports
-pub use cell::TlsCell;
 pub use error::TlsError;
 pub use tls::Tls;
 

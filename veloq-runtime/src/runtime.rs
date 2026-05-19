@@ -22,6 +22,7 @@ pub use primitives::GenericCancellationToken;
 pub use shared::{RuntimeShared, RuntimeSharedBase};
 
 use primitives::{Signal, create_waker};
+use shared::infra::{LOCAL_WORKER_STATE, LocalWorkerState};
 use shared::{Receivers, init_runtime_components};
 
 pub struct Runtime<'ctx, I, T, WF> {
@@ -85,6 +86,13 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
         I: AsyncFn(WorkerInitContext<'ctx, T>) -> () + Send + Sync,
         F: AsyncFnOnce(RuntimeScopeContext<'ctx, T>) -> R,
     {
+        struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<T>);
+        impl<'a, T> Drop for TlsCleanupGuard<'a, T> {
+            fn drop(&mut self) {
+                let _ = self.0.take();
+            }
+        }
+
         self.shared_ptr = NonNull::from(&self.shared);
         let shared_ref = self.shared_ref();
         let ctx = self.runtime_ctx();
@@ -96,7 +104,6 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
             .take()
             .expect("worker_factory already taken");
         let receivers = self.receivers.take().expect("receivers already taken");
-        let mut local_receivers = receivers.local_receivers;
         let mut remote_receivers = receivers.remote_receivers;
         let mut pinned_receivers = receivers.pinned_receivers;
 
@@ -110,7 +117,6 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
             let _guard = ShutdownGuard(shared_ref);
 
             for worker_id in (1..worker_count.get()).rev() {
-                let lrx = local_receivers.pop().expect("local receivers exhausted");
                 let rrx = remote_receivers.pop().expect("remote receivers exhausted");
                 let prx = pinned_receivers.pop().expect("pinned receivers exhausted");
                 let worker_init_ref = &worker_init;
@@ -119,7 +125,6 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 scope.spawn(move || {
                     let context = RuntimeContext {
                         worker_id,
-                        local_rx: lrx,
                         remote_rx: rrx,
                         pinned_rx: prx,
                         rand: FastRand::new(worker_id as u64),
@@ -129,6 +134,11 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                         .context_tls
                         .set_owned(context)
                         .expect("failed to set runtime context");
+                    LOCAL_WORKER_STATE
+                        .set_owned(LocalWorkerState::new(worker_id))
+                        .expect("failed to set local worker state");
+                    let _context_cleanup = TlsCleanupGuard(&shared_ref.context_tls);
+                    let _local_cleanup = TlsCleanupGuard(&LOCAL_WORKER_STATE);
 
                     let init_ctx = WorkerInitContext::new(shared_ref, worker_id, worker_count);
                     let init_fut = std::pin::pin!(worker_init_ref(init_ctx));
@@ -139,9 +149,6 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 });
             }
 
-            let lrx0 = local_receivers
-                .pop()
-                .expect("main worker local receiver exhausted");
             let rrx0 = remote_receivers
                 .pop()
                 .expect("main worker remote receiver exhausted");
@@ -151,7 +158,6 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
 
             let context = RuntimeContext {
                 worker_id: 0,
-                local_rx: lrx0,
                 remote_rx: rrx0,
                 pinned_rx: prx0,
                 rand: FastRand::new(0),
@@ -161,14 +167,11 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 .context_tls
                 .set_owned(context)
                 .expect("failed to set runtime context");
-
-            struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<RuntimeContext<T>>);
-            impl<'a, T> Drop for TlsCleanupGuard<'a, T> {
-                fn drop(&mut self) {
-                    let _ = self.0.take();
-                }
-            }
-            let _cleanup = TlsCleanupGuard(&shared_ref.context_tls);
+            LOCAL_WORKER_STATE
+                .set_owned(LocalWorkerState::new(0))
+                .expect("failed to set local worker state");
+            let _context_cleanup = TlsCleanupGuard(&shared_ref.context_tls);
+            let _local_cleanup = TlsCleanupGuard(&LOCAL_WORKER_STATE);
 
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());

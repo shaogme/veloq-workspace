@@ -11,3 +11,4 @@ pub use config::{
 pub use driver::{UringDriver, UringOpState};
 pub use error::{UringError, UringResult};
 pub use net::{Socket, socket_addr_to_storage, to_socket_addr};
+pub use op::{UringOp, UringUserPayload};
