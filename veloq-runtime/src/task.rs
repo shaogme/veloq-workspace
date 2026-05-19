@@ -88,7 +88,9 @@ impl RuntimeContextExt for Context<'_> {
                 let ptr = h.scope_ptr.load(Ordering::Acquire)?;
                 let vtable_ptr = h.scope_vtable.load(Ordering::Acquire)?;
                 let scope_ref = ScopeCompletionRef::from_parts(ptr, vtable_ptr.as_ref());
-                return Some(scope_ref.into_any());
+                let result = scope_ref.clone();
+                std::mem::forget(scope_ref);
+                return Some(result.into_any());
             }
             if let Some(h) =
                 LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
@@ -96,7 +98,9 @@ impl RuntimeContextExt for Context<'_> {
                 let ptr = h.scope_ptr.load(Ordering::Acquire)?;
                 let vtable_ptr = h.scope_vtable.load(Ordering::Acquire)?;
                 let scope_ref = ScopeCompletionRef::from_parts(ptr, vtable_ptr.as_ref());
-                return Some(scope_ref.into_any());
+                let result = scope_ref.clone();
+                std::mem::forget(scope_ref);
+                return Some(result.into_any());
             }
             None
         }

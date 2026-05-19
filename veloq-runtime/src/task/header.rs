@@ -307,13 +307,8 @@ impl<S: Storage> GenericTaskHeader<S> {
         waker: &'a Waker,
         vtable: &'static RawWakerVTable,
     ) -> Option<&'a Self> {
-        struct RawWakerLayout {
-            data: *const (),
-            vtable: *const RawWakerVTable,
-        }
-        let raw = unsafe { &*(waker as *const Waker as *const RawWakerLayout) };
-        if std::ptr::eq(raw.vtable, vtable) {
-            unsafe { Some(&*(raw.data as *const Self)) }
+        if std::ptr::eq(waker.vtable(), vtable) {
+            unsafe { Some(&*(waker.data() as *const Self)) }
         } else {
             None
         }
