@@ -223,7 +223,9 @@ pub(crate) fn dispatch_routed<
                 job();
             }));
 
-            if result.is_err() {
+            if let Err(panic_err) = result {
+                completion_err.report_panic(panic_err);
+                completion_err.cancel();
                 state_err.fail(TaskError::Panic);
                 completion_err.task_done();
             }

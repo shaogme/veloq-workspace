@@ -563,18 +563,12 @@ impl<S: Storage, O: Ownership> std::future::Future for CancelledFuture<S, O> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         if self.token.is_cancelled() {
-            if self.token.inner.cancelled.load(Ordering::Relaxed) == 0 {
-                self.token.cancel();
-            }
             return std::task::Poll::Ready(());
         }
 
         self.token.register_waker(cx.waker());
 
         if self.token.is_cancelled() {
-            if self.token.inner.cancelled.load(Ordering::Relaxed) == 0 {
-                self.token.cancel();
-            }
             std::task::Poll::Ready(())
         } else {
             std::task::Poll::Pending

@@ -140,6 +140,14 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 }
 
+impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
+    fn drop(&mut self) {
+        if let Some(panic_info) = self.panic_info.lock().take() {
+            std::panic::resume_unwind(panic_info);
+        }
+    }
+}
+
 pub trait ScopeProvider<'ctx, T> {
     type Storage: Storage;
     type Ownership: Ownership;
