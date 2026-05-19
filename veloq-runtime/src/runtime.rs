@@ -22,7 +22,6 @@ pub use primitives::GenericCancellationToken;
 pub use shared::{RuntimeShared, RuntimeSharedBase};
 
 use primitives::{Signal, create_waker};
-use shared::infra::{LOCAL_WORKER_STATE, LocalWorkerState};
 use shared::{Receivers, init_runtime_components};
 
 pub struct Runtime<'ctx, I, T, WF> {
@@ -128,17 +127,18 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                         remote_rx: rrx,
                         pinned_rx: prx,
                         rand: FastRand::new(worker_id as u64),
-                        extra: worker_factory_ref(worker_id, shared_ref),
+                        local_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
                     };
                     shared_ref
-                        .context_tls
+                        .tls
                         .set_owned(context)
                         .expect("failed to set runtime context");
-                    LOCAL_WORKER_STATE
-                        .set_owned(LocalWorkerState::new(worker_id))
-                        .expect("failed to set local worker state");
-                    let _context_cleanup = TlsCleanupGuard(&shared_ref.context_tls);
-                    let _local_cleanup = TlsCleanupGuard(&LOCAL_WORKER_STATE);
+                    shared_ref
+                        .extra_tls
+                        .set_owned(worker_factory_ref(worker_id, shared_ref))
+                        .expect("failed to set extra TLS");
+                    let _tls_cleanup = TlsCleanupGuard(&shared_ref.tls);
+                    let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
 
                     let init_ctx = WorkerInitContext::new(shared_ref, worker_id, worker_count);
                     let init_fut = std::pin::pin!(worker_init_ref(init_ctx));
@@ -161,17 +161,18 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 remote_rx: rrx0,
                 pinned_rx: prx0,
                 rand: FastRand::new(0),
-                extra: worker_factory(0, shared_ref),
+                local_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
             };
             shared_ref
-                .context_tls
+                .tls
                 .set_owned(context)
                 .expect("failed to set runtime context");
-            LOCAL_WORKER_STATE
-                .set_owned(LocalWorkerState::new(0))
-                .expect("failed to set local worker state");
-            let _context_cleanup = TlsCleanupGuard(&shared_ref.context_tls);
-            let _local_cleanup = TlsCleanupGuard(&LOCAL_WORKER_STATE);
+            shared_ref
+                .extra_tls
+                .set_owned(worker_factory(0, shared_ref))
+                .expect("failed to set extra TLS");
+            let _tls_cleanup = TlsCleanupGuard(&shared_ref.tls);
+            let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
 
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());

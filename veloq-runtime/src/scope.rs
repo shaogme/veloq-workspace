@@ -237,7 +237,7 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
         let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
         task_ref
             .header()
-            .set_runtime_info(Some(&self.context.shared.base), worker_id);
+            .set_runtime_info(&self.context.shared.base, worker_id);
         self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
@@ -273,7 +273,7 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
         task_ref
             .header()
-            .set_runtime_info(Some(&self.context.shared.base), worker_id);
+            .set_runtime_info(&self.context.shared.base, worker_id);
         self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
@@ -334,7 +334,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
         let header = task_ref.header();
-        header.set_runtime_info(Some(&self.context.shared.base), worker_id);
+        header.set_runtime_info(&self.context.shared.base, worker_id);
         self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(
@@ -380,7 +380,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
 
                 task.header().set_pinned();
                 task.header()
-                    .set_runtime_info(Some(&runtime.base), worker_id);
+                    .set_runtime_info(&runtime.base, worker_id);
                 task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(completion.clone()));
 
                 let task_ref = unsafe { SendTaskRef::from_concrete(task) };
@@ -445,7 +445,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
         task_ref
             .header()
-            .set_runtime_info(Some(&self.context.shared.base), worker_id);
+            .set_runtime_info(&self.context.shared.base, worker_id);
         self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(

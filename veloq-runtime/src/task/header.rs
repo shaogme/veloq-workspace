@@ -236,18 +236,13 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
     pub fn set_runtime_info(
         &self,
-        runtime: Option<&std::sync::Arc<crate::runtime::shared::RuntimeSharedBase>>,
+        runtime: &crate::runtime::shared::RuntimeSharedBase,
         worker_id: usize,
     ) {
-        if let Some(runtime) = runtime {
-            let arc = runtime.clone();
-            self.runtime_ptr.store(
-                NonNull::new(std::sync::Arc::into_raw(arc) as *mut _),
-                Ordering::Release,
-            );
-        } else {
-            self.runtime_ptr.store(None, Ordering::Release);
-        }
+       self.runtime_ptr.store(
+            NonNull::new(runtime as *const _ as *mut _),
+            Ordering::Release,
+        );
         self.worker_id.store(worker_id, Ordering::Release);
     }
 

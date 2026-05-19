@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
@@ -9,7 +11,7 @@ use std::time::Duration;
 
 use super::shared::RuntimeShared;
 use crate::scope::{AsyncScope, LocalAsyncScope};
-use crate::task::{RuntimeContextExt, SendTaskRef};
+use crate::task::{LocalTaskRef, RuntimeContextExt, SendTaskRef};
 use crate::utils::FastRand;
 
 use veloq_atomic_waker::AtomicWaker;
@@ -69,12 +71,30 @@ impl IdleDecision {
     }
 }
 
-pub struct RuntimeContext<T> {
+/// Worker 线程的核心运行时上下文，不含用户自定义的 extra 状态（已拆分到 `extra_tls`）。
+pub struct RuntimeContext {
     pub(crate) worker_id: usize,
     pub(crate) remote_rx: Receiver<SendTaskRef>,
     pub(crate) pinned_rx: Receiver<SendTaskRef>,
     pub(crate) rand: FastRand,
-    pub extra: T,
+    pub(crate) local_queue: RefCell<VecDeque<LocalTaskRef>>,
+}
+
+impl RuntimeContext {
+    #[inline]
+    pub(crate) fn push_local(&self, task: LocalTaskRef) {
+        self.local_queue.borrow_mut().push_back(task);
+    }
+
+    #[inline]
+    pub(crate) fn pop_local(&self) -> Option<LocalTaskRef> {
+        self.local_queue.borrow_mut().pop_front()
+    }
+
+    #[inline]
+    pub(crate) fn is_local_empty(&self) -> bool {
+        self.local_queue.borrow().is_empty()
+    }
 }
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
@@ -190,7 +210,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
         task.header.set_pinned();
         task.header
-            .set_runtime_info(Some(&self.shared.base), worker_id);
+            .set_runtime_info(&self.shared.base, worker_id);
 
         let ptr = Box::into_raw(task);
         let task_ref = unsafe { crate::task::SendTaskRef::from_concrete(ptr) };
@@ -258,7 +278,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Returns the current worker id.
     pub fn worker_id(&self) -> usize {
         self.shared
-            .context_tls
+            .tls
             .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX)
     }
@@ -325,9 +345,9 @@ impl<'ctx, T> WorkerInitContext<'ctx, T> {
     #[inline]
     pub fn extra<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         self.shared
-            .context_tls
-            .try_with(|ctx| f(&ctx.extra))
-            .expect("RuntimeContext accessed outside of a worker thread")
+            .extra_tls
+            .try_with(|extra| f(extra))
+            .expect("extra TLS accessed outside of a worker thread")
     }
 }
 

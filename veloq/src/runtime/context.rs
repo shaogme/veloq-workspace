@@ -52,8 +52,8 @@ impl<'ctx> DriverRegistrar<'ctx> {
 
     fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
         self.shared
-            .context_tls
-            .try_with(|ctx| f(&ctx.extra))
+            .extra_tls
+            .try_with(|extra| f(extra))
             .expect("RuntimeContext accessed outside of a worker thread")
     }
 
@@ -223,8 +223,8 @@ impl<'ctx> RuntimeContext<'ctx> {
     fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
         self.scope
             .shared()
-            .context_tls
-            .try_with(|ctx| f(&ctx.extra))
+            .extra_tls
+            .try_with(|extra| f(extra))
             .expect("RuntimeContext accessed outside of a worker thread")
     }
 
@@ -361,9 +361,7 @@ impl<'ctx> RuntimeContext<'ctx> {
 }
 
 pub fn poll_current_driver<'ctx>(shared: &RuntimeShared<WorkerState<'ctx>>) -> IdleDecision {
-    shared.context_tls.with(|ctx| {
-        let extra = &ctx.extra;
-
+    shared.extra_tls.with(|extra| {
         // sync registrar
         extra.registrar.sync_to_driver();
 
@@ -399,8 +397,7 @@ pub(crate) fn submit_control_task<'ctx>(
 
         fn poll_raw(&self, _worker_id: usize) -> bool {
             let shared = unsafe { &*self.shared_ptr };
-            let _ = shared.context_tls.try_with(|ctx| {
-                let extra = &ctx.extra;
+            let _ = shared.extra_tls.try_with(|extra| {
                 let mut driver = extra.driver.borrow_mut();
                 let _ = driver.unregister_files(vec![self.fd]);
             });
@@ -444,7 +441,7 @@ pub(crate) fn submit_control_task<'ctx>(
     });
 
     task.header.set_pinned();
-    task.header.set_runtime_info(Some(&shared.base), worker_id);
+    task.header.set_runtime_info(&shared.base, worker_id);
 
     let ptr = Box::into_raw(task);
     let task_ref = unsafe { veloq_runtime::task::SendTaskRef::from_concrete(ptr) };

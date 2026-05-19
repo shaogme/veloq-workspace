@@ -270,7 +270,7 @@ pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
 
     let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
     let header = task_ref.header();
-    header.set_runtime_info(Some(&runtime.base), worker_id);
+    header.set_runtime_info(&runtime.base, worker_id);
 
     if !runtime.enqueue_pinned(worker_id, task_ref) {
         unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };

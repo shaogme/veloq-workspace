@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -11,42 +9,10 @@ use crate::runtime::context::{IdleDecision, IdleWaitStrategy};
 use crate::runtime::primitives::{EventCount, Parker, ParkerInner, Unparker};
 use crate::runtime::shared::RuntimeShared;
 use crate::scope::GenericScopeCompletion;
-use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
+use crate::task::{SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicOptionPtr, Storage};
 use crate::utils::{Deque, FastRand, Steal};
-
-pub(crate) struct LocalWorkerState {
-    pub(crate) worker_id: usize,
-    pub(crate) queue: RefCell<VecDeque<LocalTaskRef>>,
-}
-
-pub(crate) static LOCAL_WORKER_STATE: veloq_tls::Tls<LocalWorkerState> =
-    veloq_tls::Tls::new(|| panic!("LocalWorkerState accessed outside of a worker thread"));
-
-impl LocalWorkerState {
-    pub(crate) fn new(worker_id: usize) -> Self {
-        Self {
-            worker_id,
-            queue: RefCell::new(VecDeque::new()),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn push(&self, task: LocalTaskRef) {
-        self.queue.borrow_mut().push_back(task);
-    }
-
-    #[inline]
-    pub(crate) fn pop(&self) -> Option<LocalTaskRef> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.queue.borrow().is_empty()
-    }
-}
 
 pub(crate) struct WorkerQueue {
     pub(crate) remote_tx: Sender<SendTaskRef>,
@@ -426,7 +392,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     ) -> bool {
         let base = &self.shared.base;
         base.idle.event_count.load() != seq
-            || base.has_work(self.worker_id)
+            || self.shared.has_work(self.worker_id)
             || base.shutdown.load(std::sync::atomic::Ordering::Acquire)
             || completion.map(|c| c.is_done()).unwrap_or(false)
     }
