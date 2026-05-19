@@ -14,20 +14,20 @@ use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicOptionPtr, Storage};
 use crate::utils::{Deque, FastRand, Steal};
 
-pub(crate) struct WorkerQueue {
-    pub(crate) remote_tx: Sender<SendTaskRef>,
-    pub(crate) pinned_tx: Sender<SendTaskRef>,
+pub(crate) struct WorkerQueue<'ctx> {
+    pub(crate) remote_tx: Sender<SendTaskRef<'ctx>>,
+    pub(crate) pinned_tx: Sender<SendTaskRef<'ctx>>,
     pub(crate) pinned_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
-    pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
+    pub(crate) lifo: AtomicOptionPtr<TaskHeader<'ctx>>,
     /// Chase-Lev Deque for work-stealing
-    pub(crate) deque: Deque<SendTaskRef>,
+    pub(crate) deque: Deque<SendTaskRef<'ctx>>,
 }
 
-impl WorkerQueue {
+impl<'ctx> WorkerQueue<'ctx> {
     pub(crate) fn new(
-        remote_tx: Sender<SendTaskRef>,
-        pinned_tx: Sender<SendTaskRef>,
+        remote_tx: Sender<SendTaskRef<'ctx>>,
+        pinned_tx: Sender<SendTaskRef<'ctx>>,
         queue_capacity: NonZeroUsize,
     ) -> Self {
         Self {
@@ -145,13 +145,13 @@ impl AtomicBitset {
     }
 }
 
-pub(crate) struct WorkerRegistry {
-    pub(crate) workers: Box<[Arc<WorkerQueue>]>,
+pub(crate) struct WorkerRegistry<'ctx> {
+    pub(crate) workers: Box<[Arc<WorkerQueue<'ctx>>]>,
     pub(crate) unparkers: Box<[Unparker]>,
     pub(crate) parker_inners: Box<[Arc<ParkerInner>]>,
 }
 
-impl WorkerRegistry {
+impl<'ctx> WorkerRegistry<'ctx> {
     #[inline]
     pub(crate) fn unpark(&self, worker_id: usize) {
         self.unparkers[worker_id].unpark();
@@ -228,7 +228,7 @@ impl GlobalInjector {
         }
     }
 
-    pub(crate) fn pop(&self) -> Option<SendTaskRef> {
+    pub(crate) fn pop<'ctx>(&self) -> Option<SendTaskRef<'ctx>> {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
             if head == Self::EMPTY {
@@ -266,17 +266,17 @@ pub(crate) struct TaskScheduler {
 }
 
 impl TaskScheduler {
-    pub(crate) fn pop_global(&self) -> Option<SendTaskRef> {
+    pub(crate) fn pop_global<'ctx>(&self) -> Option<SendTaskRef<'ctx>> {
         self.injector.pop()
     }
 
-    pub(crate) fn steal_send(
+    pub(crate) fn steal_send<'ctx>(
         &self,
         thief_id: usize,
-        registry: &WorkerRegistry,
+        registry: &WorkerRegistry<'ctx>,
         topo: &TopologyContext,
         rand: &FastRand,
-    ) -> Option<SendTaskRef> {
+    ) -> Option<SendTaskRef<'ctx>> {
         let thief_worker = &registry.workers[thief_id];
         let num_workers = registry.workers.len();
         if num_workers <= 1 {
@@ -338,13 +338,13 @@ pub(crate) struct IdleController {
     pub(crate) event_count: EventCount,
 }
 
-pub(crate) struct RuntimeProgressCoordinator<'a, T> {
-    shared: &'a RuntimeShared<T>,
+pub(crate) struct RuntimeProgressCoordinator<'a, 'ctx, T> {
+    shared: &'a RuntimeShared<'ctx, T>,
     worker_id: usize,
 }
 
-impl<'a, T> RuntimeProgressCoordinator<'a, T> {
-    pub(crate) fn new(shared: &'a RuntimeShared<T>, worker_id: usize) -> Self {
+impl<'a, 'ctx, T> RuntimeProgressCoordinator<'a, 'ctx, T> {
+    pub(crate) fn new(shared: &'a RuntimeShared<'ctx, T>, worker_id: usize) -> Self {
         Self { shared, worker_id }
     }
 

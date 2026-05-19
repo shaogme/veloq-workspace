@@ -22,35 +22,35 @@ use infra::{
     TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
 };
 
-pub struct RuntimeSharedBase {
-    pub(crate) registry: WorkerRegistry,
+pub struct RuntimeSharedBase<'ctx> {
+    pub(crate) registry: WorkerRegistry<'ctx>,
     pub(crate) topo: TopologyContext,
     pub(crate) scheduler: TaskScheduler,
     pub(crate) idle: IdleController,
     pub(crate) shutdown: AtomicBool,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
-    pub(crate) enqueue_local_fn: fn(&RuntimeSharedBase, usize, LocalTaskRef),
-    pub(crate) tls_ptr: std::sync::atomic::AtomicUsize,
+    /// Worker 线程核心上下文（不含用户 extra 状态）。
+    pub(crate) tls: veloq_tls::Tls<RuntimeContext<'ctx>>,
 }
 
-pub struct RuntimeShared<T> {
-    pub base: RuntimeSharedBase,
-    pub(crate) idle_hook: Option<IdleHook<T>>,
-    /// Worker 线程核心上下文（不含用户 extra 状态）。
-    pub tls: veloq_tls::Tls<RuntimeContext>,
+pub struct RuntimeShared<'ctx, T> {
+    pub base: RuntimeSharedBase<'ctx>,
+    pub(crate) idle_hook: Option<IdleHook<'ctx, T>>,
     /// Worker 线程用户自定义 extra 状态。
     pub extra_tls: veloq_tls::Tls<T>,
 }
 
-pub(crate) struct Receivers {
-    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
-    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
+unsafe impl<'ctx, T> Send for RuntimeShared<'ctx, T> {}
+
+pub(crate) struct Receivers<'ctx> {
+    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef<'ctx>>>,
+    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef<'ctx>>>,
 }
 
-pub(crate) fn init_runtime_components(
+pub(crate) fn init_runtime_components<'ctx>(
     worker_count: NonZeroUsize,
     queue_capacity: NonZeroUsize,
-) -> (WorkerRegistry, TopologyContext, Receivers) {
+) -> (WorkerRegistry<'ctx>, TopologyContext, Receivers<'ctx>) {
     let worker_count_val = worker_count.get();
     let mut unparkers = Vec::with_capacity(worker_count_val);
     let mut parker_inners = Vec::with_capacity(worker_count_val);
@@ -129,42 +129,19 @@ pub(crate) fn init_runtime_components(
     )
 }
 
-/// 为 `RuntimeSharedBase::enqueue_local_fn` 提供的单态化实现。
-///
-/// 通过 `tls_ptr` 还原出 `&Tls<RuntimeContext>`，将任务推入当前线程的本地队列。
-fn enqueue_local_impl(base: &RuntimeSharedBase, worker_id: usize, task: LocalTaskRef) {
-    if task.header().is_completed() {
-        return;
-    }
-    let raw = base.tls_ptr.load(Ordering::Acquire);
-    debug_assert_ne!(raw, 0, "tls_ptr not initialized");
-    // Safety: 见 `RuntimeSharedBase::tls_ptr` 文档。
-    let tls = unsafe { &*(raw as *const veloq_tls::Tls<RuntimeContext>) };
-    tls.with(|ctx| {
-        assert_eq!(
-            ctx.worker_id, worker_id,
-            "local task enqueued to a non-owned worker"
-        );
-        if task.header().try_mark_queued() {
-            base.idle.event_count.notify();
-            ctx.push_local(task);
-        }
-    });
-}
-
-impl<T> RuntimeShared<T> {
-    pub fn base(&self) -> &RuntimeSharedBase {
+impl<'ctx, T> RuntimeShared<'ctx, T> {
+    pub fn base(&self) -> &RuntimeSharedBase<'ctx> {
         &self.base
     }
 
     pub(crate) fn new(
-        registry: WorkerRegistry,
+        registry: WorkerRegistry<'ctx>,
         topo: TopologyContext,
         worker_count: NonZeroUsize,
-        idle_hook: Option<IdleHook<T>>,
+        idle_hook: Option<IdleHook<'ctx, T>>,
         worker_tick_hook: Option<WorkerTickHook>,
     ) -> Self {
-        let shared = Self {
+        Self {
             base: RuntimeSharedBase {
                 registry,
                 topo,
@@ -179,26 +156,19 @@ impl<T> RuntimeShared<T> {
                 },
                 shutdown: AtomicBool::new(false),
                 worker_tick_hook,
-                enqueue_local_fn: enqueue_local_impl,
-                tls_ptr: AtomicUsize::new(0),
+                tls: veloq_tls::Tls::new(|| {
+                    panic!("RuntimeContext accessed outside of a worker thread")
+                }),
             },
             idle_hook,
-            tls: veloq_tls::Tls::new(|| {
-                panic!("RuntimeContext accessed outside of a worker thread")
-            }),
             extra_tls: veloq_tls::Tls::new(|| {
                 panic!("extra TLS accessed outside of a worker thread")
             }),
-        };
-        // 将 tls 字段地址写入 base.tls_ptr，供 enqueue_local_impl 使用。
-        // Safety: shared 在 block_on 期间存活，base 不会在 tls 之前析构。
-        let tls_addr = &shared.tls as *const veloq_tls::Tls<RuntimeContext> as usize;
-        shared.base.tls_ptr.store(tls_addr, Ordering::Release);
-        shared
+        }
     }
 }
 
-impl RuntimeSharedBase {
+impl<'ctx> RuntimeSharedBase<'ctx> {
     pub fn unparkers(&self) -> Box<[Unparker]> {
         self.registry.unparkers.clone()
     }
@@ -209,12 +179,24 @@ impl RuntimeSharedBase {
             .expect("runtime must have at least one worker")
     }
 
-    /// 将本地任务入队当前线程的本地队列（通过注入的函数指针，无需泛型参数）。
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
-        (self.enqueue_local_fn)(self, worker_id, task);
+    /// 将本地任务入队当前线程的本地队列。
+    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'ctx>) {
+        if task.header().is_completed() {
+            return;
+        }
+        self.tls.with(|ctx| {
+            assert_eq!(
+                ctx.worker_id, worker_id,
+                "local task enqueued to a non-owned worker"
+            );
+            if task.header().try_mark_queued() {
+                self.idle.event_count.notify();
+                ctx.push_local(task);
+            }
+        });
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'ctx>) -> bool {
         if task.header().is_completed() {
             return false;
         }
@@ -241,7 +223,7 @@ impl RuntimeSharedBase {
         self.registry.unpark(worker_id);
     }
 
-    fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
+    fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef<'ctx>> {
         let worker = &self.registry.workers[worker_id];
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
@@ -249,7 +231,11 @@ impl RuntimeSharedBase {
         worker.deque.pop()
     }
 
-    fn pop_pinned(&self, worker_id: usize, rx: &Receiver<SendTaskRef>) -> Option<SendTaskRef> {
+    fn pop_pinned(
+        &self,
+        worker_id: usize,
+        rx: &Receiver<SendTaskRef<'ctx>>,
+    ) -> Option<SendTaskRef<'ctx>> {
         let res = rx.try_recv().ok();
         if res.is_some() {
             self.registry.workers[worker_id]
@@ -259,16 +245,16 @@ impl RuntimeSharedBase {
         res
     }
 
-    fn pop_global(&self) -> Option<SendTaskRef> {
+    fn pop_global(&self) -> Option<SendTaskRef<'ctx>> {
         self.scheduler.pop_global()
     }
 
-    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef> {
+    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef<'ctx>> {
         self.scheduler
             .steal_send(thief_id, &self.registry, &self.topo, rand)
     }
 
-    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
+    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef<'ctx>) {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
         } else {
@@ -276,7 +262,7 @@ impl RuntimeSharedBase {
         }
     }
 
-    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) {
+    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef<'ctx>) {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
         } else {
@@ -291,7 +277,7 @@ impl RuntimeSharedBase {
         }
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'ctx>) {
         if task.header().is_completed() {
             return;
         }
@@ -308,9 +294,10 @@ impl RuntimeSharedBase {
     }
 }
 
-impl<T> RuntimeShared<T> {
+impl<'ctx, T> RuntimeShared<'ctx, T> {
     pub fn worker_id(&self) -> usize {
-        self.tls
+        self.base
+            .tls
             .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX)
     }
@@ -321,6 +308,7 @@ impl<T> RuntimeShared<T> {
 
     pub fn choose_worker(&self) -> usize {
         let current = self
+            .base
             .tls
             .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX);
@@ -334,25 +322,14 @@ impl<T> RuntimeShared<T> {
         self.base.worker_count()
     }
 
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
-        if task.header().is_completed() {
-            return;
-        }
-        self.tls.with(|ctx| {
-            assert_eq!(
-                ctx.worker_id, worker_id,
-                "local task enqueued to a non-owned worker"
-            );
-            if task.header().try_mark_queued() {
-                self.base.idle.event_count.notify();
-                ctx.push_local(task);
-            }
-        });
+    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'ctx>) {
+        self.base.enqueue_local(worker_id, task);
     }
 
     pub(crate) fn has_work(&self, worker_id: usize) -> bool {
         let worker = &self.base.registry.workers[worker_id];
         let local_has_work = self
+            .base
             .tls
             .try_with(|ctx| ctx.worker_id == worker_id && !ctx.is_local_empty())
             .unwrap_or(false);
@@ -362,7 +339,7 @@ impl<T> RuntimeShared<T> {
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'ctx>) -> bool {
         self.base.enqueue_pinned(worker_id, task)
     }
 
@@ -371,7 +348,7 @@ impl<T> RuntimeShared<T> {
         self.base.wake_worker(worker_id)
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'ctx>) {
         if task.header().is_completed() {
             return;
         }
@@ -379,6 +356,7 @@ impl<T> RuntimeShared<T> {
         let worker_id = worker_id % worker_count;
 
         let current = self
+            .base
             .tls
             .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX);
@@ -434,7 +412,7 @@ impl<T> RuntimeShared<T> {
         completion: Option<&GenericScopeCompletion<S, O>>,
         mut init_fut: Option<Pin<&mut F>>,
     ) {
-        self.tls.with(|ctx| {
+        self.base.tls.with(move |ctx| {
             let worker_id = ctx.worker_id;
 
             let worker_tick_hook = self.base.worker_tick_hook;

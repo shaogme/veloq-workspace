@@ -9,11 +9,11 @@ use veloq::runtime::Runtime;
 use veloq::sync::mpsc;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
-fn create_runtime() -> Runtime<UniformSlot> {
+fn create_runtime<'ctx>() -> Runtime<'ctx, UniformSlot> {
     create_runtime_with_workers(1)
 }
 
-fn create_runtime_with_workers(worker_threads: usize) -> Runtime<UniformSlot> {
+fn create_runtime_with_workers<'ctx>(worker_threads: usize) -> Runtime<'ctx, UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
         .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
         .build()

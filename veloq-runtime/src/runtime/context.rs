@@ -72,22 +72,22 @@ impl IdleDecision {
 }
 
 /// Worker 线程的核心运行时上下文，不含用户自定义的 extra 状态（已拆分到 `extra_tls`）。
-pub struct RuntimeContext {
+pub struct RuntimeContext<'ctx> {
     pub(crate) worker_id: usize,
-    pub(crate) remote_rx: Receiver<SendTaskRef>,
-    pub(crate) pinned_rx: Receiver<SendTaskRef>,
+    pub(crate) remote_rx: Receiver<SendTaskRef<'ctx>>,
+    pub(crate) pinned_rx: Receiver<SendTaskRef<'ctx>>,
     pub(crate) rand: FastRand,
-    pub(crate) local_queue: RefCell<VecDeque<LocalTaskRef>>,
+    pub(crate) local_queue: RefCell<VecDeque<LocalTaskRef<'ctx>>>,
 }
 
-impl RuntimeContext {
+impl<'ctx> RuntimeContext<'ctx> {
     #[inline]
-    pub(crate) fn push_local(&self, task: LocalTaskRef) {
+    pub(crate) fn push_local(&self, task: LocalTaskRef<'ctx>) {
         self.local_queue.borrow_mut().push_back(task);
     }
 
     #[inline]
-    pub(crate) fn pop_local(&self) -> Option<LocalTaskRef> {
+    pub(crate) fn pop_local(&self) -> Option<LocalTaskRef<'ctx>> {
         self.local_queue.borrow_mut().pop_front()
     }
 
@@ -99,7 +99,7 @@ impl RuntimeContext {
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
 pub struct RuntimeScopeContext<'ctx, T> {
-    pub(crate) shared: &'ctx RuntimeShared<T>,
+    pub(crate) shared: &'ctx RuntimeShared<'ctx, T>,
 }
 
 impl<'ctx, T> Copy for RuntimeScopeContext<'ctx, T> {}
@@ -130,7 +130,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     }
 
     /// Returns the shared runtime state.
-    pub fn shared(&self) -> &'ctx RuntimeShared<T> {
+    pub fn shared(&self) -> &'ctx RuntimeShared<'ctx, T> {
         self.shared
     }
 
@@ -140,19 +140,19 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         job: F,
     ) -> std::io::Result<RoutedFuture<'_, Fut>>
     where
-        F: FnOnce() -> Fut + Send,
-        Fut: Future + Send,
+        F: FnOnce() -> Fut + Send + 'ctx,
+        Fut: Future + Send + 'ctx,
     {
         let slot = RouteCell::new();
         let slot_for_job = slot.clone();
 
-        struct RouteJobTask<F, Fut> {
-            header: crate::task::TaskHeader,
+        struct RouteJobTask<'ctx, F, Fut> {
+            header: crate::task::TaskHeader<'ctx>,
             job: core::cell::UnsafeCell<Option<F>>,
             slot: Arc<RouteCell<Fut>>,
         }
 
-        impl<F, Fut> crate::task::RawTask for RouteJobTask<F, Fut>
+        impl<'ctx, F, Fut> crate::task::RawTask<'ctx> for RouteJobTask<'ctx, F, Fut>
         where
             F: FnOnce() -> Fut + Send,
             Fut: std::future::Future + Send,
@@ -174,12 +174,12 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
                 true
             }
 
-            fn header(&self) -> &crate::task::GenericTaskHeader<Self::Storage> {
+            fn header(&self) -> &crate::task::GenericTaskHeader<'ctx, Self::Storage> {
                 &self.header
             }
         }
 
-        impl<F, Fut> RouteJobTask<F, Fut>
+        impl<'ctx, F, Fut> RouteJobTask<'ctx, F, Fut>
         where
             F: FnOnce() -> Fut + Send,
             Fut: std::future::Future + Send,
@@ -203,14 +203,16 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         }
 
         let task = Box::new(RouteJobTask {
-            header: crate::task::TaskHeader::new(RouteJobTask::<F, Fut>::VTABLE),
+            header: crate::task::TaskHeader::new(
+                RouteJobTask::<F, Fut>::VTABLE,
+                &self.shared.base,
+                worker_id,
+            ),
             job: core::cell::UnsafeCell::new(Some(job)),
             slot: slot_for_job,
         });
 
         task.header.set_pinned();
-        task.header
-            .set_runtime_info(&self.shared.base, worker_id);
 
         let ptr = Box::into_raw(task);
         let task_ref = unsafe { crate::task::SendTaskRef::from_concrete(ptr) };
@@ -227,17 +229,15 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
     pub async fn execute_on_owner<F, Fut, R>(
         &self,
-        task: &impl crate::task::TaskHandleRef,
+        task: &impl crate::task::TaskHandleRef<'ctx>,
         f: F,
     ) -> std::io::Result<R>
     where
-        F: FnOnce() -> Fut + Send,
-        Fut: std::future::Future<Output = R> + Send,
+        F: FnOnce() -> Fut + Send + 'ctx,
+        Fut: std::future::Future<Output = R> + Send + 'ctx,
         R: Send,
     {
-        use std::sync::atomic::Ordering;
-        let worker_id =
-            crate::utils::storage::StateInt::load(&task.header().worker_id, Ordering::Acquire);
+        let worker_id = task.header().worker_id();
         Ok(self.route_to(worker_id, f)?.await)
     }
 
@@ -278,18 +278,19 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Returns the current worker id.
     pub fn worker_id(&self) -> usize {
         self.shared
+            .base
             .tls
             .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX)
     }
 }
 
-pub type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
+pub type IdleHook<'ctx, T> = fn(&RuntimeShared<'ctx, T>) -> IdleDecision;
 pub type WorkerTickHook = fn();
 
 /// Worker initialization context passed to the injected worker init step.
 pub struct WorkerInitContext<'ctx, T> {
-    shared: &'ctx RuntimeShared<T>,
+    shared: &'ctx RuntimeShared<'ctx, T>,
     worker_id: usize,
     worker_count: NonZeroUsize,
 }
@@ -306,7 +307,7 @@ impl<'ctx, T> Clone for WorkerInitContext<'ctx, T> {
 
 impl<'ctx, T> WorkerInitContext<'ctx, T> {
     pub(crate) fn new(
-        shared: &'ctx RuntimeShared<T>,
+        shared: &'ctx RuntimeShared<'ctx, T>,
         worker_id: usize,
         worker_count: NonZeroUsize,
     ) -> Self {
@@ -317,7 +318,7 @@ impl<'ctx, T> WorkerInitContext<'ctx, T> {
         }
     }
 
-    pub fn shared(&self) -> &'ctx RuntimeShared<T> {
+    pub fn shared(&self) -> &'ctx RuntimeShared<'ctx, T> {
         self.shared
     }
 

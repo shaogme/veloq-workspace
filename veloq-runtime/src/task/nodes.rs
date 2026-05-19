@@ -1,11 +1,10 @@
+use crate::runtime::RuntimeSharedBase;
 use crate::task::{
     GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, IntoAnyScope, LOCAL_INTRUSIVE_WAKER_VTABLE,
     LocalTaskRef, RawTask, ScopeCompletionRef, SendTaskRef, Task, TaskError, TaskLock,
     TaskResultSetter, TaskVTable, impl_raw_task_common, poll_task_internal,
 };
-use crate::utils::storage::{
-    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage,
-};
+use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, StateOptionPtr, Storage};
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -64,16 +63,15 @@ pub enum TaskState<T, F> {
 }
 
 #[repr(C)]
-pub struct GenericTaskNode<'scope, S: TaskStorage, T, F>
+pub struct GenericTaskNode<'ctx, S: TaskStorage, T, F>
 where
     ScopeCompletionRef<S>: IntoAnyScope,
 {
-    header: GenericTaskHeader<S>,
+    header: GenericTaskHeader<'ctx, S>,
     state: S::Lock<TaskState<T, F>>,
-    _marker: std::marker::PhantomData<&'scope ()>,
 }
 
-impl<'scope, S: TaskStorage, T, F> GenericTaskNode<'scope, S, T, F>
+impl<'ctx, S: TaskStorage, T, F> GenericTaskNode<'ctx, S, T, F>
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
@@ -83,27 +81,23 @@ where
     const VTABLE: &'static TaskVTable<S> = &TaskVTable {
         wake: |data| unsafe {
             let header = data.as_ref();
-            if let Some(runtime) = header.runtime_shared() {
-                let worker_id = header.worker_id.load(Ordering::Acquire);
-                if !S::IS_LOCAL && header.is_pinned() {
-                    let task = SendTaskRef::from_header(data.as_ptr() as *const _);
-                    runtime.enqueue_pinned(worker_id, task);
-                    return;
-                }
-                S::enqueue(runtime, worker_id, data);
+            let worker_id = header.worker_id();
+            if !S::IS_LOCAL && header.is_pinned() {
+                let task = SendTaskRef::from_header(data.as_ptr() as *const _);
+                header.runtime.enqueue_pinned(worker_id, task);
+                return;
             }
+            S::enqueue(header.runtime, worker_id, data);
         },
         wake_by_ref: |header| unsafe {
-            if let Some(runtime) = header.runtime_shared() {
-                let worker_id = header.worker_id.load(Ordering::Acquire);
-                if !S::IS_LOCAL && header.is_pinned() {
-                    let task =
-                        SendTaskRef::from_header(header as *const GenericTaskHeader<S> as *const _);
-                    runtime.enqueue_pinned(worker_id, task);
-                    return;
-                }
-                S::enqueue(runtime, worker_id, NonNull::from(header));
+            let worker_id = header.worker_id();
+            if !S::IS_LOCAL && header.is_pinned() {
+                let task =
+                    SendTaskRef::from_header(header as *const GenericTaskHeader<S> as *const _);
+                header.runtime.enqueue_pinned(worker_id, task);
+                return;
             }
+            S::enqueue(header.runtime, worker_id, NonNull::from(header));
         },
         poll: |header, worker_id| unsafe {
             let node = &*(header as *const GenericTaskHeader<S> as *const Self);
@@ -112,16 +106,15 @@ where
         drop: |_| {},
     };
 
-    pub fn new(future: F) -> Self {
+    pub fn new(future: F, runtime: &'ctx RuntimeSharedBase<'ctx>, worker_id: usize) -> Self {
         Self {
-            header: GenericTaskHeader::new(Self::VTABLE),
+            header: GenericTaskHeader::new(Self::VTABLE, runtime, worker_id),
             state: S::Lock::new(TaskState::Running(future)),
-            _marker: std::marker::PhantomData,
         }
     }
 }
 
-impl<'scope, S: TaskStorage, T, F> TaskResultSetter<T> for GenericTaskNode<'scope, S, T, F>
+impl<'ctx, S: TaskStorage, T, F> TaskResultSetter<T> for GenericTaskNode<'ctx, S, T, F>
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
@@ -133,16 +126,16 @@ where
     }
 }
 
-impl<'scope, S: TaskStorage, T, F> RawTask for GenericTaskNode<'scope, S, T, F>
+impl<'ctx, 'scope, S: TaskStorage, T, F> RawTask<'scope> for GenericTaskNode<'ctx, S, T, F>
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
     ScopeCompletionRef<S>: IntoAnyScope,
 {
-    impl_raw_task_common!(S::IS_LOCAL, S, S::WAKER_VTABLE);
+    impl_raw_task_common!(S::IS_LOCAL, S, S::WAKER_VTABLE, 'scope);
 }
 
-impl<'scope, S: TaskStorage, T, F> Task<T> for GenericTaskNode<'scope, S, T, F>
+impl<'ctx, 'scope, S: TaskStorage, T, F> Task<'scope, T> for GenericTaskNode<'ctx, S, T, F>
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
@@ -202,25 +195,16 @@ where
     }
 }
 
-impl<'scope, S: TaskStorage, T, F> Drop for GenericTaskNode<'scope, S, T, F>
-where
-    ScopeCompletionRef<S>: IntoAnyScope,
-{
-    fn drop(&mut self) {
-        self.header.release_runtime();
-    }
-}
-
 /// 栈上本地任务：future 本身不进行任何堆分配。
-pub type LocalTaskNode<'scope, 'future, T, F> =
-    GenericTaskNode<'scope, LocalStorage, T, Pin<&'future mut F>>;
+pub type LocalTaskNode<'ctx, 'future, T, F> =
+    GenericTaskNode<'ctx, LocalStorage, T, Pin<&'future mut F>>;
 
 /// 堆上/拥有所有权的本地任务。
-pub type LocalBoxedTaskNode<'scope, T, F> = GenericTaskNode<'scope, LocalStorage, T, F>;
+pub type LocalBoxedTaskNode<'ctx, T, F> = GenericTaskNode<'ctx, LocalStorage, T, F>;
 
 /// 栈上 Send 任务：future 固定在调用栈里，不进行堆分配。
-pub type SendTaskNode<'scope, 'future, T, F> =
-    GenericTaskNode<'scope, AtomicStorage, T, Pin<&'future mut F>>;
+pub type SendTaskNode<'ctx, 'future, T, F> =
+    GenericTaskNode<'ctx, AtomicStorage, T, Pin<&'future mut F>>;
 
 /// 堆上/拥有所有权的 Send 任务。
-pub type SendBoxedTaskNode<'scope, T, F> = GenericTaskNode<'scope, AtomicStorage, T, F>;
+pub type SendBoxedTaskNode<'ctx, T, F> = GenericTaskNode<'ctx, AtomicStorage, T, F>;

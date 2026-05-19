@@ -25,8 +25,8 @@ fn main() {
     rt.block_on(async |ctx| {
         println!("--- 安全异步作用域执行开始 ---");
 
-        task_local!(static_node, work(ctx, "栈任务-Static".to_string(), 2));
-        task!(send_node, work(ctx, "栈Send任务".to_string(), 2));
+        task_local!(static_node, ctx, work(ctx, "栈任务-Static".to_string(), 2));
+        task!(send_node, ctx, work(ctx, "栈Send任务".to_string(), 2));
 
         ctx.scope(async |my_scope| {
             let res_send = my_scope.spawn(&send_node).await.unwrap();
@@ -152,9 +152,9 @@ fn main() {
             println!("\n  [测试] 测试定向分发：显式发送任务到 Worker 1...");
             ctx.scope(async |target_scope| {
                 let mut handles = Vec::new();
+                let worker_id = target_scope.worker_id();
                 for i in 1..=3 {
                     let h = target_scope.spawn_boxed_to(1, async move || {
-                        let worker_id = target_scope.worker_id();
                         println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
                     });
                     handles.push(h);

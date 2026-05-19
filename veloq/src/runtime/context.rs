@@ -35,13 +35,13 @@ pub struct WorkerState<'ctx> {
 
 #[derive(Clone)]
 pub struct DriverRegistrar<'ctx> {
-    shared: &'ctx RuntimeShared<WorkerState<'ctx>>,
+    shared: &'ctx RuntimeShared<'ctx, WorkerState<'ctx>>,
     registration_mode: BufferRegistrationMode,
 }
 
 impl<'ctx> DriverRegistrar<'ctx> {
     pub(crate) fn new(
-        shared: &'ctx RuntimeShared<WorkerState<'ctx>>,
+        shared: &'ctx RuntimeShared<'ctx, WorkerState<'ctx>>,
         registration_mode: BufferRegistrationMode,
     ) -> Self {
         Self {
@@ -335,7 +335,7 @@ impl<'ctx> RuntimeContext<'ctx> {
                 DriverCompletion = <PlatformDriver<'ctx> as Driver>::Completion,
                 ErasedPayload = <PlatformDriver<'ctx> as Driver>::UP,
             > + Send
-            + 'a,
+            + 'a + 'ctx,
     {
         if self.scope.worker_id() == worker_id {
             let (res, op_back) = self
@@ -379,20 +379,20 @@ pub fn poll_current_driver<'ctx>(shared: &RuntimeShared<WorkerState<'ctx>>) -> I
 }
 
 pub(crate) fn submit_control_task<'ctx>(
-    shared: &veloq_runtime::runtime::shared::RuntimeShared<WorkerState<'ctx>>,
+    shared: &'ctx veloq_runtime::runtime::shared::RuntimeShared<'ctx, WorkerState<'ctx>>,
     worker_id: usize,
     fd: veloq_driver_native::op::IoFd,
 ) {
     struct UnregisterFileTask<'ctx> {
-        header: veloq_runtime::task::TaskHeader,
+        header: veloq_runtime::task::TaskHeader<'ctx>,
         fd: veloq_driver_native::op::IoFd,
-        shared_ptr: *const veloq_runtime::runtime::shared::RuntimeShared<WorkerState<'ctx>>,
+        shared_ptr: *const veloq_runtime::runtime::shared::RuntimeShared<'ctx, WorkerState<'ctx>>,
     }
 
     unsafe impl<'ctx> Send for UnregisterFileTask<'ctx> {}
     unsafe impl<'ctx> Sync for UnregisterFileTask<'ctx> {}
 
-    impl<'ctx> veloq_runtime::task::RawTask for UnregisterFileTask<'ctx> {
+    impl<'ctx> veloq_runtime::task::RawTask<'ctx> for UnregisterFileTask<'ctx> {
         type Storage = veloq_runtime::utils::storage::AtomicStorage;
 
         fn poll_raw(&self, _worker_id: usize) -> bool {
@@ -409,7 +409,7 @@ pub(crate) fn submit_control_task<'ctx>(
             true
         }
 
-        fn header(&self) -> &veloq_runtime::task::GenericTaskHeader<Self::Storage> {
+        fn header(&self) -> &veloq_runtime::task::GenericTaskHeader<'ctx, Self::Storage> {
             &self.header
         }
     }
@@ -435,13 +435,16 @@ pub(crate) fn submit_control_task<'ctx>(
     }
 
     let task = Box::new(UnregisterFileTask {
-        header: veloq_runtime::task::TaskHeader::new(UnregisterFileTask::VTABLE),
+        header: veloq_runtime::task::TaskHeader::new(
+            UnregisterFileTask::VTABLE,
+            &shared.base,
+            worker_id,
+        ),
         fd,
         shared_ptr: shared as *const _,
     });
 
     task.header.set_pinned();
-    task.header.set_runtime_info(&shared.base, worker_id);
 
     let ptr = Box::into_raw(task);
     let task_ref = unsafe { veloq_runtime::task::SendTaskRef::from_concrete(ptr) };

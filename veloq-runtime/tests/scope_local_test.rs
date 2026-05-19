@@ -7,7 +7,7 @@ fn test_scope_local_basic() {
     rt.block_on(async |ctx| {
         ctx.scope_local(async |local_scope| {
             let h1 = local_scope.spawn_boxed_local(async { 1 + 1 });
-            task_local!(t2, async { 2 + 2 });
+            task_local!(t2, ctx, async { 2 + 2 });
             let h2 = local_scope.spawn_local(&t2);
             assert_eq!(h1.await.unwrap(), 2);
             assert_eq!(h2.await.unwrap(), 4);

@@ -82,8 +82,8 @@ impl SockAddrIn {
     }
 
     /// Converts to a standard library SocketAddrV4.
-    pub fn to_std(&self) -> SocketAddrV4 {
-        let s_addr = read_u32_ne(bytes_of(self), SOCKADDR_IN_S_ADDR_OFFSET);
+    pub fn to_std(self) -> SocketAddrV4 {
+        let s_addr = read_u32_ne(bytes_of(&self), SOCKADDR_IN_S_ADDR_OFFSET);
         let ip = Ipv4Addr::from(u32::from_be(s_addr));
         let port = u16::from_be(self.0.sin_port);
         SocketAddrV4::new(ip, port)
@@ -120,12 +120,12 @@ impl SockAddrIn6 {
     }
 
     /// Converts to a standard library SocketAddrV6.
-    pub fn to_std(&self) -> SocketAddrV6 {
-        let addr_bytes = read_ipv6_bytes(bytes_of(self), SOCKADDR_IN6_ADDR_BYTES_OFFSET);
+    pub fn to_std(self) -> SocketAddrV6 {
+        let addr_bytes = read_ipv6_bytes(bytes_of(&self), SOCKADDR_IN6_ADDR_BYTES_OFFSET);
         let ip = Ipv6Addr::from(addr_bytes);
         let port = u16::from_be(self.0.sin6_port);
         let flowinfo = self.0.sin6_flowinfo;
-        let scope_id = read_u32_ne(bytes_of(self), SOCKADDR_IN6_SCOPE_ID_OFFSET);
+        let scope_id = read_u32_ne(bytes_of(&self), SOCKADDR_IN6_SCOPE_ID_OFFSET);
         SocketAddrV6::new(ip, port, flowinfo, scope_id)
     }
 }

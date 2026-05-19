@@ -1,5 +1,6 @@
 pub mod context;
 
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
 use std::sync::{Arc, mpsc};
@@ -56,7 +57,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn build(self) -> std::io::Result<Runtime<T>> {
+    pub fn build<'a>(self) -> std::io::Result<Runtime<'a, T>> {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
@@ -72,15 +73,17 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             topology: self.topology,
             state,
             config: self.config,
+            marker: PhantomData,
         })
     }
 }
 
-pub struct Runtime<T: PoolTopology> {
+pub struct Runtime<'ctx, T: PoolTopology> {
     worker_count: std::num::NonZeroUsize,
     topology: T,
     state: T::State,
     config: Config,
+    marker: PhantomData<&'ctx ()>,
 }
 
 struct RegistrarDispatcher {
@@ -95,7 +98,7 @@ impl RegistrarDispatcher {
     }
 }
 
-impl<T: PoolTopology> Runtime<T> {
+impl<'ctx, T: PoolTopology + 'ctx> Runtime<'ctx, T> {
     pub fn builder(topology: T) -> RuntimeBuilder<T> {
         RuntimeBuilder::new(topology)
     }
@@ -106,13 +109,14 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn block_on<R, F>(self, f: F) -> R
     where
-        F: AsyncFnOnce(RuntimeContext) -> R,
+        F: AsyncFnOnce(RuntimeContext<'ctx>) -> R,
     {
         let Runtime {
             worker_count,
             topology,
             state,
             config,
+            ..
         } = self;
 
         // 预先为每个 Worker 创建消息通道

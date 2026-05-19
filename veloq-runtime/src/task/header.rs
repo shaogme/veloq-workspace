@@ -1,3 +1,4 @@
+use crate::runtime::RuntimeSharedBase;
 use crate::task::scope::{OpaqueScope, ScopeCompletionRef, ScopeVTable};
 use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
 use std::ptr::NonNull;
@@ -35,28 +36,32 @@ pub struct GenericWakerNode<S: Storage> {
 
 intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
 
-pub struct GenericTaskHeader<S: Storage> {
+pub struct GenericTaskHeader<'ctx, S: Storage> {
     pub(crate) state: S::Usize,
     pub(crate) ref_count: S::Usize,
     pub(crate) wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     pub(crate) scope_ptr: S::OptionPtr<OpaqueScope>,
     pub(crate) scope_vtable: S::OptionPtr<ScopeVTable<S>>,
-    pub(crate) runtime_ptr: S::OptionPtr<crate::runtime::shared::RuntimeSharedBase>,
-    pub(crate) worker_id: S::Usize,
-    pub(crate) injector_next: S::OptionPtr<GenericTaskHeader<S>>,
+    pub(crate) runtime: &'ctx RuntimeSharedBase<'ctx>,
+    worker_id: S::Usize,
+    pub(crate) injector_next: S::OptionPtr<GenericTaskHeader<'ctx, S>>,
     pub vtable: &'static TaskVTable<S>,
 }
 
-impl<S: Storage> GenericTaskHeader<S> {
-    pub fn new(vtable: &'static TaskVTable<S>) -> Self {
+impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
+    pub fn new(
+        vtable: &'static TaskVTable<S>,
+        runtime: &'ctx RuntimeSharedBase<'ctx>,
+        worker_id: usize,
+    ) -> Self {
         Self {
             state: S::Usize::new(0),
             ref_count: S::Usize::new(1),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
             scope_ptr: S::OptionPtr::new(None),
             scope_vtable: S::OptionPtr::new(None),
-            runtime_ptr: S::OptionPtr::new(None),
-            worker_id: S::Usize::new(0),
+            runtime,
+            worker_id: S::Usize::new(worker_id),
             injector_next: S::OptionPtr::new(None),
             vtable,
         }
@@ -234,23 +239,15 @@ impl<S: Storage> GenericTaskHeader<S> {
             node.waker.wake_by_ref();
         }
     }
-    pub fn set_runtime_info(
-        &self,
-        runtime: &crate::runtime::shared::RuntimeSharedBase,
-        worker_id: usize,
-    ) {
-       self.runtime_ptr.store(
-            NonNull::new(runtime as *const _ as *mut _),
-            Ordering::Release,
-        );
-        self.worker_id.store(worker_id, Ordering::Release);
+
+    #[inline]
+    pub fn set_worker_id(&self, worker_id: usize) {
+        self.worker_id.store(worker_id, Ordering::Relaxed)
     }
 
     #[inline]
-    pub fn runtime_shared(&self) -> Option<&crate::runtime::shared::RuntimeSharedBase> {
-        self.runtime_ptr
-            .load(Ordering::Acquire)
-            .map(|p| unsafe { p.as_ref() })
+    pub fn worker_id(&self) -> usize {
+        self.worker_id.load(Ordering::Acquire)
     }
 
     pub fn acknowledge_completion(&self) {
@@ -262,14 +259,6 @@ impl<S: Storage> GenericTaskHeader<S> {
                 let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
                 scope_ref.task_done();
                 drop(scope_ref);
-            }
-        }
-    }
-
-    pub fn release_runtime(&self) {
-        if let Some(ptr) = self.runtime_ptr.swap(None, Ordering::AcqRel) {
-            unsafe {
-                let _ = std::sync::Arc::from_raw(ptr.as_ptr());
             }
         }
     }

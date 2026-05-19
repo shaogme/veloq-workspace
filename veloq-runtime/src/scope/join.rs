@@ -20,7 +20,7 @@ pub(crate) trait RoutedTaskAccess<T>: Send {
 }
 
 pub(crate) struct RoutedSpawnReady<'ctx, T> {
-    pub(crate) task: SendTaskRef,
+    pub(crate) task: SendTaskRef<'ctx>,
     pub(crate) access: Box<dyn RoutedTaskAccess<T> + 'ctx>,
 }
 
@@ -56,7 +56,7 @@ struct SpawnToAccess<'ctx, T, S_> {
 
 impl<'ctx, T, S_> RoutedTaskAccess<T> for SpawnToAccess<'ctx, T, S_>
 where
-    S_: crate::task::SendTask<T> + Sized + 'ctx,
+    S_: crate::task::SendTask<'ctx, T> + Sized + 'ctx,
 {
     fn take_result(&self) -> Result<T, TaskError> {
         self.task.take_result().expect("task result already taken")
@@ -66,7 +66,7 @@ where
 }
 
 unsafe impl<'ctx, T, S_> Send for SpawnToAccess<'ctx, T, S_> where
-    S_: crate::task::SendTask<T> + Sized + 'ctx
+    S_: crate::task::SendTask<'ctx, T> + Sized + 'ctx
 {
 }
 
@@ -75,7 +75,7 @@ pub(crate) fn make_spawn_to_access<'ctx, T, S_>(
 ) -> Box<dyn RoutedTaskAccess<T> + 'ctx>
 where
     T: 'ctx,
-    S_: crate::task::SendTask<T> + Sized + 'ctx,
+    S_: crate::task::SendTask<'ctx, T> + Sized + 'ctx,
 {
     Box::new(SpawnToAccess {
         task,
@@ -203,7 +203,7 @@ pub(crate) fn dispatch_routed<
     F,
     TExtra,
 >(
-    context: &crate::runtime::RuntimeScopeContext<TExtra>,
+    context: &crate::runtime::RuntimeScopeContext<'ctx, TExtra>,
     completion: &O::Shared<super::GenericScopeCompletion<S, O>>,
     state: Arc<RoutedSpawnState<'ctx, T>>,
     worker_id: usize,
@@ -211,6 +211,7 @@ pub(crate) fn dispatch_routed<
 ) where
     O::Shared<super::GenericScopeCompletion<S, O>>: Send + 'ctx,
     F: FnOnce() + Send + 'ctx,
+    T: 'ctx,
 {
     let completion_for_job = completion.clone();
     let state_for_job = state.clone();
@@ -240,7 +241,7 @@ pub(crate) fn dispatch_routed<
 }
 
 pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
-    runtime: &RuntimeShared<TExtra>,
+    runtime: &'ctx RuntimeShared<'ctx, TExtra>,
     arena: &crate::task::GenericArena<AtomicStorage>,
     completion: Arc<crate::scope::ScopeCompletion>,
     worker_id: usize,
@@ -250,7 +251,7 @@ pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
     T: Send + 'ctx,
     Fut: Future<Output = T> + 'ctx,
 {
-    let node = crate::task::SendBoxedTaskNode::new(future);
+    let node = crate::task::SendBoxedTaskNode::new(future, &runtime.base, worker_id);
     let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'ctx, T, Fut>>();
     let node_ptr = unsafe {
         arena.alloc::<crate::task::SendBoxedTaskNode<'ctx, T, Fut>>(
@@ -270,7 +271,6 @@ pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
 
     let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
     let header = task_ref.header();
-    header.set_runtime_info(&runtime.base, worker_id);
 
     if !runtime.enqueue_pinned(worker_id, task_ref) {
         unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };
@@ -289,12 +289,12 @@ pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
     });
 }
 
-pub(crate) struct ResolvedRoutedTask<'ctx, T, R: TaskHandleRef> {
+pub(crate) struct ResolvedRoutedTask<'ctx, T, R: TaskHandleRef<'ctx>> {
     pub(crate) task: R,
     pub(crate) access: Option<Box<dyn RoutedTaskAccess<T> + 'ctx>>,
 }
 
-pub(crate) enum JoinSource<'ctx, T, R: TaskHandleRef> {
+pub(crate) enum JoinSource<'ctx, T, R: TaskHandleRef<'ctx>> {
     Direct {
         task: R,
         gate: &'ctx (dyn crate::task::TaskJoinGate<T> + 'ctx),
@@ -305,7 +305,14 @@ pub(crate) enum JoinSource<'ctx, T, R: TaskHandleRef> {
     },
 }
 
-pub struct JoinHandle<'ctx, 'scope, T, R: TaskHandleRef, S: ScopeProvider<'ctx, TExtra>, TExtra> {
+pub struct JoinHandle<
+    'ctx,
+    'scope,
+    T,
+    R: TaskHandleRef<'ctx>,
+    S: ScopeProvider<'ctx, TExtra>,
+    TExtra,
+> {
     pub(crate) source: JoinSource<'ctx, T, R>,
     pub(crate) scope: &'scope S,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
@@ -315,7 +322,14 @@ pub struct JoinHandle<'ctx, 'scope, T, R: TaskHandleRef, S: ScopeProvider<'ctx, 
 }
 
 unsafe impl<'ctx, 'scope, T, TExtra> Send
-    for JoinHandle<'ctx, 'scope, T, SendTaskRef, crate::scope::AsyncScope<'ctx, TExtra>, TExtra>
+    for JoinHandle<
+        'ctx,
+        'scope,
+        T,
+        SendTaskRef<'ctx>,
+        crate::scope::AsyncScope<'ctx, TExtra>,
+        TExtra,
+    >
 where
     T: Send + 'ctx,
 {
@@ -325,22 +339,22 @@ pub type LocalJoinHandle<'ctx, 'scope, T, TExtra> = JoinHandle<
     'ctx,
     'scope,
     T,
-    crate::task::LocalTaskRef,
+    crate::task::LocalTaskRef<'ctx>,
     crate::scope::AsyncScope<'ctx, TExtra>,
     TExtra,
 >;
 pub type SendJoinHandle<'ctx, 'scope, T, TExtra> =
-    JoinHandle<'ctx, 'scope, T, SendTaskRef, crate::scope::AsyncScope<'ctx, TExtra>, TExtra>;
+    JoinHandle<'ctx, 'scope, T, SendTaskRef<'ctx>, crate::scope::AsyncScope<'ctx, TExtra>, TExtra>;
 pub type LocalAsyncJoinHandle<'ctx, 'scope, T, TExtra> = JoinHandle<
     'ctx,
     'scope,
     T,
-    crate::task::LocalTaskRef,
+    crate::task::LocalTaskRef<'ctx>,
     crate::scope::LocalAsyncScope<'ctx, TExtra>,
     TExtra,
 >;
 
-impl<'ctx, 'scope, T, R: TaskHandleRef, S: ScopeProvider<'ctx, TExtra>, TExtra>
+impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TExtra>
     JoinHandle<'ctx, 'scope, T, R, S, TExtra>
 {
     pub fn cancel(&self) {
@@ -473,8 +487,8 @@ impl<'ctx, 'scope, T, R: TaskHandleRef, S: ScopeProvider<'ctx, TExtra>, TExtra>
     }
 }
 
-impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra> Future
-    for JoinHandle<'ctx, 'scope, T, crate::task::LocalTaskRef, S, TExtra>
+impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra: 'ctx> Future
+    for JoinHandle<'ctx, 'scope, T, crate::task::LocalTaskRef<'ctx>, S, TExtra>
 {
     type Output = Result<T, TaskError>;
 
@@ -516,8 +530,8 @@ impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra> Future
     }
 }
 
-impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra> Future
-    for JoinHandle<'ctx, 'scope, T, SendTaskRef, S, TExtra>
+impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra: 'ctx> Future
+    for JoinHandle<'ctx, 'scope, T, SendTaskRef<'ctx>, S, TExtra>
 {
     type Output = Result<T, TaskError>;
 
@@ -600,7 +614,7 @@ impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra> Future
     }
 }
 
-impl<'ctx, 'scope, T, R: TaskHandleRef, S: ScopeProvider<'ctx, TExtra>, TExtra> Drop
+impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TExtra> Drop
     for JoinHandle<'ctx, 'scope, T, R, S, TExtra>
 {
     fn drop(&mut self) {

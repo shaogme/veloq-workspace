@@ -25,9 +25,9 @@ use primitives::{Signal, create_waker};
 use shared::{Receivers, init_runtime_components};
 
 pub struct Runtime<'ctx, I, T, WF> {
-    pub(crate) shared: RuntimeShared<T>,
-    shared_ptr: NonNull<RuntimeShared<T>>,
-    pub(crate) receivers: Option<Receivers>,
+    pub(crate) shared: RuntimeShared<'ctx, T>,
+    shared_ptr: NonNull<RuntimeShared<'ctx, T>>,
+    pub(crate) receivers: Option<Receivers<'ctx>>,
     pub(crate) worker_init: Option<I>,
     pub(crate) worker_factory: Option<WF>,
     _marker: std::marker::PhantomData<(&'ctx (), T)>,
@@ -41,21 +41,22 @@ pub type DefaultWorkerInit = fn(WorkerInitContext<'static, ()>) -> std::future::
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
 
 pub type DefaultWorkerInitFor<'ctx, T> = fn(WorkerInitContext<'ctx, T>) -> std::future::Ready<()>;
-pub type DefaultWorkerFactoryFor<T> = fn(usize, &RuntimeShared<T>) -> T;
+pub type DefaultWorkerFactoryFor<'ctx, T> = fn(usize, &RuntimeShared<'ctx, T>) -> T;
 
-impl<'ctx, T> Runtime<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>> {
+impl<'ctx, T> Runtime<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>> {
     pub fn new() -> Self {
-        RuntimeBuilder::<DefaultWorkerInitFor<'ctx, T>, T, _>::new().build()
+        RuntimeBuilder::new().build()
     }
 
     pub fn builder()
-    -> RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>> {
+    -> RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>>
+    {
         RuntimeBuilder::new()
     }
 }
 
 impl<'ctx, T> Default
-    for Runtime<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>>
+    for Runtime<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>>
 {
     fn default() -> Self {
         Self::new()
@@ -67,7 +68,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
         self.shared.worker_count()
     }
 
-    fn shared_ref(&self) -> &'ctx RuntimeShared<T> {
+    fn shared_ref(&self) -> &'ctx RuntimeShared<'ctx, T> {
         unsafe { self.shared_ptr.as_ref() }
     }
 
@@ -81,7 +82,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
 
     pub fn block_on<R, F>(mut self, f: F) -> R
     where
-        WF: Fn(usize, &'ctx RuntimeShared<T>) -> T + Send + Sync + 'ctx,
+        WF: Fn(usize, &'ctx RuntimeShared<'ctx, T>) -> T + Send + Sync + 'ctx,
         I: AsyncFn(WorkerInitContext<'ctx, T>) -> () + Send + Sync,
         F: AsyncFnOnce(RuntimeScopeContext<'ctx, T>) -> R,
     {
@@ -107,7 +108,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
         let mut pinned_receivers = receivers.pinned_receivers;
 
         thread::scope(|scope| {
-            struct ShutdownGuard<'ctx, T>(&'ctx RuntimeShared<T>);
+            struct ShutdownGuard<'ctx, T>(&'ctx RuntimeShared<'ctx, T>);
             impl<'ctx, T> Drop for ShutdownGuard<'ctx, T> {
                 fn drop(&mut self) {
                     self.0.shutdown();
@@ -130,6 +131,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                         local_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
                     };
                     shared_ref
+                        .base
                         .tls
                         .set_owned(context)
                         .expect("failed to set runtime context");
@@ -137,7 +139,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                         .extra_tls
                         .set_owned(worker_factory_ref(worker_id, shared_ref))
                         .expect("failed to set extra TLS");
-                    let _tls_cleanup = TlsCleanupGuard(&shared_ref.tls);
+                    let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
                     let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
 
                     let init_ctx = WorkerInitContext::new(shared_ref, worker_id, worker_count);
@@ -164,6 +166,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 local_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
             };
             shared_ref
+                .base
                 .tls
                 .set_owned(context)
                 .expect("failed to set runtime context");
@@ -171,7 +174,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 .extra_tls
                 .set_owned(worker_factory(0, shared_ref))
                 .expect("failed to set extra TLS");
-            let _tls_cleanup = TlsCleanupGuard(&shared_ref.tls);
+            let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
             let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
 
             let signal = Arc::new(Signal::new(true));
@@ -211,12 +214,14 @@ pub struct RuntimeBuilder<'ctx, I, T, WF> {
     queue_capacity: usize,
     worker_init: Option<I>,
     worker_factory: Option<WF>,
-    idle_hook: Option<IdleHook<T>>,
+    idle_hook: Option<IdleHook<'ctx, T>>,
     worker_tick_hook: Option<WorkerTickHook>,
     _phantom: std::marker::PhantomData<(&'ctx (), T)>,
 }
 
-impl<'ctx, T> RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>> {
+impl<'ctx, T>
+    RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>>
+{
     pub fn new() -> Self {
         RuntimeBuilder {
             worker_count: None,
@@ -231,7 +236,7 @@ impl<'ctx, T> RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWork
 }
 
 impl<'ctx, T> Default
-    for RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<T>>
+    for RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>>
 {
     fn default() -> Self {
         Self::new()
@@ -259,7 +264,7 @@ impl<'ctx, I, T, WF> RuntimeBuilder<'ctx, I, T, WF> {
         self
     }
 
-    pub fn with_idle_hook(mut self, hook: IdleHook<T>) -> Self {
+    pub fn with_idle_hook(mut self, hook: IdleHook<'ctx, T>) -> Self {
         self.idle_hook = Some(hook);
         self
     }
