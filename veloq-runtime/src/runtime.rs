@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::{AsyncFn, AsyncFnOnce};
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
@@ -27,7 +26,6 @@ use shared::{Receivers, init_runtime_components};
 
 pub struct Runtime<'ctx, I, T, WF> {
     pub(crate) shared: RuntimeShared<'ctx, T>,
-    shared_ptr: NonNull<RuntimeShared<'ctx, T>>,
     pub(crate) receivers: Option<Receivers<'ctx>>,
     pub(crate) worker_init: Option<I>,
     pub(crate) worker_factory: Option<WF>,
@@ -69,18 +67,6 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
         self.shared.worker_count()
     }
 
-    fn shared_ref(&self) -> &'ctx RuntimeShared<'ctx, T> {
-        unsafe { self.shared_ptr.as_ref() }
-    }
-
-    fn runtime_ctx(&self) -> RuntimeScopeContext<'ctx, T> {
-        unsafe {
-            RuntimeScopeContext {
-                shared: self.shared_ptr.as_ref(),
-            }
-        }
-    }
-
     pub fn block_on<R, F>(mut self, f: F) -> R
     where
         WF: Fn(usize, &'ctx RuntimeShared<'ctx, T>) -> T + Send + Sync + 'ctx,
@@ -94,11 +80,11 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
             }
         }
 
-        self.shared_ptr = NonNull::from(&self.shared);
-        let shared_ref = self.shared_ref();
-        let ctx = self.runtime_ctx();
+        let shared_ref: &'ctx RuntimeShared<'ctx, T> =
+            unsafe { &*std::ptr::from_ref(&self.shared) };
+        let ctx = RuntimeScopeContext { shared: shared_ref };
 
-        let worker_count = self.shared_ref().worker_count();
+        let worker_count = shared_ref.worker_count();
         let worker_init = self.worker_init.take().expect("worker_init already taken");
         let worker_factory = self
             .worker_factory
@@ -318,7 +304,6 @@ impl<'ctx, I, T, WF> RuntimeBuilder<'ctx, I, T, WF> {
         );
         Runtime {
             shared,
-            shared_ptr: NonNull::dangling(),
             receivers: Some(receivers),
             worker_init: self.worker_init,
             worker_factory: self.worker_factory,
