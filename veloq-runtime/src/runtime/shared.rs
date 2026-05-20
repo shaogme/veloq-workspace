@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
 use crate::runtime::primitives::{self, Unparker};
 use crate::scope::GenericScopeCompletion;
-use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef};
+use crate::task::{IntoAnyScope, LocalTaskRef, ScopeCompletionRef, SendTaskRef, TaskHandleRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::Storage;
@@ -189,11 +189,17 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
                 ctx.worker_id, worker_id,
                 "local task enqueued to a non-owned worker"
             );
-            if task.header().try_mark_queued() {
-                self.idle.event_count.notify();
-                ctx.push_local(task);
-            }
         });
+        if task.header().try_mark_queued() {
+            let header = task.header();
+            if let Some(scope_ref) = header.scope_completion_ref() {
+                let task_static =
+                    unsafe { LocalTaskRef::from_header(task.header() as *const _ as *const _) };
+                scope_ref.enqueue_local(task_static);
+            } else {
+                panic!("local task has no scope completion");
+            }
+        }
     }
 
     pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'ctx>) -> bool {
@@ -402,18 +408,43 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
 
     pub fn drive_worker<S: Storage, O: Ownership>(
         &self,
-        completion: Option<&GenericScopeCompletion<S, O>>,
+        completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
     ) {
         self.drive_worker_with_init::<S, O, std::future::Ready<()>>(completion, None);
     }
 
     pub fn drive_worker_with_init<S: Storage, O: Ownership, F: Future<Output = ()>>(
         &self,
-        completion: Option<&GenericScopeCompletion<S, O>>,
+        completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
         mut init_fut: Option<Pin<&mut F>>,
     ) {
         self.base.tls.with(move |ctx| {
             let worker_id = ctx.worker_id;
+
+            let any_scope = completion.map(|c| {
+                let scope_ref = ScopeCompletionRef::new::<O>(c);
+                scope_ref.into_any()
+            });
+
+            if let Some(ref scope) = any_scope {
+                ctx.active_scopes.borrow_mut().push(scope.clone());
+            }
+
+            struct ScopeGuard<'a, 'ctx> {
+                ctx: &'a RuntimeContext<'ctx>,
+                has_scope: bool,
+            }
+            impl<'a, 'ctx> Drop for ScopeGuard<'a, 'ctx> {
+                fn drop(&mut self) {
+                    if self.has_scope {
+                        self.ctx.active_scopes.borrow_mut().pop();
+                    }
+                }
+            }
+            let _guard = ScopeGuard {
+                ctx,
+                has_scope: any_scope.is_some(),
+            };
 
             let worker_tick_hook = self.base.worker_tick_hook;
 
@@ -464,9 +495,18 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
                     progressed = true;
                 }
 
-                if !progressed && let Some(task) = ctx.pop_local() {
-                    self.base.poll_local_task(worker_id, task);
-                    progressed = true;
+                if !progressed {
+                    let task = {
+                        let scopes = ctx.active_scopes.borrow();
+                        scopes.iter().rev().find_map(|s| s.pop_local())
+                    };
+                    if let Some(task) = task {
+                        let task_ref = unsafe {
+                            LocalTaskRef::from_header(task.header() as *const _ as *const _)
+                        };
+                        self.base.poll_local_task(worker_id, task_ref);
+                        progressed = true;
+                    }
                 }
 
                 if !progressed
@@ -510,7 +550,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
                 if let Some(c) = completion {
                     c.register(&waker);
                 }
-                RuntimeProgressCoordinator::new(self, worker_id).run(completion);
+                RuntimeProgressCoordinator::new(self, worker_id).run(completion.map(|c| &**c));
             }
         })
     }

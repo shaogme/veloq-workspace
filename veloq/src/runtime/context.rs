@@ -404,7 +404,7 @@ pub(crate) fn submit_control_task<'ctx>(
             self.header.mark_completed_and_notify();
             unsafe {
                 let header_ptr = std::ptr::NonNull::from(&self.header);
-                (self.header.vtable.drop)(header_ptr);
+                veloq_runtime::task::GenericTaskHeader::drop_task(header_ptr);
             }
             true
         }

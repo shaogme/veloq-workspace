@@ -1,5 +1,6 @@
 use crate::runtime::RuntimeSharedBase;
 use crate::task::scope::{OpaqueScope, ScopeCompletionRef, ScopeVTable};
+use crate::task::{IntoAnyScope, SendTaskRef};
 use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
@@ -37,15 +38,15 @@ pub struct GenericWakerNode<S: Storage> {
 intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
 
 pub struct GenericTaskHeader<'ctx, S: Storage> {
-    pub(crate) state: S::Usize,
-    pub(crate) ref_count: S::Usize,
-    pub(crate) wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
-    pub(crate) scope_ptr: S::OptionPtr<OpaqueScope>,
-    pub(crate) scope_vtable: S::OptionPtr<ScopeVTable<S>>,
-    pub(crate) runtime: &'ctx RuntimeSharedBase<'ctx>,
+    state: S::Usize,
+    ref_count: S::Usize,
+    wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
+    scope_ptr: S::OptionPtr<OpaqueScope>,
+    scope_vtable: S::OptionPtr<ScopeVTable<S>>,
+    runtime: &'ctx RuntimeSharedBase<'ctx>,
     worker_id: S::Usize,
-    pub(crate) injector_next: S::OptionPtr<GenericTaskHeader<'ctx, S>>,
-    pub vtable: &'static TaskVTable<S>,
+    injector_next: S::OptionPtr<GenericTaskHeader<'ctx, S>>,
+    vtable: &'static TaskVTable<S>,
 }
 
 impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
@@ -297,17 +298,141 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
             None
         }
     }
+
+    #[inline]
+    pub fn decrement_ref_count(&self) -> bool {
+        self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    #[inline]
+    pub fn scope_vtable(&self) -> Option<&'static ScopeVTable<S>> {
+        self.scope_vtable
+            .load(Ordering::Acquire)
+            .map(|p| unsafe { &*p.as_ptr() })
+    }
+
+    #[inline]
+    pub fn set_scope_vtable(&self, vtable: Option<NonNull<ScopeVTable<S>>>) {
+        self.scope_vtable.store(vtable, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn scope_ptr(&self) -> Option<NonNull<OpaqueScope>> {
+        self.scope_ptr.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_scope_ptr(&self, ptr: Option<NonNull<OpaqueScope>>) {
+        self.scope_ptr.store(ptr, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn scope_completion_ref(&self) -> Option<ScopeCompletionRef<S>> {
+        let ptr = self.scope_ptr.load(Ordering::Acquire)?;
+        let vtable_ptr = self.scope_vtable.load(Ordering::Acquire)?;
+        unsafe {
+            let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
+            let cloned = scope_ref.clone();
+            std::mem::forget(scope_ref);
+            Some(cloned)
+        }
+    }
+
+    #[inline]
+    pub fn notify_runtime_active(&self) {
+        self.runtime.idle.event_count.notify();
+        self.runtime.wake_worker(self.worker_id());
+    }
+
+    #[inline]
+    pub(crate) fn next(&self) -> Option<NonNull<GenericTaskHeader<'ctx, S>>> {
+        self.injector_next.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn set_next(&self, next: Option<NonNull<GenericTaskHeader<'ctx, S>>>) {
+        self.injector_next.store(next, Ordering::Release);
+    }
+
+    /// 唤醒任务（消耗所有权）。
+    ///
+    /// # Safety
+    /// `self_ptr` 必须是指向 `self` 的有效非空指针。
+    #[inline]
+    pub unsafe fn wake(self_ptr: NonNull<Self>) {
+        let vtable = unsafe { self_ptr.as_ref().vtable };
+        unsafe { (vtable.wake)(self_ptr) };
+    }
+
+    /// 通过引用唤醒任务。
+    #[inline]
+    pub fn wake_by_ref(&self) {
+        unsafe { (self.vtable.wake_by_ref)(self) };
+    }
+
+    /// 执行任务的 poll。
+    ///
+    /// # Safety
+    /// 调用者必须确保 `self` 处于可被 poll 的正确状态下。
+    #[inline]
+    pub unsafe fn poll(&self, worker_id: usize) -> bool {
+        unsafe { (self.vtable.poll)(self, worker_id) }
+    }
+
+    /// 释放任务。
+    ///
+    /// # Safety
+    /// `self_ptr` 必须是指向 `self` 且未被释放的有效非空指针。
+    #[inline]
+    pub unsafe fn drop_task(self_ptr: NonNull<Self>) {
+        let vtable = unsafe { self_ptr.as_ref().vtable };
+        unsafe { (vtable.drop)(self_ptr) };
+    }
+
+    /// 入队当前任务。
+    ///
+    /// # Safety
+    /// `self_ptr` 必须是指向 `self` 的有效非空指针。
+    pub unsafe fn enqueue_self(&self, self_ptr: NonNull<Self>)
+    where
+        S: crate::task::nodes::TaskStorage,
+        ScopeCompletionRef<S>: IntoAnyScope,
+    {
+        if !S::IS_LOCAL && self.is_pinned() {
+            let task = unsafe { SendTaskRef::from_header(self_ptr.as_ptr() as *const _) };
+            self.runtime.enqueue_pinned(self.worker_id(), task);
+            return;
+        }
+        S::enqueue(self.runtime, self.worker_id(), self_ptr);
+    }
+
+    /// 尝试将一个 waker 节点从任务的 waker 列表中移除。
+    ///
+    /// # Safety
+    /// `node` 指向的节点必须是由 `register_completion` 注册的相同节点。
+    pub unsafe fn remove_waker(&self, node: NonNull<GenericWakerNode<S>>) {
+        if self.is_completed() {
+            return;
+        }
+        let mut wakers = self.wakers.lock();
+        if unsafe { node.as_ref().link.is_linked() } {
+            unsafe {
+                let mut cursor = wakers.cursor_mut_from_ptr(node);
+                cursor.remove();
+            }
+        }
+    }
 }
 
 pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
         let header = GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
-        (header.as_ref().vtable.wake)(header);
+        GenericTaskHeader::wake(header);
     },
     |data| unsafe {
         let header = GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
-        (header.as_ref().vtable.wake_by_ref)(header.as_ref());
+        header.as_ref().wake_by_ref();
     },
     |_data| {},
 );
@@ -316,11 +441,11 @@ pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &LOCAL_INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
         let header = GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
-        (header.as_ref().vtable.wake)(header);
+        GenericTaskHeader::wake(header);
     },
     |data| unsafe {
         let header = GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
-        (header.as_ref().vtable.wake_by_ref)(header.as_ref());
+        header.as_ref().wake_by_ref();
     },
     |_data| {},
 );

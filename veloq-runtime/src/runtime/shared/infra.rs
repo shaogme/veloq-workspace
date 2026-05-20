@@ -209,9 +209,7 @@ impl GlobalInjector {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
             let old_ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader;
-            task.header()
-                .injector_next
-                .store(NonNull::new(old_ptr as *mut _), Ordering::Release);
+            task.header().set_next(NonNull::new(old_ptr as *mut _));
 
             let next_gen = ((head >> 48).wrapping_add(1)) & 0xFFFF;
             let new_head = (next_gen << 48) | header_ptr;
@@ -236,7 +234,7 @@ impl GlobalInjector {
             }
 
             let ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader;
-            let next_ptr = unsafe { (&*ptr).injector_next.load(Ordering::Acquire) };
+            let next_ptr = unsafe { (&*ptr).next() };
 
             let next_raw = next_ptr.map(|p| p.as_ptr() as u64).unwrap_or(0);
             let next_gen = ((head >> 48).wrapping_add(1)) & 0xFFFF;

@@ -1,7 +1,13 @@
+use crate::runtime::primitives::GenericCancellationToken;
+use crate::scope::GenericScopeCompletion;
+use crate::task::{LocalTaskRef, TaskHandleRef};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicStorage, LocalStorage, Storage, StrategyId};
 use std::any::Any;
+use std::marker::PhantomData;
+use std::mem::forget;
 use std::ptr::NonNull;
+use std::task::Waker;
 
 /// 不透明的作用域句柄。
 ///
@@ -27,8 +33,8 @@ impl OpaqueScope {
     #[inline]
     pub unsafe fn as_concrete<'a, S: Storage, O: Ownership>(
         ptr: NonNull<Self>,
-    ) -> &'a crate::scope::GenericScopeCompletion<S, O> {
-        unsafe { &*(ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>) }
+    ) -> &'a GenericScopeCompletion<S, O> {
+        unsafe { &*(ptr.as_ptr() as *const GenericScopeCompletion<S, O>) }
     }
 }
 
@@ -39,9 +45,7 @@ pub struct ErasedCancellationToken {
 }
 
 impl ErasedCancellationToken {
-    pub fn new<S: Storage, O: Ownership>(
-        token: &crate::runtime::GenericCancellationToken<S, O>,
-    ) -> Self {
+    pub fn new<S: Storage, O: Ownership>(token: &GenericCancellationToken<S, O>) -> Self {
         Self {
             ptr: unsafe { NonNull::new_unchecked(token as *const _ as *mut OpaqueToken) },
             s_id: S::strategy_id(),
@@ -57,11 +61,9 @@ impl ErasedCancellationToken {
     /// 虽然内部有类型 ID 检查，但该函数仍被标记为 unsafe 以提醒调用者注意指针生命周期。
     pub unsafe fn downcast<S: Storage, O: Ownership>(
         &self,
-    ) -> Option<&crate::runtime::GenericCancellationToken<S, O>> {
+    ) -> Option<&GenericCancellationToken<S, O>> {
         if self.s_id == S::strategy_id() && self.o_id == O::strategy_id() {
-            unsafe {
-                Some(&*(self.ptr.as_ptr() as *const crate::runtime::GenericCancellationToken<S, O>))
-            }
+            unsafe { Some(&*(self.ptr.as_ptr() as *const GenericCancellationToken<S, O>)) }
         } else {
             None
         }
@@ -77,8 +79,11 @@ pub struct ScopeVTable<S: Storage> {
     parent: unsafe fn(NonNull<OpaqueScope>) -> Option<AnyScopeCompletionRef>,
     clone: unsafe fn(NonNull<OpaqueScope>) -> ScopeCompletionRef<S>,
     drop: unsafe fn(NonNull<OpaqueScope>),
-    register_cancel_waker: unsafe fn(NonNull<OpaqueScope>, &std::task::Waker),
-    _marker: std::marker::PhantomData<S>,
+    register_cancel_waker: unsafe fn(NonNull<OpaqueScope>, &Waker),
+    enqueue_local: unsafe fn(NonNull<OpaqueScope>, LocalTaskRef<'static>),
+    pop_local: unsafe fn(NonNull<OpaqueScope>) -> Option<LocalTaskRef<'static>>,
+    is_local_empty: unsafe fn(NonNull<OpaqueScope>) -> bool,
+    _marker: PhantomData<S>,
 }
 
 pub struct ScopeCompletionRef<S: Storage> {
@@ -93,7 +98,7 @@ impl<S: Storage> ScopeCompletionRef<S> {
     #[inline]
     pub fn into_parts(self) -> (NonNull<OpaqueScope>, &'static ScopeVTable<S>) {
         let parts = (self.ptr, self.vtable);
-        std::mem::forget(self);
+        forget(self);
         parts
     }
 
@@ -105,9 +110,7 @@ impl<S: Storage> ScopeCompletionRef<S> {
         Self { ptr, vtable }
     }
 
-    pub fn new<O: Ownership>(
-        scope: &O::Shared<crate::scope::GenericScopeCompletion<S, O>>,
-    ) -> Self {
+    pub fn new<O: Ownership>(scope: &O::Shared<GenericScopeCompletion<S, O>>) -> Self {
         let ptr = O::as_ptr(scope);
         unsafe { O::increment_strong_count(ptr) };
 
@@ -148,8 +151,23 @@ impl<S: Storage> ScopeCompletionRef<S> {
     }
 
     #[inline]
-    pub fn register_cancel_waker(&self, waker: &std::task::Waker) {
+    pub fn register_cancel_waker(&self, waker: &Waker) {
         unsafe { (self.vtable.register_cancel_waker)(self.ptr, waker) }
+    }
+
+    #[inline]
+    pub fn pop_local(&self) -> Option<LocalTaskRef<'static>> {
+        unsafe { (self.vtable.pop_local)(self.ptr) }
+    }
+
+    #[inline]
+    pub fn is_local_empty(&self) -> bool {
+        unsafe { (self.vtable.is_local_empty)(self.ptr) }
+    }
+
+    #[inline]
+    pub fn enqueue_local(&self, task: LocalTaskRef<'static>) {
+        unsafe { (self.vtable.enqueue_local)(self.ptr, task) }
     }
 }
 
@@ -165,7 +183,7 @@ impl<S: Storage> Drop for ScopeCompletionRef<S> {
     }
 }
 
-struct VTableContainer<S: Storage, O: Ownership>(std::marker::PhantomData<(S, O)>);
+struct VTableContainer<S: Storage, O: Ownership>(PhantomData<(S, O)>);
 
 impl<S: Storage, O: Ownership> VTableContainer<S, O> {
     const VTABLE: ScopeVTable<S> = ScopeVTable::<S> {
@@ -194,24 +212,34 @@ impl<S: Storage, O: Ownership> VTableContainer<S, O> {
             scope.parent().clone()
         },
         clone: |ptr| unsafe {
-            O::increment_strong_count(
-                ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>
-            );
+            O::increment_strong_count(ptr.as_ptr() as *const GenericScopeCompletion<S, O>);
             ScopeCompletionRef::<S> {
                 ptr,
                 vtable: &VTableContainer::<S, O>::VTABLE,
             }
         },
         drop: |ptr| unsafe {
-            O::decrement_strong_count(
-                ptr.as_ptr() as *const crate::scope::GenericScopeCompletion<S, O>
-            );
+            O::decrement_strong_count(ptr.as_ptr() as *const GenericScopeCompletion<S, O>);
         },
         register_cancel_waker: |ptr, waker| unsafe {
             let scope = OpaqueScope::as_concrete::<S, O>(ptr);
             scope.cancel_token().register_waker(waker);
         },
-        _marker: std::marker::PhantomData,
+        enqueue_local: |ptr, task| unsafe {
+            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
+            scope.enqueue_local_task(task);
+            let header = task.header();
+            header.notify_runtime_active();
+        },
+        pop_local: |ptr| unsafe {
+            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
+            scope.pop_local_task()
+        },
+        is_local_empty: |ptr| unsafe {
+            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
+            scope.is_local_queue_empty()
+        },
+        _marker: PhantomData,
     };
 }
 
@@ -247,10 +275,34 @@ impl AnyScopeCompletionRef {
     }
 
     #[inline]
-    pub fn register_cancel_waker(&self, waker: &std::task::Waker) {
+    pub fn register_cancel_waker(&self, waker: &Waker) {
         match self {
             Self::Local(s) => s.register_cancel_waker(waker),
             Self::Send(s) => s.register_cancel_waker(waker),
+        }
+    }
+
+    #[inline]
+    pub fn pop_local(&self) -> Option<LocalTaskRef<'static>> {
+        match self {
+            Self::Local(s) => s.pop_local(),
+            Self::Send(s) => s.pop_local(),
+        }
+    }
+
+    #[inline]
+    pub fn is_local_empty(&self) -> bool {
+        match self {
+            Self::Local(s) => s.is_local_empty(),
+            Self::Send(s) => s.is_local_empty(),
+        }
+    }
+
+    #[inline]
+    pub fn enqueue_local(&self, task: LocalTaskRef<'static>) {
+        match self {
+            Self::Local(s) => s.enqueue_local(task),
+            Self::Send(s) => s.enqueue_local(task),
         }
     }
 }

@@ -4,11 +4,10 @@ use crate::task::{
     LocalTaskRef, RawTask, ScopeCompletionRef, SendTaskRef, Task, TaskError, TaskLock,
     TaskResultSetter, TaskVTable, impl_raw_task_common, poll_task_internal,
 };
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, StateOptionPtr, Storage};
+use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
 use std::task::{Context, RawWakerVTable};
 
 /// 任务存储特性，用于统一本地和发送任务的存储行为。
@@ -80,24 +79,10 @@ where
     /// 优化 VTable 的定义，确保其作为静态引用在编译期完全内联。
     const VTABLE: &'static TaskVTable<S> = &TaskVTable {
         wake: |data| unsafe {
-            let header = data.as_ref();
-            let worker_id = header.worker_id();
-            if !S::IS_LOCAL && header.is_pinned() {
-                let task = SendTaskRef::from_header(data.as_ptr() as *const _);
-                header.runtime.enqueue_pinned(worker_id, task);
-                return;
-            }
-            S::enqueue(header.runtime, worker_id, data);
+            data.as_ref().enqueue_self(data);
         },
         wake_by_ref: |header| unsafe {
-            let worker_id = header.worker_id();
-            if !S::IS_LOCAL && header.is_pinned() {
-                let task =
-                    SendTaskRef::from_header(header as *const GenericTaskHeader<S> as *const _);
-                header.runtime.enqueue_pinned(worker_id, task);
-                return;
-            }
-            S::enqueue(header.runtime, worker_id, NonNull::from(header));
+            header.enqueue_self(NonNull::from(header));
         },
         poll: |header, worker_id| unsafe {
             let node = &*(header as *const GenericTaskHeader<S> as *const Self);
@@ -184,13 +169,12 @@ where
         if let Some(scope) = scope {
             let scope_ref = crate::task::ScopeCompletionRef::new::<O>(&scope);
             let (ptr, vtable) = scope_ref.into_parts();
-            self.header.scope_ptr.store(Some(ptr), Ordering::Release);
+            self.header.set_scope_ptr(Some(ptr));
             self.header
-                .scope_vtable
-                .store(Some(NonNull::from(vtable).cast()), Ordering::Release);
+                .set_scope_vtable(Some(NonNull::from(vtable).cast()));
         } else {
-            self.header.scope_ptr.store(None, Ordering::Release);
-            self.header.scope_vtable.store(None, Ordering::Release);
+            self.header.set_scope_ptr(None);
+            self.header.set_scope_vtable(None);
         }
     }
 }

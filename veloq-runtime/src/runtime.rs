@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::{AsyncFn, AsyncFnOnce};
@@ -128,7 +129,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                         remote_rx: rrx,
                         pinned_rx: prx,
                         rand: FastRand::new(worker_id as u64),
-                        local_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                        active_scopes: RefCell::new(std::vec::Vec::new()),
                     };
                     shared_ref
                         .base
@@ -163,7 +164,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
                 remote_rx: rrx0,
                 pinned_rx: prx0,
                 rand: FastRand::new(0),
-                local_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
+                active_scopes: RefCell::new(std::vec::Vec::new()),
             };
             shared_ref
                 .base

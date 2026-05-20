@@ -1,9 +1,12 @@
 pub mod context;
 
+use std::cell::RefCell;
+use std::io;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
 use std::sync::{Arc, mpsc};
+use std::thread;
 
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
@@ -11,10 +14,11 @@ use veloq_driver_native::driver::PlatformDriver;
 use veloq_runtime::runtime::{self as async_runtime};
 use veloq_runtime::utils::storage::StaticTransfer;
 
-use crate::config::Config;
-use crate::runtime::context::{DriverRegistrar, RegistrarMessage, RuntimeContext};
-
-use crate::runtime::context::WorkerState;
+use crate::config::{BlockingPoolConfig, Config};
+use crate::runtime::context::{
+    BorrowedRegistrar, DriverRegistrar, RegistrarMessage, RuntimeContext, WorkerRegistrarState,
+    WorkerState, poll_current_driver,
+};
 
 pub struct RuntimeBuilder<T: PoolTopology> {
     topology: T,
@@ -29,7 +33,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         }
     }
 
-    pub fn worker_count(mut self, worker_count: std::num::NonZeroUsize) -> Self {
+    pub fn worker_count(mut self, worker_count: NonZeroUsize) -> Self {
         self.config = self.config.worker_threads(worker_count.get());
         self
     }
@@ -44,7 +48,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn blocking_pool(mut self, blocking_pool: crate::config::BlockingPoolConfig) -> Self {
+    pub fn blocking_pool(mut self, blocking_pool: BlockingPoolConfig) -> Self {
         self.config = self.config.blocking_pool(blocking_pool);
         self
     }
@@ -57,9 +61,9 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn build<'a>(self) -> std::io::Result<Runtime<'a, T>> {
+    pub fn build<'a>(self) -> io::Result<Runtime<'a, T>> {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
-            std::thread::available_parallelism()
+            thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
         });
 
@@ -79,7 +83,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 }
 
 pub struct Runtime<'ctx, T: PoolTopology> {
-    worker_count: std::num::NonZeroUsize,
+    worker_count: NonZeroUsize,
     topology: T,
     state: T::State,
     config: Config,
@@ -103,7 +107,7 @@ impl<'ctx, T: PoolTopology + 'ctx> Runtime<'ctx, T> {
         RuntimeBuilder::new(topology)
     }
 
-    pub fn worker_count(&self) -> std::num::NonZeroUsize {
+    pub fn worker_count(&self) -> NonZeroUsize {
         self.worker_count
     }
 
@@ -143,7 +147,7 @@ impl<'ctx, T: PoolTopology + 'ctx> Runtime<'ctx, T> {
         let runtime = async_runtime::RuntimeBuilder::new()
             .with_worker_count(worker_count.get())
             .with_queue_capacity(config.get_queue_capacity().get())
-            .with_idle_hook(crate::runtime::context::poll_current_driver)
+            .with_idle_hook(poll_current_driver)
             .with_worker_extra(move |worker_id, shared| {
                 let topology = topology.clone();
                 let state = state.clone();
@@ -153,18 +157,17 @@ impl<'ctx, T: PoolTopology + 'ctx> Runtime<'ctx, T> {
                 let registration_mode = config.registration_mode();
                 let registrar = DriverRegistrar::new(shared, registration_mode);
 
-                let registrar_state =
-                    std::cell::RefCell::new(crate::runtime::context::WorkerRegistrarState {
-                        receiver,
-                        chunks: Vec::new(),
-                    });
+                let registrar_state = RefCell::new(WorkerRegistrarState {
+                    receiver,
+                    chunks: Vec::new(),
+                });
 
                 let driver = PlatformDriver::new(config.clone(), Box::new(registrar.clone()))
                     .expect("failed to create driver");
-                let driver_cell = std::cell::RefCell::new(driver);
+                let driver_cell = RefCell::new(driver);
 
                 let buf_pool = {
-                    let borrowed_registrar = crate::runtime::context::BorrowedRegistrar {
+                    let borrowed_registrar = BorrowedRegistrar {
                         driver: &driver_cell,
                         state: &registrar_state,
                         registration_mode,
@@ -182,7 +185,7 @@ impl<'ctx, T: PoolTopology + 'ctx> Runtime<'ctx, T> {
             .build();
 
         runtime.block_on(async move |scope| {
-            let ctx = crate::runtime::context::RuntimeContext { scope };
+            let ctx = RuntimeContext { scope };
             f(ctx).await
         })
     }

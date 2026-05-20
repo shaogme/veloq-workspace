@@ -1,12 +1,14 @@
 use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::task::{
-    Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef, SendTask, SendTaskRef, Task,
-    TaskError, TaskHandleRef,
+    AnyScopeCompletionRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef,
+    SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, Storage};
 use std::any::Any;
+use std::collections::VecDeque;
+use std::mem::take;
 use std::ops::AsyncFnOnce;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
@@ -45,27 +47,44 @@ pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
     wakers: S::Lock<Vec<Waker>>,
     cancel_token: GenericCancellationToken<S, O>,
     panic_info: S::Lock<Option<Box<dyn Any + Send + 'static>>>,
-    parent: Option<crate::task::AnyScopeCompletionRef>,
+    parent: Option<AnyScopeCompletionRef>,
+    local_queue: S::Lock<VecDeque<LocalTaskRef<'static>>>,
 }
 
 pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
 pub type LocalScopeCompletion = GenericScopeCompletion<LocalStorage, RcOwnership>;
 
 impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
-    pub fn new(parent: Option<crate::task::AnyScopeCompletionRef>) -> O::Shared<Self> {
+    pub fn new(parent: Option<AnyScopeCompletionRef>) -> O::Shared<Self> {
         O::new(Self {
             remaining: S::Usize::new(0),
             wakers: S::Lock::new(Vec::new()),
             cancel_token: GenericCancellationToken::<S, O>::new(),
             panic_info: S::Lock::new(None),
             parent,
+            local_queue: S::Lock::new(VecDeque::new()),
         })
+    }
+
+    #[inline]
+    pub(crate) fn enqueue_local_task(&self, task: LocalTaskRef<'static>) {
+        self.local_queue.lock().push_back(task);
+    }
+
+    #[inline]
+    pub(crate) fn pop_local_task(&self) -> Option<LocalTaskRef<'static>> {
+        self.local_queue.lock().pop_front()
+    }
+
+    #[inline]
+    pub(crate) fn is_local_queue_empty(&self) -> bool {
+        self.local_queue.lock().is_empty()
     }
 
     fn drain_wakers(&self) {
         let wakers = {
             let mut wakers = self.wakers.lock();
-            std::mem::take(&mut *wakers)
+            take(&mut *wakers)
         };
         for waker in wakers {
             waker.wake();
@@ -297,7 +316,9 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
     }
 
     pub async fn wait_all(&self) {
-        self.context.shared.drive_worker(Some(&self.completion));
+        self.context
+            .shared
+            .drive_worker::<S, O>(Some(&self.completion));
         if let Some(panic_info) = self.completion.take_panic() {
             std::panic::resume_unwind(panic_info);
         }

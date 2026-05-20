@@ -12,17 +12,15 @@ pub use header::{
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
     AnyScopeCompletionRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, ScopeCompletionRef,
+    ScopeVTable,
 };
 
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{
-    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage,
-};
+use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 pub type TaskHeader<'ctx> = GenericTaskHeader<'ctx, AtomicStorage>;
@@ -50,15 +48,23 @@ pub trait IntoAnyScope {
     fn into_any(self) -> AnyScopeCompletionRef;
 }
 
-impl IntoAnyScope for ScopeCompletionRef<LocalStorage> {
+impl<S: Storage> IntoAnyScope for ScopeCompletionRef<S> {
     fn into_any(self) -> AnyScopeCompletionRef {
-        AnyScopeCompletionRef::Local(self)
-    }
-}
-
-impl IntoAnyScope for ScopeCompletionRef<AtomicStorage> {
-    fn into_any(self) -> AnyScopeCompletionRef {
-        AnyScopeCompletionRef::Send(self)
+        if S::strategy_id() == LocalStorage::strategy_id() {
+            let (ptr, vtable) = self.into_parts();
+            let local_vtable =
+                unsafe { &*(vtable as *const ScopeVTable<S> as *const ScopeVTable<LocalStorage>) };
+            let local_ref = unsafe { ScopeCompletionRef::from_parts(ptr, local_vtable) };
+            AnyScopeCompletionRef::Local(local_ref)
+        } else if S::strategy_id() == AtomicStorage::strategy_id() {
+            let (ptr, vtable) = self.into_parts();
+            let send_vtable =
+                unsafe { &*(vtable as *const ScopeVTable<S> as *const ScopeVTable<AtomicStorage>) };
+            let send_ref = unsafe { ScopeCompletionRef::from_parts(ptr, send_vtable) };
+            AnyScopeCompletionRef::Send(send_ref)
+        } else {
+            panic!("unknown storage strategy");
+        }
     }
 }
 
@@ -85,22 +91,14 @@ impl RuntimeContextExt for Context<'_> {
     fn scope_completion(&self) -> Option<AnyScopeCompletionRef> {
         unsafe {
             if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
-                let ptr = h.scope_ptr.load(Ordering::Acquire)?;
-                let vtable_ptr = h.scope_vtable.load(Ordering::Acquire)?;
-                let scope_ref = ScopeCompletionRef::from_parts(ptr, vtable_ptr.as_ref());
-                let result = scope_ref.clone();
-                std::mem::forget(scope_ref);
-                return Some(result.into_any());
+                let scope_ref = h.scope_completion_ref()?;
+                return Some(scope_ref.into_any());
             }
             if let Some(h) =
                 LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
             {
-                let ptr = h.scope_ptr.load(Ordering::Acquire)?;
-                let vtable_ptr = h.scope_vtable.load(Ordering::Acquire)?;
-                let scope_ref = ScopeCompletionRef::from_parts(ptr, vtable_ptr.as_ref());
-                let result = scope_ref.clone();
-                std::mem::forget(scope_ref);
-                return Some(result.into_any());
+                let scope_ref = h.scope_completion_ref()?;
+                return Some(scope_ref.into_any());
             }
             None
         }
@@ -213,16 +211,11 @@ where
             false
         };
 
-        if let Some(ptr) = self.header.scope_ptr.load(Ordering::Acquire)
-            && let Some(vtable_ptr) = self.header.scope_vtable.load(Ordering::Acquire)
+        if let Some(scope_ref) = self.header.scope_completion_ref()
             && !is_cancelled
         {
-            unsafe {
-                let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
-                scope_ref.report_panic(panic_err);
-                scope_ref.cancel();
-                std::mem::forget(scope_ref);
-            }
+            scope_ref.report_panic(panic_err);
+            scope_ref.cancel();
         }
 
         let error = if is_cancelled {
@@ -238,7 +231,7 @@ where
     fn finalize(&self, is_local: bool) {
         self.header.mark_completed_and_notify();
 
-        let should_acknowledge = self.header.ref_count.fetch_sub(1, Ordering::AcqRel) == 1;
+        let should_acknowledge = self.header.decrement_ref_count();
 
         if !is_local {
             self.header.exit_poll();
@@ -339,7 +332,7 @@ macro_rules! define_task_infrastructure {
             #[inline]
             pub fn poll_task(&self, worker_id: usize) -> bool {
                 let header = unsafe { self.header.as_ref() };
-                unsafe { (header.vtable.poll)(header, worker_id) }
+                unsafe { header.poll(worker_id) }
             }
         }
 

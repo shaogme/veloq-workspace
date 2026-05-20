@@ -496,7 +496,7 @@ impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra: 'ctx> Future
         let this = unsafe { self.get_unchecked_mut() };
         this.scope
             .runtime()
-            .drive_worker(Some(this.scope.completion()));
+            .drive_worker::<S::Storage, S::Ownership>(Some(this.scope.completion()));
 
         let arena = this.scope.arena();
         let completion = this.scope.completion();
@@ -539,7 +539,7 @@ impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra: 'ctx> Future
         let this = unsafe { self.get_unchecked_mut() };
         this.scope
             .runtime()
-            .drive_worker(Some(this.scope.completion()));
+            .drive_worker::<S::Storage, S::Ownership>(Some(this.scope.completion()));
 
         let arena = this.scope.arena();
         let completion = this.scope.completion();
@@ -628,12 +628,8 @@ impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TE
             if let Some(task) = task {
                 let header = task.header();
                 if !header.is_completed() {
-                    let mut wakers = header.wakers.lock();
-                    if unsafe { node_ptr.as_ref().link.is_linked() } {
-                        unsafe {
-                            let mut cursor = wakers.cursor_mut_from_ptr(node_ptr);
-                            cursor.remove();
-                        }
+                    unsafe {
+                        header.remove_waker(node_ptr);
                     }
                 }
             }
