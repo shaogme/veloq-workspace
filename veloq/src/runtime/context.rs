@@ -439,6 +439,7 @@ pub(crate) fn submit_control_task<'ctx>(
             UnregisterFileTask::VTABLE,
             &shared.base,
             worker_id,
+            veloq_runtime::task::ScopeCompletionRef::dummy(),
         ),
         fd,
         shared_ptr: shared as *const _,

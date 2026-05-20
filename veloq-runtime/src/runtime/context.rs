@@ -191,7 +191,12 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         }
 
         let task = Box::new(RouteJobTask {
-            header: TaskHeader::new(RouteJobTask::<F, Fut>::VTABLE, &self.shared.base, worker_id),
+            header: TaskHeader::new(
+                RouteJobTask::<F, Fut>::VTABLE,
+                &self.shared.base,
+                worker_id,
+                crate::task::ScopeCompletionRef::dummy(),
+            ),
             job: UnsafeCell::new(Some(job)),
             slot: slot_for_job,
         });

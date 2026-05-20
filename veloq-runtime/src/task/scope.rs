@@ -95,6 +95,25 @@ unsafe impl<S: Storage> Send for ScopeCompletionRef<S> {}
 unsafe impl<S: Storage> Sync for ScopeCompletionRef<S> {}
 
 impl<S: Storage> ScopeCompletionRef<S> {
+    pub fn dummy() -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            vtable: &DummyVTableContainer::<S>::VTABLE,
+        }
+    }
+
+    /// # Safety
+    /// The caller must ensure the underlying scope outlives the casted reference,
+    /// and that the vtable functions are compatible.
+    #[inline]
+    pub unsafe fn cast<T: Storage>(self) -> ScopeCompletionRef<T> {
+        let (ptr, vtable) = self.into_parts();
+        ScopeCompletionRef {
+            ptr,
+            vtable: unsafe { &*(vtable as *const ScopeVTable<S> as *const ScopeVTable<T>) },
+        }
+    }
+
     #[inline]
     pub fn into_parts(self) -> (NonNull<OpaqueScope>, &'static ScopeVTable<S>) {
         let parts = (self.ptr, self.vtable);
@@ -239,6 +258,29 @@ impl<S: Storage, O: Ownership> VTableContainer<S, O> {
             let scope = OpaqueScope::as_concrete::<S, O>(ptr);
             scope.is_local_queue_empty()
         },
+        _marker: PhantomData,
+    };
+}
+
+struct DummyVTableContainer<S: Storage>(PhantomData<S>);
+
+impl<S: Storage> DummyVTableContainer<S> {
+    const VTABLE: ScopeVTable<S> = ScopeVTable::<S> {
+        task_done: |_| {},
+        cancel: |_| {},
+        report_panic: |_, _| {},
+        is_cancelled: |_| false,
+        try_link_child: |_, _| false,
+        parent: |_| None,
+        clone: |ptr| ScopeCompletionRef {
+            ptr,
+            vtable: &DummyVTableContainer::<S>::VTABLE,
+        },
+        drop: |_| {},
+        register_cancel_waker: |_, _| {},
+        enqueue_local: |_, _| {},
+        pop_local: |_| None,
+        is_local_empty: |_| true,
         _marker: PhantomData,
     };
 }

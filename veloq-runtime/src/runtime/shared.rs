@@ -192,13 +192,10 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         });
         if task.header().try_mark_queued() {
             let header = task.header();
-            if let Some(scope_ref) = header.scope_completion_ref() {
-                let task_static =
-                    unsafe { LocalTaskRef::from_header(task.header() as *const _ as *const _) };
-                scope_ref.enqueue_local(task_static);
-            } else {
-                panic!("local task has no scope completion");
-            }
+            let scope_ref = header.scope_completion_ref();
+            let task_static =
+                unsafe { LocalTaskRef::from_header(task.header() as *const _ as *const _) };
+            scope_ref.enqueue_local(task_static);
         }
     }
 

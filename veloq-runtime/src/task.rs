@@ -15,7 +15,6 @@ pub use scope::{
     ScopeVTable,
 };
 
-use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 use std::any::Any;
 use std::future::Future;
@@ -91,13 +90,13 @@ impl RuntimeContextExt for Context<'_> {
     fn scope_completion(&self) -> Option<AnyScopeCompletionRef> {
         unsafe {
             if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
-                let scope_ref = h.scope_completion_ref()?;
+                let scope_ref = h.scope_completion_ref();
                 return Some(scope_ref.into_any());
             }
             if let Some(h) =
                 LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
             {
-                let scope_ref = h.scope_completion_ref()?;
+                let scope_ref = h.scope_completion_ref();
                 return Some(scope_ref.into_any());
             }
             None
@@ -122,10 +121,6 @@ pub trait RawTask<'ctx> {
 pub trait Task<'ctx, T>: RawTask<'ctx> {
     fn poll_task(&self, cx: &mut Context<'_>) -> bool;
     fn take_result(&self) -> Option<Result<T, TaskError>>;
-    fn set_scope_completion<SS: Storage, O: Ownership>(
-        &self,
-        scope: Option<O::Shared<crate::scope::GenericScopeCompletion<SS, O>>>,
-    );
 }
 
 pub trait LocalTask<'ctx, T>: Task<'ctx, T, Storage = LocalStorage> {}
@@ -211,9 +206,8 @@ where
             false
         };
 
-        if let Some(scope_ref) = self.header.scope_completion_ref()
-            && !is_cancelled
-        {
+        if !is_cancelled {
+            let scope_ref = self.header.scope_completion_ref();
             scope_ref.report_panic(panic_err);
             scope_ref.cancel();
         }
@@ -413,18 +407,31 @@ impl Future for YieldNow {
 
 #[macro_export]
 macro_rules! task_local {
-    ($name:ident, $ctx:expr, $future_expr:expr) => {
+    ($name:ident, $scope:expr, $future_expr:expr) => {
         let mut __fut = $future_expr;
         let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
-        let $name = $crate::task::LocalTaskNode::new(__fut, &$ctx.shared().base, $ctx.worker_id());
+        let __scope_ref = $scope.scope_completion_ref();
+        let __scope_ref = unsafe { __scope_ref.cast::<$crate::utils::storage::LocalStorage>() };
+        let $name = $crate::task::LocalTaskNode::new(
+            __fut,
+            &$scope.shared().base,
+            $scope.worker_id(),
+            __scope_ref,
+        );
     };
 }
-
 #[macro_export]
 macro_rules! task {
-    ($name:ident, $ctx:expr, $future_expr:expr) => {
+    ($name:ident, $scope:expr, $future_expr:expr) => {
         let mut __fut = $future_expr;
         let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
-        let $name = $crate::task::SendTaskNode::new(__fut, &$ctx.shared().base, $ctx.worker_id());
+        let __scope_ref = $scope.scope_completion_ref();
+        let __scope_ref = unsafe { __scope_ref.cast::<$crate::utils::storage::AtomicStorage>() };
+        let $name = $crate::task::SendTaskNode::new(
+            __fut,
+            &$scope.shared().base,
+            $scope.worker_id(),
+            __scope_ref,
+        );
     };
 }

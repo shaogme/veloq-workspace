@@ -2,7 +2,7 @@ use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::task::{
     AnyScopeCompletionRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef,
-    SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
+    ScopeCompletionRef, SendTask, SendTaskRef, TaskError, TaskHandleRef,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, Storage};
@@ -249,7 +249,6 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
     where
         TTask: LocalTask<'ctx, T> + Sized,
     {
-        task.set_scope_completion::<S, O>(Some(self.completion.clone()));
         self.completion.add_task();
 
         let worker_id = self.context.worker_id();
@@ -272,7 +271,9 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
         F: Future<Output = T>,
     {
         let worker_id = self.context.worker_id();
-        let node = LocalBoxedTaskNode::new(future, &self.context.shared.base, worker_id);
+        let scope_ref = ScopeCompletionRef::<S>::new::<O>(&self.completion);
+        let scope_ref = unsafe { scope_ref.cast::<LocalStorage>() };
+        let node = LocalBoxedTaskNode::new(future, &self.context.shared.base, worker_id, scope_ref);
         let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<'ctx, T, F>>();
         let node_ptr = unsafe {
             self.arena.alloc::<LocalBoxedTaskNode<'ctx, T, F>>(
@@ -283,7 +284,6 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
         unsafe { std::ptr::write(node_ptr, node) };
 
         let node_ref = unsafe { &*node_ptr };
-        node_ref.set_scope_completion::<S, O>(Some(self.completion.clone()));
         self.completion.add_task();
 
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
@@ -323,6 +323,16 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
             std::panic::resume_unwind(panic_info);
         }
     }
+
+    #[inline]
+    pub fn scope_completion_ref(&self) -> ScopeCompletionRef<S> {
+        ScopeCompletionRef::<S>::new::<O>(&self.completion)
+    }
+
+    #[inline]
+    pub fn shared(&self) -> &'ctx RuntimeShared<'ctx, TExtra> {
+        self.context.shared
+    }
 }
 
 impl<'ctx, S: Storage, O: Ownership, TExtra> Drop for GenericAsyncScope<'ctx, S, O, TExtra> {
@@ -348,7 +358,6 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
             "worker_id {} is out of bounds",
             worker_id
         );
-        task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(self.completion.clone()));
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
@@ -398,7 +407,6 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
 
                 task.header().set_pinned();
                 task.header().set_worker_id(worker_id);
-                task.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(completion.clone()));
 
                 let task_ref = unsafe { SendTaskRef::from_concrete(task) };
                 if !runtime.enqueue_pinned(worker_id, task_ref) {
@@ -440,8 +448,13 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
             "worker_id {} is out of bounds",
             worker_id
         );
-        let node =
-            crate::task::SendBoxedTaskNode::new(future, &self.context.shared.base, worker_id);
+        let scope_ref = ScopeCompletionRef::<AtomicStorage>::new::<ArcOwnership>(&self.completion);
+        let node = crate::task::SendBoxedTaskNode::new(
+            future,
+            &self.context.shared.base,
+            worker_id,
+            scope_ref,
+        );
         let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'ctx, T, F>>();
         let node_ptr = unsafe {
             self.arena
@@ -457,7 +470,6 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         unsafe { std::ptr::write(node_ptr, node) };
 
         let node_ref = unsafe { &*node_ptr };
-        node_ref.set_scope_completion::<AtomicStorage, ArcOwnership>(Some(self.completion.clone()));
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };

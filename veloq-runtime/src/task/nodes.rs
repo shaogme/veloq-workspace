@@ -91,9 +91,14 @@ where
         drop: |_| {},
     };
 
-    pub fn new(future: F, runtime: &'ctx RuntimeSharedBase<'ctx>, worker_id: usize) -> Self {
+    pub fn new(
+        future: F,
+        runtime: &'ctx RuntimeSharedBase<'ctx>,
+        worker_id: usize,
+        scope: ScopeCompletionRef<S>,
+    ) -> Self {
         Self {
-            header: GenericTaskHeader::new(Self::VTABLE, runtime, worker_id),
+            header: GenericTaskHeader::new(Self::VTABLE, runtime, worker_id, scope),
             state: S::Lock::new(TaskState::Running(future)),
         }
     }
@@ -153,29 +158,6 @@ where
             }
             None
         })
-    }
-
-    fn set_scope_completion<
-        SS: crate::utils::storage::Storage,
-        O: crate::utils::ownership::Ownership,
-    >(
-        &self,
-        scope: Option<
-            <O as crate::utils::ownership::Ownership>::Shared<
-                crate::scope::GenericScopeCompletion<SS, O>,
-            >,
-        >,
-    ) {
-        if let Some(scope) = scope {
-            let scope_ref = crate::task::ScopeCompletionRef::new::<O>(&scope);
-            let (ptr, vtable) = scope_ref.into_parts();
-            self.header.set_scope_ptr(Some(ptr));
-            self.header
-                .set_scope_vtable(Some(NonNull::from(vtable).cast()));
-        } else {
-            self.header.set_scope_ptr(None);
-            self.header.set_scope_vtable(None);
-        }
     }
 }
 

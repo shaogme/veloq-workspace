@@ -251,7 +251,9 @@ pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
     T: Send + 'ctx,
     Fut: Future<Output = T> + 'ctx,
 {
-    let node = crate::task::SendBoxedTaskNode::new(future, &runtime.base, worker_id);
+    let scope_ref =
+        crate::task::ScopeCompletionRef::new::<crate::utils::ownership::ArcOwnership>(&completion);
+    let node = crate::task::SendBoxedTaskNode::new(future, &runtime.base, worker_id, scope_ref);
     let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'ctx, T, Fut>>();
     let node_ptr = unsafe {
         arena.alloc::<crate::task::SendBoxedTaskNode<'ctx, T, Fut>>(
@@ -265,9 +267,6 @@ pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
 
     let node_ref = unsafe { &*node_ptr };
     node_ref.header().set_pinned();
-    node_ref.set_scope_completion::<AtomicStorage, crate::utils::ownership::ArcOwnership>(Some(
-        completion.clone(),
-    ));
 
     let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
     let header = task_ref.header();

@@ -1,5 +1,5 @@
 use crate::runtime::RuntimeSharedBase;
-use crate::task::scope::{OpaqueScope, ScopeCompletionRef, ScopeVTable};
+use crate::task::scope::ScopeCompletionRef;
 use crate::task::{IntoAnyScope, SendTaskRef};
 use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
 use std::ptr::NonNull;
@@ -41,8 +41,7 @@ pub struct GenericTaskHeader<'ctx, S: Storage> {
     state: S::Usize,
     ref_count: S::Usize,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
-    scope_ptr: S::OptionPtr<OpaqueScope>,
-    scope_vtable: S::OptionPtr<ScopeVTable<S>>,
+    scope: ScopeCompletionRef<S>,
     runtime: &'ctx RuntimeSharedBase<'ctx>,
     worker_id: S::Usize,
     injector_next: S::OptionPtr<GenericTaskHeader<'ctx, S>>,
@@ -54,13 +53,13 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
         vtable: &'static TaskVTable<S>,
         runtime: &'ctx RuntimeSharedBase<'ctx>,
         worker_id: usize,
+        scope: ScopeCompletionRef<S>,
     ) -> Self {
         Self {
             state: S::Usize::new(0),
             ref_count: S::Usize::new(1),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
-            scope_ptr: S::OptionPtr::new(None),
-            scope_vtable: S::OptionPtr::new(None),
+            scope,
             runtime,
             worker_id: S::Usize::new(worker_id),
             injector_next: S::OptionPtr::new(None),
@@ -88,16 +87,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
         if self.state.load(Ordering::Acquire) & STATE_CANCELLED != 0 {
             return true;
         }
-        if let Some(ptr) = self.scope_ptr.load(Ordering::Acquire)
-            && let Some(vtable_ptr) = self.scope_vtable.load(Ordering::Acquire)
-        {
-            let scope_ref =
-                unsafe { ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref()) };
-            let cancelled = scope_ref.is_cancelled();
-            std::mem::forget(scope_ref);
-            return cancelled;
-        }
-        false
+        self.scope.is_cancelled()
     }
 
     #[inline]
@@ -252,16 +242,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     }
 
     pub fn acknowledge_completion(&self) {
-        let ptr = self.scope_ptr.swap(None, Ordering::AcqRel);
-        let vtable_ptr = self.scope_vtable.swap(None, Ordering::AcqRel);
-
-        if let (Some(ptr), Some(vtable_ptr)) = (ptr, vtable_ptr) {
-            unsafe {
-                let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
-                scope_ref.task_done();
-                drop(scope_ref);
-            }
-        }
+        self.scope.task_done();
     }
 
     pub fn is_ready(&self) -> bool {
@@ -305,37 +286,8 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     }
 
     #[inline]
-    pub fn scope_vtable(&self) -> Option<&'static ScopeVTable<S>> {
-        self.scope_vtable
-            .load(Ordering::Acquire)
-            .map(|p| unsafe { &*p.as_ptr() })
-    }
-
-    #[inline]
-    pub fn set_scope_vtable(&self, vtable: Option<NonNull<ScopeVTable<S>>>) {
-        self.scope_vtable.store(vtable, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn scope_ptr(&self) -> Option<NonNull<OpaqueScope>> {
-        self.scope_ptr.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    pub fn set_scope_ptr(&self, ptr: Option<NonNull<OpaqueScope>>) {
-        self.scope_ptr.store(ptr, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn scope_completion_ref(&self) -> Option<ScopeCompletionRef<S>> {
-        let ptr = self.scope_ptr.load(Ordering::Acquire)?;
-        let vtable_ptr = self.scope_vtable.load(Ordering::Acquire)?;
-        unsafe {
-            let scope_ref = ScopeCompletionRef::<S>::from_parts(ptr, vtable_ptr.as_ref());
-            let cloned = scope_ref.clone();
-            std::mem::forget(scope_ref);
-            Some(cloned)
-        }
+    pub fn scope_completion_ref(&self) -> ScopeCompletionRef<S> {
+        self.scope.clone()
     }
 
     #[inline]
