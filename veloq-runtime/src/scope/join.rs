@@ -197,6 +197,7 @@ impl<'ctx, T> RoutedSpawnState<'ctx, T> {
 
 pub(crate) fn dispatch_routed<
     'ctx,
+    'scope,
     S: crate::utils::storage::Storage,
     O: crate::utils::ownership::Ownership,
     T,
@@ -204,12 +205,12 @@ pub(crate) fn dispatch_routed<
     TExtra,
 >(
     context: &crate::runtime::RuntimeScopeContext<'ctx, TExtra>,
-    completion: &O::Shared<super::GenericScopeCompletion<S, O>>,
+    completion: &O::Shared<super::GenericScopeCompletion<'scope, S, O>>,
     state: Arc<RoutedSpawnState<'ctx, T>>,
     worker_id: usize,
     job: F,
 ) where
-    O::Shared<super::GenericScopeCompletion<S, O>>: Send + 'ctx,
+    O::Shared<super::GenericScopeCompletion<'scope, S, O>>: Send + 'ctx,
     F: FnOnce() + Send + 'ctx,
     T: 'ctx,
 {

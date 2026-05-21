@@ -31,10 +31,10 @@ impl OpaqueScope {
     /// 调用者必须确保 `ptr` 确实指向一个 `GenericScopeCompletion<S, O>` 实例，
     /// 且 `S` 和 `O` 与调用处的泛型参数匹配。通常通过 `ScopeVTable` 或 `StrategyId` 进行校验。
     #[inline]
-    pub unsafe fn as_concrete<'a, S: Storage, O: Ownership>(
+    pub unsafe fn as_concrete<'a, 'scope, S: Storage, O: Ownership>(
         ptr: NonNull<Self>,
-    ) -> &'a GenericScopeCompletion<S, O> {
-        unsafe { &*(ptr.as_ptr() as *const GenericScopeCompletion<S, O>) }
+    ) -> &'a GenericScopeCompletion<'scope, S, O> {
+        unsafe { &*(ptr.as_ptr() as *const GenericScopeCompletion<'scope, S, O>) }
     }
 }
 

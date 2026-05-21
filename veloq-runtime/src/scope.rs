@@ -42,19 +42,19 @@ impl<T> SendPtr<T> {
 }
 
 /// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
-pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
+pub struct GenericScopeCompletion<'scope, S: Storage, O: Ownership> {
     remaining: S::Usize,
     wakers: S::Lock<Vec<Waker>>,
     cancel_token: GenericCancellationToken<S, O>,
     panic_info: S::Lock<Option<Box<dyn Any + Send + 'static>>>,
     parent: Option<AnyScopeCompletionRef>,
-    local_queue: S::Lock<VecDeque<LocalTaskRef<'static>>>,
+    local_queue: S::Lock<VecDeque<LocalTaskRef<'scope>>>,
 }
 
-pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
-pub type LocalScopeCompletion = GenericScopeCompletion<LocalStorage, RcOwnership>;
+pub type ScopeCompletion<'scope> = GenericScopeCompletion<'scope, AtomicStorage, ArcOwnership>;
+pub type LocalScopeCompletion<'scope> = GenericScopeCompletion<'scope, LocalStorage, RcOwnership>;
 
-impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
+impl<'scope, S: Storage, O: Ownership> GenericScopeCompletion<'scope, S, O> {
     pub fn new(parent: Option<AnyScopeCompletionRef>) -> O::Shared<Self> {
         O::new(Self {
             remaining: S::Usize::new(0),
@@ -67,12 +67,12 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 
     #[inline]
-    pub(crate) fn enqueue_local_task(&self, task: LocalTaskRef<'static>) {
+    pub(crate) fn enqueue_local_task(&self, task: LocalTaskRef<'scope>) {
         self.local_queue.lock().push_back(task);
     }
 
     #[inline]
-    pub(crate) fn pop_local_task(&self) -> Option<LocalTaskRef<'static>> {
+    pub(crate) fn pop_local_task(&self) -> Option<LocalTaskRef<'scope>> {
         self.local_queue.lock().pop_front()
     }
 
@@ -159,7 +159,7 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 }
 
-impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
+impl<'scope, S: Storage, O: Ownership> Drop for GenericScopeCompletion<'scope, S, O> {
     fn drop(&mut self) {
         if let Some(panic_info) = self.panic_info.lock().take() {
             std::panic::resume_unwind(panic_info);
@@ -176,7 +176,7 @@ pub trait ScopeProvider<'ctx, T> {
     fn completion(
         &self,
     ) -> &<Self::Ownership as Ownership>::Shared<
-        GenericScopeCompletion<Self::Storage, Self::Ownership>,
+        GenericScopeCompletion<'ctx, Self::Storage, Self::Ownership>,
     >;
 }
 
@@ -192,7 +192,7 @@ pub(crate) type CancelTokenSlot<S, O> =
 pub struct GenericAsyncScope<'ctx, S: Storage, O: Ownership, TExtra> {
     context: crate::runtime::RuntimeScopeContext<'ctx, TExtra>,
     arena: GenericArena<S>,
-    completion: O::Shared<GenericScopeCompletion<S, O>>,
+    completion: O::Shared<GenericScopeCompletion<'ctx, S, O>>,
 }
 
 pub type AsyncScope<'ctx, TExtra> = GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra>;
@@ -213,7 +213,7 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> ScopeProvider<'ctx, TExtra>
         &self.arena
     }
     #[inline]
-    fn completion(&self) -> &O::Shared<GenericScopeCompletion<S, O>> {
+    fn completion(&self) -> &O::Shared<GenericScopeCompletion<'ctx, S, O>> {
         &self.completion
     }
 }
