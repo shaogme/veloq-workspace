@@ -2,17 +2,18 @@ use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::task::{
     AnyScopeCompletionRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef,
-    SendTask, SendTaskRef, TaskError, TaskHandleRef,
+    RawScope, SendBoxedTaskNode, SendTask, SendTaskRef, TaskError, TaskHandleRef, TaskJoinGate,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, Storage, StrategyType,
 };
+use std::alloc::Layout;
 use std::any::Any;
 use std::collections::VecDeque;
-use std::mem::take;
+use std::mem::{take, transmute};
 use std::ops::AsyncFnOnce;
-use std::ptr::NonNull;
+use std::ptr::{NonNull, drop_in_place, write};
 use std::sync::atomic::Ordering;
 use std::task::Waker;
 
@@ -23,7 +24,7 @@ pub use join::{JoinHandle, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle
 #[derive(Copy, Clone)]
 struct SendPtr<T>(NonNull<T>);
 
-unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T: Send> Send for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
     fn new(ptr: NonNull<T>) -> Self {
@@ -352,7 +353,13 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
 
         let worker_id = self.context.worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
-        task_ref.header().set_worker_id(worker_id);
+        unsafe {
+            task_ref.header().initialize(
+                &self.context.shared.base,
+                worker_id,
+                self.scope_completion_ref(),
+            );
+        }
         self.context.shared.enqueue_local(worker_id, task_ref);
 
         let gate_ref: &dyn crate::task::TaskJoinGate<T> = task;
@@ -371,7 +378,11 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
     {
         let worker_id = self.context.worker_id();
         let scope_ref = unsafe { crate::task::RawScope::clone_ref(&*self.completion) };
-        let node = LocalBoxedTaskNode::new(future, &self.context.shared.base, worker_id, scope_ref);
+        let node = LocalBoxedTaskNode::new(future);
+        unsafe {
+            node.header
+                .initialize(&self.context.shared.base, worker_id, scope_ref);
+        }
         let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<'ctx, T, F>>();
         let node_ptr = unsafe {
             self.arena.alloc::<LocalBoxedTaskNode<'ctx, T, F>>(
@@ -459,8 +470,13 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
-        let header = task_ref.header();
-        header.set_worker_id(worker_id);
+        unsafe {
+            task_ref.header().initialize(
+                &self.context.shared.base,
+                worker_id,
+                self.scope_completion_ref(),
+            );
+        }
         self.context.shared.enqueue_send(worker_id, task_ref);
 
         let gate_ref: &dyn crate::task::TaskJoinGate<T> = task;
@@ -490,6 +506,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let runtime = self.context.shared;
         let completion = self.completion.clone();
         let state_for_job = state.clone();
+        let scope_ref = self.scope_completion_ref();
 
         self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
             &self.context,
@@ -503,8 +520,11 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
                     return;
                 }
 
+                unsafe {
+                    task.header()
+                        .initialize(&runtime.base, worker_id, scope_ref);
+                }
                 task.header().set_pinned();
-                task.header().set_worker_id(worker_id);
 
                 let task_ref = unsafe { SendTaskRef::from_concrete(task) };
                 if !runtime.enqueue_pinned(worker_id, task_ref) {
@@ -546,26 +566,20 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
             "worker_id {} is out of bounds",
             worker_id
         );
-        let scope_ref = unsafe { crate::task::RawScope::clone_ref(&*self.completion) };
-        let node = crate::task::SendBoxedTaskNode::new(
-            future,
-            &self.context.shared.base,
-            worker_id,
-            scope_ref,
-        );
-        let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'ctx, T, F>>();
+        let scope_ref = unsafe { RawScope::clone_ref(&*self.completion) };
+        let node = SendBoxedTaskNode::new(future);
+        unsafe {
+            node.header
+                .initialize(&self.context.shared.base, worker_id, scope_ref);
+        }
+        let layout = Layout::new::<SendBoxedTaskNode<'ctx, T, F>>();
         let node_ptr = unsafe {
-            self.arena
-                .alloc::<crate::task::SendBoxedTaskNode<'ctx, T, F>>(
-                    layout,
-                    Some(|ptr| {
-                        std::ptr::drop_in_place(
-                            ptr as *mut crate::task::SendBoxedTaskNode<'ctx, T, F>,
-                        )
-                    }),
-                ) as *mut crate::task::SendBoxedTaskNode<'ctx, T, F>
+            self.arena.alloc::<SendBoxedTaskNode<'ctx, T, F>>(
+                layout,
+                Some(|ptr| drop_in_place(ptr as *mut SendBoxedTaskNode<'ctx, T, F>)),
+            ) as *mut SendBoxedTaskNode<'ctx, T, F>
         };
-        unsafe { std::ptr::write(node_ptr, node) };
+        unsafe { write(node_ptr, node) };
 
         let node_ref = unsafe { &*node_ptr };
         self.completion.add_task();
@@ -573,21 +587,16 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
         self.context.shared.enqueue_send(worker_id, task_ref);
 
-        let gate_ref: &dyn crate::task::TaskJoinGate<T> = node_ref;
-        let gate_ctx: &'ctx (dyn crate::task::TaskJoinGate<T> + 'ctx) =
-            unsafe { std::mem::transmute(gate_ref) };
+        let gate_ref: &dyn TaskJoinGate<T> = node_ref;
+        let gate_ctx: &'ctx (dyn TaskJoinGate<T> + 'ctx) = unsafe { transmute(gate_ref) };
 
         JoinHandle::new_direct(
             self,
             task_ref,
             gate_ctx,
             Some(|arena, gate| unsafe {
-                let layout =
-                    std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'ctx, T, F>>();
-                arena.drop_object_raw(
-                    gate as *const dyn crate::task::TaskJoinGate<T> as *mut u8,
-                    layout,
-                );
+                let layout = Layout::new::<SendBoxedTaskNode<'ctx, T, F>>();
+                arena.drop_object_raw(gate as *const dyn TaskJoinGate<T> as *mut u8, layout);
             }),
         )
     }

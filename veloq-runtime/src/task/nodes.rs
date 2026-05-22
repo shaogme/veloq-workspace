@@ -1,14 +1,14 @@
-use crate::runtime::RuntimeSharedBase;
 use crate::task::{
-    AnyScopeCompletionRef, GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE,
-    LocalTaskRef, RawTask, SendTaskRef, Task, TaskError, TaskLock, TaskResultSetter, TaskVTable,
-    impl_raw_task_common, poll_task_internal,
+    GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef, RawTask,
+    SendTaskRef, Task, TaskError, TaskLock, TaskResultSetter, TaskVTable, impl_raw_task_common,
+    poll_task_internal,
 };
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 use std::future::Future;
+use std::mem::replace;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::task::{Context, RawWakerVTable};
+use std::task::{Context, Poll, RawWakerVTable};
 
 /// 任务存储特性，用于统一本地和发送任务的存储行为。
 pub trait TaskStorage: Storage + Sized {
@@ -60,8 +60,8 @@ pub enum TaskState<T, F> {
 
 #[repr(C)]
 pub struct GenericTaskNode<'ctx, S: TaskStorage, T, F> {
-    header: GenericTaskHeader<'ctx, S>,
-    state: S::Lock<TaskState<T, F>>,
+    pub(crate) header: GenericTaskHeader<'ctx, S>,
+    pub(crate) state: S::Lock<TaskState<T, F>>,
 }
 
 impl<'ctx, S: TaskStorage, T, F> GenericTaskNode<'ctx, S, T, F>
@@ -84,14 +84,9 @@ where
         drop: |_| {},
     };
 
-    pub fn new(
-        future: F,
-        runtime: &'ctx RuntimeSharedBase<'ctx>,
-        worker_id: usize,
-        scope: AnyScopeCompletionRef<'ctx>,
-    ) -> Self {
+    pub fn new(future: F) -> Self {
         Self {
-            header: GenericTaskHeader::new(Self::VTABLE, runtime, worker_id, scope),
+            header: GenericTaskHeader::new_placeholder(Self::VTABLE),
             state: S::Lock::new(TaskState::Running(future)),
         }
     }
@@ -131,7 +126,7 @@ where
                     if let TaskState::Running(f) = s {
                         unsafe { Pin::new_unchecked(f) }.poll(cx)
                     } else {
-                        std::task::Poll::Pending
+                        Poll::Pending
                     }
                 })
             },
@@ -142,7 +137,7 @@ where
     fn take_result(&self) -> Option<Result<T, TaskError>> {
         self.state.lock_mut(|s| {
             if let TaskState::Done(_) = s
-                && let TaskState::Done(res) = std::mem::replace(s, TaskState::Empty)
+                && let TaskState::Done(res) = replace(s, TaskState::Empty)
             {
                 return Some(res);
             }

@@ -382,29 +382,17 @@ impl Future for YieldNow {
 
 #[macro_export]
 macro_rules! task_local {
-    ($name:ident, $scope:expr, $future_expr:expr) => {
+    ($name:ident, $future_expr:expr) => {
         let mut __fut = $future_expr;
         let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
-        let __scope_ref = $scope.scope_completion_ref();
-        let $name = $crate::task::LocalTaskNode::new(
-            __fut,
-            &$scope.shared().base,
-            $scope.worker_id(),
-            __scope_ref,
-        );
+        let $name = $crate::task::LocalTaskNode::new(__fut);
     };
 }
 #[macro_export]
 macro_rules! task {
-    ($name:ident, $scope:expr, $future_expr:expr) => {
+    ($name:ident, $future_expr:expr) => {
         let mut __fut = $future_expr;
         let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
-        let __scope_ref = $scope.scope_completion_ref();
-        let $name = $crate::task::SendTaskNode::new(
-            __fut,
-            &$scope.shared().base,
-            $scope.worker_id(),
-            __scope_ref,
-        );
+        let $name = $crate::task::SendTaskNode::new(__fut);
     };
 }

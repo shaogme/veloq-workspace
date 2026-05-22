@@ -1,9 +1,17 @@
 use crate::runtime::{GenericCancellationToken, RuntimeShared};
-use crate::task::{Arena, GenericWakerNode, RawTask, SendTaskRef, Task, TaskError, TaskHandleRef};
+use crate::task::{
+    Arena, GenericWakerNode, RawScope, RawTask, SendBoxedTaskNode, SendTaskRef, Task, TaskError,
+    TaskHandleRef,
+};
 use crate::utils::storage::{AtomicStorage, StateLock};
+use std::alloc::Layout;
 use std::future::Future;
+use std::marker::PhantomData;
+use std::mem::replace;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::ptr::NonNull;
+use std::ptr::{NonNull, drop_in_place, write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use veloq_atomic_waker::AtomicWaker;
@@ -33,14 +41,14 @@ pub(crate) enum RoutedSpawnOutcome<'ctx, T> {
 
 pub(crate) struct RoutedJobCell<'ctx, F> {
     job: Option<F>,
-    _marker: std::marker::PhantomData<&'ctx ()>,
+    _marker: PhantomData<&'ctx ()>,
 }
 
 impl<'ctx, F> RoutedJobCell<'ctx, F> {
     pub(crate) fn new(job: F) -> Self {
         Self {
             job: Some(job),
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -51,7 +59,7 @@ impl<'ctx, F> RoutedJobCell<'ctx, F> {
 
 struct SpawnToAccess<'ctx, T, S_> {
     task: &'ctx S_,
-    _marker: std::marker::PhantomData<T>,
+    _marker: PhantomData<T>,
 }
 
 impl<'ctx, T, S_> RoutedTaskAccess<T> for SpawnToAccess<'ctx, T, S_>
@@ -79,13 +87,13 @@ where
 {
     Box::new(SpawnToAccess {
         task,
-        _marker: std::marker::PhantomData,
+        _marker: PhantomData,
     })
 }
 
 struct BoxedTaskAccess<'ctx, T, Fut> {
-    node: &'ctx crate::task::SendBoxedTaskNode<'ctx, T, Fut>,
-    _marker: std::marker::PhantomData<T>,
+    node: &'ctx SendBoxedTaskNode<'ctx, T, Fut>,
+    _marker: PhantomData<T>,
 }
 
 impl<'ctx, T, Fut> RoutedTaskAccess<T> for BoxedTaskAccess<'ctx, T, Fut>
@@ -98,7 +106,7 @@ where
     }
 
     fn reclaim(self: Box<Self>, arena: &dyn crate::task::Arena) {
-        let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'ctx, T, Fut>>();
+        let layout = Layout::new::<SendBoxedTaskNode<'ctx, T, Fut>>();
         unsafe {
             arena.drop_object_raw(self.node as *const _ as *mut u8, layout);
         }
@@ -113,7 +121,7 @@ where
 }
 
 pub(crate) fn make_boxed_task_access<'ctx, T, Fut>(
-    node: &'ctx crate::task::SendBoxedTaskNode<'ctx, T, Fut>,
+    node: &'ctx SendBoxedTaskNode<'ctx, T, Fut>,
 ) -> Box<dyn RoutedTaskAccess<T> + 'ctx>
 where
     T: Send + 'ctx,
@@ -121,13 +129,13 @@ where
 {
     Box::new(BoxedTaskAccess {
         node,
-        _marker: std::marker::PhantomData,
+        _marker: PhantomData,
     })
 }
 
 pub(crate) struct RoutedSpawnState<'ctx, T> {
     pub(crate) outcome: Mutex<RoutedSpawnOutcome<'ctx, T>>,
-    cancel_requested: std::sync::atomic::AtomicBool,
+    cancel_requested: AtomicBool,
     waker: AtomicWaker,
 }
 
@@ -135,20 +143,18 @@ impl<'ctx, T> RoutedSpawnState<'ctx, T> {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             outcome: Mutex::new(RoutedSpawnOutcome::Pending),
-            cancel_requested: std::sync::atomic::AtomicBool::new(false),
+            cancel_requested: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         })
     }
 
     pub(crate) fn request_cancel(&self) {
-        self.cancel_requested
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.cancel_requested.store(true, Ordering::Release);
         self.waker.wake();
     }
 
     pub(crate) fn is_cancel_requested(&self) -> bool {
-        self.cancel_requested
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.cancel_requested.load(Ordering::Acquire)
     }
 
     fn set_outcome(&self, new_outcome: RoutedSpawnOutcome<'ctx, T>) {
@@ -176,7 +182,7 @@ impl<'ctx, T> RoutedSpawnState<'ctx, T> {
 
     pub(crate) fn try_take_ready(&self) -> Result<Option<RoutedSpawnReady<'ctx, T>>, TaskError> {
         let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
-        match std::mem::replace(&mut *outcome, RoutedSpawnOutcome::Taken) {
+        match replace(&mut *outcome, RoutedSpawnOutcome::Taken) {
             RoutedSpawnOutcome::Ready(ready) => Ok(Some(ready)),
             RoutedSpawnOutcome::Failed(err) => Err(err),
             RoutedSpawnOutcome::Pending => {
@@ -221,7 +227,7 @@ pub(crate) fn dispatch_routed<
         .route_to(worker_id, move || {
             let state_err = state_for_job.clone();
             let completion_err = completion_for_job.clone();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let result = catch_unwind(AssertUnwindSafe(move || {
                 job();
             }));
 
@@ -252,18 +258,19 @@ pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
     T: Send + 'ctx,
     Fut: Future<Output = T> + 'ctx,
 {
-    let scope_ref = unsafe { crate::task::RawScope::clone_ref(&*completion) };
-    let node = crate::task::SendBoxedTaskNode::new(future, &runtime.base, worker_id, scope_ref);
-    let layout = std::alloc::Layout::new::<crate::task::SendBoxedTaskNode<'ctx, T, Fut>>();
+    let scope_ref = unsafe { RawScope::clone_ref(&*completion) };
+    let node = SendBoxedTaskNode::new(future);
+    unsafe {
+        node.header.initialize(&runtime.base, worker_id, scope_ref);
+    }
+    let layout = Layout::new::<SendBoxedTaskNode<'ctx, T, Fut>>();
     let node_ptr = unsafe {
-        arena.alloc::<crate::task::SendBoxedTaskNode<'ctx, T, Fut>>(
+        arena.alloc::<SendBoxedTaskNode<'ctx, T, Fut>>(
             layout,
-            Some(|ptr| {
-                std::ptr::drop_in_place(ptr as *mut crate::task::SendBoxedTaskNode<'ctx, T, Fut>)
-            }),
-        ) as *mut crate::task::SendBoxedTaskNode<'ctx, T, Fut>
+            Some(|ptr| drop_in_place(ptr as *mut SendBoxedTaskNode<'ctx, T, Fut>)),
+        ) as *mut SendBoxedTaskNode<'ctx, T, Fut>
     };
-    unsafe { std::ptr::write(node_ptr, node) };
+    unsafe { write(node_ptr, node) };
 
     let node_ref = unsafe { &*node_ptr };
     node_ref.header().set_pinned();
@@ -427,7 +434,7 @@ impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TE
             cancel_token: super::new_cancel_slot::<'ctx, S::Storage, S::Ownership>(),
             waker_node: None,
             reclaim,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -441,7 +448,7 @@ impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TE
             cancel_token: super::new_cancel_slot::<'ctx, S::Storage, S::Ownership>(),
             waker_node: None,
             reclaim: None,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -462,18 +469,18 @@ impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TE
         } else {
             let node_ptr = unsafe {
                 arena.alloc_raw(
-                    std::alloc::Layout::new::<GenericWakerNode<St>>(),
-                    Some(|ptr| std::ptr::drop_in_place(ptr as *mut GenericWakerNode<St>)),
+                    Layout::new::<GenericWakerNode<St>>(),
+                    Some(|ptr| drop_in_place(ptr as *mut GenericWakerNode<St>)),
                 ) as *mut GenericWakerNode<St>
             };
             let node_ptr = NonNull::new(node_ptr).expect("arena allocation failed");
             unsafe {
-                std::ptr::write(
+                write(
                     node_ptr.as_ptr(),
                     GenericWakerNode {
                         waker: cx.waker().clone(),
                         link: Link::new(),
-                        _marker: std::marker::PhantomData,
+                        _marker: PhantomData,
                     },
                 );
             }

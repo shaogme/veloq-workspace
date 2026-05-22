@@ -26,12 +26,8 @@ fn main() {
         println!("--- 安全异步作用域执行开始 ---");
 
         ctx.scope(async |my_scope| {
-            task_local!(
-                static_node,
-                my_scope,
-                work(ctx, "栈任务-Static".to_string(), 2)
-            );
-            task!(send_node, my_scope, work(ctx, "栈Send任务".to_string(), 2));
+            task_local!(static_node, work(ctx, "栈任务-Static".to_string(), 2));
+            task!(send_node, work(ctx, "栈Send任务".to_string(), 2));
 
             let res_send = my_scope.spawn(&send_node).await.unwrap();
             println!("  >> 栈Send任务完成, 结果: {}", res_send);

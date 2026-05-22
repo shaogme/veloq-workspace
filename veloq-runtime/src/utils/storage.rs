@@ -12,7 +12,7 @@ pub enum StrategyType {
     Atomic,
 }
 
-pub trait Storage: Send + Sync + 'static {
+pub trait Storage: 'static {
     fn strategy_type() -> StrategyType;
     type Usize: StateInt;
     type OptionPtr<T>: StateOptionPtr<T>;

@@ -1,6 +1,7 @@
 use crate::runtime::RuntimeSharedBase;
 use crate::task::{AnyScopeCompletionRef, SendTaskRef};
 use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
+use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -40,12 +41,15 @@ pub struct GenericTaskHeader<'ctx, S: Storage> {
     state: S::Usize,
     ref_count: S::Usize,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
-    scope: AnyScopeCompletionRef<'ctx>,
-    runtime: &'ctx RuntimeSharedBase<'ctx>,
+    scope: UnsafeCell<AnyScopeCompletionRef<'ctx>>,
+    runtime: UnsafeCell<Option<NonNull<RuntimeSharedBase<'ctx>>>>,
     worker_id: S::Usize,
     injector_next: S::OptionPtr<GenericTaskHeader<'ctx, S>>,
     vtable: &'static TaskVTable<S>,
 }
+
+unsafe impl<'ctx, S: Storage + Send> Send for GenericTaskHeader<'ctx, S> {}
+unsafe impl<'ctx, S: Storage + Sync> Sync for GenericTaskHeader<'ctx, S> {}
 
 impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     pub fn new(
@@ -54,16 +58,40 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
         worker_id: usize,
         scope: AnyScopeCompletionRef<'ctx>,
     ) -> Self {
+        let this = Self::new_placeholder(vtable);
+        unsafe {
+            this.initialize(runtime, worker_id, scope);
+        }
+        this
+    }
+
+    pub fn new_placeholder(vtable: &'static TaskVTable<S>) -> Self {
         Self {
             state: S::Usize::new(0),
             ref_count: S::Usize::new(1),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
-            scope,
-            runtime,
-            worker_id: S::Usize::new(worker_id),
+            scope: UnsafeCell::new(AnyScopeCompletionRef::dummy::<S>()),
+            runtime: UnsafeCell::new(None),
+            worker_id: S::Usize::new(0),
             injector_next: S::OptionPtr::new(None),
             vtable,
         }
+    }
+
+    /// # Safety
+    ///
+    /// 必须保证该方法在任务被 enqueue 并发布给其他线程前被调用，且在生命周期内仅调用一次。
+    pub unsafe fn initialize(
+        &self,
+        runtime: &'ctx RuntimeSharedBase<'ctx>,
+        worker_id: usize,
+        scope: AnyScopeCompletionRef<'ctx>,
+    ) {
+        unsafe {
+            *self.runtime.get() = Some(NonNull::from(runtime));
+            *self.scope.get() = scope;
+        }
+        self.worker_id.store(worker_id, Ordering::Release);
     }
 
     #[inline]
@@ -86,7 +114,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
         if self.state.load(Ordering::Acquire) & STATE_CANCELLED != 0 {
             return true;
         }
-        self.scope.is_cancelled()
+        self.scope_completion_ref().is_cancelled()
     }
 
     #[inline]
@@ -241,7 +269,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     }
 
     pub fn acknowledge_completion(&self) {
-        self.scope.task_done();
+        self.scope_completion_ref().task_done();
     }
 
     pub fn is_ready(&self) -> bool {
@@ -286,13 +314,23 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
 
     #[inline]
     pub fn scope_completion_ref(&self) -> AnyScopeCompletionRef<'ctx> {
-        self.scope.clone()
+        unsafe { (*self.scope.get()).clone() }
+    }
+
+    #[inline]
+    pub fn runtime(&self) -> &'ctx RuntimeSharedBase<'ctx> {
+        unsafe {
+            (*self.runtime.get())
+                .expect("runtime not initialized")
+                .as_ref()
+        }
     }
 
     #[inline]
     pub fn notify_runtime_active(&self) {
-        self.runtime.idle.event_count.notify();
-        self.runtime.wake_worker(self.worker_id());
+        let runtime = self.runtime();
+        runtime.idle.event_count.notify();
+        runtime.wake_worker(self.worker_id());
     }
 
     #[inline]
@@ -348,12 +386,13 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     where
         S: crate::task::nodes::TaskStorage,
     {
+        let runtime = self.runtime();
         if !S::IS_LOCAL && self.is_pinned() {
             let task = unsafe { SendTaskRef::from_header(self_ptr.as_ptr() as *const _) };
-            self.runtime.enqueue_pinned(self.worker_id(), task);
+            runtime.enqueue_pinned(self.worker_id(), task);
             return;
         }
-        S::enqueue(self.runtime, self.worker_id(), self_ptr);
+        S::enqueue(runtime, self.worker_id(), self_ptr);
     }
 
     /// 尝试将一个 waker 节点从任务的 waker 列表中移除。
