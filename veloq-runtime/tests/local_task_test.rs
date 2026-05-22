@@ -5,8 +5,8 @@ use veloq_runtime::task_local;
 fn test_local_task_execution() {
     let rt = Runtime::<_, (), _>::new();
     rt.block_on(async |ctx| {
+        task_local!(t, async { 1 + 1 });
         ctx.scope(async |s| {
-            task_local!(t, async { 1 + 1 });
             let handle = s.spawn_local(&t);
             assert_eq!(handle.await.unwrap(), 2);
         })
@@ -18,11 +18,11 @@ fn test_local_task_execution() {
 fn test_local_task_with_yield() {
     let rt = Runtime::<_, (), _>::new();
     rt.block_on(async |ctx| {
+        task_local!(t, async {
+            veloq_runtime::task::yield_now().await;
+            42
+        });
         ctx.scope(async |s| {
-            task_local!(t, async {
-                veloq_runtime::task::yield_now().await;
-                42
-            });
             let handle = s.spawn_local(&t);
             assert_eq!(handle.await.unwrap(), 42);
         })
