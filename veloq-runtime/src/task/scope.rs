@@ -45,7 +45,7 @@ pub struct ErasedCancellationToken {
 }
 
 impl ErasedCancellationToken {
-    pub fn new<S: Storage, O: Ownership>(token: &GenericCancellationToken<S, O>) -> Self {
+    pub fn new<'ctx, S: Storage, O: Ownership>(token: &GenericCancellationToken<'ctx, S, O>) -> Self {
         Self {
             ptr: unsafe { NonNull::new_unchecked(token as *const _ as *mut OpaqueToken) },
             s_id: S::strategy_id(),
@@ -59,11 +59,11 @@ impl ErasedCancellationToken {
     ///
     /// 调用者必须确保该令牌确实是 `GenericCancellationToken<S, O>` 类型。
     /// 虽然内部有类型 ID 检查，但该函数仍被标记为 unsafe 以提醒调用者注意指针生命周期。
-    pub unsafe fn downcast<S: Storage, O: Ownership>(
+    pub unsafe fn downcast<'ctx, S: Storage, O: Ownership>(
         &self,
-    ) -> Option<&GenericCancellationToken<S, O>> {
+    ) -> Option<&GenericCancellationToken<'ctx, S, O>> {
         if self.s_id == S::strategy_id() && self.o_id == O::strategy_id() {
-            unsafe { Some(&*(self.ptr.as_ptr() as *const GenericCancellationToken<S, O>)) }
+            unsafe { Some(&*(self.ptr.as_ptr() as *const GenericCancellationToken<'ctx, S, O>)) }
         } else {
             None
         }

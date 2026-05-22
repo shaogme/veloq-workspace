@@ -377,26 +377,26 @@ impl Unparker {
 
 // --- 显式结构化取消系统 (CancellationToken) ---
 
-pub struct GenericCancellationToken<S: Storage, O: Ownership> {
-    pub(crate) inner: O::Shared<GenericCancellationTokenInner<S, O>>,
+pub struct GenericCancellationToken<'ctx, S: Storage, O: Ownership> {
+    pub(crate) inner: O::Shared<GenericCancellationTokenInner<'ctx, S, O>>,
 }
 
-pub type ChildList<S, O> = <S as Storage>::Lock<LinkedList<CancellationTokenAdapter<S, O>>>;
-pub type ParentSlot<S, O> =
-    <S as Storage>::Lock<Option<<O as Ownership>::Weak<GenericCancellationTokenInner<S, O>>>>;
+pub type ChildList<'ctx, S, O> = <S as Storage>::Lock<LinkedList<CancellationTokenAdapter<'ctx, S, O>>>;
+pub type ParentSlot<'ctx, S, O> =
+    <S as Storage>::Lock<Option<<O as Ownership>::Weak<GenericCancellationTokenInner<'ctx, S, O>>>>;
 
-pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
+pub struct GenericCancellationTokenInner<'ctx, S: Storage, O: Ownership> {
     cancelled: S::Usize,
     wakers: S::WakerQueue,
-    children: ChildList<S, O>,
+    children: ChildList<'ctx, S, O>,
     pub(crate) link: Link,
-    parent: ParentSlot<S, O>,
-    pub(crate) cross_parent: S::Lock<Option<AnyScopeCompletionRef<'static>>>,
+    parent: ParentSlot<'ctx, S, O>,
+    pub(crate) cross_parent: S::Lock<Option<AnyScopeCompletionRef<'ctx>>>,
 }
 
-intrusive_adapter!(pub CancellationTokenAdapter<S, O> = GenericCancellationTokenInner<S, O> { link: Link } where S: Storage, O: Ownership);
+intrusive_adapter!(pub CancellationTokenAdapter<'ctx, S, O> = GenericCancellationTokenInner<'ctx, S, O> { link: Link } where S: Storage, O: Ownership);
 
-impl<S: Storage, O: Ownership> GenericCancellationTokenInner<S, O> {
+impl<'ctx, S: Storage, O: Ownership> GenericCancellationTokenInner<'ctx, S, O> {
     fn cancel_internal(&self) {
         if self
             .cancelled
@@ -418,19 +418,19 @@ impl<S: Storage, O: Ownership> GenericCancellationTokenInner<S, O> {
     }
 }
 
-impl<S: Storage, O: Ownership> Default for GenericCancellationToken<S, O> {
+impl<'ctx, S: Storage, O: Ownership> Default for GenericCancellationToken<'ctx, S, O> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
+impl<'ctx, S: Storage, O: Ownership> GenericCancellationToken<'ctx, S, O> {
     pub fn new() -> Self {
         Self {
             inner: O::new(GenericCancellationTokenInner {
                 cancelled: S::Usize::new(0),
                 wakers: S::WakerQueue::new(),
-                children: S::Lock::new(LinkedList::new(CancellationTokenAdapter::<S, O>::new())),
+                children: S::Lock::new(LinkedList::new(CancellationTokenAdapter::<'ctx, S, O>::new())),
                 link: Link::new(),
                 parent: S::Lock::new(None),
                 cross_parent: S::Lock::new(None),
@@ -458,7 +458,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
 
         unsafe {
             let child_ptr = NonNull::new_unchecked(
-                O::as_ptr(&child.inner) as *mut GenericCancellationTokenInner<S, O>
+                O::as_ptr(&child.inner) as *mut GenericCancellationTokenInner<'ctx, S, O>
             );
             children.push_back(Pin::new_unchecked(&mut *child_ptr.as_ptr()));
         }
@@ -510,18 +510,18 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
         }
     }
 
-    pub fn cancelled(&self) -> CancelledFuture<S, O> {
+    pub fn cancelled(&self) -> CancelledFuture<'ctx, S, O> {
         CancelledFuture {
             token: self.clone(),
         }
     }
 
-    pub fn from_inner(inner: O::Shared<GenericCancellationTokenInner<S, O>>) -> Self {
+    pub fn from_inner(inner: O::Shared<GenericCancellationTokenInner<'ctx, S, O>>) -> Self {
         Self { inner }
     }
 }
 
-impl<S: Storage, O: Ownership> Drop for GenericCancellationToken<S, O> {
+impl<'ctx, S: Storage, O: Ownership> Drop for GenericCancellationToken<'ctx, S, O> {
     fn drop(&mut self) {
         if O::strong_count(&O::downgrade(&self.inner)) == 1 {
             let parent_guard = self.inner.parent.lock();
@@ -532,7 +532,7 @@ impl<S: Storage, O: Ownership> Drop for GenericCancellationToken<S, O> {
                 if self.inner.link.is_linked() {
                     unsafe {
                         let node_ptr = NonNull::new_unchecked(
-                            O::as_ptr(&self.inner) as *mut GenericCancellationTokenInner<S, O>
+                            O::as_ptr(&self.inner) as *mut GenericCancellationTokenInner<'ctx, S, O>
                         );
                         let mut cursor = children.cursor_mut_from_ptr(node_ptr);
                         cursor.remove();
@@ -543,7 +543,7 @@ impl<S: Storage, O: Ownership> Drop for GenericCancellationToken<S, O> {
     }
 }
 
-impl<S: Storage, O: Ownership> Clone for GenericCancellationToken<S, O> {
+impl<'ctx, S: Storage, O: Ownership> Clone for GenericCancellationToken<'ctx, S, O> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -551,11 +551,11 @@ impl<S: Storage, O: Ownership> Clone for GenericCancellationToken<S, O> {
     }
 }
 
-pub struct CancelledFuture<S: Storage, O: Ownership> {
-    token: GenericCancellationToken<S, O>,
+pub struct CancelledFuture<'ctx, S: Storage, O: Ownership> {
+    token: GenericCancellationToken<'ctx, S, O>,
 }
 
-impl<S: Storage, O: Ownership> std::future::Future for CancelledFuture<S, O> {
+impl<'ctx, S: Storage, O: Ownership> std::future::Future for CancelledFuture<'ctx, S, O> {
     type Output = ();
 
     fn poll(

@@ -45,7 +45,7 @@ impl<T> SendPtr<T> {
 pub struct GenericScopeCompletion<'scope, S: Storage, O: Ownership> {
     remaining: S::Usize,
     wakers: S::Lock<Vec<Waker>>,
-    cancel_token: GenericCancellationToken<S, O>,
+    cancel_token: GenericCancellationToken<'scope, S, O>,
     panic_info: S::Lock<Option<Box<dyn Any + Send + 'static>>>,
     parent: Option<AnyScopeCompletionRef<'scope>>,
     local_queue: S::Lock<VecDeque<LocalTaskRef<'scope>>>,
@@ -59,7 +59,7 @@ impl<'scope, S: Storage, O: Ownership> GenericScopeCompletion<'scope, S, O> {
         O::new(Self {
             remaining: S::Usize::new(0),
             wakers: S::Lock::new(Vec::new()),
-            cancel_token: GenericCancellationToken::<S, O>::new(),
+            cancel_token: GenericCancellationToken::<'scope, S, O>::new(),
             panic_info: S::Lock::new(None),
             parent,
             local_queue: S::Lock::new(VecDeque::new()),
@@ -108,7 +108,7 @@ impl<'scope, S: Storage, O: Ownership> GenericScopeCompletion<'scope, S, O> {
         false
     }
 
-    pub fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
+    pub fn cancel_token(&self) -> &GenericCancellationToken<'scope, S, O> {
         &self.cancel_token
     }
 
@@ -259,13 +259,13 @@ pub trait ScopeProvider<'ctx, T> {
     >;
 }
 
-pub(crate) fn new_cancel_slot<S: Storage, O: Ownership>()
--> S::Lock<Option<GenericCancellationToken<S, O>>> {
+pub(crate) fn new_cancel_slot<'ctx, S: Storage, O: Ownership>()
+-> S::Lock<Option<GenericCancellationToken<'ctx, S, O>>> {
     S::Lock::new(None)
 }
 
-pub(crate) type CancelTokenSlot<S, O> =
-    <S as Storage>::Lock<Option<GenericCancellationToken<S, O>>>;
+pub(crate) type CancelTokenSlot<'ctx, S, O> =
+    <S as Storage>::Lock<Option<GenericCancellationToken<'ctx, S, O>>>;
 
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
 pub struct GenericAsyncScope<'ctx, S: Storage, O: Ownership, TExtra> {
@@ -302,7 +302,7 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
         context: crate::runtime::RuntimeScopeContext<'ctx, TExtra>,
         parent: Option<crate::task::AnyScopeCompletionRef<'ctx>>,
     ) -> Self {
-        let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
+        let completion = GenericScopeCompletion::<'ctx, S, O>::new(parent.clone());
 
         if let Some(ref parent) = parent {
             let linked = parent.try_link_child(&crate::task::ErasedCancellationToken::new::<S, O>(
@@ -310,9 +310,7 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
             ));
             if !linked && let crate::task::AnyScopeCompletionRef::Send(_) = parent {
                 let mut cross = completion.cancel_token().inner.cross_parent.lock();
-                let parent_static: crate::task::AnyScopeCompletionRef<'static> =
-                    unsafe { std::mem::transmute(parent.clone()) };
-                *cross = Some(parent_static);
+                *cross = Some(parent.clone());
             }
         }
 
@@ -388,7 +386,7 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
         )
     }
 
-    pub fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
+    pub fn cancel_token(&self) -> &GenericCancellationToken<'ctx, S, O> {
         self.completion.cancel_token()
     }
 

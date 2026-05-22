@@ -315,7 +315,7 @@ pub struct JoinHandle<
 > {
     pub(crate) source: JoinSource<'ctx, T, R>,
     pub(crate) scope: &'scope S,
-    pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
+    pub(crate) cancel_token: CancelTokenSlot<'ctx, S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<Pin<&'ctx mut GenericWakerNode<R::Storage>>>,
     pub(crate) reclaim: Option<ReclaimFn<'ctx, T, S::Arena>>,
     pub(crate) _marker: std::marker::PhantomData<TExtra>,
@@ -381,7 +381,7 @@ impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TE
         }
     }
 
-    pub fn cancel_token(&self) -> GenericCancellationToken<S::Storage, S::Ownership> {
+    pub fn cancel_token(&self) -> GenericCancellationToken<'ctx, S::Storage, S::Ownership> {
         {
             let cancel_slot = self.cancel_token.lock();
             if let Some(token) = cancel_slot.as_ref() {
@@ -425,7 +425,7 @@ impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TE
         Self {
             source: JoinSource::Direct { task, gate },
             scope,
-            cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
+            cancel_token: super::new_cancel_slot::<'ctx, S::Storage, S::Ownership>(),
             waker_node: None,
             reclaim,
             _marker: std::marker::PhantomData,
@@ -439,7 +439,7 @@ impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TE
                 resolved: None,
             },
             scope,
-            cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
+            cancel_token: super::new_cancel_slot::<'ctx, S::Storage, S::Ownership>(),
             waker_node: None,
             reclaim: None,
             _marker: std::marker::PhantomData,
