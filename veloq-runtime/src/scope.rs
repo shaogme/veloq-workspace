@@ -5,7 +5,9 @@ use crate::task::{
     SendTask, SendTaskRef, TaskError, TaskHandleRef,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, Storage};
+use crate::utils::storage::{
+    AtomicStorage, LocalStorage, StateInt, StateLock, Storage, StrategyType,
+};
 use std::any::Any;
 use std::collections::VecDeque;
 use std::mem::take;
@@ -192,7 +194,7 @@ impl<'scope, S: Storage, O: Ownership + 'scope> crate::task::RawScope<'scope, S>
 
     #[inline]
     fn try_link_child(&self, child_token: &crate::task::ErasedCancellationToken) -> bool {
-        if child_token.s_id != S::strategy_id() || child_token.o_id != O::strategy_id() {
+        if child_token.s_type != S::strategy_type() || child_token.o_type != O::strategy_type() {
             return false;
         }
         unsafe {
@@ -235,24 +237,25 @@ impl<'scope, S: Storage, O: Ownership + 'scope> crate::task::RawScope<'scope, S>
         unsafe { O::increment_strong_count(ptr) };
         let dyn_ptr: *const (dyn crate::task::RawScope<'scope, S> + 'scope) = ptr;
         let non_null = unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) };
-        if S::strategy_id() == LocalStorage::strategy_id() {
-            let casted = unsafe {
-                std::mem::transmute::<
-                    NonNull<dyn crate::task::RawScope<'scope, S> + 'scope>,
-                    NonNull<dyn crate::task::RawScope<'scope, LocalStorage> + 'scope>,
-                >(non_null)
-            };
-            AnyScopeCompletionRef::Local(casted)
-        } else if S::strategy_id() == AtomicStorage::strategy_id() {
-            let casted = unsafe {
-                std::mem::transmute::<
-                    NonNull<dyn crate::task::RawScope<'scope, S> + 'scope>,
-                    NonNull<dyn crate::task::RawScope<'scope, AtomicStorage> + 'scope>,
-                >(non_null)
-            };
-            AnyScopeCompletionRef::Send(casted)
-        } else {
-            panic!("unknown storage strategy");
+        match S::strategy_type() {
+            StrategyType::Local => {
+                let casted = unsafe {
+                    std::mem::transmute::<
+                        NonNull<dyn crate::task::RawScope<'scope, S> + 'scope>,
+                        NonNull<dyn crate::task::RawScope<'scope, LocalStorage> + 'scope>,
+                    >(non_null)
+                };
+                AnyScopeCompletionRef::Local(casted)
+            }
+            StrategyType::Atomic => {
+                let casted = unsafe {
+                    std::mem::transmute::<
+                        NonNull<dyn crate::task::RawScope<'scope, S> + 'scope>,
+                        NonNull<dyn crate::task::RawScope<'scope, AtomicStorage> + 'scope>,
+                    >(non_null)
+                };
+                AnyScopeCompletionRef::Send(casted)
+            }
         }
     }
 

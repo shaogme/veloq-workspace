@@ -2,7 +2,7 @@ use crate::runtime::primitives::GenericCancellationToken;
 use crate::scope::GenericScopeCompletion;
 use crate::task::LocalTaskRef;
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicStorage, LocalStorage, Storage, StrategyId};
+use crate::utils::storage::{AtomicStorage, LocalStorage, Storage, StrategyType};
 use std::any::Any;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -28,7 +28,7 @@ impl OpaqueScope {
     /// # Safety
     ///
     /// 调用者必须确保 `ptr` 确实指向一个 `GenericScopeCompletion<S, O>` 实例，
-    /// 且 `S` 和 `O` 与调用处的泛型参数匹配。通常通过 `ScopeVTable` 或 `StrategyId` 进行校验。
+    /// 且 `S` 和 `O` 与调用处的泛型参数匹配。通常通过 `ScopeVTable` 或 `StrategyType` 进行校验。
     #[inline]
     pub unsafe fn as_concrete<'a, 'scope, S: Storage, O: Ownership>(
         ptr: NonNull<Self>,
@@ -39,8 +39,8 @@ impl OpaqueScope {
 
 pub struct ErasedCancellationToken {
     pub(crate) ptr: NonNull<OpaqueToken>,
-    pub(crate) s_id: StrategyId,
-    pub(crate) o_id: StrategyId,
+    pub(crate) s_type: StrategyType,
+    pub(crate) o_type: StrategyType,
 }
 
 impl ErasedCancellationToken {
@@ -49,8 +49,8 @@ impl ErasedCancellationToken {
     ) -> Self {
         Self {
             ptr: unsafe { NonNull::new_unchecked(token as *const _ as *mut OpaqueToken) },
-            s_id: S::strategy_id(),
-            o_id: O::strategy_id(),
+            s_type: S::strategy_type(),
+            o_type: O::strategy_type(),
         }
     }
 
@@ -59,11 +59,11 @@ impl ErasedCancellationToken {
     /// # Safety
     ///
     /// 调用者必须确保该令牌确实是 `GenericCancellationToken<S, O>` 类型。
-    /// 虽然内部有类型 ID 检查，但该函数仍被标记为 unsafe 以提醒调用者注意指针生命周期。
+    /// 虽然内部有类型检查，但该函数仍被标记为 unsafe 以提醒调用者注意指针生命周期。
     pub unsafe fn downcast<'ctx, S: Storage, O: Ownership>(
         &self,
     ) -> Option<&GenericCancellationToken<'ctx, S, O>> {
-        if self.s_id == S::strategy_id() && self.o_id == O::strategy_id() {
+        if self.s_type == S::strategy_type() && self.o_type == O::strategy_type() {
             unsafe { Some(&*(self.ptr.as_ptr() as *const GenericCancellationToken<'ctx, S, O>)) }
         } else {
             None
@@ -117,24 +117,21 @@ impl<'scope, S: Storage> RawScope<'scope, S> for DummyScope<'scope, S> {
     }
     unsafe fn clone_ref(&self) -> AnyScopeCompletionRef<'scope> {
         let dyn_ptr: *const (dyn RawScope<'scope, S> + 'scope) = self;
-        if S::strategy_id() == LocalStorage::strategy_id() {
-            unsafe {
+        match S::strategy_type() {
+            StrategyType::Local => unsafe {
                 let local_dyn_ptr = std::mem::transmute::<
                     *const (dyn crate::task::RawScope<'scope, S> + 'scope),
                     *mut (dyn crate::task::RawScope<'scope, LocalStorage> + 'scope),
                 >(dyn_ptr);
                 AnyScopeCompletionRef::Local(NonNull::new_unchecked(local_dyn_ptr))
-            }
-        } else if S::strategy_id() == AtomicStorage::strategy_id() {
-            unsafe {
+            },
+            StrategyType::Atomic => unsafe {
                 let send_dyn_ptr = std::mem::transmute::<
                     *const (dyn crate::task::RawScope<'scope, S> + 'scope),
                     *mut (dyn crate::task::RawScope<'scope, AtomicStorage> + 'scope),
                 >(dyn_ptr);
                 AnyScopeCompletionRef::Send(NonNull::new_unchecked(send_dyn_ptr))
-            }
-        } else {
-            panic!("unknown storage strategy");
+            },
         }
     }
     unsafe fn drop_ref(&self) {}
@@ -174,28 +171,29 @@ impl<'scope> Drop for AnyScopeCompletionRef<'scope> {
 
 impl<'scope> AnyScopeCompletionRef<'scope> {
     pub fn dummy<S: Storage>() -> Self {
-        if S::strategy_id() == LocalStorage::strategy_id() {
-            let local_ptr: NonNull<dyn RawScope<'static, LocalStorage>> =
-                NonNull::from(&DUMMY_LOCAL_SCOPE);
-            let casted_ptr = unsafe {
-                std::mem::transmute::<
-                    NonNull<dyn RawScope<'static, LocalStorage>>,
-                    NonNull<dyn RawScope<'scope, LocalStorage> + 'scope>,
-                >(local_ptr)
-            };
-            Self::Local(casted_ptr)
-        } else if S::strategy_id() == AtomicStorage::strategy_id() {
-            let send_ptr: NonNull<dyn RawScope<'static, AtomicStorage>> =
-                NonNull::from(&DUMMY_SEND_SCOPE);
-            let casted_ptr = unsafe {
-                std::mem::transmute::<
-                    NonNull<dyn RawScope<'static, AtomicStorage>>,
-                    NonNull<dyn RawScope<'scope, AtomicStorage> + 'scope>,
-                >(send_ptr)
-            };
-            Self::Send(casted_ptr)
-        } else {
-            panic!("unknown storage strategy");
+        match S::strategy_type() {
+            StrategyType::Local => {
+                let local_ptr: NonNull<dyn RawScope<'static, LocalStorage>> =
+                    NonNull::from(&DUMMY_LOCAL_SCOPE);
+                let casted_ptr = unsafe {
+                    std::mem::transmute::<
+                        NonNull<dyn RawScope<'static, LocalStorage>>,
+                        NonNull<dyn RawScope<'scope, LocalStorage> + 'scope>,
+                    >(local_ptr)
+                };
+                Self::Local(casted_ptr)
+            }
+            StrategyType::Atomic => {
+                let send_ptr: NonNull<dyn RawScope<'static, AtomicStorage>> =
+                    NonNull::from(&DUMMY_SEND_SCOPE);
+                let casted_ptr = unsafe {
+                    std::mem::transmute::<
+                        NonNull<dyn RawScope<'static, AtomicStorage>>,
+                        NonNull<dyn RawScope<'scope, AtomicStorage> + 'scope>,
+                    >(send_ptr)
+                };
+                Self::Send(casted_ptr)
+            }
         }
     }
 
