@@ -230,8 +230,8 @@ impl<'ctx> RuntimeContext<'ctx> {
 
     pub async fn scope<R, F>(&self, f: F) -> R
     where
-        F: for<'b, 's> std::ops::AsyncFnOnce(
-                &'b veloq_runtime::scope::AsyncScope<'s, WorkerState>,
+        F: for<'scope_ref, 's> std::ops::AsyncFnOnce(
+                &'scope_ref veloq_runtime::scope::AsyncScope<'s, WorkerState>,
             ) -> R,
     {
         self.scope.scope(f).await
@@ -239,8 +239,8 @@ impl<'ctx> RuntimeContext<'ctx> {
 
     pub async fn scope_local<R, F>(&self, f: F) -> R
     where
-        F: for<'b, 's> std::ops::AsyncFnOnce(
-                &'b veloq_runtime::scope::LocalAsyncScope<'s, WorkerState>,
+        F: for<'scope_ref, 's> std::ops::AsyncFnOnce(
+                &'scope_ref veloq_runtime::scope::LocalAsyncScope<'s, WorkerState>,
             ) -> R,
     {
         self.scope.scope_local(f).await

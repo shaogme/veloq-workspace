@@ -234,7 +234,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-safe (Send) asynchronous scope.
     pub async fn scope<R, F>(&self, f: F) -> R
     where
-        F: for<'b, 'scope> AsyncFnOnce(&'b AsyncScope<'scope, T>) -> R,
+        F: for<'scope_ref, 'scope> AsyncFnOnce(&'scope_ref AsyncScope<'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = AsyncScope::new(
@@ -251,7 +251,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-local asynchronous scope.
     pub async fn scope_local<R, F>(&self, f: F) -> R
     where
-        F: for<'b, 'scope> AsyncFnOnce(&'b LocalAsyncScope<'scope, T>) -> R,
+        F: for<'scope_ref, 'scope> AsyncFnOnce(&'scope_ref LocalAsyncScope<'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = LocalAsyncScope::new(
