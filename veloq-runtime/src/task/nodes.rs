@@ -1,8 +1,8 @@
 use crate::runtime::RuntimeSharedBase;
 use crate::task::{
-    GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, IntoAnyScope, LOCAL_INTRUSIVE_WAKER_VTABLE,
-    LocalTaskRef, RawTask, ScopeCompletionRef, SendTaskRef, Task, TaskError, TaskLock,
-    TaskResultSetter, TaskVTable, impl_raw_task_common, poll_task_internal,
+    AnyScopeCompletionRef, GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE,
+    LocalTaskRef, RawTask, SendTaskRef, Task, TaskError, TaskLock, TaskResultSetter, TaskVTable,
+    impl_raw_task_common, poll_task_internal,
 };
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 use std::future::Future;
@@ -11,10 +11,7 @@ use std::ptr::NonNull;
 use std::task::{Context, RawWakerVTable};
 
 /// 任务存储特性，用于统一本地和发送任务的存储行为。
-pub trait TaskStorage: Storage + Sized
-where
-    for<'scope> ScopeCompletionRef<'scope, Self>: IntoAnyScope<'scope>,
-{
+pub trait TaskStorage: Storage + Sized {
     const IS_LOCAL: bool;
     const WAKER_VTABLE: &'static RawWakerVTable;
     fn enqueue(
@@ -62,10 +59,7 @@ pub enum TaskState<T, F> {
 }
 
 #[repr(C)]
-pub struct GenericTaskNode<'ctx, S: TaskStorage, T, F>
-where
-    for<'scope> ScopeCompletionRef<'scope, S>: IntoAnyScope<'scope>,
-{
+pub struct GenericTaskNode<'ctx, S: TaskStorage, T, F> {
     header: GenericTaskHeader<'ctx, S>,
     state: S::Lock<TaskState<T, F>>,
 }
@@ -74,7 +68,6 @@ impl<'ctx, S: TaskStorage, T, F> GenericTaskNode<'ctx, S, T, F>
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
-    for<'scope> ScopeCompletionRef<'scope, S>: IntoAnyScope<'scope>,
 {
     /// 优化 VTable 的定义，确保其作为静态引用在编译期完全内联。
     const VTABLE: &'static TaskVTable<S> = &TaskVTable {
@@ -95,7 +88,7 @@ where
         future: F,
         runtime: &'ctx RuntimeSharedBase<'ctx>,
         worker_id: usize,
-        scope: ScopeCompletionRef<'ctx, S>,
+        scope: AnyScopeCompletionRef<'ctx>,
     ) -> Self {
         Self {
             header: GenericTaskHeader::new(Self::VTABLE, runtime, worker_id, scope),
@@ -108,7 +101,6 @@ impl<'ctx, S: TaskStorage, T, F> TaskResultSetter<T> for GenericTaskNode<'ctx, S
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
-    for<'scope> ScopeCompletionRef<'scope, S>: IntoAnyScope<'scope>,
 {
     #[inline]
     fn set_result(&self, res: Result<T, TaskError>) {
@@ -120,7 +112,6 @@ impl<'ctx, 'scope, S: TaskStorage, T, F> RawTask<'scope> for GenericTaskNode<'ct
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
-    for<'s> ScopeCompletionRef<'s, S>: IntoAnyScope<'s>,
 {
     impl_raw_task_common!(S::IS_LOCAL, S, S::WAKER_VTABLE, 'scope);
 }
@@ -129,7 +120,6 @@ impl<'ctx, 'scope, S: TaskStorage, T, F> Task<'scope, T> for GenericTaskNode<'ct
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
-    for<'s> ScopeCompletionRef<'s, S>: IntoAnyScope<'s>,
 {
     fn poll_task(&self, cx: &mut Context<'_>) -> bool {
         poll_task_internal(

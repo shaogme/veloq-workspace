@@ -381,7 +381,8 @@ pub struct GenericCancellationToken<'ctx, S: Storage, O: Ownership> {
     pub(crate) inner: O::Shared<GenericCancellationTokenInner<'ctx, S, O>>,
 }
 
-pub type ChildList<'ctx, S, O> = <S as Storage>::Lock<LinkedList<CancellationTokenAdapter<'ctx, S, O>>>;
+pub type ChildList<'ctx, S, O> =
+    <S as Storage>::Lock<LinkedList<CancellationTokenAdapter<'ctx, S, O>>>;
 pub type ParentSlot<'ctx, S, O> =
     <S as Storage>::Lock<Option<<O as Ownership>::Weak<GenericCancellationTokenInner<'ctx, S, O>>>>;
 
@@ -430,7 +431,9 @@ impl<'ctx, S: Storage, O: Ownership> GenericCancellationToken<'ctx, S, O> {
             inner: O::new(GenericCancellationTokenInner {
                 cancelled: S::Usize::new(0),
                 wakers: S::WakerQueue::new(),
-                children: S::Lock::new(LinkedList::new(CancellationTokenAdapter::<'ctx, S, O>::new())),
+                children: S::Lock::new(LinkedList::new(
+                    CancellationTokenAdapter::<'ctx, S, O>::new(),
+                )),
                 link: Link::new(),
                 parent: S::Lock::new(None),
                 cross_parent: S::Lock::new(None),
@@ -531,9 +534,8 @@ impl<'ctx, S: Storage, O: Ownership> Drop for GenericCancellationToken<'ctx, S, 
                 let mut children = parent_inner.children.lock();
                 if self.inner.link.is_linked() {
                     unsafe {
-                        let node_ptr = NonNull::new_unchecked(
-                            O::as_ptr(&self.inner) as *mut GenericCancellationTokenInner<'ctx, S, O>
-                        );
+                        let node_ptr = NonNull::new_unchecked(O::as_ptr(&self.inner)
+                            as *mut GenericCancellationTokenInner<'ctx, S, O>);
                         let mut cursor = children.cursor_mut_from_ptr(node_ptr);
                         cursor.remove();
                     }

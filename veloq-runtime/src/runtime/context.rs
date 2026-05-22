@@ -138,6 +138,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         let slot = RouteCell::new();
         let slot_for_job = slot.clone();
 
+        #[repr(C)]
         struct RouteJobTask<'ctx, F, Fut> {
             header: TaskHeader<'ctx>,
             job: UnsafeCell<Option<F>>,
@@ -195,7 +196,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
                 RouteJobTask::<F, Fut>::VTABLE,
                 &self.shared.base,
                 worker_id,
-                crate::task::ScopeCompletionRef::dummy(),
+                crate::task::AnyScopeCompletionRef::dummy::<AtomicStorage>(),
             ),
             job: UnsafeCell::new(Some(job)),
             slot: slot_for_job,

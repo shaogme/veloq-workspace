@@ -12,7 +12,6 @@ pub use header::{
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
     AnyScopeCompletionRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,
-    ScopeCompletionRef,
 };
 
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
@@ -43,24 +42,6 @@ impl std::fmt::Debug for TaskError {
     }
 }
 
-pub trait IntoAnyScope<'scope> {
-    fn into_any(self) -> AnyScopeCompletionRef<'scope>;
-}
-
-impl<'scope, S: Storage> IntoAnyScope<'scope> for ScopeCompletionRef<'scope, S> {
-    fn into_any(self) -> AnyScopeCompletionRef<'scope> {
-        if S::strategy_id() == LocalStorage::strategy_id() {
-            let local_ref = unsafe { self.cast::<LocalStorage>() };
-            AnyScopeCompletionRef::Local(local_ref)
-        } else if S::strategy_id() == AtomicStorage::strategy_id() {
-            let send_ref = unsafe { self.cast::<AtomicStorage>() };
-            AnyScopeCompletionRef::Send(send_ref)
-        } else {
-            panic!("unknown storage strategy");
-        }
-    }
-}
-
 pub trait RuntimeContextExt<'ctx> {
     fn is_cancelled(&self) -> bool;
     fn scope_completion(&self) -> Option<AnyScopeCompletionRef<'ctx>>;
@@ -84,14 +65,12 @@ impl<'ctx> RuntimeContextExt<'ctx> for Context<'_> {
     fn scope_completion(&self) -> Option<AnyScopeCompletionRef<'ctx>> {
         unsafe {
             if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
-                let scope_ref = h.scope_completion_ref();
-                return Some(scope_ref.into_any());
+                return Some(h.scope_completion_ref());
             }
             if let Some(h) =
                 LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
             {
-                let scope_ref = h.scope_completion_ref();
-                return Some(scope_ref.into_any());
+                return Some(h.scope_completion_ref());
             }
             None
         }
@@ -244,7 +223,6 @@ pub(crate) fn poll_task_internal<'ctx, T, R, F, S: Storage>(
 where
     R: TaskResultSetter<T>,
     F: FnMut(&mut Context<'_>) -> Poll<T>,
-    ScopeCompletionRef<'ctx, S>: IntoAnyScope<'ctx>,
 {
     let lifecycle = LifecycleManager::new(header);
     let finalizer = TaskFinalizer::new(header, result_setter);
@@ -408,7 +386,6 @@ macro_rules! task_local {
         let mut __fut = $future_expr;
         let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
         let __scope_ref = $scope.scope_completion_ref();
-        let __scope_ref = unsafe { __scope_ref.cast::<$crate::utils::storage::LocalStorage>() };
         let $name = $crate::task::LocalTaskNode::new(
             __fut,
             &$scope.shared().base,
@@ -423,7 +400,6 @@ macro_rules! task {
         let mut __fut = $future_expr;
         let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
         let __scope_ref = $scope.scope_completion_ref();
-        let __scope_ref = unsafe { __scope_ref.cast::<$crate::utils::storage::AtomicStorage>() };
         let $name = $crate::task::SendTaskNode::new(
             __fut,
             &$scope.shared().base,

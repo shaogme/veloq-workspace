@@ -1,6 +1,5 @@
 use crate::runtime::RuntimeSharedBase;
-use crate::task::scope::ScopeCompletionRef;
-use crate::task::{IntoAnyScope, SendTaskRef};
+use crate::task::{AnyScopeCompletionRef, SendTaskRef};
 use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
@@ -41,7 +40,7 @@ pub struct GenericTaskHeader<'ctx, S: Storage> {
     state: S::Usize,
     ref_count: S::Usize,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
-    scope: ScopeCompletionRef<'ctx, S>,
+    scope: AnyScopeCompletionRef<'ctx>,
     runtime: &'ctx RuntimeSharedBase<'ctx>,
     worker_id: S::Usize,
     injector_next: S::OptionPtr<GenericTaskHeader<'ctx, S>>,
@@ -53,7 +52,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
         vtable: &'static TaskVTable<S>,
         runtime: &'ctx RuntimeSharedBase<'ctx>,
         worker_id: usize,
-        scope: ScopeCompletionRef<'ctx, S>,
+        scope: AnyScopeCompletionRef<'ctx>,
     ) -> Self {
         Self {
             state: S::Usize::new(0),
@@ -286,7 +285,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> ScopeCompletionRef<'ctx, S> {
+    pub fn scope_completion_ref(&self) -> AnyScopeCompletionRef<'ctx> {
         self.scope.clone()
     }
 
@@ -348,7 +347,6 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     pub unsafe fn enqueue_self(&self, self_ptr: NonNull<Self>)
     where
         S: crate::task::nodes::TaskStorage,
-        ScopeCompletionRef<'ctx, S>: IntoAnyScope<'ctx>,
     {
         if !S::IS_LOCAL && self.is_pinned() {
             let task = unsafe { SendTaskRef::from_header(self_ptr.as_ptr() as *const _) };

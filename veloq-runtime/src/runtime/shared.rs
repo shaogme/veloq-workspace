@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
 use crate::runtime::primitives::{self, Unparker};
 use crate::scope::GenericScopeCompletion;
-use crate::task::{IntoAnyScope, LocalTaskRef, ScopeCompletionRef, SendTaskRef, TaskHandleRef};
+use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::Storage;
@@ -416,10 +416,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
         self.base.tls.with(move |ctx| {
             let worker_id = ctx.worker_id;
 
-            let any_scope = completion.map(|c| {
-                let scope_ref = ScopeCompletionRef::new::<O>(c);
-                scope_ref.into_any()
-            });
+            let any_scope = completion.map(|c| unsafe { crate::task::RawScope::clone_ref(&**c) });
 
             if let Some(ref scope) = any_scope {
                 ctx.active_scopes.borrow_mut().push(scope.clone());

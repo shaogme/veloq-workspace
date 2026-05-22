@@ -2,7 +2,7 @@ use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::task::{
     AnyScopeCompletionRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef,
-    ScopeCompletionRef, SendTask, SendTaskRef, TaskError, TaskHandleRef,
+    SendTask, SendTaskRef, TaskError, TaskHandleRef,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, Storage};
@@ -230,12 +230,29 @@ impl<'scope, S: Storage, O: Ownership + 'scope> crate::task::RawScope<'scope, S>
     }
 
     #[inline]
-    unsafe fn clone_ref(&self) -> ScopeCompletionRef<'scope, S> {
+    unsafe fn clone_ref(&self) -> AnyScopeCompletionRef<'scope> {
         let ptr = self as *const Self;
         unsafe { O::increment_strong_count(ptr) };
         let dyn_ptr: *const (dyn crate::task::RawScope<'scope, S> + 'scope) = ptr;
-        unsafe {
-            ScopeCompletionRef::from_ptr(NonNull::new_unchecked(dyn_ptr as *mut _))
+        let non_null = unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) };
+        if S::strategy_id() == LocalStorage::strategy_id() {
+            let casted = unsafe {
+                std::mem::transmute::<
+                    NonNull<dyn crate::task::RawScope<'scope, S> + 'scope>,
+                    NonNull<dyn crate::task::RawScope<'scope, LocalStorage> + 'scope>,
+                >(non_null)
+            };
+            AnyScopeCompletionRef::Local(casted)
+        } else if S::strategy_id() == AtomicStorage::strategy_id() {
+            let casted = unsafe {
+                std::mem::transmute::<
+                    NonNull<dyn crate::task::RawScope<'scope, S> + 'scope>,
+                    NonNull<dyn crate::task::RawScope<'scope, AtomicStorage> + 'scope>,
+                >(non_null)
+            };
+            AnyScopeCompletionRef::Send(casted)
+        } else {
+            panic!("unknown storage strategy");
         }
     }
 
@@ -350,8 +367,7 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
         F: Future<Output = T>,
     {
         let worker_id = self.context.worker_id();
-        let scope_ref = ScopeCompletionRef::<S>::new::<O>(&self.completion);
-        let scope_ref = unsafe { scope_ref.cast::<LocalStorage>() };
+        let scope_ref = unsafe { crate::task::RawScope::clone_ref(&*self.completion) };
         let node = LocalBoxedTaskNode::new(future, &self.context.shared.base, worker_id, scope_ref);
         let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<'ctx, T, F>>();
         let node_ptr = unsafe {
@@ -404,8 +420,8 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> ScopeCompletionRef<'ctx, S> {
-        ScopeCompletionRef::<'ctx, S>::new::<O>(&self.completion)
+    pub fn scope_completion_ref(&self) -> AnyScopeCompletionRef<'ctx> {
+        unsafe { crate::task::RawScope::clone_ref(&*self.completion) }
     }
 
     #[inline]
@@ -527,7 +543,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
             "worker_id {} is out of bounds",
             worker_id
         );
-        let scope_ref = ScopeCompletionRef::<AtomicStorage>::new::<ArcOwnership>(&self.completion);
+        let scope_ref = unsafe { crate::task::RawScope::clone_ref(&*self.completion) };
         let node = crate::task::SendBoxedTaskNode::new(
             future,
             &self.context.shared.base,
