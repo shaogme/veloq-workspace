@@ -1,9 +1,6 @@
 # Veloq
 
 🚀 一个基于 **Thread-per-Core** 模型的高性能 Rust 异步运行时。
-
-📚 **在线文档 (Documentation)**: [https://shaog-r.github.io/veloq/](https://shaog-r.github.io/veloq/)
-
 ---
 
 # Linux Kernel Requirements (内核版本要求)
