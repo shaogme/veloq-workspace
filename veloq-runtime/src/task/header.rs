@@ -41,7 +41,7 @@ pub struct GenericTaskHeader<'ctx, S: Storage> {
     state: S::Usize,
     ref_count: S::Usize,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
-    scope: ScopeCompletionRef<S>,
+    scope: ScopeCompletionRef<'ctx, S>,
     runtime: &'ctx RuntimeSharedBase<'ctx>,
     worker_id: S::Usize,
     injector_next: S::OptionPtr<GenericTaskHeader<'ctx, S>>,
@@ -53,7 +53,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
         vtable: &'static TaskVTable<S>,
         runtime: &'ctx RuntimeSharedBase<'ctx>,
         worker_id: usize,
-        scope: ScopeCompletionRef<S>,
+        scope: ScopeCompletionRef<'ctx, S>,
     ) -> Self {
         Self {
             state: S::Usize::new(0),
@@ -286,7 +286,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> ScopeCompletionRef<S> {
+    pub fn scope_completion_ref(&self) -> ScopeCompletionRef<'ctx, S> {
         self.scope.clone()
     }
 
@@ -348,7 +348,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     pub unsafe fn enqueue_self(&self, self_ptr: NonNull<Self>)
     where
         S: crate::task::nodes::TaskStorage,
-        ScopeCompletionRef<S>: IntoAnyScope,
+        ScopeCompletionRef<'ctx, S>: IntoAnyScope<'ctx>,
     {
         if !S::IS_LOCAL && self.is_pinned() {
             let task = unsafe { SendTaskRef::from_header(self_ptr.as_ptr() as *const _) };

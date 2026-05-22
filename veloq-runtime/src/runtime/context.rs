@@ -83,7 +83,7 @@ pub struct RuntimeContext<'ctx> {
     pub(crate) remote_rx: Receiver<SendTaskRef<'ctx>>,
     pub(crate) pinned_rx: Receiver<SendTaskRef<'ctx>>,
     pub(crate) rand: FastRand,
-    pub(crate) active_scopes: RefCell<Vec<AnyScopeCompletionRef>>,
+    pub(crate) active_scopes: RefCell<Vec<AnyScopeCompletionRef<'ctx>>>,
 }
 
 impl<'ctx> RuntimeContext<'ctx> {

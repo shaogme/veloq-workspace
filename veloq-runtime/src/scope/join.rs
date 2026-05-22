@@ -244,7 +244,7 @@ pub(crate) fn dispatch_routed<
 pub(crate) fn install_routed_pinned_task<'ctx, T, Fut, TExtra>(
     runtime: &'ctx RuntimeShared<'ctx, TExtra>,
     arena: &crate::task::GenericArena<AtomicStorage>,
-    completion: Arc<crate::scope::ScopeCompletion>,
+    completion: Arc<crate::scope::ScopeCompletion<'ctx>>,
     worker_id: usize,
     state: Arc<RoutedSpawnState<'ctx, T>>,
     future: Fut,
@@ -487,7 +487,7 @@ impl<'ctx, 'scope, T, R: TaskHandleRef<'ctx>, S: ScopeProvider<'ctx, TExtra>, TE
     }
 }
 
-impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra: 'ctx> Future
+impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra> + 'ctx, TExtra: 'ctx> Future
     for JoinHandle<'ctx, 'scope, T, crate::task::LocalTaskRef<'ctx>, S, TExtra>
 {
     type Output = Result<T, TaskError>;
@@ -530,7 +530,7 @@ impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra: 'ctx> Future
     }
 }
 
-impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra>, TExtra: 'ctx> Future
+impl<'ctx, 'scope, T: 'ctx, S: ScopeProvider<'ctx, TExtra> + 'ctx, TExtra: 'ctx> Future
     for JoinHandle<'ctx, 'scope, T, SendTaskRef<'ctx>, S, TExtra>
 {
     type Output = Result<T, TaskError>;

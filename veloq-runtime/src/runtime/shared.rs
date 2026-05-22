@@ -193,9 +193,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         if task.header().try_mark_queued() {
             let header = task.header();
             let scope_ref = header.scope_completion_ref();
-            let task_static =
-                unsafe { LocalTaskRef::from_header(task.header() as *const _ as *const _) };
-            scope_ref.enqueue_local(task_static);
+            scope_ref.enqueue_local(task);
         }
     }
 
@@ -403,16 +401,16 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
         self.base.shutdown();
     }
 
-    pub fn drive_worker<S: Storage, O: Ownership>(
+    pub fn drive_worker<S: Storage, O: Ownership + 'ctx>(
         &self,
-        completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
+        completion: Option<&O::Shared<GenericScopeCompletion<'ctx, S, O>>>,
     ) {
         self.drive_worker_with_init::<S, O, std::future::Ready<()>>(completion, None);
     }
 
-    pub fn drive_worker_with_init<S: Storage, O: Ownership, F: Future<Output = ()>>(
+    pub fn drive_worker_with_init<S: Storage, O: Ownership + 'ctx, F: Future<Output = ()>>(
         &self,
-        completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
+        completion: Option<&O::Shared<GenericScopeCompletion<'ctx, S, O>>>,
         mut init_fut: Option<Pin<&mut F>>,
     ) {
         self.base.tls.with(move |ctx| {

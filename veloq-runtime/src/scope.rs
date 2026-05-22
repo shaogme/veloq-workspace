@@ -47,7 +47,7 @@ pub struct GenericScopeCompletion<'scope, S: Storage, O: Ownership> {
     wakers: S::Lock<Vec<Waker>>,
     cancel_token: GenericCancellationToken<S, O>,
     panic_info: S::Lock<Option<Box<dyn Any + Send + 'static>>>,
-    parent: Option<AnyScopeCompletionRef>,
+    parent: Option<AnyScopeCompletionRef<'scope>>,
     local_queue: S::Lock<VecDeque<LocalTaskRef<'scope>>>,
 }
 
@@ -55,7 +55,7 @@ pub type ScopeCompletion<'scope> = GenericScopeCompletion<'scope, AtomicStorage,
 pub type LocalScopeCompletion<'scope> = GenericScopeCompletion<'scope, LocalStorage, RcOwnership>;
 
 impl<'scope, S: Storage, O: Ownership> GenericScopeCompletion<'scope, S, O> {
-    pub fn new(parent: Option<AnyScopeCompletionRef>) -> O::Shared<Self> {
+    pub fn new(parent: Option<AnyScopeCompletionRef<'scope>>) -> O::Shared<Self> {
         O::new(Self {
             remaining: S::Usize::new(0),
             wakers: S::Lock::new(Vec::new()),
@@ -154,7 +154,7 @@ impl<'scope, S: Storage, O: Ownership> GenericScopeCompletion<'scope, S, O> {
         self.panic_info.lock().take()
     }
 
-    pub fn parent(&self) -> &Option<crate::task::AnyScopeCompletionRef> {
+    pub fn parent(&self) -> &Option<crate::task::AnyScopeCompletionRef<'scope>> {
         &self.parent
     }
 }
@@ -164,6 +164,85 @@ impl<'scope, S: Storage, O: Ownership> Drop for GenericScopeCompletion<'scope, S
         if let Some(panic_info) = self.panic_info.lock().take() {
             std::panic::resume_unwind(panic_info);
         }
+    }
+}
+
+impl<'scope, S: Storage, O: Ownership + 'scope> crate::task::RawScope<'scope, S>
+    for GenericScopeCompletion<'scope, S, O>
+{
+    #[inline]
+    fn task_done(&self) {
+        self.task_done();
+    }
+
+    #[inline]
+    fn cancel(&self) {
+        self.cancel();
+    }
+
+    #[inline]
+    fn report_panic(&self, payload: Box<dyn std::any::Any + Send + 'static>) {
+        self.report_panic(payload);
+    }
+
+    #[inline]
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+
+    #[inline]
+    fn try_link_child(&self, child_token: &crate::task::ErasedCancellationToken) -> bool {
+        if child_token.s_id != S::strategy_id() || child_token.o_id != O::strategy_id() {
+            return false;
+        }
+        unsafe {
+            self.cancel_token()
+                .try_link_child_raw(child_token.ptr.as_ptr());
+        }
+        true
+    }
+
+    #[inline]
+    fn parent(&self) -> Option<AnyScopeCompletionRef<'scope>> {
+        self.parent().clone()
+    }
+
+    #[inline]
+    fn register_cancel_waker(&self, waker: &Waker) {
+        self.cancel_token().register_waker(waker);
+    }
+
+    #[inline]
+    fn enqueue_local(&self, task: LocalTaskRef<'scope>) {
+        self.enqueue_local_task(task);
+        let header = task.header();
+        header.notify_runtime_active();
+    }
+
+    #[inline]
+    fn pop_local(&self) -> Option<LocalTaskRef<'scope>> {
+        self.pop_local_task()
+    }
+
+    #[inline]
+    fn is_local_empty(&self) -> bool {
+        self.is_local_queue_empty()
+    }
+
+    #[inline]
+    unsafe fn clone_ref(&self) -> ScopeCompletionRef<'scope, S> {
+        let ptr = self as *const Self;
+        unsafe { O::increment_strong_count(ptr) };
+        let dyn_ptr: *const (dyn crate::task::RawScope<'scope, S> + 'scope) = ptr;
+        unsafe {
+            ScopeCompletionRef::from_ptr(NonNull::new_unchecked(dyn_ptr as *mut _))
+        }
+    }
+
+    #[inline]
+    unsafe fn drop_ref(&self) {
+        let ptr = self as *const Self;
+        unsafe { O::decrement_strong_count(ptr) };
     }
 }
 
@@ -198,7 +277,7 @@ pub struct GenericAsyncScope<'ctx, S: Storage, O: Ownership, TExtra> {
 pub type AsyncScope<'ctx, TExtra> = GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra>;
 pub type LocalAsyncScope<'ctx, TExtra> = GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra>;
 
-impl<'ctx, S: Storage, O: Ownership, TExtra> ScopeProvider<'ctx, TExtra>
+impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> ScopeProvider<'ctx, TExtra>
     for GenericAsyncScope<'ctx, S, O, TExtra>
 {
     type Storage = S;
@@ -218,10 +297,10 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> ScopeProvider<'ctx, TExtra>
     }
 }
 
-impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtra> {
+impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O, TExtra> {
     pub fn new(
         context: crate::runtime::RuntimeScopeContext<'ctx, TExtra>,
-        parent: Option<crate::task::AnyScopeCompletionRef>,
+        parent: Option<crate::task::AnyScopeCompletionRef<'ctx>>,
     ) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
@@ -231,7 +310,9 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
             ));
             if !linked && let crate::task::AnyScopeCompletionRef::Send(_) = parent {
                 let mut cross = completion.cancel_token().inner.cross_parent.lock();
-                *cross = Some(parent.clone());
+                let parent_static: crate::task::AnyScopeCompletionRef<'static> =
+                    unsafe { std::mem::transmute(parent.clone()) };
+                *cross = Some(parent_static);
             }
         }
 
@@ -325,8 +406,8 @@ impl<'ctx, S: Storage, O: Ownership, TExtra> GenericAsyncScope<'ctx, S, O, TExtr
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> ScopeCompletionRef<S> {
-        ScopeCompletionRef::<S>::new::<O>(&self.completion)
+    pub fn scope_completion_ref(&self) -> ScopeCompletionRef<'ctx, S> {
+        ScopeCompletionRef::<'ctx, S>::new::<O>(&self.completion)
     }
 
     #[inline]

@@ -1,6 +1,6 @@
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::scope::GenericScopeCompletion;
-use crate::task::{LocalTaskRef, TaskHandleRef};
+use crate::task::LocalTaskRef;
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicStorage, LocalStorage, Storage, StrategyId};
 use std::any::Any;
@@ -39,9 +39,9 @@ impl OpaqueScope {
 }
 
 pub struct ErasedCancellationToken {
-    ptr: NonNull<OpaqueToken>,
-    s_id: StrategyId,
-    o_id: StrategyId,
+    pub(crate) ptr: NonNull<OpaqueToken>,
+    pub(crate) s_id: StrategyId,
+    pub(crate) o_id: StrategyId,
 }
 
 impl ErasedCancellationToken {
@@ -70,228 +70,197 @@ impl ErasedCancellationToken {
     }
 }
 
-pub struct ScopeVTable<S: Storage> {
-    task_done: unsafe fn(NonNull<OpaqueScope>),
-    cancel: unsafe fn(NonNull<OpaqueScope>),
-    report_panic: unsafe fn(NonNull<OpaqueScope>, Box<dyn Any + Send + 'static>),
-    is_cancelled: unsafe fn(NonNull<OpaqueScope>) -> bool,
-    try_link_child: unsafe fn(NonNull<OpaqueScope>, &ErasedCancellationToken) -> bool,
-    parent: unsafe fn(NonNull<OpaqueScope>) -> Option<AnyScopeCompletionRef>,
-    clone: unsafe fn(NonNull<OpaqueScope>) -> ScopeCompletionRef<S>,
-    drop: unsafe fn(NonNull<OpaqueScope>),
-    register_cancel_waker: unsafe fn(NonNull<OpaqueScope>, &Waker),
-    enqueue_local: unsafe fn(NonNull<OpaqueScope>, LocalTaskRef<'static>),
-    pop_local: unsafe fn(NonNull<OpaqueScope>) -> Option<LocalTaskRef<'static>>,
-    is_local_empty: unsafe fn(NonNull<OpaqueScope>) -> bool,
-    _marker: PhantomData<S>,
-}
-
-pub struct ScopeCompletionRef<S: Storage> {
-    ptr: NonNull<OpaqueScope>,
-    vtable: &'static ScopeVTable<S>,
-}
-
-unsafe impl<S: Storage> Send for ScopeCompletionRef<S> {}
-unsafe impl<S: Storage> Sync for ScopeCompletionRef<S> {}
-
-impl<S: Storage> ScopeCompletionRef<S> {
-    pub fn dummy() -> Self {
-        Self {
-            ptr: NonNull::dangling(),
-            vtable: &DummyVTableContainer::<S>::VTABLE,
-        }
-    }
-
-    /// # Safety
-    /// The caller must ensure the underlying scope outlives the casted reference,
-    /// and that the vtable functions are compatible.
-    #[inline]
-    pub unsafe fn cast<T: Storage>(self) -> ScopeCompletionRef<T> {
-        let (ptr, vtable) = self.into_parts();
-        ScopeCompletionRef {
-            ptr,
-            vtable: unsafe { &*(vtable as *const ScopeVTable<S> as *const ScopeVTable<T>) },
-        }
-    }
-
-    #[inline]
-    pub fn into_parts(self) -> (NonNull<OpaqueScope>, &'static ScopeVTable<S>) {
-        let parts = (self.ptr, self.vtable);
-        forget(self);
-        parts
-    }
-
-    #[inline]
+pub trait RawScope<'scope, S: Storage> {
+    fn task_done(&self);
+    fn cancel(&self);
+    fn report_panic(&self, payload: Box<dyn Any + Send + 'static>);
+    fn is_cancelled(&self) -> bool;
+    fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool;
+    fn parent(&self) -> Option<AnyScopeCompletionRef<'scope>>;
+    fn register_cancel_waker(&self, waker: &Waker);
+    fn enqueue_local(&self, task: LocalTaskRef<'scope>);
+    fn pop_local(&self) -> Option<LocalTaskRef<'scope>>;
+    fn is_local_empty(&self) -> bool;
     /// # Safety
     ///
-    /// 调用者必须确保 `ptr` 是一个有效的 `OpaqueScope` 指针，且与 `vtable` 匹配。
-    pub unsafe fn from_parts(ptr: NonNull<OpaqueScope>, vtable: &'static ScopeVTable<S>) -> Self {
-        Self { ptr, vtable }
+    /// The caller must ensure the returned reference is dropped before the underlying scope is deallocated.
+    unsafe fn clone_ref(&self) -> ScopeCompletionRef<'scope, S>;
+    /// # Safety
+    ///
+    /// The caller must ensure the reference is not dropped twice.
+    unsafe fn drop_ref(&self);
+}
+
+pub struct ScopeCompletionRef<'scope, S: Storage> {
+    ptr: NonNull<dyn RawScope<'scope, S> + 'scope>,
+}
+
+unsafe impl<'scope, S: Storage> Send for ScopeCompletionRef<'scope, S> {}
+unsafe impl<'scope, S: Storage> Sync for ScopeCompletionRef<'scope, S> {}
+
+impl<'scope, S: Storage> ScopeCompletionRef<'scope, S> {
+    pub fn dummy() -> Self {
+        let ptr: NonNull<dyn RawScope<'scope, S> + 'scope> = if S::strategy_id() == LocalStorage::strategy_id() {
+            let local_ptr: NonNull<dyn RawScope<'static, LocalStorage>> = NonNull::from(&DUMMY_LOCAL_SCOPE);
+            unsafe {
+                std::mem::transmute::<
+                    NonNull<dyn RawScope<'static, LocalStorage>>,
+                    NonNull<dyn RawScope<'scope, S> + 'scope>,
+                >(local_ptr)
+            }
+        } else if S::strategy_id() == AtomicStorage::strategy_id() {
+            let send_ptr: NonNull<dyn RawScope<'static, AtomicStorage>> = NonNull::from(&DUMMY_SEND_SCOPE);
+            unsafe {
+                std::mem::transmute::<
+                    NonNull<dyn RawScope<'static, AtomicStorage>>,
+                    NonNull<dyn RawScope<'scope, S> + 'scope>,
+                >(send_ptr)
+            }
+        } else {
+            panic!("unknown storage strategy");
+        };
+        Self { ptr }
     }
 
-    pub fn new<O: Ownership>(scope: &O::Shared<GenericScopeCompletion<S, O>>) -> Self {
+    /// # Safety
+    /// The caller must ensure the underlying scope outlives the casted reference.
+    #[inline]
+    pub unsafe fn cast<T: Storage>(self) -> ScopeCompletionRef<'scope, T> {
+        unsafe { std::mem::transmute(self) }
+    }
+
+    #[inline]
+    pub fn into_ptr(self) -> NonNull<dyn RawScope<'scope, S> + 'scope> {
+        let ptr = self.ptr;
+        forget(self);
+        ptr
+    }
+
+    #[inline]
+    /// # Safety
+    /// The caller must ensure `ptr` is a valid pointer to `dyn RawScope<'scope, S>`.
+    pub unsafe fn from_ptr(ptr: NonNull<dyn RawScope<'scope, S> + 'scope>) -> Self {
+        Self { ptr }
+    }
+
+    pub fn new<O: Ownership>(scope: &O::Shared<GenericScopeCompletion<'scope, S, O>>) -> Self
+    where
+        GenericScopeCompletion<'scope, S, O>: RawScope<'scope, S> + 'scope,
+    {
         let ptr = O::as_ptr(scope);
         unsafe { O::increment_strong_count(ptr) };
 
+        let raw_ptr: *const GenericScopeCompletion<'scope, S, O> = ptr;
+        let dyn_ptr: *const (dyn RawScope<'scope, S> + 'scope) = raw_ptr;
+
         Self {
-            ptr: unsafe { NonNull::new_unchecked(ptr as *mut OpaqueScope) },
-            vtable: &VTableContainer::<S, O>::VTABLE,
+            ptr: unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) },
         }
     }
 
     #[inline]
     pub fn task_done(&self) {
-        unsafe { (self.vtable.task_done)(self.ptr) };
+        unsafe { self.ptr.as_ref().task_done() };
     }
 
     #[inline]
     pub fn cancel(&self) {
-        unsafe { (self.vtable.cancel)(self.ptr) };
+        unsafe { self.ptr.as_ref().cancel() };
     }
 
     #[inline]
     pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
-        unsafe { (self.vtable.report_panic)(self.ptr, payload) };
+        unsafe { self.ptr.as_ref().report_panic(payload) };
     }
 
     #[inline]
     pub(crate) fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
-        unsafe { (self.vtable.try_link_child)(self.ptr, child_token) }
+        unsafe { self.ptr.as_ref().try_link_child(child_token) }
     }
 
     #[inline]
     pub fn is_cancelled(&self) -> bool {
-        unsafe { (self.vtable.is_cancelled)(self.ptr) }
+        unsafe { self.ptr.as_ref().is_cancelled() }
     }
 
     #[inline]
-    pub fn parent(&self) -> Option<AnyScopeCompletionRef> {
-        unsafe { (self.vtable.parent)(self.ptr) }
+    pub fn parent(&self) -> Option<AnyScopeCompletionRef<'scope>> {
+        unsafe { self.ptr.as_ref().parent() }
     }
 
     #[inline]
     pub fn register_cancel_waker(&self, waker: &Waker) {
-        unsafe { (self.vtable.register_cancel_waker)(self.ptr, waker) }
+        unsafe { self.ptr.as_ref().register_cancel_waker(waker) }
     }
 
     #[inline]
-    pub fn pop_local(&self) -> Option<LocalTaskRef<'static>> {
-        unsafe { (self.vtable.pop_local)(self.ptr) }
+    pub fn pop_local(&self) -> Option<LocalTaskRef<'scope>> {
+        unsafe { self.ptr.as_ref().pop_local() }
     }
 
     #[inline]
     pub fn is_local_empty(&self) -> bool {
-        unsafe { (self.vtable.is_local_empty)(self.ptr) }
+        unsafe { self.ptr.as_ref().is_local_empty() }
     }
 
     #[inline]
-    pub fn enqueue_local(&self, task: LocalTaskRef<'static>) {
-        unsafe { (self.vtable.enqueue_local)(self.ptr, task) }
+    pub fn enqueue_local(&self, task: LocalTaskRef<'scope>) {
+        unsafe { self.ptr.as_ref().enqueue_local(task) }
     }
 }
 
-impl<S: Storage> Clone for ScopeCompletionRef<S> {
+impl<'scope, S: Storage> Clone for ScopeCompletionRef<'scope, S> {
     fn clone(&self) -> Self {
-        unsafe { (self.vtable.clone)(self.ptr) }
+        unsafe { self.ptr.as_ref().clone_ref() }
     }
 }
 
-impl<S: Storage> Drop for ScopeCompletionRef<S> {
+impl<'scope, S: Storage> Drop for ScopeCompletionRef<'scope, S> {
     fn drop(&mut self) {
-        unsafe { (self.vtable.drop)(self.ptr) }
+        unsafe { self.ptr.as_ref().drop_ref() }
     }
 }
 
-struct VTableContainer<S: Storage, O: Ownership>(PhantomData<(S, O)>);
+struct DummyScope<'scope, S: Storage>(PhantomData<(&'scope (), S)>);
 
-impl<S: Storage, O: Ownership> VTableContainer<S, O> {
-    const VTABLE: ScopeVTable<S> = ScopeVTable::<S> {
-        task_done: |ptr| unsafe {
-            OpaqueScope::as_concrete::<S, O>(ptr).task_done();
-        },
-        cancel: |ptr| unsafe {
-            OpaqueScope::as_concrete::<S, O>(ptr).cancel();
-        },
-        report_panic: |ptr, payload| unsafe {
-            OpaqueScope::as_concrete::<S, O>(ptr).report_panic(payload);
-        },
-        is_cancelled: |ptr| unsafe { OpaqueScope::as_concrete::<S, O>(ptr).is_cancelled() },
-        try_link_child: |ptr, child_token| unsafe {
-            if child_token.s_id != S::strategy_id() || child_token.o_id != O::strategy_id() {
-                return false;
-            }
-            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
-            scope
-                .cancel_token()
-                .try_link_child_raw(child_token.ptr.as_ptr());
-            true
-        },
-        parent: |ptr| unsafe {
-            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
-            scope.parent().clone()
-        },
-        clone: |ptr| unsafe {
-            O::increment_strong_count(ptr.as_ptr() as *const GenericScopeCompletion<S, O>);
-            ScopeCompletionRef::<S> {
-                ptr,
-                vtable: &VTableContainer::<S, O>::VTABLE,
-            }
-        },
-        drop: |ptr| unsafe {
-            O::decrement_strong_count(ptr.as_ptr() as *const GenericScopeCompletion<S, O>);
-        },
-        register_cancel_waker: |ptr, waker| unsafe {
-            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
-            scope.cancel_token().register_waker(waker);
-        },
-        enqueue_local: |ptr, task| unsafe {
-            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
-            scope.enqueue_local_task(task);
-            let header = task.header();
-            header.notify_runtime_active();
-        },
-        pop_local: |ptr| unsafe {
-            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
-            scope.pop_local_task()
-        },
-        is_local_empty: |ptr| unsafe {
-            let scope = OpaqueScope::as_concrete::<S, O>(ptr);
-            scope.is_local_queue_empty()
-        },
-        _marker: PhantomData,
-    };
+impl<'scope, S: Storage> RawScope<'scope, S> for DummyScope<'scope, S> {
+    fn task_done(&self) {}
+    fn cancel(&self) {}
+    fn report_panic(&self, _payload: Box<dyn Any + Send + 'static>) {}
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+    fn try_link_child(&self, _child_token: &ErasedCancellationToken) -> bool {
+        false
+    }
+    fn parent(&self) -> Option<AnyScopeCompletionRef<'scope>> {
+        None
+    }
+    fn register_cancel_waker(&self, _waker: &Waker) {}
+    fn enqueue_local(&self, _task: LocalTaskRef<'scope>) {}
+    fn pop_local(&self) -> Option<LocalTaskRef<'scope>> {
+        None
+    }
+    fn is_local_empty(&self) -> bool {
+        true
+    }
+    unsafe fn clone_ref(&self) -> ScopeCompletionRef<'scope, S> {
+        let dyn_ptr: *const (dyn RawScope<'scope, S> + 'scope) = self;
+        unsafe { ScopeCompletionRef::from_ptr(NonNull::new_unchecked(dyn_ptr as *mut _)) }
+    }
+    unsafe fn drop_ref(&self) {}
 }
 
-struct DummyVTableContainer<S: Storage>(PhantomData<S>);
-
-impl<S: Storage> DummyVTableContainer<S> {
-    const VTABLE: ScopeVTable<S> = ScopeVTable::<S> {
-        task_done: |_| {},
-        cancel: |_| {},
-        report_panic: |_, _| {},
-        is_cancelled: |_| false,
-        try_link_child: |_, _| false,
-        parent: |_| None,
-        clone: |ptr| ScopeCompletionRef {
-            ptr,
-            vtable: &DummyVTableContainer::<S>::VTABLE,
-        },
-        drop: |_| {},
-        register_cancel_waker: |_, _| {},
-        enqueue_local: |_, _| {},
-        pop_local: |_| None,
-        is_local_empty: |_| true,
-        _marker: PhantomData,
-    };
-}
+static DUMMY_LOCAL_SCOPE: DummyScope<'static, LocalStorage> = DummyScope(PhantomData);
+static DUMMY_SEND_SCOPE: DummyScope<'static, AtomicStorage> = DummyScope(PhantomData);
 
 #[derive(Clone)]
-pub enum AnyScopeCompletionRef {
-    Local(ScopeCompletionRef<LocalStorage>),
-    Send(ScopeCompletionRef<AtomicStorage>),
+pub enum AnyScopeCompletionRef<'scope> {
+    Local(ScopeCompletionRef<'scope, LocalStorage>),
+    Send(ScopeCompletionRef<'scope, AtomicStorage>),
 }
 
-impl AnyScopeCompletionRef {
+impl<'scope> AnyScopeCompletionRef<'scope> {
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         match self {
@@ -309,7 +278,7 @@ impl AnyScopeCompletionRef {
     }
 
     #[inline]
-    pub fn parent(&self) -> Option<AnyScopeCompletionRef> {
+    pub fn parent(&self) -> Option<AnyScopeCompletionRef<'scope>> {
         match self {
             Self::Local(s) => s.parent(),
             Self::Send(s) => s.parent(),
@@ -325,7 +294,7 @@ impl AnyScopeCompletionRef {
     }
 
     #[inline]
-    pub fn pop_local(&self) -> Option<LocalTaskRef<'static>> {
+    pub fn pop_local(&self) -> Option<LocalTaskRef<'scope>> {
         match self {
             Self::Local(s) => s.pop_local(),
             Self::Send(s) => s.pop_local(),
@@ -341,7 +310,7 @@ impl AnyScopeCompletionRef {
     }
 
     #[inline]
-    pub fn enqueue_local(&self, task: LocalTaskRef<'static>) {
+    pub fn enqueue_local(&self, task: LocalTaskRef<'scope>) {
         match self {
             Self::Local(s) => s.enqueue_local(task),
             Self::Send(s) => s.enqueue_local(task),

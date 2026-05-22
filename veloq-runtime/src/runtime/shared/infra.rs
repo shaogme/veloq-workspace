@@ -348,7 +348,7 @@ impl<'a, 'ctx, T> RuntimeProgressCoordinator<'a, 'ctx, T> {
 
     pub(crate) fn run<S: Storage, O: Ownership>(
         &self,
-        completion: Option<&GenericScopeCompletion<S, O>>,
+        completion: Option<&GenericScopeCompletion<'ctx, S, O>>,
     ) {
         let idle_decision = self
             .shared
@@ -386,7 +386,7 @@ impl<'a, 'ctx, T> RuntimeProgressCoordinator<'a, 'ctx, T> {
     fn should_retry<S: Storage, O: Ownership>(
         &self,
         seq: usize,
-        completion: Option<&GenericScopeCompletion<S, O>>,
+        completion: Option<&GenericScopeCompletion<'ctx, S, O>>,
     ) -> bool {
         let base = &self.shared.base;
         base.idle.event_count.load() != seq
@@ -398,7 +398,7 @@ impl<'a, 'ctx, T> RuntimeProgressCoordinator<'a, 'ctx, T> {
     fn park<S: Storage, O: Ownership>(
         &self,
         idle_decision: IdleDecision,
-        completion: Option<&GenericScopeCompletion<S, O>>,
+        completion: Option<&GenericScopeCompletion<'ctx, S, O>>,
     ) {
         let base = &self.shared.base;
         let parker = Parker::from_inner(base.registry.parker_inners[self.worker_id].clone());

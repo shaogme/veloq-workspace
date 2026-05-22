@@ -391,7 +391,7 @@ pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
     children: ChildList<S, O>,
     pub(crate) link: Link,
     parent: ParentSlot<S, O>,
-    pub(crate) cross_parent: S::Lock<Option<AnyScopeCompletionRef>>,
+    pub(crate) cross_parent: S::Lock<Option<AnyScopeCompletionRef<'static>>>,
 }
 
 intrusive_adapter!(pub CancellationTokenAdapter<S, O> = GenericCancellationTokenInner<S, O> { link: Link } where S: Storage, O: Ownership);

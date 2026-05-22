@@ -11,8 +11,8 @@ pub use header::{
 };
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
-    AnyScopeCompletionRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, ScopeCompletionRef,
-    ScopeVTable,
+    AnyScopeCompletionRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,
+    ScopeCompletionRef,
 };
 
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
@@ -43,23 +43,17 @@ impl std::fmt::Debug for TaskError {
     }
 }
 
-pub trait IntoAnyScope {
-    fn into_any(self) -> AnyScopeCompletionRef;
+pub trait IntoAnyScope<'scope> {
+    fn into_any(self) -> AnyScopeCompletionRef<'scope>;
 }
 
-impl<S: Storage> IntoAnyScope for ScopeCompletionRef<S> {
-    fn into_any(self) -> AnyScopeCompletionRef {
+impl<'scope, S: Storage> IntoAnyScope<'scope> for ScopeCompletionRef<'scope, S> {
+    fn into_any(self) -> AnyScopeCompletionRef<'scope> {
         if S::strategy_id() == LocalStorage::strategy_id() {
-            let (ptr, vtable) = self.into_parts();
-            let local_vtable =
-                unsafe { &*(vtable as *const ScopeVTable<S> as *const ScopeVTable<LocalStorage>) };
-            let local_ref = unsafe { ScopeCompletionRef::from_parts(ptr, local_vtable) };
+            let local_ref = unsafe { self.cast::<LocalStorage>() };
             AnyScopeCompletionRef::Local(local_ref)
         } else if S::strategy_id() == AtomicStorage::strategy_id() {
-            let (ptr, vtable) = self.into_parts();
-            let send_vtable =
-                unsafe { &*(vtable as *const ScopeVTable<S> as *const ScopeVTable<AtomicStorage>) };
-            let send_ref = unsafe { ScopeCompletionRef::from_parts(ptr, send_vtable) };
+            let send_ref = unsafe { self.cast::<AtomicStorage>() };
             AnyScopeCompletionRef::Send(send_ref)
         } else {
             panic!("unknown storage strategy");
@@ -67,12 +61,12 @@ impl<S: Storage> IntoAnyScope for ScopeCompletionRef<S> {
     }
 }
 
-pub trait RuntimeContextExt {
+pub trait RuntimeContextExt<'ctx> {
     fn is_cancelled(&self) -> bool;
-    fn scope_completion(&self) -> Option<AnyScopeCompletionRef>;
+    fn scope_completion(&self) -> Option<AnyScopeCompletionRef<'ctx>>;
 }
 
-impl RuntimeContextExt for Context<'_> {
+impl<'ctx> RuntimeContextExt<'ctx> for Context<'_> {
     fn is_cancelled(&self) -> bool {
         unsafe {
             if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
@@ -87,7 +81,7 @@ impl RuntimeContextExt for Context<'_> {
         }
     }
 
-    fn scope_completion(&self) -> Option<AnyScopeCompletionRef> {
+    fn scope_completion(&self) -> Option<AnyScopeCompletionRef<'ctx>> {
         unsafe {
             if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
                 let scope_ref = h.scope_completion_ref();
@@ -240,8 +234,8 @@ where
     }
 }
 
-pub(crate) fn poll_task_internal<T, R, F, S: Storage>(
-    header: &GenericTaskHeader<S>,
+pub(crate) fn poll_task_internal<'ctx, T, R, F, S: Storage>(
+    header: &GenericTaskHeader<'ctx, S>,
     result_setter: &R,
     cx: &mut Context<'_>,
     mut poll_fn: F,
@@ -250,7 +244,7 @@ pub(crate) fn poll_task_internal<T, R, F, S: Storage>(
 where
     R: TaskResultSetter<T>,
     F: FnMut(&mut Context<'_>) -> Poll<T>,
-    ScopeCompletionRef<S>: IntoAnyScope,
+    ScopeCompletionRef<'ctx, S>: IntoAnyScope<'ctx>,
 {
     let lifecycle = LifecycleManager::new(header);
     let finalizer = TaskFinalizer::new(header, result_setter);
