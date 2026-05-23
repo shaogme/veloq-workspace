@@ -14,34 +14,36 @@ use std::task::{Context, Poll, RawWakerVTable};
 pub trait TaskStorage: Storage + Sized {
     const IS_LOCAL: bool;
     const WAKER_VTABLE: &'static RawWakerVTable;
-    fn enqueue(
-        runtime: &crate::runtime::RuntimeSharedBase,
+    fn enqueue<'scope, 'ctx>(
+        runtime: &crate::runtime::RuntimeSharedBase<'ctx>,
         worker_id: usize,
-        data: NonNull<GenericTaskHeader<Self>>,
+        data: NonNull<GenericTaskHeader<'scope, 'ctx, Self>>,
     );
 }
 
 impl TaskStorage for LocalStorage {
     const IS_LOCAL: bool = true;
     const WAKER_VTABLE: &'static RawWakerVTable = &LOCAL_INTRUSIVE_WAKER_VTABLE;
-    fn enqueue(
-        runtime: &crate::runtime::RuntimeSharedBase,
+    fn enqueue<'scope, 'ctx>(
+        runtime: &crate::runtime::RuntimeSharedBase<'ctx>,
         worker_id: usize,
-        data: NonNull<GenericTaskHeader<Self>>,
+        data: NonNull<GenericTaskHeader<'scope, 'ctx, Self>>,
     ) {
-        unsafe { runtime.enqueue_local(worker_id, LocalTaskRef::from_header(data.as_ptr())) };
+        let header_ptr = data.as_ptr() as *const GenericTaskHeader<'ctx, 'ctx, Self>;
+        unsafe { runtime.enqueue_local(worker_id, LocalTaskRef::from_header(header_ptr)) };
     }
 }
 
 impl TaskStorage for AtomicStorage {
     const IS_LOCAL: bool = false;
     const WAKER_VTABLE: &'static RawWakerVTable = &INTRUSIVE_WAKER_VTABLE;
-    fn enqueue(
-        runtime: &crate::runtime::RuntimeSharedBase,
+    fn enqueue<'scope, 'ctx>(
+        runtime: &crate::runtime::RuntimeSharedBase<'ctx>,
         worker_id: usize,
-        data: NonNull<GenericTaskHeader<Self>>,
+        data: NonNull<GenericTaskHeader<'scope, 'ctx, Self>>,
     ) {
-        unsafe { runtime.enqueue_send(worker_id, SendTaskRef::from_header(data.as_ptr())) };
+        let header_ptr = data.as_ptr() as *const GenericTaskHeader<'ctx, 'ctx, Self>;
+        unsafe { runtime.enqueue_send(worker_id, SendTaskRef::from_header(header_ptr)) };
     }
 }
 
@@ -59,12 +61,12 @@ pub enum TaskState<T, F> {
 }
 
 #[repr(C)]
-pub struct GenericTaskNode<'ctx, S: TaskStorage, T, F> {
-    pub(crate) header: GenericTaskHeader<'ctx, S>,
+pub struct GenericTaskNode<'scope, 'ctx, S: TaskStorage, T, F> {
+    pub(crate) header: GenericTaskHeader<'scope, 'ctx, S>,
     pub(crate) state: S::Lock<TaskState<T, F>>,
 }
 
-impl<'ctx, S: TaskStorage, T, F> GenericTaskNode<'ctx, S, T, F>
+impl<'scope, 'ctx, S: TaskStorage, T, F> GenericTaskNode<'scope, 'ctx, S, T, F>
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
@@ -78,7 +80,7 @@ where
             header.enqueue_self(NonNull::from(header));
         },
         poll: |header, worker_id| unsafe {
-            let node = &*(header as *const GenericTaskHeader<S> as *const Self);
+            let node = &*(header as *const GenericTaskHeader<'_, '_, S> as *const Self);
             node.poll_raw(worker_id)
         },
         drop: |_| {},
@@ -92,7 +94,8 @@ where
     }
 }
 
-impl<'ctx, S: TaskStorage, T, F> TaskResultSetter<T> for GenericTaskNode<'ctx, S, T, F>
+impl<'scope, 'ctx, S: TaskStorage, T, F> TaskResultSetter<T>
+    for GenericTaskNode<'scope, 'ctx, S, T, F>
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
@@ -103,22 +106,24 @@ where
     }
 }
 
-impl<'ctx, 'scope, S: TaskStorage, T, F> RawTask<'scope> for GenericTaskNode<'ctx, S, T, F>
+impl<'scope_node, 'ctx_node, 'scope, 'ctx, S: TaskStorage, T, F> RawTask<'scope, 'ctx>
+    for GenericTaskNode<'scope_node, 'ctx_node, S, T, F>
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
 {
-    impl_raw_task_common!(S::IS_LOCAL, S, S::WAKER_VTABLE, 'scope);
+    impl_raw_task_common!(S::IS_LOCAL, S, S::WAKER_VTABLE, 'scope, 'ctx);
 }
 
-impl<'ctx, 'scope, S: TaskStorage, T, F> Task<'scope, T> for GenericTaskNode<'ctx, S, T, F>
+impl<'scope_node, 'ctx_node, 'scope, 'ctx, S: TaskStorage, T, F> Task<'scope, 'ctx, T>
+    for GenericTaskNode<'scope_node, 'ctx_node, S, T, F>
 where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
 {
     fn poll_task(&self, cx: &mut Context<'_>) -> bool {
         poll_task_internal(
-            &self.header,
+            self.header(),
             self,
             cx,
             |cx| {
@@ -147,15 +152,15 @@ where
 }
 
 /// 栈上本地任务：future 本身不进行任何堆分配。
-pub type LocalTaskNode<'ctx, 'future, T, F> =
-    GenericTaskNode<'ctx, LocalStorage, T, Pin<&'future mut F>>;
+pub type LocalTaskNode<'scope, 'ctx, 'future, T, F> =
+    GenericTaskNode<'scope, 'ctx, LocalStorage, T, Pin<&'future mut F>>;
 
 /// 堆上/拥有所有权的本地任务。
-pub type LocalBoxedTaskNode<'ctx, T, F> = GenericTaskNode<'ctx, LocalStorage, T, F>;
+pub type LocalBoxedTaskNode<'scope, 'ctx, T, F> = GenericTaskNode<'scope, 'ctx, LocalStorage, T, F>;
 
 /// 栈上 Send 任务：future 固定在调用栈里，不进行堆分配。
-pub type SendTaskNode<'ctx, 'future, T, F> =
-    GenericTaskNode<'ctx, AtomicStorage, T, Pin<&'future mut F>>;
+pub type SendTaskNode<'scope, 'ctx, 'future, T, F> =
+    GenericTaskNode<'scope, 'ctx, AtomicStorage, T, Pin<&'future mut F>>;
 
 /// 堆上/拥有所有权的 Send 任务。
-pub type SendBoxedTaskNode<'ctx, T, F> = GenericTaskNode<'ctx, AtomicStorage, T, F>;
+pub type SendBoxedTaskNode<'scope, 'ctx, T, F> = GenericTaskNode<'scope, 'ctx, AtomicStorage, T, F>;

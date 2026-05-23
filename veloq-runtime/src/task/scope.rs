@@ -44,8 +44,8 @@ pub struct ErasedCancellationToken {
 }
 
 impl ErasedCancellationToken {
-    pub fn new<'ctx, S: Storage, O: Ownership>(
-        token: &GenericCancellationToken<'ctx, S, O>,
+    pub fn new<'scope, S: Storage, O: Ownership>(
+        token: &GenericCancellationToken<'scope, S, O>,
     ) -> Self {
         Self {
             ptr: unsafe { NonNull::new_unchecked(token as *const _ as *mut OpaqueToken) },
@@ -60,11 +60,11 @@ impl ErasedCancellationToken {
     ///
     /// 调用者必须确保该令牌确实是 `GenericCancellationToken<S, O>` 类型。
     /// 虽然内部有类型检查，但该函数仍被标记为 unsafe 以提醒调用者注意指针生命周期。
-    pub unsafe fn downcast<'ctx, S: Storage, O: Ownership>(
+    pub unsafe fn downcast<'scope, S: Storage, O: Ownership>(
         &self,
-    ) -> Option<&GenericCancellationToken<'ctx, S, O>> {
+    ) -> Option<&GenericCancellationToken<'scope, S, O>> {
         if self.s_type == S::strategy_type() && self.o_type == O::strategy_type() {
-            unsafe { Some(&*(self.ptr.as_ptr() as *const GenericCancellationToken<'ctx, S, O>)) }
+            unsafe { Some(&*(self.ptr.as_ptr() as *const GenericCancellationToken<'scope, S, O>)) }
         } else {
             None
         }
@@ -79,8 +79,8 @@ pub trait RawScope<'scope, S: Storage> {
     fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool;
     fn parent(&self) -> Option<AnyScopeCompletionRef<'scope>>;
     fn register_cancel_waker(&self, waker: &Waker);
-    fn enqueue_local(&self, task: LocalTaskRef<'scope>);
-    fn pop_local(&self) -> Option<LocalTaskRef<'scope>>;
+    fn enqueue_local(&self, task: LocalTaskRef<'scope, 'scope>);
+    fn pop_local(&self) -> Option<LocalTaskRef<'scope, 'scope>>;
     fn is_local_empty(&self) -> bool;
     /// # Safety
     ///
@@ -108,8 +108,8 @@ impl<'scope, S: Storage> RawScope<'scope, S> for DummyScope<'scope, S> {
         None
     }
     fn register_cancel_waker(&self, _waker: &Waker) {}
-    fn enqueue_local(&self, _task: LocalTaskRef<'scope>) {}
-    fn pop_local(&self) -> Option<LocalTaskRef<'scope>> {
+    fn enqueue_local(&self, _task: LocalTaskRef<'scope, 'scope>) {}
+    fn pop_local(&self) -> Option<LocalTaskRef<'scope, 'scope>> {
         None
     }
     fn is_local_empty(&self) -> bool {
@@ -230,7 +230,7 @@ impl<'scope> AnyScopeCompletionRef<'scope> {
     }
 
     #[inline]
-    pub fn pop_local(&self) -> Option<LocalTaskRef<'scope>> {
+    pub fn pop_local(&self) -> Option<LocalTaskRef<'scope, 'scope>> {
         match self {
             Self::Local(s) => unsafe { s.as_ref().pop_local() },
             Self::Send(s) => unsafe { s.as_ref().pop_local() },
@@ -246,7 +246,7 @@ impl<'scope> AnyScopeCompletionRef<'scope> {
     }
 
     #[inline]
-    pub fn enqueue_local(&self, task: LocalTaskRef<'scope>) {
+    pub fn enqueue_local(&self, task: LocalTaskRef<'scope, 'scope>) {
         match self {
             Self::Local(s) => unsafe { s.as_ref().enqueue_local(task) },
             Self::Send(s) => unsafe { s.as_ref().enqueue_local(task) },

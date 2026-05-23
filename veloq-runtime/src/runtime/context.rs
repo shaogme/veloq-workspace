@@ -80,8 +80,8 @@ impl IdleDecision {
 
 pub struct RuntimeContext<'ctx> {
     pub(crate) worker_id: usize,
-    pub(crate) remote_rx: Receiver<SendTaskRef<'ctx>>,
-    pub(crate) pinned_rx: Receiver<SendTaskRef<'ctx>>,
+    pub(crate) remote_rx: Receiver<SendTaskRef<'ctx, 'ctx>>,
+    pub(crate) pinned_rx: Receiver<SendTaskRef<'ctx, 'ctx>>,
     pub(crate) rand: FastRand,
     pub(crate) active_scopes: RefCell<Vec<AnyScopeCompletionRef<'ctx>>>,
 }
@@ -140,12 +140,12 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
         #[repr(C)]
         struct RouteJobTask<'ctx, F, Fut> {
-            header: TaskHeader<'ctx>,
+            header: TaskHeader<'ctx, 'ctx>,
             job: UnsafeCell<Option<F>>,
             slot: Arc<RouteCell<Fut>>,
         }
 
-        impl<'ctx, F, Fut> RawTask<'ctx> for RouteJobTask<'ctx, F, Fut>
+        impl<'ctx, F, Fut> RawTask<'ctx, 'ctx> for RouteJobTask<'ctx, F, Fut>
         where
             F: FnOnce() -> Fut + Send,
             Fut: Future + Send,
@@ -167,7 +167,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
                 true
             }
 
-            fn header(&self) -> &GenericTaskHeader<'ctx, Self::Storage> {
+            fn header(&self) -> &GenericTaskHeader<'ctx, 'ctx, Self::Storage> {
                 &self.header
             }
         }
@@ -181,7 +181,9 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
                 wake: |_| {},
                 wake_by_ref: |_| {},
                 poll: |header, worker_id| unsafe {
-                    let node = &*(header as *const GenericTaskHeader<AtomicStorage> as *const Self);
+                    let raw_ptr =
+                        header as *const GenericTaskHeader<'_, '_, AtomicStorage> as *const ();
+                    let node = &*(raw_ptr as *const Self);
                     RawTask::poll_raw(node, worker_id)
                 },
                 drop: |data| unsafe {
@@ -219,7 +221,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
     pub async fn execute_on_owner<F, Fut, R>(
         &self,
-        task: &impl TaskHandleRef<'ctx>,
+        task: &impl TaskHandleRef<'ctx, 'ctx>,
         f: F,
     ) -> io::Result<R>
     where
@@ -234,7 +236,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-safe (Send) asynchronous scope.
     pub async fn scope<R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref, 'scope> AsyncFnOnce(&'scope_ref AsyncScope<'scope, T>) -> R,
+        F: for<'scope_ref, 'scope> AsyncFnOnce(&'scope_ref AsyncScope<'scope, 'ctx, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = AsyncScope::new(
@@ -251,7 +253,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-local asynchronous scope.
     pub async fn scope_local<R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref, 'scope> AsyncFnOnce(&'scope_ref LocalAsyncScope<'scope, T>) -> R,
+        F: for<'scope_ref, 'scope> AsyncFnOnce(&'scope_ref LocalAsyncScope<'scope, 'ctx, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = LocalAsyncScope::new(

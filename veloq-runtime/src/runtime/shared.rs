@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
 use crate::runtime::primitives::{self, Unparker};
 use crate::scope::GenericScopeCompletion;
-use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef};
+use crate::task::{AnyScopeCompletionRef, LocalTaskRef, SendTaskRef, TaskHandleRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::Storage;
@@ -43,8 +43,8 @@ pub struct RuntimeShared<'ctx, T> {
 unsafe impl<'ctx, T> Send for RuntimeShared<'ctx, T> {}
 
 pub(crate) struct Receivers<'ctx> {
-    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef<'ctx>>>,
-    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef<'ctx>>>,
+    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef<'ctx, 'ctx>>>,
+    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef<'ctx, 'ctx>>>,
 }
 
 pub(crate) fn init_runtime_components<'ctx>(
@@ -180,7 +180,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
     }
 
     /// 将本地任务入队当前线程的本地队列。
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'ctx>) {
+    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'ctx, 'ctx>) {
         if task.header().is_completed() {
             return;
         }
@@ -193,11 +193,11 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         if task.header().try_mark_queued() {
             let header = task.header();
             let scope_ref = header.scope_completion_ref();
-            scope_ref.enqueue_local(task);
+            scope_ref.enqueue_local(task.into_local());
         }
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'ctx>) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) -> bool {
         if task.header().is_completed() {
             return false;
         }
@@ -224,7 +224,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         self.registry.unpark(worker_id);
     }
 
-    fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef<'ctx>> {
+    fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef<'ctx, 'ctx>> {
         let worker = &self.registry.workers[worker_id];
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
@@ -235,8 +235,8 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
     fn pop_pinned(
         &self,
         worker_id: usize,
-        rx: &Receiver<SendTaskRef<'ctx>>,
-    ) -> Option<SendTaskRef<'ctx>> {
+        rx: &Receiver<SendTaskRef<'ctx, 'ctx>>,
+    ) -> Option<SendTaskRef<'ctx, 'ctx>> {
         let res = rx.try_recv().ok();
         if res.is_some() {
             self.registry.workers[worker_id]
@@ -246,16 +246,16 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         res
     }
 
-    fn pop_global(&self) -> Option<SendTaskRef<'ctx>> {
+    fn pop_global(&self) -> Option<SendTaskRef<'ctx, 'ctx>> {
         self.scheduler.pop_global()
     }
 
-    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef<'ctx>> {
+    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef<'ctx, 'ctx>> {
         self.scheduler
             .steal_send(thief_id, &self.registry, &self.topo, rand)
     }
 
-    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef<'ctx>) {
+    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef<'ctx, 'ctx>) {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
         } else {
@@ -263,7 +263,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         }
     }
 
-    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef<'ctx>) {
+    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
         } else {
@@ -278,7 +278,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         }
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'ctx>) {
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) {
         if task.header().is_completed() {
             return;
         }
@@ -323,7 +323,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
         self.base.worker_count()
     }
 
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'ctx>) {
+    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'ctx, 'ctx>) {
         self.base.enqueue_local(worker_id, task);
     }
 
@@ -340,7 +340,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'ctx>) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) -> bool {
         self.base.enqueue_pinned(worker_id, task)
     }
 
@@ -349,7 +349,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
         self.base.wake_worker(worker_id)
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'ctx>) {
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) {
         if task.header().is_completed() {
             return;
         }
@@ -401,22 +401,30 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
         self.base.shutdown();
     }
 
-    pub fn drive_worker<S: Storage, O: Ownership + 'ctx>(
+    pub fn drive_worker<'a, S: Storage, O: Ownership + 'ctx + 'a>(
         &self,
-        completion: Option<&O::Shared<GenericScopeCompletion<'ctx, S, O>>>,
+        completion: Option<&O::Shared<GenericScopeCompletion<'a, S, O>>>,
     ) {
         self.drive_worker_with_init::<S, O, std::future::Ready<()>>(completion, None);
     }
 
-    pub fn drive_worker_with_init<S: Storage, O: Ownership + 'ctx, F: Future<Output = ()>>(
+    pub fn drive_worker_with_init<
+        'scope,
+        S: Storage,
+        O: Ownership + 'ctx + 'scope,
+        F: Future<Output = ()>,
+    >(
         &self,
-        completion: Option<&O::Shared<GenericScopeCompletion<'ctx, S, O>>>,
+        completion: Option<&O::Shared<GenericScopeCompletion<'scope, S, O>>>,
         mut init_fut: Option<Pin<&mut F>>,
     ) {
         self.base.tls.with(move |ctx| {
             let worker_id = ctx.worker_id;
 
-            let any_scope = completion.map(|c| unsafe { crate::task::RawScope::clone_ref(&**c) });
+            let any_scope = completion.map(|c| unsafe {
+                let r = crate::task::RawScope::clone_ref(&**c);
+                std::mem::transmute::<AnyScopeCompletionRef<'scope>, AnyScopeCompletionRef<'ctx>>(r)
+            });
 
             if let Some(ref scope) = any_scope {
                 ctx.active_scopes.borrow_mut().push(scope.clone());

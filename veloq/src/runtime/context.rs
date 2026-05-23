@@ -231,7 +231,7 @@ impl<'ctx> RuntimeContext<'ctx> {
     pub async fn scope<R, F>(&self, f: F) -> R
     where
         F: for<'scope_ref, 's> std::ops::AsyncFnOnce(
-                &'scope_ref veloq_runtime::scope::AsyncScope<'s, WorkerState>,
+                &'scope_ref veloq_runtime::scope::AsyncScope<'s, 'ctx, WorkerState<'ctx>>,
             ) -> R,
     {
         self.scope.scope(f).await
@@ -240,7 +240,7 @@ impl<'ctx> RuntimeContext<'ctx> {
     pub async fn scope_local<R, F>(&self, f: F) -> R
     where
         F: for<'scope_ref, 's> std::ops::AsyncFnOnce(
-                &'scope_ref veloq_runtime::scope::LocalAsyncScope<'s, WorkerState>,
+                &'scope_ref veloq_runtime::scope::LocalAsyncScope<'s, 'ctx, WorkerState<'ctx>>,
             ) -> R,
     {
         self.scope.scope_local(f).await
@@ -384,7 +384,7 @@ pub(crate) fn submit_control_task<'ctx>(
     fd: veloq_driver_native::op::IoFd,
 ) {
     struct UnregisterFileTask<'ctx> {
-        header: veloq_runtime::task::TaskHeader<'ctx>,
+        header: veloq_runtime::task::TaskHeader<'ctx, 'ctx>,
         fd: veloq_driver_native::op::IoFd,
         shared_ptr: *const veloq_runtime::runtime::shared::RuntimeShared<'ctx, WorkerState<'ctx>>,
     }
@@ -392,7 +392,7 @@ pub(crate) fn submit_control_task<'ctx>(
     unsafe impl<'ctx> Send for UnregisterFileTask<'ctx> {}
     unsafe impl<'ctx> Sync for UnregisterFileTask<'ctx> {}
 
-    impl<'ctx> veloq_runtime::task::RawTask<'ctx> for UnregisterFileTask<'ctx> {
+    impl<'ctx> veloq_runtime::task::RawTask<'ctx, 'ctx> for UnregisterFileTask<'ctx> {
         type Storage = veloq_runtime::utils::storage::AtomicStorage;
 
         fn poll_raw(&self, _worker_id: usize) -> bool {
@@ -409,7 +409,7 @@ pub(crate) fn submit_control_task<'ctx>(
             true
         }
 
-        fn header(&self) -> &veloq_runtime::task::GenericTaskHeader<'ctx, Self::Storage> {
+        fn header(&self) -> &veloq_runtime::task::GenericTaskHeader<'ctx, 'ctx, Self::Storage> {
             &self.header
         }
     }

@@ -15,19 +15,19 @@ use crate::utils::storage::{AtomicOptionPtr, Storage};
 use crate::utils::{Deque, FastRand, Steal};
 
 pub(crate) struct WorkerQueue<'ctx> {
-    pub(crate) remote_tx: Sender<SendTaskRef<'ctx>>,
-    pub(crate) pinned_tx: Sender<SendTaskRef<'ctx>>,
+    pub(crate) remote_tx: Sender<SendTaskRef<'ctx, 'ctx>>,
+    pub(crate) pinned_tx: Sender<SendTaskRef<'ctx, 'ctx>>,
     pub(crate) pinned_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
-    pub(crate) lifo: AtomicOptionPtr<TaskHeader<'ctx>>,
+    pub(crate) lifo: AtomicOptionPtr<TaskHeader<'ctx, 'ctx>>,
     /// Chase-Lev Deque for work-stealing
-    pub(crate) deque: Deque<SendTaskRef<'ctx>>,
+    pub(crate) deque: Deque<SendTaskRef<'ctx, 'ctx>>,
 }
 
 impl<'ctx> WorkerQueue<'ctx> {
     pub(crate) fn new(
-        remote_tx: Sender<SendTaskRef<'ctx>>,
-        pinned_tx: Sender<SendTaskRef<'ctx>>,
+        remote_tx: Sender<SendTaskRef<'ctx, 'ctx>>,
+        pinned_tx: Sender<SendTaskRef<'ctx, 'ctx>>,
         queue_capacity: NonZeroUsize,
     ) -> Self {
         Self {
@@ -201,14 +201,14 @@ impl GlobalInjector {
         }
     }
 
-    pub(crate) fn push(&self, task: SendTaskRef) {
+    pub(crate) fn push<'ctx>(&self, task: SendTaskRef<'ctx, 'ctx>) {
         let header_ptr = task.header() as *const _ as u64;
         // Modern x86_64 uses 48-bit virtual addresses.
         debug_assert_eq!(header_ptr & 0xFFFF000000000000, 0);
 
         let mut head = self.head.load(Ordering::Acquire);
         loop {
-            let old_ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader;
+            let old_ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader<'ctx, 'ctx>;
             task.header().set_next(NonNull::new(old_ptr as *mut _));
 
             let next_gen = ((head >> 48).wrapping_add(1)) & 0xFFFF;
@@ -226,14 +226,14 @@ impl GlobalInjector {
         }
     }
 
-    pub(crate) fn pop<'ctx>(&self) -> Option<SendTaskRef<'ctx>> {
+    pub(crate) fn pop<'ctx>(&self) -> Option<SendTaskRef<'ctx, 'ctx>> {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
             if head == Self::EMPTY {
                 return None;
             }
 
-            let ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader;
+            let ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader<'ctx, 'ctx>;
             let next_ptr = unsafe { (&*ptr).next() };
 
             let next_raw = next_ptr.map(|p| p.as_ptr() as u64).unwrap_or(0);
@@ -264,7 +264,7 @@ pub(crate) struct TaskScheduler {
 }
 
 impl TaskScheduler {
-    pub(crate) fn pop_global<'ctx>(&self) -> Option<SendTaskRef<'ctx>> {
+    pub(crate) fn pop_global<'ctx>(&self) -> Option<SendTaskRef<'ctx, 'ctx>> {
         self.injector.pop()
     }
 
@@ -274,7 +274,7 @@ impl TaskScheduler {
         registry: &WorkerRegistry<'ctx>,
         topo: &TopologyContext,
         rand: &FastRand,
-    ) -> Option<SendTaskRef<'ctx>> {
+    ) -> Option<SendTaskRef<'ctx, 'ctx>> {
         let thief_worker = &registry.workers[thief_id];
         let num_workers = registry.workers.len();
         if num_workers <= 1 {
@@ -346,9 +346,9 @@ impl<'a, 'ctx, T> RuntimeProgressCoordinator<'a, 'ctx, T> {
         Self { shared, worker_id }
     }
 
-    pub(crate) fn run<S: Storage, O: Ownership>(
+    pub(crate) fn run<'scope, S: Storage, O: Ownership>(
         &self,
-        completion: Option<&GenericScopeCompletion<'ctx, S, O>>,
+        completion: Option<&GenericScopeCompletion<'scope, S, O>>,
     ) {
         let idle_decision = self
             .shared
@@ -383,10 +383,10 @@ impl<'a, 'ctx, T> RuntimeProgressCoordinator<'a, 'ctx, T> {
         self.leave_idle(group_idx);
     }
 
-    fn should_retry<S: Storage, O: Ownership>(
+    fn should_retry<'scope, S: Storage, O: Ownership>(
         &self,
         seq: usize,
-        completion: Option<&GenericScopeCompletion<'ctx, S, O>>,
+        completion: Option<&GenericScopeCompletion<'scope, S, O>>,
     ) -> bool {
         let base = &self.shared.base;
         base.idle.event_count.load() != seq
@@ -395,10 +395,10 @@ impl<'a, 'ctx, T> RuntimeProgressCoordinator<'a, 'ctx, T> {
             || completion.map(|c| c.is_done()).unwrap_or(false)
     }
 
-    fn park<S: Storage, O: Ownership>(
+    fn park<'scope, S: Storage, O: Ownership>(
         &self,
         idle_decision: IdleDecision,
-        completion: Option<&GenericScopeCompletion<'ctx, S, O>>,
+        completion: Option<&GenericScopeCompletion<'scope, S, O>>,
     ) {
         let base = &self.shared.base;
         let parker = Parker::from_inner(base.registry.parker_inners[self.worker_id].clone());

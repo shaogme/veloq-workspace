@@ -37,26 +37,26 @@ pub struct GenericWakerNode<S: Storage> {
 
 intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
 
-pub struct GenericTaskHeader<'ctx, S: Storage> {
+pub struct GenericTaskHeader<'scope, 'ctx, S: Storage> {
     state: S::Usize,
     ref_count: S::Usize,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
-    scope: UnsafeCell<AnyScopeCompletionRef<'ctx>>,
+    scope: UnsafeCell<AnyScopeCompletionRef<'scope>>,
     runtime: UnsafeCell<Option<NonNull<RuntimeSharedBase<'ctx>>>>,
     worker_id: S::Usize,
-    injector_next: S::OptionPtr<GenericTaskHeader<'ctx, S>>,
+    injector_next: S::OptionPtr<GenericTaskHeader<'scope, 'ctx, S>>,
     vtable: &'static TaskVTable<S>,
 }
 
-unsafe impl<'ctx, S: Storage + Send> Send for GenericTaskHeader<'ctx, S> {}
-unsafe impl<'ctx, S: Storage + Sync> Sync for GenericTaskHeader<'ctx, S> {}
+unsafe impl<'scope, 'ctx, S: Storage + Send> Send for GenericTaskHeader<'scope, 'ctx, S> {}
+unsafe impl<'scope, 'ctx, S: Storage + Sync> Sync for GenericTaskHeader<'scope, 'ctx, S> {}
 
-impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
+impl<'scope, 'ctx, S: Storage> GenericTaskHeader<'scope, 'ctx, S> {
     pub fn new(
         vtable: &'static TaskVTable<S>,
         runtime: &'ctx RuntimeSharedBase<'ctx>,
         worker_id: usize,
-        scope: AnyScopeCompletionRef<'ctx>,
+        scope: AnyScopeCompletionRef<'scope>,
     ) -> Self {
         let this = Self::new_placeholder(vtable);
         unsafe {
@@ -85,7 +85,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
         &self,
         runtime: &'ctx RuntimeSharedBase<'ctx>,
         worker_id: usize,
-        scope: AnyScopeCompletionRef<'ctx>,
+        scope: AnyScopeCompletionRef<'scope>,
     ) {
         unsafe {
             *self.runtime.get() = Some(NonNull::from(runtime));
@@ -313,7 +313,7 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> AnyScopeCompletionRef<'ctx> {
+    pub fn scope_completion_ref(&self) -> AnyScopeCompletionRef<'scope> {
         unsafe { (*self.scope.get()).clone() }
     }
 
@@ -334,12 +334,12 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
     }
 
     #[inline]
-    pub(crate) fn next(&self) -> Option<NonNull<GenericTaskHeader<'ctx, S>>> {
+    pub(crate) fn next(&self) -> Option<NonNull<GenericTaskHeader<'scope, 'ctx, S>>> {
         self.injector_next.load(Ordering::Acquire)
     }
 
     #[inline]
-    pub(crate) fn set_next(&self, next: Option<NonNull<GenericTaskHeader<'ctx, S>>>) {
+    pub(crate) fn set_next(&self, next: Option<NonNull<GenericTaskHeader<'scope, 'ctx, S>>>) {
         self.injector_next.store(next, Ordering::Release);
     }
 
@@ -416,11 +416,13 @@ impl<'ctx, S: Storage> GenericTaskHeader<'ctx, S> {
 pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
-        let header = GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
+        let header =
+            GenericTaskHeader::<'_, '_, crate::utils::storage::AtomicStorage>::from_raw_data(data);
         GenericTaskHeader::wake(header);
     },
     |data| unsafe {
-        let header = GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
+        let header =
+            GenericTaskHeader::<'_, '_, crate::utils::storage::AtomicStorage>::from_raw_data(data);
         header.as_ref().wake_by_ref();
     },
     |_data| {},
@@ -429,11 +431,13 @@ pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &LOCAL_INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
-        let header = GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
+        let header =
+            GenericTaskHeader::<'_, '_, crate::utils::storage::LocalStorage>::from_raw_data(data);
         GenericTaskHeader::wake(header);
     },
     |data| unsafe {
-        let header = GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
+        let header =
+            GenericTaskHeader::<'_, '_, crate::utils::storage::LocalStorage>::from_raw_data(data);
         header.as_ref().wake_by_ref();
     },
     |_data| {},
