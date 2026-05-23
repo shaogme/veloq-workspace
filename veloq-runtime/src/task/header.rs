@@ -37,26 +37,26 @@ pub struct GenericWakerNode<S: Storage> {
 
 intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
 
-pub struct GenericTaskHeader<'scope, S: Storage> {
+pub struct GenericTaskHeader<S: Storage> {
     state: S::Usize,
     ref_count: S::Usize,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
-    scope: UnsafeCell<AnyScopeCompletionRef<'scope>>,
+    scope: UnsafeCell<AnyScopeCompletionRef>,
     runtime: UnsafeCell<Option<NonNull<RuntimeSharedBase>>>,
     worker_id: S::Usize,
-    injector_next: S::OptionPtr<GenericTaskHeader<'scope, S>>,
+    injector_next: S::OptionPtr<GenericTaskHeader<S>>,
     vtable: &'static TaskVTable<S>,
 }
 
-unsafe impl<'scope, S: Storage + Send> Send for GenericTaskHeader<'scope, S> {}
-unsafe impl<'scope, S: Storage + Sync> Sync for GenericTaskHeader<'scope, S> {}
+unsafe impl<S: Storage + Send> Send for GenericTaskHeader<S> {}
+unsafe impl<S: Storage + Sync> Sync for GenericTaskHeader<S> {}
 
-impl<'scope, S: Storage> GenericTaskHeader<'scope, S> {
+impl<S: Storage> GenericTaskHeader<S> {
     pub fn new(
         vtable: &'static TaskVTable<S>,
         runtime: &RuntimeSharedBase,
         worker_id: usize,
-        scope: AnyScopeCompletionRef<'scope>,
+        scope: AnyScopeCompletionRef,
     ) -> Self {
         let this = Self::new_placeholder(vtable);
         unsafe {
@@ -85,7 +85,7 @@ impl<'scope, S: Storage> GenericTaskHeader<'scope, S> {
         &self,
         runtime: &RuntimeSharedBase,
         worker_id: usize,
-        scope: AnyScopeCompletionRef<'scope>,
+        scope: AnyScopeCompletionRef,
     ) {
         unsafe {
             *self.runtime.get() = Some(NonNull::from(runtime));
@@ -313,7 +313,7 @@ impl<'scope, S: Storage> GenericTaskHeader<'scope, S> {
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> AnyScopeCompletionRef<'scope> {
+    pub fn scope_completion_ref(&self) -> AnyScopeCompletionRef {
         unsafe { (*self.scope.get()).clone() }
     }
 
@@ -334,12 +334,12 @@ impl<'scope, S: Storage> GenericTaskHeader<'scope, S> {
     }
 
     #[inline]
-    pub(crate) fn next(&self) -> Option<NonNull<GenericTaskHeader<'scope, S>>> {
+    pub(crate) fn next(&self) -> Option<NonNull<GenericTaskHeader<S>>> {
         self.injector_next.load(Ordering::Acquire)
     }
 
     #[inline]
-    pub(crate) fn set_next(&self, next: Option<NonNull<GenericTaskHeader<'scope, S>>>) {
+    pub(crate) fn set_next(&self, next: Option<NonNull<GenericTaskHeader<S>>>) {
         self.injector_next.store(next, Ordering::Release);
     }
 
@@ -417,12 +417,12 @@ pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
         let header =
-            GenericTaskHeader::<'_, crate::utils::storage::AtomicStorage>::from_raw_data(data);
+            GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
         GenericTaskHeader::wake(header);
     },
     |data| unsafe {
         let header =
-            GenericTaskHeader::<'_, crate::utils::storage::AtomicStorage>::from_raw_data(data);
+            GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
         header.as_ref().wake_by_ref();
     },
     |_data| {},
@@ -432,12 +432,12 @@ pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &LOCAL_INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
         let header =
-            GenericTaskHeader::<'_, crate::utils::storage::LocalStorage>::from_raw_data(data);
+            GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
         GenericTaskHeader::wake(header);
     },
     |data| unsafe {
         let header =
-            GenericTaskHeader::<'_, crate::utils::storage::LocalStorage>::from_raw_data(data);
+            GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
         header.as_ref().wake_by_ref();
     },
     |_data| {},

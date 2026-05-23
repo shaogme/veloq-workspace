@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
 use crate::runtime::primitives::{self, Unparker};
 use crate::scope::GenericScopeCompletion;
-use crate::task::{AnyScopeCompletionRef, LocalTaskRef, SendTaskRef, TaskHandleRef};
+use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::Storage;
@@ -43,8 +43,8 @@ pub struct RuntimeShared<T> {
 unsafe impl<T> Send for RuntimeShared<T> {}
 
 pub(crate) struct Receivers {
-    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef<'static>>>,
-    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef<'static>>>,
+    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
+    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
 }
 
 pub(crate) fn init_runtime_components(
@@ -180,7 +180,7 @@ impl RuntimeSharedBase {
     }
 
     /// 将本地任务入队当前线程的本地队列。
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'static>) {
+    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
         if task.header().is_completed() {
             return;
         }
@@ -197,7 +197,7 @@ impl RuntimeSharedBase {
         }
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'static>) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
         if task.header().is_completed() {
             return false;
         }
@@ -224,7 +224,7 @@ impl RuntimeSharedBase {
         self.registry.unpark(worker_id);
     }
 
-    fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef<'static>> {
+    fn fn_pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
         let worker = &self.registry.workers[worker_id];
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
@@ -232,11 +232,11 @@ impl RuntimeSharedBase {
         worker.deque.pop()
     }
 
-    fn pop_pinned(
+    fn fn_pop_pinned(
         &self,
         worker_id: usize,
-        rx: &Receiver<SendTaskRef<'static>>,
-    ) -> Option<SendTaskRef<'static>> {
+        rx: &Receiver<SendTaskRef>,
+    ) -> Option<SendTaskRef> {
         let res = rx.try_recv().ok();
         if res.is_some() {
             self.registry.workers[worker_id]
@@ -246,16 +246,16 @@ impl RuntimeSharedBase {
         res
     }
 
-    fn pop_global(&self) -> Option<SendTaskRef<'static>> {
+    fn pop_global(&self) -> Option<SendTaskRef> {
         self.scheduler.pop_global()
     }
 
-    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef<'static>> {
+    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef> {
         self.scheduler
             .steal_send(thief_id, &self.registry, &self.topo, rand)
     }
 
-    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef<'static>) {
+    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
         } else {
@@ -263,7 +263,7 @@ impl RuntimeSharedBase {
         }
     }
 
-    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef<'static>) {
+    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
         } else {
@@ -278,7 +278,7 @@ impl RuntimeSharedBase {
         }
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'static>) {
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
         if task.header().is_completed() {
             return;
         }
@@ -323,7 +323,7 @@ impl<T> RuntimeShared<T> {
         self.base.worker_count()
     }
 
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'static>) {
+    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
         self.base.enqueue_local(worker_id, task);
     }
 
@@ -340,7 +340,7 @@ impl<T> RuntimeShared<T> {
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'static>) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
         self.base.enqueue_pinned(worker_id, task)
     }
 
@@ -349,7 +349,7 @@ impl<T> RuntimeShared<T> {
         self.base.wake_worker(worker_id)
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'static>) {
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
         if task.header().is_completed() {
             return;
         }
@@ -403,7 +403,7 @@ impl<T> RuntimeShared<T> {
 
     pub fn drive_worker<'a, S: Storage, O: Ownership + 'a>(
         &self,
-        completion: Option<&O::Shared<GenericScopeCompletion<'a, S, O>>>,
+        completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
     ) {
         self.drive_worker_with_init::<S, O, std::future::Ready<()>>(completion, None);
     }
@@ -415,7 +415,7 @@ impl<T> RuntimeShared<T> {
         F: Future<Output = ()>,
     >(
         &self,
-        completion: Option<&O::Shared<GenericScopeCompletion<'scope, S, O>>>,
+        completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
         mut init_fut: Option<Pin<&mut F>>,
     ) {
         self.base.tls.with(move |ctx| {
@@ -423,11 +423,7 @@ impl<T> RuntimeShared<T> {
 
             let any_scope =
                 completion.map(|c| unsafe {
-                    let r = crate::task::RawScope::clone_ref(&**c);
-                    std::mem::transmute::<
-                        AnyScopeCompletionRef<'scope>,
-                        AnyScopeCompletionRef<'static>,
-                    >(r)
+                    crate::task::RawScope::clone_ref(&**c)
                 });
 
             if let Some(ref scope) = any_scope {
@@ -489,12 +485,12 @@ impl<T> RuntimeShared<T> {
 
                 tick = tick.wrapping_add(1);
 
-                if let Some(task) = self.base.pop_send(worker_id) {
+                if let Some(task) = self.base.fn_pop_send(worker_id) {
                     self.base.poll_send_task(worker_id, task);
                     progressed = true;
                 }
 
-                if !progressed && let Some(task) = self.base.pop_pinned(worker_id, &ctx.pinned_rx) {
+                if !progressed && let Some(task) = self.base.fn_pop_pinned(worker_id, &ctx.pinned_rx) {
                     self.base.poll_send_task(worker_id, task);
                     progressed = true;
                 }

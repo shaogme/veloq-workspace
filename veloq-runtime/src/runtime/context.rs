@@ -80,10 +80,10 @@ impl IdleDecision {
 
 pub struct RuntimeContext {
     pub(crate) worker_id: usize,
-    pub(crate) remote_rx: Receiver<SendTaskRef<'static>>,
-    pub(crate) pinned_rx: Receiver<SendTaskRef<'static>>,
+    pub(crate) remote_rx: Receiver<SendTaskRef>,
+    pub(crate) pinned_rx: Receiver<SendTaskRef>,
     pub(crate) rand: FastRand,
-    pub(crate) active_scopes: RefCell<Vec<AnyScopeCompletionRef<'static>>>,
+    pub(crate) active_scopes: RefCell<Vec<AnyScopeCompletionRef>>,
 }
 
 impl RuntimeContext {
@@ -134,7 +134,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         &self,
         worker_id: usize,
         job: F,
-    ) -> io::Result<RoutedFuture<'scope, Fut>>
+    ) -> io::Result<RoutedFuture<Fut>>
     where
         F: FnOnce() -> Fut + Send + 'scope,
         Fut: Future + Send + 'scope,
@@ -144,12 +144,13 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
         #[repr(C)]
         struct RouteJobTask<'scope, F, Fut> {
-            header: TaskHeader<'scope>,
+            header: TaskHeader,
             job: UnsafeCell<Option<F>>,
             slot: Arc<RouteCell<Fut>>,
+            _marker: PhantomData<&'scope ()>,
         }
 
-        impl<'scope, F, Fut> RawTask<'scope> for RouteJobTask<'scope, F, Fut>
+        impl<'scope, F, Fut> RawTask for RouteJobTask<'scope, F, Fut>
         where
             F: FnOnce() -> Fut + Send + 'scope,
             Fut: Future + Send + 'scope,
@@ -171,7 +172,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
                 true
             }
 
-            fn header(&self) -> &GenericTaskHeader<'scope, Self::Storage> {
+            fn header(&self) -> &GenericTaskHeader<Self::Storage> {
                 &self.header
             }
         }
@@ -186,7 +187,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
                 wake_by_ref: |_| {},
                 poll: |header, worker_id| unsafe {
                     let raw_ptr =
-                        header as *const GenericTaskHeader<'_, AtomicStorage> as *const ();
+                        header as *const GenericTaskHeader<AtomicStorage> as *const ();
                     let node = &*(raw_ptr as *const Self);
                     RawTask::poll_raw(node, worker_id)
                 },
@@ -206,14 +207,14 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
             ),
             job: UnsafeCell::new(Some(job)),
             slot: slot_for_job,
+            _marker: PhantomData,
         });
 
         task.header.set_pinned();
 
         let ptr = Box::into_raw(task);
         let task_ref = unsafe { SendTaskRef::from_concrete(ptr) };
-        let header_ptr = task_ref.header() as *const GenericTaskHeader<'scope, AtomicStorage>
-            as *const GenericTaskHeader<'static, AtomicStorage>;
+        let header_ptr = task_ref.header() as *const GenericTaskHeader<AtomicStorage>;
         let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
 
         if !self.shared.enqueue_pinned(worker_id, task_ctx) {
@@ -228,7 +229,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
     pub async fn execute_on_owner<'scope, F, Fut, R>(
         &self,
-        task: &impl TaskHandleRef<'scope>,
+        task: &impl TaskHandleRef,
         f: F,
     ) -> io::Result<R>
     where
@@ -243,8 +244,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-safe (Send) asynchronous scope.
     pub async fn scope<'scope, R, F>(&self, f: F) -> R
     where
-        'ctx: 'scope,
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'scope, T>) -> R,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'ctx, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = AsyncScope::new(
@@ -261,8 +261,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-local asynchronous scope.
     pub async fn scope_local<'scope, R, F>(&self, f: F) -> R
     where
-        'ctx: 'scope,
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'scope, T>) -> R,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'ctx, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = LocalAsyncScope::new(
@@ -385,23 +384,21 @@ impl<T> RouteCell<T> {
     }
 }
 
-pub struct RoutedFuture<'ctx, F> {
+pub struct RoutedFuture<F> {
     slot: Arc<RouteCell<F>>,
     inner: Option<F>,
-    _marker: PhantomData<&'ctx ()>,
 }
 
-impl<'ctx, F> RoutedFuture<'ctx, F> {
+impl<F> RoutedFuture<F> {
     pub(crate) fn new(slot: Arc<RouteCell<F>>) -> Self {
         Self {
             slot,
             inner: None,
-            _marker: PhantomData,
         }
     }
 }
 
-impl<'ctx, F> Future for RoutedFuture<'ctx, F>
+impl<F> Future for RoutedFuture<F>
 where
     F: Future,
 {

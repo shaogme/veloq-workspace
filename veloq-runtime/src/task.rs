@@ -21,8 +21,8 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::task::{Context, Poll};
 
-pub type TaskHeader<'scope> = GenericTaskHeader<'scope, AtomicStorage>;
-pub type LocalTaskHeader<'scope> = GenericTaskHeader<'scope, LocalStorage>;
+pub type TaskHeader = GenericTaskHeader<AtomicStorage>;
+pub type LocalTaskHeader = GenericTaskHeader<LocalStorage>;
 
 // --- 任务错误与结果扩展 ---
 
@@ -42,20 +42,20 @@ impl std::fmt::Debug for TaskError {
     }
 }
 
-pub trait RuntimeContextExt<'scope> {
+pub trait RuntimeContextExt {
     fn is_cancelled(&self) -> bool;
-    fn scope_completion(&self) -> Option<AnyScopeCompletionRef<'scope>>;
+    fn scope_completion(&self) -> Option<AnyScopeCompletionRef>;
 }
 
-impl<'scope> RuntimeContextExt<'scope> for Context<'_> {
+impl RuntimeContextExt for Context<'_> {
     fn is_cancelled(&self) -> bool {
         unsafe {
-            if let Some(h) = TaskHeader::<'scope>::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE)
+            if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE)
             {
                 return h.is_cancelled();
             }
             if let Some(h) =
-                LocalTaskHeader::<'scope>::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
+                LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
             {
                 return h.is_cancelled();
             }
@@ -63,14 +63,14 @@ impl<'scope> RuntimeContextExt<'scope> for Context<'_> {
         }
     }
 
-    fn scope_completion(&self) -> Option<AnyScopeCompletionRef<'scope>> {
+    fn scope_completion(&self) -> Option<AnyScopeCompletionRef> {
         unsafe {
-            if let Some(h) = TaskHeader::<'scope>::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE)
+            if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE)
             {
                 return Some(h.scope_completion_ref());
             }
             if let Some(h) =
-                LocalTaskHeader::<'scope>::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
+                LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
             {
                 return Some(h.scope_completion_ref());
             }
@@ -79,30 +79,30 @@ impl<'scope> RuntimeContextExt<'scope> for Context<'_> {
     }
 }
 
-pub trait TaskHandleRef<'scope>: Copy {
+pub trait TaskHandleRef: Copy {
     type Storage: Storage;
-    fn header(&self) -> &GenericTaskHeader<'scope, Self::Storage>;
+    fn header(&self) -> &GenericTaskHeader<Self::Storage>;
     /// # Safety
     /// The `header` pointer must be a valid pointer to a `GenericTaskHeader`.
-    unsafe fn from_header(header: *const GenericTaskHeader<'scope, Self::Storage>) -> Self;
+    unsafe fn from_header(header: *const GenericTaskHeader<Self::Storage>) -> Self;
 }
 
-pub trait RawTask<'scope> {
+pub trait RawTask {
     type Storage: Storage;
     fn poll_raw(&self, worker_id: usize) -> bool;
-    fn header(&self) -> &GenericTaskHeader<'scope, Self::Storage>;
+    fn header(&self) -> &GenericTaskHeader<Self::Storage>;
 }
 
-pub trait Task<'scope, T>: RawTask<'scope> {
+pub trait Task<T>: RawTask {
     fn poll_task(&self, cx: &mut Context<'_>) -> bool;
     fn take_result(&self) -> Option<Result<T, TaskError>>;
 }
 
-pub trait LocalTask<'scope, T>: Task<'scope, T, Storage = LocalStorage> {}
-impl<'scope, T, U: Task<'scope, T, Storage = LocalStorage> + ?Sized> LocalTask<'scope, T> for U {}
+pub trait LocalTask<T>: Task<T, Storage = LocalStorage> {}
+impl<T, U: Task<T, Storage = LocalStorage> + ?Sized> LocalTask<T> for U {}
 
-pub trait SendTask<'scope, T>: Task<'scope, T, Storage = AtomicStorage> + Send {}
-impl<'scope, T, U: Task<'scope, T, Storage = AtomicStorage> + Send + ?Sized> SendTask<'scope, T>
+pub trait SendTask<T>: Task<T, Storage = AtomicStorage> + Send {}
+impl<T, U: Task<T, Storage = AtomicStorage> + Send + ?Sized> SendTask<T>
     for U
 {
 }
@@ -118,13 +118,13 @@ impl<T, L: StateLock<T>> TaskLock<T> for L {
     }
 }
 
-pub struct LifecycleManager<'a, 'scope, S: Storage> {
-    header: &'a GenericTaskHeader<'scope, S>,
+pub struct LifecycleManager<'a, S: Storage> {
+    header: &'a GenericTaskHeader<S>,
 }
 
-impl<'a, 'scope, S: Storage> LifecycleManager<'a, 'scope, S> {
+impl<'a, S: Storage> LifecycleManager<'a, S> {
     #[inline]
-    pub fn new(header: &'a GenericTaskHeader<'scope, S>) -> Self {
+    pub fn new(header: &'a GenericTaskHeader<S>) -> Self {
         Self { header }
     }
 
@@ -150,21 +150,21 @@ pub trait TaskResultSetter<T> {
     fn set_result(&self, res: Result<T, TaskError>);
 }
 
-pub struct TaskFinalizer<'a, 'scope, T, R, S: Storage>
+pub struct TaskFinalizer<'a, T, R, S: Storage>
 where
     R: TaskResultSetter<T>,
 {
-    header: &'a GenericTaskHeader<'scope, S>,
+    header: &'a GenericTaskHeader<S>,
     result_setter: &'a R,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<'a, 'scope, T, R, S: Storage> TaskFinalizer<'a, 'scope, T, R, S>
+impl<'a, T, R, S: Storage> TaskFinalizer<'a, T, R, S>
 where
     R: TaskResultSetter<T>,
 {
     #[inline]
-    pub fn new(header: &'a GenericTaskHeader<'scope, S>, result_setter: &'a R) -> Self {
+    pub fn new(header: &'a GenericTaskHeader<S>, result_setter: &'a R) -> Self {
         Self {
             header,
             result_setter,
@@ -215,8 +215,8 @@ where
     }
 }
 
-pub(crate) fn poll_task_internal<'scope, T, R, F, S: Storage>(
-    header: &GenericTaskHeader<'scope, S>,
+pub(crate) fn poll_task_internal<T, R, F, S: Storage>(
+    header: &GenericTaskHeader<S>,
     result_setter: &R,
     cx: &mut Context<'_>,
     mut poll_fn: F,
@@ -265,24 +265,24 @@ where
 
 macro_rules! define_task_infrastructure {
     ($ref_name:ident, $storage:ty) => {
-        pub struct $ref_name<'scope> {
-            header: NonNull<GenericTaskHeader<'scope, $storage>>,
+        pub struct $ref_name {
+            header: NonNull<GenericTaskHeader<$storage>>,
         }
 
-        impl<'scope> Copy for $ref_name<'scope> {}
-        impl<'scope> Clone for $ref_name<'scope> {
+        impl Copy for $ref_name {}
+        impl Clone for $ref_name {
             fn clone(&self) -> Self {
                 *self
             }
         }
 
-        impl<'scope> $ref_name<'scope> {
+        impl $ref_name {
             /// # Safety
             /// The `ptr` must be a valid pointer to a task node implementing `RawTask` with the correct storage.
             pub unsafe fn from_concrete<U>(ptr: *const U) -> Self
             where
-                U: RawTask<'scope, Storage = $storage>,
-            {
+                U: RawTask<Storage = $storage>,
+              {
                 Self {
                     header: unsafe { NonNull::from((&*ptr).header()) },
                 }
@@ -290,13 +290,13 @@ macro_rules! define_task_infrastructure {
 
             /// # Safety
             /// The `header` pointer must be a valid pointer to a `GenericTaskHeader`.
-            pub unsafe fn from_header(header: *const GenericTaskHeader<'scope, $storage>) -> Self {
+            pub unsafe fn from_header(header: *const GenericTaskHeader<$storage>) -> Self {
                 Self {
                     header: unsafe { NonNull::new_unchecked(header as *mut _) },
                 }
             }
 
-            pub fn into_local(self) -> LocalTaskRef<'scope> {
+            pub fn into_local(self) -> LocalTaskRef {
                 unsafe { LocalTaskRef::from_header(self.header.as_ptr() as *const _) }
             }
 
@@ -307,14 +307,14 @@ macro_rules! define_task_infrastructure {
             }
         }
 
-        impl<'scope> TaskHandleRef<'scope> for $ref_name<'scope> {
+        impl TaskHandleRef for $ref_name {
             type Storage = $storage;
             #[inline]
-            fn header(&self) -> &GenericTaskHeader<'scope, $storage> {
+            fn header(&self) -> &GenericTaskHeader<$storage> {
                 unsafe { self.header.as_ref() }
             }
             #[inline]
-            unsafe fn from_header(header: *const GenericTaskHeader<'scope, $storage>) -> Self {
+            unsafe fn from_header(header: *const GenericTaskHeader<$storage>) -> Self {
                 Self {
                     header: unsafe { NonNull::new_unchecked(header as *mut _) },
                 }
@@ -326,20 +326,17 @@ macro_rules! define_task_infrastructure {
 define_task_infrastructure!(LocalTaskRef, LocalStorage);
 define_task_infrastructure!(SendTaskRef, AtomicStorage);
 
-unsafe impl Send for SendTaskRef<'_> {}
+unsafe impl Send for SendTaskRef {}
 
 macro_rules! impl_raw_task_common {
-    ($is_local:expr, $storage:ty, $vtable:expr, $lt:lifetime) => {
+    ($is_local:expr, $storage:ty, $vtable:expr) => {
         fn poll_raw(&self, _worker_id: usize) -> bool {
             let waker = self.header.create_waker($vtable);
             let mut cx = $crate::task::Context::from_waker(&waker);
             self.poll_task(&mut cx)
         }
-        fn header(&self) -> &$crate::task::GenericTaskHeader<$lt, $storage> {
-            unsafe {
-                &*(&self.header as *const $crate::task::GenericTaskHeader<'_, $storage>
-                    as *const $crate::task::GenericTaskHeader<$lt, $storage>)
-            }
+        fn header(&self) -> &$crate::task::GenericTaskHeader<$storage> {
+            &self.header
         }
         type Storage = $storage;
     };
@@ -349,7 +346,7 @@ pub trait TaskJoinGate<T> {
     fn take_result_erased(&self) -> Option<Result<T, TaskError>>;
 }
 
-impl<'scope, T, S: Task<'scope, T>> TaskJoinGate<T> for S {
+impl<T, S: Task<T>> TaskJoinGate<T> for S {
     #[inline]
     fn take_result_erased(&self) -> Option<Result<T, TaskError>> {
         self.take_result()
