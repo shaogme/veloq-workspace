@@ -78,15 +78,15 @@ impl IdleDecision {
     }
 }
 
-pub struct RuntimeContext<'ctx> {
+pub struct RuntimeContext {
     pub(crate) worker_id: usize,
-    pub(crate) remote_rx: Receiver<SendTaskRef<'ctx, 'ctx>>,
-    pub(crate) pinned_rx: Receiver<SendTaskRef<'ctx, 'ctx>>,
+    pub(crate) remote_rx: Receiver<SendTaskRef<'static>>,
+    pub(crate) pinned_rx: Receiver<SendTaskRef<'static>>,
     pub(crate) rand: FastRand,
-    pub(crate) active_scopes: RefCell<Vec<AnyScopeCompletionRef<'ctx>>>,
+    pub(crate) active_scopes: RefCell<Vec<AnyScopeCompletionRef<'static>>>,
 }
 
-impl<'ctx> RuntimeContext<'ctx> {
+impl RuntimeContext {
     #[inline]
     pub(crate) fn is_local_empty(&self) -> bool {
         self.active_scopes
@@ -98,7 +98,7 @@ impl<'ctx> RuntimeContext<'ctx> {
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
 pub struct RuntimeScopeContext<'ctx, T> {
-    pub(crate) shared: &'ctx RuntimeShared<'ctx, T>,
+    pub(crate) shared: &'ctx RuntimeShared<T>,
 }
 
 impl<'ctx, T> Copy for RuntimeScopeContext<'ctx, T> {}
@@ -126,29 +126,33 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     }
 
     /// Returns the shared runtime state.
-    pub fn shared(&self) -> &'ctx RuntimeShared<'ctx, T> {
+    pub fn shared(&self) -> &'ctx RuntimeShared<T> {
         self.shared
     }
 
-    pub fn route_to<F, Fut>(&self, worker_id: usize, job: F) -> io::Result<RoutedFuture<'_, Fut>>
+    pub fn route_to<'scope, F, Fut>(
+        &self,
+        worker_id: usize,
+        job: F,
+    ) -> io::Result<RoutedFuture<'scope, Fut>>
     where
-        F: FnOnce() -> Fut + Send + 'ctx,
-        Fut: Future + Send + 'ctx,
+        F: FnOnce() -> Fut + Send + 'scope,
+        Fut: Future + Send + 'scope,
     {
         let slot = RouteCell::new();
         let slot_for_job = slot.clone();
 
         #[repr(C)]
-        struct RouteJobTask<'ctx, F, Fut> {
-            header: TaskHeader<'ctx, 'ctx>,
+        struct RouteJobTask<'scope, F, Fut> {
+            header: TaskHeader<'scope>,
             job: UnsafeCell<Option<F>>,
             slot: Arc<RouteCell<Fut>>,
         }
 
-        impl<'ctx, F, Fut> RawTask<'ctx, 'ctx> for RouteJobTask<'ctx, F, Fut>
+        impl<'scope, F, Fut> RawTask<'scope> for RouteJobTask<'scope, F, Fut>
         where
-            F: FnOnce() -> Fut + Send,
-            Fut: Future + Send,
+            F: FnOnce() -> Fut + Send + 'scope,
+            Fut: Future + Send + 'scope,
         {
             type Storage = AtomicStorage;
 
@@ -167,22 +171,22 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
                 true
             }
 
-            fn header(&self) -> &GenericTaskHeader<'ctx, 'ctx, Self::Storage> {
+            fn header(&self) -> &GenericTaskHeader<'scope, Self::Storage> {
                 &self.header
             }
         }
 
-        impl<'ctx, F, Fut> RouteJobTask<'ctx, F, Fut>
+        impl<'scope, F, Fut> RouteJobTask<'scope, F, Fut>
         where
-            F: FnOnce() -> Fut + Send,
-            Fut: Future + Send,
+            F: FnOnce() -> Fut + Send + 'scope,
+            Fut: Future + Send + 'scope,
         {
             const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
                 wake: |_| {},
                 wake_by_ref: |_| {},
                 poll: |header, worker_id| unsafe {
                     let raw_ptr =
-                        header as *const GenericTaskHeader<'_, '_, AtomicStorage> as *const ();
+                        header as *const GenericTaskHeader<'_, AtomicStorage> as *const ();
                     let node = &*(raw_ptr as *const Self);
                     RawTask::poll_raw(node, worker_id)
                 },
@@ -195,7 +199,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
         let task = Box::new(RouteJobTask {
             header: TaskHeader::new(
-                RouteJobTask::<F, Fut>::VTABLE,
+                RouteJobTask::<'scope, F, Fut>::VTABLE,
                 &self.shared.base,
                 worker_id,
                 crate::task::AnyScopeCompletionRef::dummy::<AtomicStorage>(),
@@ -208,8 +212,11 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
         let ptr = Box::into_raw(task);
         let task_ref = unsafe { SendTaskRef::from_concrete(ptr) };
+        let header_ptr = task_ref.header() as *const GenericTaskHeader<'scope, AtomicStorage>
+            as *const GenericTaskHeader<'static, AtomicStorage>;
+        let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
 
-        if !self.shared.enqueue_pinned(worker_id, task_ref) {
+        if !self.shared.enqueue_pinned(worker_id, task_ctx) {
             unsafe {
                 let _ = Box::from_raw(ptr);
             }
@@ -219,14 +226,14 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         Ok(RoutedFuture::new(slot))
     }
 
-    pub async fn execute_on_owner<F, Fut, R>(
+    pub async fn execute_on_owner<'scope, F, Fut, R>(
         &self,
-        task: &impl TaskHandleRef<'ctx, 'ctx>,
+        task: &impl TaskHandleRef<'scope>,
         f: F,
     ) -> io::Result<R>
     where
-        F: FnOnce() -> Fut + Send + 'ctx,
-        Fut: Future<Output = R> + Send + 'ctx,
+        F: FnOnce() -> Fut + Send + 'scope,
+        Fut: Future<Output = R> + Send + 'scope,
         R: Send,
     {
         let worker_id = task.header().worker_id();
@@ -236,7 +243,8 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-safe (Send) asynchronous scope.
     pub async fn scope<'scope, R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'scope, 'ctx, T>) -> R,
+        'ctx: 'scope,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = AsyncScope::new(
@@ -253,7 +261,8 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     /// Creates a new thread-local asynchronous scope.
     pub async fn scope_local<'scope, R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'scope, 'ctx, T>) -> R,
+        'ctx: 'scope,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = LocalAsyncScope::new(
@@ -277,12 +286,12 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     }
 }
 
-pub type IdleHook<'ctx, T> = fn(&RuntimeShared<'ctx, T>) -> IdleDecision;
+pub type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
 pub type WorkerTickHook = fn();
 
 /// Worker initialization context passed to the injected worker init step.
 pub struct WorkerInitContext<'ctx, T> {
-    shared: &'ctx RuntimeShared<'ctx, T>,
+    shared: &'ctx RuntimeShared<T>,
     worker_id: usize,
     worker_count: NonZeroUsize,
 }
@@ -299,7 +308,7 @@ impl<'ctx, T> Clone for WorkerInitContext<'ctx, T> {
 
 impl<'ctx, T> WorkerInitContext<'ctx, T> {
     pub(crate) fn new(
-        shared: &'ctx RuntimeShared<'ctx, T>,
+        shared: &'ctx RuntimeShared<T>,
         worker_id: usize,
         worker_count: NonZeroUsize,
     ) -> Self {
@@ -310,7 +319,7 @@ impl<'ctx, T> WorkerInitContext<'ctx, T> {
         }
     }
 
-    pub fn shared(&self) -> &'ctx RuntimeShared<'ctx, T> {
+    pub fn shared(&self) -> &'ctx RuntimeShared<T> {
         self.shared
     }
 
@@ -376,13 +385,13 @@ impl<T> RouteCell<T> {
     }
 }
 
-pub struct RoutedFuture<'a, F> {
+pub struct RoutedFuture<'ctx, F> {
     slot: Arc<RouteCell<F>>,
     inner: Option<F>,
-    _marker: PhantomData<&'a ()>,
+    _marker: PhantomData<&'ctx ()>,
 }
 
-impl<'a, F> RoutedFuture<'a, F> {
+impl<'ctx, F> RoutedFuture<'ctx, F> {
     pub(crate) fn new(slot: Arc<RouteCell<F>>) -> Self {
         Self {
             slot,
@@ -392,7 +401,7 @@ impl<'a, F> RoutedFuture<'a, F> {
     }
 }
 
-impl<'a, F> Future for RoutedFuture<'a, F>
+impl<'ctx, F> Future for RoutedFuture<'ctx, F>
 where
     F: Future,
 {

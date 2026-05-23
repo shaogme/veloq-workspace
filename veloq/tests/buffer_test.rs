@@ -12,7 +12,7 @@ use veloq_driver_native::driver::test_hooks::DriverTestHooks;
 fn build_runtime<'ctx>(
     worker_threads: usize,
     mode: BufferRegistrationMode,
-) -> Runtime<'ctx, UniformSlot> {
+) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
         .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
         .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
@@ -21,7 +21,7 @@ fn build_runtime<'ctx>(
 }
 
 #[cfg(feature = "test-hooks")]
-fn current_chunk_register_attempts(ctx: RuntimeContext<'_>) -> u64 {
+fn current_chunk_register_attempts(ctx: RuntimeContext<'_, '_>) -> u64 {
     ctx.driver(|driver| {
         let hooks = &driver as &dyn DriverTestHooks;
         hooks.debug_chunk_register_attempts()

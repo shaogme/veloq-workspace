@@ -8,22 +8,25 @@ use veloq::runtime::{Runtime, context::RuntimeContext};
 use veloq::sync::mpsc;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
-fn create_runtime<'ctx>() -> Runtime<'ctx, UniformSlot> {
+fn create_runtime<'ctx>() -> Runtime<UniformSlot> {
     create_runtime_with_workers(1)
 }
 
-fn create_runtime_with_workers<'ctx>(worker_threads: usize) -> Runtime<'ctx, UniformSlot> {
+fn create_runtime_with_workers<'ctx>(worker_threads: usize) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
         .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
         .build()
         .expect("failed to build runtime")
 }
 
-fn bind_udp_socket<'ctx>(ctx: RuntimeContext<'ctx>, bind_addr: &str) -> UdpSocket<'ctx> {
+fn bind_udp_socket<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    bind_addr: &str,
+) -> UdpSocket<'a, 'ctx> {
     UdpSocket::bind(ctx, bind_addr).expect("Failed to bind UDP socket")
 }
 
-async fn allow_udp_recv_to_arm(ctx: RuntimeContext<'_>) {
+async fn allow_udp_recv_to_arm(ctx: RuntimeContext<'_, '_>) {
     veloq::time::sleep(ctx, std::time::Duration::from_millis(5)).await;
 }
 
@@ -470,7 +473,7 @@ fn multithread_udp_cross_worker_drop_is_routed() {
 
     let runtime = create_runtime_with_workers(2);
     runtime.block_on(async |ctx| {
-        let (clone_tx, mut clone_rx) = mpsc::unbounded::<UdpSocket>();
+        let (clone_tx, mut clone_rx) = mpsc::unbounded::<UdpSocket<'_, '_>>();
         let (ready_tx, mut ready_rx) = mpsc::unbounded::<()>();
         let (done_tx, mut done_rx) = mpsc::unbounded::<()>();
 

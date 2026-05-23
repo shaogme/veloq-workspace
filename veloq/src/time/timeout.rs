@@ -10,22 +10,22 @@ use std::time::{Duration, Instant};
 // Sync/Send Timeout
 // ============================================================================
 
-pub fn timeout<'ctx, T>(
-    ctx: RuntimeContext<'ctx>,
+pub fn timeout<'a, 'ctx, T>(
+    ctx: RuntimeContext<'a, 'ctx>,
     duration: Duration,
     future: T,
-) -> Timeout<'ctx, T>
+) -> Timeout<'a, 'ctx, T>
 where
     T: Future,
 {
     timeout_at(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at<'ctx, T>(
-    ctx: RuntimeContext<'ctx>,
+pub fn timeout_at<'a, 'ctx, T>(
+    ctx: RuntimeContext<'a, 'ctx>,
     deadline: Instant,
     future: T,
-) -> Timeout<'ctx, T>
+) -> Timeout<'a, 'ctx, T>
 where
     T: Future,
 {
@@ -35,13 +35,14 @@ where
     }
 }
 
-pub struct Timeout<'ctx, T> {
+pub struct Timeout<'a, 'ctx, T> {
     value: T,
-    delay: Sleep<'ctx>,
+    delay: Sleep<'a, 'ctx>,
 }
 
-impl<'ctx, T> Future for Timeout<'ctx, T>
+impl<'a, 'ctx, T> Future for Timeout<'a, 'ctx, T>
 where
+    'ctx: 'a,
     T: Future,
 {
     type Output = Result<T::Output, Elapsed>;
@@ -71,22 +72,22 @@ where
 // Local Timeout
 // ============================================================================
 
-pub fn timeout_local<'ctx, T>(
-    ctx: RuntimeContext<'ctx>,
+pub fn timeout_local<'a, 'ctx, T>(
+    ctx: RuntimeContext<'a, 'ctx>,
     duration: Duration,
     future: T,
-) -> LocalTimeout<'ctx, T>
+) -> LocalTimeout<'a, 'ctx, T>
 where
     T: Future,
 {
     timeout_at_local(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at_local<'ctx, T>(
-    ctx: RuntimeContext<'ctx>,
+pub fn timeout_at_local<'a, 'ctx, T>(
+    ctx: RuntimeContext<'a, 'ctx>,
     deadline: Instant,
     future: T,
-) -> LocalTimeout<'ctx, T>
+) -> LocalTimeout<'a, 'ctx, T>
 where
     T: Future,
 {
@@ -96,13 +97,14 @@ where
     }
 }
 
-pub struct LocalTimeout<'ctx, T> {
+pub struct LocalTimeout<'a, 'ctx, T> {
     value: T,
-    delay: LocalSleep<'ctx>,
+    delay: LocalSleep<'a, 'ctx>,
 }
 
-impl<'ctx, T> Future for LocalTimeout<'ctx, T>
+impl<'a, 'ctx, T> Future for LocalTimeout<'a, 'ctx, T>
 where
+    'ctx: 'a,
     T: Future,
 {
     type Output = Result<T::Output, Elapsed>;

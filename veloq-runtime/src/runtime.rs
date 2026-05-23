@@ -24,12 +24,12 @@ pub use shared::{RuntimeShared, RuntimeSharedBase};
 use primitives::{Signal, create_waker};
 use shared::{Receivers, init_runtime_components};
 
-pub struct Runtime<'ctx, I, T, WF> {
-    pub(crate) shared: RuntimeShared<'ctx, T>,
-    pub(crate) receivers: Option<Receivers<'ctx>>,
+pub struct Runtime<I, T, WF> {
+    pub(crate) shared: RuntimeShared<T>,
+    pub(crate) receivers: Option<Receivers>,
     pub(crate) worker_init: Option<I>,
     pub(crate) worker_factory: Option<WF>,
-    _marker: std::marker::PhantomData<(&'ctx (), T)>,
+    _marker: std::marker::PhantomData<T>,
 }
 
 pub fn noop_worker_init<T>(_: WorkerInitContext<'_, T>) -> std::future::Ready<()> {
@@ -39,39 +39,36 @@ pub fn noop_worker_init<T>(_: WorkerInitContext<'_, T>) -> std::future::Ready<()
 pub type DefaultWorkerInit = fn(WorkerInitContext<'static, ()>) -> std::future::Ready<()>;
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
 
-pub type DefaultWorkerInitFor<'ctx, T> = fn(WorkerInitContext<'ctx, T>) -> std::future::Ready<()>;
-pub type DefaultWorkerFactoryFor<'ctx, T> = fn(usize, &RuntimeShared<'ctx, T>) -> T;
+pub type DefaultWorkerInitFor<T> = for<'a> fn(WorkerInitContext<'a, T>) -> std::future::Ready<()>;
+pub type DefaultWorkerFactoryFor<T> = fn(usize, &RuntimeShared<T>) -> T;
 
-impl<'ctx, T> Runtime<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>> {
+impl<T> Runtime<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
     pub fn new() -> Self {
         RuntimeBuilder::new().build()
     }
 
-    pub fn builder()
-    -> RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>>
-    {
+    pub fn builder() -> RuntimeBuilder<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
         RuntimeBuilder::new()
     }
 }
 
-impl<'ctx, T> Default
-    for Runtime<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>>
-{
+impl<T> Default for Runtime<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
+impl<I, T, WF> Runtime<I, T, WF> {
     pub fn worker_count(&self) -> NonZeroUsize {
         self.shared.worker_count()
     }
 
-    pub fn block_on<R, F>(mut self, f: F) -> R
+    pub fn block_on<'run, R, F>(mut self, f: F) -> R
     where
-        WF: Fn(usize, &'ctx RuntimeShared<'ctx, T>) -> T + Send + Sync + 'ctx,
-        I: AsyncFn(WorkerInitContext<'ctx, T>) -> () + Send + Sync,
-        F: AsyncFnOnce(RuntimeScopeContext<'ctx, T>) -> R,
+        T: 'run,
+        WF: Fn(usize, &'run RuntimeShared<T>) -> T + Send + Sync,
+        I: AsyncFn(WorkerInitContext<'run, T>) -> () + Send + Sync,
+        F: AsyncFnOnce(RuntimeScopeContext<'run, T>) -> R,
     {
         struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<T>);
         impl<'a, T> Drop for TlsCleanupGuard<'a, T> {
@@ -80,8 +77,7 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
             }
         }
 
-        let shared_ref: &'ctx RuntimeShared<'ctx, T> =
-            unsafe { &*std::ptr::from_ref(&self.shared) };
+        let shared_ref: &RuntimeShared<T> = unsafe { &*std::ptr::from_ref(&self.shared) };
         let ctx = RuntimeScopeContext { shared: shared_ref };
 
         let worker_count = shared_ref.worker_count();
@@ -95,8 +91,8 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
         let mut pinned_receivers = receivers.pinned_receivers;
 
         thread::scope(|scope| {
-            struct ShutdownGuard<'ctx, T>(&'ctx RuntimeShared<'ctx, T>);
-            impl<'ctx, T> Drop for ShutdownGuard<'ctx, T> {
+            struct ShutdownGuard<'a, T>(&'a RuntimeShared<T>);
+            impl<'a, T> Drop for ShutdownGuard<'a, T> {
                 fn drop(&mut self) {
                     self.0.shutdown();
                 }
@@ -196,19 +192,17 @@ impl<'ctx, I, T: 'ctx, WF> Runtime<'ctx, I, T, WF> {
     }
 }
 
-pub struct RuntimeBuilder<'ctx, I, T, WF> {
+pub struct RuntimeBuilder<I, T, WF> {
     worker_count: Option<usize>,
     queue_capacity: usize,
     worker_init: Option<I>,
     worker_factory: Option<WF>,
-    idle_hook: Option<IdleHook<'ctx, T>>,
+    idle_hook: Option<IdleHook<T>>,
     worker_tick_hook: Option<WorkerTickHook>,
-    _phantom: std::marker::PhantomData<(&'ctx (), T)>,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl<'ctx, T>
-    RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>>
-{
+impl<T> RuntimeBuilder<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
     pub fn new() -> Self {
         RuntimeBuilder {
             worker_count: None,
@@ -222,15 +216,13 @@ impl<'ctx, T>
     }
 }
 
-impl<'ctx, T> Default
-    for RuntimeBuilder<'ctx, DefaultWorkerInitFor<'ctx, T>, T, DefaultWorkerFactoryFor<'ctx, T>>
-{
+impl<T> Default for RuntimeBuilder<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'ctx, I, T, WF> RuntimeBuilder<'ctx, I, T, WF> {
+impl<I, T, WF> RuntimeBuilder<I, T, WF> {
     pub fn worker_count(mut self, count: NonZeroUsize) -> Self {
         self.worker_count = Some(count.get());
         self
@@ -251,7 +243,7 @@ impl<'ctx, I, T, WF> RuntimeBuilder<'ctx, I, T, WF> {
         self
     }
 
-    pub fn with_idle_hook(mut self, hook: IdleHook<'ctx, T>) -> Self {
+    pub fn with_idle_hook(mut self, hook: IdleHook<T>) -> Self {
         self.idle_hook = Some(hook);
         self
     }
@@ -261,7 +253,7 @@ impl<'ctx, I, T, WF> RuntimeBuilder<'ctx, I, T, WF> {
         self
     }
 
-    pub fn with_worker_init<NI>(self, init: NI) -> RuntimeBuilder<'ctx, NI, T, WF> {
+    pub fn with_worker_init<NI>(self, init: NI) -> RuntimeBuilder<NI, T, WF> {
         RuntimeBuilder {
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
@@ -273,7 +265,7 @@ impl<'ctx, I, T, WF> RuntimeBuilder<'ctx, I, T, WF> {
         }
     }
 
-    pub fn with_worker_extra<NWF>(self, factory: NWF) -> RuntimeBuilder<'ctx, I, T, NWF> {
+    pub fn with_worker_extra<NWF>(self, factory: NWF) -> RuntimeBuilder<I, T, NWF> {
         RuntimeBuilder {
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
@@ -285,7 +277,7 @@ impl<'ctx, I, T, WF> RuntimeBuilder<'ctx, I, T, WF> {
         }
     }
 
-    pub fn build(self) -> Runtime<'ctx, I, T, WF> {
+    pub fn build(self) -> Runtime<I, T, WF> {
         let count = self
             .worker_count
             .unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()));

@@ -22,35 +22,35 @@ use infra::{
     TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
 };
 
-pub struct RuntimeSharedBase<'ctx> {
-    pub(crate) registry: WorkerRegistry<'ctx>,
+pub struct RuntimeSharedBase {
+    pub(crate) registry: WorkerRegistry,
     pub(crate) topo: TopologyContext,
     pub(crate) scheduler: TaskScheduler,
     pub(crate) idle: IdleController,
     pub(crate) shutdown: AtomicBool,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
     /// Worker 线程核心上下文（不含用户 extra 状态）。
-    pub(crate) tls: veloq_tls::Tls<RuntimeContext<'ctx>>,
+    pub(crate) tls: veloq_tls::Tls<RuntimeContext>,
 }
 
-pub struct RuntimeShared<'ctx, T> {
-    pub base: RuntimeSharedBase<'ctx>,
-    pub(crate) idle_hook: Option<IdleHook<'ctx, T>>,
+pub struct RuntimeShared<T> {
+    pub base: RuntimeSharedBase,
+    pub(crate) idle_hook: Option<IdleHook<T>>,
     /// Worker 线程用户自定义 extra 状态。
     pub extra_tls: veloq_tls::Tls<T>,
 }
 
-unsafe impl<'ctx, T> Send for RuntimeShared<'ctx, T> {}
+unsafe impl<T> Send for RuntimeShared<T> {}
 
-pub(crate) struct Receivers<'ctx> {
-    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef<'ctx, 'ctx>>>,
-    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef<'ctx, 'ctx>>>,
+pub(crate) struct Receivers {
+    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef<'static>>>,
+    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef<'static>>>,
 }
 
-pub(crate) fn init_runtime_components<'ctx>(
+pub(crate) fn init_runtime_components(
     worker_count: NonZeroUsize,
     queue_capacity: NonZeroUsize,
-) -> (WorkerRegistry<'ctx>, TopologyContext, Receivers<'ctx>) {
+) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
     let mut unparkers = Vec::with_capacity(worker_count_val);
     let mut parker_inners = Vec::with_capacity(worker_count_val);
@@ -129,16 +129,16 @@ pub(crate) fn init_runtime_components<'ctx>(
     )
 }
 
-impl<'ctx, T> RuntimeShared<'ctx, T> {
-    pub fn base(&self) -> &RuntimeSharedBase<'ctx> {
+impl<T> RuntimeShared<T> {
+    pub fn base(&self) -> &RuntimeSharedBase {
         &self.base
     }
 
     pub(crate) fn new(
-        registry: WorkerRegistry<'ctx>,
+        registry: WorkerRegistry,
         topo: TopologyContext,
         worker_count: NonZeroUsize,
-        idle_hook: Option<IdleHook<'ctx, T>>,
+        idle_hook: Option<IdleHook<T>>,
         worker_tick_hook: Option<WorkerTickHook>,
     ) -> Self {
         Self {
@@ -168,7 +168,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
     }
 }
 
-impl<'ctx> RuntimeSharedBase<'ctx> {
+impl RuntimeSharedBase {
     pub fn unparkers(&self) -> Box<[Unparker]> {
         self.registry.unparkers.clone()
     }
@@ -180,7 +180,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
     }
 
     /// 将本地任务入队当前线程的本地队列。
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'ctx, 'ctx>) {
+    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'static>) {
         if task.header().is_completed() {
             return;
         }
@@ -197,7 +197,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         }
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'static>) -> bool {
         if task.header().is_completed() {
             return false;
         }
@@ -224,7 +224,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         self.registry.unpark(worker_id);
     }
 
-    fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef<'ctx, 'ctx>> {
+    fn pop_send(&self, worker_id: usize) -> Option<SendTaskRef<'static>> {
         let worker = &self.registry.workers[worker_id];
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
@@ -235,8 +235,8 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
     fn pop_pinned(
         &self,
         worker_id: usize,
-        rx: &Receiver<SendTaskRef<'ctx, 'ctx>>,
-    ) -> Option<SendTaskRef<'ctx, 'ctx>> {
+        rx: &Receiver<SendTaskRef<'static>>,
+    ) -> Option<SendTaskRef<'static>> {
         let res = rx.try_recv().ok();
         if res.is_some() {
             self.registry.workers[worker_id]
@@ -246,16 +246,16 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         res
     }
 
-    fn pop_global(&self) -> Option<SendTaskRef<'ctx, 'ctx>> {
+    fn pop_global(&self) -> Option<SendTaskRef<'static>> {
         self.scheduler.pop_global()
     }
 
-    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef<'ctx, 'ctx>> {
+    fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef<'static>> {
         self.scheduler
             .steal_send(thief_id, &self.registry, &self.topo, rand)
     }
 
-    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef<'ctx, 'ctx>) {
+    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef<'static>) {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
         } else {
@@ -263,7 +263,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         }
     }
 
-    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) {
+    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef<'static>) {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
         } else {
@@ -278,7 +278,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
         }
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) {
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'static>) {
         if task.header().is_completed() {
             return;
         }
@@ -295,7 +295,7 @@ impl<'ctx> RuntimeSharedBase<'ctx> {
     }
 }
 
-impl<'ctx, T> RuntimeShared<'ctx, T> {
+impl<T> RuntimeShared<T> {
     pub fn worker_id(&self) -> usize {
         self.base
             .tls
@@ -323,7 +323,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
         self.base.worker_count()
     }
 
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'ctx, 'ctx>) {
+    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef<'static>) {
         self.base.enqueue_local(worker_id, task);
     }
 
@@ -340,7 +340,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef<'static>) -> bool {
         self.base.enqueue_pinned(worker_id, task)
     }
 
@@ -349,7 +349,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
         self.base.wake_worker(worker_id)
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'ctx, 'ctx>) {
+    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef<'static>) {
         if task.header().is_completed() {
             return;
         }
@@ -401,7 +401,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
         self.base.shutdown();
     }
 
-    pub fn drive_worker<'a, S: Storage, O: Ownership + 'ctx + 'a>(
+    pub fn drive_worker<'a, S: Storage, O: Ownership + 'a>(
         &self,
         completion: Option<&O::Shared<GenericScopeCompletion<'a, S, O>>>,
     ) {
@@ -411,7 +411,7 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
     pub fn drive_worker_with_init<
         'scope,
         S: Storage,
-        O: Ownership + 'ctx + 'scope,
+        O: Ownership + 'scope,
         F: Future<Output = ()>,
     >(
         &self,
@@ -421,20 +421,24 @@ impl<'ctx, T> RuntimeShared<'ctx, T> {
         self.base.tls.with(move |ctx| {
             let worker_id = ctx.worker_id;
 
-            let any_scope = completion.map(|c| unsafe {
-                let r = crate::task::RawScope::clone_ref(&**c);
-                std::mem::transmute::<AnyScopeCompletionRef<'scope>, AnyScopeCompletionRef<'ctx>>(r)
-            });
+            let any_scope =
+                completion.map(|c| unsafe {
+                    let r = crate::task::RawScope::clone_ref(&**c);
+                    std::mem::transmute::<
+                        AnyScopeCompletionRef<'scope>,
+                        AnyScopeCompletionRef<'static>,
+                    >(r)
+                });
 
             if let Some(ref scope) = any_scope {
                 ctx.active_scopes.borrow_mut().push(scope.clone());
             }
 
-            struct ScopeGuard<'a, 'ctx> {
-                ctx: &'a RuntimeContext<'ctx>,
+            struct ScopeGuard<'a> {
+                ctx: &'a RuntimeContext,
                 has_scope: bool,
             }
-            impl<'a, 'ctx> Drop for ScopeGuard<'a, 'ctx> {
+            impl<'a> Drop for ScopeGuard<'a> {
                 fn drop(&mut self) {
                     if self.has_scope {
                         self.ctx.active_scopes.borrow_mut().pop();

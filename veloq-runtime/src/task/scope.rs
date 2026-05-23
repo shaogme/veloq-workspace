@@ -79,8 +79,8 @@ pub trait RawScope<'scope, S: Storage> {
     fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool;
     fn parent(&self) -> Option<AnyScopeCompletionRef<'scope>>;
     fn register_cancel_waker(&self, waker: &Waker);
-    fn enqueue_local(&self, task: LocalTaskRef<'scope, 'scope>);
-    fn pop_local(&self) -> Option<LocalTaskRef<'scope, 'scope>>;
+    fn enqueue_local(&self, task: LocalTaskRef<'scope>);
+    fn pop_local(&self) -> Option<LocalTaskRef<'scope>>;
     fn is_local_empty(&self) -> bool;
     /// # Safety
     ///
@@ -108,8 +108,8 @@ impl<'scope, S: Storage> RawScope<'scope, S> for DummyScope<'scope, S> {
         None
     }
     fn register_cancel_waker(&self, _waker: &Waker) {}
-    fn enqueue_local(&self, _task: LocalTaskRef<'scope, 'scope>) {}
-    fn pop_local(&self) -> Option<LocalTaskRef<'scope, 'scope>> {
+    fn enqueue_local(&self, _task: LocalTaskRef<'scope>) {}
+    fn pop_local(&self) -> Option<LocalTaskRef<'scope>> {
         None
     }
     fn is_local_empty(&self) -> bool {
@@ -230,7 +230,7 @@ impl<'scope> AnyScopeCompletionRef<'scope> {
     }
 
     #[inline]
-    pub fn pop_local(&self) -> Option<LocalTaskRef<'scope, 'scope>> {
+    pub fn pop_local(&self) -> Option<LocalTaskRef<'scope>> {
         match self {
             Self::Local(s) => unsafe { s.as_ref().pop_local() },
             Self::Send(s) => unsafe { s.as_ref().pop_local() },
@@ -246,7 +246,7 @@ impl<'scope> AnyScopeCompletionRef<'scope> {
     }
 
     #[inline]
-    pub fn enqueue_local(&self, task: LocalTaskRef<'scope, 'scope>) {
+    pub fn enqueue_local(&self, task: LocalTaskRef<'scope>) {
         match self {
             Self::Local(s) => unsafe { s.as_ref().enqueue_local(task) },
             Self::Send(s) => unsafe { s.as_ref().enqueue_local(task) },

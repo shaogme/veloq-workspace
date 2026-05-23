@@ -14,20 +14,20 @@ use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicOptionPtr, Storage};
 use crate::utils::{Deque, FastRand, Steal};
 
-pub(crate) struct WorkerQueue<'ctx> {
-    pub(crate) remote_tx: Sender<SendTaskRef<'ctx, 'ctx>>,
-    pub(crate) pinned_tx: Sender<SendTaskRef<'ctx, 'ctx>>,
+pub(crate) struct WorkerQueue {
+    pub(crate) remote_tx: Sender<SendTaskRef<'static>>,
+    pub(crate) pinned_tx: Sender<SendTaskRef<'static>>,
     pub(crate) pinned_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
-    pub(crate) lifo: AtomicOptionPtr<TaskHeader<'ctx, 'ctx>>,
+    pub(crate) lifo: AtomicOptionPtr<TaskHeader<'static>>,
     /// Chase-Lev Deque for work-stealing
-    pub(crate) deque: Deque<SendTaskRef<'ctx, 'ctx>>,
+    pub(crate) deque: Deque<SendTaskRef<'static>>,
 }
 
-impl<'ctx> WorkerQueue<'ctx> {
+impl WorkerQueue {
     pub(crate) fn new(
-        remote_tx: Sender<SendTaskRef<'ctx, 'ctx>>,
-        pinned_tx: Sender<SendTaskRef<'ctx, 'ctx>>,
+        remote_tx: Sender<SendTaskRef<'static>>,
+        pinned_tx: Sender<SendTaskRef<'static>>,
         queue_capacity: NonZeroUsize,
     ) -> Self {
         Self {
@@ -145,13 +145,13 @@ impl AtomicBitset {
     }
 }
 
-pub(crate) struct WorkerRegistry<'ctx> {
-    pub(crate) workers: Box<[Arc<WorkerQueue<'ctx>>]>,
+pub(crate) struct WorkerRegistry {
+    pub(crate) workers: Box<[Arc<WorkerQueue>]>,
     pub(crate) unparkers: Box<[Unparker]>,
     pub(crate) parker_inners: Box<[Arc<ParkerInner>]>,
 }
 
-impl<'ctx> WorkerRegistry<'ctx> {
+impl WorkerRegistry {
     #[inline]
     pub(crate) fn unpark(&self, worker_id: usize) {
         self.unparkers[worker_id].unpark();
@@ -201,14 +201,14 @@ impl GlobalInjector {
         }
     }
 
-    pub(crate) fn push<'ctx>(&self, task: SendTaskRef<'ctx, 'ctx>) {
+    pub(crate) fn push(&self, task: SendTaskRef<'static>) {
         let header_ptr = task.header() as *const _ as u64;
         // Modern x86_64 uses 48-bit virtual addresses.
         debug_assert_eq!(header_ptr & 0xFFFF000000000000, 0);
 
         let mut head = self.head.load(Ordering::Acquire);
         loop {
-            let old_ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader<'ctx, 'ctx>;
+            let old_ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader<'static>;
             task.header().set_next(NonNull::new(old_ptr as *mut _));
 
             let next_gen = ((head >> 48).wrapping_add(1)) & 0xFFFF;
@@ -226,14 +226,14 @@ impl GlobalInjector {
         }
     }
 
-    pub(crate) fn pop<'ctx>(&self) -> Option<SendTaskRef<'ctx, 'ctx>> {
+    pub(crate) fn pop(&self) -> Option<SendTaskRef<'static>> {
         let mut head = self.head.load(Ordering::Acquire);
         loop {
             if head == Self::EMPTY {
                 return None;
             }
 
-            let ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader<'ctx, 'ctx>;
+            let ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader<'static>;
             let next_ptr = unsafe { (&*ptr).next() };
 
             let next_raw = next_ptr.map(|p| p.as_ptr() as u64).unwrap_or(0);
@@ -264,17 +264,17 @@ pub(crate) struct TaskScheduler {
 }
 
 impl TaskScheduler {
-    pub(crate) fn pop_global<'ctx>(&self) -> Option<SendTaskRef<'ctx, 'ctx>> {
+    pub(crate) fn pop_global(&self) -> Option<SendTaskRef<'static>> {
         self.injector.pop()
     }
 
-    pub(crate) fn steal_send<'ctx>(
+    pub(crate) fn steal_send(
         &self,
         thief_id: usize,
-        registry: &WorkerRegistry<'ctx>,
+        registry: &WorkerRegistry,
         topo: &TopologyContext,
         rand: &FastRand,
-    ) -> Option<SendTaskRef<'ctx, 'ctx>> {
+    ) -> Option<SendTaskRef<'static>> {
         let thief_worker = &registry.workers[thief_id];
         let num_workers = registry.workers.len();
         if num_workers <= 1 {
@@ -336,13 +336,13 @@ pub(crate) struct IdleController {
     pub(crate) event_count: EventCount,
 }
 
-pub(crate) struct RuntimeProgressCoordinator<'a, 'ctx, T> {
-    shared: &'a RuntimeShared<'ctx, T>,
+pub(crate) struct RuntimeProgressCoordinator<'a, T> {
+    shared: &'a RuntimeShared<T>,
     worker_id: usize,
 }
 
-impl<'a, 'ctx, T> RuntimeProgressCoordinator<'a, 'ctx, T> {
-    pub(crate) fn new(shared: &'a RuntimeShared<'ctx, T>, worker_id: usize) -> Self {
+impl<'a, T> RuntimeProgressCoordinator<'a, T> {
+    pub(crate) fn new(shared: &'a RuntimeShared<T>, worker_id: usize) -> Self {
         Self { shared, worker_id }
     }
 

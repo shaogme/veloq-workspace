@@ -2,7 +2,6 @@ pub mod context;
 
 use std::cell::RefCell;
 use std::io;
-use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
 use std::sync::{Arc, mpsc};
@@ -61,7 +60,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn build<'a>(self) -> io::Result<Runtime<'a, T>> {
+    pub fn build(self) -> io::Result<Runtime<T>> {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
             thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
@@ -77,17 +76,15 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             topology: self.topology,
             state,
             config: self.config,
-            marker: PhantomData,
         })
     }
 }
 
-pub struct Runtime<'ctx, T: PoolTopology> {
+pub struct Runtime<T: PoolTopology> {
     worker_count: NonZeroUsize,
     topology: T,
     state: T::State,
     config: Config,
-    marker: PhantomData<&'ctx ()>,
 }
 
 struct RegistrarDispatcher {
@@ -102,7 +99,7 @@ impl RegistrarDispatcher {
     }
 }
 
-impl<'ctx, T: PoolTopology + 'ctx> Runtime<'ctx, T> {
+impl<T: PoolTopology> Runtime<T> {
     pub fn builder(topology: T) -> RuntimeBuilder<T> {
         RuntimeBuilder::new(topology)
     }
@@ -111,9 +108,9 @@ impl<'ctx, T: PoolTopology + 'ctx> Runtime<'ctx, T> {
         self.worker_count
     }
 
-    pub fn block_on<R, F>(self, f: F) -> R
+    pub fn block_on<'run, R, F>(self, f: F) -> R
     where
-        F: AsyncFnOnce(RuntimeContext<'ctx>) -> R,
+        F: AsyncFnOnce(RuntimeContext<'run, 'run>) -> R,
     {
         let Runtime {
             worker_count,

@@ -4,11 +4,7 @@ use veloq_runtime::{task, task_local};
 
 // --- 测试用例 ---
 
-async fn work<'ctx>(
-    ctx: RuntimeScopeContext<'ctx, ()>,
-    id: String,
-    steps: u32,
-) -> String {
+async fn work<'ctx>(ctx: RuntimeScopeContext<'ctx, ()>, id: String, steps: u32) -> String {
     for i in 1..=steps {
         yield_now().await;
         let worker_id = ctx.worker_id();
@@ -20,9 +16,7 @@ async fn work<'ctx>(
     format!("Result from {}", id)
 }
 
-async fn run_nested_cancellation_scope<'ctx>(
-    ctx: RuntimeScopeContext<'ctx, ()>,
-) {
+async fn run_nested_cancellation_scope<'ctx>(ctx: RuntimeScopeContext<'ctx, ()>) {
     println!("    [父作用域] 启动子作用域...");
     ctx.scope(async |child_scope| {
         child_scope.spawn_boxed(async move {

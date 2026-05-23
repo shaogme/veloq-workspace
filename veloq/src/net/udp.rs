@@ -14,20 +14,21 @@ use veloq_driver_native::op::{
 };
 
 #[derive(Clone)]
-pub struct GenericUdpSocket<'ctx, S, P: SocketTokenPtr<'ctx>> {
-    pub(crate) inner: InnerSocket<'ctx, P>,
+pub struct GenericUdpSocket<'a, 'ctx, S, P: SocketTokenPtr<'a, 'ctx>> {
+    pub(crate) inner: InnerSocket<'a, 'ctx, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: RuntimeContext<'ctx>,
+    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
 }
 
-pub type LocalUdpSocket<'ctx> =
-    GenericUdpSocket<'ctx, LocalSubmitter<RuntimeContext<'ctx>>, Rc<SocketToken<'ctx>>>;
-pub type UdpSocket<'ctx> = GenericUdpSocket<'ctx, DetachedSubmitter, Arc<SocketToken<'ctx>>>;
+pub type LocalUdpSocket<'a, 'ctx> =
+    GenericUdpSocket<'a, 'ctx, LocalSubmitter<RuntimeContext<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
+pub type UdpSocket<'a, 'ctx> =
+    GenericUdpSocket<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a, 'ctx>>>;
 
-fn bind_inner<'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'ctx>>(
-    ctx: RuntimeContext<'ctx>,
+fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
+    ctx: RuntimeContext<'a, 'ctx>,
     addr: A,
-) -> VeloqResult<InnerSocket<'ctx, P>> {
+) -> VeloqResult<InnerSocket<'a, 'ctx, P>> {
     let addr = addr
         .to_socket_addrs()
         .map_err(from_io_error)?
@@ -51,8 +52,8 @@ fn bind_inner<'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'ctx>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-impl<'ctx, S: OpSubmitter<'ctx, RuntimeContext<'ctx>> + Copy, P: SocketTokenPtr<'ctx>>
-    GenericUdpSocket<'ctx, S, P>
+impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
+    GenericUdpSocket<'a, 'ctx, S, P>
 {
     pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
         self.inner.local_addr()
@@ -168,8 +169,8 @@ impl<'ctx, S: OpSubmitter<'ctx, RuntimeContext<'ctx>> + Copy, P: SocketTokenPtr<
     }
 }
 
-impl<'ctx> LocalUdpSocket<'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'ctx>, addr: A) -> VeloqResult<Self> {
+impl<'a, 'ctx> LocalUdpSocket<'a, 'ctx> {
+    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -218,8 +219,8 @@ impl<'ctx> LocalUdpSocket<'ctx> {
     }
 }
 
-impl<'ctx> UdpSocket<'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'ctx>, addr: A) -> VeloqResult<Self> {
+impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
+    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> VeloqResult<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -319,7 +320,7 @@ impl<'ctx> UdpSocket<'ctx> {
     }
 }
 
-impl<'ctx> crate::io::AsyncBufRead for LocalUdpSocket<'ctx> {
+impl<'a, 'ctx> crate::io::AsyncBufRead for LocalUdpSocket<'a, 'ctx> {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.recv(buf).await.map_err(to_io_error)
     }
@@ -342,7 +343,7 @@ impl<'ctx> crate::io::AsyncBufRead for LocalUdpSocket<'ctx> {
     }
 }
 
-impl<'ctx> crate::io::AsyncBufRead for UdpSocket<'ctx> {
+impl<'a, 'ctx> crate::io::AsyncBufRead for UdpSocket<'a, 'ctx> {
     async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.recv(buf).await.map_err(to_io_error)
     }
@@ -365,7 +366,7 @@ impl<'ctx> crate::io::AsyncBufRead for UdpSocket<'ctx> {
     }
 }
 
-impl<'ctx> crate::io::AsyncBufWrite for LocalUdpSocket<'ctx> {
+impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalUdpSocket<'a, 'ctx> {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.send(buf).await.map_err(to_io_error)
     }
@@ -396,7 +397,7 @@ impl<'ctx> crate::io::AsyncBufWrite for LocalUdpSocket<'ctx> {
     }
 }
 
-impl<'ctx> crate::io::AsyncBufWrite for UdpSocket<'ctx> {
+impl<'a, 'ctx> crate::io::AsyncBufWrite for UdpSocket<'a, 'ctx> {
     async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
         self.send(buf).await.map_err(to_io_error)
     }

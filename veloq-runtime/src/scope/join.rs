@@ -27,14 +27,14 @@ pub(crate) trait RoutedTaskAccess<T>: Send {
     fn reclaim(self: Box<Self>, arena: &dyn crate::task::Arena);
 }
 
-pub(crate) struct RoutedSpawnReady<'scope, 'ctx, T> {
-    pub(crate) task: SendTaskRef<'scope, 'ctx>,
+pub(crate) struct RoutedSpawnReady<'scope, T> {
+    pub(crate) task: SendTaskRef<'scope>,
     pub(crate) access: Box<dyn RoutedTaskAccess<T> + 'scope>,
 }
 
-pub(crate) enum RoutedSpawnOutcome<'scope, 'ctx, T> {
+pub(crate) enum RoutedSpawnOutcome<'scope, T> {
     Pending,
-    Ready(RoutedSpawnReady<'scope, 'ctx, T>),
+    Ready(RoutedSpawnReady<'scope, T>),
     Failed(TaskError),
     Taken,
 }
@@ -57,14 +57,14 @@ impl<'scope, F> RoutedJobCell<'scope, F> {
     }
 }
 
-struct SpawnToAccess<'scope, 'ctx, T, S_> {
+struct SpawnToAccess<'scope, T, S_> {
     task: &'scope S_,
-    _marker: PhantomData<(&'ctx (), T)>,
+    _marker: PhantomData<(T,)>,
 }
 
-impl<'scope, 'ctx, T, S_> RoutedTaskAccess<T> for SpawnToAccess<'scope, 'ctx, T, S_>
+impl<'scope, T, S_> RoutedTaskAccess<T> for SpawnToAccess<'scope, T, S_>
 where
-    S_: crate::task::SendTask<'scope, 'ctx, T> + Sized + 'scope,
+    S_: crate::task::SendTask<'scope, T> + Sized + 'scope,
 {
     fn take_result(&self) -> Result<T, TaskError> {
         self.task.take_result().expect("task result already taken")
@@ -73,18 +73,17 @@ where
     fn reclaim(self: Box<Self>, _arena: &dyn crate::task::Arena) {}
 }
 
-unsafe impl<'scope, 'ctx, T, S_> Send for SpawnToAccess<'scope, 'ctx, T, S_> where
-    S_: crate::task::SendTask<'scope, 'ctx, T> + Sized + 'scope
+unsafe impl<'scope, T, S_> Send for SpawnToAccess<'scope, T, S_> where
+    S_: crate::task::SendTask<'scope, T> + Sized + 'scope
 {
 }
 
-pub(crate) fn make_spawn_to_access<'scope, 'ctx, T, S_>(
+pub(crate) fn make_spawn_to_access<'scope, T, S_>(
     task: &'scope S_,
 ) -> Box<dyn RoutedTaskAccess<T> + 'scope>
 where
-    'ctx: 'scope,
     T: 'scope,
-    S_: crate::task::SendTask<'scope, 'ctx, T> + Sized + 'scope,
+    S_: crate::task::SendTask<'scope, T> + Sized + 'scope,
 {
     Box::new(SpawnToAccess {
         task,
@@ -92,12 +91,12 @@ where
     })
 }
 
-struct BoxedTaskAccess<'scope, 'ctx, T, Fut> {
-    node: &'scope SendBoxedTaskNode<'scope, 'ctx, T, Fut>,
+struct BoxedTaskAccess<'scope, T, Fut> {
+    node: &'scope SendBoxedTaskNode<'scope, T, Fut>,
     _marker: PhantomData<T>,
 }
 
-impl<'scope, 'ctx, T, Fut> RoutedTaskAccess<T> for BoxedTaskAccess<'scope, 'ctx, T, Fut>
+impl<'scope, T, Fut> RoutedTaskAccess<T> for BoxedTaskAccess<'scope, T, Fut>
 where
     T: Send + 'scope,
     Fut: Future<Output = T> + 'scope,
@@ -107,22 +106,22 @@ where
     }
 
     fn reclaim(self: Box<Self>, arena: &dyn crate::task::Arena) {
-        let layout = Layout::new::<SendBoxedTaskNode<'scope, 'ctx, T, Fut>>();
+        let layout = Layout::new::<SendBoxedTaskNode<'scope, T, Fut>>();
         unsafe {
             arena.drop_object_raw(self.node as *const _ as *mut u8, layout);
         }
     }
 }
 
-unsafe impl<'scope, 'ctx, T, Fut> Send for BoxedTaskAccess<'scope, 'ctx, T, Fut>
+unsafe impl<'scope, T, Fut> Send for BoxedTaskAccess<'scope, T, Fut>
 where
     T: Send + 'scope,
     Fut: Future<Output = T> + 'scope,
 {
 }
 
-pub(crate) fn make_boxed_task_access<'scope, 'ctx, T, Fut>(
-    node: &'scope SendBoxedTaskNode<'scope, 'ctx, T, Fut>,
+pub(crate) fn make_boxed_task_access<'scope, T, Fut>(
+    node: &'scope SendBoxedTaskNode<'scope, T, Fut>,
 ) -> Box<dyn RoutedTaskAccess<T> + 'scope>
 where
     T: Send + 'scope,
@@ -134,20 +133,18 @@ where
     })
 }
 
-pub(crate) struct RoutedSpawnState<'scope, 'ctx, T> {
-    pub(crate) outcome: Mutex<RoutedSpawnOutcome<'scope, 'ctx, T>>,
+pub(crate) struct RoutedSpawnState<'scope, T> {
+    pub(crate) outcome: Mutex<RoutedSpawnOutcome<'scope, T>>,
     cancel_requested: AtomicBool,
     waker: AtomicWaker,
-    pub(crate) _marker: std::marker::PhantomData<&'ctx ()>,
 }
 
-impl<'scope, 'ctx, T> RoutedSpawnState<'scope, 'ctx, T> {
+impl<'scope, T> RoutedSpawnState<'scope, T> {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             outcome: Mutex::new(RoutedSpawnOutcome::Pending),
             cancel_requested: AtomicBool::new(false),
             waker: AtomicWaker::new(),
-            _marker: std::marker::PhantomData,
         })
     }
 
@@ -160,7 +157,7 @@ impl<'scope, 'ctx, T> RoutedSpawnState<'scope, 'ctx, T> {
         self.cancel_requested.load(Ordering::Acquire)
     }
 
-    fn set_outcome(&self, new_outcome: RoutedSpawnOutcome<'scope, 'ctx, T>) {
+    fn set_outcome(&self, new_outcome: RoutedSpawnOutcome<'scope, T>) {
         let should_wake = {
             let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
             if matches!(*outcome, RoutedSpawnOutcome::Pending) {
@@ -175,7 +172,7 @@ impl<'scope, 'ctx, T> RoutedSpawnState<'scope, 'ctx, T> {
         }
     }
 
-    pub(crate) fn set_ready(&self, ready: RoutedSpawnReady<'scope, 'ctx, T>) {
+    pub(crate) fn set_ready(&self, ready: RoutedSpawnReady<'scope, T>) {
         self.set_outcome(RoutedSpawnOutcome::Ready(ready));
     }
 
@@ -183,9 +180,7 @@ impl<'scope, 'ctx, T> RoutedSpawnState<'scope, 'ctx, T> {
         self.set_outcome(RoutedSpawnOutcome::Failed(err));
     }
 
-    pub(crate) fn try_take_ready(
-        &self,
-    ) -> Result<Option<RoutedSpawnReady<'scope, 'ctx, T>>, TaskError> {
+    pub(crate) fn try_take_ready(&self) -> Result<Option<RoutedSpawnReady<'scope, T>>, TaskError> {
         let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
         match replace(&mut *outcome, RoutedSpawnOutcome::Taken) {
             RoutedSpawnOutcome::Ready(ready) => Ok(Some(ready)),
@@ -217,7 +212,7 @@ pub(crate) fn dispatch_routed<
 >(
     context: &crate::runtime::RuntimeScopeContext<'ctx, TExtra>,
     completion: &O::Shared<super::GenericScopeCompletion<'scope, S, O>>,
-    state: Arc<RoutedSpawnState<'scope, 'ctx, T>>,
+    state: Arc<RoutedSpawnState<'scope, T>>,
     worker_id: usize,
     job: F,
 ) where
@@ -225,28 +220,29 @@ pub(crate) fn dispatch_routed<
     F: FnOnce() + Send + 'scope,
     T: 'scope + 'ctx,
 {
-    let completion_raw_ptr = O::as_ptr(completion)
-        as *const super::GenericScopeCompletion<'scope, S, O>
-        as *const super::GenericScopeCompletion<'ctx, S, O>;
+    let completion_raw_ptr =
+        O::as_ptr(completion) as *const super::GenericScopeCompletion<'scope, S, O> as *const ();
     let completion_send_ptr =
-        super::SendPtr::new(NonNull::new(completion_raw_ptr as *mut _).unwrap());
+        super::SendPtr::new(NonNull::new(completion_raw_ptr as *mut ()).unwrap());
 
-    let state_raw_ptr = Arc::as_ptr(&state) as *const RoutedSpawnState<'scope, 'ctx, T>
-        as *const RoutedSpawnState<'ctx, 'ctx, T>;
-    let state_send_ptr = super::SendPtr::new(NonNull::new(state_raw_ptr as *mut _).unwrap());
+    let state_raw_ptr = Arc::as_ptr(&state) as *const RoutedSpawnState<'scope, T> as *const ();
+    let state_send_ptr = super::SendPtr::new(NonNull::new(state_raw_ptr as *mut ()).unwrap());
 
     let job_boxed: Box<dyn FnOnce() + Send + 'scope> = Box::new(job);
     let job_ctx = unsafe {
-        std::mem::transmute::<Box<dyn FnOnce() + Send + 'scope>, Box<dyn FnOnce() + Send + 'ctx>>(
+        std::mem::transmute::<Box<dyn FnOnce() + Send + 'scope>, Box<dyn FnOnce() + Send + 'static>>(
             job_boxed,
         )
     };
 
     if context
         .route_to(worker_id, move || {
-            let state_ref: &RoutedSpawnState<'ctx, 'ctx, T> = unsafe { &*state_send_ptr.as_ptr() };
-            let completion_ref: &super::GenericScopeCompletion<'ctx, S, O> =
-                unsafe { &*completion_send_ptr.as_ptr() };
+            let state_ref: &RoutedSpawnState<'scope, T> =
+                unsafe { &*(state_send_ptr.as_ptr() as *const RoutedSpawnState<'scope, T>) };
+            let completion_ref: &super::GenericScopeCompletion<'scope, S, O> = unsafe {
+                &*(completion_send_ptr.as_ptr()
+                    as *const super::GenericScopeCompletion<'scope, S, O>)
+            };
             let result = catch_unwind(AssertUnwindSafe(move || {
                 job_ctx();
             }));
@@ -267,12 +263,12 @@ pub(crate) fn dispatch_routed<
     }
 }
 
-pub(crate) fn install_routed_pinned_task<'scope, 'ctx, T, Fut, TExtra>(
-    runtime: &'ctx RuntimeShared<'ctx, TExtra>,
+pub(crate) fn install_routed_pinned_task<'scope, 'rt, T, Fut, TExtra>(
+    runtime: &'rt RuntimeShared<TExtra>,
     arena: &crate::task::GenericArena<AtomicStorage>,
     completion: Arc<crate::scope::ScopeCompletion<'scope>>,
     worker_id: usize,
-    state: Arc<RoutedSpawnState<'scope, 'ctx, T>>,
+    state: Arc<RoutedSpawnState<'scope, T>>,
     future: Fut,
 ) where
     T: Send + 'scope,
@@ -280,17 +276,16 @@ pub(crate) fn install_routed_pinned_task<'scope, 'ctx, T, Fut, TExtra>(
 {
     let scope_ref = unsafe { RawScope::clone_ref(&*completion) };
     let node = SendBoxedTaskNode::new(future);
-    let node_header_ptr = &node.header as *const GenericTaskHeader<'scope, 'scope, AtomicStorage>
-        as *const GenericTaskHeader<'scope, 'ctx, AtomicStorage>;
+    let node_header_ptr = &node.header as *const GenericTaskHeader<'scope, AtomicStorage>;
     unsafe {
         (*node_header_ptr).initialize(&runtime.base, worker_id, scope_ref);
     }
-    let layout = Layout::new::<SendBoxedTaskNode<'scope, 'scope, T, Fut>>();
+    let layout = Layout::new::<SendBoxedTaskNode<'scope, T, Fut>>();
     let node_ptr = unsafe {
-        arena.alloc::<SendBoxedTaskNode<'scope, 'scope, T, Fut>>(
+        arena.alloc::<SendBoxedTaskNode<'scope, T, Fut>>(
             layout,
-            Some(|ptr| drop_in_place(ptr as *mut SendBoxedTaskNode<'scope, 'scope, T, Fut>)),
-        ) as *mut SendBoxedTaskNode<'scope, 'scope, T, Fut>
+            Some(|ptr| drop_in_place(ptr as *mut SendBoxedTaskNode<'scope, T, Fut>)),
+        ) as *mut SendBoxedTaskNode<'scope, T, Fut>
     };
     unsafe { write(node_ptr, node) };
 
@@ -298,8 +293,8 @@ pub(crate) fn install_routed_pinned_task<'scope, 'ctx, T, Fut, TExtra>(
     node_ref.header().set_pinned();
 
     let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-    let header_ptr = task_ref.header() as *const GenericTaskHeader<'scope, 'scope, AtomicStorage>
-        as *const GenericTaskHeader<'ctx, 'ctx, AtomicStorage>;
+    let header_ptr = task_ref.header() as *const GenericTaskHeader<'scope, AtomicStorage>
+        as *const GenericTaskHeader<'static, AtomicStorage>;
     let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
     let header = task_ref.header();
 
@@ -315,9 +310,9 @@ pub(crate) fn install_routed_pinned_task<'scope, 'ctx, T, Fut, TExtra>(
     }
 
     let task_ready = unsafe {
-        SendTaskRef::from_header(task_ref.header()
-            as *const GenericTaskHeader<'scope, 'scope, AtomicStorage>
-            as *const GenericTaskHeader<'scope, 'ctx, AtomicStorage>)
+        SendTaskRef::from_header(
+            task_ref.header() as *const GenericTaskHeader<'scope, AtomicStorage>
+        )
     };
 
     state.set_ready(RoutedSpawnReady {
@@ -326,49 +321,45 @@ pub(crate) fn install_routed_pinned_task<'scope, 'ctx, T, Fut, TExtra>(
     });
 }
 
-pub(crate) struct ResolvedRoutedTask<'scope, 'ctx, T, R: TaskHandleRef<'scope, 'ctx>> {
+pub(crate) struct ResolvedRoutedTask<'scope, T, R: TaskHandleRef<'scope>> {
     pub(crate) task: R,
     pub(crate) access: Option<Box<dyn RoutedTaskAccess<T> + 'scope>>,
-    pub(crate) _marker: std::marker::PhantomData<&'ctx ()>,
 }
 
-pub(crate) enum JoinSource<'scope, 'ctx, T, R: TaskHandleRef<'scope, 'ctx>> {
+pub(crate) enum JoinSource<'scope, T, R: TaskHandleRef<'scope>> {
     Direct {
         task: R,
         gate: &'scope (dyn crate::task::TaskJoinGate<T> + 'scope),
-        _marker: std::marker::PhantomData<&'ctx ()>,
     },
     Routed {
-        state: Arc<RoutedSpawnState<'scope, 'ctx, T>>,
-        resolved: Option<ResolvedRoutedTask<'scope, 'ctx, T, R>>,
+        state: Arc<RoutedSpawnState<'scope, T>>,
+        resolved: Option<ResolvedRoutedTask<'scope, T, R>>,
     },
 }
 
 pub struct JoinHandle<
     'scope,
     'scope_ref,
-    'ctx,
     T,
-    R: TaskHandleRef<'scope, 'ctx>,
-    S: ScopeProvider<'scope, 'ctx, TExtra>,
+    R: TaskHandleRef<'scope>,
+    S: ScopeProvider<'scope, TExtra>,
     TExtra,
 > {
-    pub(crate) source: JoinSource<'scope, 'ctx, T, R>,
+    pub(crate) source: JoinSource<'scope, T, R>,
     pub(crate) scope: &'scope_ref S,
     pub(crate) cancel_token: CancelTokenSlot<'scope, S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<Pin<&'scope mut GenericWakerNode<R::Storage>>>,
     pub(crate) reclaim: Option<ReclaimFn<'scope, T, S::Arena>>,
-    pub(crate) _marker: std::marker::PhantomData<(&'ctx (), TExtra)>,
+    pub(crate) _marker: std::marker::PhantomData<TExtra>,
 }
 
-unsafe impl<'scope, 'scope_ref, 'ctx, T, TExtra> Send
+unsafe impl<'scope, 'scope_ref, T, TExtra> Send
     for JoinHandle<
         'scope,
         'scope_ref,
-        'ctx,
         T,
-        SendTaskRef<'scope, 'ctx>,
-        crate::scope::AsyncScope<'scope, 'ctx, TExtra>,
+        SendTaskRef<'scope>,
+        crate::scope::AsyncScope<'scope, TExtra>,
         TExtra,
     >
 where
@@ -376,43 +367,33 @@ where
 {
 }
 
-pub type LocalJoinHandle<'scope, 'scope_ref, 'ctx, T, TExtra> = JoinHandle<
+pub type LocalJoinHandle<'scope, 'scope_ref, T, TExtra> = JoinHandle<
     'scope,
     'scope_ref,
-    'ctx,
     T,
-    crate::task::LocalTaskRef<'scope, 'ctx>,
-    crate::scope::AsyncScope<'scope, 'ctx, TExtra>,
+    crate::task::LocalTaskRef<'scope>,
+    crate::scope::AsyncScope<'scope, TExtra>,
     TExtra,
 >;
-pub type SendJoinHandle<'scope, 'scope_ref, 'ctx, T, TExtra> = JoinHandle<
+pub type SendJoinHandle<'scope, 'scope_ref, T, TExtra> = JoinHandle<
     'scope,
     'scope_ref,
-    'ctx,
     T,
-    SendTaskRef<'scope, 'ctx>,
-    crate::scope::AsyncScope<'scope, 'ctx, TExtra>,
+    SendTaskRef<'scope>,
+    crate::scope::AsyncScope<'scope, TExtra>,
     TExtra,
 >;
-pub type LocalAsyncJoinHandle<'scope, 'scope_ref, 'ctx, T, TExtra> = JoinHandle<
+pub type LocalAsyncJoinHandle<'scope, 'scope_ref, T, TExtra> = JoinHandle<
     'scope,
     'scope_ref,
-    'ctx,
     T,
-    crate::task::LocalTaskRef<'scope, 'ctx>,
-    crate::scope::LocalAsyncScope<'scope, 'ctx, TExtra>,
+    crate::task::LocalTaskRef<'scope>,
+    crate::scope::LocalAsyncScope<'scope, TExtra>,
     TExtra,
 >;
 
-impl<
-    'scope,
-    'scope_ref,
-    'ctx,
-    T,
-    R: TaskHandleRef<'scope, 'ctx>,
-    S: ScopeProvider<'scope, 'ctx, TExtra>,
-    TExtra,
-> JoinHandle<'scope, 'scope_ref, 'ctx, T, R, S, TExtra>
+impl<'scope, 'scope_ref, T, R: TaskHandleRef<'scope>, S: ScopeProvider<'scope, TExtra>, TExtra>
+    JoinHandle<'scope, 'scope_ref, T, R, S, TExtra>
 {
     pub fn cancel(&self) {
         let mut cancel_slot = self.cancel_token.lock();
@@ -480,11 +461,7 @@ impl<
         reclaim: Option<ReclaimFn<'scope, T, S::Arena>>,
     ) -> Self {
         Self {
-            source: JoinSource::Direct {
-                task,
-                gate,
-                _marker: PhantomData,
-            },
+            source: JoinSource::Direct { task, gate },
             scope,
             cancel_token: super::new_cancel_slot::<'scope, S::Storage, S::Ownership>(),
             waker_node: None,
@@ -495,7 +472,7 @@ impl<
 
     pub(crate) fn new_routed(
         scope: &'scope_ref S,
-        state: Arc<RoutedSpawnState<'scope, 'ctx, T>>,
+        state: Arc<RoutedSpawnState<'scope, T>>,
     ) -> Self {
         Self {
             source: JoinSource::Routed {
@@ -513,7 +490,7 @@ impl<
     fn register_waker_on<St: crate::utils::storage::Storage>(
         waker_node: &mut Option<Pin<&'scope mut GenericWakerNode<St>>>,
         arena: &dyn crate::task::Arena,
-        header: &crate::task::GenericTaskHeader<'scope, 'ctx, St>,
+        header: &crate::task::GenericTaskHeader<'scope, St>,
         cx: &mut Context<'_>,
     ) {
         if let Some(node) = waker_node {
@@ -551,15 +528,8 @@ impl<
     }
 }
 
-impl<
-    'scope,
-    'scope_ref,
-    'ctx,
-    T: 'scope,
-    S: ScopeProvider<'scope, 'ctx, TExtra> + 'scope,
-    TExtra: 'scope,
-> Future
-    for JoinHandle<'scope, 'scope_ref, 'ctx, T, crate::task::LocalTaskRef<'scope, 'ctx>, S, TExtra>
+impl<'scope, 'scope_ref, T: 'scope, S: ScopeProvider<'scope, TExtra> + 'scope, TExtra: 'scope>
+    Future for JoinHandle<'scope, 'scope_ref, T, crate::task::LocalTaskRef<'scope>, S, TExtra>
 {
     type Output = Result<T, TaskError>;
 
@@ -601,14 +571,8 @@ impl<
     }
 }
 
-impl<
-    'scope,
-    'scope_ref,
-    'ctx,
-    T: 'scope,
-    S: ScopeProvider<'scope, 'ctx, TExtra> + 'scope,
-    TExtra: 'scope,
-> Future for JoinHandle<'scope, 'scope_ref, 'ctx, T, SendTaskRef<'scope, 'ctx>, S, TExtra>
+impl<'scope, 'scope_ref, T: 'scope, S: ScopeProvider<'scope, TExtra> + 'scope, TExtra: 'scope>
+    Future for JoinHandle<'scope, 'scope_ref, T, SendTaskRef<'scope>, S, TExtra>
 {
     type Output = Result<T, TaskError>;
 
@@ -666,12 +630,11 @@ impl<
                             Ok(Some(ready)) => {
                                 let task_cast = unsafe {
                                     SendTaskRef::from_header(ready.task.header()
-                                        as *const GenericTaskHeader<'scope, 'ctx, AtomicStorage>)
+                                        as *const GenericTaskHeader<'scope, AtomicStorage>)
                                 };
                                 *resolved = Some(ResolvedRoutedTask {
                                     task: task_cast,
                                     access: Some(ready.access),
-                                    _marker: PhantomData,
                                 });
                                 // Continue to poll the newly resolved task
                             }
@@ -681,16 +644,11 @@ impl<
                                 if let Some(ready) = state.try_take_ready()? {
                                     let task_cast = unsafe {
                                         SendTaskRef::from_header(ready.task.header()
-                                            as *const GenericTaskHeader<
-                                                'scope,
-                                                'ctx,
-                                                AtomicStorage,
-                                            >)
+                                            as *const GenericTaskHeader<'scope, AtomicStorage>)
                                     };
                                     *resolved = Some(ResolvedRoutedTask {
                                         task: task_cast,
                                         access: Some(ready.access),
-                                        _marker: PhantomData,
                                     });
                                     continue;
                                 }
@@ -705,15 +663,8 @@ impl<
     }
 }
 
-impl<
-    'scope,
-    'scope_ref,
-    'ctx,
-    T,
-    R: TaskHandleRef<'scope, 'ctx>,
-    S: ScopeProvider<'scope, 'ctx, TExtra>,
-    TExtra,
-> Drop for JoinHandle<'scope, 'scope_ref, 'ctx, T, R, S, TExtra>
+impl<'scope, 'scope_ref, T, R: TaskHandleRef<'scope>, S: ScopeProvider<'scope, TExtra>, TExtra> Drop
+    for JoinHandle<'scope, 'scope_ref, T, R, S, TExtra>
 {
     fn drop(&mut self) {
         if let Some(node) = self.waker_node.as_mut() {

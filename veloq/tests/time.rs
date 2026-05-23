@@ -8,7 +8,7 @@ use veloq::time::{
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 use veloq_runtime::select;
 
-fn build_runtime<'ctx>(worker_threads: usize) -> Runtime<'ctx, UniformSlot> {
+fn build_runtime<'ctx>(worker_threads: usize) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
         .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
         .build()
