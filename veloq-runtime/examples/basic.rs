@@ -1,11 +1,11 @@
-use veloq_runtime::runtime::Runtime;
+use veloq_runtime::runtime::{Runtime, RuntimeScopeContext};
 use veloq_runtime::task::yield_now;
 use veloq_runtime::{task, task_local};
 
 // --- 测试用例 ---
 
 async fn work<'ctx>(
-    ctx: veloq_runtime::runtime::RuntimeScopeContext<'ctx, ()>,
+    ctx: RuntimeScopeContext<'ctx, ()>,
     id: String,
     steps: u32,
 ) -> String {
@@ -18,6 +18,24 @@ async fn work<'ctx>(
         );
     }
     format!("Result from {}", id)
+}
+
+async fn run_nested_cancellation_scope<'ctx>(
+    ctx: RuntimeScopeContext<'ctx, ()>,
+) {
+    println!("    [父作用域] 启动子作用域...");
+    ctx.scope(async |child_scope| {
+        child_scope.spawn_boxed(async move {
+            for i in 1..=100 {
+                yield_now().await;
+                if i % 10 == 0 {
+                    println!("      [子作用域任务] 运行中... {}", i);
+                }
+            }
+        });
+    })
+    .await;
+    println!("    [父作用域] 子作用域已退出");
 }
 
 fn main() {
@@ -170,21 +188,7 @@ fn main() {
             ctx.scope(async |parent_scope| {
                 let token = parent_scope.cancel_token().clone();
 
-                parent_scope.spawn_boxed(async move {
-                    println!("    [父作用域] 启动子作用域...");
-                    ctx.scope(async move |child_scope| {
-                        child_scope.spawn_boxed(async move {
-                            for i in 1..=100 {
-                                yield_now().await;
-                                if i % 10 == 0 {
-                                    println!("      [子作用域任务] 运行中... {}", i);
-                                }
-                            }
-                        });
-                    })
-                    .await;
-                    println!("    [父作用域] 子作用域已退出");
-                });
+                parent_scope.spawn_boxed(run_nested_cancellation_scope(ctx));
 
                 yield_now().await;
                 yield_now().await;
