@@ -416,13 +416,11 @@ impl<S: Storage> GenericTaskHeader<S> {
 pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
-        let header =
-            GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
+        let header = GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
         GenericTaskHeader::wake(header);
     },
     |data| unsafe {
-        let header =
-            GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
+        let header = GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
         header.as_ref().wake_by_ref();
     },
     |_data| {},
@@ -431,13 +429,11 @@ pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| RawWaker::new(data, &LOCAL_INTRUSIVE_WAKER_VTABLE),
     |data| unsafe {
-        let header =
-            GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
+        let header = GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
         GenericTaskHeader::wake(header);
     },
     |data| unsafe {
-        let header =
-            GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
+        let header = GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
         header.as_ref().wake_by_ref();
     },
     |_data| {},

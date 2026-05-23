@@ -172,9 +172,7 @@ impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     }
 }
 
-impl<S: Storage, O: Ownership> crate::task::RawScope<S>
-    for GenericScopeCompletion<S, O>
-{
+impl<S: Storage, O: Ownership> crate::task::RawScope<S> for GenericScopeCompletion<S, O> {
     #[inline]
     fn task_done(&self) {
         self.task_done();
@@ -297,10 +295,8 @@ pub struct GenericAsyncScope<'ctx, S: Storage, O: Ownership, TExtra> {
     completion: O::Shared<GenericScopeCompletion<S, O>>,
 }
 
-pub type AsyncScope<'ctx, TExtra> =
-    GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra>;
-pub type LocalAsyncScope<'ctx, TExtra> =
-    GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra>;
+pub type AsyncScope<'ctx, TExtra> = GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra>;
+pub type LocalAsyncScope<'ctx, TExtra> = GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra>;
 
 impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> ScopeProvider<TExtra>
     for GenericAsyncScope<'ctx, S, O, TExtra>
@@ -641,9 +637,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let job_ptr = unsafe {
             self.arena.alloc::<self::join::RoutedJobCell<F>>(
                 job_layout,
-                Some(|ptr| {
-                    std::ptr::drop_in_place(ptr as *mut self::join::RoutedJobCell<F>)
-                }),
+                Some(|ptr| std::ptr::drop_in_place(ptr as *mut self::join::RoutedJobCell<F>)),
             ) as *mut self::join::RoutedJobCell<F>
         };
         unsafe { std::ptr::write(job_ptr, self::join::RoutedJobCell::new(job)) };

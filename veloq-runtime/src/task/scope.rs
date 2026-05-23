@@ -44,9 +44,7 @@ pub struct ErasedCancellationToken {
 }
 
 impl ErasedCancellationToken {
-    pub fn new<S: Storage, O: Ownership>(
-        token: &GenericCancellationToken<S, O>,
-    ) -> Self {
+    pub fn new<S: Storage, O: Ownership>(token: &GenericCancellationToken<S, O>) -> Self {
         Self {
             ptr: unsafe { NonNull::new_unchecked(token as *const _ as *mut OpaqueToken) },
             s_type: S::strategy_type(),

@@ -232,11 +232,7 @@ impl RuntimeSharedBase {
         worker.deque.pop()
     }
 
-    fn fn_pop_pinned(
-        &self,
-        worker_id: usize,
-        rx: &Receiver<SendTaskRef>,
-    ) -> Option<SendTaskRef> {
+    fn fn_pop_pinned(&self, worker_id: usize, rx: &Receiver<SendTaskRef>) -> Option<SendTaskRef> {
         let res = rx.try_recv().ok();
         if res.is_some() {
             self.registry.workers[worker_id]
@@ -421,10 +417,7 @@ impl<T> RuntimeShared<T> {
         self.base.tls.with(move |ctx| {
             let worker_id = ctx.worker_id;
 
-            let any_scope =
-                completion.map(|c| unsafe {
-                    crate::task::RawScope::clone_ref(&**c)
-                });
+            let any_scope = completion.map(|c| unsafe { crate::task::RawScope::clone_ref(&**c) });
 
             if let Some(ref scope) = any_scope {
                 ctx.active_scopes.borrow_mut().push(scope.clone());
@@ -490,7 +483,9 @@ impl<T> RuntimeShared<T> {
                     progressed = true;
                 }
 
-                if !progressed && let Some(task) = self.base.fn_pop_pinned(worker_id, &ctx.pinned_rx) {
+                if !progressed
+                    && let Some(task) = self.base.fn_pop_pinned(worker_id, &ctx.pinned_rx)
+                {
                     self.base.poll_send_task(worker_id, task);
                     progressed = true;
                 }

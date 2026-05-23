@@ -50,8 +50,7 @@ pub trait RuntimeContextExt {
 impl RuntimeContextExt for Context<'_> {
     fn is_cancelled(&self) -> bool {
         unsafe {
-            if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE)
-            {
+            if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
                 return h.is_cancelled();
             }
             if let Some(h) =
@@ -65,8 +64,7 @@ impl RuntimeContextExt for Context<'_> {
 
     fn scope_completion(&self) -> Option<AnyScopeCompletionRef> {
         unsafe {
-            if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE)
-            {
+            if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
                 return Some(h.scope_completion_ref());
             }
             if let Some(h) =
@@ -102,10 +100,7 @@ pub trait LocalTask<T>: Task<T, Storage = LocalStorage> {}
 impl<T, U: Task<T, Storage = LocalStorage> + ?Sized> LocalTask<T> for U {}
 
 pub trait SendTask<T>: Task<T, Storage = AtomicStorage> + Send {}
-impl<T, U: Task<T, Storage = AtomicStorage> + Send + ?Sized> SendTask<T>
-    for U
-{
-}
+impl<T, U: Task<T, Storage = AtomicStorage> + Send + ?Sized> SendTask<T> for U {}
 
 pub trait TaskLock<T> {
     fn lock_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R;
@@ -282,7 +277,7 @@ macro_rules! define_task_infrastructure {
             pub unsafe fn from_concrete<U>(ptr: *const U) -> Self
             where
                 U: RawTask<Storage = $storage>,
-              {
+            {
                 Self {
                     header: unsafe { NonNull::from((&*ptr).header()) },
                 }

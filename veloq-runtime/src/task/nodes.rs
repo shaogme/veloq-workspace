@@ -125,7 +125,7 @@ where
                 self.state.lock_mut(|s| {
                     if let TaskState::Running(f) = s {
                         unsafe { Pin::new_unchecked(f) }.poll(cx)
-                      } else {
+                    } else {
                         Poll::Pending
                     }
                 })
@@ -147,15 +147,13 @@ where
 }
 
 /// 栈上本地任务：future 本身不进行 any 堆分配。
-pub type LocalTaskNode<'future, T, F> =
-    GenericTaskNode<LocalStorage, T, Pin<&'future mut F>>;
+pub type LocalTaskNode<'future, T, F> = GenericTaskNode<LocalStorage, T, Pin<&'future mut F>>;
 
 /// 堆上/拥有所有权的本地任务。
 pub type LocalBoxedTaskNode<T, F> = GenericTaskNode<LocalStorage, T, F>;
 
 /// 栈上 Send 任务：future 固定在调用栈里，不进行堆分配。
-pub type SendTaskNode<'future, T, F> =
-    GenericTaskNode<AtomicStorage, T, Pin<&'future mut F>>;
+pub type SendTaskNode<'future, T, F> = GenericTaskNode<AtomicStorage, T, Pin<&'future mut F>>;
 
 /// 堆上/拥有所有权的 Send 任务。
 pub type SendBoxedTaskNode<T, F> = GenericTaskNode<AtomicStorage, T, F>;

@@ -45,9 +45,7 @@ pub(crate) struct RoutedJobCell<F> {
 
 impl<F> RoutedJobCell<F> {
     pub(crate) fn new(job: F) -> Self {
-        Self {
-            job: Some(job),
-        }
+        Self { job: Some(job) }
     }
 
     pub(crate) fn take(&mut self) -> F {
@@ -178,7 +176,9 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
         self.set_outcome(RoutedSpawnOutcome::Failed(err));
     }
 
-    pub(crate) fn try_take_ready(&self) -> Result<Option<RoutedSpawnReady<'scope_ref, T>>, TaskError> {
+    pub(crate) fn try_take_ready(
+        &self,
+    ) -> Result<Option<RoutedSpawnReady<'scope_ref, T>>, TaskError> {
         let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
         match replace(&mut *outcome, RoutedSpawnOutcome::Taken) {
             RoutedSpawnOutcome::Ready(ready) => Ok(Some(ready)),
@@ -217,19 +217,19 @@ pub(crate) fn dispatch_routed<
     F: FnOnce() + Send + 'scope_ref,
     T: 'scope_ref,
 {
-    let completion_raw_ptr =
-        O::as_ptr(completion) as *const super::GenericScopeCompletion<S, O> as *const ();
+    let completion_raw_ptr = O::as_ptr(completion) as *const ();
     let completion_send_ptr =
         super::SendPtr::new(NonNull::new(completion_raw_ptr as *mut ()).unwrap());
 
-    let state_raw_ptr = Arc::as_ptr(&state) as *const RoutedSpawnState<'scope_ref, T> as *const ();
+    let state_raw_ptr = Arc::as_ptr(&state) as *const ();
     let state_send_ptr = super::SendPtr::new(NonNull::new(state_raw_ptr as *mut ()).unwrap());
 
     let job_boxed: Box<dyn FnOnce() + Send + 'scope_ref> = Box::new(job);
     let job_ctx = unsafe {
-        std::mem::transmute::<Box<dyn FnOnce() + Send + 'scope_ref>, Box<dyn FnOnce() + Send + 'static>>(
-            job_boxed,
-        )
+        std::mem::transmute::<
+            Box<dyn FnOnce() + Send + 'scope_ref>,
+            Box<dyn FnOnce() + Send + 'static>,
+        >(job_boxed)
     };
 
     if context
@@ -237,8 +237,7 @@ pub(crate) fn dispatch_routed<
             let state_ref: &RoutedSpawnState<'scope_ref, T> =
                 unsafe { &*(state_send_ptr.as_ptr() as *const RoutedSpawnState<'scope_ref, T>) };
             let completion_ref: &super::GenericScopeCompletion<S, O> = unsafe {
-                &*(completion_send_ptr.as_ptr()
-                    as *const super::GenericScopeCompletion<S, O>)
+                &*(completion_send_ptr.as_ptr() as *const super::GenericScopeCompletion<S, O>)
             };
             let result = catch_unwind(AssertUnwindSafe(move || {
                 job_ctx();
@@ -306,9 +305,7 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
     }
 
     let task_ready = unsafe {
-        SendTaskRef::from_header(
-            task_ref.header() as *const GenericTaskHeader<AtomicStorage>
-        )
+        SendTaskRef::from_header(task_ref.header() as *const GenericTaskHeader<AtomicStorage>)
     };
 
     state.set_ready(RoutedSpawnReady {
@@ -333,13 +330,7 @@ pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
     },
 }
 
-pub struct JoinHandle<
-    'scope_ref,
-    T,
-    R: TaskHandleRef,
-    S: ScopeProvider<TExtra>,
-    TExtra,
-> {
+pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
     pub(crate) source: JoinSource<'scope_ref, T, R>,
     pub(crate) scope: &'scope_ref S,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
@@ -349,13 +340,7 @@ pub struct JoinHandle<
 }
 
 unsafe impl<'scope_ref, T, TExtra> Send
-    for JoinHandle<
-        'scope_ref,
-        T,
-        SendTaskRef,
-        crate::scope::AsyncScope<'scope_ref, TExtra>,
-        TExtra,
-    >
+    for JoinHandle<'scope_ref, T, SendTaskRef, crate::scope::AsyncScope<'scope_ref, TExtra>, TExtra>
 where
     T: Send,
 {
@@ -368,13 +353,8 @@ pub type LocalJoinHandle<'scope_ref, T, TExtra> = JoinHandle<
     crate::scope::AsyncScope<'scope_ref, TExtra>,
     TExtra,
 >;
-pub type SendJoinHandle<'scope_ref, T, TExtra> = JoinHandle<
-    'scope_ref,
-    T,
-    SendTaskRef,
-    crate::scope::AsyncScope<'scope_ref, TExtra>,
-    TExtra,
->;
+pub type SendJoinHandle<'scope_ref, T, TExtra> =
+    JoinHandle<'scope_ref, T, SendTaskRef, crate::scope::AsyncScope<'scope_ref, TExtra>, TExtra>;
 pub type LocalAsyncJoinHandle<'scope_ref, T, TExtra> = JoinHandle<
     'scope_ref,
     T,
@@ -519,8 +499,8 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
     }
 }
 
-impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref>
-    Future for JoinHandle<'scope_ref, T, crate::task::LocalTaskRef, S, TExtra>
+impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref> Future
+    for JoinHandle<'scope_ref, T, crate::task::LocalTaskRef, S, TExtra>
 {
     type Output = Result<T, TaskError>;
 
@@ -562,8 +542,8 @@ impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref>
     }
 }
 
-impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref>
-    Future for JoinHandle<'scope_ref, T, SendTaskRef, S, TExtra>
+impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref> Future
+    for JoinHandle<'scope_ref, T, SendTaskRef, S, TExtra>
 {
     type Output = Result<T, TaskError>;
 

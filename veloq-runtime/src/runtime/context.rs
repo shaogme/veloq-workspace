@@ -186,8 +186,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
                 wake: |_| {},
                 wake_by_ref: |_| {},
                 poll: |header, worker_id| unsafe {
-                    let raw_ptr =
-                        header as *const GenericTaskHeader<AtomicStorage> as *const ();
+                    let raw_ptr = header as *const GenericTaskHeader<AtomicStorage> as *const ();
                     let node = &*(raw_ptr as *const Self);
                     RawTask::poll_raw(node, worker_id)
                 },
@@ -391,10 +390,7 @@ pub struct RoutedFuture<F> {
 
 impl<F> RoutedFuture<F> {
     pub(crate) fn new(slot: Arc<RouteCell<F>>) -> Self {
-        Self {
-            slot,
-            inner: None,
-        }
+        Self { slot, inner: None }
     }
 }
 
