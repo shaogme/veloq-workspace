@@ -12,7 +12,7 @@ use crate::utils::storage::{
 use std::alloc::Layout;
 use std::any::Any;
 use std::collections::VecDeque;
-use std::mem::{take, transmute};
+use std::mem::take;
 use std::ops::AsyncFnOnce;
 use std::ptr::{NonNull, drop_in_place, write};
 use std::sync::atomic::Ordering;
@@ -344,7 +344,7 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
 
     pub fn spawn_local<'scope_ref, T: Send, TTask>(
         &'scope_ref self,
-        task: &TTask,
+        task: &'scope_ref TTask,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
         TTask: LocalTask<T> + Sized,
@@ -364,11 +364,7 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
         let task_ctx = unsafe { LocalTaskRef::from_header(header_ptr) };
         self.context.shared.enqueue_local(worker_id, task_ctx);
 
-        let gate_ref: &dyn crate::task::TaskJoinGate<T> = task;
-        let gate_ctx: &'scope_ref dyn crate::task::TaskJoinGate<T> =
-            unsafe { std::mem::transmute(gate_ref) };
-
-        JoinHandle::new_direct(self, task_ref, gate_ctx, None)
+        JoinHandle::new_direct(self, task_ref, task, None)
     }
 
     pub fn spawn_boxed_local<'scope_ref, T, F>(
@@ -402,14 +398,10 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
         let task_ctx = unsafe { LocalTaskRef::from_header(header_ptr) };
         self.context.shared.enqueue_local(worker_id, task_ctx);
 
-        let gate_ref: &dyn crate::task::TaskJoinGate<T> = node_ref;
-        let gate_ctx: &'scope_ref dyn crate::task::TaskJoinGate<T> =
-            unsafe { std::mem::transmute(gate_ref) };
-
         JoinHandle::new_direct(
             self,
             task_ref,
-            gate_ctx,
+            node_ref,
             Some(|arena, gate| unsafe {
                 let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<T, F>>();
                 arena.drop_object_raw(
@@ -461,7 +453,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
     fn spawn_send_impl<'scope_ref, T: Send, S_>(
         &'scope_ref self,
         worker_id: usize,
-        task: &S_,
+        task: &'scope_ref S_,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
         S_: SendTask<T> + Sized,
@@ -485,11 +477,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
         self.context.shared.enqueue_send(worker_id, task_ctx);
 
-        let gate_ref: &dyn crate::task::TaskJoinGate<T> = task;
-        let gate_ctx: &'scope_ref dyn crate::task::TaskJoinGate<T> =
-            unsafe { std::mem::transmute(gate_ref) };
-
-        JoinHandle::new_direct(self, task_ref, gate_ctx, None)
+        JoinHandle::new_direct(self, task_ref, task, None)
     }
 
     pub fn spawn_to<'scope_ref, T: Send, S_>(
@@ -554,7 +542,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
 
     pub fn spawn<'scope_ref, T: Send, S_>(
         &'scope_ref self,
-        task: &S_,
+        task: &'scope_ref S_,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
         S_: SendTask<T> + Sized,
@@ -598,13 +586,10 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
         self.context.shared.enqueue_send(worker_id, task_ctx);
 
-        let gate_ref: &dyn TaskJoinGate<T> = node_ref;
-        let gate_ctx: &'scope_ref dyn TaskJoinGate<T> = unsafe { transmute(gate_ref) };
-
         JoinHandle::new_direct(
             self,
             task_ref,
-            gate_ctx,
+            node_ref,
             Some(|arena, gate| unsafe {
                 let layout = Layout::new::<SendBoxedTaskNode<T, F>>();
                 arena.drop_object_raw(gate as *const dyn TaskJoinGate<T> as *mut u8, layout);
@@ -699,7 +684,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
 impl<'ctx, TExtra> GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra> {
     pub fn spawn<'scope_ref, T: Send, S_>(
         &'scope_ref self,
-        task: &S_,
+        task: &'scope_ref S_,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
         S_: LocalTask<T> + Sized,
