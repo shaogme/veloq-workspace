@@ -409,9 +409,9 @@ impl<T> RuntimeShared<T> {
     }
 
     pub fn drive_worker_with_init<
-        'scope,
+        'scope_ref,
         S: Storage,
-        O: Ownership + 'scope,
+        O: Ownership + 'scope_ref,
         F: Future<Output = ()>,
     >(
         &self,

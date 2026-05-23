@@ -130,30 +130,30 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         self.shared
     }
 
-    pub fn route_to<'scope, F, Fut>(
+    pub fn route_to<'scope_ref, F, Fut>(
         &self,
         worker_id: usize,
         job: F,
     ) -> io::Result<RoutedFuture<Fut>>
     where
-        F: FnOnce() -> Fut + Send + 'scope,
-        Fut: Future + Send + 'scope,
+        F: FnOnce() -> Fut + Send + 'scope_ref,
+        Fut: Future + Send + 'scope_ref,
     {
         let slot = RouteCell::new();
         let slot_for_job = slot.clone();
 
         #[repr(C)]
-        struct RouteJobTask<'scope, F, Fut> {
+        struct RouteJobTask<'scope_ref, F, Fut> {
             header: TaskHeader,
             job: UnsafeCell<Option<F>>,
             slot: Arc<RouteCell<Fut>>,
-            _marker: PhantomData<&'scope ()>,
+            _marker: PhantomData<&'scope_ref ()>,
         }
 
-        impl<'scope, F, Fut> RawTask for RouteJobTask<'scope, F, Fut>
+        impl<'scope_ref, F, Fut> RawTask for RouteJobTask<'scope_ref, F, Fut>
         where
-            F: FnOnce() -> Fut + Send + 'scope,
-            Fut: Future + Send + 'scope,
+            F: FnOnce() -> Fut + Send + 'scope_ref,
+            Fut: Future + Send + 'scope_ref,
         {
             type Storage = AtomicStorage;
 
@@ -177,10 +177,10 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
             }
         }
 
-        impl<'scope, F, Fut> RouteJobTask<'scope, F, Fut>
+        impl<'scope_ref, F, Fut> RouteJobTask<'scope_ref, F, Fut>
         where
-            F: FnOnce() -> Fut + Send + 'scope,
-            Fut: Future + Send + 'scope,
+            F: FnOnce() -> Fut + Send + 'scope_ref,
+            Fut: Future + Send + 'scope_ref,
         {
             const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
                 wake: |_| {},
@@ -200,7 +200,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
         let task = Box::new(RouteJobTask {
             header: TaskHeader::new(
-                RouteJobTask::<'scope, F, Fut>::VTABLE,
+                RouteJobTask::<'scope_ref, F, Fut>::VTABLE,
                 &self.shared.base,
                 worker_id,
                 crate::task::AnyScopeCompletionRef::dummy::<AtomicStorage>(),
@@ -227,14 +227,14 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         Ok(RoutedFuture::new(slot))
     }
 
-    pub async fn execute_on_owner<'scope, F, Fut, R>(
+    pub async fn execute_on_owner<'scope_ref, F, Fut, R>(
         &self,
         task: &impl TaskHandleRef,
         f: F,
     ) -> io::Result<R>
     where
-        F: FnOnce() -> Fut + Send + 'scope,
-        Fut: Future<Output = R> + Send + 'scope,
+        F: FnOnce() -> Fut + Send + 'scope_ref,
+        Fut: Future<Output = R> + Send + 'scope_ref,
         R: Send,
     {
         let worker_id = task.header().worker_id();
@@ -242,7 +242,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     }
 
     /// Creates a new thread-safe (Send) asynchronous scope.
-    pub async fn scope<'scope, R, F>(&self, f: F) -> R
+    pub async fn scope<R, F>(&self, f: F) -> R
     where
         F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'ctx, T>) -> R,
     {
@@ -259,7 +259,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     }
 
     /// Creates a new thread-local asynchronous scope.
-    pub async fn scope_local<'scope, R, F>(&self, f: F) -> R
+    pub async fn scope_local<R, F>(&self, f: F) -> R
     where
         F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'ctx, T>) -> R,
     {
