@@ -151,7 +151,7 @@ where
 {
     header: &'a GenericTaskHeader<S>,
     result_setter: &'a R,
-    _marker: std::marker::PhantomData<T>,
+    marker: std::marker::PhantomData<T>,
 }
 
 impl<'a, T, R, S: Storage> TaskFinalizer<'a, T, R, S>
@@ -163,7 +163,7 @@ where
         Self {
             header,
             result_setter,
-            _marker: std::marker::PhantomData,
+            marker: std::marker::PhantomData,
         }
     }
 

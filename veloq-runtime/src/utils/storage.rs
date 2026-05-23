@@ -406,7 +406,7 @@ impl<T: ?Sized> PointerStrategy<Arc<T>> for ArcStrategy<T> {
 
 pub struct GenericAtomicOption<T, S: PointerStrategy<T>> {
     inner: AtomicPtr<()>,
-    _marker: std::marker::PhantomData<fn(T) -> S::Raw>,
+    marker: std::marker::PhantomData<fn(T) -> S::Raw>,
 }
 
 unsafe impl<T, S: PointerStrategy<T>> Send for GenericAtomicOption<T, S> where T: Send {}
@@ -420,7 +420,7 @@ impl<T, S: PointerStrategy<T>> GenericAtomicOption<T, S> {
         };
         Self {
             inner: AtomicPtr::new(ptr),
-            _marker: std::marker::PhantomData,
+            marker: std::marker::PhantomData,
         }
     }
 

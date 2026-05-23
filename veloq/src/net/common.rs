@@ -98,7 +98,7 @@ where
 {
     token: P,
     local_addr: Option<SocketAddr>,
-    _marker: std::marker::PhantomData<(&'a (), &'ctx ())>,
+    marker: std::marker::PhantomData<(&'a (), &'ctx ())>,
 }
 
 impl<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>> InnerSocket<'a, 'ctx, P>
@@ -113,7 +113,7 @@ where
         Ok(Self {
             token: P::new_ptr(SocketToken::new(ctx, handle)?),
             local_addr,
-            _marker: std::marker::PhantomData,
+            marker: std::marker::PhantomData,
         })
     }
 

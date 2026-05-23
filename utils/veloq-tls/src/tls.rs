@@ -24,7 +24,7 @@ use libc::{pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_
 pub struct Tls<T, F = fn() -> T> {
     key: OnceCell<RawKey>,
     init: F,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<T, F: Fn() -> T> Tls<T, F> {
@@ -35,7 +35,7 @@ impl<T, F: Fn() -> T> Tls<T, F> {
         Self {
             key: OnceCell::new(),
             init,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 

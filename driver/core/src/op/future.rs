@@ -269,7 +269,7 @@ where
     pub(crate) provider: P,
     pub(crate) user_data: usize,
     pub(crate) token: u64,
-    pub(crate) _marker: std::marker::PhantomData<&'a ()>,
+    pub(crate) marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a, T, P> LocalOp<'a, T, P>
@@ -284,7 +284,7 @@ where
             provider,
             user_data: 0,
             token: 0,
-            _marker: std::marker::PhantomData,
+            marker: std::marker::PhantomData,
         }
     }
 }

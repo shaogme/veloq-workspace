@@ -222,7 +222,7 @@ pub struct RawHandle<H: Handle> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BorrowedRawHandle<'a, H: Handle> {
     raw: RawHandle<H>,
-    _marker: PhantomData<&'a RawHandle<H>>,
+    marker: PhantomData<&'a RawHandle<H>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -252,7 +252,7 @@ impl<H: RawHandleMeta> RawHandle<H> {
     pub const fn borrow(&self) -> BorrowedRawHandle<'_, H> {
         BorrowedRawHandle {
             raw: *self,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 

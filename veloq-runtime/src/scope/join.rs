@@ -55,7 +55,7 @@ impl<F> RoutedJobCell<F> {
 
 struct SpawnToAccess<'scope_ref, T, S_> {
     task: &'scope_ref S_,
-    _marker: PhantomData<(T,)>,
+    marker: PhantomData<(T,)>,
 }
 
 impl<'scope_ref, T, S_> RoutedTaskAccess<T> for SpawnToAccess<'scope_ref, T, S_>
@@ -83,13 +83,13 @@ where
 {
     Box::new(SpawnToAccess {
         task,
-        _marker: PhantomData,
+        marker: PhantomData,
     })
 }
 
 struct BoxedTaskAccess<'scope_ref, T, Fut> {
     node: &'scope_ref SendBoxedTaskNode<T, Fut>,
-    _marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<'scope_ref, T, Fut> RoutedTaskAccess<T> for BoxedTaskAccess<'scope_ref, T, Fut>
@@ -125,7 +125,7 @@ where
 {
     Box::new(BoxedTaskAccess {
         node,
-        _marker: PhantomData,
+        marker: PhantomData,
     })
 }
 
@@ -336,7 +336,7 @@ pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<Pin<&'scope_ref mut GenericWakerNode<R::Storage>>>,
     pub(crate) reclaim: Option<ReclaimFn<'scope_ref, T, S::Arena>>,
-    pub(crate) _marker: std::marker::PhantomData<TExtra>,
+    pub(crate) marker: std::marker::PhantomData<TExtra>,
 }
 
 unsafe impl<'scope_ref, T, TExtra> Send
@@ -437,7 +437,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
             cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
             waker_node: None,
             reclaim,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -454,7 +454,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
             cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
             waker_node: None,
             reclaim: None,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -486,7 +486,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
                     GenericWakerNode {
                         waker: cx.waker().clone(),
                         link: Link::new(),
-                        _marker: PhantomData,
+                        marker: PhantomData,
                     },
                 );
             }

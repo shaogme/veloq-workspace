@@ -29,7 +29,7 @@ pub struct Runtime<I, T, WF> {
     pub(crate) receivers: Option<Receivers>,
     pub(crate) worker_init: Option<I>,
     pub(crate) worker_factory: Option<WF>,
-    _marker: std::marker::PhantomData<T>,
+    marker: std::marker::PhantomData<T>,
 }
 
 pub fn noop_worker_init<T>(_: WorkerInitContext<'_, T>) -> std::future::Ready<()> {
@@ -299,7 +299,7 @@ impl<I, T, WF> RuntimeBuilder<I, T, WF> {
             receivers: Some(receivers),
             worker_init: self.worker_init,
             worker_factory: self.worker_factory,
-            _marker: std::marker::PhantomData,
+            marker: std::marker::PhantomData,
         }
     }
 }

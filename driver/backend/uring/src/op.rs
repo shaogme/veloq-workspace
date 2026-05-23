@@ -178,7 +178,7 @@ macro_rules! define_uring_ops {
     (@resolve_chunks ) => { crate::op::submit::resolve_chunks_none };
     (@resolve_chunks $func:expr) => { $func };
 
-    (@construct_dummy $OpType:ty) => { crate::op::payload::KernelRef { _marker: std::marker::PhantomData } };
+    (@construct_dummy $OpType:ty) => { crate::op::payload::KernelRef { marker: std::marker::PhantomData } };
     (@construct_dummy $OpType:ty, $Payload:ty) => { unsafe { std::mem::zeroed() } };
 
     (@on_complete ) => { crate::op::submit::on_complete_default };

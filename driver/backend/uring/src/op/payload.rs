@@ -36,7 +36,7 @@ pub(crate) type UdpRecvFrom = CoreUdpRecvFrom;
 pub(crate) type Wakeup = CoreWakeup;
 
 pub(crate) struct KernelRef<T> {
-    pub(crate) _marker: std::marker::PhantomData<T>,
+    pub(crate) marker: std::marker::PhantomData<T>,
 }
 
 pub(crate) struct AcceptPayload {}

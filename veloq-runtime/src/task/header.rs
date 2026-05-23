@@ -32,7 +32,7 @@ pub struct TaskVTable<S: Storage> {
 pub struct GenericWakerNode<S: Storage> {
     pub(crate) waker: Waker,
     pub(crate) link: Link,
-    pub(crate) _marker: std::marker::PhantomData<S>,
+    pub(crate) marker: std::marker::PhantomData<S>,
 }
 
 intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);

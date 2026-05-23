@@ -249,7 +249,7 @@ struct Shared<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
     receiver_count: AtomicUsize,
 
     flavor: F,
-    _marker: std::marker::PhantomData<T>,
+    marker: std::marker::PhantomData<T>,
 }
 
 unsafe impl<T: Send, F: ChannelFlavor, Q: flavor::RawQueue<T>> Send for Shared<T, F, Q> {}
@@ -265,7 +265,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Shared<T, F, Q> {
             sender_count: AtomicUsize::new(1),
             receiver_count: AtomicUsize::new(1),
             flavor: F::new(),
-            _marker: std::marker::PhantomData,
+            marker: std::marker::PhantomData,
         }
     }
 

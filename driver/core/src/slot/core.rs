@@ -141,7 +141,7 @@ pub struct SlotData<Op, UP, S: SlotSidecar, R = usize> {
     pub(crate) completion_flags: AtomicU32,
     pub(crate) completion_data: Mutex<CompletionData<UP, R>>,
     pub(crate) completion_waker: AtomicWaker,
-    _marker: SlotMarker<Op, S, UP>,
+    marker: SlotMarker<Op, S, UP>,
 }
 
 #[derive(Debug)]
@@ -174,7 +174,7 @@ impl<Op, UP, S: SlotSidecar, R> SlotData<Op, UP, S, R> {
             completion_flags: AtomicU32::new(0),
             completion_data: Mutex::new(CompletionData::<UP, R>::default()),
             completion_waker: AtomicWaker::new(),
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 

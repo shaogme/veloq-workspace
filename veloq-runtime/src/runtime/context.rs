@@ -147,7 +147,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
             header: TaskHeader,
             job: UnsafeCell<Option<F>>,
             slot: Arc<RouteCell<Fut>>,
-            _marker: PhantomData<&'scope_ref ()>,
+            marker: PhantomData<&'scope_ref ()>,
         }
 
         impl<'scope_ref, F, Fut> RawTask for RouteJobTask<'scope_ref, F, Fut>
@@ -206,7 +206,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
             ),
             job: UnsafeCell::new(Some(job)),
             slot: slot_for_job,
-            _marker: PhantomData,
+            marker: PhantomData,
         });
 
         task.header.set_pinned();
