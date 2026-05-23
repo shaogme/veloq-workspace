@@ -28,7 +28,7 @@ impl Drop for CleanupGuard {
     }
 }
 
-fn create_runtime<'ctx>() -> Runtime<UniformSlot> {
+fn create_runtime() -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
         .worker_count(NonZeroUsize::new(1).expect("1 is non-zero"))
         .build()

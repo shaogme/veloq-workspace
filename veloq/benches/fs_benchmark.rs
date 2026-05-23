@@ -141,7 +141,7 @@ async fn open_and_fallocate<'a, 'ctx>(
     file
 }
 
-fn create_runtime<'ctx>(worker_threads: usize) -> Runtime<UniformSlot> {
+fn create_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(128))))
         .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
         .build()
