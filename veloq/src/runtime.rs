@@ -108,9 +108,9 @@ impl<T: PoolTopology> Runtime<T> {
         self.worker_count
     }
 
-    pub fn block_on<'run, R, F>(self, f: F) -> R
+    pub fn block_on<R, F>(self, f: F) -> R
     where
-        F: AsyncFnOnce(RuntimeContext<'run, 'run>) -> R,
+        F: for<'s1, 's2> AsyncFnOnce(RuntimeContext<'s1, 's2>) -> R,
     {
         let Runtime {
             worker_count,
