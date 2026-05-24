@@ -264,7 +264,10 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
     T: Send + 'scope_ref,
     Fut: Future<Output = T> + 'scope_ref,
 {
-    let scope_ref = unsafe { RawScope::clone_ref(&*completion) };
+    let scope_ref = unsafe {
+        let non_null = RawScope::clone_raw(&*completion);
+        crate::task::ScopeRef::new(non_null)
+    };
     let node = SendBoxedTaskNode::new(future);
     let node_header_ptr = &node.header as *const GenericTaskHeader<AtomicStorage>;
     unsafe {

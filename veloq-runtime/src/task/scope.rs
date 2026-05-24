@@ -68,7 +68,7 @@ impl ErasedCancellationToken {
     }
 }
 
-pub trait RawScope<S: Storage> {
+pub trait RawScope {
     fn task_done(&self);
     fn cancel(&self);
     fn report_panic(&self, payload: Box<dyn Any + Send + 'static>);
@@ -79,16 +79,16 @@ pub trait RawScope<S: Storage> {
     /// # Safety
     ///
     /// The caller must ensure the returned reference is dropped before the underlying scope is deallocated.
-    unsafe fn clone_ref(&self) -> ScopeRef<S>;
+    unsafe fn clone_raw(&self) -> NonNull<dyn RawScope>;
     /// # Safety
     ///
     /// The caller must ensure the reference is not dropped twice.
-    unsafe fn drop_ref(&self);
+    unsafe fn drop_raw(&self);
 }
 
 struct DummyScope<S: Storage>(PhantomData<S>);
 
-impl<S: Storage> RawScope<S> for DummyScope<S> {
+impl<S: Storage> RawScope for DummyScope<S> {
     fn task_done(&self) {}
     fn cancel(&self) {}
     fn report_panic(&self, _payload: Box<dyn Any + Send + 'static>) {}
@@ -102,18 +102,19 @@ impl<S: Storage> RawScope<S> for DummyScope<S> {
         None
     }
     fn register_cancel_waker(&self, _waker: &Waker) {}
-    unsafe fn clone_ref(&self) -> ScopeRef<S> {
-        let dyn_ptr: *const dyn RawScope<S> = self;
-        unsafe { ScopeRef::new(NonNull::new_unchecked(dyn_ptr as *mut _)) }
+    unsafe fn clone_raw(&self) -> NonNull<dyn RawScope> {
+        let dyn_ptr: *const dyn RawScope = self;
+        unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) }
     }
-    unsafe fn drop_ref(&self) {}
+    unsafe fn drop_raw(&self) {}
 }
 
 static DUMMY_LOCAL_SCOPE: DummyScope<LocalStorage> = DummyScope(PhantomData);
 static DUMMY_SEND_SCOPE: DummyScope<AtomicStorage> = DummyScope(PhantomData);
 
 pub struct ScopeRef<S: Storage> {
-    inner: NonNull<dyn RawScope<S>>,
+    inner: NonNull<dyn RawScope>,
+    _marker: PhantomData<S>,
 }
 
 impl<S: Storage> std::fmt::Debug for ScopeRef<S> {
@@ -134,13 +135,16 @@ impl<S: Storage> ScopeRef<S> {
     ///
     /// 调用者必须确保指针有效。
     #[inline]
-    pub const unsafe fn new(inner: NonNull<dyn RawScope<S>>) -> Self {
-        Self { inner }
+    pub const unsafe fn new(inner: NonNull<dyn RawScope>) -> Self {
+        Self {
+            inner,
+            _marker: PhantomData,
+        }
     }
 
     /// 获取内部的 `NonNull` 指针。
     #[inline]
-    pub fn as_non_null(&self) -> NonNull<dyn RawScope<S>> {
+    pub fn as_non_null(&self) -> NonNull<dyn RawScope> {
         self.inner
     }
 
@@ -150,23 +154,37 @@ impl<S: Storage> ScopeRef<S> {
     ///
     /// 必须保证指针依然有效。
     #[inline]
-    pub unsafe fn as_ref(&self) -> &dyn RawScope<S> {
+    pub unsafe fn as_ref(&self) -> &dyn RawScope {
         unsafe { self.inner.as_ref() }
+    }
+
+    /// 安全地将 ScopeRef 从一种 Storage 模式转换为另一种 Storage 模式。
+    #[inline]
+    pub fn cast<T: Storage>(self) -> ScopeRef<T> {
+        let this = std::mem::ManuallyDrop::new(self);
+        ScopeRef {
+            inner: this.inner,
+            _marker: PhantomData,
+        }
     }
 
     /// 创建一个虚拟的 `ScopeRef`。
     pub fn dummy() -> Self {
         match S::strategy_type() {
-            StrategyType::Local => unsafe {
-                let local_ptr: NonNull<dyn RawScope<LocalStorage>> =
-                    NonNull::from(&DUMMY_LOCAL_SCOPE);
-                std::mem::transmute::<ScopeRef<LocalStorage>, ScopeRef<S>>(ScopeRef::new(local_ptr))
-            },
-            StrategyType::Atomic => unsafe {
-                let send_ptr: NonNull<dyn RawScope<AtomicStorage>> =
-                    NonNull::from(&DUMMY_SEND_SCOPE);
-                std::mem::transmute::<ScopeRef<AtomicStorage>, ScopeRef<S>>(ScopeRef::new(send_ptr))
-            },
+            StrategyType::Local => {
+                let local_ptr: NonNull<dyn RawScope> = NonNull::from(&DUMMY_LOCAL_SCOPE);
+                Self {
+                    inner: local_ptr,
+                    _marker: PhantomData,
+                }
+            }
+            StrategyType::Atomic => {
+                let send_ptr: NonNull<dyn RawScope> = NonNull::from(&DUMMY_SEND_SCOPE);
+                Self {
+                    inner: send_ptr,
+                    _marker: PhantomData,
+                }
+            }
         }
     }
 
@@ -203,15 +221,16 @@ impl<S: Storage> ScopeRef<S> {
     /// 将具体类型的 `ScopeRef` 转换成不透明类型的 `AnyScopeRef`。
     #[inline]
     pub fn into_any(self) -> AnyScopeRef {
+        let this = std::mem::ManuallyDrop::new(self);
         match S::strategy_type() {
-            StrategyType::Local => unsafe {
-                let casted = std::mem::transmute::<ScopeRef<S>, ScopeRef<LocalStorage>>(self);
-                AnyScopeRef::Local(casted)
-            },
-            StrategyType::Atomic => unsafe {
-                let casted = std::mem::transmute::<ScopeRef<S>, ScopeRef<AtomicStorage>>(self);
-                AnyScopeRef::Send(casted)
-            },
+            StrategyType::Local => AnyScopeRef::Local(ScopeRef {
+                inner: this.inner,
+                _marker: PhantomData,
+            }),
+            StrategyType::Atomic => AnyScopeRef::Send(ScopeRef {
+                inner: this.inner,
+                _marker: PhantomData,
+            }),
         }
     }
 }
@@ -219,14 +238,15 @@ impl<S: Storage> ScopeRef<S> {
 impl<S: Storage> Clone for ScopeRef<S> {
     #[inline]
     fn clone(&self) -> Self {
-        unsafe { self.inner.as_ref().clone_ref() }
+        let non_null = unsafe { self.as_ref().clone_raw() };
+        unsafe { Self::new(non_null) }
     }
 }
 
 impl<S: Storage> Drop for ScopeRef<S> {
     #[inline]
     fn drop(&mut self) {
-        unsafe { self.inner.as_ref().drop_ref() }
+        unsafe { self.as_ref().drop_raw() }
     }
 }
 

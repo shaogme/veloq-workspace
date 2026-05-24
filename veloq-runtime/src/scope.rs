@@ -1,7 +1,7 @@
 use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::task::{
-    AnyScopeRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef, ScopeRef,
+    AnyScopeRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef,
     SendBoxedTaskNode, SendTask, SendTaskRef, TaskError, TaskHandleRef, TaskJoinGate,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
@@ -151,7 +151,7 @@ impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     }
 }
 
-impl<S: Storage, O: Ownership + 'static> crate::task::RawScope<S> for GenericScopeCompletion<S, O> {
+impl<S: Storage, O: Ownership + 'static> crate::task::RawScope for GenericScopeCompletion<S, O> {
     #[inline]
     fn task_done(&self) {
         self.task_done();
@@ -195,16 +195,15 @@ impl<S: Storage, O: Ownership + 'static> crate::task::RawScope<S> for GenericSco
     }
 
     #[inline]
-    unsafe fn clone_ref(&self) -> crate::task::ScopeRef<S> {
+    unsafe fn clone_raw(&self) -> NonNull<dyn crate::task::RawScope> {
         let ptr = self as *const Self;
         unsafe { O::increment_strong_count(ptr) };
-        let dyn_ptr: *const dyn crate::task::RawScope<S> = ptr;
-        let non_null = unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) };
-        unsafe { crate::task::ScopeRef::new(non_null) }
+        let dyn_ptr: *const dyn crate::task::RawScope = ptr;
+        unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) }
     }
 
     #[inline]
-    unsafe fn drop_ref(&self) {
+    unsafe fn drop_raw(&self) {
         let ptr = self as *const Self;
         unsafe { O::decrement_strong_count(ptr) };
     }
@@ -297,9 +296,7 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
         let worker_id = self.context.worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
         unsafe {
-            let scope_ref = std::mem::transmute::<ScopeRef<S>, ScopeRef<LocalStorage>>(
-                self.scope_completion_ref(),
-            );
+            let scope_ref = self.scope_completion_ref().cast::<LocalStorage>();
             task_ref
                 .header()
                 .initialize(&self.context.shared.base, worker_id, scope_ref);
@@ -317,9 +314,7 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
         F: Future<Output = T> + 'scope_ref,
     {
         let worker_id = self.context.worker_id();
-        let scope_ref = unsafe {
-            std::mem::transmute::<ScopeRef<S>, ScopeRef<LocalStorage>>(self.scope_completion_ref())
-        };
+        let scope_ref = self.scope_completion_ref().cast::<LocalStorage>();
         let node = LocalBoxedTaskNode::new(future);
         unsafe {
             node.header
@@ -373,7 +368,10 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
 
     #[inline]
     pub fn scope_completion_ref(&self) -> crate::task::ScopeRef<S> {
-        unsafe { crate::task::RawScope::clone_ref(&*self.completion) }
+        unsafe {
+            let non_null = crate::task::RawScope::clone_raw(&*self.completion);
+            crate::task::ScopeRef::new(non_null)
+        }
     }
 
     #[inline]
