@@ -10,7 +10,6 @@ use crate::utils::storage::{
 };
 use std::alloc::Layout;
 use std::any::Any;
-use std::collections::VecDeque;
 use std::mem::take;
 use std::ops::AsyncFnOnce;
 use std::ptr::{NonNull, drop_in_place, write};
@@ -52,7 +51,6 @@ pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
     cancel_token: GenericCancellationToken<S, O>,
     panic_info: S::Lock<Option<Box<dyn Any + Send + 'static>>>,
     parent: Option<AnyScopeCompletionRef>,
-    local_queue: S::Lock<VecDeque<LocalTaskRef>>,
 }
 
 pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
@@ -66,23 +64,7 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
             cancel_token: GenericCancellationToken::<S, O>::new(),
             panic_info: S::Lock::new(None),
             parent,
-            local_queue: S::Lock::new(VecDeque::new()),
         })
-    }
-
-    #[inline]
-    pub(crate) fn enqueue_local_task(&self, task: LocalTaskRef) {
-        self.local_queue.lock().push_back(task);
-    }
-
-    #[inline]
-    pub(crate) fn pop_local_task(&self) -> Option<LocalTaskRef> {
-        self.local_queue.lock().pop_front()
-    }
-
-    #[inline]
-    pub(crate) fn is_local_queue_empty(&self) -> bool {
-        self.local_queue.lock().is_empty()
     }
 
     fn drain_wakers(&self) {
@@ -212,23 +194,6 @@ impl<S: Storage, O: Ownership> crate::task::RawScope<S> for GenericScopeCompleti
     #[inline]
     fn register_cancel_waker(&self, waker: &Waker) {
         self.cancel_token().register_waker(waker);
-    }
-
-    #[inline]
-    fn enqueue_local(&self, task: LocalTaskRef) {
-        self.enqueue_local_task(task);
-        let header = task.header();
-        header.notify_runtime_active();
-    }
-
-    #[inline]
-    fn pop_local(&self) -> Option<LocalTaskRef> {
-        self.pop_local_task()
-    }
-
-    #[inline]
-    fn is_local_empty(&self) -> bool {
-        self.is_local_queue_empty()
     }
 
     #[inline]

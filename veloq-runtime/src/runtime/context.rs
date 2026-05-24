@@ -1,5 +1,4 @@
 use core::cell::UnsafeCell;
-use std::cell::RefCell;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::marker::PhantomData;
@@ -15,8 +14,8 @@ use std::time::Duration;
 use super::shared::RuntimeShared;
 use crate::scope::{AsyncScope, LocalAsyncScope};
 use crate::task::{
-    AnyScopeCompletionRef, GenericTaskHeader, RawTask, RuntimeContextExt, SendTaskRef,
-    TaskHandleRef, TaskHeader, TaskVTable,
+    GenericTaskHeader, LocalTaskRef, RawTask, RuntimeContextExt, SendTaskRef, TaskHandleRef,
+    TaskHeader, TaskVTable,
 };
 use crate::utils::FastRand;
 use crate::utils::storage::AtomicStorage;
@@ -82,19 +81,12 @@ pub struct RuntimeContext {
     pub(crate) worker_id: usize,
     pub(crate) remote_rx: Receiver<SendTaskRef>,
     pub(crate) pinned_rx: Receiver<SendTaskRef>,
+    pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) rand: FastRand,
-    pub(crate) active_scopes: RefCell<Vec<AnyScopeCompletionRef>>,
 }
 
-impl RuntimeContext {
-    #[inline]
-    pub(crate) fn is_local_empty(&self) -> bool {
-        self.active_scopes
-            .borrow()
-            .iter()
-            .all(|s| s.is_local_empty())
-    }
-}
+unsafe impl Send for RuntimeContext {}
+unsafe impl Sync for RuntimeContext {}
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
 pub struct RuntimeScopeContext<'ctx, T> {

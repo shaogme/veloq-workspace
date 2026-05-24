@@ -9,7 +9,7 @@ use crate::runtime::context::{IdleDecision, IdleWaitStrategy};
 use crate::runtime::primitives::{EventCount, Parker, ParkerInner, Unparker};
 use crate::runtime::shared::RuntimeShared;
 use crate::scope::GenericScopeCompletion;
-use crate::task::{SendTaskRef, TaskHandleRef, TaskHeader};
+use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicOptionPtr, Storage};
 use crate::utils::{Deque, FastRand, Steal};
@@ -17,7 +17,9 @@ use crate::utils::{Deque, FastRand, Steal};
 pub(crate) struct WorkerQueue {
     pub(crate) remote_tx: Sender<SendTaskRef>,
     pub(crate) pinned_tx: Sender<SendTaskRef>,
+    pub(crate) local_tx: Sender<LocalTaskRef>,
     pub(crate) pinned_count: AtomicUsize,
+    pub(crate) local_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
     pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
     /// Chase-Lev Deque for work-stealing
@@ -28,17 +30,23 @@ impl WorkerQueue {
     pub(crate) fn new(
         remote_tx: Sender<SendTaskRef>,
         pinned_tx: Sender<SendTaskRef>,
+        local_tx: Sender<LocalTaskRef>,
         queue_capacity: NonZeroUsize,
     ) -> Self {
         Self {
             remote_tx,
             pinned_tx,
+            local_tx,
             pinned_count: AtomicUsize::new(0),
+            local_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),
             deque: Deque::new(queue_capacity),
         }
     }
 }
+
+unsafe impl Send for WorkerQueue {}
+unsafe impl Sync for WorkerQueue {}
 
 pub(crate) struct NUMAGroup {
     pub(crate) worker_ids: Vec<usize>,

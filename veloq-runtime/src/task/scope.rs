@@ -1,6 +1,5 @@
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::scope::GenericScopeCompletion;
-use crate::task::LocalTaskRef;
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicStorage, LocalStorage, Storage, StrategyType};
 use std::any::Any;
@@ -77,9 +76,6 @@ pub trait RawScope<S: Storage> {
     fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool;
     fn parent(&self) -> Option<AnyScopeCompletionRef>;
     fn register_cancel_waker(&self, waker: &Waker);
-    fn enqueue_local(&self, task: LocalTaskRef);
-    fn pop_local(&self) -> Option<LocalTaskRef>;
-    fn is_local_empty(&self) -> bool;
     /// # Safety
     ///
     /// The caller must ensure the returned reference is dropped before the underlying scope is deallocated.
@@ -106,13 +102,6 @@ impl<S: Storage> RawScope<S> for DummyScope<S> {
         None
     }
     fn register_cancel_waker(&self, _waker: &Waker) {}
-    fn enqueue_local(&self, _task: LocalTaskRef) {}
-    fn pop_local(&self) -> Option<LocalTaskRef> {
-        None
-    }
-    fn is_local_empty(&self) -> bool {
-        true
-    }
     unsafe fn clone_ref(&self) -> AnyScopeCompletionRef {
         let dyn_ptr: *const dyn RawScope<S> = self;
         match S::strategy_type() {
@@ -212,30 +201,6 @@ impl AnyScopeCompletionRef {
         match self {
             Self::Local(s) => unsafe { s.as_ref().register_cancel_waker(waker) },
             Self::Send(s) => unsafe { s.as_ref().register_cancel_waker(waker) },
-        }
-    }
-
-    #[inline]
-    pub fn pop_local(&self) -> Option<LocalTaskRef> {
-        match self {
-            Self::Local(s) => unsafe { s.as_ref().pop_local() },
-            Self::Send(s) => unsafe { s.as_ref().pop_local() },
-        }
-    }
-
-    #[inline]
-    pub fn is_local_empty(&self) -> bool {
-        match self {
-            Self::Local(s) => unsafe { s.as_ref().is_local_empty() },
-            Self::Send(s) => unsafe { s.as_ref().is_local_empty() },
-        }
-    }
-
-    #[inline]
-    pub fn enqueue_local(&self, task: LocalTaskRef) {
-        match self {
-            Self::Local(s) => unsafe { s.as_ref().enqueue_local(task) },
-            Self::Send(s) => unsafe { s.as_ref().enqueue_local(task) },
         }
     }
 

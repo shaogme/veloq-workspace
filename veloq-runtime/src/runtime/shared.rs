@@ -41,10 +41,14 @@ pub struct RuntimeShared<T> {
 }
 
 unsafe impl<T> Send for RuntimeShared<T> {}
+unsafe impl<T> Sync for RuntimeShared<T> {}
+unsafe impl Send for RuntimeSharedBase {}
+unsafe impl Sync for RuntimeSharedBase {}
 
 pub(crate) struct Receivers {
     pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
+    pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
 }
 
 pub(crate) fn init_runtime_components(
@@ -56,6 +60,7 @@ pub(crate) fn init_runtime_components(
     let mut parker_inners = Vec::with_capacity(worker_count_val);
     let mut remote_receivers = Vec::with_capacity(worker_count_val);
     let mut pinned_receivers = Vec::with_capacity(worker_count_val);
+    let mut local_receivers = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
     let mut next_idle = Vec::with_capacity(worker_count_val);
 
@@ -68,9 +73,11 @@ pub(crate) fn init_runtime_components(
 
         let (rtx, rrx) = mpsc::channel();
         let (ptx, prx) = mpsc::channel();
+        let (ltx, lrx) = mpsc::channel();
         remote_receivers.push(rrx);
         pinned_receivers.push(prx);
-        workers.push(Arc::new(WorkerQueue::new(rtx, ptx, queue_capacity)));
+        local_receivers.push(lrx);
+        workers.push(Arc::new(WorkerQueue::new(rtx, ptx, ltx, queue_capacity)));
         next_idle.push(AtomicUsize::new(usize::MAX));
     }
 
@@ -125,6 +132,7 @@ pub(crate) fn init_runtime_components(
         Receivers {
             remote_receivers,
             pinned_receivers,
+            local_receivers,
         },
     )
 }
@@ -184,16 +192,14 @@ impl RuntimeSharedBase {
         if task.header().is_completed() {
             return;
         }
-        self.tls.with(|ctx| {
-            assert_eq!(
-                ctx.worker_id, worker_id,
-                "local task enqueued to a non-owned worker"
-            );
-        });
         if task.header().try_mark_queued() {
-            let header = task.header();
-            let scope_ref = header.scope_completion_ref();
-            scope_ref.enqueue_local(task);
+            let worker = &self.registry.workers[worker_id];
+            worker.local_count.fetch_add(1, Ordering::Release);
+            if worker.local_tx.send(task).is_ok() {
+                task.header().notify_runtime_active();
+            } else {
+                worker.local_count.fetch_sub(1, Ordering::Release);
+            }
         }
     }
 
@@ -237,6 +243,16 @@ impl RuntimeSharedBase {
         if res.is_some() {
             self.registry.workers[worker_id]
                 .pinned_count
+                .fetch_sub(1, Ordering::Release);
+        }
+        res
+    }
+
+    fn fn_pop_local(&self, worker_id: usize, rx: &Receiver<LocalTaskRef>) -> Option<LocalTaskRef> {
+        let res = rx.try_recv().ok();
+        if res.is_some() {
+            self.registry.workers[worker_id]
+                .local_count
                 .fetch_sub(1, Ordering::Release);
         }
         res
@@ -325,11 +341,7 @@ impl<T> RuntimeShared<T> {
 
     pub(crate) fn has_work(&self, worker_id: usize) -> bool {
         let worker = &self.base.registry.workers[worker_id];
-        let local_has_work = self
-            .base
-            .tls
-            .try_with(|ctx| ctx.worker_id == worker_id && !ctx.is_local_empty())
-            .unwrap_or(false);
+        let local_has_work = worker.local_count.load(Ordering::Acquire) > 0;
         worker.lifo.load(Ordering::Acquire).is_some()
             || !worker.deque.is_empty()
             || local_has_work
@@ -417,28 +429,6 @@ impl<T> RuntimeShared<T> {
         self.base.tls.with(move |ctx| {
             let worker_id = ctx.worker_id;
 
-            let any_scope = completion.map(|c| unsafe { crate::task::RawScope::clone_ref(&**c) });
-
-            if let Some(ref scope) = any_scope {
-                ctx.active_scopes.borrow_mut().push(scope.clone());
-            }
-
-            struct ScopeGuard<'a> {
-                ctx: &'a RuntimeContext,
-                has_scope: bool,
-            }
-            impl<'a> Drop for ScopeGuard<'a> {
-                fn drop(&mut self) {
-                    if self.has_scope {
-                        self.ctx.active_scopes.borrow_mut().pop();
-                    }
-                }
-            }
-            let _guard = ScopeGuard {
-                ctx,
-                has_scope: any_scope.is_some(),
-            };
-
             let worker_tick_hook = self.base.worker_tick_hook;
 
             let waker =
@@ -490,15 +480,10 @@ impl<T> RuntimeShared<T> {
                     progressed = true;
                 }
 
-                if !progressed {
-                    let task = {
-                        let scopes = ctx.active_scopes.borrow();
-                        scopes.iter().rev().find_map(|s| s.pop_local())
-                    };
-                    if let Some(task) = task {
-                        self.base.poll_local_task(worker_id, task);
-                        progressed = true;
-                    }
+                if !progressed && let Some(task) = self.base.fn_pop_local(worker_id, &ctx.local_rx)
+                {
+                    self.base.poll_local_task(worker_id, task);
+                    progressed = true;
                 }
 
                 if !progressed

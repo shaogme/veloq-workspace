@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::{AsyncFn, AsyncFnOnce};
@@ -89,6 +88,7 @@ impl<I, T, WF> Runtime<I, T, WF> {
         let receivers = self.receivers.take().expect("receivers already taken");
         let mut remote_receivers = receivers.remote_receivers;
         let mut pinned_receivers = receivers.pinned_receivers;
+        let mut local_receivers = receivers.local_receivers;
 
         thread::scope(|scope| {
             struct ShutdownGuard<'a, T>(&'a RuntimeShared<T>);
@@ -102,17 +102,19 @@ impl<I, T, WF> Runtime<I, T, WF> {
             for worker_id in (1..worker_count.get()).rev() {
                 let rrx = remote_receivers.pop().expect("remote receivers exhausted");
                 let prx = pinned_receivers.pop().expect("pinned receivers exhausted");
+                let lrx = local_receivers.pop().expect("local receivers exhausted");
                 let worker_init_ref = &worker_init;
                 let worker_factory_ref = &worker_factory;
 
+                let context = RuntimeContext {
+                    worker_id,
+                    remote_rx: rrx,
+                    pinned_rx: prx,
+                    local_rx: lrx,
+                    rand: FastRand::new(worker_id as u64),
+                };
+
                 scope.spawn(move || {
-                    let context = RuntimeContext {
-                        worker_id,
-                        remote_rx: rrx,
-                        pinned_rx: prx,
-                        rand: FastRand::new(worker_id as u64),
-                        active_scopes: RefCell::new(std::vec::Vec::new()),
-                    };
                     shared_ref
                         .base
                         .tls
@@ -140,13 +142,16 @@ impl<I, T, WF> Runtime<I, T, WF> {
             let prx0 = pinned_receivers
                 .pop()
                 .expect("main worker pinned receiver exhausted");
+            let lrx0 = local_receivers
+                .pop()
+                .expect("main worker local receiver exhausted");
 
             let context = RuntimeContext {
                 worker_id: 0,
                 remote_rx: rrx0,
                 pinned_rx: prx0,
+                local_rx: lrx0,
                 rand: FastRand::new(0),
-                active_scopes: RefCell::new(std::vec::Vec::new()),
             };
             shared_ref
                 .base
