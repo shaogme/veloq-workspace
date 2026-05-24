@@ -1,7 +1,7 @@
 use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::task::{
-    AnyScopeCompletionRef, Arena, GenericArena, GenericTaskHeader, LocalBoxedTaskNode, LocalTask,
+    AnyScopeCompletionRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask,
     LocalTaskRef, RawScope, SendBoxedTaskNode, SendTask, SendTaskRef, TaskError, TaskHandleRef,
     TaskJoinGate,
 };
@@ -347,7 +347,7 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
         task: &'scope_ref TTask,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
-        TTask: LocalTask<T> + Sized,
+        TTask: LocalTask<T> + Sized + 'scope_ref,
     {
         self.completion.add_task();
 
@@ -360,9 +360,7 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
                 self.scope_completion_ref(),
             );
         }
-        let header_ptr = task_ref.header() as *const GenericTaskHeader<LocalStorage>;
-        let task_ctx = unsafe { LocalTaskRef::from_header(header_ptr) };
-        self.context.shared.enqueue_local(worker_id, task_ctx);
+        self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(self, task_ref, task, None)
     }
@@ -394,9 +392,7 @@ impl<'ctx, S: Storage, O: Ownership + 'ctx, TExtra> GenericAsyncScope<'ctx, S, O
         self.completion.add_task();
 
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
-        let header_ptr = task_ref.header() as *const GenericTaskHeader<LocalStorage>;
-        let task_ctx = unsafe { LocalTaskRef::from_header(header_ptr) };
-        self.context.shared.enqueue_local(worker_id, task_ctx);
+        self.context.shared.enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -473,9 +469,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
                 self.scope_completion_ref(),
             );
         }
-        let header_ptr = task_ref.header() as *const GenericTaskHeader<AtomicStorage>;
-        let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
-        self.context.shared.enqueue_send(worker_id, task_ctx);
+        self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(self, task_ref, task, None)
     }
@@ -522,9 +516,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
                 task.header().set_pinned();
 
                 let task_ref = unsafe { SendTaskRef::from_concrete(task) };
-                let header_ptr = task_ref.header() as *const GenericTaskHeader<AtomicStorage>;
-                let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
-                if !unsafe { &*runtime_base_ptr.as_ptr() }.enqueue_pinned(worker_id, task_ctx) {
+                if !unsafe { &*runtime_base_ptr.as_ptr() }.enqueue_pinned(worker_id, task_ref) {
                     state_for_job.fail(TaskError::Panic);
                     completion.task_done();
                     return;
@@ -545,7 +537,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         task: &'scope_ref S_,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        S_: SendTask<T> + Sized,
+        S_: SendTask<T> + Sized + 'scope_ref,
     {
         self.spawn_send_impl(self.context.shared.choose_worker(), task)
     }
@@ -582,9 +574,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-        let header_ptr = task_ref.header() as *const GenericTaskHeader<AtomicStorage>;
-        let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
-        self.context.shared.enqueue_send(worker_id, task_ctx);
+        self.context.shared.enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -687,7 +677,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra> {
         task: &'scope_ref S_,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
-        S_: LocalTask<T> + Sized,
+        S_: LocalTask<T> + Sized + 'scope_ref,
     {
         self.spawn_local(task)
     }

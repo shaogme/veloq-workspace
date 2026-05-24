@@ -599,12 +599,8 @@ impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref> F
                     } else {
                         match state.try_take_ready() {
                             Ok(Some(ready)) => {
-                                let task_cast = unsafe {
-                                    SendTaskRef::from_header(ready.task.header()
-                                        as *const GenericTaskHeader<AtomicStorage>)
-                                };
                                 *resolved = Some(ResolvedRoutedTask {
-                                    task: task_cast,
+                                    task: ready.task,
                                     access: Some(ready.access),
                                 });
                                 // Continue to poll the newly resolved task
@@ -613,12 +609,8 @@ impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref> F
                                 state.register(cx.waker());
                                 // Double check to avoid race condition
                                 if let Some(ready) = state.try_take_ready()? {
-                                    let task_cast = unsafe {
-                                        SendTaskRef::from_header(ready.task.header()
-                                            as *const GenericTaskHeader<AtomicStorage>)
-                                    };
                                     *resolved = Some(ResolvedRoutedTask {
-                                        task: task_cast,
+                                        task: ready.task,
                                         access: Some(ready.access),
                                     });
                                     continue;

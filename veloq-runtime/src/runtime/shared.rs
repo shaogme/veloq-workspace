@@ -193,7 +193,7 @@ impl RuntimeSharedBase {
         if task.header().try_mark_queued() {
             let header = task.header();
             let scope_ref = header.scope_completion_ref();
-            scope_ref.enqueue_local(task.into_local());
+            scope_ref.enqueue_local(task);
         }
     }
 
@@ -496,10 +496,7 @@ impl<T> RuntimeShared<T> {
                         scopes.iter().rev().find_map(|s| s.pop_local())
                     };
                     if let Some(task) = task {
-                        let task_ref = unsafe {
-                            LocalTaskRef::from_header(task.header() as *const _ as *const _)
-                        };
-                        self.base.poll_local_task(worker_id, task_ref);
+                        self.base.poll_local_task(worker_id, task);
                         progressed = true;
                     }
                 }

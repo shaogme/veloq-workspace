@@ -291,10 +291,6 @@ macro_rules! define_task_infrastructure {
                 }
             }
 
-            pub fn into_local(self) -> LocalTaskRef {
-                unsafe { LocalTaskRef::from_header(self.header.as_ptr() as *const _) }
-            }
-
             #[inline]
             pub fn poll_task(&self, worker_id: usize) -> bool {
                 let header = unsafe { self.header.as_ref() };
