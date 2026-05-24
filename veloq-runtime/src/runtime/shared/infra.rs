@@ -204,21 +204,21 @@ pub(crate) struct GlobalInjector {
 impl GlobalInjector {
     pub(crate) fn new() -> Self {
         Self {
-            head: AtomicTaggedPtr::new(None),
+            head: AtomicTaggedPtr::default(),
         }
     }
 
     pub(crate) fn push(&self, task: SendTaskRef) {
         let mut bits = self.head.load(Ordering::Acquire);
         loop {
-            task.header().set_next(bits.0.option());
+            task.header().set_next(bits.ptr.option());
 
-            let next_tag = bits.1.wrapping_add(1);
+            let next_tag = bits.tag.wrapping_add(1);
             let task_ptr = NonNull::from(task.header());
 
             match self.head.compare_exchange_weak(
                 bits,
-                (Some(task_ptr), next_tag),
+                (task_ptr, next_tag),
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
@@ -231,10 +231,10 @@ impl GlobalInjector {
     pub(crate) fn pop(&self) -> Option<SendTaskRef> {
         let mut bits = self.head.load(Ordering::Acquire);
         loop {
-            let head_ptr = bits.0.option()?;
+            let head_ptr = bits.ptr.option()?;
             let next_ptr = unsafe { head_ptr.as_ref().next() };
 
-            let next_tag = bits.1.wrapping_add(1);
+            let next_tag = bits.tag.wrapping_add(1);
 
             match self.head.compare_exchange_weak(
                 bits,
