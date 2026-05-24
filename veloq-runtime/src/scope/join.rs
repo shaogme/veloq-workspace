@@ -225,12 +225,6 @@ pub(crate) fn dispatch_routed<
     let state_send_ptr = super::SendPtr::new(NonNull::new(state_raw_ptr as *mut ()).unwrap());
 
     let job_boxed: Box<dyn FnOnce() + Send + 'scope_ref> = Box::new(job);
-    let job_ctx = unsafe {
-        std::mem::transmute::<
-            Box<dyn FnOnce() + Send + 'scope_ref>,
-            Box<dyn FnOnce() + Send + 'static>,
-        >(job_boxed)
-    };
 
     if context
         .route_to(worker_id, move || {
@@ -240,7 +234,7 @@ pub(crate) fn dispatch_routed<
                 &*(completion_send_ptr.as_ptr() as *const super::GenericScopeCompletion<S, O>)
             };
             let result = catch_unwind(AssertUnwindSafe(move || {
-                job_ctx();
+                job_boxed();
             }));
 
             if let Err(panic_err) = result {
