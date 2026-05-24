@@ -156,7 +156,6 @@ impl<T> RuntimeShared<T> {
                 scheduler: TaskScheduler {
                     injector: GlobalInjector::new(),
                     next_worker: AtomicUsize::new(0),
-                    searching_workers: AtomicUsize::new(0),
                 },
                 idle: IdleController {
                     idle_mask: infra::AtomicBitset::new(worker_count.get()),
@@ -503,10 +502,6 @@ impl<T> RuntimeShared<T> {
                     continue;
                 }
 
-                self.base
-                    .scheduler
-                    .searching_workers
-                    .fetch_add(1, Ordering::Relaxed);
                 for _ in 0..4 {
                     if let Some(task) = self.base.steal_send(worker_id, &ctx.rand) {
                         self.base.poll_send_task(worker_id, task);
@@ -515,10 +510,6 @@ impl<T> RuntimeShared<T> {
                     }
                     std::hint::spin_loop();
                 }
-                self.base
-                    .scheduler
-                    .searching_workers
-                    .fetch_sub(1, Ordering::Relaxed);
 
                 if progressed {
                     continue;

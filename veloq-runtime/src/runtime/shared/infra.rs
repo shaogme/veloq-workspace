@@ -1,4 +1,4 @@
-use atomic_tagged_ptr::AtomicTaggedPtr;
+use parking_lot::Mutex;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -198,53 +198,31 @@ impl TopologyContext {
 }
 
 pub(crate) struct GlobalInjector {
-    head: AtomicTaggedPtr<TaskHeader>,
+    head: Mutex<Option<NonNull<TaskHeader>>>,
 }
 
 impl GlobalInjector {
     pub(crate) fn new() -> Self {
         Self {
-            head: AtomicTaggedPtr::default(),
+            head: Mutex::new(None),
         }
     }
 
     pub(crate) fn push(&self, task: SendTaskRef) {
-        let mut bits = self.head.load(Ordering::Acquire);
-        loop {
-            task.header().set_next(bits.ptr.option());
-
-            let next_tag = bits.tag.wrapping_add(1);
-            let task_ptr = NonNull::from(task.header());
-
-            match self.head.compare_exchange_weak(
-                bits,
-                (task_ptr, next_tag),
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => bits = actual,
-            }
-        }
+        let task_ptr = NonNull::from(task.header());
+        let mut head = self.head.lock();
+        task.header().set_next(*head);
+        *head = Some(task_ptr);
     }
 
     pub(crate) fn pop(&self) -> Option<SendTaskRef> {
-        let mut bits = self.head.load(Ordering::Acquire);
-        loop {
-            let head_ptr = bits.ptr.option()?;
-            let next_ptr = unsafe { head_ptr.as_ref().next() };
-
-            let next_tag = bits.tag.wrapping_add(1);
-
-            match self.head.compare_exchange_weak(
-                bits,
-                (next_ptr, next_tag),
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(unsafe { SendTaskRef::from_header(head_ptr.as_ptr()) }),
-                Err(actual) => bits = actual,
-            }
+        let mut head = self.head.lock();
+        let head_ptr = (*head)?;
+        let next_ptr = unsafe { head_ptr.as_ref().next() };
+        *head = next_ptr;
+        unsafe {
+            head_ptr.as_ref().set_next(None);
+            Some(SendTaskRef::from_header(head_ptr.as_ptr()))
         }
     }
 }
@@ -252,7 +230,6 @@ impl GlobalInjector {
 pub(crate) struct TaskScheduler {
     pub(crate) injector: GlobalInjector,
     pub(crate) next_worker: AtomicUsize,
-    pub(crate) searching_workers: AtomicUsize,
 }
 
 impl TaskScheduler {

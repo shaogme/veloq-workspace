@@ -145,7 +145,9 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
 
 impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     fn drop(&mut self) {
-        if let Some(panic_info) = self.panic_info.lock().take() {
+        if let Some(panic_info) = self.panic_info.lock().take()
+            && !std::thread::panicking()
+        {
             std::panic::resume_unwind(panic_info);
         }
     }

@@ -194,25 +194,25 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// 退出 Poll 状态并检查是否需要重新进入。
     #[inline]
     pub fn exit_poll_to_pending(&self) -> bool {
-        let old_state = self.state.fetch_and(!STATE_POLLING, Ordering::AcqRel);
-        if old_state & STATE_WOKEN != 0 {
-            self.state.fetch_and(!STATE_WOKEN, Ordering::Release);
-            let state = self.state.load(Ordering::Acquire);
-            if state & STATE_POLLING == 0
-                && self
-                    .state
-                    .compare_exchange_weak(
-                        state,
-                        state | STATE_POLLING,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-            {
-                return true;
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            let mut new_state = state & !STATE_POLLING;
+            let was_woken = state & STATE_WOKEN != 0;
+            if was_woken {
+                new_state &= !STATE_WOKEN;
+                new_state |= STATE_POLLING;
+            }
+
+            match self.state.compare_exchange_weak(
+                state,
+                new_state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return was_woken,
+                Err(s) => state = s,
             }
         }
-        false
     }
 
     /// 显式退出 Poll 状态，不检查唤醒标记。
