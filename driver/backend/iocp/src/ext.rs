@@ -97,23 +97,11 @@ impl Extensions {
     fn load_traditional(
         socket: SOCKET,
     ) -> IocpResult<(LpfnAcceptEx, LpfnConnectEx, LpfnGetAcceptExSockaddrs)> {
-        let accept_ex_ptr = Self::get_extension(socket, WSAID_ACCEPTEX)?;
-        let connect_ex_ptr = Self::get_extension(socket, WSAID_CONNECTEX)?;
-        let get_accept_ex_sockaddrs_ptr = Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
+        let accept_ex = Self::get_extension(socket, WSAID_ACCEPTEX)?;
+        let connect_ex = Self::get_extension(socket, WSAID_CONNECTEX)?;
+        let get_accept_ex_sockaddrs = Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
 
-        // SAFETY: These raw pointers are returned by WinSock for the corresponding
-        // extension GUIDs and are valid function pointers with matching ABI/signature.
-        let funcs = unsafe {
-            (
-                std::mem::transmute::<*const std::ffi::c_void, LpfnAcceptEx>(accept_ex_ptr),
-                std::mem::transmute::<*const std::ffi::c_void, LpfnConnectEx>(connect_ex_ptr),
-                std::mem::transmute::<*const std::ffi::c_void, LpfnGetAcceptExSockaddrs>(
-                    get_accept_ex_sockaddrs_ptr,
-                ),
-            )
-        };
-
-        Ok(funcs)
+        Ok((accept_ex, connect_ex, get_accept_ex_sockaddrs))
     }
 
     fn load_rio(socket: SOCKET) -> IocpResult<RIO_EXTENSION_FUNCTION_TABLE> {
@@ -150,24 +138,22 @@ impl Extensions {
         }
     }
 
-    fn get_extension(
-        socket: SOCKET,
-        guid: windows_sys::core::GUID,
-    ) -> IocpResult<*const std::ffi::c_void> {
+    fn get_extension<T>(socket: SOCKET, guid: windows_sys::core::GUID) -> IocpResult<T> {
         let mut guid = guid;
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut val = std::mem::MaybeUninit::<T>::uninit();
         let mut bytes_returned = 0;
 
         // SAFETY: `WSAIoctl` is called with correct pointers and sizes for the requested GUID extension pointer.
-        // The pointers are valid and owned by the stack.
+        // The pointer `val.as_mut_ptr()` is a valid pointer to memory owned by the stack.
+        // If WSAIoctl returns success (0), it has initialized the memory inside `val` with the function pointer.
         let ret = unsafe {
             WSAIoctl(
                 socket,
                 SIO_GET_EXTENSION_FUNCTION_POINTER,
                 &mut guid as *mut _ as *mut _,
                 std::mem::size_of_val(&guid) as u32,
-                &mut ptr as *mut _ as *mut _,
-                std::mem::size_of_val(&ptr) as u32,
+                val.as_mut_ptr() as *mut _,
+                std::mem::size_of::<T>() as u32,
                 &mut bytes_returned,
                 std::ptr::null_mut(),
                 None,
@@ -175,7 +161,8 @@ impl Extensions {
         };
 
         if ret == 0 {
-            Ok(ptr)
+            // SAFETY: WSAIoctl successfully executed and initialized the memory.
+            unsafe { Ok(val.assume_init()) }
         } else {
             Err(from_io_error(
                 IocpError::DriverInit,
