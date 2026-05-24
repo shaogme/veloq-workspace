@@ -83,6 +83,15 @@ pub trait TaskHandleRef: Copy {
     /// # Safety
     /// The `header` pointer must be a valid pointer to a `GenericTaskHeader`.
     unsafe fn from_header(header: *const GenericTaskHeader<Self::Storage>) -> Self;
+
+    /// Polls the task through the handle.
+    fn poll_task(&self, worker_id: usize) -> bool;
+
+    /// # Safety
+    /// The `ptr` must be a valid pointer to a task node implementing `RawTask` with the correct storage.
+    unsafe fn from_concrete<U>(ptr: *const U) -> Self
+    where
+        U: RawTask<Storage = Self::Storage>;
 }
 
 pub trait RawTask {
@@ -256,82 +265,96 @@ where
     }
 }
 
-// --- 基础设施宏 (Internal) ---
+// --- 任务引用基础结构 (Direct Implementation) ---
 
-macro_rules! define_task_infrastructure {
-    ($ref_name:ident, $storage:ty) => {
-        pub struct $ref_name {
-            header: NonNull<GenericTaskHeader<$storage>>,
-        }
-
-        impl Copy for $ref_name {}
-        impl Clone for $ref_name {
-            fn clone(&self) -> Self {
-                *self
-            }
-        }
-
-        impl $ref_name {
-            /// # Safety
-            /// The `ptr` must be a valid pointer to a task node implementing `RawTask` with the correct storage.
-            pub unsafe fn from_concrete<U>(ptr: *const U) -> Self
-            where
-                U: RawTask<Storage = $storage>,
-            {
-                Self {
-                    header: unsafe { NonNull::from((&*ptr).header()) },
-                }
-            }
-
-            /// # Safety
-            /// The `header` pointer must be a valid pointer to a `GenericTaskHeader`.
-            pub unsafe fn from_header(header: *const GenericTaskHeader<$storage>) -> Self {
-                Self {
-                    header: unsafe { NonNull::new_unchecked(header as *mut _) },
-                }
-            }
-
-            #[inline]
-            pub fn poll_task(&self, worker_id: usize) -> bool {
-                let header = unsafe { self.header.as_ref() };
-                unsafe { header.poll(worker_id) }
-            }
-        }
-
-        impl TaskHandleRef for $ref_name {
-            type Storage = $storage;
-            #[inline]
-            fn header(&self) -> &GenericTaskHeader<$storage> {
-                unsafe { self.header.as_ref() }
-            }
-            #[inline]
-            unsafe fn from_header(header: *const GenericTaskHeader<$storage>) -> Self {
-                Self {
-                    header: unsafe { NonNull::new_unchecked(header as *mut _) },
-                }
-            }
-        }
-    };
+pub struct LocalTaskRef {
+    header: NonNull<GenericTaskHeader<LocalStorage>>,
 }
 
-define_task_infrastructure!(LocalTaskRef, LocalStorage);
-define_task_infrastructure!(SendTaskRef, AtomicStorage);
+impl Copy for LocalTaskRef {}
+impl Clone for LocalTaskRef {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl TaskHandleRef for LocalTaskRef {
+    type Storage = LocalStorage;
+
+    #[inline]
+    fn header(&self) -> &GenericTaskHeader<LocalStorage> {
+        unsafe { self.header.as_ref() }
+    }
+
+    #[inline]
+    unsafe fn from_header(header: *const GenericTaskHeader<LocalStorage>) -> Self {
+        Self {
+            header: unsafe { NonNull::new_unchecked(header as *mut _) },
+        }
+    }
+
+    #[inline]
+    fn poll_task(&self, worker_id: usize) -> bool {
+        let header = unsafe { self.header.as_ref() };
+        unsafe { header.poll(worker_id) }
+    }
+
+    #[inline]
+    unsafe fn from_concrete<U>(ptr: *const U) -> Self
+    where
+        U: RawTask<Storage = LocalStorage>,
+    {
+        Self {
+            header: unsafe { NonNull::from((&*ptr).header()) },
+        }
+    }
+}
+
+pub struct SendTaskRef {
+    header: NonNull<GenericTaskHeader<AtomicStorage>>,
+}
+
+impl Copy for SendTaskRef {}
+impl Clone for SendTaskRef {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl TaskHandleRef for SendTaskRef {
+    type Storage = AtomicStorage;
+
+    #[inline]
+    fn header(&self) -> &GenericTaskHeader<AtomicStorage> {
+        unsafe { self.header.as_ref() }
+    }
+
+    #[inline]
+    unsafe fn from_header(header: *const GenericTaskHeader<AtomicStorage>) -> Self {
+        Self {
+            header: unsafe { NonNull::new_unchecked(header as *mut _) },
+        }
+    }
+
+    #[inline]
+    fn poll_task(&self, worker_id: usize) -> bool {
+        let header = unsafe { self.header.as_ref() };
+        unsafe { header.poll(worker_id) }
+    }
+
+    #[inline]
+    unsafe fn from_concrete<U>(ptr: *const U) -> Self
+    where
+        U: RawTask<Storage = AtomicStorage>,
+    {
+        Self {
+            header: unsafe { NonNull::from((&*ptr).header()) },
+        }
+    }
+}
 
 unsafe impl Send for SendTaskRef {}
-
-macro_rules! impl_raw_task_common {
-    ($is_local:expr, $storage:ty, $vtable:expr) => {
-        fn poll_raw(&self, _worker_id: usize) -> bool {
-            let waker = self.header.create_waker($vtable);
-            let mut cx = $crate::task::Context::from_waker(&waker);
-            self.poll_task(&mut cx)
-        }
-        fn header(&self) -> &$crate::task::GenericTaskHeader<$storage> {
-            &self.header
-        }
-        type Storage = $storage;
-    };
-}
+unsafe impl Sync for SendTaskRef {}
 
 pub trait TaskJoinGate<T> {
     fn take_result_erased(&self) -> Option<Result<T, TaskError>>;
@@ -343,8 +366,6 @@ impl<T, S: Task<T>> TaskJoinGate<T> for S {
         self.take_result()
     }
 }
-
-pub(crate) use impl_raw_task_common;
 
 // --- 实用工具与宏 (Public API) ---
 

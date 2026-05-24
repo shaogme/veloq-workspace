@@ -499,8 +499,8 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
     }
 }
 
-impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref> Future
-    for JoinHandle<'scope_ref, T, crate::task::LocalTaskRef, S, TExtra>
+impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref>
+    Future for JoinHandle<'scope_ref, T, R, S, TExtra>
 {
     type Output = Result<T, TaskError>;
 
@@ -532,50 +532,7 @@ impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref> F
                     return Poll::Ready(Err(TaskError::Cancelled));
                 }
 
-                Self::register_waker_on::<crate::utils::storage::LocalStorage>(
-                    waker_node, arena, header, cx,
-                );
-                Poll::Pending
-            }
-            JoinSource::Routed { .. } => unreachable!("local join handle cannot be routed"),
-        }
-    }
-}
-
-impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref> Future
-    for JoinHandle<'scope_ref, T, SendTaskRef, S, TExtra>
-{
-    type Output = Result<T, TaskError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        this.scope
-            .runtime()
-            .drive_worker::<S::Storage, S::Ownership>(Some(this.scope.completion()));
-
-        let arena = this.scope.arena();
-        let completion = this.scope.completion();
-        let waker_node = &mut this.waker_node;
-        let reclaim = this.reclaim;
-
-        match &mut this.source {
-            JoinSource::Direct { task, gate, .. } => {
-                let header = task.header();
-                if header.is_completed() {
-                    let res = gate
-                        .take_result_erased()
-                        .expect("task result already taken");
-                    if let Some(reclaim) = reclaim {
-                        unsafe { (reclaim)(arena, *gate) };
-                    }
-                    return Poll::Ready(res);
-                }
-
-                if completion.is_cancelled() || header.is_cancelled() {
-                    return Poll::Ready(Err(TaskError::Cancelled));
-                }
-
-                Self::register_waker_on::<AtomicStorage>(waker_node, arena, header, cx);
+                Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx);
                 Poll::Pending
             }
             JoinSource::Routed { state, resolved } => {
@@ -594,13 +551,18 @@ impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref> F
                             return Poll::Ready(Err(TaskError::Cancelled));
                         }
 
-                        Self::register_waker_on::<AtomicStorage>(waker_node, arena, header, cx);
+                        Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx);
                         return Poll::Pending;
                     } else {
                         match state.try_take_ready() {
                             Ok(Some(ready)) => {
+                                let converted_task = unsafe {
+                                    R::from_header(ready.task.header()
+                                        as *const GenericTaskHeader<AtomicStorage>
+                                        as *const GenericTaskHeader<R::Storage>)
+                                };
                                 *resolved = Some(ResolvedRoutedTask {
-                                    task: ready.task,
+                                    task: converted_task,
                                     access: Some(ready.access),
                                 });
                                 // Continue to poll the newly resolved task
@@ -609,8 +571,13 @@ impl<'scope_ref, T, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref> F
                                 state.register(cx.waker());
                                 // Double check to avoid race condition
                                 if let Some(ready) = state.try_take_ready()? {
+                                    let converted_task = unsafe {
+                                        R::from_header(ready.task.header()
+                                            as *const GenericTaskHeader<AtomicStorage>
+                                            as *const GenericTaskHeader<R::Storage>)
+                                    };
                                     *resolved = Some(ResolvedRoutedTask {
-                                        task: ready.task,
+                                        task: converted_task,
                                         access: Some(ready.access),
                                     });
                                     continue;

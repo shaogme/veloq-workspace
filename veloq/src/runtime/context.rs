@@ -7,6 +7,7 @@ use veloq_driver_native::driver::{
     ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver,
 };
 use veloq_driver_native::op::{DetachedSubmitter, IntoPlatformOp, Op};
+use veloq_runtime::task::TaskHandleRef;
 
 use crate::config::BufferRegistrationMode;
 use crate::error::{Result as VeloqResult, from_io_error};

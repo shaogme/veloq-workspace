@@ -1,9 +1,8 @@
 use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::task::{
-    AnyScopeCompletionRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask,
-    LocalTaskRef, RawScope, SendBoxedTaskNode, SendTask, SendTaskRef, TaskError, TaskHandleRef,
-    TaskJoinGate,
+    AnyScopeCompletionRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef,
+    RawScope, SendBoxedTaskNode, SendTask, SendTaskRef, TaskError, TaskHandleRef, TaskJoinGate,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{

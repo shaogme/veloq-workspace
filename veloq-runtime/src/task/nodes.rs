@@ -1,6 +1,6 @@
 use crate::task::{
     GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef, RawTask,
-    SendTaskRef, Task, TaskError, TaskLock, TaskResultSetter, TaskVTable, impl_raw_task_common,
+    SendTaskRef, Task, TaskError, TaskHandleRef, TaskLock, TaskResultSetter, TaskVTable,
     poll_task_internal,
 };
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
@@ -108,7 +108,17 @@ where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
 {
-    impl_raw_task_common!(S::IS_LOCAL, S, S::WAKER_VTABLE);
+    type Storage = S;
+
+    fn poll_raw(&self, _worker_id: usize) -> bool {
+        let waker = self.header.create_waker(S::WAKER_VTABLE);
+        let mut cx = Context::from_waker(&waker);
+        self.poll_task(&mut cx)
+    }
+
+    fn header(&self) -> &GenericTaskHeader<Self::Storage> {
+        &self.header
+    }
 }
 
 impl<S: TaskStorage, T, F> Task<T> for GenericTaskNode<S, T, F>

@@ -1,5 +1,5 @@
 use crate::runtime::RuntimeSharedBase;
-use crate::task::{AnyScopeCompletionRef, SendTaskRef};
+use crate::task::{AnyScopeCompletionRef, SendTaskRef, TaskHandleRef};
 use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
