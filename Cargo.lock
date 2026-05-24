@@ -90,9 +90,9 @@ checksum = "993a810118f8f37e9c4411c86f1c4c940a09a7ab34b7bf2d88d06f50c553fab7"
 
 [[package]]
 name = "atomic-tagged-ptr"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba707b4316d7be91f82b7efb067053a25f80fbae1bc2f50fd3d9bfca59ca12bd"
+checksum = "762b8bab4bd76e6937c1c534c59fcd8426dc443d08cc09b3885308598a3729fa"
 dependencies = [
  "parking_lot",
 ]
