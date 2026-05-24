@@ -89,6 +89,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993a810118f8f37e9c4411c86f1c4c940a09a7ab34b7bf2d88d06f50c553fab7"
 
 [[package]]
+name = "atomic-tagged-ptr"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f851a0c79a05d7a9e9af1d6f343af6540c010c5aa26cbb7c0a80743769a643a6"
+dependencies = [
+ "parking_lot",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1414,6 +1423,7 @@ version = "0.1.0"
 name = "veloq-runtime"
 version = "0.1.0"
 dependencies = [
+ "atomic-tagged-ptr",
  "crossbeam-queue",
  "libc",
  "numaperf-topo",

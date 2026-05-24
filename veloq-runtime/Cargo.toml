@@ -19,6 +19,7 @@ numaperf-topo = "0.1"
 veloq-atomic-waker.workspace = true
 veloq-intrusive-linklist.workspace = true
 veloq-tls.workspace = true
+atomic-tagged-ptr = { version = "0.1.0", features = ["parking_lot"] }
 
 [lints]
 workspace = true

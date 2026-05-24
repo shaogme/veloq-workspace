@@ -1,3 +1,4 @@
+use atomic_tagged_ptr::AtomicTaggedPtr;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -197,69 +198,52 @@ impl TopologyContext {
 }
 
 pub(crate) struct GlobalInjector {
-    head: AtomicU64,
+    head: AtomicTaggedPtr<TaskHeader>,
 }
 
 impl GlobalInjector {
-    const EMPTY: u64 = 0;
-
     pub(crate) fn new() -> Self {
         Self {
-            head: AtomicU64::new(Self::EMPTY),
+            head: AtomicTaggedPtr::new(None),
         }
     }
 
     pub(crate) fn push(&self, task: SendTaskRef) {
-        let header_ptr = task.header() as *const _ as u64;
-        // Modern x86_64 uses 48-bit virtual addresses.
-        debug_assert_eq!(header_ptr & 0xFFFF000000000000, 0);
-
-        let mut head = self.head.load(Ordering::Acquire);
+        let mut bits = self.head.load(Ordering::Acquire);
         loop {
-            let old_ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader;
-            task.header().set_next(NonNull::new(old_ptr as *mut _));
+            task.header().set_next(bits.0.option());
 
-            let next_gen = ((head >> 48).wrapping_add(1)) & 0xFFFF;
-            let new_head = (next_gen << 48) | header_ptr;
+            let next_tag = bits.1.wrapping_add(1);
+            let task_ptr = NonNull::from(task.header());
 
             match self.head.compare_exchange_weak(
-                head,
-                new_head,
+                bits,
+                (Some(task_ptr), next_tag),
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
                 Ok(_) => break,
-                Err(h) => head = h,
+                Err(actual) => bits = actual,
             }
         }
     }
 
     pub(crate) fn pop(&self) -> Option<SendTaskRef> {
-        let mut head = self.head.load(Ordering::Acquire);
+        let mut bits = self.head.load(Ordering::Acquire);
         loop {
-            if head == Self::EMPTY {
-                return None;
-            }
+            let head_ptr = bits.0.option()?;
+            let next_ptr = unsafe { head_ptr.as_ref().next() };
 
-            let ptr = (head & 0x0000FFFFFFFFFFFF) as *const TaskHeader;
-            let next_ptr = unsafe { (&*ptr).next() };
-
-            let next_raw = next_ptr.map(|p| p.as_ptr() as u64).unwrap_or(0);
-            let next_gen = ((head >> 48).wrapping_add(1)) & 0xFFFF;
-            let new_head = if next_raw == 0 {
-                Self::EMPTY
-            } else {
-                (next_gen << 48) | next_raw
-            };
+            let next_tag = bits.1.wrapping_add(1);
 
             match self.head.compare_exchange_weak(
-                head,
-                new_head,
+                bits,
+                (next_ptr, next_tag),
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(unsafe { SendTaskRef::from_header(ptr) }),
-                Err(h) => head = h,
+                Ok(_) => return Some(unsafe { SendTaskRef::from_header(head_ptr.as_ptr()) }),
+                Err(actual) => bits = actual,
             }
         }
     }
