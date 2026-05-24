@@ -252,48 +252,79 @@ impl TaskScheduler {
 
         let group_idx = topo.worker_to_group[thief_id];
         let group = &topo.groups[group_idx];
+        const MAX_STEAL_RETRIES: usize = 32;
+        let mut retries = 0;
 
-        if group.worker_ids.len() > 1 {
-            let start = rand.next_u32(group.worker_ids.len() as u32) as usize;
+        loop {
+            if retries >= MAX_STEAL_RETRIES {
+                return self.pop_global();
+            }
 
-            for i in 0..group.worker_ids.len() {
-                let victim = group.worker_ids[(start + i) % group.worker_ids.len()];
-                if victim == thief_id {
-                    continue;
-                }
-                match registry.workers[victim]
-                    .deque
-                    .steal_batch(&thief_worker.deque)
-                {
-                    Steal::Success(task) => return Some(task),
-                    Steal::Retry => return self.steal_send(thief_id, registry, topo, rand),
-                    Steal::Empty => continue,
+            let mut retry_steal = false;
+
+            if group.worker_ids.len() > 1 {
+                let start = rand.next_u32(group.worker_ids.len() as u32) as usize;
+
+                for i in 0..group.worker_ids.len() {
+                    let victim = group.worker_ids[(start + i) % group.worker_ids.len()];
+                    if victim == thief_id {
+                        continue;
+                    }
+                    match registry.workers[victim]
+                        .deque
+                        .steal_batch(&thief_worker.deque)
+                    {
+                        Steal::Success(task) => return Some(task),
+                        Steal::Retry => {
+                            retry_steal = true;
+                            break;
+                        }
+                        Steal::Empty => continue,
+                    }
                 }
             }
-        }
 
-        if let Some(task) = self.pop_global() {
-            return Some(task);
-        }
-
-        let start_group = rand.next_u32(topo.groups.len() as u32) as usize;
-
-        for i in 0..topo.groups.len() {
-            let other_group_idx = (start_group + i) % topo.groups.len();
-            if other_group_idx == group_idx {
+            if retry_steal {
+                retries += 1;
                 continue;
             }
-            let other_group = &topo.groups[other_group_idx];
-            for &victim in &other_group.worker_ids {
-                match registry.workers[victim]
-                    .deque
-                    .steal_batch(&thief_worker.deque)
-                {
-                    Steal::Success(task) => return Some(task),
-                    Steal::Retry => return self.steal_send(thief_id, registry, topo, rand),
-                    Steal::Empty => continue,
+
+            if let Some(task) = self.pop_global() {
+                return Some(task);
+            }
+
+            let start_group = rand.next_u32(topo.groups.len() as u32) as usize;
+
+            for i in 0..topo.groups.len() {
+                let other_group_idx = (start_group + i) % topo.groups.len();
+                if other_group_idx == group_idx {
+                    continue;
+                }
+                let other_group = &topo.groups[other_group_idx];
+                for &victim in &other_group.worker_ids {
+                    match registry.workers[victim]
+                        .deque
+                        .steal_batch(&thief_worker.deque)
+                    {
+                        Steal::Success(task) => return Some(task),
+                        Steal::Retry => {
+                            retry_steal = true;
+                            break;
+                        }
+                        Steal::Empty => continue,
+                    }
+                }
+                if retry_steal {
+                    break;
                 }
             }
+
+            if retry_steal {
+                retries += 1;
+                continue;
+            }
+
+            break;
         }
 
         None

@@ -252,6 +252,10 @@ where
                 return true;
             }
             Ok(Poll::Pending) => {
+                if header.is_cancelled() {
+                    finalizer.complete(Err(TaskError::Cancelled), is_local);
+                    return true;
+                }
                 if lifecycle.exit_pending(is_local) {
                     continue;
                 }
@@ -379,7 +383,7 @@ impl Future for YieldNow {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if cx.is_cancelled() {
-            std::panic::panic_any(TaskError::Cancelled);
+            return Poll::Pending;
         }
         if self.0 {
             Poll::Ready(())

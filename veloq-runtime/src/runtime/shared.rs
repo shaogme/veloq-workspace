@@ -436,6 +436,7 @@ impl<T> RuntimeShared<T> {
 
             let mut tick = 0u32;
             const INJECTOR_CHECK_INTERVAL: u32 = 61;
+            let mut processed_tasks = 0u32;
 
             while init_fut.is_some() || !self.base.shutdown.load(Ordering::Acquire) {
                 let mut progressed = false;
@@ -467,7 +468,15 @@ impl<T> RuntimeShared<T> {
 
                 tick = tick.wrapping_add(1);
 
-                if let Some(task) = self.base.fn_pop_send(worker_id) {
+                if processed_tasks >= 64 {
+                    processed_tasks = 0;
+                    if let Some(task) = self.base.pop_global() {
+                        self.base.poll_send_task(worker_id, task);
+                        progressed = true;
+                    }
+                }
+
+                if !progressed && let Some(task) = self.base.fn_pop_send(worker_id) {
                     self.base.poll_send_task(worker_id, task);
                     progressed = true;
                 }
@@ -499,6 +508,7 @@ impl<T> RuntimeShared<T> {
                 }
 
                 if progressed {
+                    processed_tasks = processed_tasks.wrapping_add(1);
                     continue;
                 }
 
@@ -512,6 +522,7 @@ impl<T> RuntimeShared<T> {
                 }
 
                 if progressed {
+                    processed_tasks = processed_tasks.wrapping_add(1);
                     continue;
                 }
 
