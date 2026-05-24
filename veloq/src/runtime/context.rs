@@ -7,7 +7,8 @@ use veloq_driver_native::driver::{
     ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver,
 };
 use veloq_driver_native::op::{DetachedSubmitter, IntoPlatformOp, Op};
-use veloq_runtime::task::TaskHandleRef;
+use veloq_runtime::task::{ScopeRef, TaskHandleRef};
+use veloq_runtime::utils::storage::AtomicStorage;
 
 use crate::config::BufferRegistrationMode;
 use crate::error::{Result as VeloqResult, from_io_error};
@@ -445,9 +446,7 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
             UnregisterFileTask::<'a, 'ctx>::VTABLE,
             &shared.base,
             worker_id,
-            veloq_runtime::task::AnyScopeCompletionRef::dummy::<
-                veloq_runtime::utils::storage::AtomicStorage,
-            >(),
+            ScopeRef::<AtomicStorage>::dummy(),
         ),
         fd,
         shared_ptr: shared as *const _,

@@ -74,12 +74,12 @@ pub trait RawScope<S: Storage> {
     fn report_panic(&self, payload: Box<dyn Any + Send + 'static>);
     fn is_cancelled(&self) -> bool;
     fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool;
-    fn parent(&self) -> Option<AnyScopeCompletionRef>;
+    fn parent(&self) -> Option<AnyScopeRef>;
     fn register_cancel_waker(&self, waker: &Waker);
     /// # Safety
     ///
     /// The caller must ensure the returned reference is dropped before the underlying scope is deallocated.
-    unsafe fn clone_ref(&self) -> AnyScopeCompletionRef;
+    unsafe fn clone_ref(&self) -> ScopeRef<S>;
     /// # Safety
     ///
     /// The caller must ensure the reference is not dropped twice.
@@ -98,28 +98,13 @@ impl<S: Storage> RawScope<S> for DummyScope<S> {
     fn try_link_child(&self, _child_token: &ErasedCancellationToken) -> bool {
         false
     }
-    fn parent(&self) -> Option<AnyScopeCompletionRef> {
+    fn parent(&self) -> Option<AnyScopeRef> {
         None
     }
     fn register_cancel_waker(&self, _waker: &Waker) {}
-    unsafe fn clone_ref(&self) -> AnyScopeCompletionRef {
+    unsafe fn clone_ref(&self) -> ScopeRef<S> {
         let dyn_ptr: *const dyn RawScope<S> = self;
-        match S::strategy_type() {
-            StrategyType::Local => unsafe {
-                let local_dyn_ptr = std::mem::transmute::<
-                    *const dyn crate::task::RawScope<S>,
-                    *mut dyn crate::task::RawScope<LocalStorage>,
-                >(dyn_ptr);
-                AnyScopeCompletionRef::Local(NonNull::new_unchecked(local_dyn_ptr))
-            },
-            StrategyType::Atomic => unsafe {
-                let send_dyn_ptr = std::mem::transmute::<
-                    *const dyn crate::task::RawScope<S>,
-                    *mut dyn crate::task::RawScope<AtomicStorage>,
-                >(dyn_ptr);
-                AnyScopeCompletionRef::Send(NonNull::new_unchecked(send_dyn_ptr))
-            },
-        }
+        unsafe { ScopeRef::new(NonNull::new_unchecked(dyn_ptr as *mut _)) }
     }
     unsafe fn drop_ref(&self) {}
 }
@@ -127,51 +112,144 @@ impl<S: Storage> RawScope<S> for DummyScope<S> {
 static DUMMY_LOCAL_SCOPE: DummyScope<LocalStorage> = DummyScope(PhantomData);
 static DUMMY_SEND_SCOPE: DummyScope<AtomicStorage> = DummyScope(PhantomData);
 
-#[derive(Debug)]
-pub enum AnyScopeCompletionRef {
-    Local(NonNull<dyn RawScope<LocalStorage>>),
-    Send(NonNull<dyn RawScope<AtomicStorage>>),
+pub struct ScopeRef<S: Storage> {
+    inner: NonNull<dyn RawScope<S>>,
 }
 
-unsafe impl Send for AnyScopeCompletionRef {}
-unsafe impl Sync for AnyScopeCompletionRef {}
-
-impl Clone for AnyScopeCompletionRef {
-    #[inline]
-    fn clone(&self) -> Self {
-        match *self {
-            Self::Local(ptr) => unsafe { ptr.as_ref().clone_ref() },
-            Self::Send(ptr) => unsafe { ptr.as_ref().clone_ref() },
-        }
+impl<S: Storage> std::fmt::Debug for ScopeRef<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopeRef")
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 
-impl Drop for AnyScopeCompletionRef {
-    #[inline]
-    fn drop(&mut self) {
-        match *self {
-            Self::Local(ptr) => unsafe { ptr.as_ref().drop_ref() },
-            Self::Send(ptr) => unsafe { ptr.as_ref().drop_ref() },
-        }
-    }
-}
+unsafe impl<S: Storage> Send for ScopeRef<S> {}
+unsafe impl<S: Storage> Sync for ScopeRef<S> {}
 
-impl AnyScopeCompletionRef {
-    pub fn dummy<S: Storage>() -> Self {
+impl<S: Storage> ScopeRef<S> {
+    /// 创建一个新的 `ScopeRef`。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须确保指针有效。
+    #[inline]
+    pub const unsafe fn new(inner: NonNull<dyn RawScope<S>>) -> Self {
+        Self { inner }
+    }
+
+    /// 获取内部的 `NonNull` 指针。
+    #[inline]
+    pub fn as_non_null(&self) -> NonNull<dyn RawScope<S>> {
+        self.inner
+    }
+
+    /// 获取对内部 `RawScope` 的引用。
+    ///
+    /// # Safety
+    ///
+    /// 必须保证指针依然有效。
+    #[inline]
+    pub unsafe fn as_ref(&self) -> &dyn RawScope<S> {
+        unsafe { self.inner.as_ref() }
+    }
+
+    /// 创建一个虚拟的 `ScopeRef`。
+    pub fn dummy() -> Self {
         match S::strategy_type() {
-            StrategyType::Local => {
+            StrategyType::Local => unsafe {
                 let local_ptr: NonNull<dyn RawScope<LocalStorage>> =
                     NonNull::from(&DUMMY_LOCAL_SCOPE);
-                Self::Local(local_ptr)
-            }
-            StrategyType::Atomic => {
+                std::mem::transmute::<ScopeRef<LocalStorage>, ScopeRef<S>>(ScopeRef::new(local_ptr))
+            },
+            StrategyType::Atomic => unsafe {
                 let send_ptr: NonNull<dyn RawScope<AtomicStorage>> =
                     NonNull::from(&DUMMY_SEND_SCOPE);
-                Self::Send(send_ptr)
-            }
+                std::mem::transmute::<ScopeRef<AtomicStorage>, ScopeRef<S>>(ScopeRef::new(send_ptr))
+            },
         }
     }
 
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        unsafe { self.as_ref().is_cancelled() }
+    }
+
+    #[inline]
+    pub fn parent(&self) -> Option<AnyScopeRef> {
+        unsafe { self.as_ref().parent() }
+    }
+
+    #[inline]
+    pub fn register_cancel_waker(&self, waker: &Waker) {
+        unsafe { self.as_ref().register_cancel_waker(waker) }
+    }
+
+    #[inline]
+    pub fn task_done(&self) {
+        unsafe { self.as_ref().task_done() }
+    }
+
+    #[inline]
+    pub fn cancel(&self) {
+        unsafe { self.as_ref().cancel() }
+    }
+
+    #[inline]
+    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+        unsafe { self.as_ref().report_panic(payload) }
+    }
+
+    /// 将具体类型的 `ScopeRef` 转换成不透明类型的 `AnyScopeRef`。
+    #[inline]
+    pub fn into_any(self) -> AnyScopeRef {
+        match S::strategy_type() {
+            StrategyType::Local => unsafe {
+                let casted = std::mem::transmute::<ScopeRef<S>, ScopeRef<LocalStorage>>(self);
+                AnyScopeRef::Local(casted)
+            },
+            StrategyType::Atomic => unsafe {
+                let casted = std::mem::transmute::<ScopeRef<S>, ScopeRef<AtomicStorage>>(self);
+                AnyScopeRef::Send(casted)
+            },
+        }
+    }
+}
+
+impl<S: Storage> Clone for ScopeRef<S> {
+    #[inline]
+    fn clone(&self) -> Self {
+        unsafe { self.inner.as_ref().clone_ref() }
+    }
+}
+
+impl<S: Storage> Drop for ScopeRef<S> {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe { self.inner.as_ref().drop_ref() }
+    }
+}
+
+#[derive(Debug)]
+pub enum AnyScopeRef {
+    Local(ScopeRef<LocalStorage>),
+    Send(ScopeRef<AtomicStorage>),
+}
+
+unsafe impl Send for AnyScopeRef {}
+unsafe impl Sync for AnyScopeRef {}
+
+impl Clone for AnyScopeRef {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Local(s) => Self::Local(s.clone()),
+            Self::Send(s) => Self::Send(s.clone()),
+        }
+    }
+}
+
+impl AnyScopeRef {
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         match self {
@@ -189,42 +267,10 @@ impl AnyScopeCompletionRef {
     }
 
     #[inline]
-    pub fn parent(&self) -> Option<AnyScopeCompletionRef> {
-        match self {
-            Self::Local(s) => unsafe { s.as_ref().parent() },
-            Self::Send(s) => unsafe { s.as_ref().parent() },
-        }
-    }
-
-    #[inline]
     pub fn register_cancel_waker(&self, waker: &Waker) {
         match self {
             Self::Local(s) => unsafe { s.as_ref().register_cancel_waker(waker) },
             Self::Send(s) => unsafe { s.as_ref().register_cancel_waker(waker) },
-        }
-    }
-
-    #[inline]
-    pub fn task_done(&self) {
-        match self {
-            Self::Local(s) => unsafe { s.as_ref().task_done() },
-            Self::Send(s) => unsafe { s.as_ref().task_done() },
-        }
-    }
-
-    #[inline]
-    pub fn cancel(&self) {
-        match self {
-            Self::Local(s) => unsafe { s.as_ref().cancel() },
-            Self::Send(s) => unsafe { s.as_ref().cancel() },
-        }
-    }
-
-    #[inline]
-    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
-        match self {
-            Self::Local(s) => unsafe { s.as_ref().report_panic(payload) },
-            Self::Send(s) => unsafe { s.as_ref().report_panic(payload) },
         }
     }
 }

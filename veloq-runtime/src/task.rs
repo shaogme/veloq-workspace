@@ -11,7 +11,7 @@ pub use header::{
 };
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
-    AnyScopeCompletionRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,
+    AnyScopeRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope, ScopeRef,
 };
 
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
@@ -44,7 +44,7 @@ impl std::fmt::Debug for TaskError {
 
 pub trait RuntimeContextExt {
     fn is_cancelled(&self) -> bool;
-    fn scope_completion(&self) -> Option<AnyScopeCompletionRef>;
+    fn scope_completion(&self) -> Option<AnyScopeRef>;
 }
 
 impl RuntimeContextExt for Context<'_> {
@@ -62,15 +62,15 @@ impl RuntimeContextExt for Context<'_> {
         }
     }
 
-    fn scope_completion(&self) -> Option<AnyScopeCompletionRef> {
+    fn scope_completion(&self) -> Option<AnyScopeRef> {
         unsafe {
             if let Some(h) = TaskHeader::from_waker(self.waker(), &INTRUSIVE_WAKER_VTABLE) {
-                return Some(h.scope_completion_ref());
+                return Some(h.scope_completion_ref().into_any());
             }
             if let Some(h) =
                 LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
             {
-                return Some(h.scope_completion_ref());
+                return Some(h.scope_completion_ref().into_any());
             }
             None
         }

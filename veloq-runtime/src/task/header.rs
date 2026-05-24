@@ -1,5 +1,5 @@
 use crate::runtime::RuntimeSharedBase;
-use crate::task::{AnyScopeCompletionRef, SendTaskRef, TaskHandleRef};
+use crate::task::{ScopeRef, SendTaskRef, TaskHandleRef};
 use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
@@ -41,7 +41,7 @@ pub struct GenericTaskHeader<S: Storage> {
     state: S::Usize,
     ref_count: S::Usize,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
-    scope: UnsafeCell<AnyScopeCompletionRef>,
+    scope: UnsafeCell<ScopeRef<S>>,
     runtime: UnsafeCell<Option<NonNull<RuntimeSharedBase>>>,
     worker_id: S::Usize,
     injector_next: S::OptionPtr<GenericTaskHeader<S>>,
@@ -56,7 +56,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         vtable: &'static TaskVTable<S>,
         runtime: &RuntimeSharedBase,
         worker_id: usize,
-        scope: AnyScopeCompletionRef,
+        scope: ScopeRef<S>,
     ) -> Self {
         let this = Self::new_placeholder(vtable);
         unsafe {
@@ -70,7 +70,7 @@ impl<S: Storage> GenericTaskHeader<S> {
             state: S::Usize::new(0),
             ref_count: S::Usize::new(1),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
-            scope: UnsafeCell::new(AnyScopeCompletionRef::dummy::<S>()),
+            scope: UnsafeCell::new(ScopeRef::dummy()),
             runtime: UnsafeCell::new(None),
             worker_id: S::Usize::new(0),
             injector_next: S::OptionPtr::new(None),
@@ -85,7 +85,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         &self,
         runtime: &RuntimeSharedBase,
         worker_id: usize,
-        scope: AnyScopeCompletionRef,
+        scope: ScopeRef<S>,
     ) {
         unsafe {
             *self.runtime.get() = Some(NonNull::from(runtime));
@@ -313,7 +313,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> AnyScopeCompletionRef {
+    pub fn scope_completion_ref(&self) -> ScopeRef<S> {
         unsafe { (*self.scope.get()).clone() }
     }
 

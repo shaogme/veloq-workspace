@@ -14,8 +14,8 @@ use std::time::Duration;
 use super::shared::RuntimeShared;
 use crate::scope::{AsyncScope, LocalAsyncScope};
 use crate::task::{
-    GenericTaskHeader, LocalTaskRef, RawTask, RuntimeContextExt, SendTaskRef, TaskHandleRef,
-    TaskHeader, TaskVTable,
+    GenericTaskHeader, LocalTaskRef, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef,
+    TaskHandleRef, TaskHeader, TaskVTable,
 };
 use crate::utils::FastRand;
 use crate::utils::storage::AtomicStorage;
@@ -194,7 +194,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
                 RouteJobTask::<'scope_ref, F, Fut>::VTABLE,
                 &self.shared.base,
                 worker_id,
-                crate::task::AnyScopeCompletionRef::dummy::<AtomicStorage>(),
+                ScopeRef::<AtomicStorage>::dummy(),
             ),
             job: UnsafeCell::new(Some(job)),
             slot: slot_for_job,

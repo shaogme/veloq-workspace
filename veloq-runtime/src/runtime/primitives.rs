@@ -7,7 +7,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
-use crate::task::{AnyScopeCompletionRef, OpaqueToken};
+use crate::task::{AnyScopeRef, OpaqueToken};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{StateInt, StateLock, StateWakerQueue, Storage};
 
@@ -391,7 +391,7 @@ pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
     children: ChildList<S, O>,
     pub(crate) link: Link,
     parent: ParentSlot<S, O>,
-    pub(crate) cross_parent: S::Lock<Option<AnyScopeCompletionRef>>,
+    pub(crate) cross_parent: S::Lock<Option<AnyScopeRef>>,
 }
 
 intrusive_adapter!(pub CancellationTokenAdapter<S, O> = GenericCancellationTokenInner<S, O> { link: Link } where S: Storage, O: Ownership);
