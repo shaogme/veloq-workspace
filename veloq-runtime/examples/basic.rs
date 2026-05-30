@@ -63,7 +63,7 @@ fn main() {
             // --- 测试显式取消 (Explicit Cancellation) ---
             println!("\n  [测试] 测试显式取消：手动取消特定任务...");
             ctx.scope(async |explicit_cancel_scope| {
-                let h1 = explicit_cancel_scope.spawn_boxed(async move {
+                let h1 = explicit_cancel_scope.spawn_boxed(async {
                     for i in 1..=10 {
                         yield_now().await;
                         let worker_id = explicit_cancel_scope.worker_id();
@@ -91,7 +91,7 @@ fn main() {
             ctx.scope(async |async_notify_scope| {
                 let token = async_notify_scope.cancel_token().child();
                 let token_clone = token.clone();
-                let h = async_notify_scope.spawn_boxed(async move {
+                let h = async_notify_scope.spawn_boxed(async {
                     let worker_id = async_notify_scope.worker_id();
                     println!(
                         "    [Worker {}] [异步监听任务] 正在等待取消信号...",
@@ -119,7 +119,7 @@ fn main() {
             // --- 测试延迟生成的任务令牌 (Lazy Task Token) ---
             println!("\n  [测试] 测试 JoinHandle 延迟生成的取消令牌...");
             ctx.scope(async |lazy_token_scope| {
-                let h = lazy_token_scope.spawn_boxed(async move {
+                let h = lazy_token_scope.spawn_boxed(async {
                     yield_now().await;
                     yield_now().await;
                     let worker_id = lazy_token_scope.worker_id();
@@ -129,7 +129,7 @@ fn main() {
                 let task_token = h.cancel_token();
                 let token_clone = task_token.clone();
 
-                lazy_token_scope.spawn_boxed(async move {
+                lazy_token_scope.spawn_boxed(async {
                     token_clone.cancelled().await;
                     let worker_id = lazy_token_scope.worker_id();
                     println!("    [Worker {}] [监听器] 检测到任务令牌被取消", worker_id);
@@ -165,10 +165,10 @@ fn main() {
             ctx.scope(async |parent_scope| {
                 let token = parent_scope.cancel_token().clone();
 
-                parent_scope.spawn_boxed(async move {
+                parent_scope.spawn_boxed(async {
                     println!("    [父作用域] 启动子作用域...");
                     ctx.scope(async |child_scope| {
-                        child_scope.spawn_boxed(async move {
+                        child_scope.spawn_boxed(async {
                             for i in 1..=100 {
                                 yield_now().await;
                                 if i % 10 == 0 {
