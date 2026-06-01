@@ -525,21 +525,13 @@ macro_rules! impl_ptr_state_wrapper {
     ) => {
         pub struct $name<T>($inner_ty);
         $( $unsafe_impl )*
-        impl<T> $name<T> {
-            pub fn new(ptr: $val) -> Self { let $new_ptr = ptr; $new_expr }
-            pub fn load(&$self, $order: Ordering) -> $val { $load_expr }
-            pub fn store(&$self, ptr: $val, $order: Ordering) { let $store_ptr = ptr; $store_expr }
-            pub fn swap(&$self, ptr: $val, $order: Ordering) -> $val { let $swap_ptr = ptr; $swap_expr }
-            pub fn compare_exchange(&$self, $ce_curr: $val, $ce_new: $val, $ce_s: Ordering, $ce_f: Ordering) -> Result<$val, $val> { $ce_expr }
-            pub fn compare_exchange_weak(&$self, $cew_curr: $val, $cew_new: $val, $cew_s: Ordering, $cew_f: Ordering) -> Result<$val, $val> { $cew_expr }
-        }
         impl<T> $trait<T> for $name<T> {
-            fn new(ptr: $val) -> Self { Self::new(ptr) }
-            fn load(&$self, order: Ordering) -> $val { $self.load(order) }
-            fn store(&$self, ptr: $val, order: Ordering) { $self.store(ptr, order) }
-            fn swap(&$self, ptr: $val, order: Ordering) -> $val { $self.swap(ptr, order) }
-            fn compare_exchange(&$self, current: $val, new: $val, success: Ordering, failure: Ordering) -> Result<$val, $val> { $self.compare_exchange(current, new, success, failure) }
-            fn compare_exchange_weak(&$self, current: $val, new: $val, success: Ordering, failure: Ordering) -> Result<$val, $val> { $self.compare_exchange_weak(current, new, success, failure) }
+            fn new(ptr: $val) -> Self { let $new_ptr = ptr; $new_expr }
+            fn load(&$self, $order: Ordering) -> $val { $load_expr }
+            fn store(&$self, ptr: $val, $order: Ordering) { let $store_ptr = ptr; $store_expr }
+            fn swap(&$self, ptr: $val, $order: Ordering) -> $val { let $swap_ptr = ptr; $swap_expr }
+            fn compare_exchange(&$self, $ce_curr: $val, $ce_new: $val, $ce_s: Ordering, $ce_f: Ordering) -> Result<$val, $val> { $ce_expr }
+            fn compare_exchange_weak(&$self, $cew_curr: $val, $cew_new: $val, $cew_s: Ordering, $cew_f: Ordering) -> Result<$val, $val> { $cew_expr }
         }
     };
 }
@@ -646,49 +638,18 @@ pub struct AtomicOptionBox<T: ?Sized>(GenericAtomicOption<Box<T>, BoxStrategy<T>
 unsafe impl<T: ?Sized + Send> Send for AtomicOptionBox<T> {}
 unsafe impl<T: ?Sized + Send> Sync for AtomicOptionBox<T> {}
 
-impl<T: ?Sized> AtomicOptionBox<T> {
-    pub fn new(opt: Option<Box<T>>) -> Self {
-        Self(GenericAtomicOption::new(opt))
-    }
-
-    /// 获取当前存储的 Box 并将其置为空。
-    pub fn take(&self, order: Ordering) -> Option<Box<T>> {
-        self.0.take(order)
-    }
-
-    /// 交换当前存储的 Box。
-    pub fn swap(&self, new: Option<Box<T>>, order: Ordering) -> Option<Box<T>> {
-        self.0.swap(new, order)
-    }
-
-    /// 存储一个新的 Box。如果之前有存储，则旧的会被释放。
-    pub fn store(&self, val: Option<Box<T>>, order: Ordering) {
-        self.0.store(val, order)
-    }
-
-    /// 仅在当前为空时，存入新的 Box。如果存入失败，则返回原 Box 的所有权。
-    pub fn compare_exchange_none(
-        &self,
-        new: Box<T>,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<(), Box<T>> {
-        self.0.compare_exchange_none(new, success, failure)
-    }
-}
-
 impl<T: ?Sized + Send> StateOptionBox<T> for AtomicOptionBox<T> {
     fn new(opt: Option<Box<T>>) -> Self {
-        Self::new(opt)
+        Self(GenericAtomicOption::new(opt))
     }
     fn take(&self, order: Ordering) -> Option<Box<T>> {
-        self.take(order)
+        self.0.take(order)
     }
     fn swap(&self, new: Option<Box<T>>, order: Ordering) -> Option<Box<T>> {
-        self.swap(new, order)
+        self.0.swap(new, order)
     }
     fn store(&self, val: Option<Box<T>>, order: Ordering) {
-        self.store(val, order)
+        self.0.store(val, order)
     }
     fn compare_exchange_none(
         &self,
@@ -696,7 +657,7 @@ impl<T: ?Sized + Send> StateOptionBox<T> for AtomicOptionBox<T> {
         success: Ordering,
         failure: Ordering,
     ) -> Result<(), Box<T>> {
-        self.compare_exchange_none(new, success, failure)
+        self.0.compare_exchange_none(new, success, failure)
     }
 }
 
@@ -751,45 +712,18 @@ pub struct AtomicOptionArc<T: ?Sized>(GenericAtomicOption<Arc<T>, ArcStrategy<T>
 unsafe impl<T: ?Sized + Send + Sync> Send for AtomicOptionArc<T> {}
 unsafe impl<T: ?Sized + Send + Sync> Sync for AtomicOptionArc<T> {}
 
-impl<T: ?Sized> AtomicOptionArc<T> {
-    pub fn new(opt: Option<Arc<T>>) -> Self {
-        Self(GenericAtomicOption::new(opt))
-    }
-
-    pub fn take(&self, order: Ordering) -> Option<Arc<T>> {
-        self.0.take(order)
-    }
-
-    pub fn store(&self, opt: Option<Arc<T>>, order: Ordering) {
-        self.0.store(opt, order)
-    }
-
-    pub fn load_clone(&self, order: Ordering) -> Option<Arc<T>> {
-        self.0.load_clone(order)
-    }
-
-    pub fn compare_exchange_none(
-        &self,
-        new: Arc<T>,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<(), Arc<T>> {
-        self.0.compare_exchange_none(new, success, failure)
-    }
-}
-
 impl<T: ?Sized + Send + Sync> StateOptionArc<T> for AtomicOptionArc<T> {
     fn new(opt: Option<Arc<T>>) -> Self {
-        Self::new(opt)
+        Self(GenericAtomicOption::new(opt))
     }
     fn take(&self, order: Ordering) -> Option<Arc<T>> {
-        self.take(order)
+        self.0.take(order)
     }
     fn store(&self, opt: Option<Arc<T>>, order: Ordering) {
-        self.store(opt, order)
+        self.0.store(opt, order)
     }
     fn load_clone(&self, order: Ordering) -> Option<Arc<T>> {
-        self.load_clone(order)
+        self.0.load_clone(order)
     }
     fn compare_exchange_none(
         &self,
@@ -797,7 +731,7 @@ impl<T: ?Sized + Send + Sync> StateOptionArc<T> for AtomicOptionArc<T> {
         success: Ordering,
         failure: Ordering,
     ) -> Result<(), Arc<T>> {
-        self.compare_exchange_none(new, success, failure)
+        self.0.compare_exchange_none(new, success, failure)
     }
 }
 
@@ -821,7 +755,7 @@ pub struct StaticTransfer<T>(Box<[AtomicOptionBox<T>]>);
 
 unsafe impl<T: Send> Sync for StaticTransfer<T> {}
 
-impl<T> StaticTransfer<T> {
+impl<T: Send> StaticTransfer<T> {
     pub fn new(items: Vec<T>) -> Self {
         Self(
             items

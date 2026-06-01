@@ -13,7 +13,7 @@ use crate::scope::GenericScopeCompletion;
 use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::Storage;
+use crate::utils::storage::{StateOptionPtr, Storage};
 
 pub(crate) mod infra;
 

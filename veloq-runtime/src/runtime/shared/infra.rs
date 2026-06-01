@@ -12,7 +12,7 @@ use crate::runtime::shared::RuntimeShared;
 use crate::scope::GenericScopeCompletion;
 use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicOptionPtr, Storage};
+use crate::utils::storage::{AtomicOptionPtr, StateOptionPtr, Storage};
 use crate::utils::{Deque, FastRand, Steal};
 
 pub(crate) struct WorkerQueue {

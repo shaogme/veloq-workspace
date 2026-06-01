@@ -6,7 +6,7 @@ use crate::task::{
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{
-    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage, StateOptionBox,
+    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, StateOptionPtr, Storage,
 };
 use std::alloc::Layout;
 use std::any::Any;
@@ -152,11 +152,9 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 
     pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
-        let _ = self.panic_info.compare_exchange_none(
-            payload,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ = self
+            .panic_info
+            .compare_exchange_none(payload, Ordering::AcqRel, Ordering::Acquire);
     }
 
     pub fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
