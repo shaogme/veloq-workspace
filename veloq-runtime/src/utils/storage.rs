@@ -19,6 +19,8 @@ pub trait Storage: 'static {
     type NonNullPtr<T>: StateNonNullPtr<T>;
     type Lock<T>: StateLock<T>;
     type WakerQueue: StateWakerQueue;
+    type OptionBox<T: ?Sized + Send>: StateOptionBox<T>;
+    type OptionArc<T: ?Sized + Send + Sync>: StateOptionArc<T>;
 }
 
 pub trait StateInt: Send + Sync {
@@ -102,6 +104,32 @@ pub trait StateWakerQueue: Send + Sync + 'static {
     fn take_all(&self) -> Vec<Waker>;
 }
 
+pub trait StateOptionBox<T: ?Sized + Send>: Send + Sync {
+    fn new(opt: Option<Box<T>>) -> Self;
+    fn take(&self, order: Ordering) -> Option<Box<T>>;
+    fn swap(&self, new: Option<Box<T>>, order: Ordering) -> Option<Box<T>>;
+    fn store(&self, val: Option<Box<T>>, order: Ordering);
+    fn compare_exchange_none(
+        &self,
+        new: Box<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Box<T>>;
+}
+
+pub trait StateOptionArc<T: ?Sized + Send + Sync>: Send + Sync {
+    fn new(opt: Option<Arc<T>>) -> Self;
+    fn take(&self, order: Ordering) -> Option<Arc<T>>;
+    fn store(&self, opt: Option<Arc<T>>, order: Ordering);
+    fn load_clone(&self, order: Ordering) -> Option<Arc<T>>;
+    fn compare_exchange_none(
+        &self,
+        new: Arc<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Arc<T>>;
+}
+
 // --- Atomic Storage Implementation ---
 
 pub struct AtomicStorage;
@@ -114,6 +142,8 @@ impl Storage for AtomicStorage {
     type NonNullPtr<T> = AtomicNonNullPtr<T>;
     type Lock<T> = AtomicLock<T>;
     type WakerQueue = AtomicWakerQueue;
+    type OptionBox<T: ?Sized + Send> = AtomicOptionBox<T>;
+    type OptionArc<T: ?Sized + Send + Sync> = AtomicOptionArc<T>;
 }
 
 pub struct AtomicLock<T>(parking_lot::Mutex<T>);
@@ -204,6 +234,8 @@ impl Storage for LocalStorage {
     type NonNullPtr<T> = NonAtomicNonNullPtr<T>;
     type Lock<T> = LocalLock<T>;
     type WakerQueue = LocalWakerQueue;
+    type OptionBox<T: ?Sized + Send> = NonAtomicOptionBox<T>;
+    type OptionArc<T: ?Sized + Send + Sync> = NonAtomicOptionArc<T>;
 }
 
 pub struct LocalLock<T>(RefCell<T>);
@@ -612,7 +644,7 @@ impl_ptr_state_wrapper!(
 pub struct AtomicOptionBox<T: ?Sized>(GenericAtomicOption<Box<T>, BoxStrategy<T>>);
 
 unsafe impl<T: ?Sized + Send> Send for AtomicOptionBox<T> {}
-unsafe impl<T: ?Sized + Sync> Sync for AtomicOptionBox<T> {}
+unsafe impl<T: ?Sized + Send> Sync for AtomicOptionBox<T> {}
 
 impl<T: ?Sized> AtomicOptionBox<T> {
     pub fn new(opt: Option<Box<T>>) -> Self {
@@ -642,6 +674,71 @@ impl<T: ?Sized> AtomicOptionBox<T> {
         failure: Ordering,
     ) -> Result<(), Box<T>> {
         self.0.compare_exchange_none(new, success, failure)
+    }
+}
+
+impl<T: ?Sized + Send> StateOptionBox<T> for AtomicOptionBox<T> {
+    fn new(opt: Option<Box<T>>) -> Self {
+        Self::new(opt)
+    }
+    fn take(&self, order: Ordering) -> Option<Box<T>> {
+        self.take(order)
+    }
+    fn swap(&self, new: Option<Box<T>>, order: Ordering) -> Option<Box<T>> {
+        self.swap(new, order)
+    }
+    fn store(&self, val: Option<Box<T>>, order: Ordering) {
+        self.store(val, order)
+    }
+    fn compare_exchange_none(
+        &self,
+        new: Box<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Box<T>> {
+        self.compare_exchange_none(new, success, failure)
+    }
+}
+
+macro_rules! impl_cell_opt_methods {
+    ($val:ty) => {
+        fn new(opt: Option<$val>) -> Self {
+            Self(Cell::new(opt))
+        }
+        fn take(&self, _order: Ordering) -> Option<$val> {
+            self.0.take()
+        }
+        fn store(&self, val: Option<$val>, _order: Ordering) {
+            self.0.set(val);
+        }
+        fn compare_exchange_none(
+            &self,
+            new: $val,
+            _success: Ordering,
+            _failure: Ordering,
+        ) -> Result<(), $val> {
+            let old = self.0.take();
+            if old.is_none() {
+                self.0.set(Some(new));
+                Ok(())
+            } else {
+                self.0.set(old);
+                Err(new)
+            }
+        }
+    };
+}
+
+// --- NonAtomicOptionBox ---
+
+pub struct NonAtomicOptionBox<T: ?Sized>(Cell<Option<Box<T>>>);
+unsafe impl<T: ?Sized + Send> Send for NonAtomicOptionBox<T> {}
+unsafe impl<T: ?Sized + Send> Sync for NonAtomicOptionBox<T> {}
+
+impl<T: ?Sized + Send> StateOptionBox<T> for NonAtomicOptionBox<T> {
+    impl_cell_opt_methods!(Box<T>);
+    fn swap(&self, new: Option<Box<T>>, _order: Ordering) -> Option<Box<T>> {
+        self.0.replace(new)
     }
 }
 
@@ -678,6 +775,45 @@ impl<T: ?Sized> AtomicOptionArc<T> {
         failure: Ordering,
     ) -> Result<(), Arc<T>> {
         self.0.compare_exchange_none(new, success, failure)
+    }
+}
+
+impl<T: ?Sized + Send + Sync> StateOptionArc<T> for AtomicOptionArc<T> {
+    fn new(opt: Option<Arc<T>>) -> Self {
+        Self::new(opt)
+    }
+    fn take(&self, order: Ordering) -> Option<Arc<T>> {
+        self.take(order)
+    }
+    fn store(&self, opt: Option<Arc<T>>, order: Ordering) {
+        self.store(opt, order)
+    }
+    fn load_clone(&self, order: Ordering) -> Option<Arc<T>> {
+        self.load_clone(order)
+    }
+    fn compare_exchange_none(
+        &self,
+        new: Arc<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Arc<T>> {
+        self.compare_exchange_none(new, success, failure)
+    }
+}
+
+// --- NonAtomicOptionArc ---
+
+pub struct NonAtomicOptionArc<T: ?Sized>(Cell<Option<Arc<T>>>);
+unsafe impl<T: ?Sized + Send + Sync> Send for NonAtomicOptionArc<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for NonAtomicOptionArc<T> {}
+
+impl<T: ?Sized + Send + Sync> StateOptionArc<T> for NonAtomicOptionArc<T> {
+    impl_cell_opt_methods!(Arc<T>);
+    fn load_clone(&self, _order: Ordering) -> Option<Arc<T>> {
+        let opt = self.0.take();
+        let cloned = opt.clone();
+        self.0.set(opt);
+        cloned
     }
 }
 

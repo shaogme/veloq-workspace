@@ -1,14 +1,18 @@
 use crate::task::{
     GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef, RawTask,
-    SendTaskRef, Task, TaskError, TaskHandleRef, TaskLock, TaskResultSetter, TaskVTable,
-    poll_task_internal,
+    SendTaskRef, Task, TaskError, TaskHandleRef, TaskResultSetter, TaskVTable, poll_task_internal,
 };
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
+use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, Storage};
+use std::cell::UnsafeCell;
 use std::future::Future;
-use std::mem::replace;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, RawWakerVTable};
+
+const STATUS_RUNNING: usize = 0;
+const STATUS_DONE: usize = 1;
+const STATUS_EMPTY: usize = 2;
 
 /// 任务存储特性，用于统一本地和发送任务的存储行为。
 pub trait TaskStorage: Storage + Sized {
@@ -50,18 +54,28 @@ pub trait TaskBounds<T, F> {}
 impl<T, F> TaskBounds<T, F> for LocalStorage {}
 impl<T, F> TaskBounds<T, F> for AtomicStorage where T: Send {}
 
-/// 任务状态枚举，合并了运行中的 Future 和完成后的 Result。
-/// 这种设计减少了锁的层数，并允许 Future 和 Result 共享内存空间。
-pub enum TaskState<T, F> {
-    Running(F),
-    Done(Result<T, TaskError>),
-    Empty,
-}
-
 #[repr(C)]
 pub struct GenericTaskNode<S: TaskStorage, T, F> {
     pub(crate) header: GenericTaskHeader<S>,
-    pub(crate) state: S::Lock<TaskState<T, F>>,
+    pub(crate) status: S::Usize,
+    pub(crate) future: UnsafeCell<Option<F>>,
+    pub(crate) result: UnsafeCell<Option<Result<T, TaskError>>>,
+}
+
+unsafe impl<S: TaskStorage, T, F> Send for GenericTaskNode<S, T, F>
+where
+    S: TaskBounds<T, F>,
+    F: Send,
+    T: Send,
+{
+}
+
+unsafe impl<S: TaskStorage, T, F> Sync for GenericTaskNode<S, T, F>
+where
+    S: TaskBounds<T, F>,
+    F: Send,
+    T: Send,
+{
 }
 
 impl<S: TaskStorage, T, F> GenericTaskNode<S, T, F>
@@ -87,7 +101,9 @@ where
     pub fn new(future: F) -> Self {
         Self {
             header: GenericTaskHeader::new_placeholder(Self::VTABLE),
-            state: S::Lock::new(TaskState::Running(future)),
+            status: S::Usize::new(STATUS_RUNNING),
+            future: UnsafeCell::new(Some(future)),
+            result: UnsafeCell::new(None),
         }
     }
 }
@@ -99,7 +115,11 @@ where
 {
     #[inline]
     fn set_result(&self, res: Result<T, TaskError>) {
-        self.state.lock_mut(|s| *s = TaskState::Done(res));
+        unsafe {
+            *self.result.get() = Some(res);
+            self.status.store(STATUS_DONE, Ordering::Release);
+            *self.future.get() = None;
+        }
     }
 }
 
@@ -132,27 +152,39 @@ where
             self,
             cx,
             |cx| {
-                self.state.lock_mut(|s| {
-                    if let TaskState::Running(f) = s {
+                if self.status.load(Ordering::Acquire) == STATUS_RUNNING {
+                    let fut_opt = unsafe { &mut *self.future.get() };
+                    if let Some(f) = fut_opt {
                         unsafe { Pin::new_unchecked(f) }.poll(cx)
                     } else {
                         Poll::Pending
                     }
-                })
+                } else {
+                    Poll::Pending
+                }
             },
             S::IS_LOCAL,
         )
     }
 
     fn take_result(&self) -> Option<Result<T, TaskError>> {
-        self.state.lock_mut(|s| {
-            if let TaskState::Done(_) = s
-                && let TaskState::Done(res) = replace(s, TaskState::Empty)
-            {
-                return Some(res);
+        if self
+            .status
+            .compare_exchange(
+                STATUS_DONE,
+                STATUS_EMPTY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            unsafe {
+                let res = &mut *self.result.get();
+                res.take()
             }
+        } else {
             None
-        })
+        }
     }
 }
 

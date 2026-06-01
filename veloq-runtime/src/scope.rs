@@ -5,10 +5,11 @@ use crate::task::{
     SendBoxedTaskNode, SendTask, SendTaskRef, TaskError, TaskHandleRef, TaskJoinGate,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, StateLock, Storage};
+use crate::utils::storage::{
+    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage, StateOptionBox,
+};
 use std::alloc::Layout;
 use std::any::Any;
-use std::mem::take;
 use std::ops::AsyncFnOnce;
 use std::ptr::{NonNull, drop_in_place, write};
 use std::sync::atomic::Ordering;
@@ -42,12 +43,17 @@ impl<T> SendPtr<T> {
     }
 }
 
+struct WakerNode {
+    waker: Waker,
+    next: Option<NonNull<WakerNode>>,
+}
+
 /// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
 pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
     remaining: S::Usize,
-    wakers: S::Lock<Vec<Waker>>,
+    wakers: S::OptionPtr<WakerNode>,
     cancel_token: GenericCancellationToken<S, O>,
-    panic_info: S::Lock<Option<Box<dyn Any + Send + 'static>>>,
+    panic_info: S::OptionBox<dyn Any + Send + 'static>,
     parent: Option<AnyScopeRef>,
 }
 
@@ -58,20 +64,21 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     pub fn new(parent: Option<AnyScopeRef>) -> O::Shared<Self> {
         O::new(Self {
             remaining: S::Usize::new(0),
-            wakers: S::Lock::new(Vec::new()),
+            wakers: S::OptionPtr::new(None),
             cancel_token: GenericCancellationToken::<S, O>::new(),
-            panic_info: S::Lock::new(None),
+            panic_info: S::OptionBox::new(None),
             parent,
         })
     }
 
     fn drain_wakers(&self) {
-        let wakers = {
-            let mut wakers = self.wakers.lock();
-            take(&mut *wakers)
-        };
-        for waker in wakers {
-            waker.wake();
+        let mut current = self.wakers.swap(None, Ordering::AcqRel);
+        while let Some(node_ptr) = current {
+            unsafe {
+                let node = Box::from_raw(node_ptr.as_ptr());
+                node.waker.wake();
+                current = node.next;
+            }
         }
     }
 
@@ -113,9 +120,26 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
             return;
         }
 
-        {
-            let mut wakers = self.wakers.lock();
-            wakers.push(waker.clone());
+        let mut node = Box::new(WakerNode {
+            waker: waker.clone(),
+            next: None,
+        });
+        let mut current = self.wakers.load(Ordering::Acquire);
+        loop {
+            node.next = current;
+            let node_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(node)) };
+            match self.wakers.compare_exchange_weak(
+                current,
+                Some(node_ptr),
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => {
+                    node = unsafe { Box::from_raw(node_ptr.as_ptr()) };
+                    current = actual;
+                }
+            }
         }
 
         if self.remaining.load(Ordering::Acquire) == 0 {
@@ -128,14 +152,15 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 
     pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
-        let mut panic_info = self.panic_info.lock();
-        if panic_info.is_none() {
-            *panic_info = Some(payload);
-        }
+        let _ = self.panic_info.compare_exchange_none(
+            payload,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     pub fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
-        self.panic_info.lock().take()
+        self.panic_info.take(Ordering::AcqRel)
     }
 
     pub fn parent(&self) -> &Option<crate::task::AnyScopeRef> {
@@ -145,7 +170,15 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
 
 impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     fn drop(&mut self) {
-        if let Some(panic_info) = self.panic_info.lock().take()
+        let mut current = self.wakers.swap(None, Ordering::Relaxed);
+        while let Some(node_ptr) = current {
+            unsafe {
+                let node = Box::from_raw(node_ptr.as_ptr());
+                current = node.next;
+            }
+        }
+
+        if let Some(panic_info) = self.take_panic()
             && !std::thread::panicking()
         {
             std::panic::resume_unwind(panic_info);
