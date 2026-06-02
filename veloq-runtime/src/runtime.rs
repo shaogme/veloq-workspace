@@ -67,7 +67,7 @@ impl<I, T, WF> Runtime<I, T, WF> {
         T: 'run,
         WF: Fn(usize, &'run RuntimeShared<T>) -> T + Send + Sync,
         I: AsyncFn(WorkerInitContext<'run, T>) -> () + Send + Sync,
-        F: AsyncFnOnce(RuntimeScopeContext<'run, T>) -> R,
+        F: AsyncFnOnce(RuntimeScopeContext<T>) -> R,
     {
         struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<T>);
         impl<'a, T> Drop for TlsCleanupGuard<'a, T> {
@@ -77,7 +77,7 @@ impl<I, T, WF> Runtime<I, T, WF> {
         }
 
         let shared_ref: &RuntimeShared<T> = unsafe { &*std::ptr::from_ref(&self.shared) };
-        let ctx = RuntimeScopeContext { shared: shared_ref };
+        let ctx = RuntimeScopeContext::new(shared_ref);
 
         let worker_count = shared_ref.worker_count();
         let worker_init = self.worker_init.take().expect("worker_init already taken");

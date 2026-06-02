@@ -216,7 +216,7 @@ unsafe impl<'scope_ref, T> Send for RoutedSpawnState<'scope_ref, T> where T: Sen
 unsafe impl<'scope_ref, T> Sync for RoutedSpawnState<'scope_ref, T> where T: Send {}
 
 pub(crate) fn dispatch_routed<'scope_ref, S: Storage, O: Ownership, T, F, TExtra>(
-    context: &RuntimeScopeContext<'_, TExtra>,
+    context: &RuntimeScopeContext<TExtra>,
     completion: &O::Shared<GenericScopeCompletion<S, O>>,
     state: Arc<RoutedSpawnState<'scope_ref, T>>,
     worker_id: usize,

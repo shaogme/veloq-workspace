@@ -196,7 +196,7 @@ pub struct RuntimeContext<'a, 'ctx>
 where
     'ctx: 'a,
 {
-    pub scope: RuntimeScopeContext<'a, WorkerState<'a, 'ctx>>,
+    pub scope: RuntimeScopeContext<WorkerState<'a, 'ctx>>,
 }
 
 impl<'a, 'ctx> ContextDriverProvider<PlatformDriver<'ctx>> for RuntimeContext<'a, 'ctx> {

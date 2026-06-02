@@ -70,25 +70,25 @@ pub(crate) type CancelTokenSlot<S, O> =
     <S as Storage>::Lock<Option<GenericCancellationToken<S, O>>>;
 
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
-pub struct GenericAsyncScope<'ctx, S: Storage, O: Ownership + 'static, TExtra> {
-    context: RuntimeScopeContext<'ctx, TExtra>,
+pub struct GenericAsyncScope<'scope, S: Storage, O: Ownership + 'static, TExtra> {
+    context: RuntimeScopeContext<TExtra>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
-    _phantom: std::marker::PhantomData<fn(&'ctx ()) -> &'ctx ()>,
+    _phantom: std::marker::PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-pub type AsyncScope<'ctx, TExtra> = GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra>;
-pub type LocalAsyncScope<'ctx, TExtra> = GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra>;
+pub type AsyncScope<'scope, TExtra> = GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExtra>;
+pub type LocalAsyncScope<'scope, TExtra> = GenericAsyncScope<'scope, LocalStorage, RcOwnership, TExtra>;
 
-impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
-    for GenericAsyncScope<'ctx, S, O, TExtra>
+impl<'scope, S: Storage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
+    for GenericAsyncScope<'scope, S, O, TExtra>
 {
     type Storage = S;
     type Ownership = O;
     type Arena = GenericArena<S>;
     #[inline]
     fn runtime(&self) -> &RuntimeShared<TExtra> {
-        self.context.shared
+        self.context.shared()
     }
     #[inline]
     fn arena(&self) -> &Self::Arena {
@@ -100,8 +100,8 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
     }
 }
 
-impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S, O, TExtra> {
-    pub fn new(context: RuntimeScopeContext<'ctx, TExtra>, parent: Option<AnyScopeRef>) -> Self {
+impl<'scope, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'scope, S, O, TExtra> {
+    pub fn new(context: RuntimeScopeContext<TExtra>, parent: Option<AnyScopeRef>) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
         if let Some(ref parent) = parent {
@@ -120,10 +120,10 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
 
     pub fn spawn_local<'scope_ref, T: Send, TTask>(
         &'scope_ref self,
-        task: &'ctx TTask,
+        task: &'scope TTask,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
-        TTask: LocalTask<T> + Sized + 'ctx,
+        TTask: LocalTask<T> + Sized + 'scope,
     {
         self.completion.add_task();
 
@@ -133,9 +133,9 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
             let scope_ref = self.scope_completion_ref().cast::<LocalStorage>();
             task_ref
                 .header()
-                .initialize(&self.context.shared.base, worker_id, scope_ref);
+                .initialize(&self.context.shared().base, worker_id, scope_ref);
         }
-        self.context.shared.enqueue_local(worker_id, task_ref);
+        self.context.shared().enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(self, task_ref, task, None)
     }
@@ -152,7 +152,7 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
         let node = LocalBoxedTaskNode::new(future);
         unsafe {
             node.header
-                .initialize(&self.context.shared.base, worker_id, scope_ref);
+                .initialize(&self.context.shared().base, worker_id, scope_ref);
         }
         let layout = Layout::new::<LocalBoxedTaskNode<T, F>>();
         let node_ptr = unsafe {
@@ -167,7 +167,7 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
         self.completion.add_task();
 
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
-        self.context.shared.enqueue_local(worker_id, task_ref);
+        self.context.shared().enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -190,7 +190,7 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
 
     pub async fn wait_all(&self) {
         self.context
-            .shared
+            .shared()
             .drive_worker::<S, O>(Some(&self.completion));
         if let Some(panic_info) = self.completion.take_panic() {
             std::panic::resume_unwind(panic_info);
@@ -207,12 +207,12 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
 
     #[inline]
     pub fn shared(&self) -> &RuntimeShared<TExtra> {
-        self.context.shared
+        self.context.shared()
     }
 }
 
-impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> Drop
-    for GenericAsyncScope<'ctx, S, O, TExtra>
+impl<'scope, S: Storage, O: Ownership + 'static, TExtra> Drop
+    for GenericAsyncScope<'scope, S, O, TExtra>
 {
     fn drop(&mut self) {
         if !self.completion.is_done() {
@@ -222,17 +222,17 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> Drop
 }
 
 // 线程安全作用域特合方法
-impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> {
+impl<'scope, TExtra> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExtra> {
     fn spawn_send_impl<'scope_ref, T: Send, S_>(
         &'scope_ref self,
         worker_id: usize,
-        task: &'ctx S_,
+        task: &'scope S_,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        S_: SendTask<T> + Sized + 'ctx,
+        S_: SendTask<T> + Sized + 'scope,
     {
         debug_assert!(
-            worker_id < self.context.shared.worker_count().get(),
+            worker_id < self.context.shared().worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -241,12 +241,12 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
         unsafe {
             task_ref.header().initialize(
-                &self.context.shared.base,
+                &self.context.shared().base,
                 worker_id,
                 self.scope_completion_ref(),
             );
         }
-        self.context.shared.enqueue_send(worker_id, task_ref);
+        self.context.shared().enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(self, task_ref, task, None)
     }
@@ -254,13 +254,13 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
     pub fn spawn_to<'scope_ref, T: Send, S_>(
         &'scope_ref self,
         worker_id: usize,
-        task: &'ctx S_,
+        task: &'scope S_,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        S_: SendTask<T> + Sized + Sync + 'ctx,
+        S_: SendTask<T> + Sized + Sync + 'scope,
     {
         debug_assert!(
-            worker_id < self.context.shared.worker_count().get(),
+            worker_id < self.context.shared().worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -268,7 +268,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let state = RoutedSpawnState::new();
         self.completion.add_task();
 
-        let runtime = self.context.shared;
+        let runtime = self.context.shared();
         let runtime_base_ptr = SendPtr::new(NonNull::from(&runtime.base));
         let completion = self.completion.clone();
         let state_for_job = state.clone();
@@ -311,12 +311,12 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
 
     pub fn spawn<'scope_ref, T: Send, S_>(
         &'scope_ref self,
-        task: &'ctx S_,
+        task: &'scope S_,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        S_: SendTask<T> + Sized + 'ctx,
+        S_: SendTask<T> + Sized + 'scope,
     {
-        self.spawn_send_impl(self.context.shared.choose_worker(), task)
+        self.spawn_send_impl(self.context.shared().choose_worker(), task)
     }
 
     fn spawn_boxed_send_impl<'scope_ref, T: Send, F>(
@@ -328,7 +328,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         F: Future<Output = T> + Send + 'scope_ref,
     {
         debug_assert!(
-            worker_id < self.context.shared.worker_count().get(),
+            worker_id < self.context.shared().worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -336,7 +336,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let node = SendBoxedTaskNode::new(future);
         unsafe {
             node.header
-                .initialize(&self.context.shared.base, worker_id, scope_ref);
+                .initialize(&self.context.shared().base, worker_id, scope_ref);
         }
         let layout = Layout::new::<SendBoxedTaskNode<T, F>>();
         let node_ptr = unsafe {
@@ -351,7 +351,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         self.completion.add_task();
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-        self.context.shared.enqueue_send(worker_id, task_ref);
+        self.context.shared().enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(
             self,
@@ -373,7 +373,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         F: AsyncFnOnce() -> T + Send + 'scope_ref,
     {
         debug_assert!(
-            worker_id < self.context.shared.worker_count().get(),
+            worker_id < self.context.shared().worker_count().get(),
             "worker_id {} is out of bounds",
             worker_id
         );
@@ -381,7 +381,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let state = RoutedSpawnState::new();
         self.completion.add_task();
 
-        let runtime = self.context.shared;
+        let runtime = self.context.shared();
         let runtime_ptr = SendPtr::new(NonNull::from(runtime));
         let completion = self.completion.clone();
         let state_for_job = state.clone();
@@ -443,18 +443,18 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
     where
         F: Future<Output = T> + Send + 'scope_ref,
     {
-        self.spawn_boxed_send_impl(self.context.shared.choose_worker(), future)
+        self.spawn_boxed_send_impl(self.context.shared().choose_worker(), future)
     }
 }
 
 // 本地作用域特有方法
-impl<'ctx, TExtra> GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra> {
+impl<'scope, TExtra> GenericAsyncScope<'scope, LocalStorage, RcOwnership, TExtra> {
     pub fn spawn<'scope_ref, T: Send, S_>(
         &'scope_ref self,
-        task: &'ctx S_,
+        task: &'scope S_,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
-        S_: LocalTask<T> + Sized + 'ctx,
+        S_: LocalTask<T> + Sized + 'scope,
     {
         self.spawn_local(task)
     }

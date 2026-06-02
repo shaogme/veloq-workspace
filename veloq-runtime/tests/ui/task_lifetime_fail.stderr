@@ -19,8 +19,8 @@ error[E0716]: temporary value dropped while borrowed
 note: requirement that the value outlives `'1` introduced here
   --> src/scope.rs
    |
-   |         TTask: LocalTask<T> + Sized + 'ctx,
-   |                                       ^^^^
+   |         TTask: LocalTask<T> + Sized + 'scope,
+   |                                       ^^^^^^
    = note: this error originates in the macro `task_local` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0716]: temporary value dropped while borrowed
@@ -64,8 +64,8 @@ error[E0716]: temporary value dropped while borrowed
 note: requirement that the value outlives `'1` introduced here
   --> src/scope.rs
    |
-   |         S_: SendTask<T> + Sized + 'ctx,
-   |                                   ^^^^
+   |         S_: SendTask<T> + Sized + 'scope,
+   |                                   ^^^^^^
    = note: this error originates in the macro `task` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0716]: temporary value dropped while borrowed

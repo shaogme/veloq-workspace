@@ -62,8 +62,6 @@ fn test_nested_scope_build_3() {
     });
 }
 
-
-
 #[test]
 fn test_nested_scope_build_4() {
     let rt = Runtime::<_, (), _>::new();

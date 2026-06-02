@@ -89,37 +89,44 @@ unsafe impl Send for RuntimeContext {}
 unsafe impl Sync for RuntimeContext {}
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
-pub struct RuntimeScopeContext<'ctx, T> {
-    pub(crate) shared: &'ctx RuntimeShared<T>,
+pub struct RuntimeScopeContext<T> {
+    shared: *const RuntimeShared<T>,
 }
 
-impl<'ctx, T> Copy for RuntimeScopeContext<'ctx, T> {}
+unsafe impl<T> Send for RuntimeScopeContext<T> {}
+unsafe impl<T> Sync for RuntimeScopeContext<T> {}
 
-impl<'ctx, T> Clone for RuntimeScopeContext<'ctx, T> {
+impl<T> Copy for RuntimeScopeContext<T> {}
+
+impl<T> Clone for RuntimeScopeContext<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
+impl<T> RuntimeScopeContext<T> {
+    pub fn new(shared: *const RuntimeShared<T>) -> Self {
+        Self { shared }
+    }
+
     /// Returns the total worker count in the runtime.
     pub fn worker_count(&self) -> NonZeroUsize {
-        self.shared.worker_count()
+        self.shared().worker_count()
     }
 
     /// Wakes up the specified worker.
     pub fn wake_worker(&self, worker_id: usize) {
-        self.shared.wake_worker(worker_id);
+        self.shared().wake_worker(worker_id);
     }
 
     /// Checks if the runtime is shutting down.
     pub fn is_shutdown(&self) -> bool {
-        self.shared.base.shutdown.load(Ordering::Acquire)
+        self.shared().base.shutdown.load(Ordering::Acquire)
     }
 
     /// Returns the shared runtime state.
-    pub fn shared(&self) -> &'ctx RuntimeShared<T> {
-        self.shared
+    pub fn shared<'a>(&self) -> &'a RuntimeShared<T> {
+        unsafe { &*self.shared }
     }
 
     pub fn route_to<'scope_ref, F, Fut>(
@@ -192,7 +199,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         let task = Box::new(RouteJobTask {
             header: TaskHeader::new(
                 RouteJobTask::<'scope_ref, F, Fut>::VTABLE,
-                &self.shared.base,
+                &self.shared().base,
                 worker_id,
                 ScopeRef::<AtomicStorage>::dummy(),
             ),
@@ -208,7 +215,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
         let header_ptr = task_ref.header() as *const GenericTaskHeader<AtomicStorage>;
         let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
 
-        if !self.shared.enqueue_pinned(worker_id, task_ctx) {
+        if !self.shared().enqueue_pinned(worker_id, task_ctx) {
             unsafe {
                 let _ = Box::from_raw(ptr);
             }
@@ -233,7 +240,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     }
 
     /// Creates a new thread-safe (Send) asynchronous scope.
-    pub async fn scope<R, F>(&self, f: F) -> R
+    pub async fn scope<'ctx, R, F>(&self, f: F) -> R
     where
         F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'ctx, T>) -> R,
     {
@@ -250,7 +257,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
     }
 
     /// Creates a new thread-local asynchronous scope.
-    pub async fn scope_local<R, F>(&self, f: F) -> R
+    pub async fn scope_local<'ctx, R, F>(&self, f: F) -> R
     where
         F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'ctx, T>) -> R,
     {
@@ -268,7 +275,7 @@ impl<'ctx, T> RuntimeScopeContext<'ctx, T> {
 
     /// Returns the current worker id.
     pub fn worker_id(&self) -> usize {
-        self.shared
+        self.shared()
             .base
             .tls
             .try_with(|ctx| ctx.worker_id)
@@ -327,7 +334,7 @@ impl<'ctx, T> WorkerInitContext<'ctx, T> {
 
     /// Returns the runtime scope context.
     #[inline]
-    pub fn scope(&self) -> RuntimeScopeContext<'ctx, T> {
+    pub fn scope(&self) -> RuntimeScopeContext<T> {
         RuntimeScopeContext {
             shared: self.shared,
         }
