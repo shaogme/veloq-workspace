@@ -5,7 +5,8 @@ union! {
     pub enum Error =
         io::Error as Io |
         veloq_driver_native::error::DriverErrorKind as DriverKind |
-        veloq_driver_native::error::Error as Driver
+        veloq_driver_native::error::Error as Driver |
+        veloq_buf::BufError as Buf
 }
 
 pub type Result<T> = std::result::Result<T, Report<Error>>;

@@ -1,7 +1,6 @@
 pub mod context;
 
 use std::cell::RefCell;
-use std::io;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
 use std::sync::{Arc, mpsc};
@@ -60,7 +59,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn build(self) -> io::Result<Runtime<T>> {
+    pub fn build(self) -> crate::error::Result<Runtime<T>> {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
             thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
@@ -69,7 +68,10 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         // Initialize blocking pool using config
         init_blocking_pool(self.config.get_blocking_pool_config().clone());
 
-        let state = self.topology.init(worker_count.get())?;
+        let state = self
+            .topology
+            .init(worker_count.get())
+            .map_err(crate::error::from_report)?;
 
         Ok(Runtime {
             worker_count,

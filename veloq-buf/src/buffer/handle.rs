@@ -6,7 +6,9 @@ use std::ptr::NonNull;
 
 use bilge::prelude::*;
 
-use super::common::{AllocError, PoolKind, RegionInfo};
+use super::common::{PoolKind, RegionInfo};
+use super::error::{BufError, BufResult};
+use diagweave::prelude::*;
 
 #[bitsize(64)]
 #[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
@@ -172,14 +174,18 @@ impl FixedBuf {
     /// This is used as a fallback when the pool is full.
     /// Note: Heap-allocated buffers may not be registered with the I/O driver
     /// and thus may incur overhead for direct I/O operations.
-    pub fn alloc_heap(len: NonZeroUsize) -> Result<Self, AllocError> {
+    pub fn alloc_heap(len: NonZeroUsize) -> BufResult<Self> {
         // Allocate space for the metadata block plus the payload.
         // We use os::alloc_pages to ensure page alignment for both.
-        let total_size = len.get().checked_add(4096).ok_or(AllocError::Oom)?;
+        let total_size = len
+            .get()
+            .checked_add(4096)
+            .ok_or_else(|| BufError::oom().to_report())?;
         let total_size_nz = unsafe { NonZeroUsize::new_unchecked(total_size) };
 
-        let base_ptr =
-            unsafe { crate::os::alloc_pages(total_size_nz) }.map_err(|_| AllocError::Oom)?;
+        let base_ptr = unsafe { crate::os::alloc_pages(total_size_nz) }
+            .to_report()
+            .map_report_err(BufError::from)?;
 
         // Initialize the control block in the first page
         let control = unsafe { &mut *(base_ptr as *mut HeapControlBlock) };

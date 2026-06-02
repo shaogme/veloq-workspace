@@ -1,6 +1,5 @@
 //! Common traits and types for buffer management.
 
-use std::alloc::LayoutError;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::ptr::NonNull;
 
@@ -128,7 +127,7 @@ pub trait BufferRegistrar {
     /// Register memory regions with the kernel.
     /// Returns a list of handles (tokens) corresponding to the regions.
     /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
-    fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>>;
+    fn register(&self, regions: &[BufferRegion]) -> super::error::BufResult<Vec<usize>>;
 
     /// Resolve chunk info for a given chunk_id.
     /// Used for lazy registration.
@@ -139,7 +138,7 @@ pub trait BufferRegistrar {
 pub struct NoopRegistrar;
 
 impl BufferRegistrar for NoopRegistrar {
-    fn register(&self, _regions: &[BufferRegion]) -> std::io::Result<Vec<usize>> {
+    fn register(&self, _regions: &[BufferRegion]) -> super::error::BufResult<Vec<usize>> {
         Ok(Vec::new())
     }
 
@@ -169,34 +168,4 @@ pub trait BackingPool: std::fmt::Debug {
 pub trait BufPool: std::fmt::Debug {
     /// Allocate a buffer ready for I/O.
     fn alloc(&self, len: NonZeroUsize) -> Option<super::handle::FixedBuf>;
-}
-
-#[derive(Debug)]
-pub enum AllocError {
-    Layout(LayoutError),
-    Oom,
-}
-
-impl std::fmt::Display for AllocError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AllocError::Layout(e) => write!(f, "Layout error: {}", e),
-            AllocError::Oom => write!(f, "Out of memory"),
-        }
-    }
-}
-
-impl std::error::Error for AllocError {}
-
-impl From<AllocError> for std::io::Error {
-    fn from(err: AllocError) -> Self {
-        match err {
-            AllocError::Layout(_) => {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Layout error")
-            }
-            AllocError::Oom => {
-                std::io::Error::new(std::io::ErrorKind::OutOfMemory, "Out of memory")
-            }
-        }
-    }
 }

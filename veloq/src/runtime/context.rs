@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::mpsc;
 
-use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
+use veloq_buf::{AnyBufPool, BufError, BufPool, FixedBuf};
 use veloq_driver_native::driver::{
     ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver,
 };
@@ -12,6 +12,7 @@ use veloq_runtime::utils::storage::AtomicStorage;
 
 use crate::config::BufferRegistrationMode;
 use crate::error::{Result as VeloqResult, from_io_error};
+use diagweave::prelude::*;
 use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared};
 
 /// 驱动注册中心的消息类型
@@ -71,7 +72,7 @@ impl<'a, 'ctx> DriverRegistrar<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'a, 'ctx> {
-    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> std::io::Result<Vec<usize>> {
+    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> veloq_buf::BufResult<Vec<usize>> {
         self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
     }
 
@@ -94,7 +95,7 @@ pub(crate) struct BorrowedRegistrar<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> veloq_buf::BufferRegistrar for BorrowedRegistrar<'a, 'ctx> {
-    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> std::io::Result<Vec<usize>> {
+    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> veloq_buf::BufResult<Vec<usize>> {
         register_internal(self.driver, self.state, regions)
     }
 
@@ -107,7 +108,7 @@ fn register_internal(
     driver: &RefCell<PlatformDriver<'_>>,
     state: &RefCell<WorkerRegistrarState>,
     regions: &[veloq_buf::BufferRegion],
-) -> std::io::Result<Vec<usize>> {
+) -> veloq_buf::BufResult<Vec<usize>> {
     let mut indices = Vec::with_capacity(regions.len());
     let mut new_chunks = Vec::with_capacity(regions.len());
 
@@ -117,7 +118,9 @@ fn register_internal(
             let chunk_idx = idx as u16;
             driver
                 .register_chunk(chunk_idx, region.as_ptr(), region.len())
-                .map_err(|err| std::io::Error::other(format!("{err:#}")))?;
+                .map_err(|err| std::io::Error::other(format!("{err:#}")))
+                .to_report()
+                .map_report_err(BufError::from)?;
 
             new_chunks.push(veloq_buf::heap::ChunkInfo {
                 id: chunk_idx,
@@ -277,7 +280,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
         self.buf_pool().alloc(size)
     }
 
-    pub fn try_alloc(&self, size: NonZeroUsize) -> Result<FixedBuf, veloq_buf::AllocError> {
+    pub fn try_alloc(&self, size: NonZeroUsize) -> veloq_buf::BufResult<FixedBuf> {
         self.try_alloc_from_pool(size)
             .map_or_else(|| FixedBuf::alloc_heap(size), Ok)
     }

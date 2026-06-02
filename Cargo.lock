@@ -1309,6 +1309,7 @@ dependencies = [
  "core_affinity",
  "criterion",
  "crossbeam-utils",
+ "diagweave",
  "libc",
  "parking_lot",
  "tempfile",

@@ -47,11 +47,13 @@
 
 mod any;
 mod common;
+mod error;
 mod handle;
 mod slot_pool;
 
 pub use any::*;
 pub use common::*;
+pub use error::*;
 pub use handle::*;
 pub use slot_pool::*;
 

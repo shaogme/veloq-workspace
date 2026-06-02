@@ -9,6 +9,7 @@ use super::any::AnyBufPool;
 use super::common::{
     AllocResult, BackingPool, BufPool, BufferRegion, BufferRegistrar, PoolKind, RegionInfo,
 };
+use super::error::BufResult;
 use super::handle::{FixedBuf, PackedContext};
 
 /// 定义 Runtime 所有工作线程的缓冲池拓扑结构
@@ -27,7 +28,7 @@ pub trait PoolTopology: Clone + Send + Sync {
 
     /// Initialize the global/shared state.
     /// Called once by the Runtime Builder.
-    fn init(&self, worker_count: usize) -> std::io::Result<Self::State>;
+    fn init(&self, worker_count: usize) -> BufResult<Self::State>;
 
     /// Build the `AnyBufPool` for a specific worker.
     /// Called within each worker thread.
@@ -65,10 +66,7 @@ impl UniformSlot {
     }
 
     // Backward compatibility shim for tests if needed
-    pub fn create_pool(
-        &self,
-        worker_count: usize,
-    ) -> std::io::Result<Arc<crate::heap::GlobalSlotPool>> {
+    pub fn create_pool(&self, worker_count: usize) -> BufResult<Arc<crate::heap::GlobalSlotPool>> {
         self.init(worker_count)
     }
 }
@@ -76,7 +74,7 @@ impl UniformSlot {
 impl PoolTopology for UniformSlot {
     type State = Arc<crate::heap::GlobalSlotPool>;
 
-    fn init(&self, worker_count: usize) -> std::io::Result<Self::State> {
+    fn init(&self, worker_count: usize) -> BufResult<Self::State> {
         let total_size =
             self.multiplier.0.get() * crate::heap::MIN_THREAD_MEMORY.get() * 2 * worker_count;
         let config = crate::heap::GlobalAllocatorConfig {

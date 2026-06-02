@@ -6,10 +6,11 @@ use super::units::{
     ChunkInfo, GlobalAllocatorConfig, SLOT_SIZE, SUPERBLOCK_ORDER, SUPERBLOCK_SIZE, SlotIndex,
     SuperblockState,
 };
+use crate::buffer::{BufError, BufResult};
 use crossbeam_utils::CachePadded;
+use diagweave::prelude::*;
 use parking_lot::{Mutex, RwLock};
 use std::hash::{Hash, Hasher};
-use std::io;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -27,18 +28,23 @@ unsafe impl Send for MemoryChunk {}
 unsafe impl Sync for MemoryChunk {}
 
 impl MemoryChunk {
-    pub fn new(size: NonZeroUsize) -> std::io::Result<Self> {
+    pub fn new(size: NonZeroUsize) -> BufResult<Self> {
         let ptr = unsafe {
             // Try Huge Pages first
             match crate::os::alloc_huge_pages(size) {
                 Ok(p) => NonNull::new(p),
                 Err(_) => {
                     // Fallback to standard pages if Huge Pages failed
-                    crate::os::alloc_pages(size).map(NonNull::new)?
+                    let p = crate::os::alloc_pages(size)
+                        .to_report()
+                        .map_report_err(BufError::from)?;
+                    NonNull::new(p)
                 }
             }
         }
-        .ok_or_else(|| std::io::Error::other("Allocation failed"))?;
+        .ok_or_else(|| {
+            BufError::alloc_failed("Allocation returned null pointer".to_string()).to_report()
+        })?;
         Ok(Self { ptr, size })
     }
 
@@ -113,7 +119,7 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    pub fn new(id: u16, size: usize) -> io::Result<Self> {
+    pub fn new(id: u16, size: usize) -> BufResult<Self> {
         // 1. Allocate the massive slab
         let chunk = Arc::new(MemoryChunk::new(unsafe {
             NonZeroUsize::new_unchecked(size)
@@ -146,10 +152,7 @@ impl Chunk {
         let bytes_per_shard = slots_per_shard * SLOT_SIZE;
 
         if slots_per_shard == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "Chunk memory size too small for sharding",
-            ));
+            return Err(BufError::chunk_too_small().to_report());
         }
 
         // 3. Initialize Buddy Allocators (Sharded)
@@ -369,14 +372,11 @@ pub struct GlobalSlotPool {
 
 impl GlobalSlotPool {
     /// Create a new GlobalSlotPool
-    pub fn new(config: GlobalAllocatorConfig) -> io::Result<Self> {
+    pub fn new(config: GlobalAllocatorConfig) -> BufResult<Self> {
         let total_size = config.total_memory;
 
         if total_size < super::units::MIN_THREAD_MEMORY.get() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Total memory too small",
-            ));
+            return Err(BufError::chunk_too_small().to_report());
         }
 
         // Initial Chunk (ID=0)

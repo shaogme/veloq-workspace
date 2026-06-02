@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
+use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, from_report};
 use crate::runtime::context::RuntimeContext;
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::Open;
@@ -99,7 +99,7 @@ impl OpenOptions {
         ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> VeloqResult<super::file::LocalFile<'a, 'ctx>> {
-        let op = self.build_op(&ctx, path.as_ref()).map_err(from_io_error)?;
+        let op = self.build_op(&ctx, path.as_ref())?;
         use veloq_driver_native::op::{LocalSubmitter, Op};
 
         let submitter = LocalSubmitter::new();
@@ -132,7 +132,7 @@ impl OpenOptions {
         ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> VeloqResult<super::file::File<'a, 'ctx>> {
-        let op = self.build_op(&ctx, path.as_ref()).map_err(from_io_error)?;
+        let op = self.build_op(&ctx, path.as_ref())?;
         use veloq_driver_native::op::{DetachedSubmitter, Op};
 
         let submitter = DetachedSubmitter::new();
@@ -155,7 +155,7 @@ impl OpenOptions {
         &self,
         ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
         path: &Path,
-    ) -> std::io::Result<Open> {
+    ) -> VeloqResult<Open> {
         use std::num::NonZeroUsize;
         use std::os::unix::ffi::OsStrExt;
 
@@ -163,13 +163,13 @@ impl OpenOptions {
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
 
-        let mut buf = ctx.try_alloc(len_nz)?;
+        let mut buf = ctx.try_alloc(len_nz).map_err(from_report)?;
         let slice = buf.as_slice_mut();
         if slice.len() < len {
-            return Err(std::io::Error::new(
+            return Err(from_io_error(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 "path too long for buffer",
-            ));
+            )));
         }
         slice[..len - 1].copy_from_slice(path_bytes);
         slice[len - 1] = 0;
@@ -219,7 +219,7 @@ impl OpenOptions {
         &self,
         ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
         path: &Path,
-    ) -> std::io::Result<Open> {
+    ) -> VeloqResult<Open> {
         use std::num::NonZeroUsize;
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
@@ -234,13 +234,13 @@ impl OpenOptions {
         path_w.push(0);
         let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
 
-        let mut buf = ctx.try_alloc(len_bytes)?;
+        let mut buf = ctx.try_alloc(len_bytes).map_err(from_report)?;
         let slice = buf.as_slice_mut();
         if slice.len() < len_bytes.get() {
-            return Err(std::io::Error::new(
+            return Err(from_io_error(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 "path too long for buffer",
-            ));
+            )));
         }
 
         unsafe {
