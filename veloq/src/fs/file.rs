@@ -1,7 +1,8 @@
 use super::open_options::OpenOptions;
+use crate::fs::error::FsError;
 use crate::runtime::context::RuntimeContext;
 
-use diagweave::report::ResultReportExt;
+use diagweave::report::{Diagnostic, ResultReportExt};
 use veloq_buf::FixedBuf;
 use veloq_driver_native::driver::Driver;
 use veloq_driver_native::op::{
@@ -18,7 +19,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use crate::error::{Result as VeloqResult, from_io_error, to_io_error};
+use crate::error::{Result as VeloqResult, to_io_error};
 
 #[cfg(not(unix))]
 macro_rules! ignore {
@@ -119,9 +120,10 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
+        let buf = op
+            .map(|o| o.buf)
+            .ok_or(FsError::op_buffer_lost())
+            .diag(|r| r.map_err(Into::into))?;
         Ok((res.trans_inner_err()?, buf))
     }
 
@@ -143,9 +145,10 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
+        let buf = op
+            .map(|o| o.buf)
+            .ok_or(FsError::op_buffer_lost())
+            .diag(|r| r.map_err(Into::into))?;
         Ok((res.trans_inner_err()?, buf))
     }
 
@@ -457,11 +460,7 @@ impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
         match Pin::new(&mut this.inner).poll(cx) {
             Poll::Ready(res) => {
                 let (res, _) = res.into_inner();
-                Poll::Ready(
-                    res.map(|_| ())
-                        .trans_inner_err()
-                        .map_err(to_io_error),
-                )
+                Poll::Ready(res.map(|_| ()).trans_inner_err().map_err(to_io_error))
             }
             Poll::Pending => Poll::Pending,
         }

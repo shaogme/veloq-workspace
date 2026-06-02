@@ -183,8 +183,8 @@ impl FixedBuf {
             .ok_or_else(|| BufError::oom().to_report())?;
         let total_size_nz = unsafe { NonZeroUsize::new_unchecked(total_size) };
 
-        let base_ptr = unsafe { crate::os::alloc_pages(total_size_nz) }
-            .diag(|r| r.map_err(BufError::from))?;
+        let base_ptr =
+            unsafe { crate::os::alloc_pages(total_size_nz) }.diag(|r| r.map_err(BufError::from))?;
 
         // Initialize the control block in the first page
         let control = unsafe { &mut *(base_ptr as *mut HeapControlBlock) };

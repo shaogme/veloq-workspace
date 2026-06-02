@@ -1,7 +1,7 @@
-use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::error::{Result as VeloqResult, from_io_error};
+use crate::net::error::NetError;
 use crate::runtime::context::RuntimeContext;
 use diagweave::report::ResultReportExt;
 use veloq_driver_native::Socket;
@@ -45,30 +45,22 @@ impl TcpSocket {
 
     /// Set `SO_RCVBUF` option.
     pub fn set_recv_buffer_size(&self, size: usize) -> VeloqResult<()> {
-        self.inner
-            .set_recv_buffer_size(size)
-            .trans_inner_err()
+        self.inner.set_recv_buffer_size(size).trans_inner_err()
     }
 
     /// Set `SO_SNDBUF` option.
     pub fn set_send_buffer_size(&self, size: usize) -> VeloqResult<()> {
-        self.inner
-            .set_send_buffer_size(size)
-            .trans_inner_err()
+        self.inner.set_send_buffer_size(size).trans_inner_err()
     }
 
     /// Set `SO_REUSEADDR` option.
     pub fn set_reuse_address(&self, reuse: bool) -> VeloqResult<()> {
-        self.inner
-            .set_reuse_address(reuse)
-            .trans_inner_err()
+        self.inner.set_reuse_address(reuse).trans_inner_err()
     }
 
     /// Set `SO_KEEPALIVE` option.
     pub fn set_keepalive(&self, keepalive: bool) -> VeloqResult<()> {
-        self.inner
-            .set_keepalive(keepalive)
-            .trans_inner_err()
+        self.inner.set_keepalive(keepalive).trans_inner_err()
     }
 
     /// Set `IP_TTL` option.
@@ -84,12 +76,8 @@ impl TcpSocket {
             .to_socket_addrs()
             .map_err(from_io_error)?
             .next()
-            .ok_or_else(|| {
-                from_io_error(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "No address provided",
-                ))
-            })?;
+            .ok_or_else(|| NetError::NoAddressProvided.to_report())
+            .trans_inner_err()?;
         self.inner.bind(addr).trans_inner_err()
     }
 
@@ -102,9 +90,7 @@ impl TcpSocket {
         backlog: u32,
     ) -> VeloqResult<TcpListener<'a, 'ctx>> {
         let local_addr = self.inner.local_addr().trans_inner_err()?;
-        self.inner
-            .listen(backlog as i32)
-            .trans_inner_err()?;
+        self.inner.listen(backlog as i32).trans_inner_err()?;
         Ok(GenericTcpListener {
             inner: InnerSocket::new(
                 ctx,
@@ -155,30 +141,22 @@ impl UdpSocketBuilder {
 
     /// Set `SO_BROADCAST` option.
     pub fn set_broadcast(&self, broadcast: bool) -> VeloqResult<()> {
-        self.inner
-            .set_broadcast(broadcast)
-            .trans_inner_err()
+        self.inner.set_broadcast(broadcast).trans_inner_err()
     }
 
     /// Set `SO_RCVBUF` option.
     pub fn set_recv_buffer_size(&self, size: usize) -> VeloqResult<()> {
-        self.inner
-            .set_recv_buffer_size(size)
-            .trans_inner_err()
+        self.inner.set_recv_buffer_size(size).trans_inner_err()
     }
 
     /// Set `SO_SNDBUF` option.
     pub fn set_send_buffer_size(&self, size: usize) -> VeloqResult<()> {
-        self.inner
-            .set_send_buffer_size(size)
-            .trans_inner_err()
+        self.inner.set_send_buffer_size(size).trans_inner_err()
     }
 
     /// Set `SO_REUSEADDR` option.
     pub fn set_reuse_address(&self, reuse: bool) -> VeloqResult<()> {
-        self.inner
-            .set_reuse_address(reuse)
-            .trans_inner_err()
+        self.inner.set_reuse_address(reuse).trans_inner_err()
     }
 
     /// Set `IP_TTL` option.
@@ -198,12 +176,8 @@ impl UdpSocketBuilder {
             .to_socket_addrs()
             .map_err(from_io_error)?
             .next()
-            .ok_or_else(|| {
-                from_io_error(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "No address provided",
-                ))
-            })?;
+            .ok_or_else(|| NetError::NoAddressProvided.to_report())
+            .trans_inner_err()?;
         self.inner.bind(addr).trans_inner_err()?;
         let local_addr = self.inner.local_addr().trans_inner_err()?;
 

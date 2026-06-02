@@ -69,10 +69,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         // Initialize blocking pool using config
         init_blocking_pool(self.config.get_blocking_pool_config().clone());
 
-        let state = self
-            .topology
-            .init(worker_count.get())
-            .trans_inner_err()?;
+        let state = self.topology.init(worker_count.get()).trans_inner_err()?;
 
         Ok(Runtime {
             worker_count,

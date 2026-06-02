@@ -1,10 +1,10 @@
-use std::io;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::{Result as VeloqResult, from_io_error};
+use crate::error::Result as VeloqResult;
+use crate::net::error::NetError;
 use crate::runtime::context::{RuntimeContext, submit_control_task};
 use diagweave::report::ResultReportExt;
 use veloq_driver_native::driver::{Driver, RegisterFd};
@@ -24,10 +24,7 @@ pub struct SocketToken<'a, 'ctx> {
 impl<'a, 'ctx> SocketToken<'a, 'ctx> {
     pub(crate) fn new(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> VeloqResult<Self> {
         if !handle.borrow().is_socket() {
-            return Err(from_io_error(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "socket registration requires socket handle",
-            )));
+            return Err(NetError::InvalidSocketHandle.to_report()).trans_inner_err();
         }
 
         // SAFETY: caller transfers ownership via RawHandle created from OwnedRawHandle::into_raw.
@@ -37,9 +34,9 @@ impl<'a, 'ctx> SocketToken<'a, 'ctx> {
                 .register_files(vec![RegisterFd::Owned(owned)])
                 .trans_inner_err()
                 .and_then(|mut fds| {
-                    fds.pop().ok_or_else(|| {
-                        from_io_error(io::Error::other("register_files returned empty"))
-                    })
+                    fds.pop()
+                        .ok_or_else(|| NetError::RegistrationEmpty.to_report())
+                        .trans_inner_err()
                 })
         })?;
         Ok(Self {
@@ -128,10 +125,8 @@ where
     }
 
     pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
-        self.local_addr.ok_or_else(|| {
-            from_io_error(io::Error::other(
-                "local addr is unavailable for this socket",
-            ))
-        })
+        self.local_addr
+            .ok_or_else(|| NetError::LocalAddrUnavailable.to_report())
+            .trans_inner_err()
     }
 }

@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use crate::error::{Result as VeloqResult, from_io_error};
+use crate::error::Result as VeloqResult;
+use crate::fs::error::FsError;
 use crate::runtime::context::RuntimeContext;
-use diagweave::report::ResultReportExt;
+use diagweave::report::{Diagnostic, ResultReportExt};
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::Open;
 
@@ -108,14 +109,15 @@ impl OpenOptions {
         let owned = res.trans_inner_err()?;
         let fd = owned.into_raw();
         let fixed = ctx.driver(|mut driver| {
-            driver
+            let res = driver
                 .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
                 .trans_inner_err()?
                 .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    from_io_error(std::io::Error::other("register_files returned empty"))
-                })
+                .next();
+            match res {
+                Some(fixed) => Ok(fixed),
+                None => Err(FsError::register_failed()).diag(|r| r.map_err(Into::into)),
+            }
         })?;
         use std::cell::Cell;
 
@@ -157,21 +159,18 @@ impl OpenOptions {
         ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
         path: &Path,
     ) -> VeloqResult<Open> {
-        use std::num::NonZeroUsize;
         use diagweave::report::ResultReportExt;
+        use std::num::NonZeroUsize;
         use std::os::unix::ffi::OsStrExt;
 
         let path_bytes = path.as_os_str().as_bytes();
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
 
-        let mut buf = ctx.try_alloc(len_nz).map_report_err(|r| r.into())?;
+        let mut buf = ctx.try_alloc(len_nz).trans_inner_err()?;
         let slice = buf.as_slice_mut();
         if slice.len() < len {
-            return Err(from_io_error(std::io::Error::new(
-                std::io::ErrorKind::OutOfMemory,
-                "path too long for buffer",
-            )));
+            return Err(FsError::path_too_long()).diag(|r| r.map_err(Into::into));
         }
         slice[..len - 1].copy_from_slice(path_bytes);
         slice[len - 1] = 0;
@@ -222,9 +221,9 @@ impl OpenOptions {
         ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
         path: &Path,
     ) -> VeloqResult<Open> {
+        use diagweave::report::ResultReportExt;
         use std::num::NonZeroUsize;
         use std::os::windows::ffi::OsStrExt;
-        use diagweave::report::ResultReportExt;
         use windows_sys::Win32::Foundation::*;
         use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
 
@@ -240,10 +239,7 @@ impl OpenOptions {
         let mut buf = ctx.try_alloc(len_bytes).trans_inner_err()?;
         let slice = buf.as_slice_mut();
         if slice.len() < len_bytes.get() {
-            return Err(from_io_error(std::io::Error::new(
-                std::io::ErrorKind::OutOfMemory,
-                "path too long for buffer",
-            )));
+            return Err(FsError::path_too_long()).diag(|r| r.map_err(Into::into));
         }
 
         unsafe {

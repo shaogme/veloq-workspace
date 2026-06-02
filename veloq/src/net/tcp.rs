@@ -3,9 +3,11 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::{Result as VeloqResult, from_io_error, to_io_error};
+use crate::error::{Error, Result as VeloqResult, from_io_error, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
+use crate::net::error::NetError;
 use crate::runtime::context::RuntimeContext;
+use diagweave::report::Report;
 use diagweave::report::ResultReportExt;
 use veloq_buf::FixedBuf;
 use veloq_driver_native::Socket;
@@ -49,12 +51,7 @@ fn bind_listener_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
         .to_socket_addrs()
         .map_err(from_io_error)?
         .next()
-        .ok_or_else(|| {
-            from_io_error(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "No address provided",
-            ))
-        })?;
+        .ok_or_else(|| Report::new(Error::from(NetError::NoAddressProvided)))?;
 
     let socket = if addr.is_ipv4() {
         Socket::new_tcp_v4().trans_inner_err()?
@@ -97,17 +94,15 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let op = op_back.ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Accept op lost"))
-        })?;
+        let op = op_back
+            .ok_or_else(|| NetError::AcceptOpLost.to_report())
+            .trans_inner_err()?;
 
         let accepted = res.trans_inner_err()?;
-        let addr = op.remote_addr.ok_or_else(|| {
-            from_io_error(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Accept completed without remote address",
-            ))
-        })?;
+        let addr = op
+            .remote_addr
+            .ok_or_else(|| NetError::AcceptMissingRemoteAddr.to_report())
+            .trans_inner_err()?;
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,
@@ -165,9 +160,10 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
+        let buf = op_back
+            .map(|o| o.buf)
+            .ok_or_else(|| NetError::OpBufferLost.to_report())
+            .trans_inner_err()?;
         Ok((res.trans_inner_err()?, buf))
     }
 
@@ -186,9 +182,10 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
+        let buf = op_back
+            .map(|o| o.buf)
+            .ok_or_else(|| NetError::OpBufferLost.to_report())
+            .trans_inner_err()?;
         Ok((res.trans_inner_err()?, buf))
     }
 }
@@ -227,12 +224,10 @@ impl<'a, 'ctx> TcpListener<'a, 'ctx> {
 
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         let accepted = res.trans_inner_err()?;
-        let addr = op.remote_addr.ok_or_else(|| {
-            from_io_error(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Accept completed without remote address",
-            ))
-        })?;
+        let addr = op
+            .remote_addr
+            .ok_or_else(|| NetError::AcceptMissingRemoteAddr.to_report())
+            .trans_inner_err()?;
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,

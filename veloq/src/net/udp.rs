@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::error::{Result as VeloqResult, from_io_error, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
+use crate::net::error::NetError;
 use crate::runtime::context::RuntimeContext;
 use diagweave::report::ResultReportExt;
 use veloq_buf::FixedBuf;
@@ -34,12 +35,8 @@ fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
         .to_socket_addrs()
         .map_err(from_io_error)?
         .next()
-        .ok_or_else(|| {
-            from_io_error(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "No address provided",
-            ))
-        })?;
+        .ok_or_else(|| NetError::NoAddressProvided.to_report())
+        .trans_inner_err()?;
 
     let socket = if addr.is_ipv4() {
         Socket::new_udp_v4().trans_inner_err()?
@@ -76,9 +73,10 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
+        let buf = op_back
+            .map(|o| o.buf)
+            .ok_or_else(|| NetError::OpBufferLost.to_report())
+            .trans_inner_err()?;
         Ok((res.trans_inner_err()?, buf))
     }
 
@@ -94,17 +92,16 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let op_back =
-            op_back_opt.ok_or_else(|| from_io_error(io::Error::other("UdpRecvFrom op lost")))?;
+        let op_back = op_back_opt
+            .ok_or_else(|| NetError::UdpRecvFromOpLost.to_report())
+            .trans_inner_err()?;
         let n = res.trans_inner_err()?;
         let mut recv_buf = op_back.buf;
         recv_buf.set_len(n);
-        let addr = op_back.addr.ok_or_else(|| {
-            from_io_error(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "driver must populate UdpRecvFrom::addr before completion",
-            ))
-        })?;
+        let addr = op_back
+            .addr
+            .ok_or_else(|| NetError::UdpRecvFromMissingAddr.to_report())
+            .trans_inner_err()?;
         Ok(UdpRecvPacket {
             buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
             addr,
@@ -142,9 +139,10 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
+        let buf = op_back
+            .map(|o| o.buf)
+            .ok_or_else(|| NetError::OpBufferLost.to_report())
+            .trans_inner_err()?;
         Ok((res.trans_inner_err()?, buf))
     }
 
@@ -163,9 +161,10 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op_back.map(|o| o.buf).ok_or_else(|| {
-            from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
-        })?;
+        let buf = op_back
+            .map(|o| o.buf)
+            .ok_or_else(|| NetError::OpBufferLost.to_report())
+            .trans_inner_err()?;
         Ok((res.trans_inner_err()?, buf))
     }
 }
@@ -257,12 +256,10 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
         let n = res.trans_inner_err()?;
         let mut recv_buf = op.buf;
         recv_buf.set_len(n);
-        let addr = op.addr.ok_or_else(|| {
-            from_io_error(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "driver must populate UdpRecvFrom::addr before completion",
-            ))
-        })?;
+        let addr = op
+            .addr
+            .ok_or_else(|| NetError::UdpRecvFromMissingAddr.to_report())
+            .trans_inner_err()?;
         Ok(UdpRecvPacket {
             buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
             addr,

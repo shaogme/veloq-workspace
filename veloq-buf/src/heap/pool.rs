@@ -35,8 +35,7 @@ impl MemoryChunk {
                 Ok(p) => NonNull::new(p),
                 Err(_) => {
                     // Fallback to standard pages if Huge Pages failed
-                    let p = crate::os::alloc_pages(size)
-                        .diag(|r| r.map_err(BufError::from))?;
+                    let p = crate::os::alloc_pages(size).diag(|r| r.map_err(BufError::from))?;
                     NonNull::new(p)
                 }
             }
