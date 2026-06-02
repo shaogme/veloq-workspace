@@ -77,8 +77,10 @@ pub struct GenericAsyncScope<'scope, S: Storage, O: Ownership + 'static, TExtra>
     _phantom: std::marker::PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-pub type AsyncScope<'scope, TExtra> = GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExtra>;
-pub type LocalAsyncScope<'scope, TExtra> = GenericAsyncScope<'scope, LocalStorage, RcOwnership, TExtra>;
+pub type AsyncScope<'scope, TExtra> =
+    GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExtra>;
+pub type LocalAsyncScope<'scope, TExtra> =
+    GenericAsyncScope<'scope, LocalStorage, RcOwnership, TExtra>;
 
 impl<'scope, S: Storage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
     for GenericAsyncScope<'scope, S, O, TExtra>

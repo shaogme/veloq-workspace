@@ -240,9 +240,9 @@ impl<T> RuntimeScopeContext<T> {
     }
 
     /// Creates a new thread-safe (Send) asynchronous scope.
-    pub async fn scope<'ctx, R, F>(&self, f: F) -> R
+    pub async fn scope<'scope, R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'ctx, T>) -> R,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = AsyncScope::new(
@@ -257,9 +257,9 @@ impl<T> RuntimeScopeContext<T> {
     }
 
     /// Creates a new thread-local asynchronous scope.
-    pub async fn scope_local<'ctx, R, F>(&self, f: F) -> R
+    pub async fn scope_local<'scope, R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'ctx, T>) -> R,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = LocalAsyncScope::new(
@@ -287,13 +287,13 @@ pub type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
 pub type WorkerTickHook = fn();
 
 /// Worker initialization context passed to the injected worker init step.
-pub struct WorkerInitContext<'ctx, T> {
-    shared: &'ctx RuntimeShared<T>,
+pub struct WorkerInitContext<'scope, T> {
+    shared: &'scope RuntimeShared<T>,
     worker_id: usize,
     worker_count: NonZeroUsize,
 }
 
-impl<'ctx, T> Clone for WorkerInitContext<'ctx, T> {
+impl<'scope, T> Clone for WorkerInitContext<'scope, T> {
     fn clone(&self) -> Self {
         Self {
             shared: self.shared,
@@ -303,9 +303,9 @@ impl<'ctx, T> Clone for WorkerInitContext<'ctx, T> {
     }
 }
 
-impl<'ctx, T> WorkerInitContext<'ctx, T> {
+impl<'scope, T> WorkerInitContext<'scope, T> {
     pub(crate) fn new(
-        shared: &'ctx RuntimeShared<T>,
+        shared: &'scope RuntimeShared<T>,
         worker_id: usize,
         worker_count: NonZeroUsize,
     ) -> Self {
@@ -316,7 +316,7 @@ impl<'ctx, T> WorkerInitContext<'ctx, T> {
         }
     }
 
-    pub fn shared(&self) -> &'ctx RuntimeShared<T> {
+    pub fn shared(&self) -> &'scope RuntimeShared<T> {
         self.shared
     }
 
