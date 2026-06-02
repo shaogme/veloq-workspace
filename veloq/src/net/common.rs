@@ -24,7 +24,7 @@ pub struct SocketToken<'a, 'ctx> {
 impl<'a, 'ctx> SocketToken<'a, 'ctx> {
     pub(crate) fn new(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> Result<Self> {
         if !handle.borrow().is_socket() {
-            return Err(NetError::InvalidSocketHandle.to_report()).trans_inner_err();
+            return Err(NetError::InvalidSocketHandle.to_report_trans());
         }
 
         // SAFETY: caller transfers ownership via RawHandle created from OwnedRawHandle::into_raw.
@@ -35,8 +35,7 @@ impl<'a, 'ctx> SocketToken<'a, 'ctx> {
                 .trans_inner_err()
                 .and_then(|mut fds| {
                     fds.pop()
-                        .ok_or_else(|| NetError::RegistrationEmpty.to_report())
-                        .trans_inner_err()
+                        .ok_or_else(|| NetError::RegistrationEmpty.to_report_trans())
                 })
         })?;
         Ok(Self {

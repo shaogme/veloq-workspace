@@ -48,10 +48,9 @@ fn bind_listener_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
 ) -> Result<InnerSocket<'a, 'ctx, P>> {
     let addr = addr
         .to_socket_addrs()
-        .to_report()
-        .trans_inner_err()?
+        .to_report_trans()?
         .next()
-        .ok_or_else(|| Report::new(Error::from(NetError::NoAddressProvided)))?;
+        .ok_or_else(|| NetError::NoAddressProvided)?;
 
     let socket = if addr.is_ipv4() {
         Socket::new_tcp_v4().trans_inner_err()?
@@ -94,15 +93,12 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let op = op_back
-            .ok_or_else(|| NetError::AcceptOpLost.to_report())
-            .trans_inner_err()?;
+        let op = op_back.ok_or_else(|| NetError::AcceptOpLost)?;
 
         let accepted = res.trans_inner_err()?;
         let addr = op
             .remote_addr
-            .ok_or_else(|| NetError::AcceptMissingRemoteAddr.to_report())
-            .trans_inner_err()?;
+            .ok_or_else(|| NetError::AcceptMissingRemoteAddr)?;
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,
@@ -184,8 +180,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .into_inner();
         let buf = op_back
             .map(|o| o.buf)
-            .ok_or_else(|| NetError::OpBufferLost.to_report())
-            .trans_inner_err()?;
+            .ok_or_else(|| NetError::OpBufferLost)?;
         Ok((res.trans_inner_err()?, buf))
     }
 }
@@ -226,8 +221,7 @@ impl<'a, 'ctx> TcpListener<'a, 'ctx> {
         let accepted = res.trans_inner_err()?;
         let addr = op
             .remote_addr
-            .ok_or_else(|| NetError::AcceptMissingRemoteAddr.to_report())
-            .trans_inner_err()?;
+            .ok_or_else(|| NetError::AcceptMissingRemoteAddr)?;
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,
@@ -321,7 +315,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalTcpStream<'a, 'ctx> {
             let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::UnexpectedEof.to_report()).trans_inner_err();
+                return Err(NetError::UnexpectedEof)?;
             }
             total += n;
         }
@@ -343,7 +337,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for TcpStream<'a, 'ctx> {
             let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::UnexpectedEof.to_report()).trans_inner_err();
+                return Err(NetError::UnexpectedEof)?;
             }
             total += n;
         }
@@ -365,7 +359,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalTcpStream<'a, 'ctx> {
             let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::WriteZero.to_report()).trans_inner_err();
+                return Err(NetError::WriteZero)?;
             }
             total += n;
         }
@@ -395,7 +389,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for TcpStream<'a, 'ctx> {
             let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::WriteZero.to_report()).trans_inner_err();
+                return Err(NetError::WriteZero)?;
             }
             total += n;
         }

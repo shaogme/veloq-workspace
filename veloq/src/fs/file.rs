@@ -214,7 +214,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalFile<'a, 'ctx> {
             let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(FsError::UnexpectedEof.to_report()).trans_inner_err();
+                return Err(FsError::UnexpectedEof.to_report_trans());
             }
             total += n;
             self.pos.set(self.pos.get() + n as u64);
@@ -241,7 +241,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalFile<'a, 'ctx> {
             let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(FsError::WriteZero.to_report()).trans_inner_err();
+                return Err(FsError::WriteZero.to_report_trans());
             }
             total += n;
             self.pos.set(self.pos.get() + n as u64);
@@ -476,7 +476,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for File<'a, 'ctx> {
             let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(FsError::UnexpectedEof.to_report()).trans_inner_err();
+                return Err(FsError::UnexpectedEof.to_report_trans());
             }
             total += n;
             self.pos.fetch_add(n as u64, Ordering::Relaxed);
@@ -503,7 +503,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for File<'a, 'ctx> {
             let (n, b) = self.write_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(FsError::WriteZero.to_report()).trans_inner_err();
+                return Err(FsError::WriteZero.to_report_trans());
             }
             total += n;
             self.pos.fetch_add(n as u64, Ordering::Relaxed);
