@@ -1,4 +1,3 @@
-use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -322,10 +321,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalTcpStream<'a, 'ctx> {
             let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(Report::new(Error::from(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer",
-                ))));
+                return Err(NetError::UnexpectedEof.to_report()).trans_inner_err();
             }
             total += n;
         }
@@ -347,10 +343,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for TcpStream<'a, 'ctx> {
             let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(Report::new(Error::from(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer",
-                ))));
+                return Err(NetError::UnexpectedEof.to_report()).trans_inner_err();
             }
             total += n;
         }
@@ -372,10 +365,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalTcpStream<'a, 'ctx> {
             let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(Report::new(Error::from(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write whole buffer",
-                ))));
+                return Err(NetError::WriteZero.to_report()).trans_inner_err();
             }
             total += n;
         }
@@ -405,10 +395,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for TcpStream<'a, 'ctx> {
             let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(Report::new(Error::from(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write whole buffer",
-                ))));
+                return Err(NetError::WriteZero.to_report()).trans_inner_err();
             }
             total += n;
         }

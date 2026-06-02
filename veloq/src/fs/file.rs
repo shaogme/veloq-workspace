@@ -13,7 +13,6 @@ use veloq_driver_native::{RawHandle, RawHandleKind};
 
 use std::cell::Cell;
 use std::future::{Future, IntoFuture};
-use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -215,10 +214,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalFile<'a, 'ctx> {
             let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(Report::new(Error::from(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer",
-                ))));
+                return Err(FsError::UnexpectedEof.to_report()).trans_inner_err();
             }
             total += n;
             self.pos.set(self.pos.get() + n as u64);
@@ -245,10 +241,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalFile<'a, 'ctx> {
             let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(Report::new(Error::from(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write whole buffer",
-                ))));
+                return Err(FsError::WriteZero.to_report()).trans_inner_err();
             }
             total += n;
             self.pos.set(self.pos.get() + n as u64);
@@ -483,10 +476,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for File<'a, 'ctx> {
             let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(Report::new(Error::from(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer",
-                ))));
+                return Err(FsError::UnexpectedEof.to_report()).trans_inner_err();
             }
             total += n;
             self.pos.fetch_add(n as u64, Ordering::Relaxed);
@@ -513,10 +503,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for File<'a, 'ctx> {
             let (n, b) = self.write_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(Report::new(Error::from(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write whole buffer",
-                ))));
+                return Err(FsError::WriteZero.to_report()).trans_inner_err();
             }
             total += n;
             self.pos.fetch_add(n as u64, Ordering::Relaxed);

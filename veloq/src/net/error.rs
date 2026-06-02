@@ -28,5 +28,11 @@ set! {
 
         #[display("driver must populate UdpRecvFrom::addr before completion")]
         UdpRecvFromMissingAddr,
+
+        #[display("failed to fill whole buffer")]
+        UnexpectedEof,
+
+        #[display("failed to write whole buffer")]
+        WriteZero,
     }
 }
