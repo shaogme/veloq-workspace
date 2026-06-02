@@ -1,262 +1,57 @@
-use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
+use crate::runtime::{RuntimeScopeContext, RuntimeShared};
 use crate::task::{
     AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, LocalBoxedTaskNode, LocalTask,
-    LocalTaskRef, SendBoxedTaskNode, SendTask, SendTaskRef, TaskError, TaskHandleRef, TaskJoinGate,
+    LocalTaskRef, RawScope, ScopeRef, SendBoxedTaskNode, SendTask, SendTaskRef, TaskError,
+    TaskHandleRef, TaskJoinGate,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
-use crate::utils::storage::{
-    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, StateOptionPtr, Storage,
-    StrategyType,
-};
+use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 use std::alloc::Layout;
-use std::any::Any;
+use std::future::Future;
 use std::ops::AsyncFnOnce;
 use std::ptr::{NonNull, drop_in_place, write};
-use std::sync::atomic::Ordering;
-use std::task::Waker;
 
+mod completion;
 mod join;
+mod router;
 
+pub use completion::{GenericScopeCompletion, LocalScopeCompletion, ScopeCompletion};
 pub use join::{JoinHandle, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle};
 
+use router::{
+    RoutedJobCell, RoutedSpawnReady, RoutedSpawnState, dispatch_routed, install_routed_pinned_task,
+    make_spawn_to_access,
+};
+
 #[derive(Copy, Clone)]
-struct SendPtr<T>(NonNull<T>);
+pub(crate) struct SendPtr<T>(NonNull<T>);
 
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
-    fn new(ptr: NonNull<T>) -> Self {
+    pub(crate) fn new(ptr: NonNull<T>) -> Self {
         Self(ptr)
     }
 
-    unsafe fn as_ref(&self) -> &T {
+    pub(crate) unsafe fn as_ref(&self) -> &T {
         unsafe { self.0.as_ref() }
     }
 
-    unsafe fn as_mut(&mut self) -> &mut T {
+    pub(crate) unsafe fn as_mut(&mut self) -> &mut T {
         unsafe { self.0.as_mut() }
     }
 
-    fn as_ptr(&self) -> *mut T {
+    pub(crate) fn as_ptr(&self) -> *mut T {
         self.0.as_ptr()
-    }
-}
-
-struct WakerNode {
-    waker: Waker,
-    next: Option<NonNull<WakerNode>>,
-}
-
-/// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
-pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
-    remaining: S::Usize,
-    wakers: S::OptionPtr<WakerNode>,
-    cancel_token: GenericCancellationToken<S, O>,
-    panic_info: S::OptionBox<dyn Any + Send + 'static>,
-    parent: Option<AnyScopeRef>,
-}
-
-pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
-pub type LocalScopeCompletion = GenericScopeCompletion<LocalStorage, RcOwnership>;
-
-impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
-    pub fn new(parent: Option<AnyScopeRef>) -> O::Shared<Self> {
-        let cross_parent = if let Some(ref p) = parent
-            && (S::strategy_type() != StrategyType::Atomic
-                || O::strategy_type() != StrategyType::Atomic)
-            && let AnyScopeRef::Send(_) = p
-        {
-            Some(p.clone())
-        } else {
-            None
-        };
-
-        O::new(Self {
-            remaining: S::Usize::new(0),
-            wakers: S::OptionPtr::new(None),
-            cancel_token: GenericCancellationToken::<S, O>::new_with_parent(cross_parent),
-            panic_info: S::OptionBox::new(None),
-            parent,
-        })
-    }
-
-    fn drain_wakers(&self) {
-        let mut current = self.wakers.swap(None, Ordering::AcqRel);
-        while let Some(node_ptr) = current {
-            unsafe {
-                let node = Box::from_raw(node_ptr.as_ptr());
-                node.waker.wake();
-                current = node.next;
-            }
-        }
-    }
-
-    pub fn cancel(&self) {
-        self.cancel_token.cancel();
-        self.drain_wakers();
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        if self.cancel_token.is_cancelled() {
-            return true;
-        }
-        if let Some(ref parent) = self.parent
-            && parent.is_cancelled()
-        {
-            return true;
-        }
-        false
-    }
-
-    pub fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
-        &self.cancel_token
-    }
-
-    pub fn add_task(&self) {
-        self.remaining.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub fn task_done(&self) {
-        let remaining = self.remaining.fetch_sub(1, Ordering::AcqRel) - 1;
-        if remaining == 0 {
-            self.drain_wakers();
-        }
-    }
-
-    pub fn register(&self, waker: &Waker) {
-        if self.remaining.load(Ordering::Acquire) == 0 {
-            waker.wake_by_ref();
-            return;
-        }
-
-        let mut node = Box::new(WakerNode {
-            waker: waker.clone(),
-            next: None,
-        });
-        let mut current = self.wakers.load(Ordering::Acquire);
-        loop {
-            node.next = current;
-            let node_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(node)) };
-            match self.wakers.compare_exchange_weak(
-                current,
-                Some(node_ptr),
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => {
-                    node = unsafe { Box::from_raw(node_ptr.as_ptr()) };
-                    current = actual;
-                }
-            }
-        }
-
-        if self.remaining.load(Ordering::Acquire) == 0 {
-            self.drain_wakers();
-        }
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.remaining.load(Ordering::Acquire) == 0
-    }
-
-    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
-        let _ = self
-            .panic_info
-            .compare_exchange_none(payload, Ordering::AcqRel, Ordering::Acquire);
-    }
-
-    pub fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
-        self.panic_info.take(Ordering::AcqRel)
-    }
-
-    pub fn parent(&self) -> &Option<crate::task::AnyScopeRef> {
-        &self.parent
-    }
-}
-
-impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
-    fn drop(&mut self) {
-        let mut current = self.wakers.swap(None, Ordering::Relaxed);
-        while let Some(node_ptr) = current {
-            unsafe {
-                let node = Box::from_raw(node_ptr.as_ptr());
-                current = node.next;
-            }
-        }
-
-        if let Some(panic_info) = self.take_panic()
-            && !std::thread::panicking()
-        {
-            std::panic::resume_unwind(panic_info);
-        }
-    }
-}
-
-impl<S: Storage, O: Ownership + 'static> crate::task::RawScope for GenericScopeCompletion<S, O> {
-    #[inline]
-    fn task_done(&self) {
-        self.task_done();
-    }
-
-    #[inline]
-    fn cancel(&self) {
-        self.cancel();
-    }
-
-    #[inline]
-    fn report_panic(&self, payload: Box<dyn std::any::Any + Send + 'static>) {
-        self.report_panic(payload);
-    }
-
-    #[inline]
-    fn is_cancelled(&self) -> bool {
-        self.is_cancelled()
-    }
-
-    #[inline]
-    fn try_link_child(&self, child_token: &crate::task::ErasedCancellationToken) -> bool {
-        if child_token.s_type != S::strategy_type() || child_token.o_type != O::strategy_type() {
-            return false;
-        }
-        unsafe {
-            self.cancel_token()
-                .try_link_child_raw(child_token.ptr.as_ptr());
-        }
-        true
-    }
-
-    #[inline]
-    fn parent(&self) -> Option<AnyScopeRef> {
-        self.parent().clone()
-    }
-
-    #[inline]
-    fn register_cancel_waker(&self, waker: &Waker) {
-        self.cancel_token().register_waker(waker);
-    }
-
-    #[inline]
-    unsafe fn clone_raw(&self) -> NonNull<dyn crate::task::RawScope> {
-        let ptr = self as *const Self;
-        unsafe { O::increment_strong_count(ptr) };
-        let dyn_ptr: *const dyn crate::task::RawScope = ptr;
-        unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) }
-    }
-
-    #[inline]
-    unsafe fn drop_raw(&self) {
-        let ptr = self as *const Self;
-        unsafe { O::decrement_strong_count(ptr) };
     }
 }
 
 pub trait ScopeProvider<T> {
     type Storage: Storage;
     type Ownership: Ownership;
-    type Arena: crate::task::Arena;
+    type Arena: Arena;
     fn runtime(&self) -> &RuntimeShared<T>;
     fn arena(&self) -> &Self::Arena;
     fn completion(
@@ -276,7 +71,7 @@ pub(crate) type CancelTokenSlot<S, O> =
 
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
 pub struct GenericAsyncScope<'ctx, S: Storage, O: Ownership + 'static, TExtra> {
-    context: crate::runtime::RuntimeScopeContext<'ctx, TExtra>,
+    context: RuntimeScopeContext<'ctx, TExtra>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
 }
@@ -305,10 +100,7 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
 }
 
 impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S, O, TExtra> {
-    pub fn new(
-        context: crate::runtime::RuntimeScopeContext<'ctx, TExtra>,
-        parent: Option<crate::task::AnyScopeRef>,
-    ) -> Self {
+    pub fn new(context: RuntimeScopeContext<'ctx, TExtra>, parent: Option<AnyScopeRef>) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
         if let Some(ref parent) = parent {
@@ -360,14 +152,14 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
             node.header
                 .initialize(&self.context.shared.base, worker_id, scope_ref);
         }
-        let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<T, F>>();
+        let layout = Layout::new::<LocalBoxedTaskNode<T, F>>();
         let node_ptr = unsafe {
             self.arena.alloc::<LocalBoxedTaskNode<T, F>>(
                 layout,
-                Some(|ptr| std::ptr::drop_in_place(ptr as *mut LocalBoxedTaskNode<T, F>)),
+                Some(|ptr| drop_in_place(ptr as *mut LocalBoxedTaskNode<T, F>)),
             ) as *mut LocalBoxedTaskNode<T, F>
         };
-        unsafe { std::ptr::write(node_ptr, node) };
+        unsafe { write(node_ptr, node) };
 
         let node_ref = unsafe { &*node_ptr };
         self.completion.add_task();
@@ -380,11 +172,8 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
             task_ref,
             node_ref,
             Some(|arena, gate| unsafe {
-                let layout = std::alloc::Layout::new::<LocalBoxedTaskNode<T, F>>();
-                arena.drop_object_raw(
-                    gate as *const dyn crate::task::TaskJoinGate<T> as *mut u8,
-                    layout,
-                );
+                let layout = Layout::new::<LocalBoxedTaskNode<T, F>>();
+                arena.drop_object_raw(gate as *const dyn TaskJoinGate<T> as *mut u8, layout);
             }),
         )
     }
@@ -407,10 +196,10 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> crate::task::ScopeRef<S> {
+    pub fn scope_completion_ref(&self) -> ScopeRef<S> {
         unsafe {
-            let non_null = crate::task::RawScope::clone_raw(&*self.completion);
-            crate::task::ScopeRef::new(non_null)
+            let non_null = RawScope::clone_raw(&*self.completion);
+            ScopeRef::new(non_null)
         }
     }
 
@@ -474,7 +263,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
             worker_id
         );
 
-        let state = self::join::RoutedSpawnState::new();
+        let state = RoutedSpawnState::new();
         self.completion.add_task();
 
         let runtime = self.context.shared;
@@ -483,7 +272,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
         let state_for_job = state.clone();
         let scope_ref = self.scope_completion_ref();
 
-        self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
+        dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
             &self.context,
             &self.completion,
             state.clone(),
@@ -508,9 +297,9 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
                     return;
                 }
 
-                state_for_job.set_ready(self::join::RoutedSpawnReady {
+                state_for_job.set_ready(RoutedSpawnReady {
                     task: task_ref,
-                    access: self::join::make_spawn_to_access::<T, S_>(task),
+                    access: make_spawn_to_access::<T, S_>(task),
                 });
             },
         );
@@ -587,26 +376,26 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
             worker_id
         );
 
-        let state = self::join::RoutedSpawnState::new();
+        let state = RoutedSpawnState::new();
         self.completion.add_task();
 
         let runtime = self.context.shared;
         let runtime_ptr = SendPtr::new(NonNull::from(runtime));
         let completion = self.completion.clone();
         let state_for_job = state.clone();
-        let job_layout = std::alloc::Layout::new::<self::join::RoutedJobCell<F>>();
+        let job_layout = Layout::new::<RoutedJobCell<F>>();
         let job_ptr = unsafe {
-            self.arena.alloc::<self::join::RoutedJobCell<F>>(
+            self.arena.alloc::<RoutedJobCell<F>>(
                 job_layout,
-                Some(|ptr| std::ptr::drop_in_place(ptr as *mut self::join::RoutedJobCell<F>)),
-            ) as *mut self::join::RoutedJobCell<F>
+                Some(|ptr| drop_in_place(ptr as *mut RoutedJobCell<F>)),
+            ) as *mut RoutedJobCell<F>
         };
-        unsafe { std::ptr::write(job_ptr, self::join::RoutedJobCell::new(job)) };
-        let mut job_ptr: SendPtr<self::join::RoutedJobCell<F>> =
+        unsafe { write(job_ptr, RoutedJobCell::new(job)) };
+        let mut job_ptr: SendPtr<RoutedJobCell<F>> =
             SendPtr::new(unsafe { NonNull::new_unchecked(job_ptr) });
 
         let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
-        self::join::dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
+        dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
             &self.context,
             &self.completion,
             state.clone(),
@@ -631,7 +420,7 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
                     return;
                 }
 
-                self::join::install_routed_pinned_task(
+                install_routed_pinned_task(
                     unsafe { &*runtime_ptr.as_ptr() },
                     arena,
                     completion,
