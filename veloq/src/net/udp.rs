@@ -3,11 +3,11 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::{Result as VeloqResult, from_io_error, to_io_error};
+use crate::error::{Result, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::net::error::NetError;
 use crate::runtime::context::RuntimeContext;
-use diagweave::report::ResultReportExt;
+use diagweave::prelude::*;
 use veloq_buf::FixedBuf;
 use veloq_driver_native::Socket;
 use veloq_driver_native::op::{
@@ -30,10 +30,11 @@ pub type UdpSocket<'a, 'ctx> =
 fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
     ctx: RuntimeContext<'a, 'ctx>,
     addr: A,
-) -> VeloqResult<InnerSocket<'a, 'ctx, P>> {
+) -> Result<InnerSocket<'a, 'ctx, P>> {
     let addr = addr
         .to_socket_addrs()
-        .map_err(from_io_error)?
+        .to_report()
+        .trans_inner_err()?
         .next()
         .ok_or_else(|| NetError::NoAddressProvided.to_report())
         .trans_inner_err()?;
@@ -53,15 +54,11 @@ fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
 impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
     GenericUdpSocket<'a, 'ctx, S, P>
 {
-    pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
+    pub fn local_addr(&self) -> Result<SocketAddr> {
         self.inner.local_addr()
     }
 
-    async fn send_to_direct(
-        &self,
-        buf: FixedBuf,
-        target: SocketAddr,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    async fn send_to_direct(&self, buf: FixedBuf, target: SocketAddr) -> Result<(usize, FixedBuf)> {
         let op = SendTo {
             fd: self.inner.fd(),
             buf,
@@ -80,7 +77,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         Ok((res.trans_inner_err()?, buf))
     }
 
-    async fn recv_from_direct(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
+    async fn recv_from_direct(&self, buf: FixedBuf) -> Result<UdpRecvPacket> {
         let op = UdpRecvFrom {
             fd: self.inner.fd(),
             buf,
@@ -108,7 +105,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         })
     }
 
-    async fn connect_direct(&self, addr: SocketAddr) -> VeloqResult<()> {
+    async fn connect_direct(&self, addr: SocketAddr) -> Result<()> {
         let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = UdpConnect {
@@ -128,7 +125,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         &self,
         buf: FixedBuf,
         buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    ) -> Result<(usize, FixedBuf)> {
         let op = OpUdpSend {
             fd: self.inner.fd(),
             buf,
@@ -150,7 +147,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         &self,
         buf: FixedBuf,
         buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    ) -> Result<(usize, FixedBuf)> {
         let op = OpUdpRecv {
             fd: self.inner.fd(),
             buf,
@@ -170,7 +167,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
 }
 
 impl<'a, 'ctx> LocalUdpSocket<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -178,49 +175,37 @@ impl<'a, 'ctx> LocalUdpSocket<'a, 'ctx> {
         })
     }
 
-    pub async fn send_to(
-        &self,
-        buf: FixedBuf,
-        target: SocketAddr,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn send_to(&self, buf: FixedBuf, target: SocketAddr) -> Result<(usize, FixedBuf)> {
         self.send_to_direct(buf, target).await
     }
 
-    pub async fn recv_from(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
+    pub async fn recv_from(&self, buf: FixedBuf) -> Result<UdpRecvPacket> {
         self.recv_from_direct(buf).await
     }
 
-    pub async fn connect(&self, addr: SocketAddr) -> VeloqResult<()> {
+    pub async fn connect(&self, addr: SocketAddr) -> Result<()> {
         self.connect_direct(addr).await
     }
 
-    pub async fn send(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn send(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         self.send_subset(buf, 0).await
     }
 
-    pub async fn recv(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn recv(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         self.recv_subset(buf, 0).await
     }
 
-    pub async fn send_subset(
-        &self,
-        buf: FixedBuf,
-        buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn send_subset(&self, buf: FixedBuf, buf_offset: usize) -> Result<(usize, FixedBuf)> {
         self.send_subset_direct(buf, buf_offset).await
     }
 
-    pub async fn recv_subset(
-        &self,
-        buf: FixedBuf,
-        buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn recv_subset(&self, buf: FixedBuf, buf_offset: usize) -> Result<(usize, FixedBuf)> {
         self.recv_subset_direct(buf, buf_offset).await
     }
 }
 
 impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> VeloqResult<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -228,11 +213,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
         })
     }
 
-    pub async fn send_to(
-        &self,
-        buf: FixedBuf,
-        target: SocketAddr,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn send_to(&self, buf: FixedBuf, target: SocketAddr) -> Result<(usize, FixedBuf)> {
         let owner = self.inner.owner_worker_id();
         let op = SendTo {
             fd: self.inner.fd(),
@@ -244,7 +225,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
         Ok((res.trans_inner_err()?, op.buf))
     }
 
-    pub async fn recv_from(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
+    pub async fn recv_from(&self, buf: FixedBuf) -> Result<UdpRecvPacket> {
         let owner = self.inner.owner_worker_id();
         let op = UdpRecvFrom {
             fd: self.inner.fd(),
@@ -266,7 +247,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
         })
     }
 
-    pub async fn connect(&self, addr: SocketAddr) -> VeloqResult<()> {
+    pub async fn connect(&self, addr: SocketAddr) -> Result<()> {
         let owner = self.inner.owner_worker_id();
         let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
@@ -279,19 +260,15 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
         res.map(|_| ()).trans_inner_err()
     }
 
-    pub async fn send(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn send(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         self.send_subset(buf, 0).await
     }
 
-    pub async fn recv(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn recv(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         self.recv_subset(buf, 0).await
     }
 
-    pub async fn send_subset(
-        &self,
-        buf: FixedBuf,
-        buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn send_subset(&self, buf: FixedBuf, buf_offset: usize) -> Result<(usize, FixedBuf)> {
         let owner = self.inner.owner_worker_id();
         let op = OpUdpSend {
             fd: self.inner.fd(),
@@ -302,11 +279,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
         Ok((res.trans_inner_err()?, op.buf))
     }
 
-    pub async fn recv_subset(
-        &self,
-        buf: FixedBuf,
-        buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn recv_subset(&self, buf: FixedBuf, buf_offset: usize) -> Result<(usize, FixedBuf)> {
         let owner = self.inner.owner_worker_id();
         let op = OpUdpRecv {
             fd: self.inner.fd(),

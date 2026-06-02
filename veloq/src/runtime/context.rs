@@ -11,7 +11,7 @@ use veloq_runtime::task::{ScopeRef, TaskHandleRef};
 use veloq_runtime::utils::storage::AtomicStorage;
 
 use crate::config::BufferRegistrationMode;
-use crate::error::{Result as VeloqResult, from_io_error};
+use crate::error::Result as VeloqResult;
 use diagweave::prelude::*;
 use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared};
 
@@ -359,7 +359,8 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
                     let ctx = RuntimeContext { scope: scope_clone };
                     ctx.driver(|mut driver| op.submit_detached(&mut driver))
                 })
-                .map_err(from_io_error)?;
+                .to_report()
+                .trans_inner_err()?;
             let (res, op_back) = routed.await.into_inner();
             let op = op_back.expect("Op lost in remote submit");
             Ok((res, op))

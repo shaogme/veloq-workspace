@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use crate::error::{Result as VeloqResult, to_io_error};
+use crate::error::{Result, to_io_error};
 
 #[cfg(not(unix))]
 macro_rules! ignore {
@@ -94,11 +94,11 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         self.pos.get()
     }
 
-    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> Result<(usize, FixedBuf)> {
         self.read_at_subset(buf, offset, 0).await
     }
 
-    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> Result<(usize, FixedBuf)> {
         self.write_at_subset(buf, offset, 0).await
     }
 
@@ -107,7 +107,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         buf: FixedBuf,
         offset: u64,
         buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    ) -> Result<(usize, FixedBuf)> {
         let op = ReadFixed {
             fd: self.fd,
             buf,
@@ -132,7 +132,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         buf: FixedBuf,
         offset: u64,
         buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    ) -> Result<(usize, FixedBuf)> {
         let op = WriteFixed {
             fd: self.fd,
             buf,
@@ -152,7 +152,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         Ok((res.trans_inner_err()?, buf))
     }
 
-    pub async fn sync_all(&self) -> VeloqResult<()> {
+    pub async fn sync_all(&self) -> Result<()> {
         let op = Fsync {
             fd: self.fd,
             datasync: false,
@@ -166,7 +166,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         res.map(|_| ()).trans_inner_err()
     }
 
-    pub async fn sync_data(&self) -> VeloqResult<()> {
+    pub async fn sync_data(&self) -> Result<()> {
         let op = Fsync {
             fd: self.fd,
             datasync: true,
@@ -180,7 +180,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         res.map(|_| ()).trans_inner_err()
     }
 
-    pub async fn fallocate(&self, offset: u64, len: u64) -> VeloqResult<()> {
+    pub async fn fallocate(&self, offset: u64, len: u64) -> Result<()> {
         let op = Fallocate {
             fd: self.fd,
             mode: 0,
@@ -280,11 +280,11 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         self.pos.load(Ordering::Relaxed)
     }
 
-    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn read_at(&self, buf: FixedBuf, offset: u64) -> Result<(usize, FixedBuf)> {
         self.read_at_subset(buf, offset, 0).await
     }
 
-    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> VeloqResult<(usize, FixedBuf)> {
+    pub async fn write_at(&self, buf: FixedBuf, offset: u64) -> Result<(usize, FixedBuf)> {
         self.write_at_subset(buf, offset, 0).await
     }
 
@@ -293,7 +293,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         buf: FixedBuf,
         offset: u64,
         buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    ) -> Result<(usize, FixedBuf)> {
         let op: FileReadRaw = FileReadRaw {
             fd: self.raw.raw(),
             buf,
@@ -312,7 +312,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         buf: FixedBuf,
         offset: u64,
         buf_offset: usize,
-    ) -> VeloqResult<(usize, FixedBuf)> {
+    ) -> Result<(usize, FixedBuf)> {
         let op: FileWriteRaw = FileWriteRaw {
             fd: self.raw.raw(),
             buf,
@@ -326,7 +326,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         Ok((res.trans_inner_err()?, buf))
     }
 
-    pub async fn sync_all(&self) -> VeloqResult<()> {
+    pub async fn sync_all(&self) -> Result<()> {
         let op: FileFsyncRaw = FileFsyncRaw {
             fd: self.raw.raw(),
             datasync: false,
@@ -337,7 +337,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         res.map(|_| ()).trans_inner_err()
     }
 
-    pub async fn sync_data(&self) -> VeloqResult<()> {
+    pub async fn sync_data(&self) -> Result<()> {
         let op: FileFsyncRaw = FileFsyncRaw {
             fd: self.raw.raw(),
             datasync: true,
@@ -348,7 +348,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         res.map(|_| ()).trans_inner_err()
     }
 
-    pub async fn fallocate(&self, offset: u64, len: u64) -> VeloqResult<()> {
+    pub async fn fallocate(&self, offset: u64, len: u64) -> Result<()> {
         let op: FileFallocateRaw = FileFallocateRaw {
             fd: self.raw.raw(),
             mode: 0,
@@ -541,14 +541,14 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
     pub async fn open(
         ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<LocalFile<'a, 'ctx>> {
+    ) -> Result<LocalFile<'a, 'ctx>> {
         OpenOptions::new().read(true).open_local(ctx, path).await
     }
 
     pub async fn create(
         ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<LocalFile<'a, 'ctx>> {
+    ) -> Result<LocalFile<'a, 'ctx>> {
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -562,14 +562,14 @@ impl<'a, 'ctx> File<'a, 'ctx> {
     pub async fn open(
         ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<File<'a, 'ctx>> {
+    ) -> Result<File<'a, 'ctx>> {
         OpenOptions::new().read(true).open(ctx, path).await
     }
 
     pub async fn create(
         ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<File<'a, 'ctx>> {
+    ) -> Result<File<'a, 'ctx>> {
         OpenOptions::new()
             .write(true)
             .create(true)

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::error::Result as VeloqResult;
+use crate::error::Result;
 use crate::fs::error::FsError;
 use crate::runtime::context::RuntimeContext;
 use diagweave::report::{Diagnostic, ResultReportExt};
@@ -100,7 +100,7 @@ impl OpenOptions {
         &self,
         ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<super::file::LocalFile<'a, 'ctx>> {
+    ) -> Result<super::file::LocalFile<'a, 'ctx>> {
         let op = self.build_op(&ctx, path.as_ref())?;
         use veloq_driver_native::op::{LocalSubmitter, Op};
 
@@ -134,7 +134,7 @@ impl OpenOptions {
         &self,
         ctx: RuntimeContext<'a, 'ctx>,
         path: impl AsRef<Path>,
-    ) -> VeloqResult<super::file::File<'a, 'ctx>> {
+    ) -> Result<super::file::File<'a, 'ctx>> {
         let op = self.build_op(&ctx, path.as_ref())?;
         use veloq_driver_native::op::{DetachedSubmitter, Op};
 
@@ -158,7 +158,7 @@ impl OpenOptions {
         &self,
         ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
         path: &Path,
-    ) -> VeloqResult<Open> {
+    ) -> Result<Open> {
         use diagweave::report::ResultReportExt;
         use std::num::NonZeroUsize;
         use std::os::unix::ffi::OsStrExt;
@@ -220,7 +220,7 @@ impl OpenOptions {
         &self,
         ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
         path: &Path,
-    ) -> VeloqResult<Open> {
+    ) -> Result<Open> {
         use diagweave::report::ResultReportExt;
         use std::num::NonZeroUsize;
         use std::os::windows::ffi::OsStrExt;

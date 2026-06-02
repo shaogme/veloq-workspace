@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::Result as VeloqResult;
+use crate::error::Result;
 use crate::net::error::NetError;
 use crate::runtime::context::{RuntimeContext, submit_control_task};
 use diagweave::report::ResultReportExt;
@@ -22,7 +22,7 @@ pub struct SocketToken<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> SocketToken<'a, 'ctx> {
-    pub(crate) fn new(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> VeloqResult<Self> {
+    pub(crate) fn new(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> Result<Self> {
         if !handle.borrow().is_socket() {
             return Err(NetError::InvalidSocketHandle.to_report()).trans_inner_err();
         }
@@ -107,7 +107,7 @@ where
         ctx: RuntimeContext<'a, 'ctx>,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
-    ) -> VeloqResult<Self> {
+    ) -> Result<Self> {
         Ok(Self {
             token: P::new_ptr(SocketToken::new(ctx, handle)?),
             local_addr,
@@ -124,7 +124,7 @@ where
         self.token.owner_worker_id
     }
 
-    pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
+    pub fn local_addr(&self) -> Result<SocketAddr> {
         self.local_addr
             .ok_or_else(|| NetError::LocalAddrUnavailable.to_report())
             .trans_inner_err()
