@@ -383,7 +383,7 @@ impl Future for YieldNow {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if cx.is_cancelled() {
-            return Poll::Pending;
+            return Poll::Ready(());
         }
         if self.0 {
             Poll::Ready(())

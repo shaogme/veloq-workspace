@@ -4,15 +4,14 @@ use crate::task::{
     SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
 };
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicStorage, Storage};
+use crate::utils::storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr, Storage};
 use std::alloc::Layout;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::mem::replace;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{NonNull, drop_in_place, write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use veloq_atomic_waker::AtomicWaker;
 
@@ -29,11 +28,9 @@ pub(crate) struct RoutedSpawnReady<'scope_ref, T> {
     pub(crate) access: Box<dyn RoutedTaskAccess<T> + 'scope_ref>,
 }
 
-pub(crate) enum RoutedSpawnOutcome<'scope_ref, T> {
-    Pending,
+pub(crate) enum RoutedSpawnOutcomeInner<'scope_ref, T> {
     Ready(RoutedSpawnReady<'scope_ref, T>),
     Failed(TaskError),
-    Taken,
 }
 
 pub(crate) struct RoutedJobCell<F> {
@@ -127,7 +124,7 @@ where
 }
 
 pub(crate) struct RoutedSpawnState<'scope_ref, T> {
-    pub(crate) outcome: Mutex<RoutedSpawnOutcome<'scope_ref, T>>,
+    outcome: AtomicOptionPtr<RoutedSpawnOutcomeInner<'scope_ref, T>>,
     cancel_requested: AtomicBool,
     waker: AtomicWaker,
 }
@@ -135,7 +132,7 @@ pub(crate) struct RoutedSpawnState<'scope_ref, T> {
 impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            outcome: Mutex::new(RoutedSpawnOutcome::Pending),
+            outcome: AtomicOptionPtr::new(None),
             cancel_requested: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         })
@@ -150,43 +147,52 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
         self.cancel_requested.load(Ordering::Acquire)
     }
 
-    fn set_outcome(&self, new_outcome: RoutedSpawnOutcome<'scope_ref, T>) {
-        let should_wake = {
-            let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
-            if matches!(*outcome, RoutedSpawnOutcome::Pending) {
-                *outcome = new_outcome;
-                true
-            } else {
-                false
+    fn set_outcome(&self, inner: RoutedSpawnOutcomeInner<'scope_ref, T>) {
+        let boxed = Box::new(inner);
+        let raw = NonNull::new(Box::into_raw(boxed)).unwrap();
+        match self
+            .outcome
+            .compare_exchange(None, Some(raw), Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                self.waker.wake();
             }
-        };
-        if should_wake {
-            self.waker.wake();
+            Err(_) => {
+                // If it's already set (e.g. Taken or Cancelled), drop the box to prevent leak.
+                unsafe {
+                    let _ = Box::from_raw(raw.as_ptr());
+                }
+            }
         }
     }
 
     pub(crate) fn set_ready(&self, ready: RoutedSpawnReady<'scope_ref, T>) {
-        self.set_outcome(RoutedSpawnOutcome::Ready(ready));
+        self.set_outcome(RoutedSpawnOutcomeInner::Ready(ready));
     }
 
     pub(crate) fn fail(&self, err: TaskError) {
-        self.set_outcome(RoutedSpawnOutcome::Failed(err));
+        self.set_outcome(RoutedSpawnOutcomeInner::Failed(err));
     }
 
     pub(crate) fn try_take_ready(
         &self,
     ) -> Result<Option<RoutedSpawnReady<'scope_ref, T>>, TaskError> {
-        let mut outcome = self.outcome.lock().expect("routed spawn state poisoned");
-        match replace(&mut *outcome, RoutedSpawnOutcome::Taken) {
-            RoutedSpawnOutcome::Ready(ready) => Ok(Some(ready)),
-            RoutedSpawnOutcome::Failed(err) => Err(err),
-            RoutedSpawnOutcome::Pending => {
-                *outcome = RoutedSpawnOutcome::Pending;
-                Ok(None)
+        if let Some(raw) = self.outcome.swap(None, Ordering::AcqRel) {
+            let inner = unsafe { Box::from_raw(raw.as_ptr()) };
+            match *inner {
+                RoutedSpawnOutcomeInner::Ready(ready) => Ok(Some(ready)),
+                RoutedSpawnOutcomeInner::Failed(err) => Err(err),
             }
-            RoutedSpawnOutcome::Taken => {
-                *outcome = RoutedSpawnOutcome::Taken;
-                Ok(None)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn cancel_ready_task_if_any(&self) {
+        if let Some(raw) = self.outcome.load(Ordering::Acquire) {
+            let inner = unsafe { raw.as_ref() };
+            if let RoutedSpawnOutcomeInner::Ready(ready) = inner {
+                ready.task.header().cancel();
             }
         }
     }
@@ -195,6 +201,19 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
         self.waker.register(waker);
     }
 }
+
+impl<'scope_ref, T> Drop for RoutedSpawnState<'scope_ref, T> {
+    fn drop(&mut self) {
+        if let Some(raw) = self.outcome.swap(None, Ordering::Acquire) {
+            unsafe {
+                let _ = Box::from_raw(raw.as_ptr());
+            }
+        }
+    }
+}
+
+unsafe impl<'scope_ref, T> Send for RoutedSpawnState<'scope_ref, T> where T: Send {}
+unsafe impl<'scope_ref, T> Sync for RoutedSpawnState<'scope_ref, T> where T: Send {}
 
 pub(crate) fn dispatch_routed<'scope_ref, S: Storage, O: Ownership, T, F, TExtra>(
     context: &RuntimeScopeContext<'_, TExtra>,

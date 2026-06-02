@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use veloq_intrusive_linklist::Link;
 
-use super::router::{RoutedSpawnOutcome, RoutedSpawnState, RoutedTaskAccess};
+use super::router::{RoutedSpawnState, RoutedTaskAccess};
 use super::{CancelTokenSlot, ScopeProvider};
 
 pub(crate) type ReclaimFn<'scope_ref, T, A> =
@@ -83,10 +83,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
                 if let Some(resolved) = resolved {
                     resolved.task.header().cancel();
                 } else {
-                    let outcome = state.outcome.lock().expect("routed spawn state poisoned");
-                    if let RoutedSpawnOutcome::Ready(ready) = &*outcome {
-                        ready.task.header().cancel();
-                    }
+                    state.cancel_ready_task_if_any();
                 }
             }
         }

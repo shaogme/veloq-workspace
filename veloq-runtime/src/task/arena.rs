@@ -300,11 +300,15 @@ impl<S: Storage> GenericChunk<S> {
         let size = layout.size();
         let mask = align - 1;
 
+        let base_addr = self.ptr.as_ptr() as usize;
         let mut current_used = self.used.load(Ordering::Acquire);
         loop {
-            let current_ptr = unsafe { self.ptr.as_ptr().add(current_used) } as usize;
+            let current_ptr = match base_addr.checked_add(current_used) {
+                Some(addr) => addr,
+                None => return ptr::null_mut(),
+            };
             let aligned_ptr = (current_ptr + mask) & !mask;
-            let offset = aligned_ptr - self.ptr.as_ptr() as usize;
+            let offset = aligned_ptr - base_addr;
             let new_used = offset + size;
 
             if new_used <= self.layout.size() {
@@ -366,13 +370,13 @@ impl<S: Storage> Arena for GenericArena<S> {
 unsafe impl<S: Storage> Send for GenericArena<S>
 where
     S::OptionPtr<GenericChunk<S>>: Send,
-    S::Lock<Vec<*mut GenericChunk<S>>>: Send,
+    S::Lock<LinkedList<ChunkAdapter<S>>>: Send,
 {
 }
 unsafe impl<S: Storage> Sync for GenericArena<S>
 where
     S::OptionPtr<GenericChunk<S>>: Sync,
-    S::Lock<Vec<*mut GenericChunk<S>>>: Sync,
+    S::Lock<LinkedList<ChunkAdapter<S>>>: Sync,
 {
 }
 
