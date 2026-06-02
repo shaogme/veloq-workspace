@@ -165,21 +165,19 @@ fn main() {
             ctx.scope(async |parent_scope| {
                 let token = parent_scope.cancel_token().clone();
 
-                parent_scope.spawn_boxed(async {
-                    println!("    [父作用域] 启动子作用域...");
-                    ctx.scope(async |child_scope| {
-                        child_scope.spawn_boxed(async {
-                            for i in 1..=100 {
-                                yield_now().await;
-                                if i % 10 == 0 {
-                                    println!("      [子作用域任务] 运行中... {}", i);
-                                }
+                println!("    [父作用域] 启动子作用域...");
+                ctx.scope(async |child_scope| {
+                    child_scope.spawn_boxed(async {
+                        for i in 1..=100 {
+                            yield_now().await;
+                            if i % 10 == 0 {
+                                println!("      [子作用域任务] 运行中... {}", i);
                             }
-                        });
-                    })
-                    .await;
-                    println!("    [父作用域] 子作用域已退出");
-                });
+                        }
+                    });
+                })
+                .await;
+                println!("    [父作用域] 子作用域已退出");
 
                 yield_now().await;
                 yield_now().await;

@@ -74,6 +74,7 @@ pub struct GenericAsyncScope<'ctx, S: Storage, O: Ownership + 'static, TExtra> {
     context: RuntimeScopeContext<'ctx, TExtra>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
+    _phantom: std::marker::PhantomData<fn(&'ctx ()) -> &'ctx ()>,
 }
 
 pub type AsyncScope<'ctx, TExtra> = GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra>;
@@ -113,15 +114,16 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
             context,
             arena: GenericArena::new(),
             completion,
+            _phantom: std::marker::PhantomData,
         }
     }
 
     pub fn spawn_local<'scope_ref, T: Send, TTask>(
         &'scope_ref self,
-        task: &'scope_ref TTask,
+        task: &'ctx TTask,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
-        TTask: LocalTask<T> + Sized + 'scope_ref,
+        TTask: LocalTask<T> + Sized + 'ctx,
     {
         self.completion.add_task();
 
@@ -224,10 +226,10 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
     fn spawn_send_impl<'scope_ref, T: Send, S_>(
         &'scope_ref self,
         worker_id: usize,
-        task: &'scope_ref S_,
+        task: &'ctx S_,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        S_: SendTask<T> + Sized,
+        S_: SendTask<T> + Sized + 'ctx,
     {
         debug_assert!(
             worker_id < self.context.shared.worker_count().get(),
@@ -252,10 +254,10 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
     pub fn spawn_to<'scope_ref, T: Send, S_>(
         &'scope_ref self,
         worker_id: usize,
-        task: &'scope_ref S_,
+        task: &'ctx S_,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        S_: SendTask<T> + Sized + Sync + 'scope_ref,
+        S_: SendTask<T> + Sized + Sync + 'ctx,
     {
         debug_assert!(
             worker_id < self.context.shared.worker_count().get(),
@@ -309,10 +311,10 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
 
     pub fn spawn<'scope_ref, T: Send, S_>(
         &'scope_ref self,
-        task: &'scope_ref S_,
+        task: &'ctx S_,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        S_: SendTask<T> + Sized + 'scope_ref,
+        S_: SendTask<T> + Sized + 'ctx,
     {
         self.spawn_send_impl(self.context.shared.choose_worker(), task)
     }
@@ -449,10 +451,10 @@ impl<'ctx, TExtra> GenericAsyncScope<'ctx, AtomicStorage, ArcOwnership, TExtra> 
 impl<'ctx, TExtra> GenericAsyncScope<'ctx, LocalStorage, RcOwnership, TExtra> {
     pub fn spawn<'scope_ref, T: Send, S_>(
         &'scope_ref self,
-        task: &'scope_ref S_,
+        task: &'ctx S_,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
-        S_: LocalTask<T> + Sized + 'scope_ref,
+        S_: LocalTask<T> + Sized + 'ctx,
     {
         self.spawn_local(task)
     }
