@@ -1,12 +1,13 @@
 use crate::runtime::RuntimeShared;
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::task::{
-    AnyScopeRef, Arena, GenericArena, LocalBoxedTaskNode, LocalTask, LocalTaskRef,
-    SendBoxedTaskNode, SendTask, SendTaskRef, TaskError, TaskHandleRef, TaskJoinGate,
+    AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, LocalBoxedTaskNode, LocalTask,
+    LocalTaskRef, SendBoxedTaskNode, SendTask, SendTaskRef, TaskError, TaskHandleRef, TaskJoinGate,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, StateOptionPtr, Storage,
+    StrategyType,
 };
 use std::alloc::Layout;
 use std::any::Any;
@@ -62,10 +63,20 @@ pub type LocalScopeCompletion = GenericScopeCompletion<LocalStorage, RcOwnership
 
 impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     pub fn new(parent: Option<AnyScopeRef>) -> O::Shared<Self> {
+        let cross_parent = if let Some(ref p) = parent
+            && (S::strategy_type() != StrategyType::Atomic
+                || O::strategy_type() != StrategyType::Atomic)
+            && let AnyScopeRef::Send(_) = p
+        {
+            Some(p.clone())
+        } else {
+            None
+        };
+
         O::new(Self {
             remaining: S::Usize::new(0),
             wakers: S::OptionPtr::new(None),
-            cancel_token: GenericCancellationToken::<S, O>::new(),
+            cancel_token: GenericCancellationToken::<S, O>::new_with_parent(cross_parent),
             panic_info: S::OptionBox::new(None),
             parent,
         })
@@ -301,13 +312,9 @@ impl<'ctx, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'ctx, S
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
         if let Some(ref parent) = parent {
-            let linked = parent.try_link_child(&crate::task::ErasedCancellationToken::new::<S, O>(
+            let _ = parent.try_link_child(&ErasedCancellationToken::new::<S, O>(
                 completion.cancel_token(),
             ));
-            if !linked && let crate::task::AnyScopeRef::Send(_) = parent {
-                let mut cross = completion.cancel_token().inner.cross_parent.lock();
-                *cross = Some(parent.clone());
-            }
         }
 
         Self {

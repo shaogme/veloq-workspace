@@ -389,9 +389,9 @@ pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
     cancelled: S::Usize,
     wakers: S::WakerQueue,
     children: ChildList<S, O>,
-    pub(crate) link: Link,
+    link: Link,
     parent: ParentSlot<S, O>,
-    pub(crate) cross_parent: S::Lock<Option<AnyScopeRef>>,
+    cross_parent: Option<AnyScopeRef>,
 }
 
 intrusive_adapter!(pub CancellationTokenAdapter<S, O> = GenericCancellationTokenInner<S, O> { link: Link } where S: Storage, O: Ownership);
@@ -426,6 +426,10 @@ impl<S: Storage, O: Ownership> Default for GenericCancellationToken<S, O> {
 
 impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
     pub fn new() -> Self {
+        Self::new_with_parent(None)
+    }
+
+    pub fn new_with_parent(cross_parent: Option<AnyScopeRef>) -> Self {
         Self {
             inner: O::new(GenericCancellationTokenInner {
                 cancelled: S::Usize::new(0),
@@ -433,7 +437,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
                 children: S::Lock::new(LinkedList::new(CancellationTokenAdapter::<S, O>::new())),
                 link: Link::new(),
                 parent: S::Lock::new(None),
-                cross_parent: S::Lock::new(None),
+                cross_parent,
             }),
         }
     }
@@ -485,7 +489,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
         if self.inner.cancelled.load(Ordering::SeqCst) != 0 {
             return true;
         }
-        if let Some(ref parent) = *self.inner.cross_parent.lock()
+        if let Some(ref parent) = self.inner.cross_parent
             && parent.is_cancelled()
         {
             return true;
@@ -499,7 +503,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
             return;
         }
         self.inner.wakers.push(waker.clone());
-        if let Some(ref parent) = *self.inner.cross_parent.lock() {
+        if let Some(ref parent) = self.inner.cross_parent {
             parent.register_cancel_waker(waker);
         }
         if self.is_cancelled() {
