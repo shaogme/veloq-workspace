@@ -119,8 +119,7 @@ fn register_internal(
             driver
                 .register_chunk(chunk_idx, region.as_ptr(), region.len())
                 .map_err(|err| std::io::Error::other(format!("{err:#}")))
-                .to_report()
-                .map_report_err(BufError::from)?;
+                .diag(|r| r.map_err(BufError::from))?;
 
             new_chunks.push(veloq_buf::heap::ChunkInfo {
                 id: chunk_idx,

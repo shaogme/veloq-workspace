@@ -26,15 +26,6 @@ where
 }
 
 #[inline]
-pub fn from_driver_report<E>(report: Report<E>) -> Report<Error>
-where
-    Error: From<E>,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    from_report(report)
-}
-
-#[inline]
 pub fn to_io_error(error: Report<Error>) -> io::Error {
     io::Error::other(error)
 }

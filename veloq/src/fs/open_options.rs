@@ -1,7 +1,8 @@
 use std::path::Path;
 
-use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, from_report};
+use crate::error::{Result as VeloqResult, from_io_error};
 use crate::runtime::context::RuntimeContext;
+use diagweave::report::ResultReportExt;
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::Open;
 
@@ -104,12 +105,12 @@ impl OpenOptions {
 
         let submitter = LocalSubmitter::new();
         let (res, _) = ctx.submit(&submitter, Op::new(op)).await.into_inner();
-        let owned = res.map_err(from_driver_report)?;
+        let owned = res.trans_inner_err()?;
         let fd = owned.into_raw();
         let fixed = ctx.driver(|mut driver| {
             driver
                 .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
-                .map_err(from_driver_report)?
+                .trans_inner_err()?
                 .into_iter()
                 .next()
                 .ok_or_else(|| {
@@ -138,7 +139,7 @@ impl OpenOptions {
         let submitter = DetachedSubmitter::new();
         let owner = ctx.scope.worker_id();
         let (res, _) = ctx.submit_to(owner, Op::new(op)).await?;
-        let owned = res.map_err(from_driver_report)?;
+        let owned = res.trans_inner_err()?;
         let fd = owned.into_raw();
         use std::sync::atomic::AtomicU64;
 
@@ -157,13 +158,14 @@ impl OpenOptions {
         path: &Path,
     ) -> VeloqResult<Open> {
         use std::num::NonZeroUsize;
+        use diagweave::report::ResultReportExt;
         use std::os::unix::ffi::OsStrExt;
 
         let path_bytes = path.as_os_str().as_bytes();
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
 
-        let mut buf = ctx.try_alloc(len_nz).map_err(from_report)?;
+        let mut buf = ctx.try_alloc(len_nz).map_report_err(|r| r.into())?;
         let slice = buf.as_slice_mut();
         if slice.len() < len {
             return Err(from_io_error(std::io::Error::new(
@@ -222,6 +224,7 @@ impl OpenOptions {
     ) -> VeloqResult<Open> {
         use std::num::NonZeroUsize;
         use std::os::windows::ffi::OsStrExt;
+        use diagweave::report::ResultReportExt;
         use windows_sys::Win32::Foundation::*;
         use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
 
@@ -234,7 +237,7 @@ impl OpenOptions {
         path_w.push(0);
         let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
 
-        let mut buf = ctx.try_alloc(len_bytes).map_err(from_report)?;
+        let mut buf = ctx.try_alloc(len_bytes).trans_inner_err()?;
         let slice = buf.as_slice_mut();
         if slice.len() < len_bytes.get() {
             return Err(from_io_error(std::io::Error::new(

@@ -3,9 +3,10 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
+use crate::error::{Result as VeloqResult, from_io_error, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::runtime::context::RuntimeContext;
+use diagweave::report::ResultReportExt;
 use veloq_buf::FixedBuf;
 use veloq_driver_native::Socket;
 use veloq_driver_native::op::{
@@ -41,13 +42,13 @@ fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
         })?;
 
     let socket = if addr.is_ipv4() {
-        Socket::new_udp_v4().map_err(from_driver_report)?
+        Socket::new_udp_v4().trans_inner_err()?
     } else {
-        Socket::new_udp_v6().map_err(from_driver_report)?
+        Socket::new_udp_v6().trans_inner_err()?
     };
 
-    socket.bind(addr).map_err(from_driver_report)?;
-    let local_addr = socket.local_addr().map_err(from_driver_report)?;
+    socket.bind(addr).trans_inner_err()?;
+    let local_addr = socket.local_addr().trans_inner_err()?;
 
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
@@ -78,7 +79,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let buf = op_back.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        Ok((res.trans_inner_err()?, buf))
     }
 
     async fn recv_from_direct(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
@@ -95,7 +96,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .into_inner();
         let op_back =
             op_back_opt.ok_or_else(|| from_io_error(io::Error::other("UdpRecvFrom op lost")))?;
-        let n = res.map_err(from_driver_report)?;
+        let n = res.trans_inner_err()?;
         let mut recv_buf = op_back.buf;
         recv_buf.set_len(n);
         let addr = op_back.addr.ok_or_else(|| {
@@ -123,7 +124,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        res.map(|_| ()).map_err(from_driver_report)
+        res.map(|_| ()).trans_inner_err()
     }
 
     async fn send_subset_direct(
@@ -144,7 +145,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let buf = op_back.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        Ok((res.trans_inner_err()?, buf))
     }
 
     async fn recv_subset_direct(
@@ -165,7 +166,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let buf = op_back.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        Ok((res.trans_inner_err()?, buf))
     }
 }
 
@@ -241,7 +242,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             addr: target,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.map_err(from_driver_report)?, op.buf))
+        Ok((res.trans_inner_err()?, op.buf))
     }
 
     pub async fn recv_from(&self, buf: FixedBuf) -> VeloqResult<UdpRecvPacket> {
@@ -253,7 +254,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             addr: None,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        let n = res.map_err(from_driver_report)?;
+        let n = res.trans_inner_err()?;
         let mut recv_buf = op.buf;
         recv_buf.set_len(n);
         let addr = op.addr.ok_or_else(|| {
@@ -278,7 +279,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             addr_len: raw_addr_len as u32,
         };
         let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        res.map(|_| ()).map_err(from_driver_report)
+        res.map(|_| ()).trans_inner_err()
     }
 
     pub async fn send(&self, buf: FixedBuf) -> VeloqResult<(usize, FixedBuf)> {
@@ -301,7 +302,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             buf_offset,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.map_err(from_driver_report)?, op.buf))
+        Ok((res.trans_inner_err()?, op.buf))
     }
 
     pub async fn recv_subset(
@@ -316,7 +317,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             buf_offset,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.map_err(from_driver_report)?, op.buf))
+        Ok((res.trans_inner_err()?, op.buf))
     }
 }
 

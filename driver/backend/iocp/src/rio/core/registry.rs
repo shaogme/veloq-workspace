@@ -165,7 +165,7 @@ impl RioRegistry {
                 self.chunk_register_failures_recent
                     .insert(id, Instant::now());
                 return Err(e)
-                    .map_report_err(|_| RioError::BufferRegistration)
+                    .map_inner_err(|_| RioError::BufferRegistration)
                     .attach_note(format!(
                         "RIORegisterBuffer failed: chunk_id={id}, len={len}"
                     ));

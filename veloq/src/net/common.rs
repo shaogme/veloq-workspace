@@ -4,8 +4,9 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
+use crate::error::{Result as VeloqResult, from_io_error};
 use crate::runtime::context::{RuntimeContext, submit_control_task};
+use diagweave::report::ResultReportExt;
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::IoFd;
 use veloq_driver_native::{OwnedRawHandle, RawHandle};
@@ -34,7 +35,7 @@ impl<'a, 'ctx> SocketToken<'a, 'ctx> {
         let fd = ctx.driver(|mut driver| {
             driver
                 .register_files(vec![RegisterFd::Owned(owned)])
-                .map_err(from_driver_report)
+                .trans_inner_err()
                 .and_then(|mut fds| {
                     fds.pop().ok_or_else(|| {
                         from_io_error(io::Error::other("register_files returned empty"))

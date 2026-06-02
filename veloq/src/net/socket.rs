@@ -1,8 +1,9 @@
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
+use crate::error::{Result as VeloqResult, from_io_error};
 use crate::runtime::context::RuntimeContext;
+use diagweave::report::ResultReportExt;
 use veloq_driver_native::Socket;
 use veloq_driver_native::op::DetachedSubmitter;
 
@@ -26,53 +27,53 @@ impl TcpSocket {
     /// Create a new IPv4 TCP socket.
     pub fn new_v4() -> VeloqResult<Self> {
         Ok(Self {
-            inner: Socket::new_tcp_v4().map_err(from_driver_report)?,
+            inner: Socket::new_tcp_v4().trans_inner_err()?,
         })
     }
 
     /// Create a new IPv6 TCP socket.
     pub fn new_v6() -> VeloqResult<Self> {
         Ok(Self {
-            inner: Socket::new_tcp_v6().map_err(from_driver_report)?,
+            inner: Socket::new_tcp_v6().trans_inner_err()?,
         })
     }
 
     /// Set `TCP_NODELAY` option.
     pub fn set_nodelay(&self, nodelay: bool) -> VeloqResult<()> {
-        self.inner.set_nodelay(nodelay).map_err(from_driver_report)
+        self.inner.set_nodelay(nodelay).trans_inner_err()
     }
 
     /// Set `SO_RCVBUF` option.
     pub fn set_recv_buffer_size(&self, size: usize) -> VeloqResult<()> {
         self.inner
             .set_recv_buffer_size(size)
-            .map_err(from_driver_report)
+            .trans_inner_err()
     }
 
     /// Set `SO_SNDBUF` option.
     pub fn set_send_buffer_size(&self, size: usize) -> VeloqResult<()> {
         self.inner
             .set_send_buffer_size(size)
-            .map_err(from_driver_report)
+            .trans_inner_err()
     }
 
     /// Set `SO_REUSEADDR` option.
     pub fn set_reuse_address(&self, reuse: bool) -> VeloqResult<()> {
         self.inner
             .set_reuse_address(reuse)
-            .map_err(from_driver_report)
+            .trans_inner_err()
     }
 
     /// Set `SO_KEEPALIVE` option.
     pub fn set_keepalive(&self, keepalive: bool) -> VeloqResult<()> {
         self.inner
             .set_keepalive(keepalive)
-            .map_err(from_driver_report)
+            .trans_inner_err()
     }
 
     /// Set `IP_TTL` option.
     pub fn set_ttl(&self, ttl: u32) -> VeloqResult<()> {
-        self.inner.set_ttl(ttl).map_err(from_driver_report)
+        self.inner.set_ttl(ttl).trans_inner_err()
     }
 
     /// Bind the socket to the given address.
@@ -89,7 +90,7 @@ impl TcpSocket {
                     "No address provided",
                 ))
             })?;
-        self.inner.bind(addr).map_err(from_driver_report)
+        self.inner.bind(addr).trans_inner_err()
     }
 
     /// Listen for incoming connections.
@@ -100,10 +101,10 @@ impl TcpSocket {
         ctx: RuntimeContext<'a, 'ctx>,
         backlog: u32,
     ) -> VeloqResult<TcpListener<'a, 'ctx>> {
-        let local_addr = self.inner.local_addr().map_err(from_driver_report)?;
+        let local_addr = self.inner.local_addr().trans_inner_err()?;
         self.inner
             .listen(backlog as i32)
-            .map_err(from_driver_report)?;
+            .trans_inner_err()?;
         Ok(GenericTcpListener {
             inner: InnerSocket::new(
                 ctx,
@@ -141,14 +142,14 @@ impl UdpSocketBuilder {
     /// Create a new IPv4 UDP socket.
     pub fn new_v4() -> VeloqResult<Self> {
         Ok(Self {
-            inner: Socket::new_udp_v4().map_err(from_driver_report)?,
+            inner: Socket::new_udp_v4().trans_inner_err()?,
         })
     }
 
     /// Create a new IPv6 UDP socket.
     pub fn new_v6() -> VeloqResult<Self> {
         Ok(Self {
-            inner: Socket::new_udp_v6().map_err(from_driver_report)?,
+            inner: Socket::new_udp_v6().trans_inner_err()?,
         })
     }
 
@@ -156,33 +157,33 @@ impl UdpSocketBuilder {
     pub fn set_broadcast(&self, broadcast: bool) -> VeloqResult<()> {
         self.inner
             .set_broadcast(broadcast)
-            .map_err(from_driver_report)
+            .trans_inner_err()
     }
 
     /// Set `SO_RCVBUF` option.
     pub fn set_recv_buffer_size(&self, size: usize) -> VeloqResult<()> {
         self.inner
             .set_recv_buffer_size(size)
-            .map_err(from_driver_report)
+            .trans_inner_err()
     }
 
     /// Set `SO_SNDBUF` option.
     pub fn set_send_buffer_size(&self, size: usize) -> VeloqResult<()> {
         self.inner
             .set_send_buffer_size(size)
-            .map_err(from_driver_report)
+            .trans_inner_err()
     }
 
     /// Set `SO_REUSEADDR` option.
     pub fn set_reuse_address(&self, reuse: bool) -> VeloqResult<()> {
         self.inner
             .set_reuse_address(reuse)
-            .map_err(from_driver_report)
+            .trans_inner_err()
     }
 
     /// Set `IP_TTL` option.
     pub fn set_ttl(&self, ttl: u32) -> VeloqResult<()> {
-        self.inner.set_ttl(ttl).map_err(from_driver_report)
+        self.inner.set_ttl(ttl).trans_inner_err()
     }
 
     /// Bind the socket to the given address.
@@ -203,8 +204,8 @@ impl UdpSocketBuilder {
                     "No address provided",
                 ))
             })?;
-        self.inner.bind(addr).map_err(from_driver_report)?;
-        let local_addr = self.inner.local_addr().map_err(from_driver_report)?;
+        self.inner.bind(addr).trans_inner_err()?;
+        let local_addr = self.inner.local_addr().trans_inner_err()?;
 
         Ok(GenericUdpSocket {
             inner: InnerSocket::new(

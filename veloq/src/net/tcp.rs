@@ -3,9 +3,10 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
+use crate::error::{Result as VeloqResult, from_io_error, to_io_error};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::runtime::context::RuntimeContext;
+use diagweave::report::ResultReportExt;
 use veloq_buf::FixedBuf;
 use veloq_driver_native::Socket;
 use veloq_driver_native::op::{
@@ -56,14 +57,14 @@ fn bind_listener_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
         })?;
 
     let socket = if addr.is_ipv4() {
-        Socket::new_tcp_v4().map_err(from_driver_report)?
+        Socket::new_tcp_v4().trans_inner_err()?
     } else {
-        Socket::new_tcp_v6().map_err(from_driver_report)?
+        Socket::new_tcp_v6().trans_inner_err()?
     };
 
-    socket.bind(addr).map_err(from_driver_report)?;
-    socket.listen(1024).map_err(from_driver_report)?;
-    let local_addr = socket.local_addr().map_err(from_driver_report)?;
+    socket.bind(addr).trans_inner_err()?;
+    socket.listen(1024).trans_inner_err()?;
+    let local_addr = socket.local_addr().trans_inner_err()?;
 
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
@@ -73,9 +74,9 @@ fn new_stream_inner<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>>(
     addr: &SocketAddr,
 ) -> VeloqResult<InnerSocket<'a, 'ctx, P>> {
     let socket = if addr.is_ipv4() {
-        Socket::new_tcp_v4().map_err(from_driver_report)?
+        Socket::new_tcp_v4().trans_inner_err()?
     } else {
-        Socket::new_tcp_v6().map_err(from_driver_report)?
+        Socket::new_tcp_v6().trans_inner_err()?
     };
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), None)
 }
@@ -100,7 +101,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Accept op lost"))
         })?;
 
-        let accepted = res.map_err(from_driver_report)?;
+        let accepted = res.trans_inner_err()?;
         let addr = op.remote_addr.ok_or_else(|| {
             from_io_error(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -140,7 +141,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         };
 
         let (res, _) = ctx.submit(&submitter, Op::new(op)).await.into_inner();
-        res.map_err(from_driver_report)?;
+        res.trans_inner_err()?;
 
         Ok(Self {
             inner,
@@ -167,7 +168,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let buf = op_back.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        Ok((res.trans_inner_err()?, buf))
     }
 
     async fn send_subset_direct(
@@ -188,7 +189,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let buf = op_back.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        Ok((res.trans_inner_err()?, buf))
     }
 }
 
@@ -225,7 +226,7 @@ impl<'a, 'ctx> TcpListener<'a, 'ctx> {
         };
 
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        let accepted = res.map_err(from_driver_report)?;
+        let accepted = res.trans_inner_err()?;
         let addr = op.remote_addr.ok_or_else(|| {
             from_io_error(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -308,7 +309,7 @@ impl<'a, 'ctx> TcpStream<'a, 'ctx> {
             buf_offset,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.map_err(from_driver_report)?, op.buf))
+        Ok((res.trans_inner_err()?, op.buf))
     }
 
     pub async fn send_subset(
@@ -323,7 +324,7 @@ impl<'a, 'ctx> TcpStream<'a, 'ctx> {
             buf_offset,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.map_err(from_driver_report)?, op.buf))
+        Ok((res.trans_inner_err()?, op.buf))
     }
 }
 

@@ -1,6 +1,7 @@
 use super::open_options::OpenOptions;
 use crate::runtime::context::RuntimeContext;
 
+use diagweave::report::ResultReportExt;
 use veloq_buf::FixedBuf;
 use veloq_driver_native::driver::Driver;
 use veloq_driver_native::op::{
@@ -17,7 +18,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use crate::error::{Result as VeloqResult, from_driver_report, from_io_error, to_io_error};
+use crate::error::{Result as VeloqResult, from_io_error, to_io_error};
 
 #[cfg(not(unix))]
 macro_rules! ignore {
@@ -121,7 +122,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         let buf = op.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        Ok((res.trans_inner_err()?, buf))
     }
 
     pub async fn write_at_subset(
@@ -145,7 +146,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         let buf = op.map(|o| o.buf).ok_or_else(|| {
             from_io_error(io::Error::new(io::ErrorKind::BrokenPipe, "Op buffer lost"))
         })?;
-        Ok((res.map_err(from_driver_report)?, buf))
+        Ok((res.trans_inner_err()?, buf))
     }
 
     pub async fn sync_all(&self) -> VeloqResult<()> {
@@ -159,7 +160,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        res.map(|_| ()).map_err(from_driver_report)
+        res.map(|_| ()).trans_inner_err()
     }
 
     pub async fn sync_data(&self) -> VeloqResult<()> {
@@ -173,7 +174,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        res.map(|_| ()).map_err(from_driver_report)
+        res.map(|_| ()).trans_inner_err()
     }
 
     pub async fn fallocate(&self, offset: u64, len: u64) -> VeloqResult<()> {
@@ -189,7 +190,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        res.map(|_| ()).map_err(from_driver_report)
+        res.map(|_| ()).trans_inner_err()
     }
 }
 
@@ -300,7 +301,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         let owner = self.ctx.scope.worker_id();
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         let buf = op.buf;
-        Ok((res.map_err(from_driver_report)?, buf))
+        Ok((res.trans_inner_err()?, buf))
     }
 
     pub async fn write_at_subset(
@@ -319,7 +320,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         let owner = self.ctx.scope.worker_id();
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         let buf = op.buf;
-        Ok((res.map_err(from_driver_report)?, buf))
+        Ok((res.trans_inner_err()?, buf))
     }
 
     pub async fn sync_all(&self) -> VeloqResult<()> {
@@ -330,7 +331,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
 
         let owner = self.ctx.scope.worker_id();
         let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        res.map(|_| ()).map_err(from_driver_report)
+        res.map(|_| ()).trans_inner_err()
     }
 
     pub async fn sync_data(&self) -> VeloqResult<()> {
@@ -341,7 +342,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
 
         let owner = self.ctx.scope.worker_id();
         let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        res.map(|_| ()).map_err(from_driver_report)
+        res.map(|_| ()).trans_inner_err()
     }
 
     pub async fn fallocate(&self, offset: u64, len: u64) -> VeloqResult<()> {
@@ -354,7 +355,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
 
         let owner = self.ctx.scope.worker_id();
         let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        res.map(|_| ()).map_err(from_driver_report)
+        res.map(|_| ()).trans_inner_err()
     }
 
     pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, 'a, 'ctx> {
@@ -458,7 +459,7 @@ impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
                 let (res, _) = res.into_inner();
                 Poll::Ready(
                     res.map(|_| ())
-                        .map_err(from_driver_report)
+                        .trans_inner_err()
                         .map_err(to_io_error),
                 )
             }

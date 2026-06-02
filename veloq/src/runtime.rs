@@ -6,6 +6,7 @@ use std::ops::AsyncFnOnce;
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+use diagweave::report::ResultReportExt;
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::PlatformDriver;
@@ -71,7 +72,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         let state = self
             .topology
             .init(worker_count.get())
-            .map_err(crate::error::from_report)?;
+            .trans_inner_err()?;
 
         Ok(Runtime {
             worker_count,

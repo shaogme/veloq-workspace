@@ -1,7 +1,47 @@
 use clap::{Parser, ValueEnum};
-use std::io;
+use diagweave::prelude::*;
+use diagweave::union;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
+
+union! {
+    pub enum RunnerError =
+        std::io::Error as Io |
+        {
+            #[display("{0}")]
+            Cli(String),
+
+            #[display("未检测到 docker-compose（或 docker compose），无法在 Windows 上执行 Linux 相关命令")]
+            DockerComposeNotFound,
+
+            #[display("无法解析 workspace 根目录")]
+            WorkspaceRootResolutionFailed,
+
+            #[display("无法读取已安装 target 列表")]
+            FailedToReadTargetList,
+
+            #[display("检查 rustup target 失败")]
+            FailedToCheckRustupTarget,
+
+            #[display("{step} 失败（退出码: {code:?}）")]
+            SetupFailed {
+                step: String,
+                code: Option<i32>,
+            },
+
+            #[display("{task}-{target} 第 {round}/{total} 次执行失败（退出码: {code:?}）")]
+            RoundFailed {
+                task: &'static str,
+                target: &'static str,
+                round: usize,
+                total: usize,
+                code: Option<i32>,
+            },
+
+            #[display("命令执行失败")]
+            CommandFailed,
+        }
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum Target {
@@ -79,16 +119,22 @@ struct Config {
 }
 
 impl TryFrom<Cli> for Config {
-    type Error = String;
+    type Error = RunnerError;
 
     fn try_from(cli: Cli) -> Result<Self, Self::Error> {
         let target = match (cli.target, cli.target_positional) {
             (Some(target), None) | (None, Some(target)) => target,
             (Some(flag), Some(positional)) if flag == positional => flag,
             (Some(_), Some(_)) => {
-                return Err("--target 与位置参数冲突，请仅保留一种写法".to_string());
+                return Err(RunnerError::Cli(
+                    "--target 与位置参数冲突，请仅保留一种写法".to_string(),
+                ));
             }
-            (None, None) => return Err("缺少目标平台，请使用 --target <linux|windows>".to_string()),
+            (None, None) => {
+                return Err(RunnerError::Cli(
+                    "缺少目标平台，请使用 --target <linux|windows>".to_string(),
+                ));
+            }
         };
 
         let count = cli.count.unwrap_or_else(|| cli.task.default_count());
@@ -168,9 +214,14 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(config: Config) -> io::Result<Self> {
-        let workspace_root = workspace_root()?;
-        let mode = determine_mode(config.target, &workspace_root)?;
+    fn new(config: Config) -> Result<Self, Report<RunnerError>> {
+        let workspace_root = workspace_root().map_err(|e| e.to_report())?;
+        let mode = determine_mode(config.target, &workspace_root).map_err(|e| {
+            e.to_report().with_ctx(
+                "workspace_root",
+                workspace_root.to_string_lossy().to_string(),
+            )
+        })?;
 
         let windows_target = if cfg!(target_os = "windows") || config.target != Target::Windows {
             None
@@ -221,12 +272,13 @@ impl Runner {
         Ok(runner)
     }
 
-    fn run(&self) -> io::Result<()> {
+    fn run(&self) -> Result<(), Report<RunnerError>> {
         let command = self.round_command();
 
         if !matches!(self.mode, RunMode::Native) {
             // 在非原生环境下，我们直接运行一次 xtest-runner，由内部的 xtest-runner 负责循环
-            let status = command_status(&command, &self.workspace_root)?;
+            let status = command_status(&command, &self.workspace_root)
+                .map_err(|e| e.to_report().with_ctx("command", command.display()))?;
             if status.success() {
                 return Ok(());
             } else {
@@ -249,23 +301,27 @@ impl Runner {
         Ok(())
     }
 
-    fn run_round(&self, command: &CommandSpec, round: usize) -> io::Result<()> {
+    fn run_round(&self, command: &CommandSpec, round: usize) -> Result<(), Report<RunnerError>> {
         if !self.config.quiet {
-            let status = command_status(command, &self.workspace_root)?;
+            let status = command_status(command, &self.workspace_root)
+                .map_err(|e| e.to_report().with_ctx("round", round.to_string()))?;
             if status.success() {
                 return Ok(());
             }
 
-            return Err(io::Error::other(format!(
-                "{}-{} 第 {round}/{} 次执行失败（退出码: {:?}）",
-                self.config.task.name(),
-                self.config.target.name(),
-                self.config.count,
-                status.code()
-            )));
+            return Err(RunnerError::RoundFailed {
+                task: self.config.task.name(),
+                target: self.config.target.name(),
+                round,
+                total: self.config.count,
+                code: status.code(),
+            }
+            .to_report()
+            .with_ctx("command", command.display()));
         }
 
-        let output = command_output(command, &self.workspace_root)?;
+        let output = command_output(command, &self.workspace_root)
+            .map_err(|e| e.to_report().with_ctx("round", round.to_string()))?;
         if output.status.success() {
             return Ok(());
         }
@@ -278,10 +334,10 @@ impl Runner {
             output.status.code()
         );
         print_output(&output);
-        Err(io::Error::other("命令执行失败"))
+        Err(RunnerError::CommandFailed.to_report())
     }
 
-    fn prepare_environment(&self) -> io::Result<()> {
+    fn prepare_environment(&self) -> Result<(), Report<RunnerError>> {
         if matches!(self.mode, RunMode::WindowsOnLinux) {
             if !command_works("cross", &["--version"], &self.workspace_root) {
                 self.run_setup(
@@ -291,7 +347,8 @@ impl Runner {
             }
 
             if let Some(target) = &self.windows_target
-                && !has_rust_target(target, &self.workspace_root)?
+                && !has_rust_target(target, &self.workspace_root)
+                    .map_err(|e| e.to_report().with_ctx("target", target.clone()))?
             {
                 self.run_setup(
                     &format!("安装 {} 工具链", target),
@@ -306,28 +363,37 @@ impl Runner {
         Ok(())
     }
 
-    fn run_setup(&self, step: &str, command: CommandSpec) -> io::Result<()> {
+    fn run_setup(&self, step: &str, command: CommandSpec) -> Result<(), Report<RunnerError>> {
         if !self.config.quiet {
             eprintln!("[xtest-runner] {step}: {}", command.display());
-            let status = command_status(&command, &self.workspace_root)?;
+            let status = command_status(&command, &self.workspace_root)
+                .map_err(|e| e.to_report().with_ctx("step", step.to_string()))?;
             if status.success() {
                 return Ok(());
             }
 
-            return Err(io::Error::other(format!(
-                "{step} 失败（退出码: {:?}）",
-                status.code()
-            )));
+            return Err(RunnerError::SetupFailed {
+                step: step.to_string(),
+                code: status.code(),
+            }
+            .to_report()
+            .with_ctx("command", command.display()));
         }
 
-        let output = command_output(&command, &self.workspace_root)?;
+        let output = command_output(&command, &self.workspace_root)
+            .map_err(|e| e.to_report().with_ctx("step", step.to_string()))?;
         if output.status.success() {
             return Ok(());
         }
 
         eprintln!("{step} 失败（退出码: {:?}）", output.status.code());
         print_output(&output);
-        Err(io::Error::other(format!("{step} 失败")))
+        Err(RunnerError::SetupFailed {
+            step: step.to_string(),
+            code: output.status.code(),
+        }
+        .to_report()
+        .with_ctx("command", command.display()))
     }
 
     fn round_command(&self) -> CommandSpec {
@@ -465,25 +531,22 @@ fn windows_native_command(task: Task, features: Option<&str>, target: Option<&st
     CommandSpec::new("cargo", args)
 }
 
-fn parse_count(input: &str) -> Result<usize, String> {
+fn parse_count(input: &str) -> Result<usize, RunnerError> {
     let count = input
         .parse::<usize>()
-        .map_err(|_| format!("无效的次数: {input}"))?;
+        .map_err(|_| RunnerError::Cli(format!("无效的次数: {input}")))?;
 
     if count == 0 {
-        return Err("--count 必须大于 0".to_string());
+        return Err(RunnerError::Cli("--count 必须大于 0".to_string()));
     }
 
     Ok(count)
 }
 
-fn determine_mode(target: Target, workspace_root: &Path) -> io::Result<RunMode> {
+fn determine_mode(target: Target, workspace_root: &Path) -> Result<RunMode, RunnerError> {
     if cfg!(target_os = "windows") && target == Target::Linux {
-        let compose_variant = docker_compose_variant(workspace_root).ok_or_else(|| {
-            io::Error::other(
-                "未检测到 docker-compose（或 docker compose），无法在 Windows 上执行 Linux 相关命令",
-            )
-        })?;
+        let compose_variant =
+            docker_compose_variant(workspace_root).ok_or(RunnerError::DockerComposeNotFound)?;
 
         return Ok(RunMode::LinuxOnWindows(compose_variant));
     }
@@ -495,7 +558,7 @@ fn determine_mode(target: Target, workspace_root: &Path) -> io::Result<RunMode> 
     Ok(RunMode::Native)
 }
 
-fn has_rust_target(target: &str, workspace_root: &Path) -> io::Result<bool> {
+fn has_rust_target(target: &str, workspace_root: &Path) -> Result<bool, RunnerError> {
     let output = command_output(
         &CommandSpec::new(
             "rustup",
@@ -510,7 +573,7 @@ fn has_rust_target(target: &str, workspace_root: &Path) -> io::Result<bool> {
             output.status.code()
         );
         print_output(&output);
-        return Err(io::Error::other("无法读取已安装 target 列表"));
+        return Err(RunnerError::FailedToCheckRustupTarget);
     }
 
     let installed = String::from_utf8_lossy(&output.stdout);
@@ -550,63 +613,64 @@ fn print_output(output: &Output) {
     }
 }
 
-fn workspace_root() -> io::Result<PathBuf> {
+fn workspace_root() -> Result<PathBuf, RunnerError> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .ok_or_else(|| io::Error::other("无法解析 workspace 根目录"))
+        .ok_or(RunnerError::WorkspaceRootResolutionFailed)
 }
 
 fn command_status(
     command: &CommandSpec,
     workspace_root: &Path,
-) -> io::Result<std::process::ExitStatus> {
+) -> Result<std::process::ExitStatus, RunnerError> {
     if !workspace_root.exists() {
-        return Err(io::Error::other(format!(
-            "Workspace root does not exist: {:?}",
-            workspace_root
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Workspace root does not exist: {:?}", workspace_root),
+        )
+        .into());
     }
     let mut process = Command::new(&command.program);
     process
         .args(&command.args)
         .envs(command.envs.iter().map(|(k, v)| (k, v)))
         .current_dir(workspace_root);
-    process.status()
+    Ok(process.status()?)
 }
 
-fn command_output(command: &CommandSpec, workspace_root: &Path) -> io::Result<Output> {
+fn command_output(command: &CommandSpec, workspace_root: &Path) -> Result<Output, RunnerError> {
     if !workspace_root.exists() {
-        return Err(io::Error::other(format!(
-            "Workspace root does not exist: {:?}",
-            workspace_root
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Workspace root does not exist: {:?}", workspace_root),
+        )
+        .into());
     }
     let mut process = Command::new(&command.program);
     process
         .args(&command.args)
         .envs(command.envs.iter().map(|(k, v)| (k, v)))
         .current_dir(workspace_root);
-    process.output()
+    Ok(process.output()?)
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let config = match Config::try_from(cli) {
-        Ok(config) => config,
-        Err(message) => {
-            eprintln!("{message}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    match Runner::new(config).and_then(|runner| runner.run()) {
+    match run_app(cli) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{error}");
+        Err(report) => {
+            eprintln!("{}", report.pretty());
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_app(cli: Cli) -> Result<(), Report<RunnerError>> {
+    let config = Config::try_from(cli).map_err(|e| e.to_report())?;
+    let runner = Runner::new(config)?;
+    runner.run()?;
+    Ok(())
 }
