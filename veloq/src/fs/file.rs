@@ -2,7 +2,7 @@ use super::open_options::OpenOptions;
 use crate::fs::error::FsError;
 use crate::runtime::context::RuntimeContext;
 
-use diagweave::report::{Diagnostic, ResultReportExt};
+use diagweave::report::{Diagnostic, Report, ResultReportExt};
 use veloq_buf::FixedBuf;
 use veloq_driver_native::driver::Driver;
 use veloq_driver_native::op::{
@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use crate::error::{Result, to_io_error};
+use crate::error::{Error, Result};
 
 #[cfg(not(unix))]
 macro_rules! ignore {
@@ -198,28 +198,27 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> crate::io::AsyncBufRead for LocalFile<'a, 'ctx> {
-    async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    type Error = Report<Error>;
+
+    async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
-        let (n, buf) = self.read_at(buf, offset).await.map_err(to_io_error)?;
+        let (n, buf) = self.read_at(buf, offset).await?;
         self.pos.set(self.pos.get() + n as u64);
         Ok((n, buf))
     }
 
-    async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    async fn read_exact(&self, mut buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
             let offset = self.pos.get();
-            let (n, b) = self
-                .read_at_subset(buf, offset, total)
-                .await
-                .map_err(to_io_error)?;
+            let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(io::Error::new(
+                return Err(Report::new(Error::from(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "failed to fill whole buffer",
-                ));
+                ))));
             }
             total += n;
             self.pos.set(self.pos.get() + n as u64);
@@ -229,28 +228,27 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalFile<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalFile<'a, 'ctx> {
-    async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    type Error = Report<Error>;
+
+    async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let offset = self.pos.get();
-        let (n, buf) = self.write_at(buf, offset).await.map_err(to_io_error)?;
+        let (n, buf) = self.write_at(buf, offset).await?;
         self.pos.set(self.pos.get() + n as u64);
         Ok((n, buf))
     }
 
-    async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    async fn write_all(&self, mut buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
             let offset = self.pos.get();
-            let (n, b) = self
-                .write_at_subset(buf, offset, total)
-                .await
-                .map_err(to_io_error)?;
+            let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(io::Error::new(
+                return Err(Report::new(Error::from(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "failed to write whole buffer",
-                ));
+                ))));
             }
             total += n;
             self.pos.set(self.pos.get() + n as u64);
@@ -258,12 +256,12 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalFile<'a, 'ctx> {
         Ok((total, buf))
     }
 
-    async fn flush(&self) -> io::Result<()> {
-        self.sync_data().await.map_err(to_io_error)
+    async fn flush(&self) -> Result<()> {
+        self.sync_data().await
     }
 
-    async fn shutdown(&self) -> io::Result<()> {
-        self.sync_all().await.map_err(to_io_error)
+    async fn shutdown(&self) -> Result<()> {
+        self.sync_all().await
     }
 }
 
@@ -428,7 +426,7 @@ impl<'f, 'a, 'ctx> SyncRangeBuilder<'f, 'a, 'ctx> {
 }
 
 impl<'f, 'a, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'a, 'ctx> {
-    type Output = io::Result<()>;
+    type Output = Result<usize>;
     type IntoFuture = SyncRangeFuture<'a, 'ctx>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -453,14 +451,14 @@ pub struct SyncRangeFuture<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
-    type Output = io::Result<()>;
+    type Output = Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         match Pin::new(&mut this.inner).poll(cx) {
             Poll::Ready(res) => {
                 let (res, _) = res.into_inner();
-                Poll::Ready(res.map(|_| ()).trans_inner_err().map_err(to_io_error))
+                Poll::Ready(res.trans_inner_err())
             }
             Poll::Pending => Poll::Pending,
         }
@@ -468,28 +466,27 @@ impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> crate::io::AsyncBufRead for File<'a, 'ctx> {
-    async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    type Error = Report<Error>;
+
+    async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let offset = self.pos.load(Ordering::Relaxed);
-        let (n, buf) = self.read_at(buf, offset).await.map_err(to_io_error)?;
+        let (n, buf) = self.read_at(buf, offset).await?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
         Ok((n, buf))
     }
 
-    async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    async fn read_exact(&self, mut buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
             let offset = self.pos.load(Ordering::Relaxed);
-            let (n, b) = self
-                .read_at_subset(buf, offset, total)
-                .await
-                .map_err(to_io_error)?;
+            let (n, b) = self.read_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(io::Error::new(
+                return Err(Report::new(Error::from(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "failed to fill whole buffer",
-                ));
+                ))));
             }
             total += n;
             self.pos.fetch_add(n as u64, Ordering::Relaxed);
@@ -499,28 +496,27 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for File<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> crate::io::AsyncBufWrite for File<'a, 'ctx> {
-    async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    type Error = Report<Error>;
+
+    async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let offset = self.pos.load(Ordering::Relaxed);
-        let (n, buf) = self.write_at(buf, offset).await.map_err(to_io_error)?;
+        let (n, buf) = self.write_at(buf, offset).await?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
         Ok((n, buf))
     }
 
-    async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    async fn write_all(&self, mut buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
             let offset = self.pos.load(Ordering::Relaxed);
-            let (n, b) = self
-                .write_at_subset(buf, offset, total)
-                .await
-                .map_err(to_io_error)?;
+            let (n, b) = self.write_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
-                return Err(io::Error::new(
+                return Err(Report::new(Error::from(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "failed to write whole buffer",
-                ));
+                ))));
             }
             total += n;
             self.pos.fetch_add(n as u64, Ordering::Relaxed);
@@ -528,12 +524,12 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for File<'a, 'ctx> {
         Ok((total, buf))
     }
 
-    async fn flush(&self) -> io::Result<()> {
-        self.sync_data().await.map_err(to_io_error)
+    async fn flush(&self) -> Result<()> {
+        self.sync_data().await
     }
 
-    async fn shutdown(&self) -> io::Result<()> {
-        self.sync_all().await.map_err(to_io_error)
+    async fn shutdown(&self) -> Result<()> {
+        self.sync_all().await
     }
 }
 

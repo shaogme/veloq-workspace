@@ -12,8 +12,3 @@ union! {
 }
 
 pub type Result<T> = std::result::Result<T, Report<Error>>;
-
-#[inline]
-pub fn to_io_error(error: Report<Error>) -> io::Error {
-    io::Error::other(error)
-}

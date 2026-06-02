@@ -3,11 +3,12 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::{Error, Result, to_io_error};
+use crate::error::{Error, Result};
 use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
 use crate::net::error::NetError;
 use crate::runtime::context::RuntimeContext;
 use diagweave::prelude::*;
+use diagweave::report::Report;
 use veloq_buf::FixedBuf;
 use veloq_driver_native::Socket;
 use veloq_driver_native::op::{
@@ -308,21 +309,23 @@ impl<'a, 'ctx> TcpStream<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> crate::io::AsyncBufRead for LocalTcpStream<'a, 'ctx> {
-    async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
-        self.recv(buf).await.map_err(to_io_error)
+    type Error = Report<Error>;
+
+    async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
+        self.recv(buf).await
     }
 
-    async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    async fn read_exact(&self, mut buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.recv_subset(buf, total).await.map_err(to_io_error)?;
+            let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(io::Error::new(
+                return Err(Report::new(Error::from(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "failed to fill whole buffer",
-                ));
+                ))));
             }
             total += n;
         }
@@ -331,21 +334,23 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalTcpStream<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> crate::io::AsyncBufRead for TcpStream<'a, 'ctx> {
-    async fn read(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
-        self.recv(buf).await.map_err(to_io_error)
+    type Error = Report<Error>;
+
+    async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
+        self.recv(buf).await
     }
 
-    async fn read_exact(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    async fn read_exact(&self, mut buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.recv_subset(buf, total).await.map_err(to_io_error)?;
+            let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(io::Error::new(
+                return Err(Report::new(Error::from(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "failed to fill whole buffer",
-                ));
+                ))));
             }
             total += n;
         }
@@ -354,63 +359,67 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for TcpStream<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalTcpStream<'a, 'ctx> {
-    async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
-        self.send(buf).await.map_err(to_io_error)
+    type Error = Report<Error>;
+
+    async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
+        self.send(buf).await
     }
 
-    async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    async fn write_all(&self, mut buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.send_subset(buf, total).await.map_err(to_io_error)?;
+            let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(io::Error::new(
+                return Err(Report::new(Error::from(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "failed to write whole buffer",
-                ));
+                ))));
             }
             total += n;
         }
         Ok((total, buf))
     }
 
-    async fn flush(&self) -> io::Result<()> {
+    async fn flush(&self) -> Result<()> {
         Ok(())
     }
 
-    async fn shutdown(&self) -> io::Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
 }
 
 impl<'a, 'ctx> crate::io::AsyncBufWrite for TcpStream<'a, 'ctx> {
-    async fn write(&self, buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
-        self.send(buf).await.map_err(to_io_error)
+    type Error = Report<Error>;
+
+    async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
+        self.send(buf).await
     }
 
-    async fn write_all(&self, mut buf: FixedBuf) -> io::Result<(usize, FixedBuf)> {
+    async fn write_all(&self, mut buf: FixedBuf) -> Result<(usize, FixedBuf)> {
         let target = buf.len();
         let mut total = 0;
         while total < target {
-            let (n, b) = self.send_subset(buf, total).await.map_err(to_io_error)?;
+            let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(io::Error::new(
+                return Err(Report::new(Error::from(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "failed to write whole buffer",
-                ));
+                ))));
             }
             total += n;
         }
         Ok((total, buf))
     }
 
-    async fn flush(&self) -> io::Result<()> {
+    async fn flush(&self) -> Result<()> {
         Ok(())
     }
 
-    async fn shutdown(&self) -> io::Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
 }
