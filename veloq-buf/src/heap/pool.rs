@@ -35,13 +35,13 @@ impl MemoryChunk {
                 Ok(p) => NonNull::new(p),
                 Err(_) => {
                     // Fallback to standard pages if Huge Pages failed
-                    let p = crate::os::alloc_pages(size).diag(|r| r.map_err(BufError::from))?;
+                    let p = crate::os::alloc_pages(size).trans()?;
                     NonNull::new(p)
                 }
             }
         }
         .ok_or_else(|| {
-            BufError::alloc_failed("Allocation returned null pointer".to_string()).to_report()
+            BufError::AllocFailed("Allocation returned null pointer".to_string()).to_report()
         })?;
         Ok(Self { ptr, size })
     }
@@ -150,7 +150,7 @@ impl Chunk {
         let bytes_per_shard = slots_per_shard * SLOT_SIZE;
 
         if slots_per_shard == 0 {
-            return Err(BufError::chunk_too_small().to_report());
+            return BufError::ChunkTooSmall.trans();
         }
 
         // 3. Initialize Buddy Allocators (Sharded)
@@ -374,7 +374,7 @@ impl GlobalSlotPool {
         let total_size = config.total_memory;
 
         if total_size < super::units::MIN_THREAD_MEMORY.get() {
-            return Err(BufError::chunk_too_small().to_report());
+            return BufError::ChunkTooSmall.trans();
         }
 
         // Initial Chunk (ID=0)

@@ -90,7 +90,7 @@ windows-sys = { version = "0.61", features = [
 tracing = "0.1.44"
 parking_lot = "0.12"
 bilge = "0.3.0"
-diagweave = "0.2.2"
+diagweave = "0.3.1"
 
 clap = { version = "4.6", features = ["derive"] }
 loom = "0.7.2"

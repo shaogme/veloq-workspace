@@ -50,17 +50,17 @@ fn bind_listener_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
         .to_socket_addrs()
         .map_err(NetError::ToSocketAddrs)?
         .next()
-        .ok_or_else(|| NetError::NoAddressProvided)?;
+        .ok_or(NetError::NoAddressProvided)?;
 
     let socket = if addr.is_ipv4() {
-        Socket::new_tcp_v4().trans_inner_err()?
+        Socket::new_tcp_v4().trans()?
     } else {
-        Socket::new_tcp_v6().trans_inner_err()?
+        Socket::new_tcp_v6().trans()?
     };
 
-    socket.bind(addr).trans_inner_err()?;
-    socket.listen(1024).trans_inner_err()?;
-    let local_addr = socket.local_addr().trans_inner_err()?;
+    socket.bind(addr).trans()?;
+    socket.listen(1024).trans()?;
+    let local_addr = socket.local_addr().trans()?;
 
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
@@ -70,9 +70,9 @@ fn new_stream_inner<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>>(
     addr: &SocketAddr,
 ) -> Result<InnerSocket<'a, 'ctx, P>> {
     let socket = if addr.is_ipv4() {
-        Socket::new_tcp_v4().trans_inner_err()?
+        Socket::new_tcp_v4().trans()?
     } else {
-        Socket::new_tcp_v6().trans_inner_err()?
+        Socket::new_tcp_v6().trans()?
     };
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), None)
 }
@@ -93,12 +93,12 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let op = op_back.ok_or_else(|| NetError::AcceptOpLost)?;
+        let op = op_back.ok_or(NetError::AcceptOpLost)?;
 
-        let accepted = res.trans_inner_err()?;
+        let accepted = res.trans()?;
         let addr = op
             .remote_addr
-            .ok_or_else(|| NetError::AcceptMissingRemoteAddr)?;
+            .ok_or(NetError::AcceptMissingRemoteAddr)?;
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,
@@ -132,7 +132,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         };
 
         let (res, _) = ctx.submit(&submitter, Op::new(op)).await.into_inner();
-        res.trans_inner_err()?;
+        res.trans()?;
 
         Ok(Self {
             inner,
@@ -159,8 +159,8 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let buf = op_back
             .map(|o| o.buf)
             .ok_or_else(|| NetError::OpBufferLost.to_report())
-            .trans_inner_err()?;
-        Ok((res.trans_inner_err()?, buf))
+            .trans()?;
+        Ok((res.trans()?, buf))
     }
 
     async fn send_subset_direct(
@@ -180,8 +180,8 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .into_inner();
         let buf = op_back
             .map(|o| o.buf)
-            .ok_or_else(|| NetError::OpBufferLost)?;
-        Ok((res.trans_inner_err()?, buf))
+            .ok_or(NetError::OpBufferLost)?;
+        Ok((res.trans()?, buf))
     }
 }
 
@@ -218,10 +218,10 @@ impl<'a, 'ctx> TcpListener<'a, 'ctx> {
         };
 
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        let accepted = res.trans_inner_err()?;
+        let accepted = res.trans()?;
         let addr = op
             .remote_addr
-            .ok_or_else(|| NetError::AcceptMissingRemoteAddr)?;
+            .ok_or(NetError::AcceptMissingRemoteAddr)?;
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,
@@ -286,7 +286,7 @@ impl<'a, 'ctx> TcpStream<'a, 'ctx> {
             buf_offset,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.trans_inner_err()?, op.buf))
+        Ok((res.trans()?, op.buf))
     }
 
     pub async fn send_subset(&self, buf: FixedBuf, buf_offset: usize) -> Result<(usize, FixedBuf)> {
@@ -297,7 +297,7 @@ impl<'a, 'ctx> TcpStream<'a, 'ctx> {
             buf_offset,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.trans_inner_err()?, op.buf))
+        Ok((res.trans()?, op.buf))
     }
 }
 

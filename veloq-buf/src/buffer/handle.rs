@@ -177,14 +177,10 @@ impl FixedBuf {
     pub fn alloc_heap(len: NonZeroUsize) -> BufResult<Self> {
         // Allocate space for the metadata block plus the payload.
         // We use os::alloc_pages to ensure page alignment for both.
-        let total_size = len
-            .get()
-            .checked_add(4096)
-            .ok_or_else(|| BufError::oom().to_report())?;
+        let total_size = len.get().checked_add(4096).ok_or(BufError::Oom)?;
         let total_size_nz = unsafe { NonZeroUsize::new_unchecked(total_size) };
 
-        let base_ptr =
-            unsafe { crate::os::alloc_pages(total_size_nz) }.diag(|r| r.map_err(BufError::from))?;
+        let base_ptr = unsafe { crate::os::alloc_pages(total_size_nz) }.trans()?;
 
         // Initialize the control block in the first page
         let control = unsafe { &mut *(base_ptr as *mut HeapControlBlock) };

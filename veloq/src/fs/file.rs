@@ -2,7 +2,7 @@ use super::open_options::OpenOptions;
 use crate::fs::error::FsError;
 use crate::runtime::context::RuntimeContext;
 
-use diagweave::report::{Diagnostic, Report, ResultReportExt};
+use diagweave::prelude::*;
 use veloq_buf::FixedBuf;
 use veloq_driver_native::driver::Driver;
 use veloq_driver_native::op::{
@@ -119,10 +119,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op
-            .map(|o| o.buf)
-            .ok_or(FsError::op_buffer_lost())
-            .diag(|r| r.map_err(Into::into))?;
+        let buf = op.map(|o| o.buf).ok_or(FsError::OpBufferLost)?;
         let res = res
             .map_report(|r| {
                 r.with_ctx("op", "read_at_subset")
@@ -130,7 +127,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
                     .with_ctx("buf_offset", buf_offset)
                     .with_ctx("buf_len", buf.len())
             })
-            .trans_inner_err()?;
+            .trans()?;
         Ok((res, buf))
     }
 
@@ -152,10 +149,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op
-            .map(|o| o.buf)
-            .ok_or(FsError::op_buffer_lost())
-            .diag(|r| r.map_err(Into::into))?;
+        let buf = op.map(|o| o.buf).ok_or(FsError::OpBufferLost)?;
         let res = res
             .map_report(|r| {
                 r.with_ctx("op", "write_at_subset")
@@ -163,7 +157,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
                     .with_ctx("buf_offset", buf_offset)
                     .with_ctx("buf_len", buf.len())
             })
-            .trans_inner_err()?;
+            .trans()?;
         Ok((res, buf))
     }
 
@@ -178,7 +172,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        res.map(|_| ()).trans_inner_err()
+        res.map(|_| ()).trans()
     }
 
     pub async fn sync_data(&self) -> Result<()> {
@@ -192,7 +186,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        res.map(|_| ()).trans_inner_err()
+        res.map(|_| ()).trans()
     }
 
     pub async fn fallocate(&self, offset: u64, len: u64) -> Result<()> {
@@ -208,7 +202,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        res.map(|_| ()).trans_inner_err()
+        res.map(|_| ()).trans()
     }
 }
 
@@ -318,7 +312,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
                     .with_ctx("buf_offset", buf_offset)
                     .with_ctx("buf_len", buf.len())
             })
-            .trans_inner_err()?;
+            .trans()?;
         Ok((res, buf))
     }
 
@@ -345,7 +339,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
                     .with_ctx("buf_offset", buf_offset)
                     .with_ctx("buf_len", buf.len())
             })
-            .trans_inner_err()?;
+            .trans()?;
         Ok((res, buf))
     }
 
@@ -357,7 +351,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
 
         let owner = self.ctx.scope.worker_id();
         let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        res.map(|_| ()).trans_inner_err()
+        res.map(|_| ()).trans()
     }
 
     pub async fn sync_data(&self) -> Result<()> {
@@ -368,7 +362,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
 
         let owner = self.ctx.scope.worker_id();
         let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        res.map(|_| ()).trans_inner_err()
+        res.map(|_| ()).trans()
     }
 
     pub async fn fallocate(&self, offset: u64, len: u64) -> Result<()> {
@@ -381,7 +375,7 @@ impl<'a, 'ctx> File<'a, 'ctx> {
 
         let owner = self.ctx.scope.worker_id();
         let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        res.map(|_| ()).trans_inner_err()
+        res.map(|_| ()).trans()
     }
 
     pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, 'a, 'ctx> {
@@ -483,7 +477,7 @@ impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
         match Pin::new(&mut this.inner).poll(cx) {
             Poll::Ready(res) => {
                 let (res, _) = res.into_inner();
-                Poll::Ready(res.trans_inner_err())
+                Poll::Ready(res.trans())
             }
             Poll::Pending => Poll::Pending,
         }

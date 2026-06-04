@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::mpsc;
 
-use veloq_buf::{AnyBufPool, BufError, BufPool, FixedBuf};
+use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver_native::driver::{
     ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver,
 };
@@ -119,7 +119,7 @@ fn register_internal(
             driver
                 .register_chunk(chunk_idx, region.as_ptr(), region.len())
                 .map_err(|err| std::io::Error::other(format!("{err:#}")))
-                .diag(|r| r.map_err(BufError::from))?;
+                .trans()?;
 
             new_chunks.push(veloq_buf::heap::ChunkInfo {
                 id: chunk_idx,
@@ -359,7 +359,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
                     let ctx = RuntimeContext { scope: scope_clone };
                     ctx.driver(|mut driver| op.submit_detached(&mut driver))
                 })
-                .trans_inner_err()?;
+                .trans()?;
             let (res, op_back) = routed.await.into_inner();
             let op = op_back.expect("Op lost in remote submit");
             Ok((res, op))

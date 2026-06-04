@@ -6,10 +6,11 @@ use std::sync::Arc;
 use crate::error::Result;
 use crate::net::error::NetError;
 use crate::runtime::context::{RuntimeContext, submit_control_task};
-use diagweave::report::ResultReportExt;
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::IoFd;
 use veloq_driver_native::{OwnedRawHandle, RawHandle};
+
+use diagweave::prelude::*;
 
 // ============================================================================
 // SocketToken + InnerSocket (RAII Wrapper)
@@ -32,11 +33,8 @@ impl<'a, 'ctx> SocketToken<'a, 'ctx> {
         let fd = ctx.driver(|mut driver| {
             driver
                 .register_files(vec![RegisterFd::Owned(owned)])
-                .trans_inner_err()
-                .and_then(|mut fds| {
-                    fds.pop()
-                        .ok_or_else(|| NetError::RegistrationEmpty.to_report_trans())
-                })
+                .trans()
+                .and_then(|mut fds| fds.pop().ok_or(NetError::RegistrationEmpty).trans())
         })?;
         Ok(Self {
             fd,
@@ -125,7 +123,7 @@ where
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.local_addr
-            .ok_or_else(|| NetError::LocalAddrUnavailable.to_report())
-            .trans_inner_err()
+            .ok_or(NetError::LocalAddrUnavailable)
+            .trans()
     }
 }

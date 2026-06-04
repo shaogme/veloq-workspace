@@ -20,6 +20,7 @@ use crate::task::{
 use crate::utils::FastRand;
 use crate::utils::storage::AtomicStorage;
 
+use diagweave::DiagnosticError;
 use veloq_atomic_waker::AtomicWaker;
 
 /// Worker 空闲时的等待策略。
@@ -221,10 +222,12 @@ impl<T> RuntimeScopeContext<T> {
             }
             let current_worker = self.worker_id();
             let is_shutdown = self.is_shutdown();
-            return Err(
-                RuntimeError::dispatch_failed_report(worker_id, current_worker)
-                    .with_ctx("is_shutdown", is_shutdown),
-            );
+            return Err(RuntimeError::DispatchFailed {
+                target_worker: worker_id,
+                current_worker,
+            }
+            .to_report()
+            .with_ctx("is_shutdown", is_shutdown));
         }
 
         Ok(RoutedFuture::new(slot))

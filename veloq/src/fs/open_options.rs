@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::error::Result;
 use crate::fs::error::FsError;
 use crate::runtime::context::RuntimeContext;
-use diagweave::report::{Diagnostic, ResultReportExt};
+use diagweave::prelude::*;
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::Open;
 
@@ -106,17 +106,17 @@ impl OpenOptions {
 
         let submitter = LocalSubmitter::new();
         let (res, _) = ctx.submit(&submitter, Op::new(op)).await.into_inner();
-        let owned = res.trans_inner_err()?;
+        let owned = res.trans()?;
         let fd = owned.into_raw();
         let fixed = ctx.driver(|mut driver| {
             let res = driver
                 .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
-                .trans_inner_err()?
+                .trans()?
                 .into_iter()
                 .next();
             match res {
                 Some(fixed) => Ok(fixed),
-                None => Err(FsError::register_failed()).diag(|r| r.map_err(Into::into)),
+                None => FsError::RegisterFailed.trans(),
             }
         })?;
         use std::cell::Cell;
@@ -141,7 +141,7 @@ impl OpenOptions {
         let submitter = DetachedSubmitter::new();
         let owner = ctx.scope.worker_id();
         let (res, _) = ctx.submit_to(owner, Op::new(op)).await?;
-        let owned = res.trans_inner_err()?;
+        let owned = res.trans()?;
         let fd = owned.into_raw();
         use std::sync::atomic::AtomicU64;
 
@@ -159,7 +159,6 @@ impl OpenOptions {
         ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
         path: &Path,
     ) -> Result<Open> {
-        use diagweave::report::ResultReportExt;
         use std::num::NonZeroUsize;
         use std::os::unix::ffi::OsStrExt;
 
@@ -167,10 +166,10 @@ impl OpenOptions {
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
 
-        let mut buf = ctx.try_alloc(len_nz).trans_inner_err()?;
+        let mut buf = ctx.try_alloc(len_nz).trans()?;
         let slice = buf.as_slice_mut();
         if slice.len() < len {
-            return Err(FsError::path_too_long()).diag(|r| r.map_err(Into::into));
+            return FsError::PathTooLong.trans();
         }
         slice[..len - 1].copy_from_slice(path_bytes);
         slice[len - 1] = 0;
@@ -221,7 +220,6 @@ impl OpenOptions {
         ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
         path: &Path,
     ) -> Result<Open> {
-        use diagweave::report::ResultReportExt;
         use std::num::NonZeroUsize;
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
@@ -236,10 +234,10 @@ impl OpenOptions {
         path_w.push(0);
         let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
 
-        let mut buf = ctx.try_alloc(len_bytes).trans_inner_err()?;
+        let mut buf = ctx.try_alloc(len_bytes).trans()?;
         let slice = buf.as_slice_mut();
         if slice.len() < len_bytes.get() {
-            return Err(FsError::path_too_long()).diag(|r| r.map_err(Into::into));
+            return FsError::PathTooLong.trans();
         }
 
         unsafe {

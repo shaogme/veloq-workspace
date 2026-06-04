@@ -35,16 +35,16 @@ fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
         .to_socket_addrs()
         .map_err(NetError::ToSocketAddrs)?
         .next()
-        .ok_or_else(|| NetError::NoAddressProvided)?;
+        .ok_or(NetError::NoAddressProvided)?;
 
     let socket = if addr.is_ipv4() {
-        Socket::new_udp_v4().trans_inner_err()?
+        Socket::new_udp_v4().trans()?
     } else {
-        Socket::new_udp_v6().trans_inner_err()?
+        Socket::new_udp_v6().trans()?
     };
 
-    socket.bind(addr).trans_inner_err()?;
-    let local_addr = socket.local_addr().trans_inner_err()?;
+    socket.bind(addr).trans()?;
+    let local_addr = socket.local_addr().trans()?;
 
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
@@ -71,8 +71,8 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let buf = op_back
             .map(|o| o.buf)
             .ok_or_else(|| NetError::OpBufferLost.to_report())
-            .trans_inner_err()?;
-        Ok((res.trans_inner_err()?, buf))
+            .trans()?;
+        Ok((res.trans()?, buf))
     }
 
     async fn recv_from_direct(&self, buf: FixedBuf) -> Result<UdpRecvPacket> {
@@ -89,14 +89,14 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .into_inner();
         let op_back = op_back_opt
             .ok_or_else(|| NetError::UdpRecvFromOpLost.to_report())
-            .trans_inner_err()?;
-        let n = res.trans_inner_err()?;
+            .trans()?;
+        let n = res.trans()?;
         let mut recv_buf = op_back.buf;
         recv_buf.set_len(n);
         let addr = op_back
             .addr
             .ok_or_else(|| NetError::UdpRecvFromMissingAddr.to_report())
-            .trans_inner_err()?;
+            .trans()?;
         Ok(UdpRecvPacket {
             buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
             addr,
@@ -116,7 +116,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        res.map(|_| ()).trans_inner_err()
+        res.map(|_| ()).trans()
     }
 
     async fn send_subset_direct(
@@ -137,8 +137,8 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let buf = op_back
             .map(|o| o.buf)
             .ok_or_else(|| NetError::OpBufferLost.to_report())
-            .trans_inner_err()?;
-        Ok((res.trans_inner_err()?, buf))
+            .trans()?;
+        Ok((res.trans()?, buf))
     }
 
     async fn recv_subset_direct(
@@ -159,8 +159,8 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let buf = op_back
             .map(|o| o.buf)
             .ok_or_else(|| NetError::OpBufferLost.to_report())
-            .trans_inner_err()?;
-        Ok((res.trans_inner_err()?, buf))
+            .trans()?;
+        Ok((res.trans()?, buf))
     }
 }
 
@@ -220,7 +220,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             addr: target,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.trans_inner_err()?, op.buf))
+        Ok((res.trans()?, op.buf))
     }
 
     pub async fn recv_from(&self, buf: FixedBuf) -> Result<UdpRecvPacket> {
@@ -232,13 +232,13 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             addr: None,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        let n = res.trans_inner_err()?;
+        let n = res.trans()?;
         let mut recv_buf = op.buf;
         recv_buf.set_len(n);
         let addr = op
             .addr
             .ok_or_else(|| NetError::UdpRecvFromMissingAddr.to_report())
-            .trans_inner_err()?;
+            .trans()?;
         Ok(UdpRecvPacket {
             buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
             addr,
@@ -255,7 +255,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             addr_len: raw_addr_len as u32,
         };
         let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        res.map(|_| ()).trans_inner_err()
+        res.map(|_| ()).trans()
     }
 
     pub async fn send(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -274,7 +274,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             buf_offset,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.trans_inner_err()?, op.buf))
+        Ok((res.trans()?, op.buf))
     }
 
     pub async fn recv_subset(&self, buf: FixedBuf, buf_offset: usize) -> Result<(usize, FixedBuf)> {
@@ -285,7 +285,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
             buf_offset,
         };
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
-        Ok((res.trans_inner_err()?, op.buf))
+        Ok((res.trans()?, op.buf))
     }
 }
 
