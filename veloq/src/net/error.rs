@@ -34,5 +34,8 @@ set! {
 
         #[display("failed to write whole buffer")]
         WriteZero,
+
+        #[display("failed to resolve address")]
+        ToSocketAddrs(std::io::Error),
     }
 }

@@ -33,11 +33,9 @@ fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
 ) -> Result<InnerSocket<'a, 'ctx, P>> {
     let addr = addr
         .to_socket_addrs()
-        .to_report()
-        .trans_inner_err()?
+        .map_err(NetError::ToSocketAddrs)?
         .next()
-        .ok_or_else(|| NetError::NoAddressProvided.to_report())
-        .trans_inner_err()?;
+        .ok_or_else(|| NetError::NoAddressProvided)?;
 
     let socket = if addr.is_ipv4() {
         Socket::new_udp_v4().trans_inner_err()?

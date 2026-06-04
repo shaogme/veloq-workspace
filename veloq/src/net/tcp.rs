@@ -48,7 +48,7 @@ fn bind_listener_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
 ) -> Result<InnerSocket<'a, 'ctx, P>> {
     let addr = addr
         .to_socket_addrs()
-        .to_report_trans()?
+        .map_err(NetError::ToSocketAddrs)?
         .next()
         .ok_or_else(|| NetError::NoAddressProvided)?;
 

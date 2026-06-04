@@ -74,7 +74,7 @@ impl TcpSocket {
     pub fn bind<A: ToSocketAddrs>(&self, addr: A) -> Result<()> {
         let addr = addr
             .to_socket_addrs()
-            .to_report_trans()?
+            .map_err(NetError::ToSocketAddrs)?
             .next()
             .ok_or_else(|| NetError::NoAddressProvided)?;
         self.inner.bind(addr).trans_inner_err()
@@ -173,7 +173,7 @@ impl UdpSocketBuilder {
     ) -> Result<UdpSocket<'a, 'ctx>> {
         let addr = addr
             .to_socket_addrs()
-            .to_report_trans()?
+            .map_err(NetError::ToSocketAddrs)?
             .next()
             .ok_or_else(|| NetError::NoAddressProvided)?;
         self.inner.bind(addr).trans_inner_err()?;
