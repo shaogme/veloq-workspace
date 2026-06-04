@@ -123,7 +123,15 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .map(|o| o.buf)
             .ok_or(FsError::op_buffer_lost())
             .diag(|r| r.map_err(Into::into))?;
-        Ok((res.trans_inner_err()?, buf))
+        let res = res
+            .map_report(|r| {
+                r.with_ctx("op", "read_at_subset")
+                    .with_ctx("offset", offset as i64)
+                    .with_ctx("buf_offset", buf_offset as i64)
+                    .with_ctx("buf_len", buf.len() as i64)
+            })
+            .trans_inner_err()?;
+        Ok((res, buf))
     }
 
     pub async fn write_at_subset(
@@ -148,7 +156,15 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .map(|o| o.buf)
             .ok_or(FsError::op_buffer_lost())
             .diag(|r| r.map_err(Into::into))?;
-        Ok((res.trans_inner_err()?, buf))
+        let res = res
+            .map_report(|r| {
+                r.with_ctx("op", "write_at_subset")
+                    .with_ctx("offset", offset as i64)
+                    .with_ctx("buf_offset", buf_offset as i64)
+                    .with_ctx("buf_len", buf.len() as i64)
+            })
+            .trans_inner_err()?;
+        Ok((res, buf))
     }
 
     pub async fn sync_all(&self) -> Result<()> {
@@ -238,7 +254,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalFile<'a, 'ctx> {
         let mut total = 0;
         while total < target {
             let offset = self.pos.get();
-            let (n, b) = self.read_at_subset(buf, offset, total).await?;
+            let (n, b) = self.write_at_subset(buf, offset, total).await?;
             buf = b;
             if n == 0 {
                 return Err(FsError::WriteZero.to_report_trans());
@@ -295,7 +311,15 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         let owner = self.ctx.scope.worker_id();
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         let buf = op.buf;
-        Ok((res.trans_inner_err()?, buf))
+        let res = res
+            .map_report(|r| {
+                r.with_ctx("op", "read_at_subset")
+                    .with_ctx("offset", offset as i64)
+                    .with_ctx("buf_offset", buf_offset as i64)
+                    .with_ctx("buf_len", buf.len() as i64)
+            })
+            .trans_inner_err()?;
+        Ok((res, buf))
     }
 
     pub async fn write_at_subset(
@@ -314,7 +338,15 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         let owner = self.ctx.scope.worker_id();
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         let buf = op.buf;
-        Ok((res.trans_inner_err()?, buf))
+        let res = res
+            .map_report(|r| {
+                r.with_ctx("op", "write_at_subset")
+                    .with_ctx("offset", offset as i64)
+                    .with_ctx("buf_offset", buf_offset as i64)
+                    .with_ctx("buf_len", buf.len() as i64)
+            })
+            .trans_inner_err()?;
+        Ok((res, buf))
     }
 
     pub async fn sync_all(&self) -> Result<()> {
