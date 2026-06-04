@@ -2,7 +2,7 @@ use core::convert::TryFrom;
 use core::fmt;
 use core::marker::PhantomData;
 
-use diagweave::{report::Report, set};
+use diagweave::prelude::*;
 use std::net::SocketAddr;
 
 pub mod driver;
@@ -148,7 +148,7 @@ pub fn driver_error(
     detail: impl ToString,
 ) -> DriverErrorReport {
     let detail = detail.to_string();
-    Report::new(kind)
+    kind.to_report()
         .with_ctx("scope", scope)
         .attach_note(detail)
 }
@@ -161,7 +161,7 @@ pub fn driver_os_error(
     detail: impl ToString,
 ) -> DriverErrorReport {
     let detail = detail.to_string();
-    Report::new(kind)
+    kind.to_report()
         .with_ctx("scope", scope)
         .set_error_code(code)
         .attach_note(detail)
@@ -187,7 +187,7 @@ where
         detail: impl ToString,
     ) -> DriverResult<T> {
         let detail = detail.to_string();
-        self.map_err(|report| {
+        self.map_report(|report| {
             tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
             report
                 .set_accumulate_src_chain(true)

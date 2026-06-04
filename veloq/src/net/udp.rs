@@ -70,7 +70,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .into_inner();
         let buf = op_back
             .map(|o| o.buf)
-            .ok_or_else(|| NetError::OpBufferLost.to_report())
+            .ok_or(NetError::OpBufferLost)
             .trans()?;
         Ok((res.trans()?, buf))
     }
@@ -87,15 +87,13 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let op_back = op_back_opt
-            .ok_or_else(|| NetError::UdpRecvFromOpLost.to_report())
-            .trans()?;
+        let op_back = op_back_opt.ok_or(NetError::UdpRecvFromOpLost).trans()?;
         let n = res.trans()?;
         let mut recv_buf = op_back.buf;
         recv_buf.set_len(n);
         let addr = op_back
             .addr
-            .ok_or_else(|| NetError::UdpRecvFromMissingAddr.to_report())
+            .ok_or(NetError::UdpRecvFromMissingAddr)
             .trans()?;
         Ok(UdpRecvPacket {
             buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
@@ -136,7 +134,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .into_inner();
         let buf = op_back
             .map(|o| o.buf)
-            .ok_or_else(|| NetError::OpBufferLost.to_report())
+            .ok_or(NetError::OpBufferLost)
             .trans()?;
         Ok((res.trans()?, buf))
     }
@@ -158,7 +156,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .into_inner();
         let buf = op_back
             .map(|o| o.buf)
-            .ok_or_else(|| NetError::OpBufferLost.to_report())
+            .ok_or(NetError::OpBufferLost)
             .trans()?;
         Ok((res.trans()?, buf))
     }
@@ -235,10 +233,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
         let n = res.trans()?;
         let mut recv_buf = op.buf;
         recv_buf.set_len(n);
-        let addr = op
-            .addr
-            .ok_or_else(|| NetError::UdpRecvFromMissingAddr.to_report())
-            .trans()?;
+        let addr = op.addr.ok_or(NetError::UdpRecvFromMissingAddr).trans()?;
         Ok(UdpRecvPacket {
             buf: UdpRecvPacketBuf::from_fixed_buf(recv_buf),
             addr,
@@ -303,7 +298,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalUdpSocket<'a, 'ctx> {
             let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::UnexpectedEof.to_report_trans());
+                return NetError::UnexpectedEof.trans();
             }
             total += n;
         }
@@ -325,7 +320,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for UdpSocket<'a, 'ctx> {
             let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::UnexpectedEof.to_report_trans());
+                return NetError::UnexpectedEof.trans();
             }
             total += n;
         }
@@ -347,7 +342,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalUdpSocket<'a, 'ctx> {
             let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::WriteZero.to_report_trans());
+                return NetError::WriteZero.trans();
             }
             total += n;
         }
@@ -377,7 +372,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for UdpSocket<'a, 'ctx> {
             let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::WriteZero.to_report_trans());
+                return NetError::WriteZero.trans();
             }
             total += n;
         }

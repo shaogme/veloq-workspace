@@ -10,6 +10,8 @@ use veloq_driver_core::driver::{
 use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
 use veloq_driver_core::{DriverErrorKind, DriverResult, driver_error};
 
+use diagweave::prelude::*;
+
 use crate::common::{
     IocpErrorContext, WAKEUP_USER_DATA, completion_record, io_result_to_event_res, iocp_msg,
     push_completion_shared,
@@ -172,7 +174,9 @@ impl<'a> IocpDriver<'a> {
         self.last_timer_poll = now;
 
         let status = status.map_err(|e| {
-            diagweave::report::Report::new(IocpError::CompletionWait).attach_note(format!("{e:#}"))
+            IocpError::CompletionWait
+                .to_report()
+                .attach_note(format!("{e:#}"))
         })?;
 
         match status {
@@ -196,7 +200,8 @@ impl<'a> IocpDriver<'a> {
                             self.drain_deferred_socket_cleanup();
                         })
                         .map_err(|e| {
-                            diagweave::report::Report::new(IocpError::CompletionWait)
+                            IocpError::CompletionWait
+                                .to_report()
                                 .attach_note(format!("{e:#}"))
                         })?;
                     return Ok(());
@@ -439,13 +444,14 @@ impl<'a> IocpDriver<'a> {
                         | crate::op::IocpOpPayload::Fallocate(_)
                         | crate::op::IocpOpPayload::FallocateRaw(_)
                 ) {
-                    io_result = Err(diagweave::report::Report::new(IocpError::CompletionWait)
-                        .attach_note("missing blocking result for offloaded file completion"));
+                    io_result = IocpError::CompletionWait
+                        .attach_note("missing blocking result for offloaded file completion");
                 } else if let Ok(val) = io_result {
                     io_result = iocp_op.on_complete(val, &self.extensions).map_err(|e| {
-                        diagweave::report::Report::new(IocpError::CompletionWait)
+                        IocpError::CompletionWait
+                            .to_report()
                             .attach_note(format!("{e:#}"))
-                    });
+                    })
                 }
             });
         });

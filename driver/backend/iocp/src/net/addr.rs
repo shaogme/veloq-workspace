@@ -7,6 +7,8 @@ use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
 };
 
+use diagweave::prelude::*;
+
 const SOCKADDR_IN_S_ADDR_OFFSET: usize = offset_of!(SOCKADDR_IN, sin_addr);
 const SOCKADDR_IN6_ADDR_BYTES_OFFSET: usize = offset_of!(SOCKADDR_IN6, sin6_addr);
 const SOCKADDR_IN6_SCOPE_ID_OFFSET: usize = offset_of!(SOCKADDR_IN6, Anonymous);
@@ -133,8 +135,7 @@ impl SockAddrIn6 {
 /// Converts a byte buffer to a SocketAddr.
 pub fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
     if buf.len() < 2 {
-        return Err(diagweave::report::Report::new(IocpError::InvalidInput)
-            .attach_note("invalid address length"));
+        return IocpError::InvalidInput.attach_note("invalid address length");
     }
 
     // Use veloq_pod to cast the family safely if possible, but family is at offset 0.
@@ -143,23 +144,20 @@ pub fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
     match family {
         AF_INET => {
             if buf.len() < std::mem::size_of::<SOCKADDR_IN>() {
-                return Err(diagweave::report::Report::new(IocpError::InvalidInput)
-                    .attach_note("invalid IPv4 sockaddr length"));
+                return IocpError::InvalidInput.attach_note("invalid IPv4 sockaddr length");
             }
             let sin_wrapped: &SockAddrIn = from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN>()]);
             Ok(SocketAddr::V4(sin_wrapped.to_std()))
         }
         AF_INET6 => {
             if buf.len() < std::mem::size_of::<SOCKADDR_IN6>() {
-                return Err(diagweave::report::Report::new(IocpError::InvalidInput)
-                    .attach_note("invalid IPv6 sockaddr length"));
+                return IocpError::InvalidInput.attach_note("invalid IPv6 sockaddr length");
             }
             let sin6_wrapped: &SockAddrIn6 =
                 from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN6>()]);
             Ok(SocketAddr::V6(sin6_wrapped.to_std()))
         }
-        _ => Err(diagweave::report::Report::new(IocpError::InvalidInput)
-            .attach_note("unsupported address family")),
+        _ => IocpError::InvalidInput.attach_note("unsupported address family"),
     }
 }
 

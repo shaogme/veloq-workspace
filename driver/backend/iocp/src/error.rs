@@ -1,4 +1,4 @@
-use diagweave::{report::Report, set};
+use diagweave::prelude::*;
 use veloq_driver_core::{DriverErrorKind, DriverResult, ResultAsDriverExt};
 
 set! {
@@ -63,7 +63,8 @@ where
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error);
     let detail = error.to_string();
-    let report = Report::new(context)
+    let report = context
+        .to_report()
         .with_ctx("scope", scope)
         .attach_note(detail)
         .with_diag_src_err(error);

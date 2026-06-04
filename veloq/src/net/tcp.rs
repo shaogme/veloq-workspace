@@ -96,9 +96,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         let op = op_back.ok_or(NetError::AcceptOpLost)?;
 
         let accepted = res.trans()?;
-        let addr = op
-            .remote_addr
-            .ok_or(NetError::AcceptMissingRemoteAddr)?;
+        let addr = op.remote_addr.ok_or(NetError::AcceptMissingRemoteAddr)?;
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,
@@ -158,7 +156,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .into_inner();
         let buf = op_back
             .map(|o| o.buf)
-            .ok_or_else(|| NetError::OpBufferLost.to_report())
+            .ok_or(NetError::OpBufferLost)
             .trans()?;
         Ok((res.trans()?, buf))
     }
@@ -178,9 +176,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
             .submit(&self.submitter, Op::new(op))
             .await
             .into_inner();
-        let buf = op_back
-            .map(|o| o.buf)
-            .ok_or(NetError::OpBufferLost)?;
+        let buf = op_back.map(|o| o.buf).ok_or(NetError::OpBufferLost)?;
         Ok((res.trans()?, buf))
     }
 }
@@ -219,9 +215,7 @@ impl<'a, 'ctx> TcpListener<'a, 'ctx> {
 
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         let accepted = res.trans()?;
-        let addr = op
-            .remote_addr
-            .ok_or(NetError::AcceptMissingRemoteAddr)?;
+        let addr = op.remote_addr.ok_or(NetError::AcceptMissingRemoteAddr)?;
 
         let stream = GenericTcpStream {
             inner: InnerSocket::new(self.ctx, accepted.into_raw(), None)?,

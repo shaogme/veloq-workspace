@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use diagweave::DiagnosticResult;
 use veloq_blocking::{BlockingTask, get_blocking_pool};
 use veloq_driver_core::driver::registry::OpRegistry;
 use veloq_driver_core::driver::{
@@ -47,19 +48,20 @@ impl<'a> IocpDriver<'a> {
                 op_ref.header.generation = generation;
                 op_ref.header.resolved_handle = None;
             })
-            .ok_or_else(|| {
-                diagweave::report::Report::new(IocpError::InvalidState)
-                    .attach_note("Op missing in prep_op_slot")
-            })?;
+            .ok_or(IocpError::InvalidState)
+            .attach_note("Op missing in prep_op_slot")?;
 
-        let user_payload = guard.storage.payload.as_mut().ok_or_else(|| {
-            diagweave::report::Report::new(IocpError::InvalidState)
-                .attach_note("User payload missing in prep_op_slot")
-        })?;
-        let op_ref = guard.op.as_mut().ok_or_else(|| {
-            diagweave::report::Report::new(IocpError::InvalidState)
-                .attach_note("Op missing while binding user payload in prep_op_slot")
-        })?;
+        let user_payload = guard
+            .storage
+            .payload
+            .as_mut()
+            .ok_or(IocpError::InvalidState)
+            .attach_note("User payload missing in prep_op_slot")?;
+        let op_ref = guard
+            .op
+            .as_mut()
+            .ok_or(IocpError::InvalidState)
+            .attach_note("Op missing while binding user payload in prep_op_slot")?;
         op_ref.bind_user_payload(user_payload)?;
 
         Ok(guard)

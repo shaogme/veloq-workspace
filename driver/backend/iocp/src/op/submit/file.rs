@@ -2,6 +2,8 @@ use veloq_blocking::BlockingTask;
 use veloq_blocking::blocking_ops::windows::{BlockingOps, CompletionInfo};
 use veloq_buf::FixedBuf;
 
+use diagweave::prelude::*;
+
 use crate::error::{IocpError, IocpResult};
 use crate::op::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write,
@@ -47,12 +49,12 @@ macro_rules! submit_io_op {
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             if val.buf_offset > val.buf.len() {
-                return Err(diagweave::report::Report::new(IocpError::InvalidInput).attach_note(format!(
+                return IocpError::InvalidInput.attach_note(format!(
                     "{}: buf_offset {} exceeds buffer length {}",
                     stringify!($fn_name),
                     val.buf_offset,
                     val.buf.len()
-                )));
+                ));
             }
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
             // SAFETY: buf_offset <= buf.len() is verified above.
@@ -106,12 +108,12 @@ macro_rules! submit_raw_io_op {
             )?;
 
             if val.buf_offset > val.buf.len() {
-                return Err(diagweave::report::Report::new(IocpError::InvalidInput).attach_note(format!(
+                return IocpError::InvalidInput.attach_note(format!(
                     "{}: buf_offset {} exceeds buffer length {}",
                     stringify!($fn_name),
                     val.buf_offset,
                     val.buf.len()
-                )));
+                ));
             }
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
             let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };

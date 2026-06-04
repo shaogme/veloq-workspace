@@ -40,9 +40,7 @@ impl MemoryChunk {
                 }
             }
         }
-        .ok_or_else(|| {
-            BufError::AllocFailed("Allocation returned null pointer".to_string()).to_report()
-        })?;
+        .ok_or_else(|| BufError::AllocFailed("Allocation returned null pointer".to_string()))?;
         Ok(Self { ptr, size })
     }
 

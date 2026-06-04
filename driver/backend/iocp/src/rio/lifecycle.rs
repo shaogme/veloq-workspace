@@ -9,6 +9,7 @@ use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::control_flow::RioSocketActor;
+use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::sync::OnceLock;
@@ -92,12 +93,10 @@ impl RioState {
         let start = std::time::Instant::now();
         while self.outstanding_count > 0 {
             if start.elapsed() >= timeout {
-                return Err(
-                    diagweave::report::Report::new(RioError::Internal).attach_note(format!(
-                        "strict close timed out while draining RIO outstanding requests: {}",
-                        self.outstanding_count
-                    )),
-                );
+                return RioError::Internal.attach_note(format!(
+                    "strict close timed out while draining RIO outstanding requests: {}",
+                    self.outstanding_count
+                ));
             }
 
             const MAX_RESULTS: usize = 128;
@@ -106,8 +105,8 @@ impl RioState {
             let count = self.kernel.dequeue(&mut results);
 
             if count == RIO_CORRUPT_CQ {
-                return Err(diagweave::report::Report::new(RioError::Internal)
-                    .attach_note("RIO completion queue is corrupt (RIO_CORRUPT_CQ)"));
+                return RioError::Internal
+                    .attach_note("RIO completion queue is corrupt (RIO_CORRUPT_CQ)");
             }
 
             if count == 0 {

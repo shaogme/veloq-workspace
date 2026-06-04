@@ -25,7 +25,7 @@ pub struct SocketToken<'a, 'ctx> {
 impl<'a, 'ctx> SocketToken<'a, 'ctx> {
     pub(crate) fn new(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> Result<Self> {
         if !handle.borrow().is_socket() {
-            return Err(NetError::InvalidSocketHandle.to_report_trans());
+            return NetError::InvalidSocketHandle.trans();
         }
 
         // SAFETY: caller transfers ownership via RawHandle created from OwnedRawHandle::into_raw.

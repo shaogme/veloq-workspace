@@ -1,3 +1,4 @@
+use diagweave::prelude::*;
 use std::io;
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
 use windows_sys::Win32::Networking::WinSock::SOCKET;
@@ -197,11 +198,9 @@ pub(crate) fn resolve_fd_borrowed<'a>(
     if let Some(Some(h)) = registered_files.get(idx as usize) {
         Ok(h.as_borrowed())
     } else {
-        Err(
-            diagweave::report::Report::new(IocpError::ResolveFd).attach_note(format!(
-                "invalid registered file descriptor: fd={fd:?}, idx={idx}"
-            )),
-        )
+        IocpError::ResolveFd.attach_note(format!(
+            "invalid registered file descriptor: fd={fd:?}, idx={idx}"
+        ))
     }
 }
 

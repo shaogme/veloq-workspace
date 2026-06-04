@@ -14,7 +14,7 @@ use crate::config::BorrowedRawHandle;
 use crate::rio::RioEnv;
 use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
 use crate::rio::error::{RioError, RioResult};
-use diagweave::report::ResultReportExt;
+use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 use veloq_buf::{FixedBuf, PoolKind};
@@ -91,7 +91,7 @@ impl RioRegistry {
 
         match buffer_id {
             Some(id) => Ok((id, info.offset as u32)),
-            None => Err(diagweave::report::Report::new(RioError::Internal))
+            None => RioError::Internal
                 .attach_note(format!("RIO chunk not registered: chunk_id={}", info.id)),
         }
     }
@@ -130,11 +130,9 @@ impl RioRegistry {
                 .registration_stats
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(
-                diagweave::report::Report::new(RioError::ResourceExhaustion).attach_note(format!(
-                    "RIO chunk registration skipped due to recent failure: chunk_id={id}"
-                )),
-            );
+            return RioError::ResourceExhaustion.attach_note(format!(
+                "RIO chunk registration skipped due to recent failure: chunk_id={id}",
+            ));
         }
 
         let (ptr, len) = mem;
@@ -201,11 +199,9 @@ impl RioRegistry {
                     ))?;
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize, len));
             } else {
-                return Err(
-                    diagweave::report::Report::new(RioError::Internal).attach_note(format!(
-                        "RIO slab page not found in registry: page_idx={page_idx}"
-                    )),
-                );
+                return RioError::Internal.attach_note(format!(
+                    "RIO slab page not found in registry: page_idx={page_idx}",
+                ));
             }
         }
         Ok(())
@@ -312,11 +308,10 @@ impl RioRegistry {
                 .registration_stats
                 .heap_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(diagweave::report::Report::new(RioError::ResourceExhaustion)
-                .attach_note(format!(
-                    "RIO heap registration skipped due to recent failure (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
-                    env.registration_mode, key.0, key.1, key.2
-                )));
+            return RioError::ResourceExhaustion.attach_note(format!(
+                "RIO heap registration skipped due to recent failure (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
+                env.registration_mode, key.0, key.1, key.2
+            ));
         }
 
         if self.heap_rio_bufs.len() >= 1024 {

@@ -26,6 +26,8 @@ use veloq_driver_core::{
 };
 use veloq_wheel::{Wheel, WheelConfig};
 
+use diagweave::prelude::*;
+
 use crate::common::IocpWaker;
 use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, RegisteredHandle};
 use crate::error::{IocpError, IocpResult};
@@ -144,7 +146,8 @@ impl<'a> IocpDriver<'a> {
             registration_mode,
         )
         .map_err(|e| {
-            diagweave::report::Report::new(IocpError::Rio)
+            IocpError::Rio
+                .to_report()
                 .attach_note(format!(
                     "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
                 ))

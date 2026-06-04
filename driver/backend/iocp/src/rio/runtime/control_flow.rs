@@ -11,7 +11,7 @@ use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioCompletionContext, RioEnv, RioState, SocketRuntimeMode, SocketRuntimeState};
-use diagweave::report::ResultReportExt;
+use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::error;
 use veloq_driver_core::driver::registry::OpRegistry;
@@ -192,7 +192,7 @@ impl RioState {
             return self
                 .actors
                 .get_mut(key)
-                .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+                .ok_or(RioError::Internal)
                 .attach_note("failed to retrieve indexed actor");
         }
 
@@ -237,7 +237,8 @@ impl RioState {
         state.iocp_associated = false;
         self.actors
             .get_mut(key)
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .ok_or(RioError::Internal)
+            .trans()
             .attach_note("failed to retrieve inserted actor")
     }
 
@@ -308,7 +309,7 @@ impl RioState {
         loop {
             let count = self.kernel.dequeue(&mut results);
             if count == RIO_CORRUPT_CQ {
-                return Err(diagweave::report::Report::new(RioError::Internal))
+                return RioError::Internal
                     .attach_note("RIO completion queue is corrupt (RIO_CORRUPT_CQ)");
             }
             if count == 0 {

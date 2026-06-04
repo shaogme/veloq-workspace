@@ -18,7 +18,7 @@ use crate::op::submit::SubmissionResult;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, RioTarget};
-use diagweave::report::ResultReportExt;
+use diagweave::prelude::*;
 use tracing::error;
 
 impl RioState {
@@ -85,10 +85,11 @@ impl RioState {
             generation,
             buf_offset,
         } = target;
-        let dispatch = self.kernel.dispatch.ok_or_else(|| {
-            diagweave::report::Report::new(RioError::NotSupported)
-                .attach_note("RIO not supported or dispatch table missing")
-        })?;
+        let dispatch = self
+            .kernel
+            .dispatch
+            .ok_or(RioError::NotSupported)
+            .attach_note("RIO not supported or dispatch table missing")?;
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -102,8 +103,7 @@ impl RioState {
             actor.rq
         };
         if self.is_iocp_fallback(handle.raw().actor_key()) {
-            return Err(diagweave::report::Report::new(RioError::NotSupported))
-                .attach_note("Socket is marked for IOCP fallback");
+            return RioError::NotSupported.attach_note("Socket is marked for IOCP fallback");
         }
         let rio_buf = self.registry.prepare_submission(
             buf,
@@ -142,10 +142,11 @@ impl RioState {
             generation,
             buf_offset,
         } = target;
-        let dispatch = self.kernel.dispatch.ok_or_else(|| {
-            diagweave::report::Report::new(RioError::NotSupported)
-                .attach_note("RIO not supported or dispatch table missing")
-        })?;
+        let dispatch = self
+            .kernel
+            .dispatch
+            .ok_or(RioError::NotSupported)
+            .attach_note("RIO not supported or dispatch table missing")?;
         let env = RioEnv {
             registrar,
             dispatch: &dispatch,
@@ -169,8 +170,7 @@ impl RioState {
             actor.rq
         };
         if self.is_iocp_fallback(handle.raw().actor_key()) {
-            return Err(diagweave::report::Report::new(RioError::NotSupported))
-                .attach_note("Socket is marked for IOCP fallback");
+            return RioError::NotSupported.attach_note("Socket is marked for IOCP fallback");
         }
         let rio_buf = self.registry.prepare_submission(
             buf,

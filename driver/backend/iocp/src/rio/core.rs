@@ -5,7 +5,7 @@ pub(crate) mod submit_ops;
 
 use crate::rio::RioState;
 use crate::rio::error::RioError;
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use veloq_driver_core::{
     DriverErrorKind, DriverResult, driver_error_report_to_event_res, driver_os_error,
 };
@@ -93,7 +93,8 @@ impl RioState {
 
     pub(crate) fn last_wsa_report(context: RioError, scope: &'static str) -> Report<RioError> {
         let code = Self::last_wsa_error_code() as u32;
-        diagweave::report::Report::new(context)
+        context
+            .to_report()
             .with_ctx("scope", scope)
             .set_error_code(code)
             .attach_note(driver_os_error(

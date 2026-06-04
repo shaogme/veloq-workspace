@@ -4,7 +4,7 @@ pub(crate) mod net;
 pub(crate) mod net_udp;
 
 use core::convert::TryFrom;
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::{
     CompletionRecord, DriveMode, Driver, PollRecordResult, encode_completion_token,
@@ -79,18 +79,18 @@ pub(crate) fn wait_completion_record(
     let token = encode_completion_token(user_data, generation);
     loop {
         if start.elapsed() > timeout {
-            return Err(Report::new(IocpError::CompletionWait).attach_note(format!(
+            return IocpError::CompletionWait.attach_note(format!(
                 "wait completion timed out: user_data={}, generation={}",
                 user_data, generation
-            )));
+            ));
         }
         let _ = driver.drive(DriveMode::Poll);
         let completion_table = driver.completion_table();
         match completion_table.try_take_record(token) {
             PollRecordResult::Ready(record) => return Ok(record),
             PollRecordResult::Stale => {
-                return Err(Report::new(IocpError::CompletionWait)
-                    .attach_note("stale completion record (generation mismatch)"));
+                return IocpError::CompletionWait
+                    .attach_note("stale completion record (generation mismatch)");
             }
             PollRecordResult::Pending => {}
         }

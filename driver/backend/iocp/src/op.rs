@@ -20,6 +20,8 @@ use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioState;
 
+use diagweave::prelude::*;
+
 use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{
@@ -142,9 +144,9 @@ macro_rules! define_iocp_ops {
                             Ok(())
                         },
                     )+
-                    _ => Err(diagweave::report::Report::new(IocpError::InvalidState).attach_note(
+                    _ => IocpError::InvalidState.attach_note(
                         "variant mismatch while binding IOCP user payload",
-                    )),
+                    ),
                 }
             }
 
@@ -188,10 +190,10 @@ macro_rules! define_iocp_ops {
                             if let IocpOpPayload::$Variant(ref mut p) = op.payload {
                                 $submit(&mut op.header, p, ctx)
                             } else {
-                                Err(diagweave::report::Report::new(IocpError::InvalidState).attach_note(format!(
+                                IocpError::InvalidState.attach_note(format!(
                                     "variant mismatch in IocpKernelOp dispatch for {}",
                                     stringify!($OpType)
-                                )))
+                                ))
                             }
                         },
                         on_complete: define_iocp_ops!(@optional_complete_shim $OpType, $Variant, $($complete)?),
@@ -248,10 +250,10 @@ macro_rules! define_iocp_ops {
             if let IocpOpPayload::$Variant(ref mut p) = op.payload {
                 $fn(&mut op.header, p, result, ext)
             } else {
-                Err(diagweave::report::Report::new(IocpError::InvalidState).attach_note(format!(
+                IocpError::InvalidState.attach_note(format!(
                     "variant mismatch in IocpKernelOp on_complete for {}",
                     stringify!($OpType)
-                )))
+                ))
             }
         })
     };

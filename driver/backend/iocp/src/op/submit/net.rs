@@ -1,3 +1,4 @@
+use diagweave::DiagnosticResult;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use veloq_pod::{bytes_of_mut, from_bytes_mut};
@@ -285,11 +286,9 @@ fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> IocpResult<u16> {
     })?;
     match storage.family() {
         AF_INET | AF_INET6 => Ok(storage.family()),
-        family => Err(
-            diagweave::report::Report::new(IocpError::InvalidInput).attach_note(format!(
-                "unsupported listen socket family for accept: {family}"
-            )),
-        ),
+        family => IocpError::InvalidInput.attach_note(format!(
+            "unsupported listen socket family for accept: {family}",
+        )),
     }
 }
 
@@ -302,10 +301,10 @@ pub(crate) unsafe fn on_complete_connect(
     result: usize,
     _ext: &Extensions,
 ) -> IocpResult<usize> {
-    let raw_handle = header.resolved_handle.ok_or_else(|| {
-        diagweave::report::Report::new(IocpError::InvalidState)
-            .attach_note("resolved handle missing for connect completion")
-    })?;
+    let raw_handle = header
+        .resolved_handle
+        .ok_or(IocpError::InvalidState)
+        .attach_note("resolved handle missing for connect completion")?;
     with_borrowed_socket(raw_handle.as_socket(), |socket| {
         socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
     })?;
@@ -371,10 +370,11 @@ pub(crate) fn submit_accept(
         })?;
         payload.accept_socket = Some(accept_socket);
     }
-    let accept_socket = payload.accept_socket.as_ref().ok_or_else(|| {
-        diagweave::report::Report::new(IocpError::InvalidState)
-            .attach_note("accept socket not initialized")
-    })?;
+    let accept_socket = payload
+        .accept_socket
+        .as_ref()
+        .ok_or(IocpError::InvalidState)
+        .attach_note("accept socket not initialized")?;
     let accept_socket_raw = accept_socket.raw().as_socket();
 
     ensure_iocp_association(
@@ -429,14 +429,15 @@ pub(crate) unsafe fn on_complete_accept(
 ) -> IocpResult<usize> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
-    let accept_socket = payload.accept_socket.take().ok_or_else(|| {
-        diagweave::report::Report::new(IocpError::InvalidState)
-            .attach_note("accept socket not initialized")
-    })?;
-    let listen_handle = header.resolved_handle.ok_or_else(|| {
-        diagweave::report::Report::new(IocpError::InvalidState)
-            .attach_note("resolved listen handle missing for accept completion")
-    })?;
+    let accept_socket = payload
+        .accept_socket
+        .take()
+        .ok_or(IocpError::InvalidState)
+        .attach_note("accept socket not initialized")?;
+    let listen_handle = header
+        .resolved_handle
+        .ok_or(IocpError::InvalidState)
+        .attach_note("resolved listen handle missing for accept completion")?;
     let listen_socket = listen_handle.as_socket();
     let accept_socket_raw = accept_socket.raw().as_socket();
 
@@ -581,9 +582,10 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
             std::mem::size_of::<SockAddrStorage>(),
         )
     };
-    val.addr = Some(addr::to_socket_addr(addr_bytes).map_err(|_| {
-        diagweave::report::Report::new(IocpError::InvalidState)
-            .attach_note("failed to parse RIO udp_recv_from source address")
-    })?);
+    val.addr = Some(
+        addr::to_socket_addr(addr_bytes)
+            .map_err(|_| IocpError::InvalidState)
+            .attach_note("failed to parse RIO udp_recv_from source address")?,
+    );
     Ok(result)
 }

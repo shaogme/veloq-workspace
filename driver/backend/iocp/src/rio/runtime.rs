@@ -8,7 +8,7 @@ use crate::op::SubmissionResult;
 use crate::rio::core::submit_ops::{RioExConfig, RioProvider};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, SocketLifecycleState, SocketRuntimeMode, SocketRuntimeState};
-use diagweave::report::ResultReportExt;
+use diagweave::prelude::*;
 use veloq_driver_core::op::UdpRecvFrom;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, RIO_BUF, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
@@ -102,8 +102,7 @@ impl RioState {
         page_idx: usize,
     ) -> RioResult<(u32, usize)> {
         if addr_ptr.is_null() {
-            return Err(diagweave::report::Report::new(RioError::Internal))
-                .attach_note("RIO send_to received null address");
+            return RioError::Internal.attach_note("RIO send_to received null address");
         }
         // SAFETY: addr_ptr is checked for null, and sa_family is a standard field in SOCKADDR.
         let family = unsafe { (*(addr_ptr as *const SOCKADDR)).sa_family };
@@ -111,20 +110,18 @@ impl RioState {
             AF_INET => std::mem::size_of::<SOCKADDR_IN>(),
             AF_INET6 => std::mem::size_of::<SOCKADDR_IN6>(),
             _ => {
-                return Err(diagweave::report::Report::new(RioError::Internal))
-                    .attach_note(format!("RIO unsupported family: {family}"));
+                return RioError::Internal.attach_note(format!("RIO unsupported family: {family}"));
             }
         };
         if (addr_len as usize) < min_len {
-            return Err(diagweave::report::Report::new(RioError::Internal))
-                .attach_note("RIO send_to invalid address length");
+            return RioError::Internal.attach_note("RIO send_to invalid address length");
         }
 
         let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>();
         let addr_addr = addr_ptr as usize;
         let slab_end = base_addr.saturating_add(slab_len);
         if addr_addr < base_addr || addr_addr.saturating_add(rio_addr_len) > slab_end {
-            return Err(diagweave::report::Report::new(RioError::Internal))
+            return RioError::Internal
                 .attach_note(format!("RIO address outside slab: page={page_idx}"));
         }
 
@@ -139,13 +136,12 @@ impl RioState {
         page_idx: usize,
     ) -> RioResult<usize> {
         if addr_ptr.is_null() {
-            return Err(diagweave::report::Report::new(RioError::Internal))
-                .attach_note("RIO recv_from received null address buffer");
+            return RioError::Internal.attach_note("RIO recv_from received null address buffer");
         }
         let addr_addr = addr_ptr as usize;
         let slab_end = base_addr.saturating_add(slab_len);
         if addr_addr < base_addr || addr_addr.saturating_add(rio_addr_len as usize) > slab_end {
-            return Err(diagweave::report::Report::new(RioError::Internal)).attach_note(format!(
+            return RioError::Internal.attach_note(format!(
                 "RIO recv_from address outside slab: page={page_idx}"
             ));
         }
@@ -184,7 +180,7 @@ impl RioState {
         let dispatch = self
             .kernel
             .dispatch
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .ok_or(RioError::Internal)
             .attach_note("lost RIO context")?;
         let env = RioEnv {
             registrar,
@@ -198,8 +194,7 @@ impl RioState {
         };
         let socket_key = handle.raw().actor_key();
         if self.is_iocp_fallback(socket_key) {
-            return Err(diagweave::report::Report::new(RioError::NotSupported))
-                .attach_note("Socket is marked for IOCP fallback");
+            return RioError::NotSupported.attach_note("Socket is marked for IOCP fallback");
         }
         let data_buf = self.registry.prepare_submission(
             buf,
@@ -211,7 +206,7 @@ impl RioState {
             .ensure_page_reg(page_idx, slab_resolver, env)?;
 
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx]
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .ok_or(RioError::Internal)
             .attach_note("missing slab page")?;
 
         let (rio_addr_len, addr_offset) =
@@ -261,7 +256,7 @@ impl RioState {
         let dispatch = self
             .kernel
             .dispatch
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .ok_or(RioError::Internal)
             .attach_note("lost RIO context")?;
         let env = RioEnv {
             registrar,
@@ -275,8 +270,7 @@ impl RioState {
         };
         let socket_key = handle.raw().actor_key();
         if self.is_iocp_fallback(socket_key) {
-            return Err(diagweave::report::Report::new(RioError::NotSupported))
-                .attach_note("Socket is marked for IOCP fallback");
+            return RioError::NotSupported.attach_note("Socket is marked for IOCP fallback");
         }
         let buf_offset = recv_from_op.buf_offset;
         let buf_len = recv_from_op.buf.capacity().saturating_sub(buf_offset) as u32;
@@ -288,7 +282,7 @@ impl RioState {
 
         let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>() as u32;
         let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx]
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .ok_or(RioError::Internal)
             .attach_note("missing slab page")?;
         let addr_offset =
             Self::validate_rio_addr_output(addr_ptr, rio_addr_len, base_addr, slab_len, page_idx)?;

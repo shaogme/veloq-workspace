@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use tracing::error;
 
 use crate::error::{IocpError, IocpResult, IocpResultExt};
@@ -47,7 +47,8 @@ fn sanitize_field(s: &str) -> String {
 
 pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Report<IocpError> {
     let detail = detail.into();
-    let report = Report::new(IocpError::from(ctx))
+    let report = IocpError::from(ctx)
+        .to_report()
         .with_ctx("scope", "iocp/common")
         .with_ctx("detail", sanitize_field(&detail))
         .attach_note(detail);

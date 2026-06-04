@@ -63,7 +63,7 @@ impl<'a> UringDriver<'a> {
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr, user_data)
                             .map_err(|e| {
-                                Report::new(UringError::Submission).attach_note(format!(
+                                UringError::Submission.attach_note(format!(
                                     "driver.submit_from_slot_raw.make_sqe: {e:#}"
                                 ))
                             })?

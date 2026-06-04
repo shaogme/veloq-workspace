@@ -215,13 +215,11 @@ struct Runner {
 
 impl Runner {
     fn new(config: Config) -> Result<Self, Report<RunnerError>> {
-        let workspace_root = workspace_root().map_err(|e| e.to_report())?;
-        let mode = determine_mode(config.target, &workspace_root).map_err(|e| {
-            e.to_report().with_ctx(
-                "workspace_root",
-                workspace_root.to_string_lossy().to_string(),
-            )
-        })?;
+        let workspace_root = workspace_root().map_err(|e| e)?;
+        let mode = determine_mode(config.target, &workspace_root).with_ctx(
+            "workspace_root",
+            workspace_root.to_string_lossy().to_string(),
+        )?;
 
         let windows_target = if cfg!(target_os = "windows") || config.target != Target::Windows {
             None
@@ -278,7 +276,7 @@ impl Runner {
         if !matches!(self.mode, RunMode::Native) {
             // 在非原生环境下，我们直接运行一次 xtest-runner，由内部的 xtest-runner 负责循环
             let status = command_status(&command, &self.workspace_root)
-                .map_err(|e| e.to_report().with_ctx("command", command.display()))?;
+                .with_ctx("command", command.display())?;
             if status.success() {
                 return Ok(());
             } else {
@@ -304,24 +302,23 @@ impl Runner {
     fn run_round(&self, command: &CommandSpec, round: usize) -> Result<(), Report<RunnerError>> {
         if !self.config.quiet {
             let status = command_status(command, &self.workspace_root)
-                .map_err(|e| e.to_report().with_ctx("round", round.to_string()))?;
+                .with_ctx("round", round.to_string())?;
             if status.success() {
                 return Ok(());
             }
 
-            return Err(RunnerError::RoundFailed {
+            return RunnerError::RoundFailed {
                 task: self.config.task.name(),
                 target: self.config.target.name(),
                 round,
                 total: self.config.count,
                 code: status.code(),
             }
-            .to_report()
-            .with_ctx("command", command.display()));
+            .with_ctx("command", command.display());
         }
 
-        let output = command_output(command, &self.workspace_root)
-            .map_err(|e| e.to_report().with_ctx("round", round.to_string()))?;
+        let output =
+            command_output(command, &self.workspace_root).with_ctx("round", round.to_string())?;
         if output.status.success() {
             return Ok(());
         }
@@ -334,7 +331,7 @@ impl Runner {
             output.status.code()
         );
         print_output(&output);
-        Err(RunnerError::CommandFailed.to_report())
+        Err(RunnerError::CommandFailed.trans())
     }
 
     fn prepare_environment(&self) -> Result<(), Report<RunnerError>> {
@@ -348,7 +345,7 @@ impl Runner {
 
             if let Some(target) = &self.windows_target
                 && !has_rust_target(target, &self.workspace_root)
-                    .map_err(|e| e.to_report().with_ctx("target", target.clone()))?
+                    .with_ctx("target", target.clone())?
             {
                 self.run_setup(
                     &format!("安装 {} 工具链", target),
@@ -367,33 +364,31 @@ impl Runner {
         if !self.config.quiet {
             eprintln!("[xtest-runner] {step}: {}", command.display());
             let status = command_status(&command, &self.workspace_root)
-                .map_err(|e| e.to_report().with_ctx("step", step.to_string()))?;
+                .with_ctx("step", step.to_string())?;
             if status.success() {
                 return Ok(());
             }
 
-            return Err(RunnerError::SetupFailed {
+            return RunnerError::SetupFailed {
                 step: step.to_string(),
                 code: status.code(),
             }
-            .to_report()
-            .with_ctx("command", command.display()));
+            .with_ctx("command", command.display());
         }
 
-        let output = command_output(&command, &self.workspace_root)
-            .map_err(|e| e.to_report().with_ctx("step", step.to_string()))?;
+        let output =
+            command_output(&command, &self.workspace_root).with_ctx("step", step.to_string())?;
         if output.status.success() {
             return Ok(());
         }
 
         eprintln!("{step} 失败（退出码: {:?}）", output.status.code());
         print_output(&output);
-        Err(RunnerError::SetupFailed {
+        RunnerError::SetupFailed {
             step: step.to_string(),
             code: output.status.code(),
         }
-        .to_report()
-        .with_ctx("command", command.display()))
+        .with_ctx("command", command.display())
     }
 
     fn round_command(&self) -> CommandSpec {
@@ -669,7 +664,7 @@ fn main() -> ExitCode {
 }
 
 fn run_app(cli: Cli) -> Result<(), Report<RunnerError>> {
-    let config = Config::try_from(cli).map_err(|e| e.to_report())?;
+    let config = Config::try_from(cli).map_err(|e| e)?;
     let runner = Runner::new(config)?;
     runner.run()?;
     Ok(())

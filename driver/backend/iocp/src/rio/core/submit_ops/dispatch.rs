@@ -4,7 +4,7 @@ use crate::ext::Extensions;
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState};
 use crate::win32::Overlapped;
-use diagweave::report::ResultReportExt;
+use diagweave::prelude::*;
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION, RIO_RQ,
     RIORESULT, SOCKET_ERROR,
@@ -337,47 +337,47 @@ impl RioKernel {
         let dispatch = RioDispatch {
             create_cq: table
                 .RIOCreateCompletionQueue
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIOCreateCompletionQueue missing")?,
             create_rq: table
                 .RIOCreateRequestQueue
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIOCreateRequestQueue missing")?,
             register_buffer: table
                 .RIORegisterBuffer
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIORegisterBuffer missing")?,
             deregister_buffer: table
                 .RIODeregisterBuffer
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIODeregisterBuffer missing")?,
             dequeue: table
                 .RIODequeueCompletion
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIODequeueCompletion missing")?,
             notify: table
                 .RIONotify
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIONotify missing")?,
             close_cq: table
                 .RIOCloseCompletionQueue
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIOCloseCompletionQueue missing")?,
             receive: table
                 .RIOReceive
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIOReceive missing")?,
             send: table
                 .RIOSend
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIOSend missing")?,
             send_ex: table
                 .RIOSendEx
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIOSendEx missing")?,
             receive_ex: table
                 .RIOReceiveEx
-                .ok_or_else(|| diagweave::report::Report::new(RioError::LibraryLoad))
+                .ok_or(RioError::LibraryLoad)
                 .attach_note("RIOReceiveEx missing")?,
         };
         Self::new(port, entries, dispatch)
@@ -448,7 +448,7 @@ impl RioKernel {
     ) -> RioResult<()> {
         self.dispatch
             .as_ref()
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .ok_or(RioError::Internal)
             .attach_note("RIO dispatch context lost")?
             .receive(rq, buf, 1, 0, ctx)
     }
@@ -461,7 +461,7 @@ impl RioKernel {
     ) -> RioResult<()> {
         self.dispatch
             .as_ref()
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .ok_or(RioError::Internal)
             .attach_note("RIO dispatch context lost")?
             .send(rq, buf, 1, 0, ctx)
     }
@@ -476,7 +476,7 @@ impl RioKernel {
         let dispatch = self
             .dispatch
             .as_ref()
-            .ok_or_else(|| diagweave::report::Report::new(RioError::Internal))
+            .ok_or(RioError::Internal)
             .attach_note("RIO dispatch context lost")?;
         dispatch.send_ex(RioExConfig {
             rq,
