@@ -21,9 +21,7 @@ use veloq_driver_core::driver::{
     RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::slot::{DetachedCancelTable, SlotTable};
-use veloq_driver_core::{
-    DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
-};
+use veloq_driver_core::{DriverErrorKind, DriverErrorReport, DriverResult, driver_error};
 use veloq_wheel::{Wheel, WheelConfig};
 
 use diagweave::prelude::*;
@@ -103,8 +101,7 @@ impl<'a> IocpDriver<'a> {
 
     /// Creates a pre-initialization completion port handle.
     pub(crate) fn create_pre_init() -> IocpResult<PreInit> {
-        crate::win32::IoCompletionPort::new(0)
-            .map_err(|e| e.attach_note("failed to create pre-init IOCP"))
+        crate::win32::IoCompletionPort::new(0).attach_note("failed to create pre-init IOCP")
     }
 
     /// Creates a new IOCP driver instance.
@@ -134,11 +131,9 @@ impl<'a> IocpDriver<'a> {
 
         let port_handle = port_val.as_raw();
         debug!(port = ?port_handle, "Initializing IocpDriver");
-        let extensions = crate::ext::Extensions::new().map_err(|e| {
-            e.attach_note(format!(
-                "failed to load IOCP extensions, port={port_handle:?}"
-            ))
-        })?;
+        let extensions = crate::ext::Extensions::new().attach_note(format!(
+            "failed to load IOCP extensions, port={port_handle:?}"
+        ))?;
         let rio_state = RioState::new(
             crate::config::RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
@@ -183,16 +178,6 @@ impl<'a> IocpDriver<'a> {
             port: self.port.clone(),
             is_notified: self.is_notified.clone(),
         })
-    }
-
-    #[inline]
-    pub(crate) fn with_report_detail(
-        kind: DriverErrorKind,
-        scope: &'static str,
-        detail: &'static str,
-        report: impl std::fmt::Display,
-    ) -> DriverErrorReport {
-        driver_error(kind, scope, format!("{detail}: {report}"))
     }
 }
 
@@ -256,12 +241,11 @@ impl<'a> Driver for IocpDriver<'a> {
     {
         if self.shutting_down {
             return binder.err(
-                driver_os_error(
-                    DriverErrorKind::System,
-                    "iocp/driver",
-                    windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
-                    "driver is shutting down",
-                ),
+                DriverErrorKind::System
+                    .to_report()
+                    .with_ctx("scope", "iocp/driver")
+                    .set_error_code(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+                    .attach_note("driver is shutting down"),
                 SubmitStatus::Void,
             );
         }
@@ -269,11 +253,10 @@ impl<'a> Driver for IocpDriver<'a> {
             Some(op) => op,
             None => {
                 return binder.err(
-                    driver_error(
-                        DriverErrorKind::InvalidInput,
-                        "iocp/driver",
-                        "submit called with empty option",
-                    ),
+                    DriverErrorKind::InvalidInput
+                        .to_report()
+                        .with_ctx("scope", "iocp/driver")
+                        .attach_note("submit called with empty option"),
                     SubmitStatus::Void,
                 );
             }
@@ -283,12 +266,10 @@ impl<'a> Driver for IocpDriver<'a> {
             Ok(res) => res,
             Err(e) => {
                 return binder.err(
-                    Self::with_report_detail(
-                        DriverErrorKind::Submission,
-                        "iocp/driver",
-                        "call_op_submit failed",
-                        format!("{e:#}"),
-                    ),
+                    DriverErrorKind::Submission
+                        .to_report()
+                        .with_ctx("scope", "iocp/driver")
+                        .attach_note(format!("call_op_submit failed: {e:#}")),
                     SubmitStatus::Void,
                 );
             }
@@ -308,12 +289,10 @@ impl<'a> Driver for IocpDriver<'a> {
         match mode {
             DriveMode::Poll => {
                 self.get_completion(0).map_err(|e| {
-                    Self::with_report_detail(
-                        DriverErrorKind::Completion,
-                        "iocp/driver.drive.poll",
-                        "drive(Poll) failed",
-                        format!("{e:#}"),
-                    )
+                    DriverErrorKind::Completion
+                        .to_report()
+                        .with_ctx("scope", "iocp/driver.drive.poll")
+                        .attach_note(format!("drive(Poll) failed: {e:#}"))
                 })?;
             }
             DriveMode::Wait => {
@@ -326,12 +305,10 @@ impl<'a> Driver for IocpDriver<'a> {
                     });
                 }
                 self.get_completion(u32::MAX).map_err(|e| {
-                    Self::with_report_detail(
-                        DriverErrorKind::Completion,
-                        "iocp/driver.drive.wait",
-                        "wait for completion failed",
-                        format!("{e:#}"),
-                    )
+                    DriverErrorKind::Completion
+                        .to_report()
+                        .with_ctx("scope", "iocp/driver.drive.wait")
+                        .attach_note(format!("wait for completion failed: {e:#}"))
                 })?;
             }
         }
@@ -358,12 +335,10 @@ impl<'a> Driver for IocpDriver<'a> {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
         IocpDriver::register_chunk(self, id, ptr, len).map_err(|e| {
-            Self::with_report_detail(
-                DriverErrorKind::Registration,
-                "iocp/driver",
-                "register chunk failed",
-                format!("{e:#}"),
-            )
+            DriverErrorKind::Registration
+                .to_report()
+                .with_ctx("scope", "iocp/driver")
+                .attach_note(format!("register chunk failed: {e:#}"))
         })
     }
 

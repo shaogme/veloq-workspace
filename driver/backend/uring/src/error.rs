@@ -1,4 +1,4 @@
-use diagweave::{report::Report, set};
+use diagweave::prelude::*;
 use veloq_driver_core::{DriverErrorKind, DriverResult, ResultAsDriverExt};
 
 set! {

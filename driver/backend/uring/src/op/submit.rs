@@ -1,9 +1,9 @@
 use crate::driver::UringDriver;
 use crate::op::{UringOp, UringOpPayload, UringUserPayload};
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use veloq_buf::PoolKind;
-use veloq_driver_core::{DriverErrorKind, DriverResult, driver_error, driver_os_error};
+use veloq_driver_core::{DriverErrorKind, DriverResult, driver_error};
 
 #[inline]
 fn payload_variant_mismatch(scope: &'static str) -> Report<DriverErrorKind> {
@@ -36,12 +36,10 @@ macro_rules! impl_default_completion {
             if result >= 0 {
                 Ok(result as usize)
             } else {
-                Err(driver_os_error(
-                    DriverErrorKind::Completion,
-                    concat!("uring.op.submit.", stringify!($fn_name)),
-                    -result,
-                    "kernel completion returned error",
-                ))
+                DriverErrorKind::Completion
+                    .with_ctx("scope", concat!("uring.op.submit.", stringify!($fn_name)))
+                    .set_error_code(-result)
+                    .attach_note("kernel completion returned error")
             }
         }
     };
@@ -55,12 +53,10 @@ pub(crate) unsafe fn on_complete_default(
     if result >= 0 {
         Ok(result as usize)
     } else {
-        Err(driver_os_error(
-            DriverErrorKind::Completion,
-            "uring.op.submit.on_complete_default",
-            -result,
-            "kernel completion returned error",
-        ))
+        DriverErrorKind::Completion
+            .with_ctx("scope", "uring.op.submit.on_complete_default")
+            .set_error_code(-result)
+            .attach_note("kernel completion returned error")
     }
 }
 
@@ -447,12 +443,10 @@ pub(crate) unsafe fn on_complete_accept(
     result: i32,
 ) -> DriverResult<usize> {
     if result < 0 {
-        return Err(driver_os_error(
-            DriverErrorKind::Completion,
-            "uring.op.submit.on_complete_accept",
-            -result,
-            "kernel completion returned error",
-        ));
+        return DriverErrorKind::Completion
+            .with_ctx("scope", "uring.op.submit.on_complete_accept")
+            .set_error_code(-result)
+            .attach_note("kernel completion returned error");
     }
 
     let accept_op = match payload {
@@ -575,12 +569,10 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
     result: i32,
 ) -> DriverResult<usize> {
     if result < 0 {
-        return Err(driver_os_error(
-            DriverErrorKind::Completion,
-            "uring.op.submit.on_complete_udp_recv_from",
-            -result,
-            "kernel completion returned error",
-        ));
+        return DriverErrorKind::Completion
+            .with_ctx("scope", "uring.op.submit.on_complete_udp_recv_from")
+            .set_error_code(-result)
+            .attach_note("kernel completion returned error");
     }
 
     let user = match payload {

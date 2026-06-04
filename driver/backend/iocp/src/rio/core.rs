@@ -6,9 +6,7 @@ pub(crate) mod submit_ops;
 use crate::rio::RioState;
 use crate::rio::error::RioError;
 use diagweave::prelude::*;
-use veloq_driver_core::{
-    DriverErrorKind, DriverResult, driver_error_report_to_event_res, driver_os_error,
-};
+use veloq_driver_core::{DriverErrorKind, DriverResult, driver_error_report_to_event_res};
 
 #[derive(Clone, Copy)]
 pub(crate) enum RioCompletionKind {
@@ -97,12 +95,13 @@ impl RioState {
             .to_report()
             .with_ctx("scope", scope)
             .set_error_code(code)
-            .attach_note(driver_os_error(
-                DriverErrorKind::System,
-                scope,
-                code as i32,
-                "winsock error",
-            ))
+            .attach_note(
+                DriverErrorKind::System
+                    .to_report()
+                    .with_ctx("scope", scope)
+                    .set_error_code(code as i32)
+                    .attach_note("winsock error"),
+            )
     }
 }
 
@@ -132,12 +131,11 @@ mod tests {
             rio_result_to_event_res(&Ok((i32::MAX as usize) + 10)),
             i32::MAX
         );
-        let err = driver_os_error(
-            DriverErrorKind::System,
-            "rio.core.tests",
-            10022,
-            "invalid argument",
-        );
+        let err = DriverErrorKind::System
+            .to_report()
+            .with_ctx("scope", "rio.core.tests")
+            .set_error_code(10022)
+            .attach_note("invalid argument");
         assert_eq!(rio_result_to_event_res(&Err(err)), -10022);
     }
 

@@ -153,20 +153,6 @@ pub fn driver_error(
         .attach_note(detail)
 }
 
-#[inline]
-pub fn driver_os_error(
-    kind: DriverErrorKind,
-    scope: &'static str,
-    code: i32,
-    detail: impl ToString,
-) -> DriverErrorReport {
-    let detail = detail.to_string();
-    kind.to_report()
-        .with_ctx("scope", scope)
-        .set_error_code(code)
-        .attach_note(detail)
-}
-
 pub trait ResultAsDriverExt<T, E> {
     fn to_driver_result(
         self,

@@ -1,4 +1,4 @@
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use std::task::Poll;
 use tracing::{debug, trace};
 
@@ -63,7 +63,7 @@ impl<'a> UringDriver<'a> {
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr, user_data)
                             .map_err(|e| {
-                                UringError::Submission.attach_note(format!(
+                                UringError::Submission.to_report().attach_note(format!(
                                     "driver.submit_from_slot_raw.make_sqe: {e:#}"
                                 ))
                             })?

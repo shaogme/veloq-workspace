@@ -1,4 +1,4 @@
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use io_uring::IoUring;
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -20,9 +20,7 @@ use veloq_driver_core::driver::{
     SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
-use veloq_driver_core::{
-    DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
-};
+use veloq_driver_core::{DriverErrorKind, DriverErrorReport, DriverResult, driver_error};
 
 mod completion;
 mod lifecycle;
@@ -56,12 +54,10 @@ impl RemoteWaker for UringWaker {
                 if err.raw_os_error() == Some(libc::EAGAIN) {
                     return Ok(());
                 }
-                return Err(driver_os_error(
-                    DriverErrorKind::System,
-                    "uring.driver.waker.wake",
-                    err.raw_os_error().unwrap_or(libc::EIO),
-                    err.to_string(),
-                ));
+                return DriverErrorKind::System
+                    .with_ctx("scope", "uring.driver.waker.wake")
+                    .set_error_code(err.raw_os_error().unwrap_or(libc::EIO))
+                    .attach_note(err.to_string());
             }
         }
         Ok(())

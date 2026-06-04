@@ -2,7 +2,7 @@
 
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
-use crate::driver::{IocpDriver, IocpOpState};
+use crate::driver::IocpOpState;
 use crate::op::IocpOp;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpCtxGuard;
@@ -14,12 +14,12 @@ use crate::rio::{RioCompletionContext, RioEnv, RioState, SocketRuntimeMode, Sock
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::error;
+use veloq_driver_core::DriverErrorKind;
 use veloq_driver_core::driver::registry::OpRegistry;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
 use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
-use veloq_driver_core::{DriverErrorKind, driver_os_error};
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 pub(crate) struct RioSocketActor {
@@ -85,12 +85,10 @@ impl<'a> RioCompletionRouter<'a> {
                     let mut completion = if res.Status == 0 {
                         Ok(res.BytesTransferred as usize)
                     } else {
-                        Err(driver_os_error(
-                            DriverErrorKind::Completion,
-                            "rio.runtime.control_flow.handle_op_completion",
-                            res.Status,
-                            "rio completion returned os error",
-                        ))
+                        DriverErrorKind::Completion
+                            .with_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
+                            .set_error_code(res.Status)
+                            .attach_note("rio completion returned os error")
                     };
                     let socket_key = slot
                         .with_op_mut(|iocp_op| {
@@ -107,12 +105,15 @@ impl<'a> RioCompletionRouter<'a> {
                             if let Ok(bytes) = completion {
                                 completion =
                                     iocp_op.on_complete(bytes, self.comp.ext).map_err(|e| {
-                                        IocpDriver::with_report_detail(
-                                            DriverErrorKind::Completion,
-                                            "rio.runtime.control_flow.handle_op_completion",
-                                            "rio op completion hook failed",
-                                            format!("{e:#}"),
-                                        )
+                                        DriverErrorKind::Completion
+                                            .to_report()
+                                            .with_ctx(
+                                                "scope",
+                                                "rio.runtime.control_flow.handle_op_completion",
+                                            )
+                                            .attach_note(format!(
+                                                "rio op completion hook failed: {e:#}"
+                                            ))
                                     });
                             }
                             socket_key

@@ -112,12 +112,10 @@ impl<'a> IocpDriver<'a> {
                             self.drain_deferred_socket_cleanup();
                         })
                         .map_err(|e| {
-                            Self::with_report_detail(
-                                DriverErrorKind::Completion,
-                                "iocp/driver",
-                                "failed to process rio completions",
-                                format!("{e:#}"),
-                            )
+                            DriverErrorKind::Completion
+                                .to_report()
+                                .with_ctx("scope", "iocp/driver")
+                                .attach_note(format!("failed to process rio completions: {e:#}"))
                         });
                 }
 
@@ -140,20 +138,16 @@ impl<'a> IocpDriver<'a> {
         let pending = self.shutdown_ops();
         if let CloseMode::Strict { timeout } = mode {
             self.drain_pending_iocp(pending, timeout).map_err(|e| {
-                Self::with_report_detail(
-                    DriverErrorKind::Timeout,
-                    "iocp/driver",
-                    "drain pending iocp timed out",
-                    format!("{e:#}"),
-                )
+                DriverErrorKind::Timeout
+                    .to_report()
+                    .with_ctx("scope", "iocp/driver")
+                    .attach_note(format!("drain pending iocp timed out: {e:#}"))
             })?;
             self.rio_state.drain_outstanding(timeout).map_err(|e| {
-                Self::with_report_detail(
-                    DriverErrorKind::Completion,
-                    "iocp/driver",
-                    "failed to drain RIO outstanding requests",
-                    format!("{e:#}"),
-                )
+                DriverErrorKind::Completion
+                    .to_report()
+                    .with_ctx("scope", "iocp/driver")
+                    .attach_note(format!("failed to drain RIO outstanding requests: {e:#}"))
             })?;
         }
         self.rio_state.kernel.close();

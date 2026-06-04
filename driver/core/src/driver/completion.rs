@@ -1,11 +1,13 @@
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
 use crate::slot;
-use crate::{DriverErrorKind, DriverResult, driver_os_error};
+use crate::{DriverErrorKind, DriverResult};
 use crossbeam_queue::SegQueue;
 use std::sync::Arc;
 use std::task::Waker;
 use veloq_shim::atomic::Ordering;
+
+use diagweave::prelude::*;
 
 pub trait CompletionValue: Send {
     fn from_event_res(res: i32) -> DriverResult<Self>
@@ -19,12 +21,10 @@ impl CompletionValue for usize {
         if res >= 0 {
             Ok(res as usize)
         } else {
-            Err(driver_os_error(
-                DriverErrorKind::System,
-                "driver-core/completion",
-                -res,
-                "completion reported OS error",
-            ))
+            DriverErrorKind::System
+                .with_ctx("scope", "driver-core/completion")
+                .set_error_code(-res)
+                .attach_note("completion reported OS error")
         }
     }
 }
