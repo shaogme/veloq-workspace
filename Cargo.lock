@@ -1511,6 +1511,7 @@ name = "veloq-runtime"
 version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
+ "diagweave",
  "libc",
  "numaperf-topo",
  "parking_lot",

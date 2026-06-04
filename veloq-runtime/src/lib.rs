@@ -1,3 +1,4 @@
+pub mod error;
 pub mod macros;
 pub mod runtime;
 pub mod scope;

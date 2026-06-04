@@ -1,6 +1,5 @@
 use core::cell::UnsafeCell;
 use std::future::{Future, poll_fn};
-use std::io;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
@@ -12,6 +11,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::shared::RuntimeShared;
+use crate::error::{Result, RuntimeError};
 use crate::scope::{AsyncScope, LocalAsyncScope};
 use crate::task::{
     GenericTaskHeader, LocalTaskRef, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef,
@@ -133,7 +133,7 @@ impl<T> RuntimeScopeContext<T> {
         &self,
         worker_id: usize,
         job: F,
-    ) -> io::Result<RoutedFuture<Fut>>
+    ) -> Result<RoutedFuture<Fut>>
     where
         F: FnOnce() -> Fut + Send + 'scope_ref,
         Fut: Future + Send + 'scope_ref,
@@ -219,7 +219,12 @@ impl<T> RuntimeScopeContext<T> {
             unsafe {
                 let _ = Box::from_raw(ptr);
             }
-            return Err(io::Error::other("failed to dispatch job to worker"));
+            let current_worker = self.worker_id();
+            let is_shutdown = self.is_shutdown();
+            return Err(
+                RuntimeError::dispatch_failed_report(worker_id, current_worker)
+                    .with_ctx("is_shutdown", is_shutdown),
+            );
         }
 
         Ok(RoutedFuture::new(slot))
@@ -229,7 +234,7 @@ impl<T> RuntimeScopeContext<T> {
         &self,
         task: &impl TaskHandleRef,
         f: F,
-    ) -> io::Result<R>
+    ) -> Result<R>
     where
         F: FnOnce() -> Fut + Send + 'scope_ref,
         Fut: Future<Output = R> + Send + 'scope_ref,

@@ -359,7 +359,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
                     let ctx = RuntimeContext { scope: scope_clone };
                     ctx.driver(|mut driver| op.submit_detached(&mut driver))
                 })
-                .to_report_trans()?;
+                .trans_inner_err()?;
             let (res, op_back) = routed.await.into_inner();
             let op = op_back.expect("Op lost in remote submit");
             Ok((res, op))
