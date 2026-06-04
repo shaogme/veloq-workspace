@@ -1,7 +1,23 @@
 use diagweave::set;
 
 set! {
-    pub NetError = {
+    pub TcpError = {
+        #[display("Accept op lost")]
+        AcceptOpLost,
+
+        #[display("Accept completed without remote address")]
+        AcceptMissingRemoteAddr,
+    }
+
+    pub UdpError = {
+        #[display("UdpRecvFrom op lost")]
+        UdpRecvFromOpLost,
+
+        #[display("driver must populate UdpRecvFrom::addr before completion")]
+        UdpRecvFromMissingAddr,
+    }
+
+    pub NetError = TcpError | UdpError | {
         #[display("socket registration requires socket handle")]
         InvalidSocketHandle,
 
@@ -14,20 +30,8 @@ set! {
         #[display("no address provided")]
         NoAddressProvided,
 
-        #[display("Accept op lost")]
-        AcceptOpLost,
-
-        #[display("Accept completed without remote address")]
-        AcceptMissingRemoteAddr,
-
         #[display("Op buffer lost")]
         OpBufferLost,
-
-        #[display("UdpRecvFrom op lost")]
-        UdpRecvFromOpLost,
-
-        #[display("driver must populate UdpRecvFrom::addr before completion")]
-        UdpRecvFromMissingAddr,
 
         #[display("failed to fill whole buffer")]
         UnexpectedEof,
