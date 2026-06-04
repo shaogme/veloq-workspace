@@ -339,9 +339,9 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "diagweave"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d23060f35c7ddc8ef88ee231179da0cf8bf2d1f117deb40ca40b448c8e2ce619"
+checksum = "2e1f9de4b360ccd241c33429e842c0c290e1335bf3676809b99379a1d9537796"
 dependencies = [
  "diagweave-macros",
  "ref_str",

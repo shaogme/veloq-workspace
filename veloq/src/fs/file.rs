@@ -126,9 +126,9 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         let res = res
             .map_report(|r| {
                 r.with_ctx("op", "read_at_subset")
-                    .with_ctx("offset", offset as i64)
-                    .with_ctx("buf_offset", buf_offset as i64)
-                    .with_ctx("buf_len", buf.len() as i64)
+                    .with_ctx("offset", offset)
+                    .with_ctx("buf_offset", buf_offset)
+                    .with_ctx("buf_len", buf.len())
             })
             .trans_inner_err()?;
         Ok((res, buf))
@@ -159,9 +159,9 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
         let res = res
             .map_report(|r| {
                 r.with_ctx("op", "write_at_subset")
-                    .with_ctx("offset", offset as i64)
-                    .with_ctx("buf_offset", buf_offset as i64)
-                    .with_ctx("buf_len", buf.len() as i64)
+                    .with_ctx("offset", offset)
+                    .with_ctx("buf_offset", buf_offset)
+                    .with_ctx("buf_len", buf.len())
             })
             .trans_inner_err()?;
         Ok((res, buf))
@@ -314,9 +314,9 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         let res = res
             .map_report(|r| {
                 r.with_ctx("op", "read_at_subset")
-                    .with_ctx("offset", offset as i64)
-                    .with_ctx("buf_offset", buf_offset as i64)
-                    .with_ctx("buf_len", buf.len() as i64)
+                    .with_ctx("offset", offset)
+                    .with_ctx("buf_offset", buf_offset)
+                    .with_ctx("buf_len", buf.len())
             })
             .trans_inner_err()?;
         Ok((res, buf))
@@ -341,9 +341,9 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         let res = res
             .map_report(|r| {
                 r.with_ctx("op", "write_at_subset")
-                    .with_ctx("offset", offset as i64)
-                    .with_ctx("buf_offset", buf_offset as i64)
-                    .with_ctx("buf_len", buf.len() as i64)
+                    .with_ctx("offset", offset)
+                    .with_ctx("buf_offset", buf_offset)
+                    .with_ctx("buf_len", buf.len())
             })
             .trans_inner_err()?;
         Ok((res, buf))
