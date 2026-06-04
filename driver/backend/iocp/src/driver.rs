@@ -30,7 +30,7 @@ use diagweave::prelude::*;
 
 use crate::common::IocpWaker;
 use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, RegisteredHandle};
-use crate::error::{IocpError, IocpResult};
+use crate::error::IocpResult;
 use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload, OverlappedEntry};
 use crate::rio::RioState;
 
@@ -145,14 +145,10 @@ impl<'a> IocpDriver<'a> {
             &extensions,
             registration_mode,
         )
-        .map_err(|e| {
-            IocpError::Rio
-                .to_report()
-                .attach_note(format!(
-                    "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
-                ))
-                .attach_note(format!("{e:#}"))
-        })?;
+        .attach_note(format!(
+            "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
+        ))
+        .trans()?;
         let ops = OpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<IocpUserPayload> = ops.shared.clone();
         Ok(Self {

@@ -1,6 +1,8 @@
 use diagweave::prelude::*;
 use veloq_driver_core::{DriverErrorKind, DriverResult, ResultAsDriverExt};
 
+use crate::rio::error::RioError;
+
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     pub IocpError = {
@@ -10,8 +12,8 @@ set! {
         CompletionWait,
         #[display("IOCP operation submission failed")]
         Submission,
-        #[display("RIO operation failed")]
-        Rio,
+        #[display(transparent)]
+        Rio(#[from] RioError),
         #[display("failed to resolve IO handle")]
         ResolveFd,
         #[display("socket operation failed")]

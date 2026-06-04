@@ -83,7 +83,7 @@ fn fallback_errno_by_iocp_error(kind: IocpError) -> i32 {
         IocpError::DriverInit => 5,       // EIO
         IocpError::CompletionWait => 110, // ETIMEDOUT
         IocpError::Submission => 11,      // EAGAIN
-        IocpError::Rio => 5,              // EIO
+        IocpError::Rio(_) => 5,           // EIO
         IocpError::ResolveFd => 9,        // EBADF
         IocpError::Socket => 5,           // EIO
         IocpError::Win32 => 5,            // EIO

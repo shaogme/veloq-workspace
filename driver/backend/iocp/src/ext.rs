@@ -1,4 +1,5 @@
 use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::rio::error::RioError;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCK_STREAM,
@@ -130,7 +131,7 @@ impl Extensions {
                 Ok(table)
             } else {
                 Err(from_io_error(
-                    IocpError::Rio,
+                    IocpError::Rio(RioError::LibraryLoad),
                     "WSAIoctl.load_rio",
                     std::io::Error::last_os_error(),
                 ))
