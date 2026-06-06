@@ -1,6 +1,6 @@
 use crate::driver::UringDriver;
 use crate::error::{UringError, UringResult};
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use std::time::{Duration, Instant};
 
 use crate::config::{IoFd, OwnedRawHandle, UringRawHandle};
@@ -40,16 +40,21 @@ impl<'a> UringDriver<'a> {
                 .registration_stats
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(Report::new(UringError::Registration).attach_note(format!(
-                "driver.register_chunk_internal: recent failure cooldown, chunk_id={id}"
-            )));
+            return Err(UringError::Registration
+                .to_report()
+                .push_ctx("scope", "driver.register_chunk_internal")
+                .with_ctx("chunk_id", id as usize)
+                .attach_note("recent chunk registration failure cooldown"));
         }
 
         let index = id as usize;
         if index >= MAX_CHUNKS {
-            return Err(Report::new(UringError::InvalidInput).attach_note(format!(
-                "driver.register_chunk_internal: chunk id exceeds max, id={id}, max={MAX_CHUNKS}"
-            )));
+            return Err(UringError::InvalidInput
+                .to_report()
+                .push_ctx("scope", "driver.register_chunk_internal")
+                .with_ctx("chunk_id", id as usize)
+                .with_ctx("max_chunks", MAX_CHUNKS)
+                .attach_note("chunk id exceeds maximum registered chunk count"));
         }
 
         let iovecs = [libc::iovec {

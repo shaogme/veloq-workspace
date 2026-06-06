@@ -71,10 +71,12 @@ impl<'a> UringDriver<'a> {
                 for &chunk_id in chunks.iter().take(count) {
                     let index = chunk_id as usize;
                     let is_registered = driver.registered_chunks.get(index).map_err(|e| {
-                        UringError::InvalidState.report(
-                            "driver.submit_from_slot_raw.bitset_get",
-                            format!("BitSet get failed index={index}: {e:?}"),
-                        )
+                        UringError::InvalidState
+                            .to_report()
+                            .push_ctx("scope", "driver.submit_from_slot_raw.bitset_get")
+                            .with_ctx("chunk_index", index)
+                            .with_ctx("bitset_error", format!("{e:?}"))
+                            .attach_note("BitSet get failed")
                     })?;
 
                     if !is_registered
@@ -86,9 +88,10 @@ impl<'a> UringDriver<'a> {
                             info.len.get(),
                         ) {
                             if driver.registration_mode.is_strict() {
-                                return Err(e.attach_note(format!(
-                                    "strict mode lazy register failed: chunk_id={chunk_id}, user_data={user_data}"
-                                )));
+                                return Err(e
+                                    .with_ctx("chunk_id", chunk_id as usize)
+                                    .with_ctx("user_data", user_data)
+                                    .attach_note("strict mode lazy register failed"));
                             }
                             return Err(e);
                         }
@@ -98,19 +101,21 @@ impl<'a> UringDriver<'a> {
                             .submission_missing_chunk_info
                             .saturating_add(1);
                         if driver.registration_mode.is_strict() {
-                            return Err(UringError::InvalidState.report(
-                                "driver.submit_from_slot_raw.missing_chunk_info",
-                                format!(
-                                    "strict mode missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
-                                ),
-                            ));
+                            return Err(UringError::InvalidState
+                                .to_report()
+                                .push_ctx("scope", "driver.submit_from_slot_raw.missing_chunk_info")
+                                .with_ctx("chunk_id", chunk_id as usize)
+                                .with_ctx("user_data", user_data)
+                                .attach_note(
+                                    "strict mode missing chunk info for lazy registration",
+                                ));
                         }
-                        return Err(UringError::InvalidInput.report(
-                            "driver.submit_from_slot_raw.missing_chunk_info",
-                            format!(
-                                "Missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
-                            ),
-                        ));
+                        return Err(UringError::InvalidInput
+                            .to_report()
+                            .push_ctx("scope", "driver.submit_from_slot_raw.missing_chunk_info")
+                            .with_ctx("chunk_id", chunk_id as usize)
+                            .with_ctx("user_data", user_data)
+                            .attach_note("missing chunk info for lazy registration"));
                     }
                 }
 

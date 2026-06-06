@@ -25,6 +25,14 @@ impl BufferRegistrationMode {
     pub const fn is_strict(self) -> bool {
         matches!(self, Self::Strict)
     }
+
+    #[inline]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Compatible => "compatible",
+        }
+    }
 }
 
 /// Configuration for the IOCP driver.

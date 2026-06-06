@@ -714,13 +714,12 @@ pub(crate) unsafe fn make_sqe_sync_range(
         if sync_op.nbytes == u64::MAX {
             0
         } else {
-            return Err(UringError::InvalidInput.report(
-                "uring.op.submit.make_sqe_sync_range",
-                format!(
-                    "sync_file_range: nbytes ({}) exceeds 32-bit limit and is not u64::MAX (0)",
-                    sync_op.nbytes
-                ),
-            ));
+            return Err(UringError::InvalidInput
+                .to_report()
+                .push_ctx("scope", "uring.op.submit.make_sqe_sync_range")
+                .with_ctx("nbytes", sync_op.nbytes)
+                .with_ctx("max_nbytes", u32::MAX as u64)
+                .attach_note("sync_file_range nbytes exceeds 32-bit limit and is not u64::MAX"));
         }
     } else {
         sync_op.nbytes as u32
@@ -761,13 +760,12 @@ pub(crate) unsafe fn make_sqe_sync_range_raw(
         if sync_op.nbytes == u64::MAX {
             0
         } else {
-            return Err(UringError::InvalidInput.report(
-                "uring.op.submit.make_sqe_sync_range_raw",
-                format!(
-                    "sync_file_range: nbytes ({}) exceeds 32-bit limit and is not u64::MAX (0)",
-                    sync_op.nbytes
-                ),
-            ));
+            return Err(UringError::InvalidInput
+                .to_report()
+                .push_ctx("scope", "uring.op.submit.make_sqe_sync_range_raw")
+                .with_ctx("nbytes", sync_op.nbytes)
+                .with_ctx("max_nbytes", u32::MAX as u64)
+                .attach_note("sync_file_range nbytes exceeds 32-bit limit and is not u64::MAX"));
         }
     } else {
         sync_op.nbytes as u32

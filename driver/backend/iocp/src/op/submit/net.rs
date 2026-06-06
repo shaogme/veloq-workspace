@@ -64,10 +64,11 @@ pub(crate) fn submit_recv(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_recv")
-            .attach_note_lazy(|| format!(
-                "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, user_data, generation
-            ))
+            .with_ctx("fd_fixed_index", val.fd.fixed_index())
+            .with_ctx("fd_generation", val.fd.generation())
+            .with_ctx("user_data", user_data)
+            .with_ctx("generation", generation)
+            .attach_note("RIO recv submit failed")
             .trans(),
     )
 }
@@ -101,10 +102,11 @@ pub(crate) fn submit_udp_recv(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_udp_recv")
-            .attach_note_lazy(|| format!(
-                "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, header.user_data, header.generation
-            ))
+            .with_ctx("fd_fixed_index", val.fd.fixed_index())
+            .with_ctx("fd_generation", val.fd.generation())
+            .with_ctx("user_data", user_data)
+            .with_ctx("generation", generation)
+            .attach_note("RIO udp_recv submit failed")
             .trans(),
     )
 }
@@ -137,10 +139,11 @@ pub(crate) fn submit_send(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_send")
-            .attach_note_lazy(|| format!(
-                "RIO send submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, user_data, generation
-            ))
+            .with_ctx("fd_fixed_index", val.fd.fixed_index())
+            .with_ctx("fd_generation", val.fd.generation())
+            .with_ctx("user_data", user_data)
+            .with_ctx("generation", generation)
+            .attach_note("RIO send submit failed")
             .trans(),
     )
 }
@@ -173,10 +176,11 @@ pub(crate) fn submit_udp_send(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_udp_send")
-            .attach_note_lazy(|| format!(
-                "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
-                val.fd, user_data, generation
-            ))
+            .with_ctx("fd_fixed_index", val.fd.fixed_index())
+            .with_ctx("fd_generation", val.fd.generation())
+            .with_ctx("user_data", user_data)
+            .with_ctx("generation", generation)
+            .attach_note("RIO udp_send submit failed")
             .trans(),
     )
 }
@@ -190,17 +194,13 @@ pub(crate) fn submit_connect(
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files)?;
     header.resolved_handle = Some(resolve_fd_handle(&connect_op.fd, ctx.registered_files)?);
-    ensure_iocp_association(
-        handle,
-        ctx.port,
-        format!(
-            "submit_connect: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}",
-            connect_op.fd,
-            handle.raw().as_handle(),
-            header.user_data,
-            header.generation
-        ),
-    )?;
+    ensure_iocp_association(handle, ctx.port)
+        .push_ctx("scope", "submit_connect")
+        .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
+        .with_ctx("fd_generation", connect_op.fd.generation())
+        .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+        .with_ctx("user_data", header.user_data)
+        .with_ctx("generation", header.generation)?;
     ensure_socket_bound(handle, connect_op)?;
 
     let mut bytes_sent = 0;
@@ -286,9 +286,9 @@ fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> IocpResult<u16> {
     })?;
     match storage.family() {
         AF_INET | AF_INET6 => Ok(storage.family()),
-        family => IocpError::InvalidInput.attach_note_lazy(|| format!(
-            "unsupported listen socket family for accept: {family}",
-        )),
+        family => IocpError::InvalidInput
+            .with_ctx("address_family", family)
+            .attach_note("unsupported listen socket family for accept"),
     }
 }
 
@@ -361,11 +361,10 @@ pub(crate) fn submit_accept(
             crate::Socket::new_tcp_v6()
         }
         .map(|s| s.into_owned_raw())
-        .attach_note_lazy(|| format!(
-            "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
-            handle.raw().as_handle() as usize,
-            family
-        ))?;
+        .push_ctx("scope", "submit_accept.create_accept_socket")
+        .with_ctx("listen_handle_raw", handle.raw().as_handle() as usize)
+        .with_ctx("address_family", family)
+        .attach_note("create accept socket failed")?;
         payload.accept_socket = Some(accept_socket);
     }
     let accept_socket = payload
@@ -375,16 +374,11 @@ pub(crate) fn submit_accept(
         .attach_note("accept socket not initialized")?;
     let accept_socket_raw = accept_socket.raw().as_socket();
 
-    ensure_iocp_association(
-        handle,
-        ctx.port,
-        format!(
-            "submit_accept: associate listen socket failed: listen=0x{:x}, user_data={}, generation={}",
-            handle.raw().as_handle() as usize,
-            header.user_data,
-            header.generation
-        ),
-    )?;
+    ensure_iocp_association(handle, ctx.port)
+        .push_ctx("scope", "submit_accept")
+        .with_ctx("listen_handle_raw", handle.raw().as_handle() as usize)
+        .with_ctx("user_data", header.user_data)
+        .with_ctx("generation", header.generation)?;
 
     let split = ACCEPT_EX_ADDR_SECTION_LEN;
     let mut bytes_received = 0;
@@ -402,15 +396,14 @@ pub(crate) fn submit_accept(
             lp_overlapped: ctx.overlapped,
         })
     }
-    .attach_note_lazy(|| format!(
-        "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
-        handle.raw().as_handle() as usize,
-        accept_socket_raw,
-        split,
-        split,
-        header.user_data,
-        header.generation
-    ));
+    .push_ctx("scope", "submit_accept")
+    .with_ctx("listen_handle_raw", handle.raw().as_handle() as usize)
+    .with_ctx("accept_socket_raw", accept_socket_raw as usize)
+    .with_ctx("accept_input_length", split)
+    .with_ctx("accept_output_length", split)
+    .with_ctx("user_data", header.user_data)
+    .with_ctx("generation", header.generation)
+    .attach_note("AcceptEx submit failed");
     mark_header_in_flight(header, submit_res)
 }
 
@@ -440,12 +433,12 @@ pub(crate) unsafe fn on_complete_accept(
     if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
         socket.setsockopt(SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_socket)
     }) {
-        return Err(e.attach_note_lazy(|| format!(
-            "on_complete_accept: setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed: accept_socket=0x{:x}, listen_socket=0x{:x}, optlen={}",
-            accept_socket_raw,
-            listen_socket,
-            std::mem::size_of::<SOCKET>()
-        )));
+        return Err(e
+            .push_ctx("scope", "on_complete_accept")
+            .with_ctx("accept_socket_raw", accept_socket_raw as usize)
+            .with_ctx("listen_socket_raw", listen_socket as usize)
+            .with_ctx("socket_opt_len", std::mem::size_of::<SOCKET>())
+            .attach_note("setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed"));
     }
 
     let split = ACCEPT_EX_ADDR_SECTION_LEN;
@@ -511,10 +504,12 @@ pub(crate) fn submit_send_to(
         ctx.rio
             .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
             .with_ctx("outer_scope", "submit_send_to")
-            .attach_note_lazy(|| format!(
-                "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
-                user.fd, header.user_data, header.generation, page_idx
-            ))
+            .with_ctx("fd_fixed_index", user.fd.fixed_index())
+            .with_ctx("fd_generation", user.fd.generation())
+            .with_ctx("user_data", header.user_data)
+            .with_ctx("generation", header.generation)
+            .with_ctx("page_idx", page_idx)
+            .attach_note("RIO send_to submit failed")
             .trans(),
     )
 }
@@ -553,10 +548,13 @@ pub(crate) fn submit_udp_recv_from(
         ctx.rio
             .try_submit_recv_from(args, ctx.registrar, ctx.slab_resolver)
             .with_ctx("outer_scope", "submit_udp_recv_from")
-            .attach_note_lazy(|| format!(
-                "RIO udp_recv_from submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
-                fd, header.user_data, header.generation, page_idx
-            )).trans(),
+            .with_ctx("fd_fixed_index", fd.fixed_index())
+            .with_ctx("fd_generation", fd.generation())
+            .with_ctx("user_data", header.user_data)
+            .with_ctx("generation", header.generation)
+            .with_ctx("page_idx", page_idx)
+            .attach_note("RIO udp_recv_from submit failed")
+            .trans(),
     )
 }
 

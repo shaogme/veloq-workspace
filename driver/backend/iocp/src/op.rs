@@ -190,10 +190,9 @@ macro_rules! define_iocp_ops {
                             if let IocpOpPayload::$Variant(ref mut p) = op.payload {
                                 $submit(&mut op.header, p, ctx)
                             } else {
-                                IocpError::InvalidState.attach_note(format!(
-                                    "variant mismatch in IocpKernelOp dispatch for {}",
-                                    stringify!($OpType)
-                                ))
+                                IocpError::InvalidState
+                                    .with_ctx("op_type", stringify!($OpType))
+                                    .attach_note("variant mismatch in IocpKernelOp dispatch")
                             }
                         },
                         on_complete: define_iocp_ops!(@optional_complete_shim $OpType, $Variant, $($complete)?),
@@ -250,10 +249,9 @@ macro_rules! define_iocp_ops {
             if let IocpOpPayload::$Variant(ref mut p) = op.payload {
                 $fn(&mut op.header, p, result, ext)
             } else {
-                IocpError::InvalidState.attach_note(format!(
-                    "variant mismatch in IocpKernelOp on_complete for {}",
-                    stringify!($OpType)
-                ))
+                IocpError::InvalidState
+                    .with_ctx("op_type", stringify!($OpType))
+                    .attach_note("variant mismatch in IocpKernelOp on_complete")
             }
         })
     };

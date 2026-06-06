@@ -92,7 +92,8 @@ impl RioRegistry {
         match buffer_id {
             Some(id) => Ok((id, info.offset as u32)),
             None => RioError::Internal
-                .attach_note(format!("RIO chunk not registered: chunk_id={}", info.id)),
+                .with_ctx("chunk_id", info.id as usize)
+                .attach_note("RIO chunk not registered"),
         }
     }
 
@@ -130,9 +131,9 @@ impl RioRegistry {
                 .registration_stats
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
-            return RioError::ResourceExhaustion.attach_note(format!(
-                "RIO chunk registration skipped due to recent failure: chunk_id={id}",
-            ));
+            return RioError::ResourceExhaustion
+                .with_ctx("chunk_id", id as usize)
+                .attach_note("RIO chunk registration skipped due to recent failure");
         }
 
         let (ptr, len) = mem;
@@ -163,10 +164,9 @@ impl RioRegistry {
                 self.chunk_register_failures_recent
                     .insert(id, Instant::now());
                 return Err(e)
-                    .map_inner_err(|_| RioError::BufferRegistration)
-                    .attach_note(format!(
-                        "RIORegisterBuffer failed: chunk_id={id}, len={len}"
-                    ));
+                    .with_ctx("chunk_id", id as usize)
+                    .with_ctx("buffer_length", len)
+                    .attach_note("RIORegisterBuffer failed for chunk");
             }
         };
 
@@ -194,14 +194,14 @@ impl RioRegistry {
                 let id = env
                     .dispatch
                     .register_buffer(ptr, len as u32)
-                    .attach_note_lazy(|| format!(
-                        "RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"
-                    ))?;
+                    .with_ctx("page_idx", page_idx)
+                    .with_ctx("buffer_length", len)
+                    .attach_note("RIORegisterBuffer failed for slab page")?;
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize, len));
             } else {
-                return RioError::Internal.attach_note(format!(
-                    "RIO slab page not found in registry: page_idx={page_idx}",
-                ));
+                return RioError::Internal
+                    .with_ctx("page_idx", page_idx)
+                    .attach_note("RIO slab page not found in registry");
             }
         }
         Ok(())
@@ -228,21 +228,15 @@ impl RioRegistry {
                 send_cq: env.cq,
                 context: std::ptr::null(),
             })
-            .map_err(|e| {
-                let diag = format!(
-                    "create_rq: socket_raw=0x{:x}, rq_depth={}, max_outstanding_recvs={}, max_outstanding_sends={}, max_receive_data_buffers=1, max_send_data_buffers=1",
-                    handle.raw().as_handle() as usize,
-                    self.rq_depth,
-                    max_outstanding_recvs,
-                    max_outstanding_sends,
-                );
-                e.attach_note(diag)
-            })
-            .attach_note_lazy(|| format!(
-                "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",
-                self.rq_depth,
-                handle = handle.raw().as_handle()
-            ))
+            .with_ctx("fd_fixed_index", fd.fixed_index())
+            .with_ctx("fd_generation", fd.generation())
+            .with_ctx("socket_raw", handle.raw().as_handle() as usize)
+            .with_ctx("rq_depth", self.rq_depth)
+            .with_ctx("max_outstanding_recvs", max_outstanding_recvs)
+            .with_ctx("max_outstanding_sends", max_outstanding_sends)
+            .with_ctx("max_receive_data_buffers", 1_u32)
+            .with_ctx("max_send_data_buffers", 1_u32)
+            .attach_note("RIOCreateRequestQueue failed")
     }
 
     pub(crate) fn flush_deregs(&mut self, env: RioEnv<'_>) {
@@ -308,10 +302,12 @@ impl RioRegistry {
                 .registration_stats
                 .heap_register_skipped_recent_failure
                 .saturating_add(1);
-            return RioError::ResourceExhaustion.attach_note(format!(
-                "RIO heap registration skipped due to recent failure (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
-                env.registration_mode, key.0, key.1, key.2
-            ));
+            return RioError::ResourceExhaustion
+                .with_ctx("registration_mode", env.registration_mode.as_str())
+                .with_ctx("buffer_ptr", key.0)
+                .with_ctx("buffer_capacity", key.1)
+                .with_ctx("buffer_cookie", key.2)
+                .attach_note("RIO heap registration skipped due to recent failure");
         }
 
         if self.heap_rio_bufs.len() >= 1024 {
@@ -349,10 +345,11 @@ impl RioRegistry {
                 self.heap_register_failures_recent
                     .insert(key, Instant::now());
                 return Err(e)
-                    .attach_note(format!(
-                        "RIORegisterBuffer failed for heap buffer (mode={:?}): ptr=0x{:x}, cap={}, cookie={}",
-                        env.registration_mode, key.0, key.1, key.2
-                    ));
+                    .with_ctx("registration_mode", env.registration_mode.as_str())
+                    .with_ctx("buffer_ptr", key.0)
+                    .with_ctx("buffer_capacity", key.1)
+                    .with_ctx("buffer_cookie", key.2)
+                    .attach_note("RIORegisterBuffer failed for heap buffer");
             }
         };
 

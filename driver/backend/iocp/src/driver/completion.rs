@@ -231,11 +231,11 @@ impl<'a> IocpDriver<'a> {
                 if completion_key == 0 {
                     return Err(iocp_msg(
                         IocpErrorContext::CompletionWait,
-                        format!(
-                            "GetQueuedCompletionStatus failed: err={}, key={}, overlapped=null",
-                            err, completion_key
-                        ),
-                    ));
+                        "GetQueuedCompletionStatus failed with null overlapped",
+                    )
+                    .with_ctx("os_error_code", err)
+                    .with_ctx("completion_key", completion_key)
+                    .with_ctx("overlapped_is_null", true));
                 }
             }
             Ok(completion_key)

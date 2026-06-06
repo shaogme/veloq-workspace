@@ -81,10 +81,11 @@ pub(crate) fn wait_completion_record(
     let token = encode_completion_token(user_data, generation);
     loop {
         if start.elapsed() > timeout {
-            return IocpError::CompletionWait.attach_note(format!(
-                "wait completion timed out: user_data={}, generation={}",
-                user_data, generation
-            ));
+            return IocpError::CompletionWait
+                .with_ctx("user_data", user_data)
+                .with_ctx("generation", generation)
+                .with_ctx("timeout_ms", timeout.as_millis() as u64)
+                .attach_note("wait completion timed out");
         }
         let _ = driver.drive(DriveMode::Poll);
         let completion_table = driver.completion_table();

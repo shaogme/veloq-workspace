@@ -134,18 +134,18 @@ impl<'a> IocpDriver<'a> {
 
         let port_handle = port_val.as_raw();
         debug!(port = ?port_handle, "Initializing IocpDriver");
-        let extensions = crate::ext::Extensions::new().attach_note_lazy(|| format!(
-            "failed to load IOCP extensions, port={port_handle:?}"
-        ))?;
+        let extensions = crate::ext::Extensions::new()
+            .with_ctx("port_raw", port_handle as usize)
+            .attach_note("failed to load IOCP extensions")?;
         let rio_state = RioState::new(
             crate::config::RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
             &extensions,
             registration_mode,
         )
-        .attach_note_lazy(|| format!(
-            "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
-        ))
+        .with_ctx("entries", entries)
+        .with_ctx("port_raw", port_handle as usize)
+        .attach_note("failed to initialize RIO state")
         .trans()?;
         let ops = IocpOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<IocpUserPayload, IocpError> =

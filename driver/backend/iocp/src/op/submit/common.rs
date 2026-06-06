@@ -186,9 +186,10 @@ pub(crate) fn resolve_fd_borrowed<'a>(
     if let Some(Some(h)) = registered_files.get(idx as usize) {
         Ok(h.as_borrowed())
     } else {
-        IocpError::ResolveFd.attach_note(format!(
-            "invalid registered file descriptor: fd={fd:?}, idx={idx}"
-        ))
+        IocpError::ResolveFd
+            .with_ctx("fd_fixed_index", idx)
+            .with_ctx("fd_generation", fd.generation())
+            .attach_note("invalid registered file descriptor")
     }
 }
 
@@ -221,10 +222,10 @@ pub(crate) unsafe fn unpack_kernel_ref<T>(
 pub(crate) fn ensure_iocp_association(
     handle: BorrowedRawHandle<'_>,
     port: &crate::win32::IoCompletionPort,
-    detail: impl Into<String>,
 ) -> IocpResult<()> {
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
-    unsafe { port.associate(handle.raw().as_handle(), 0) }.map_err(|e| e.attach_note(detail.into()))
+    unsafe { port.associate(handle.raw().as_handle(), 0) }
+        .map_err(|e| e.attach_note("CreateIoCompletionPort association failed"))
 }
 
 #[inline]

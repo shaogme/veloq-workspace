@@ -32,29 +32,23 @@ macro_rules! submit_io_op {
 
             let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files)?;
             header.resolved_handle = Some(resolve_fd_handle(&val.fd, ctx.registered_files)?);
-            ensure_iocp_association(
-                handle,
-                ctx.port,
-                format!(
-                    "{}: CreateIoCompletionPort failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, len={}",
-                    stringify!($fn_name),
-                    val.fd,
-                    handle.raw().as_handle(),
-                    header.user_data,
-                    header.generation,
-                    val.offset,
-                    val.buf.len()
-                ),
-            )?;
+            ensure_iocp_association(handle, ctx.port)
+                .push_ctx("scope", stringify!($fn_name))
+                .with_ctx("fd_fixed_index", val.fd.fixed_index())
+                .with_ctx("fd_generation", val.fd.generation())
+                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("user_data", header.user_data)
+                .with_ctx("generation", header.generation)
+                .with_ctx("offset", val.offset)
+                .with_ctx("buffer_length", val.buf.len())?;
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             if val.buf_offset > val.buf.len() {
-                return IocpError::InvalidInput.attach_note(format!(
-                    "{}: buf_offset {} exceeds buffer length {}",
-                    stringify!($fn_name),
-                    val.buf_offset,
-                    val.buf.len()
-                ));
+                return IocpError::InvalidInput
+                    .push_ctx("scope", stringify!($fn_name))
+                    .with_ctx("buffer_offset", val.buf_offset)
+                    .with_ctx("buffer_length", val.buf.len())
+                    .attach_note("buffer offset exceeds buffer length");
             }
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
             // SAFETY: buf_offset <= buf.len() is verified above.
@@ -62,17 +56,16 @@ macro_rules! submit_io_op {
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
-                .attach_note_lazy(|| format!(
-                    "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
-                    stringify!($fn_name),
-                    val.fd,
-                    handle.raw().as_handle(),
-                    header.user_data,
-                    header.generation,
-                    val.offset,
-                    val.buf_offset,
-                    len
-                ));
+                .push_ctx("scope", stringify!($fn_name))
+                .with_ctx("fd_fixed_index", val.fd.fixed_index())
+                .with_ctx("fd_generation", val.fd.generation())
+                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("user_data", header.user_data)
+                .with_ctx("generation", header.generation)
+                .with_ctx("offset", val.offset)
+                .with_ctx("buffer_offset", val.buf_offset)
+                .with_ctx("buffer_length", len)
+                .attach_note("file syscall submit failed");
             mark_header_in_flight(header, submit_res)
         }
     };
@@ -93,42 +86,33 @@ macro_rules! submit_raw_io_op {
             header.resolved_handle = Some(val.fd);
             let raw_handle = crate::config::RawHandle::new(val.fd);
             let handle = raw_handle.borrow();
-            ensure_iocp_association(
-                handle,
-                ctx.port,
-                format!(
-                    "{}: CreateIoCompletionPort failed: handle={:?}, user_data={}, generation={}, offset={}, len={}",
-                    stringify!($fn_name),
-                    handle.raw().as_handle(),
-                    header.user_data,
-                    header.generation,
-                    val.offset,
-                    val.buf.len()
-                ),
-            )?;
+            ensure_iocp_association(handle, ctx.port)
+                .push_ctx("scope", stringify!($fn_name))
+                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("user_data", header.user_data)
+                .with_ctx("generation", header.generation)
+                .with_ctx("offset", val.offset)
+                .with_ctx("buffer_length", val.buf.len())?;
 
             if val.buf_offset > val.buf.len() {
-                return IocpError::InvalidInput.attach_note(format!(
-                    "{}: buf_offset {} exceeds buffer length {}",
-                    stringify!($fn_name),
-                    val.buf_offset,
-                    val.buf.len()
-                ));
+                return IocpError::InvalidInput
+                    .push_ctx("scope", stringify!($fn_name))
+                    .with_ctx("buffer_offset", val.buf_offset)
+                    .with_ctx("buffer_length", val.buf.len())
+                    .attach_note("buffer offset exceeds buffer length");
             }
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
             let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
-                .map_err(|e| e.attach_note_lazy(|| format!(
-                    "{}: syscall failed: handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
-                    stringify!($fn_name),
-                    handle.raw().as_handle(),
-                    header.user_data,
-                    header.generation,
-                    val.offset,
-                    val.buf_offset,
-                    len
-                )));
+                .push_ctx("scope", stringify!($fn_name))
+                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("user_data", header.user_data)
+                .with_ctx("generation", header.generation)
+                .with_ctx("offset", val.offset)
+                .with_ctx("buffer_offset", val.buf_offset)
+                .with_ctx("buffer_length", len)
+                .attach_note("file syscall submit failed");
             mark_header_in_flight(header, submit_res)
         }
     };

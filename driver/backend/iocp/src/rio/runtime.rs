@@ -110,11 +110,16 @@ impl RioState {
             AF_INET => std::mem::size_of::<SOCKADDR_IN>(),
             AF_INET6 => std::mem::size_of::<SOCKADDR_IN6>(),
             _ => {
-                return RioError::Internal.attach_note(format!("RIO unsupported family: {family}"));
+                return RioError::Internal
+                    .with_ctx("address_family", family)
+                    .attach_note("RIO unsupported address family");
             }
         };
         if (addr_len as usize) < min_len {
-            return RioError::Internal.attach_note("RIO send_to invalid address length");
+            return RioError::Internal
+                .with_ctx("address_len", addr_len)
+                .with_ctx("min_address_len", min_len)
+                .attach_note("RIO send_to invalid address length");
         }
 
         let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>();
@@ -122,7 +127,12 @@ impl RioState {
         let slab_end = base_addr.saturating_add(slab_len);
         if addr_addr < base_addr || addr_addr.saturating_add(rio_addr_len) > slab_end {
             return RioError::Internal
-                .attach_note(format!("RIO address outside slab: page={page_idx}"));
+                .with_ctx("page_idx", page_idx)
+                .with_ctx("addr_raw", addr_addr)
+                .with_ctx("base_addr", base_addr)
+                .with_ctx("slab_len", slab_len)
+                .with_ctx("rio_addr_len", rio_addr_len)
+                .attach_note("RIO address outside slab");
         }
 
         Ok((rio_addr_len as u32, (addr_addr - base_addr) as u32 as usize))
@@ -141,9 +151,13 @@ impl RioState {
         let addr_addr = addr_ptr as usize;
         let slab_end = base_addr.saturating_add(slab_len);
         if addr_addr < base_addr || addr_addr.saturating_add(rio_addr_len as usize) > slab_end {
-            return RioError::Internal.attach_note(format!(
-                "RIO recv_from address outside slab: page={page_idx}"
-            ));
+            return RioError::Internal
+                .with_ctx("page_idx", page_idx)
+                .with_ctx("addr_raw", addr_addr)
+                .with_ctx("base_addr", base_addr)
+                .with_ctx("slab_len", slab_len)
+                .with_ctx("rio_addr_len", rio_addr_len)
+                .attach_note("RIO recv_from address outside slab");
         }
 
         Ok((addr_addr - base_addr) as u32 as usize)
@@ -223,7 +237,22 @@ impl RioState {
             .submit_send_ex(rq, &data_buf, &addr_buf, request_context)
         {
             Self::free_op_req_ctx(request_context as u64);
-            return Err(e.attach_note(format!("RIOSendEx failed for fd={fd:?}")));
+            return Err(e
+                .push_ctx("scope", "rio.runtime.try_submit_send_to_internal")
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("user_data", user_data)
+                .with_ctx("generation", generation)
+                .with_ctx("page_idx", page_idx)
+                .with_ctx("rq_raw", rq.0 as usize)
+                .with_ctx("data_buffer_id", data_buf.BufferId as usize)
+                .with_ctx("data_buffer_offset", data_buf.Offset)
+                .with_ctx("data_buffer_length", data_buf.Length)
+                .with_ctx("addr_buffer_id", addr_buf.BufferId as usize)
+                .with_ctx("addr_buffer_offset", addr_buf.Offset)
+                .with_ctx("addr_buffer_length", addr_buf.Length)
+                .with_ctx("outstanding_count", self.outstanding_count)
+                .attach_note("RIOSendEx submit failed"));
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
@@ -305,9 +334,22 @@ impl RioState {
             context: request_context,
         }) {
             Self::free_op_req_ctx(request_context as u64);
-            return Err(e.attach_note(format!(
-                "RIOReceiveEx failed for fd={fd:?}, user_data={user_data}, generation={generation}, page_idx={page_idx}"
-            )));
+            return Err(e
+                .push_ctx("scope", "rio.runtime.try_submit_recv_from_internal")
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("user_data", user_data)
+                .with_ctx("generation", generation)
+                .with_ctx("page_idx", page_idx)
+                .with_ctx("rq_raw", rq.0 as usize)
+                .with_ctx("data_buffer_id", data_buf.BufferId as usize)
+                .with_ctx("data_buffer_offset", data_buf.Offset)
+                .with_ctx("data_buffer_length", data_buf.Length)
+                .with_ctx("addr_buffer_id", addr_buf.BufferId as usize)
+                .with_ctx("addr_buffer_offset", addr_buf.Offset)
+                .with_ctx("addr_buffer_length", addr_buf.Length)
+                .with_ctx("outstanding_count", self.outstanding_count)
+                .attach_note("RIOReceiveEx submit failed"));
         }
 
         self.outstanding_count += 1;

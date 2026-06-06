@@ -93,10 +93,10 @@ impl RioState {
         let start = std::time::Instant::now();
         while self.outstanding_count > 0 {
             if start.elapsed() >= timeout {
-                return RioError::Internal.attach_note(format!(
-                    "strict close timed out while draining RIO outstanding requests: {}",
-                    self.outstanding_count
-                ));
+                return RioError::Internal
+                    .with_ctx("outstanding_count", self.outstanding_count)
+                    .with_ctx("timeout_ms", timeout.as_millis() as u64)
+                    .attach_note("strict close timed out while draining RIO outstanding requests");
             }
 
             const MAX_RESULTS: usize = 128;
