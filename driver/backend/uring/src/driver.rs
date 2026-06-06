@@ -68,33 +68,6 @@ impl RemoteWaker<UringError> for UringWaker {
     }
 }
 
-#[inline]
-pub(crate) fn invalid_state(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    UringError::InvalidState.report(scope, msg.into())
-}
-
-#[inline]
-pub(crate) fn invalid_input(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    UringError::InvalidInput.report(scope, msg.into())
-}
-
-#[inline]
-pub(crate) fn unsupported(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    UringError::Unsupported.report(scope, msg.into())
-}
-
-#[inline]
-pub(crate) fn map_uring_error(
-    report: Report<UringError>,
-    scope: &'static str,
-    detail: impl ToString,
-) -> DriverErrorReport {
-    let detail_text = detail.to_string();
-    report
-        .with_ctx("scope", scope)
-        .attach_note(detail_text)
-}
-
 pub struct UringDriver<'a> {
     pub(crate) ring: IoUring,
     pub(crate) ops: UringOpRegistry,
@@ -292,11 +265,10 @@ impl<'a> Driver for UringDriver<'a> {
     ) -> Outcome<Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>> {
         let Some(op) = op_in.take() else {
             return binder.err(
-                map_uring_error(
-                    invalid_state("driver.submit", "submit called with empty Option"),
-                    "uring.driver.submit",
-                    "submit called with empty Option",
-                ),
+                UringError::InvalidState
+                    .report("driver.submit", "submit called with empty Option")
+                    .with_ctx("scope", "uring.driver.submit")
+                    .attach_note("submit called with empty Option"),
                 SubmitStatus::Void,
             );
         };
@@ -315,14 +287,13 @@ impl<'a> Driver for UringDriver<'a> {
 
         match strategy {
             crate::op::SubmissionStrategy::BackgroundOnly => binder.err(
-                map_uring_error(
-                    invalid_state(
+                UringError::InvalidState
+                    .report(
                         "driver.submit",
                         "background strategy reached normal submit path",
-                    ),
-                    "uring.driver.submit",
-                    "background strategy reached normal submit path",
-                ),
+                    )
+                    .with_ctx("scope", "uring.driver.submit")
+                    .attach_note("background strategy reached normal submit path"),
                 SubmitStatus::Void,
             ),
             crate::op::SubmissionStrategy::SubmitSqe => {

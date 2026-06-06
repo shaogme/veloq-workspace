@@ -41,7 +41,11 @@ pub type IocpDriverResult<T> = DriverResult<T, IocpError>;
 
 impl IocpError {
     #[inline]
-    pub(crate) fn report(self, scope: &'static str, detail: impl Display + Send + Sync + 'static) -> Report<Self> {
+    pub(crate) fn report(
+        self,
+        scope: &'static str,
+        detail: impl Display + Send + Sync + 'static,
+    ) -> Report<Self> {
         self.to_report()
             .set_error_code(iocp_fallback_errno(self))
             .with_ctx("scope", scope)

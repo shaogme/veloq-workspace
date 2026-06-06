@@ -3,8 +3,8 @@ use std::task::Poll;
 use tracing::{debug, trace};
 
 use crate::config::{RawHandle, UringRawHandle};
+use crate::driver::UringDriver;
 use crate::driver::lifecycle::UringOpState;
-use crate::driver::{UringDriver, invalid_input, invalid_state, map_uring_error, unsupported};
 use crate::error::{UringError, UringResult};
 use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
 use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
@@ -27,7 +27,7 @@ impl<'a> UringDriver<'a> {
             .slot
             .as_mut()
             .ok_or_else(|| {
-                invalid_state(
+                UringError::InvalidState.report(
                     "driver.submit_from_slot_raw",
                     "submission guard slot missing",
                 )
@@ -42,13 +42,13 @@ impl<'a> UringDriver<'a> {
                 let (count, sqe) = {
                     let driver_ptr = driver as *mut UringDriver;
                     let slot = sub_guard.slot.as_mut().ok_or_else(|| {
-                        invalid_state(
+                        UringError::InvalidState.report(
                             "driver.submit_from_slot_raw",
                             "submission guard slot missing",
                         )
                     })?;
                     let payload = slot.storage.payload.as_mut().ok_or_else(|| {
-                        invalid_state(
+                        UringError::InvalidState.report(
                             "driver.submit_from_slot_raw",
                             "submission guard payload missing",
                         )
@@ -74,7 +74,7 @@ impl<'a> UringDriver<'a> {
                 for &chunk_id in chunks.iter().take(count) {
                     let index = chunk_id as usize;
                     let is_registered = driver.registered_chunks.get(index).map_err(|e| {
-                        invalid_state(
+                        UringError::InvalidState.report(
                             "driver.submit_from_slot_raw.bitset_get",
                             format!("BitSet get failed index={index}: {e:?}"),
                         )
@@ -101,14 +101,14 @@ impl<'a> UringDriver<'a> {
                             .submission_missing_chunk_info
                             .saturating_add(1);
                         if driver.registration_mode.is_strict() {
-                            return Err(invalid_state(
+                            return Err(UringError::InvalidState.report(
                                 "driver.submit_from_slot_raw.missing_chunk_info",
                                 format!(
                                     "strict mode missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
                                 ),
                             ));
                         }
-                        return Err(invalid_input(
+                        return Err(UringError::InvalidInput.report(
                             "driver.submit_from_slot_raw.missing_chunk_info",
                             format!(
                                 "Missing chunk info for lazy registration: chunk_id={chunk_id}, user_data={user_data}"
@@ -129,13 +129,13 @@ impl<'a> UringDriver<'a> {
             SubmissionStrategy::SoftwareTimer => {
                 let duration_opt = {
                     let slot = sub_guard.slot.as_mut().ok_or_else(|| {
-                        invalid_state(
+                        UringError::InvalidState.report(
                             "driver.submit_from_slot_raw.timer",
                             "submission guard slot missing",
                         )
                     })?;
                     let payload = slot.storage.payload.as_mut().ok_or_else(|| {
-                        invalid_state(
+                        UringError::InvalidState.report(
                             "driver.submit_from_slot_raw.timer",
                             "submission guard payload missing",
                         )
@@ -153,13 +153,13 @@ impl<'a> UringDriver<'a> {
                     trace!(user_data, ?duration, "Registered software timer");
                     Ok(true)
                 } else {
-                    Err(invalid_input(
+                    Err(UringError::InvalidInput.report(
                         "driver.submit_from_slot_raw.timer_duration",
                         "Timer duration missing",
                     ))
                 }
             }
-            _ => Err(unsupported(
+            _ => Err(UringError::Unsupported.report(
                 "driver.submit_from_slot_raw.strategy",
                 "Unsupported strategy for slot submission",
             )),
@@ -171,10 +171,8 @@ impl<'a> UringDriver<'a> {
         let slot = match self.ops.slot_view(user_data) {
             Some(SlotView::Reserved(slot)) => slot,
             _ => {
-                return Err(invalid_state(
-                    "driver.submit_from_slot_index",
-                    "op missing in slot",
-                ));
+                return Err(UringError::InvalidState
+                    .report("driver.submit_from_slot_index", "op missing in slot"));
             }
         };
         unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) }
@@ -194,7 +192,8 @@ impl<'a> UringDriver<'a> {
                     veloq_driver_core::driver::RegisterFd::Borrowed(raw.borrow()),
                 ])?;
                 let fixed_fd = fds.pop().ok_or_else(|| {
-                    invalid_state("driver.submit_waker", "register_files returned empty")
+                    UringError::InvalidState
+                        .report("driver.submit_waker", "register_files returned empty")
                 })?;
                 self.waker_registered_fd = Some(fixed_fd);
                 fixed_fd
@@ -226,10 +225,8 @@ impl<'a> UringDriver<'a> {
             }
             Ok(())
         } else {
-            Err(invalid_state(
-                "driver.submit_waker",
-                "failed to reserve waker slot",
-            ))
+            Err(UringError::InvalidState
+                .report("driver.submit_waker", "failed to reserve waker slot"))
         }
     }
 
@@ -328,11 +325,8 @@ impl<'a> UringDriver<'a> {
                     *op_in = Some(op);
                 }
                 binder.err(
-                    map_uring_error(
-                        e,
-                        "uring.driver.submit_sqe_internal",
-                        "submit sqe",
-                    ),
+                    e.with_ctx("scope", "uring.driver.submit_sqe_internal")
+                        .attach_note("submit sqe"),
                     SubmitStatus::Void,
                 )
             }
@@ -387,11 +381,8 @@ impl<'a> UringDriver<'a> {
                     *op_in = Some(op);
                 }
                 binder.err(
-                    map_uring_error(
-                        e,
-                        "uring.driver.submit_timer_internal",
-                        "submit timer",
-                    ),
+                    e.with_ctx("scope", "uring.driver.submit_timer_internal")
+                        .attach_note("submit timer"),
                     SubmitStatus::Void,
                 )
             }

@@ -147,7 +147,7 @@ impl<'a> UringDriver<'a> {
                 RegisteredFileEntry::OwnedHandle(o) => o.raw().as_fd(),
             };
             let idx = self.free_file_slots.pop().ok_or_else(|| {
-                crate::driver::invalid_state(
+                UringError::InvalidState.report(
                     "driver.register_files_internal",
                     "io_uring registered file table exhausted",
                 )
