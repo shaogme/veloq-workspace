@@ -46,7 +46,6 @@ impl<T> RioResultExt<T> for RioResult<T> {
         self.map_report(|report| {
             tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
             report
-                .set_accumulate_src_chain(true)
                 .map_err(IocpError::Rio)
                 .with_ctx("scope", scope)
                 .with_ctx("driver_error_kind", kind.to_string())

@@ -127,7 +127,6 @@ impl<T> UringResultExt<T> for UringResult<T> {
         self.map_report(|report| {
             tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
             report
-                .set_accumulate_src_chain(true)
                 .with_ctx("scope", scope)
                 .with_ctx("driver_error_kind", kind.to_string())
                 .attach_note(detail)
