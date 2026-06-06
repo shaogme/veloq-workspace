@@ -6,7 +6,7 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::config::{BorrowedRawHandle, IoFd, IocpHandle, RegisteredHandle};
-use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::error::{IocpError, IocpResult};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
 use crate::op::{KernelRef, OverlappedEntry};
 use crate::win32::Overlapped;
@@ -75,11 +75,8 @@ pub(crate) unsafe fn iocp_submit_read(
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
-            return Err(from_io_error(
-                IocpError::Submission,
-                "ReadFile",
-                io::Error::from_raw_os_error(err as i32),
-            ));
+            return Err(IocpError::Submission
+                .io_report("ReadFile", io::Error::from_raw_os_error(err as i32)));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -111,11 +108,8 @@ pub(crate) unsafe fn iocp_submit_write(
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
-            return Err(from_io_error(
-                IocpError::Submission,
-                "WriteFile",
-                io::Error::from_raw_os_error(err as i32),
-            ));
+            return Err(IocpError::Submission
+                .io_report("WriteFile", io::Error::from_raw_os_error(err as i32)));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -143,11 +137,8 @@ pub(crate) unsafe fn iocp_submit_connect_ex(args: ConnectExArgs) -> IocpResult<S
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
-            return Err(from_io_error(
-                IocpError::Submission,
-                "ConnectEx",
-                io::Error::from_raw_os_error(err as i32),
-            ));
+            return Err(IocpError::Submission
+                .io_report("ConnectEx", io::Error::from_raw_os_error(err as i32)));
         }
     }
     Ok(SubmissionResult::Pending)
@@ -176,11 +167,8 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> IocpResult<Sub
         // SAFETY: GetLastError is safe to call.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
-            return Err(from_io_error(
-                IocpError::Submission,
-                "AcceptEx",
-                io::Error::from_raw_os_error(err as i32),
-            ));
+            return Err(IocpError::Submission
+                .io_report("AcceptEx", io::Error::from_raw_os_error(err as i32)));
         }
     }
     Ok(SubmissionResult::Pending)

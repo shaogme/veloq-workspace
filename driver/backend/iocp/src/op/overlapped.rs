@@ -1,5 +1,5 @@
 use crate::IocpHandle;
-use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::error::{IocpError, IocpResult};
 use crate::win32::Overlapped;
 use std::io;
 
@@ -45,13 +45,10 @@ pub(crate) unsafe fn store_blocking_result(overlapped: usize, result: io::Result
     // SAFETY: `OverlappedEntry` is `repr(C)` and `inner` is its first field,
     // so the overlapped pointer is the same as the struct pointer.
     let entry = unsafe { &mut *(overlapped as *mut OverlappedEntry) };
-    entry.blocking_result = Some(result.map_err(|e| {
-        from_io_error(
-            IocpError::Win32,
-            "iocp.driver.inner.blocking_completion.store",
-            e,
-        )
-    }));
+    entry.blocking_result =
+        Some(result.map_err(|e| {
+            IocpError::Win32.io_report("iocp.driver.inner.blocking_completion.store", e)
+        }));
 }
 
 pub(crate) unsafe fn clear_blocking_result(overlapped: usize) {

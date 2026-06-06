@@ -12,7 +12,7 @@ use tracing::{debug, trace};
 use crate::config::{
     BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig, UringRawHandle,
 };
-use crate::error::{UringError, UringResult, UringResultExt, from_io_error};
+use crate::error::{UringError, UringResult, UringResultExt};
 use crate::op::{UringOp, UringUserPayload};
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle, OpRegistry};
 use veloq_driver_core::driver::{
@@ -149,18 +149,16 @@ impl<'a> UringDriver<'a> {
                     Err(e)
                 }
             })
-            .map_err(|e| from_io_error(UringError::DriverInit, "driver.new.build_ring", e))?;
+            .map_err(|e| UringError::DriverInit.io_report("driver.new.build_ring", e))?;
 
         let ops = OpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<UringUserPayload> = ops.shared.clone();
 
         let waker_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if waker_fd < 0 {
-            return Err(from_io_error(
-                UringError::DriverInit,
-                "driver.new.eventfd",
-                io::Error::last_os_error(),
-            ));
+            return Err(
+                UringError::DriverInit.io_report("driver.new.eventfd", io::Error::last_os_error())
+            );
         }
 
         debug!("Initalized UringDriver with {} entries", entries);

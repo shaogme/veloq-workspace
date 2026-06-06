@@ -1,4 +1,4 @@
-use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::error::{IocpError, IocpResult};
 use crate::rio::error::RioError;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
@@ -71,11 +71,9 @@ impl Extensions {
                 WSA_FLAG_OVERLAPPED,
             );
             if s == INVALID_SOCKET {
-                return Err(from_io_error(
-                    IocpError::DriverInit,
-                    "WSASocketW",
-                    std::io::Error::last_os_error(),
-                ));
+                return Err(
+                    IocpError::DriverInit.io_report("WSASocketW", std::io::Error::last_os_error())
+                );
             }
             crate::win32::SafeSocket(s)
         };
@@ -130,11 +128,8 @@ impl Extensions {
             if ret == 0 {
                 Ok(table)
             } else {
-                Err(from_io_error(
-                    IocpError::Rio(RioError::LibraryLoad),
-                    "WSAIoctl.load_rio",
-                    std::io::Error::last_os_error(),
-                ))
+                Err(IocpError::Rio(RioError::LibraryLoad)
+                    .io_report("WSAIoctl.load_rio", std::io::Error::last_os_error()))
             }
         }
     }
@@ -165,11 +160,8 @@ impl Extensions {
             // SAFETY: WSAIoctl successfully executed and initialized the memory.
             unsafe { Ok(val.assume_init()) }
         } else {
-            Err(from_io_error(
-                IocpError::DriverInit,
-                "WSAIoctl.get_extension",
-                std::io::Error::last_os_error(),
-            ))
+            Err(IocpError::DriverInit
+                .io_report("WSAIoctl.get_extension", std::io::Error::last_os_error()))
         }
     }
 }

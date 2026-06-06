@@ -1,6 +1,6 @@
 use super::addr::{socket_addr_to_storage, to_socket_addr};
 use crate::config::{IocpHandle, OwnedRawHandle, RawHandle};
-use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::error::{IocpError, IocpResult};
 use crate::win32::SafeSocket;
 use std::net::SocketAddr;
 use veloq_driver_core::PlatformSocket;
@@ -20,11 +20,7 @@ impl Socket {
         // SAFETY: Calling WSASocketW with valid arguments.
         let s = unsafe { WSASocketW(af as i32, ty, protocol, std::ptr::null(), 0, flags) };
         if s == INVALID_SOCKET {
-            return Err(from_io_error(
-                IocpError::Socket,
-                "WSASocketW",
-                std::io::Error::last_os_error(),
-            ));
+            return Err(IocpError::Socket.io_report("WSASocketW", std::io::Error::last_os_error()));
         }
         Ok(Self {
             inner: SafeSocket(s),

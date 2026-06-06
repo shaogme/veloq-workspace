@@ -8,7 +8,7 @@ use veloq_driver_core::{DriverErrorKind, DriverResult};
 
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
 use crate::driver::IocpDriver;
-use crate::error::{IocpError, IocpResult, IocpResultExt, from_io_error};
+use crate::error::{IocpError, IocpResult, IocpResultExt};
 
 pub(crate) struct DeferredSocketCleanup {
     pub(crate) handle: SocketKey,
@@ -42,8 +42,7 @@ impl<'a> IocpDriver<'a> {
         if err == WSAENOTSOCK {
             Ok(false)
         } else {
-            Err(from_io_error(
-                IocpError::ResolveFd,
+            Err(IocpError::ResolveFd.io_report(
                 "iocp/driver.detect_socket_from_file_handle",
                 std::io::Error::from_raw_os_error(err),
             ))

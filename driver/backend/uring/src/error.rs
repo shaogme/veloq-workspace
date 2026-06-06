@@ -29,6 +29,30 @@ set! {
 
 pub type UringResult<T> = Result<T, Report<UringError>>;
 
+impl UringError {
+    #[inline]
+    pub(crate) fn io_report<E>(self, scope: &'static str, error: E) -> Report<Self>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let error_ref = &error as &dyn std::any::Any;
+        let os_code = error_ref
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error);
+        let detail = error.to_string();
+        let report = self
+            .to_report()
+            .with_ctx("scope", scope)
+            .attach_note(detail)
+            .with_diag_src_err(error);
+        if let Some(code) = os_code {
+            report.set_error_code(code)
+        } else {
+            report
+        }
+    }
+}
+
 impl From<DriverErrorKind> for UringError {
     fn from(kind: DriverErrorKind) -> Self {
         match kind {
@@ -61,30 +85,5 @@ impl<T> UringResultExt<T> for UringResult<T> {
         detail: impl ToString,
     ) -> DriverResult<T> {
         ResultAsDriverExt::to_driver_result(self, kind, scope, detail)
-    }
-}
-
-#[inline]
-pub(crate) fn from_io_error<E>(
-    context: UringError,
-    scope: &'static str,
-    error: E,
-) -> Report<UringError>
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    let error_ref = &error as &dyn std::any::Any;
-    let os_code = error_ref
-        .downcast_ref::<std::io::Error>()
-        .and_then(std::io::Error::raw_os_error);
-    let detail = error.to_string();
-    let report = Report::new(context)
-        .with_ctx("scope", scope)
-        .attach_note(detail)
-        .with_diag_src_err(error);
-    if let Some(code) = os_code {
-        report.set_error_code(code)
-    } else {
-        report
     }
 }

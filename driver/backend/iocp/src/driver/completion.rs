@@ -18,7 +18,7 @@ use crate::common::{
 };
 use crate::config::SocketKey;
 use crate::driver::{CloseMode, CompletionSidecar, IocpDriver, IocpOpState, RIO_EVENT_KEY};
-use crate::error::{IocpError, IocpResult, IocpResultExt, from_io_error};
+use crate::error::{IocpError, IocpResult, IocpResultExt};
 use crate::op::slot::Slot;
 use crate::op::{IocpOp, IocpUserPayload, OverlappedEntry, submit};
 use crate::rio::error::RioResultExt;
@@ -408,8 +408,7 @@ impl<'a> IocpDriver<'a> {
         bytes_transferred: u32,
     ) -> IocpResult<usize> {
         let mut io_result = if !success {
-            Err(from_io_error(
-                IocpError::CompletionWait,
+            Err(IocpError::CompletionWait.io_report(
                 "iocp.driver.calculate_io_result",
                 std::io::Error::from_raw_os_error(error_code.unwrap_or(0) as i32),
             ))
@@ -424,7 +423,7 @@ impl<'a> IocpDriver<'a> {
             let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
                 if let Some(res) = blocking_res {
                     io_result = res.map_err(|e| {
-                        from_io_error(IocpError::Win32, "iocp.driver.blocking_completion", e)
+                        IocpError::Win32.io_report("iocp.driver.blocking_completion", e)
                     });
                 } else if matches!(
                     &iocp_op.payload,

@@ -1,5 +1,5 @@
 use crate::config::UringRawHandle;
-use crate::error::{UringError, UringResult, from_io_error};
+use crate::error::{UringError, UringResult};
 use crate::{OwnedRawHandle, RawHandle, SockAddrStorage};
 use diagweave::report::Report;
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
@@ -15,11 +15,7 @@ impl Socket {
     fn new_v4(ty: c_int) -> UringResult<Self> {
         let fd = unsafe { libc::socket(libc::AF_INET, ty, 0) };
         if fd < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.new_v4",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.new_v4", io::Error::last_os_error()));
         }
         Ok(Self {
             // SAFETY: newly created socket fd is uniquely owned.
@@ -32,11 +28,7 @@ impl Socket {
     fn new_v6(ty: c_int) -> UringResult<Self> {
         let fd = unsafe { libc::socket(libc::AF_INET6, ty, 0) };
         if fd < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.new_v6",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.new_v6", io::Error::last_os_error()));
         }
         Ok(Self {
             // SAFETY: newly created socket fd is uniquely owned.
@@ -57,11 +49,9 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.setsockopt",
-                io::Error::last_os_error(),
-            ));
+            return Err(
+                UringError::Socket.io_report("socket.setsockopt", io::Error::last_os_error())
+            );
         }
         Ok(())
     }
@@ -92,11 +82,7 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.bind",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.bind", io::Error::last_os_error()));
         }
         Ok(())
     }
@@ -111,11 +97,7 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.connect",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.connect", io::Error::last_os_error()));
         }
         Ok(())
     }
@@ -123,11 +105,7 @@ impl Socket {
     pub fn listen(&self, backlog: i32) -> UringResult<()> {
         let ret = unsafe { libc::listen(self.fd.raw().as_fd(), backlog as c_int) };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.listen",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.listen", io::Error::last_os_error()));
         }
         Ok(())
     }
@@ -157,11 +135,8 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.local_addr.getsockname",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket
+                .io_report("socket.local_addr.getsockname", io::Error::last_os_error()));
         }
         to_socket_addr(unsafe {
             std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)

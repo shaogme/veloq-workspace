@@ -15,7 +15,7 @@ use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
 use veloq_driver_core::slot::SlotTable;
 
 use crate::driver::IocpDriver;
-use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::error::{IocpError, IocpResult};
 use crate::op::{IocpOp, IocpUserPayload};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
@@ -108,11 +108,7 @@ pub(crate) fn wait_completion(
     event_res_to_result(record.event.res).map_err(|e| {
         let code = driver_error_report_to_event_res(&e);
         let io_error = std::io::Error::from_raw_os_error(-code);
-        from_io_error(
-            IocpError::CompletionWait,
-            "iocp.tests.wait_completion",
-            io_error,
-        )
+        IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error)
     })
 }
 

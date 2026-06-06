@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, trace};
 
 use crate::driver::UringDriver;
-use crate::error::{UringError, UringResult, from_io_error};
+use crate::error::{UringError, UringResult};
 use crate::op::{
     UringUserPayload,
     slot::{SlotView, UringOpRegistryExt},
@@ -36,20 +36,13 @@ impl<'a> UringDriver<'a> {
                     Ok(_) => {}
                     Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => {}
                     Err(e) => {
-                        return Err(from_io_error(
-                            UringError::CompletionWait,
-                            "driver.wait_internal.submit_with_args",
-                            e,
-                        ));
+                        return Err(UringError::CompletionWait
+                            .io_report("driver.wait_internal.submit_with_args", e));
                     }
                 }
             } else {
                 self.ring.submit_and_wait(1).map_err(|e| {
-                    from_io_error(
-                        UringError::CompletionWait,
-                        "driver.wait_internal.submit_and_wait",
-                        e,
-                    )
+                    UringError::CompletionWait.io_report("driver.wait_internal.submit_and_wait", e)
                 })?;
             }
         }

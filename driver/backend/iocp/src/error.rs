@@ -31,6 +31,30 @@ set! {
 
 pub type IocpResult<T> = Result<T, Report<IocpError>>;
 
+impl IocpError {
+    #[inline]
+    pub(crate) fn io_report<E>(self, scope: &'static str, error: E) -> Report<Self>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let error_ref = &error as &dyn std::any::Any;
+        let os_code = error_ref
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error);
+        let detail = error.to_string();
+        let report = self
+            .to_report()
+            .with_ctx("scope", scope)
+            .attach_note(detail)
+            .with_diag_src_err(error);
+        if let Some(code) = os_code {
+            report.set_error_code(code)
+        } else {
+            report
+        }
+    }
+}
+
 pub(crate) trait IocpResultExt<T> {
     fn to_driver_result(
         self,
@@ -48,31 +72,5 @@ impl<T> IocpResultExt<T> for IocpResult<T> {
         detail: impl ToString,
     ) -> DriverResult<T> {
         ResultAsDriverExt::to_driver_result(self, kind, scope, detail)
-    }
-}
-
-#[inline]
-pub(crate) fn from_io_error<E>(
-    context: IocpError,
-    scope: &'static str,
-    error: E,
-) -> Report<IocpError>
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    let error_ref = &error as &dyn std::any::Any;
-    let os_code = error_ref
-        .downcast_ref::<std::io::Error>()
-        .and_then(std::io::Error::raw_os_error);
-    let detail = error.to_string();
-    let report = context
-        .to_report()
-        .with_ctx("scope", scope)
-        .attach_note(detail)
-        .with_diag_src_err(error);
-    if let Some(code) = os_code {
-        report.set_error_code(code)
-    } else {
-        report
     }
 }

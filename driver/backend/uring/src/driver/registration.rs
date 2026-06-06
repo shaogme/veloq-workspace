@@ -1,5 +1,5 @@
 use crate::driver::UringDriver;
-use crate::error::{UringError, UringResult, from_io_error};
+use crate::error::{UringError, UringResult};
 use diagweave::report::Report;
 use std::time::{Duration, Instant};
 
@@ -74,11 +74,8 @@ impl<'a> UringDriver<'a> {
                 .saturating_add(1);
             self.chunk_register_failures_recent
                 .insert(id, Instant::now());
-            return Err(from_io_error(
-                UringError::Registration,
-                "driver.register_chunk_internal.register_buffers_update",
-                e,
-            ));
+            return Err(UringError::Registration
+                .io_report("driver.register_chunk_internal.register_buffers_update", e));
         }
 
         // Mark as registered in local bitset
@@ -108,9 +105,7 @@ impl<'a> UringDriver<'a> {
             self.ring
                 .submitter()
                 .register_files_update(idx, &[-1])
-                .map_err(|e| {
-                    from_io_error(UringError::Registration, "driver.unregister_fixed_fd", e)
-                })?;
+                .map_err(|e| UringError::Registration.io_report("driver.unregister_fixed_fd", e))?;
             self.free_file_slots.push(idx);
             self.file_generations[index] = self.file_generations[index].wrapping_add(1);
         }
@@ -125,11 +120,7 @@ impl<'a> UringDriver<'a> {
         let capacity = self.ops.local.len().max(MIN_FILE_TABLE_CAPACITY);
         let sparse = vec![-1; capacity];
         self.ring.submitter().register_files(&sparse).map_err(|e| {
-            from_io_error(
-                UringError::Registration,
-                "driver.ensure_file_table_initialized",
-                e,
-            )
+            UringError::Registration.io_report("driver.ensure_file_table_initialized", e)
         })?;
 
         self.registered_files = (0..capacity).map(|_| None).collect();
@@ -165,11 +156,8 @@ impl<'a> UringDriver<'a> {
                 .submitter()
                 .register_files_update(idx, &[fd])
                 .map_err(|e| {
-                    from_io_error(
-                        UringError::Registration,
-                        "driver.register_files_internal.register_files_update",
-                        e,
-                    )
+                    UringError::Registration
+                        .io_report("driver.register_files_internal.register_files_update", e)
                 })?;
             self.registered_files[idx as usize] = Some(entry);
             let generation = self.file_generations[idx as usize];

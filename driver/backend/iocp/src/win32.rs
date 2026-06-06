@@ -1,7 +1,7 @@
+use std::io::Error as IoError;
 use std::ptr;
 
-use crate::error::{IocpError, IocpResult, from_io_error};
-use diagweave::report::Report;
+use crate::error::{IocpError, IocpResult};
 use veloq_pod::{Pod, Zeroable, bytes_of, bytes_of_mut, zeroed};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
@@ -14,6 +14,14 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
     PostQueuedCompletionStatus,
 };
+
+fn last_os_error() -> IoError {
+    IoError::last_os_error()
+}
+
+fn from_raw_os_error(err: i32) -> IoError {
+    IoError::from_raw_os_error(err)
+}
 
 // ============================================================================
 // Overlapped
@@ -113,11 +121,6 @@ unsafe impl Sync for OwnedHandle {}
 #[derive(Debug)]
 pub struct SafeSocket(pub SOCKET);
 
-#[inline]
-fn win32_last_error(context: IocpError, scope: &'static str) -> Report<IocpError> {
-    from_io_error(context, scope, std::io::Error::last_os_error())
-}
-
 impl SafeSocket {
     /// Returns the raw SOCKET.
     pub fn as_raw(&self) -> SOCKET {
@@ -139,7 +142,7 @@ impl SafeSocket {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { bind(self.0, addr, len) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "bind"));
+            return Err(IocpError::Socket.io_report("bind", last_os_error()));
         }
         Ok(())
     }
@@ -149,7 +152,7 @@ impl SafeSocket {
         // SAFETY: The socket is valid and owned by us.
         let ret = unsafe { listen(self.0, backlog) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "listen"));
+            return Err(IocpError::Socket.io_report("listen", last_os_error()));
         }
         Ok(())
     }
@@ -164,7 +167,7 @@ impl SafeSocket {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { connect(self.0, addr, len) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "connect"));
+            return Err(IocpError::Socket.io_report("connect", last_os_error()));
         }
         Ok(())
     }
@@ -178,7 +181,7 @@ impl SafeSocket {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { getsockname(self.0, addr, len) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "getsockname"));
+            return Err(IocpError::Socket.io_report("getsockname", last_os_error()));
         }
         Ok(())
     }
@@ -192,7 +195,7 @@ impl SafeSocket {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { getpeername(self.0, addr, len) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "getpeername"));
+            return Err(IocpError::Socket.io_report("getpeername", last_os_error()));
         }
         Ok(())
     }
@@ -210,7 +213,7 @@ impl SafeSocket {
             )
         };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "setsockopt"));
+            return Err(IocpError::Socket.io_report("setsockopt", last_os_error()));
         }
         Ok(())
     }
@@ -220,7 +223,7 @@ impl SafeSocket {
         // SAFETY: Setting socket option with no payload is safe for valid options.
         let ret = unsafe { setsockopt(self.0, level, optname, std::ptr::null(), 0) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "setsockopt_empty"));
+            return Err(IocpError::Socket.io_report("setsockopt_empty", last_os_error()));
         }
         Ok(())
     }
@@ -256,10 +259,9 @@ impl IoCompletionPort {
         let handle =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, threads) };
         if handle.is_null() {
-            return Err(win32_last_error(
-                IocpError::Win32,
-                "CreateIoCompletionPort.new",
-            ));
+            return Err(
+                IocpError::Win32.io_report("CreateIoCompletionPort.new", last_os_error())
+            );
         }
         Ok(Self(OwnedHandle(handle)))
     }
@@ -278,10 +280,9 @@ impl IoCompletionPort {
             if err == windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER {
                 return Ok(());
             }
-            return Err(from_io_error(
-                IocpError::Win32,
+            return Err(IocpError::Win32.io_report(
                 "CreateIoCompletionPort.associate",
-                std::io::Error::from_raw_os_error(err as i32),
+                from_raw_os_error(err as i32),
             ));
         }
         Ok(())
@@ -303,10 +304,9 @@ impl IoCompletionPort {
             PostQueuedCompletionStatus(self.0.as_raw(), bytes, key, overlapped as *mut OVERLAPPED)
         };
         if res == 0 {
-            return Err(win32_last_error(
-                IocpError::Win32,
-                "PostQueuedCompletionStatus",
-            ));
+            return Err(
+                IocpError::Win32.io_report("PostQueuedCompletionStatus", last_os_error())
+            );
         }
         Ok(())
     }
@@ -331,11 +331,9 @@ impl IoCompletionPort {
             if err == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
                 return Ok(());
             }
-            return Err(from_io_error(
-                IocpError::Win32,
-                "CancelIoEx",
-                std::io::Error::from_raw_os_error(err as i32),
-            ));
+            return Err(
+                IocpError::Win32.io_report("CancelIoEx", from_raw_os_error(err as i32))
+            );
         }
         Ok(())
     }
@@ -364,10 +362,9 @@ impl IoCompletionPort {
                 if err == WAIT_TIMEOUT {
                     return Ok(CompletionStatus::Timeout);
                 }
-                return Err(from_io_error(
-                    IocpError::Win32,
+                return Err(IocpError::Win32.io_report(
                     "GetQueuedCompletionStatus",
-                    std::io::Error::from_raw_os_error(err as i32),
+                    from_raw_os_error(err as i32),
                 ));
             } else {
                 return Ok(CompletionStatus::Completed {

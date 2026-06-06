@@ -5,7 +5,7 @@ use tracing::{debug, trace};
 use crate::config::{RawHandle, UringRawHandle};
 use crate::driver::lifecycle::UringOpState;
 use crate::driver::{UringDriver, invalid_input, invalid_state, map_uring_error, unsupported};
-use crate::error::{UringError, UringResult, from_io_error};
+use crate::error::{UringError, UringResult};
 use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
 use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 
@@ -239,11 +239,7 @@ impl<'a> UringDriver<'a> {
         if self.ring.params().is_setup_sqpoll() {
             if self.ring.submission().need_wakeup() {
                 self.ring.submit().map_err(|e| {
-                    from_io_error(
-                        UringError::Submission,
-                        "driver.submit_to_kernel.submit.sqpoll",
-                        e,
-                    )
+                    UringError::Submission.io_report("driver.submit_to_kernel.submit.sqpoll", e)
                 })?;
             }
         } else {
@@ -255,11 +251,7 @@ impl<'a> UringDriver<'a> {
                         .submitter()
                         .enter::<()>(n as u32, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
                         .map_err(|e| {
-                            from_io_error(
-                                UringError::Submission,
-                                "driver.submit_to_kernel.enter",
-                                e,
-                            )
+                            UringError::Submission.io_report("driver.submit_to_kernel.enter", e)
                         })?;
                 }
             }

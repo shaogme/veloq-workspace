@@ -8,7 +8,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use crate::config::BorrowedRawHandle;
-use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::error::{IocpError, IocpResult};
 use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
 use crate::op::submit::common::{
@@ -64,10 +64,12 @@ pub(crate) fn submit_recv(
                 ctx.registrar,
             )
             .map_err(|e| {
-                from_io_error(IocpError::Submission, "submit_recv", e).attach_note(format!(
-                    "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, user_data, generation
-                ))
+                IocpError::Submission
+                    .io_report("submit_recv", e)
+                    .attach_note(format!(
+                        "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
+                        val.fd, user_data, generation
+                    ))
             }),
     )
 }
@@ -101,10 +103,12 @@ pub(crate) fn submit_udp_recv(
                 ctx.registrar,
             )
             .map_err(|e| {
-                from_io_error(IocpError::Submission, "submit_udp_recv", e).attach_note(format!(
-                    "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, header.user_data, header.generation
-                ))
+                IocpError::Submission
+                    .io_report("submit_udp_recv", e)
+                    .attach_note(format!(
+                        "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
+                        val.fd, header.user_data, header.generation
+                    ))
             }),
     )
 }
@@ -137,10 +141,12 @@ pub(crate) fn submit_send(
                 ctx.registrar,
             )
             .map_err(|e| {
-                from_io_error(IocpError::Submission, "submit_send", e).attach_note(format!(
-                    "RIO send submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, user_data, generation
-                ))
+                IocpError::Submission
+                    .io_report("submit_send", e)
+                    .attach_note(format!(
+                        "RIO send submit failed: fd={:?}, user_data={}, generation={}",
+                        val.fd, user_data, generation
+                    ))
             }),
     )
 }
@@ -173,10 +179,12 @@ pub(crate) fn submit_udp_send(
                 ctx.registrar,
             )
             .map_err(|e| {
-                from_io_error(IocpError::Submission, "submit_udp_send", e).attach_note(format!(
-                    "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
-                    val.fd, user_data, generation
-                ))
+                IocpError::Submission
+                    .io_report("submit_udp_send", e)
+                    .attach_note(format!(
+                        "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
+                        val.fd, user_data, generation
+                    ))
             }),
     )
 }
@@ -515,7 +523,7 @@ pub(crate) fn submit_send_to(
         ctx.rio
             .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
             .map_err(|e| {
-                from_io_error(IocpError::Submission, "submit_send_to", e).attach_note(format!(
+                IocpError::Submission.io_report("submit_send_to", e).attach_note(format!(
                     "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
                     user.fd, header.user_data, header.generation, page_idx
                 ))
@@ -557,7 +565,7 @@ pub(crate) fn submit_udp_recv_from(
         ctx.rio
             .try_submit_recv_from(args, ctx.registrar, ctx.slab_resolver)
             .map_err(|e| {
-            from_io_error(IocpError::Submission, "submit_udp_recv_from", e).attach_note(format!(
+            IocpError::Submission.io_report("submit_udp_recv_from", e).attach_note(format!(
                 "RIO udp_recv_from submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
                 fd, header.user_data, header.generation, page_idx
             ))
