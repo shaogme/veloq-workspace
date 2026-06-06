@@ -192,7 +192,7 @@ impl<'a> IocpDriver<'a> {
             "failed to prepare op slot",
         )?;
 
-        let overlapped = guard.storage.with_mut(|_op, _result, _payload, sidecar| {
+        let overlapped = guard.storage.with_mut(|_result, _payload, sidecar| {
             &mut sidecar.inner as *mut crate::win32::Overlapped
         });
 
@@ -209,7 +209,7 @@ impl<'a> IocpDriver<'a> {
 
         let mut sub_guard = guard.start_submission_with(Some(|slot| {
             slot.storage
-                .with_mut(|_op, _result, _payload, sidecar| sidecar.in_flight = false);
+                .with_mut(|_result, _payload, sidecar| sidecar.in_flight = false);
         }));
         let result = sub_guard
             .slot

@@ -14,10 +14,10 @@ use crate::config::{
 };
 use crate::error::{UringError, UringResult, UringResultExt};
 use crate::op::{UringOp, UringUserPayload};
-use veloq_driver_core::driver::registry::{OpEntry, OpHandle, OpRegistry};
+use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
     DriveMode, DriveOutcome, Driver, Outcome, RegisterFd, RemoteWaker, SharedCompletionQueue,
-    SharedCompletionTable, SubmitBinder, SubmitStatus,
+    SharedCompletionTable, SharedDriverSlotTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
 use veloq_driver_core::{DriverReport, DriverResult as CoreDriverResult};
@@ -30,7 +30,7 @@ mod submission;
 pub use lifecycle::UringOpState;
 pub(crate) use registration::{MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats};
 
-use crate::op::slot::UringOpRegistryExt;
+use crate::op::slot::{UringOpRegistry, UringOpRegistryExt, UringSlotSpec};
 
 type DriverResult<T> = CoreDriverResult<T, UringError>;
 type DriverErrorReport = DriverReport<UringError>;
@@ -100,7 +100,7 @@ pub(crate) fn map_uring_error(
 
 pub struct UringDriver<'a> {
     pub(crate) ring: IoUring,
-    pub(crate) ops: OpRegistry<UringOp, UringUserPayload, UringOpState, (), UringError>,
+    pub(crate) ops: UringOpRegistry,
     pub(crate) backlog: VecDeque<usize>,
     pub(crate) pending_cancellations: VecDeque<usize>,
     pub(crate) completion_events: SharedCompletionQueue,
@@ -155,7 +155,7 @@ impl<'a> UringDriver<'a> {
             })
             .map_err(|e| UringError::DriverInit.io_report("driver.new.build_ring", e))?;
 
-        let ops = OpRegistry::new(entries as usize);
+        let ops = UringOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<UringUserPayload, UringError> =
             ops.shared.clone();
 
@@ -245,6 +245,7 @@ impl<'a> Driver for UringDriver<'a> {
     type Sidecar = ();
     type Completion = usize;
     type Error = UringError;
+    type SlotSpec = UringSlotSpec;
 
     fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
         match self.ops.insert(OpEntry::new(UringOpState::new())) {
@@ -262,17 +263,7 @@ impl<'a> Driver for UringDriver<'a> {
         }
     }
 
-    fn slot_table(
-        &self,
-    ) -> std::sync::Arc<
-        veloq_driver_core::slot::SlotTable<
-            Self::Op,
-            Self::UP,
-            Self::Sidecar,
-            Self::Error,
-            Self::Completion,
-        >,
-    > {
+    fn slot_table(&self) -> SharedDriverSlotTable<Self> {
         self.ops.shared.clone()
     }
 
@@ -281,16 +272,16 @@ impl<'a> Driver for UringDriver<'a> {
     }
 
     fn slot_set_payload(&mut self, user_data: usize, payload: UringUserPayload) {
-        let _ =
-            self.ops
-                .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
-                    *payload_cell = Some(payload);
-                });
+        let _ = self
+            .ops
+            .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
+                *payload_cell = Some(payload);
+            });
     }
 
     fn slot_take_payload(&mut self, user_data: usize) -> Option<UringUserPayload> {
         self.ops
-            .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
+            .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
                 payload_cell.take()
             })
             .flatten()

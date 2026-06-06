@@ -15,12 +15,13 @@ use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
 
 use veloq_buf::BufferRegistrar;
-use veloq_driver_core::driver::registry::{OpEntry, OpRegistry};
+use veloq_driver_core::driver::registry::OpEntry;
 use veloq_driver_core::driver::{
     CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver, RegisterFd,
-    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitBinder,
+    SubmitStatus,
 };
-use veloq_driver_core::slot::{DetachedCancelTable, SlotTable};
+use veloq_driver_core::slot::DetachedCancelTable;
 use veloq_driver_core::{DriverReport, DriverResult as CoreDriverResult};
 use veloq_wheel::{Wheel, WheelConfig};
 
@@ -29,12 +30,11 @@ use diagweave::prelude::*;
 use crate::common::IocpWaker;
 use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, RegisteredHandle};
 use crate::error::{IocpError, IocpResult, IocpResultExt};
-use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload, OverlappedEntry};
+use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload};
 use crate::rio::RioState;
 
 pub(crate) type IocpDriverResult<T> = CoreDriverResult<T, IocpError>;
-pub(crate) type IocpOpRegistry =
-    OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry, IocpError>;
+pub(crate) use crate::op::slot::{IocpOpRegistry, IocpSlotSpec};
 
 // ============================================================================
 // State & Lifecycle Types
@@ -148,7 +148,7 @@ impl<'a> IocpDriver<'a> {
             "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
         ))
         .trans()?;
-        let ops = OpRegistry::new(entries as usize);
+        let ops = IocpOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<IocpUserPayload, IocpError> =
             ops.shared.clone();
         Ok(Self {
@@ -193,6 +193,7 @@ impl<'a> Driver for IocpDriver<'a> {
     type Sidecar = crate::op::OverlappedEntry;
     type Completion = usize;
     type Error = IocpError;
+    type SlotSpec = IocpSlotSpec;
 
     fn reserve_op(&mut self) -> IocpDriverResult<(usize, u32)> {
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::default())) {
@@ -205,9 +206,7 @@ impl<'a> Driver for IocpDriver<'a> {
         Ok((user_data, generation))
     }
 
-    fn slot_table(
-        &self,
-    ) -> Arc<SlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Error, Self::Completion>> {
+    fn slot_table(&self) -> SharedDriverSlotTable<Self> {
         self.ops.shared.clone()
     }
 
@@ -216,18 +215,18 @@ impl<'a> Driver for IocpDriver<'a> {
     }
 
     fn slot_set_payload(&mut self, user_data: usize, payload: Self::UP) {
-        let _ =
-            self.ops
-                .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
-                    *payload_cell = Some(payload);
-                });
+        let _ = self
+            .ops
+            .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
+                *payload_cell = Some(payload);
+            });
     }
 
     fn slot_take_payload(&mut self, user_data: usize) -> Option<Self::UP> {
         use std::sync::atomic::Ordering;
         let payload = self
             .ops
-            .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
+            .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
                 payload_cell.take()
             })
             .flatten();

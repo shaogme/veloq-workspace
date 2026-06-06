@@ -1,5 +1,3 @@
-use crate::SlotSidecar;
-use crate::driver::PlatformOp;
 use crate::slot;
 use crate::{DriverCoreError, DriverError, DriverResult};
 use crossbeam_queue::SegQueue;
@@ -127,8 +125,9 @@ pub const CELL_STATE_READY: u8 = 2;
 pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
 
-impl<Op: PlatformOp, UP: Send, S: SlotSidecar, E: Send, R: Send> CompletionAccess<UP, E, R>
-    for slot::SlotTable<Op, UP, S, E, R>
+impl<Spec, UP: Send, E: Send, R: Send> CompletionAccess<UP, E, R> for slot::SlotTable<Spec>
+where
+    Spec: slot::SlotSpec<UserPayload = UP, Error = E, Completion = R>,
 {
     #[inline]
     fn record_completion_with_data(

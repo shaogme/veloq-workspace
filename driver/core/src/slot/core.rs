@@ -1,5 +1,5 @@
+use super::{SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
 use crate::DriverResult;
-use crate::SlotSidecar;
 use bilge::prelude::*;
 use std::marker::PhantomData;
 use veloq_atomic_waker::AtomicWaker;
@@ -88,21 +88,19 @@ impl AtomicPackedCoreState {
     }
 }
 
-pub struct SlotStorage<Op, UP, S: SlotSidecar, E, R = usize> {
-    pub op: Option<Op>,
-    pub result: Option<DriverResult<R, E>>,
-    pub payload: Option<UP>,
-    pub sidecar: S,
+pub struct SlotStorage<Spec: SlotSpec> {
+    pub result: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+    pub payload: Option<SlotPayload<Spec>>,
+    pub sidecar: SlotSidecarData<Spec>,
 }
 
-impl<Op, UP, S: SlotSidecar, E, R> SlotStorage<Op, UP, S, E, R> {
+impl<Spec: SlotSpec> SlotStorage<Spec> {
     #[inline]
     pub fn new() -> Self {
         Self {
-            op: None,
             result: None,
             payload: None,
-            sidecar: S::default(),
+            sidecar: SlotSidecarData::<Spec>::default(),
         }
     }
 
@@ -114,34 +112,34 @@ impl<Op, UP, S: SlotSidecar, E, R> SlotStorage<Op, UP, S, E, R> {
     #[inline]
     pub fn with_mut<F, X>(&mut self, f: F) -> X
     where
-        F: FnOnce(&mut Option<Op>, &mut Option<DriverResult<R, E>>, &mut Option<UP>, &mut S) -> X,
+        F: FnOnce(
+            &mut Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+            &mut Option<SlotPayload<Spec>>,
+            &mut SlotSidecarData<Spec>,
+        ) -> X,
     {
-        f(
-            &mut self.op,
-            &mut self.result,
-            &mut self.payload,
-            &mut self.sidecar,
-        )
+        f(&mut self.result, &mut self.payload, &mut self.sidecar)
     }
 }
 
-impl<Op, UP, S: SlotSidecar, E, R> Default for SlotStorage<Op, UP, S, E, R> {
+impl<Spec: SlotSpec> Default for SlotStorage<Spec> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-type SlotMarker<Op, S, UP> = PhantomData<fn() -> (Op, S, UP)>;
+type SlotMarker<Spec> = PhantomData<fn() -> Spec>;
 
-pub struct SlotData<Op, UP, S: SlotSidecar, E, R = usize> {
+pub struct SlotData<Spec: SlotSpec> {
     pub(crate) core_state: AtomicPackedCoreState,
     pub next_free: AtomicUsize,
     pub(crate) completion_res: AtomicI32,
     pub(crate) completion_flags: AtomicU32,
-    pub(crate) completion_data: Mutex<CompletionData<UP, E, R>>,
+    pub(crate) completion_data:
+        Mutex<CompletionData<SlotPayload<Spec>, SlotError<Spec>, SlotCompletion<Spec>>>,
     pub(crate) completion_waker: AtomicWaker,
-    marker: SlotMarker<Op, S, UP>,
+    marker: SlotMarker<Spec>,
 }
 
 #[derive(Debug)]
@@ -159,7 +157,7 @@ impl<UP, E, R> Default for CompletionData<UP, E, R> {
     }
 }
 
-impl<Op, UP, S: SlotSidecar, E, R> SlotData<Op, UP, S, E, R> {
+impl<Spec: SlotSpec> SlotData<Spec> {
     pub(crate) const NULL_INDEX: usize = usize::MAX;
 
     pub fn new() -> Self {
@@ -172,7 +170,11 @@ impl<Op, UP, S: SlotSidecar, E, R> SlotData<Op, UP, S, E, R> {
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             completion_res: AtomicI32::new(0),
             completion_flags: AtomicU32::new(0),
-            completion_data: Mutex::new(CompletionData::<UP, E, R>::default()),
+            completion_data: Mutex::new(CompletionData::<
+                SlotPayload<Spec>,
+                SlotError<Spec>,
+                SlotCompletion<Spec>,
+            >::default()),
             completion_waker: AtomicWaker::new(),
             marker: PhantomData,
         }
@@ -240,7 +242,10 @@ impl<Op, UP, S: SlotSidecar, E, R> SlotData<Op, UP, S, E, R> {
     #[inline]
     pub(crate) fn completion_with_data<F, X>(&self, f: F) -> X
     where
-        F: FnOnce(&mut Option<UP>, &mut Option<DriverResult<R, E>>) -> X,
+        F: FnOnce(
+            &mut Option<SlotPayload<Spec>>,
+            &mut Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+        ) -> X,
     {
         let mut data = self.completion_data.lock();
         let CompletionData { payload, detail } = &mut *data;
@@ -248,7 +253,7 @@ impl<Op, UP, S: SlotSidecar, E, R> SlotData<Op, UP, S, E, R> {
     }
 }
 
-impl<Op, UP, S: SlotSidecar, E, R> Default for SlotData<Op, UP, S, E, R> {
+impl<Spec: SlotSpec> Default for SlotData<Spec> {
     fn default() -> Self {
         Self::new()
     }

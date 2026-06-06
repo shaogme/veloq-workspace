@@ -19,14 +19,7 @@ use crate::op::{IocpOp, IocpUserPayload};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);
-    while cur
-        != SlotTable::<
-            crate::op::IocpOp,
-            crate::op::IocpUserPayload,
-            crate::op::OverlappedEntry,
-            IocpError,
-        >::NULL_INDEX
-    {
+    while cur != SlotTable::<crate::op::slot::IocpSlotSpec>::NULL_INDEX {
         if cur == needle {
             return true;
         }

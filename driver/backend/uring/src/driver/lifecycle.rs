@@ -166,8 +166,7 @@ fn cancel_slot_immediate<'a, S: SlotState>(
 ) -> CompletionSidecar<UringUserPayload, UringError> {
     let generation = slot.entry.generation(Ordering::Acquire);
     let (payload, detail) = slot.storage.with_mut(
-        |_op: &mut Option<crate::op::UringOp>,
-         result: &mut Option<UringDriverResult<usize>>,
+        |result: &mut Option<UringDriverResult<usize>>,
          payload: &mut Option<UringUserPayload>,
          _sidecar| (payload.take(), result.take()),
     );

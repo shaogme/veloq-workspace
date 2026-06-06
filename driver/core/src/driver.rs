@@ -1,4 +1,5 @@
 use crate::slot;
+use crate::slot::SlotSpec as CoreSlotSpec;
 use crate::slot::is_runnable_state;
 use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
 use crate::{DriverError, DriverReport, DriverResult};
@@ -25,14 +26,8 @@ pub enum DriverControlCommand {
     UnregisterFiles(Vec<IoFd>),
 }
 
-pub type SharedSlotTable<Op, UP, S, E, C = usize> = Arc<slot::SlotTable<Op, UP, S, E, C>>;
-pub type SharedDriverSlotTable<D> = SharedSlotTable<
-    <D as Driver>::Op,
-    <D as Driver>::UP,
-    <D as Driver>::Sidecar,
-    <D as Driver>::Error,
-    <D as Driver>::Completion,
->;
+pub type SharedSlotTable<Spec> = Arc<slot::SlotTable<Spec>>;
+pub type SharedDriverSlotTable<D> = SharedSlotTable<<D as Driver>::SlotSpec>;
 pub type DriverSubmitResult<E> = Outcome<Result<Poll<()>, (DriverReport<E>, SubmitStatus)>>;
 
 pub trait Driver {
@@ -42,6 +37,13 @@ pub trait Driver {
     type Sidecar: SlotSidecar;
     type Completion: CompletionValue;
     type Error: DriverError;
+    type SlotSpec: CoreSlotSpec<
+            Op = Self::Op,
+            UserPayload = Self::UP,
+            Sidecar = Self::Sidecar,
+            Error = Self::Error,
+            Completion = Self::Completion,
+        >;
 
     fn reserve_op(&mut self) -> DriverResult<(usize, u32), Self::Error>;
 
@@ -121,6 +123,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     type Sidecar = D::Sidecar;
     type Completion = D::Completion;
     type Error = D::Error;
+    type SlotSpec = D::SlotSpec;
 
     #[inline]
     fn reserve_op(&mut self) -> DriverResult<(usize, u32), Self::Error> {

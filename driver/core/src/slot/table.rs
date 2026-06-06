@@ -1,10 +1,10 @@
-use crate::SlotSidecar;
 use crate::slot::core::{SlotData, SlotState};
+use crate::slot::{SlotCompletion, SlotError, SlotSpec};
 use crossbeam_utils::CachePadded;
 use veloq_shim::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-pub type SlotEntry<Op, UP, S, E, R = usize> = CachePadded<SlotData<Op, UP, S, E, R>>;
-pub type SlotEntries<Op, UP, S, E, R = usize> = Box<[SlotEntry<Op, UP, S, E, R>]>;
+pub type SlotEntry<Spec> = CachePadded<SlotData<Spec>>;
+pub type SlotEntries<Spec> = Box<[SlotEntry<Spec>]>;
 
 pub struct DetachedCancelTable {
     slot_count: usize,
@@ -73,15 +73,21 @@ impl DetachedCancelTable {
     }
 }
 
-pub struct SlotTable<Op, UP, S: SlotSidecar, E, R = usize> {
-    pub slots: SlotEntries<Op, UP, S, E, R>,
+pub struct SlotTable<Spec: SlotSpec> {
+    pub slots: SlotEntries<Spec>,
     pub remote_free_head: AtomicUsize,
     ready_completion_count: AtomicUsize,
 }
 
-unsafe impl<Op, UP, S: SlotSidecar, E, R> Sync for SlotTable<Op, UP, S, E, R> {}
+unsafe impl<Spec> Sync for SlotTable<Spec>
+where
+    Spec: SlotSpec,
+    SlotCompletion<Spec>: Send,
+    SlotError<Spec>: Send,
+{
+}
 
-impl<Op, UP, S: SlotSidecar, E, R> SlotTable<Op, UP, S, E, R> {
+impl<Spec: SlotSpec> SlotTable<Spec> {
     pub const NULL_INDEX: usize = usize::MAX;
 
     pub fn new(capacity: usize) -> Self {

@@ -454,7 +454,7 @@ impl<'a> IocpDriver<'a> {
         if io_result.is_err() {
             let _ = self
                 .ops
-                .with_slot_storage_mut(user_data, |_op, result, _payload, _sidecar| {
+                .with_slot_storage_mut(user_data, |result, _payload, _sidecar| {
                     *result = Some(Err(IocpError::CompletionWait
                         .report("iocp/driver", "completion without os error")));
                 });
@@ -593,7 +593,7 @@ impl<'a> IocpDriver<'a> {
                     } else {
                         // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
                         let overlapped_ptr =
-                            guard.storage.with_mut(|_op, _result, _payload, sidecar| {
+                            guard.storage.with_mut(|_result, _payload, sidecar| {
                                 &mut sidecar.inner as *mut crate::win32::Overlapped
                             });
                         // SAFETY: handle and overlapped_ptr are valid for this operation.
@@ -637,7 +637,7 @@ impl<'a> IocpDriver<'a> {
         let (payload, detail) = if let Some(data) = inflight {
             data
         } else {
-            ops.with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
+            ops.with_slot_storage_mut(user_data, |result, payload, _sidecar| {
                 (payload.take(), result.take())
             })
             .unwrap_or((None, None))
