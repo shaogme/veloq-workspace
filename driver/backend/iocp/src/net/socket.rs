@@ -2,6 +2,7 @@ use super::addr::{socket_addr_to_storage, to_socket_addr};
 use crate::config::{IocpHandle, OwnedRawHandle, RawHandle};
 use crate::error::{IocpError, IocpResult};
 use crate::win32::SafeSocket;
+use diagweave::report::ResultReportExt;
 use std::net::SocketAddr;
 use veloq_driver_core::PlatformSocket;
 use windows_sys::Win32::Networking::WinSock::{
@@ -38,26 +39,22 @@ impl Socket {
 
     /// Creates a new TCP v4 socket.
     pub fn new_tcp_v4() -> IocpResult<Self> {
-        Self::new_inner(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-            .map_err(|e| e.attach_note("socket new_tcp_v4 failed"))
+        Self::new_inner(AF_INET, SOCK_STREAM, IPPROTO_TCP).attach_note("socket new_tcp_v4 failed")
     }
 
     /// Creates a new TCP v6 socket.
     pub fn new_tcp_v6() -> IocpResult<Self> {
-        Self::new_inner(AF_INET6, SOCK_STREAM, IPPROTO_TCP)
-            .map_err(|e| e.attach_note("socket new_tcp_v6 failed"))
+        Self::new_inner(AF_INET6, SOCK_STREAM, IPPROTO_TCP).attach_note("socket new_tcp_v6 failed")
     }
 
     /// Creates a new UDP v4 socket.
     pub fn new_udp_v4() -> IocpResult<Self> {
-        Self::new_inner(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-            .map_err(|e| e.attach_note("socket new_udp_v4 failed"))
+        Self::new_inner(AF_INET, SOCK_DGRAM, IPPROTO_UDP).attach_note("socket new_udp_v4 failed")
     }
 
     /// Creates a new UDP v6 socket.
     pub fn new_udp_v6() -> IocpResult<Self> {
-        Self::new_inner(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
-            .map_err(|e| e.attach_note("socket new_udp_v6 failed"))
+        Self::new_inner(AF_INET6, SOCK_DGRAM, IPPROTO_UDP).attach_note("socket new_udp_v6 failed")
     }
 
     /// Binds the socket to the given address.
@@ -67,7 +64,7 @@ impl Socket {
         unsafe {
             self.inner
                 .bind(&storage.0 as *const _ as *const SOCKADDR, len)
-                .map_err(|e| e.attach_note("socket bind failed"))
+                .attach_note("socket bind failed")
         }
     }
 
@@ -78,7 +75,7 @@ impl Socket {
         unsafe {
             self.inner
                 .connect(&storage.0 as *const _ as *const SOCKADDR, len)
-                .map_err(|e| e.attach_note("socket connect failed"))
+                .attach_note("socket connect failed")
         }
     }
 
@@ -86,7 +83,7 @@ impl Socket {
     pub fn listen(&self, backlog: i32) -> IocpResult<()> {
         self.inner
             .listen(backlog)
-            .map_err(|e| e.attach_note("socket listen failed"))
+            .attach_note("socket listen failed")
     }
 
     /// Consumes the Socket and returns an owned handle.
@@ -118,13 +115,13 @@ impl Socket {
         unsafe {
             self.inner
                 .getsockname(&mut storage as *mut _ as *mut SOCKADDR, &mut len)
-                .map_err(|e| e.attach_note("socket getsockname failed"))?;
+                .attach_note("socket getsockname failed")?;
         }
 
         // SAFETY: storage is a valid SOCKADDR_STORAGE and len is its size.
         let buf =
             unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
-        to_socket_addr(buf).map_err(|e| e.attach_note("decode local socket address failed"))
+        to_socket_addr(buf).attach_note("decode local socket address failed")
     }
 
     /// Sets TCP_NODELAY option.
@@ -132,7 +129,7 @@ impl Socket {
         let val = if nodelay { 1i32 } else { 0i32 };
         self.inner
             .setsockopt(IPPROTO_TCP, TCP_NODELAY, &val)
-            .map_err(|e| e.attach_note("socket set_nodelay failed"))
+            .attach_note("socket set_nodelay failed")
     }
 
     /// Sets receive buffer size.
@@ -140,7 +137,7 @@ impl Socket {
         let val = size as i32;
         self.inner
             .setsockopt(SOL_SOCKET, SO_RCVBUF, &val)
-            .map_err(|e| e.attach_note("socket set_recv_buffer_size failed"))
+            .attach_note("socket set_recv_buffer_size failed")
     }
 
     /// Sets send buffer size.
@@ -148,7 +145,7 @@ impl Socket {
         let val = size as i32;
         self.inner
             .setsockopt(SOL_SOCKET, SO_SNDBUF, &val)
-            .map_err(|e| e.attach_note("socket set_send_buffer_size failed"))
+            .attach_note("socket set_send_buffer_size failed")
     }
 
     /// Sets SO_REUSEADDR option.
@@ -156,7 +153,7 @@ impl Socket {
         let val = if reuse { 1i32 } else { 0i32 };
         self.inner
             .setsockopt(SOL_SOCKET, SO_REUSEADDR, &val)
-            .map_err(|e| e.attach_note("socket set_reuse_address failed"))
+            .attach_note("socket set_reuse_address failed")
     }
 
     /// Sets SO_KEEPALIVE option.
@@ -164,7 +161,7 @@ impl Socket {
         let val = if keepalive { 1i32 } else { 0i32 };
         self.inner
             .setsockopt(SOL_SOCKET, SO_KEEPALIVE, &val)
-            .map_err(|e| e.attach_note("socket set_keepalive failed"))
+            .attach_note("socket set_keepalive failed")
     }
 
     /// Sets IP_TTL option.
@@ -172,7 +169,7 @@ impl Socket {
         let val = ttl as i32;
         self.inner
             .setsockopt(IPPROTO_IP, IP_TTL, &val)
-            .map_err(|e| e.attach_note("socket set_ttl failed"))
+            .attach_note("socket set_ttl failed")
     }
 
     /// Sets SO_BROADCAST option.
@@ -180,7 +177,7 @@ impl Socket {
         let val = if broadcast { 1i32 } else { 0i32 };
         self.inner
             .setsockopt(SOL_SOCKET, SO_BROADCAST, &val)
-            .map_err(|e| e.attach_note("socket set_broadcast failed"))
+            .attach_note("socket set_broadcast failed")
     }
 }
 

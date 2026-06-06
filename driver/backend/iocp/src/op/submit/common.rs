@@ -225,7 +225,7 @@ pub(crate) fn ensure_iocp_association(
 ) -> IocpResult<()> {
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
     unsafe { port.associate(handle.raw().as_handle(), 0) }
-        .map_err(|e| e.attach_note("CreateIoCompletionPort association failed"))
+        .attach_note("CreateIoCompletionPort association failed")
 }
 
 #[inline]

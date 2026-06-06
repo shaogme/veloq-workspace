@@ -193,7 +193,7 @@ impl<'a> UringDriver<'a> {
         config: impl AsRef<UringConfig>,
         registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
     ) -> UringResult<Self> {
-        Self::new_internal(config, registrar).map_err(|e| e.attach_note("create uring driver"))
+        Self::new_internal(config, registrar).attach_note("create uring driver")
     }
 
     fn has_active_ops_internal(&mut self) -> bool {

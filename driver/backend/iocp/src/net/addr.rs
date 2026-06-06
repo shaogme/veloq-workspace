@@ -190,7 +190,7 @@ impl SocketAddrCodec for SockAddrStorage {
     type Error = IocpError;
 
     fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
-        to_socket_addr(buf).map_err(|e| e.attach_note("decode socket address failed"))
+        to_socket_addr(buf).attach_note("decode socket address failed")
     }
 
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {

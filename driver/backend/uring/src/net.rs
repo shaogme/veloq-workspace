@@ -141,7 +141,7 @@ impl Socket {
         to_socket_addr(unsafe {
             std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
         })
-        .map_err(|e| e.attach_note("socket.local_addr.decode"))
+        .attach_note("socket.local_addr.decode")
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> UringResult<()> {
@@ -251,7 +251,7 @@ impl SocketAddrCodec for SockAddrStorage {
     type Error = UringError;
 
     fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
-        to_socket_addr(buf).map_err(|e| e.attach_note("socket_addr.decode"))
+        to_socket_addr(buf).attach_note("socket_addr.decode")
     }
 
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {
