@@ -86,15 +86,12 @@ pub(crate) fn unsupported(scope: &'static str, msg: impl Into<String>) -> Report
 #[inline]
 pub(crate) fn map_uring_error(
     report: Report<UringError>,
-    kind: UringError,
     scope: &'static str,
     detail: impl ToString,
 ) -> DriverErrorReport {
     let detail_text = detail.to_string();
     report
-        .set_accumulate_src_chain(true)
         .with_ctx("scope", scope)
-        .with_ctx("driver_error_kind", kind.to_string())
         .attach_note(detail_text)
 }
 
@@ -297,7 +294,6 @@ impl<'a> Driver for UringDriver<'a> {
             return binder.err(
                 map_uring_error(
                     invalid_state("driver.submit", "submit called with empty Option"),
-                    UringError::InvalidState,
                     "uring.driver.submit",
                     "submit called with empty Option",
                 ),
@@ -324,7 +320,6 @@ impl<'a> Driver for UringDriver<'a> {
                         "driver.submit",
                         "background strategy reached normal submit path",
                     ),
-                    UringError::InvalidState,
                     "uring.driver.submit",
                     "background strategy reached normal submit path",
                 ),

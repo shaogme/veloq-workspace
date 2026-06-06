@@ -330,7 +330,6 @@ impl<'a> UringDriver<'a> {
                 binder.err(
                     map_uring_error(
                         e,
-                        UringError::Submission,
                         "uring.driver.submit_sqe_internal",
                         "submit sqe",
                     ),
@@ -390,7 +389,6 @@ impl<'a> UringDriver<'a> {
                 binder.err(
                     map_uring_error(
                         e,
-                        UringError::Submission,
                         "uring.driver.submit_timer_internal",
                         "submit timer",
                     ),
