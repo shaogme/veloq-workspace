@@ -121,12 +121,10 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .into_inner();
         let buf = op.map(|o| o.buf).ok_or(FsError::OpBufferLost)?;
         let res = res
-            .map_report(|r| {
-                r.with_ctx("op", "read_at_subset")
-                    .with_ctx("offset", offset)
-                    .with_ctx("buf_offset", buf_offset)
-                    .with_ctx("buf_len", buf.len())
-            })
+            .with_ctx("op", "read_at_subset")
+            .with_ctx("offset", offset)
+            .with_ctx("buf_offset", buf_offset)
+            .with_ctx("buf_len", buf.len())
             .trans()?;
         Ok((res, buf))
     }
@@ -151,12 +149,10 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
             .into_inner();
         let buf = op.map(|o| o.buf).ok_or(FsError::OpBufferLost)?;
         let res = res
-            .map_report(|r| {
-                r.with_ctx("op", "write_at_subset")
-                    .with_ctx("offset", offset)
-                    .with_ctx("buf_offset", buf_offset)
-                    .with_ctx("buf_len", buf.len())
-            })
+            .with_ctx("op", "write_at_subset")
+            .with_ctx("offset", offset)
+            .with_ctx("buf_offset", buf_offset)
+            .with_ctx("buf_len", buf.len())
             .trans()?;
         Ok((res, buf))
     }
@@ -306,12 +302,10 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         let buf = op.buf;
         let res = res
-            .map_report(|r| {
-                r.with_ctx("op", "read_at_subset")
-                    .with_ctx("offset", offset)
-                    .with_ctx("buf_offset", buf_offset)
-                    .with_ctx("buf_len", buf.len())
-            })
+            .with_ctx("op", "read_at_subset")
+            .with_ctx("offset", offset)
+            .with_ctx("buf_offset", buf_offset)
+            .with_ctx("buf_len", buf.len())
             .trans()?;
         Ok((res, buf))
     }
@@ -333,12 +327,10 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
         let buf = op.buf;
         let res = res
-            .map_report(|r| {
-                r.with_ctx("op", "write_at_subset")
-                    .with_ctx("offset", offset)
-                    .with_ctx("buf_offset", buf_offset)
-                    .with_ctx("buf_len", buf.len())
-            })
+            .with_ctx("op", "write_at_subset")
+            .with_ctx("offset", offset)
+            .with_ctx("buf_offset", buf_offset)
+            .with_ctx("buf_len", buf.len())
             .trans()?;
         Ok((res, buf))
     }

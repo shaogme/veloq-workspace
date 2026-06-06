@@ -62,10 +62,7 @@ impl<'a> UringDriver<'a> {
                     let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr, user_data)
-                            .map_report(|e| {
-                                e.set_accumulate_src_chain(true)
-                                    .attach_note("driver.submit_from_slot_raw.make_sqe")
-                            })?
+                            .attach_note("driver.submit_from_slot_raw.make_sqe")?
                             .user_data(user_data as u64)
                     };
                     (count, sqe)

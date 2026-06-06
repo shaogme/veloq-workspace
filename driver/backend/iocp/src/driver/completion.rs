@@ -158,7 +158,7 @@ impl<'a> IocpDriver<'a> {
         self.last_timer_poll = now;
 
         let status = status
-            .map_report(|e| e.attach_note("failed to get IOCP completion status"))
+            .attach_note("failed to get IOCP completion status")
             .trans()?;
 
         match status {
@@ -181,11 +181,8 @@ impl<'a> IocpDriver<'a> {
                         .inspect(|_| {
                             self.drain_deferred_socket_cleanup();
                         })
-                        .map_report(|e| {
-                            e.set_accumulate_src_chain(true)
-                                .map_err(IocpError::from)
-                                .attach_note("failed to process RIO completions")
-                        })?;
+                        .attach_note("failed to process RIO completions")
+                        .trans()?;
                     return Ok(());
                 }
 
@@ -430,7 +427,7 @@ impl<'a> IocpDriver<'a> {
                 } else if let Ok(val) = io_result {
                     io_result = iocp_op
                         .on_complete(val, &self.extensions)
-                        .map_report(|e| e.attach_note("IOCP completion hook failed"))
+                        .attach_note("IOCP completion hook failed")
                 }
             });
         });
