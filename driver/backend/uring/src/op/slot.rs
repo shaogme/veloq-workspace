@@ -1,14 +1,12 @@
 use crate::driver::UringOpState;
 use crate::error::UringError;
 use crate::op::{UringOp, UringUserPayload};
-use veloq_driver_core::driver::registry::{
-    OpRegistry as CoreOpRegistry, SlotRegistrySpec as CoreSlotRegistrySpec,
-};
-use veloq_driver_core::slot::Slot as CoreSlot;
+use veloq_driver_core::driver::registry::OpRegistry as CoreOpRegistry;
+use veloq_driver_core::slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec};
 
 pub enum UringSlotSpec {}
 
-impl CoreSlotRegistrySpec for UringSlotSpec {
+impl CoreSlotSpec for UringSlotSpec {
     type Op = UringOp;
     type UserPayload = UringUserPayload;
     type PlatformData = UringOpState;

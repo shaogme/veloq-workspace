@@ -2,13 +2,14 @@ use crate::DriverResult;
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
 use crate::slot::{
-    SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotSidecarData, SlotSpec,
-    SlotState, SlotStorage, SlotTable,
+    SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData, SlotSidecarData,
+    SlotSpec, SlotState, SlotStorage, SlotTable,
 };
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 use veloq_shim::atomic::Ordering;
 
+/// Legacy compatibility shim for older slot registry specifications.
 pub trait SlotRegistrySpec {
     type Op: PlatformOp;
     type UserPayload: Send;
@@ -21,6 +22,7 @@ pub trait SlotRegistrySpec {
 impl<T: SlotRegistrySpec> SlotSpec for T {
     type Op = <T as SlotRegistrySpec>::Op;
     type UserPayload = <T as SlotRegistrySpec>::UserPayload;
+    type PlatformData = <T as SlotRegistrySpec>::PlatformData;
     type Sidecar = <T as SlotRegistrySpec>::Sidecar;
     type Error = <T as SlotRegistrySpec>::Error;
     type Completion = <T as SlotRegistrySpec>::Completion;
@@ -28,7 +30,7 @@ impl<T: SlotRegistrySpec> SlotSpec for T {
 
 pub type RegistryOp<T> = SlotOp<T>;
 pub type RegistryPayload<T> = SlotPayload<T>;
-pub type RegistryPlatformData<T> = <T as SlotRegistrySpec>::PlatformData;
+pub type RegistryPlatformData<T> = SlotPlatformData<T>;
 pub type RegistrySidecar<T> = SlotSidecarData<T>;
 pub type RegistryError<T> = SlotError<T>;
 pub type RegistryCompletion<T> = SlotCompletion<T>;
@@ -46,13 +48,13 @@ impl<P> OpEntry<P> {
     }
 }
 
-pub struct LocalSlot<Spec: SlotRegistrySpec> {
+pub struct LocalSlot<Spec: SlotSpec> {
     pub(crate) op: Option<RegistryOp<Spec>>,
     pub entry: OpEntry<RegistryPlatformData<Spec>>,
     pub storage: SlotStorageOf<Spec>,
 }
 
-impl<Spec: SlotRegistrySpec> LocalSlot<Spec> {
+impl<Spec: SlotSpec> LocalSlot<Spec> {
     #[inline]
     fn new() -> Self {
         Self {
@@ -67,7 +69,7 @@ impl<Spec: SlotRegistrySpec> LocalSlot<Spec> {
 
 pub type LocalSlots<Spec> = Box<[LocalSlot<Spec>]>;
 
-pub struct OpRegistry<Spec: SlotRegistrySpec> {
+pub struct OpRegistry<Spec: SlotSpec> {
     pub shared: Arc<SlotTableOf<Spec>>,
     pub local: LocalSlots<Spec>,
     local_free_head: usize,
@@ -96,7 +98,7 @@ pub type SlotEntryAndOpEntry<'a, Spec> = (
     &'a mut OpEntry<RegistryPlatformData<Spec>>,
 );
 
-impl<Spec: SlotRegistrySpec> OpRegistry<Spec> {
+impl<Spec: SlotSpec> OpRegistry<Spec> {
     pub fn new(capacity: usize) -> Self {
         let shared = Arc::new(SlotTableOf::<Spec>::new(capacity));
         let mut local: Vec<LocalSlot<Spec>> = Vec::with_capacity(capacity);
@@ -293,7 +295,7 @@ impl<Spec: SlotRegistrySpec> OpRegistry<Spec> {
     }
 }
 
-impl<Spec: SlotRegistrySpec> Index<usize> for OpRegistry<Spec> {
+impl<Spec: SlotSpec> Index<usize> for OpRegistry<Spec> {
     type Output = OpEntry<RegistryPlatformData<Spec>>;
 
     fn index(&self, index: usize) -> &Self::Output {
@@ -301,7 +303,7 @@ impl<Spec: SlotRegistrySpec> Index<usize> for OpRegistry<Spec> {
     }
 }
 
-impl<Spec: SlotRegistrySpec> IndexMut<usize> for OpRegistry<Spec> {
+impl<Spec: SlotSpec> IndexMut<usize> for OpRegistry<Spec> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.local[index].entry
     }

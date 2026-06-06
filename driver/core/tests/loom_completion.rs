@@ -1,18 +1,28 @@
 #![cfg(feature = "loom")]
 use std::sync::Arc;
 use veloq_driver_core::driver::*;
-use veloq_driver_core::slot::SlotTable;
+use veloq_driver_core::slot::{SlotSpec, SlotTable};
 use veloq_shim::thread;
 
 struct DummyPlatformOp;
 
 impl PlatformOp for DummyPlatformOp {}
 
+struct DummySlotSpec;
+
+impl SlotSpec for DummySlotSpec {
+    type Op = DummyPlatformOp;
+    type UserPayload = ();
+    type PlatformData = ();
+    type Sidecar = ();
+    type Error = ();
+    type Completion = usize;
+}
+
 #[test]
 fn test_completion_table_loom() {
     loom::model(|| {
-        let table: SharedCompletionTable<()> =
-            Arc::new(SlotTable::<DummyPlatformOp, (), ()>::new(1));
+        let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
         let token = encode_completion_token(0, 1);
 
         let table_cloned = table.clone();
@@ -49,8 +59,7 @@ fn test_completion_table_loom() {
 #[test]
 fn test_detached_drop_race_loom() {
     loom::model(|| {
-        let table: SharedCompletionTable<()> =
-            Arc::new(SlotTable::<DummyPlatformOp, (), ()>::new(1));
+        let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
         let token = encode_completion_token(0, 1);
 
         let table_cloned = table.clone();
@@ -84,8 +93,7 @@ fn test_detached_drop_race_loom() {
 #[test]
 fn test_fast_completion_then_waiting_take_loom() {
     loom::model(|| {
-        let table: SharedCompletionTable<()> =
-            Arc::new(SlotTable::<DummyPlatformOp, (), ()>::new(1));
+        let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
         let token = encode_completion_token(0, 1);
 
         table.record_completion_with_data(
@@ -115,8 +123,7 @@ fn test_fast_completion_then_waiting_take_loom() {
 #[test]
 fn test_stale_after_generation_advance_loom() {
     loom::model(|| {
-        let table: SharedCompletionTable<()> =
-            Arc::new(SlotTable::<DummyPlatformOp, (), ()>::new(1));
+        let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
         let token_g1 = encode_completion_token(0, 1);
         let token_g2 = encode_completion_token(0, 2);
 
@@ -146,8 +153,7 @@ fn test_stale_after_generation_advance_loom() {
 #[test]
 fn test_ready_race_with_mark_orphaned_loom() {
     loom::model(|| {
-        let table: SharedCompletionTable<()> =
-            Arc::new(SlotTable::<DummyPlatformOp, (), ()>::new(1));
+        let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
         let token = encode_completion_token(0, 1);
 
         table.record_completion_with_data(
@@ -182,8 +188,7 @@ fn test_two_consumers_at_most_one_ready_loom() {
     loom::model(|| {
         use loom::sync::atomic::{AtomicUsize, Ordering};
 
-        let table: SharedCompletionTable<()> =
-            Arc::new(SlotTable::<DummyPlatformOp, (), ()>::new(1));
+        let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
         let token = encode_completion_token(0, 1);
         let ready_count = Arc::new(AtomicUsize::new(0));
 

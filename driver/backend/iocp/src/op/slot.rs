@@ -1,14 +1,12 @@
 use crate::driver::IocpOpState;
 use crate::error::IocpError;
 use crate::op::{IocpOp, IocpUserPayload, OverlappedEntry};
-use veloq_driver_core::driver::registry::{
-    OpRegistry as CoreOpRegistry, SlotRegistrySpec as CoreSlotRegistrySpec,
-};
-use veloq_driver_core::slot::Slot as CoreSlot;
+use veloq_driver_core::driver::registry::OpRegistry as CoreOpRegistry;
+use veloq_driver_core::slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec};
 
 pub enum IocpSlotSpec {}
 
-impl CoreSlotRegistrySpec for IocpSlotSpec {
+impl CoreSlotSpec for IocpSlotSpec {
     type Op = IocpOp;
     type UserPayload = IocpUserPayload;
     type PlatformData = IocpOpState;
