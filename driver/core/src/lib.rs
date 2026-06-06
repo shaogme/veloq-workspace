@@ -76,7 +76,7 @@ impl IoFd {
 
 set! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub DriverErrorKind = {
+    pub DriverCoreError = {
         #[display("invalid input")]
         InvalidInput,
         #[display("invalid state")]
@@ -100,8 +100,9 @@ set! {
     }
 }
 
-pub type DriverResult<T> = Result<T, Report<DriverErrorKind>>;
-pub type DriverErrorReport = Report<DriverErrorKind>;
+pub type DriverResult<T, E> = Result<T, Report<E>>;
+pub type DriverCoreResult<T> = DriverResult<T, DriverCoreError>;
+pub type DriverReport<E> = Report<E>;
 
 #[inline]
 fn neg_code(code: i32) -> Option<i32> {
@@ -109,7 +110,7 @@ fn neg_code(code: i32) -> Option<i32> {
 }
 
 #[inline]
-fn diag_code_i32(report: &DriverErrorReport) -> Option<i32> {
+fn diag_code_i32<E>(report: &Report<E>) -> Option<i32> {
     report
         .error_code()
         .and_then(|code| i32::try_from(code).ok())
@@ -117,39 +118,52 @@ fn diag_code_i32(report: &DriverErrorReport) -> Option<i32> {
 }
 
 #[inline]
-pub fn driver_error_kind_fallback_errno(kind: DriverErrorKind) -> i32 {
+pub fn driver_core_error_fallback_errno(kind: DriverCoreError) -> i32 {
     match kind {
-        DriverErrorKind::InvalidInput => 22, // EINVAL
-        DriverErrorKind::InvalidState => 5,  // EIO
-        DriverErrorKind::Submission => 11,   // EAGAIN
-        DriverErrorKind::Completion => 5,    // EIO
-        DriverErrorKind::Registration => 12, // ENOMEM
-        DriverErrorKind::Socket => 5,        // EIO
-        DriverErrorKind::Timeout => 110,     // ETIMEDOUT
-        DriverErrorKind::Unsupported => 95,  // EOPNOTSUPP
-        DriverErrorKind::Internal => 5,      // EIO
-        DriverErrorKind::System => 5,        // EIO
+        DriverCoreError::InvalidInput => 22, // EINVAL
+        DriverCoreError::InvalidState => 5,  // EIO
+        DriverCoreError::Submission => 11,   // EAGAIN
+        DriverCoreError::Completion => 5,    // EIO
+        DriverCoreError::Registration => 12, // ENOMEM
+        DriverCoreError::Socket => 5,        // EIO
+        DriverCoreError::Timeout => 110,     // ETIMEDOUT
+        DriverCoreError::Unsupported => 95,  // EOPNOTSUPP
+        DriverCoreError::Internal => 5,      // EIO
+        DriverCoreError::System => 5,        // EIO
     }
 }
 
 #[inline]
-pub fn driver_error_report_to_event_res(report: &DriverErrorReport) -> i32 {
+pub fn driver_report_to_event_res<E>(report: &Report<E>) -> i32 {
     if let Some(res) = diag_code_i32(report) {
         return res;
     }
-    -driver_error_kind_fallback_errno(*report.inner())
+    -driver_core_error_fallback_errno(DriverCoreError::System)
 }
 
 #[inline]
-pub fn driver_error(
-    kind: DriverErrorKind,
+pub fn driver_core_error(
+    kind: DriverCoreError,
     scope: &'static str,
     detail: impl ToString,
-) -> DriverErrorReport {
+) -> Report<DriverCoreError> {
     let detail = detail.to_string();
     kind.to_report()
+        .set_error_code(driver_core_error_fallback_errno(kind))
         .with_ctx("scope", scope)
         .attach_note(detail)
+}
+
+#[inline]
+pub fn driver_error<E>(
+    kind: DriverCoreError,
+    scope: &'static str,
+    detail: impl ToString,
+) -> Report<E>
+where
+    E: std::error::Error + Send + Sync + 'static + From<DriverCoreError>,
+{
+    driver_core_error(kind, scope, detail).map_err(E::from)
 }
 
 // ============================================================================

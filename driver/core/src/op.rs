@@ -1,13 +1,22 @@
+use std::error::Error;
+
 use tracing::trace;
 
-use crate::DriverResult;
+use crate::{DriverCoreError, DriverResult};
 use crate::driver::{Driver, PlatformOp, SubmitBinder, SubmitStatus, encode_completion_token};
 
 pub trait DriverProvider: Clone + Unpin {
     type Op: PlatformOp;
     type UP: std::marker::Send;
     type Completion: crate::driver::CompletionValue;
-    type Driver<'a>: crate::driver::Driver<Op = Self::Op, UP = Self::UP, Completion = Self::Completion>
+    type Error:
+        Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
+    type Driver<'a>: crate::driver::Driver<
+        Op = Self::Op,
+        UP = Self::UP,
+        Completion = Self::Completion,
+        Error = Self::Error,
+    >
     where
         Self: 'a;
 
@@ -26,14 +35,19 @@ pub trait OpLifecycle: Sized {
     type Output;
     type Raw: crate::RawHandleMeta;
     type CompletionValue;
+    type Error:
+        Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
 
-    fn pre_alloc(fd: Self::Raw) -> DriverResult<Self::PreAlloc>;
+    fn pre_alloc(fd: Self::Raw) -> DriverResult<Self::PreAlloc, Self::Error>;
 
     fn into_op(fd: Self::Raw, pre: Self::PreAlloc) -> Self;
 
-    fn into_output(self, res: DriverResult<Self::CompletionValue>) -> DriverResult<Self::Output>;
+    fn into_output(
+        self,
+        res: DriverResult<Self::CompletionValue, Self::Error>,
+    ) -> DriverResult<Self::Output, Self::Error>;
 
-    fn prepare_op(fd: Self::Raw) -> DriverResult<Self> {
+    fn prepare_op(fd: Self::Raw) -> DriverResult<Self, Self::Error> {
         let pre = Self::pre_alloc(fd)?;
         Ok(Self::into_op(fd, pre))
     }
@@ -46,6 +60,8 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     type Output;
     type Completion;
     type DriverCompletion: crate::driver::CompletionValue;
+    type Error:
+        Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
     const PAYLOAD_KIND: OpKind;
 
     fn into_kernel_and_payload(self) -> (O, Self::UserPayload);
@@ -56,8 +72,8 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
 
     fn complete(
         payload: Self::UserPayload,
-        res: DriverResult<Self::DriverCompletion>,
-    ) -> OpCompletion<Self::Output, Self::Completion>;
+        res: DriverResult<Self::DriverCompletion, <Self as IntoPlatformOp<O>>::Error>,
+    ) -> OpCompletion<Self::Output, Self::Error, Self::Completion>;
 }
 
 /// A generic wrapper for IO operation data.
@@ -70,9 +86,14 @@ impl<T> Op<T> {
         Self { data }
     }
 
-    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Completion>
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Error, D::Completion>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
+        T: IntoPlatformOp<
+                D::Op,
+                DriverCompletion = D::Completion,
+                ErasedPayload = D::UP,
+                Error = D::Error,
+            >
             + std::marker::Send,
         D: Driver,
     {
@@ -158,7 +179,12 @@ impl<T> Op<T> {
 
     pub fn submit_local<'a, P: DriverProvider>(self, provider: P) -> LocalOp<'a, T, P>
     where
-        T: IntoPlatformOp<P::Op, DriverCompletion = P::Completion, ErasedPayload = P::UP>,
+        T: IntoPlatformOp<
+            P::Op,
+            DriverCompletion = P::Completion,
+            ErasedPayload = P::UP,
+            Error = P::Error,
+        >,
     {
         LocalOp::new(self.data, provider)
     }

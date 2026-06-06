@@ -1,7 +1,7 @@
 use crate::slot;
 use crate::slot::is_runnable_state;
 use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
-use crate::{DriverErrorReport, DriverResult};
+use crate::{DriverCoreError, DriverReport, DriverResult};
 
 use std::sync::Arc;
 use std::task::Poll;
@@ -25,7 +25,7 @@ pub enum DriverControlCommand {
     UnregisterFiles(Vec<IoFd>),
 }
 
-pub type SharedSlotTable<Op, UP, S, C> = Arc<slot::SlotTable<Op, UP, S, C>>;
+pub type SharedSlotTable<Op, UP, S, E, C = usize> = Arc<slot::SlotTable<Op, UP, S, E, C>>;
 
 pub trait Driver {
     type Op: PlatformOp;
@@ -33,10 +33,13 @@ pub trait Driver {
     type Raw: RawHandleMeta;
     type Sidecar: SlotSidecar;
     type Completion: CompletionValue;
+    type Error: std::error::Error + Send + Sync + 'static + From<DriverCoreError>;
 
-    fn reserve_op(&mut self) -> DriverResult<(usize, u32)>;
+    fn reserve_op(&mut self) -> DriverResult<(usize, u32), Self::Error>;
 
-    fn slot_table(&self) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion>;
+    fn slot_table(
+        &self,
+    ) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Error, Self::Completion>;
 
     fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable>;
 
@@ -49,13 +52,13 @@ pub trait Driver {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>>;
+    ) -> Outcome<Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>>;
 
-    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome>;
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error>;
 
     fn completion_queue(&self) -> SharedCompletionQueue;
 
-    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion>;
+    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion>;
 
     fn try_pop_completion(&mut self) -> Option<CompletionEvent> {
         self.completion_queue().pop()
@@ -67,16 +70,21 @@ pub trait Driver {
 
     fn cancel_op(&mut self, user_data: usize);
 
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()>;
+    fn register_chunk(
+        &mut self,
+        id: u16,
+        ptr: *const u8,
+        len: usize,
+    ) -> DriverResult<(), Self::Error>;
 
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, Self::Raw>>,
-    ) -> DriverResult<Vec<IoFd>>;
+    ) -> DriverResult<Vec<IoFd>, Self::Error>;
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()>;
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<(), Self::Error>;
 
-    fn create_waker(&self) -> Arc<dyn RemoteWaker>;
+    fn create_waker(&self) -> Arc<dyn RemoteWaker<Self::Error>>;
 }
 
 impl<D: Driver + ?Sized> Driver for &mut D {
@@ -85,14 +93,17 @@ impl<D: Driver + ?Sized> Driver for &mut D {
     type Raw = D::Raw;
     type Sidecar = D::Sidecar;
     type Completion = D::Completion;
+    type Error = D::Error;
 
     #[inline]
-    fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
+    fn reserve_op(&mut self) -> DriverResult<(usize, u32), Self::Error> {
         (**self).reserve_op()
     }
 
     #[inline]
-    fn slot_table(&self) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion> {
+    fn slot_table(
+        &self,
+    ) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Error, Self::Completion> {
         (**self).slot_table()
     }
 
@@ -117,12 +128,12 @@ impl<D: Driver + ?Sized> Driver for &mut D {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+    ) -> Outcome<Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>> {
         (**self).submit(user_data, op_in, binder)
     }
 
     #[inline]
-    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error> {
         (**self).drive(mode)
     }
 
@@ -132,7 +143,7 @@ impl<D: Driver + ?Sized> Driver for &mut D {
     }
 
     #[inline]
-    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion> {
+    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion> {
         (**self).completion_table()
     }
 
@@ -142,7 +153,12 @@ impl<D: Driver + ?Sized> Driver for &mut D {
     }
 
     #[inline]
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
+    fn register_chunk(
+        &mut self,
+        id: u16,
+        ptr: *const u8,
+        len: usize,
+    ) -> DriverResult<(), Self::Error> {
         (**self).register_chunk(id, ptr, len)
     }
 
@@ -150,17 +166,17 @@ impl<D: Driver + ?Sized> Driver for &mut D {
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, Self::Raw>>,
-    ) -> DriverResult<Vec<IoFd>> {
+    ) -> DriverResult<Vec<IoFd>, Self::Error> {
         (**self).register_files(files)
     }
 
     #[inline]
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<(), Self::Error> {
         (**self).unregister_files(files)
     }
 
     #[inline]
-    fn create_waker(&self) -> Arc<dyn RemoteWaker> {
+    fn create_waker(&self) -> Arc<dyn RemoteWaker<Self::Error>> {
         (**self).create_waker()
     }
 }
@@ -192,14 +208,17 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     type Raw = D::Raw;
     type Sidecar = D::Sidecar;
     type Completion = D::Completion;
+    type Error = D::Error;
 
     #[inline]
-    fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
+    fn reserve_op(&mut self) -> DriverResult<(usize, u32), Self::Error> {
         self.provider.with_driver_mut(|d| d.reserve_op())
     }
 
     #[inline]
-    fn slot_table(&self) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion> {
+    fn slot_table(
+        &self,
+    ) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Error, Self::Completion> {
         self.provider.with_driver_ref(|d| d.slot_table())
     }
 
@@ -226,13 +245,13 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+    ) -> Outcome<Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>> {
         self.provider
             .with_driver_mut(|d| d.submit(user_data, op_in, binder))
     }
 
     #[inline]
-    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error> {
         self.provider.with_driver_mut(|d| d.drive(mode))
     }
 
@@ -242,7 +261,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 
     #[inline]
-    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion> {
+    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion> {
         self.provider.with_driver_ref(|d| d.completion_table())
     }
 
@@ -252,7 +271,12 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 
     #[inline]
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
+    fn register_chunk(
+        &mut self,
+        id: u16,
+        ptr: *const u8,
+        len: usize,
+    ) -> DriverResult<(), Self::Error> {
         self.provider
             .with_driver_mut(|d| d.register_chunk(id, ptr, len))
     }
@@ -261,17 +285,17 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, Self::Raw>>,
-    ) -> DriverResult<Vec<IoFd>> {
+    ) -> DriverResult<Vec<IoFd>, Self::Error> {
         self.provider.with_driver_mut(|d| d.register_files(files))
     }
 
     #[inline]
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<(), Self::Error> {
         self.provider.with_driver_mut(|d| d.unregister_files(files))
     }
 
     #[inline]
-    fn create_waker(&self) -> Arc<dyn RemoteWaker> {
+    fn create_waker(&self) -> Arc<dyn RemoteWaker<Self::Error>> {
         self.provider.with_driver_ref(|d| d.create_waker())
     }
 }
@@ -312,8 +336,11 @@ pub struct DriveOutcome {
     pub pending_progress: bool,
 }
 
-pub trait RemoteWaker: Send + Sync {
-    fn wake(&self) -> DriverResult<()>;
+pub trait RemoteWaker<E>: Send + Sync
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn wake(&self) -> DriverResult<(), E>;
 }
 
 #[must_use]
@@ -345,19 +372,25 @@ impl SubmitBinder {
     }
 
     #[inline]
-    pub fn ok(
+    pub fn ok<E>(
         self,
         poll: Poll<()>,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+    ) -> Outcome<Result<Poll<()>, (DriverReport<E>, SubmitStatus)>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
         Outcome(Ok(poll))
     }
 
     #[inline]
-    pub fn err(
+    pub fn err<E>(
         self,
-        err: DriverErrorReport,
+        err: DriverReport<E>,
         status: SubmitStatus,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+    ) -> Outcome<Result<Poll<()>, (DriverReport<E>, SubmitStatus)>>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
         Outcome(Err((err, status)))
     }
 }

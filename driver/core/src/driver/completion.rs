@@ -1,8 +1,9 @@
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
 use crate::slot;
-use crate::{DriverErrorKind, DriverResult};
+use crate::{DriverCoreError, DriverResult};
 use crossbeam_queue::SegQueue;
+use std::error::Error;
 use std::sync::Arc;
 use std::task::Waker;
 use veloq_shim::atomic::Ordering;
@@ -10,32 +11,37 @@ use veloq_shim::atomic::Ordering;
 use diagweave::prelude::*;
 
 pub trait CompletionValue: Send {
-    fn from_event_res(res: i32) -> DriverResult<Self>
+    fn from_event_res<E>(res: i32) -> DriverResult<Self, E>
     where
-        Self: Sized;
+        Self: Sized,
+        E: Error + Send + Sync + 'static + From<DriverCoreError>;
 }
 
 impl CompletionValue for usize {
     #[inline]
-    fn from_event_res(res: i32) -> DriverResult<Self> {
+    fn from_event_res<E>(res: i32) -> DriverResult<Self, E>
+    where
+        E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    {
         if res >= 0 {
             Ok(res as usize)
         } else {
-            DriverErrorKind::System
+            DriverCoreError::System
                 .with_ctx("scope", "driver-core/completion")
                 .set_error_code(-res)
                 .attach_note("completion reported OS error")
+                .map_inner_err(E::from)
         }
     }
 }
 
-pub struct CompletionSidecar<UP, R = usize> {
+pub struct CompletionSidecar<UP, E, R = usize> {
     pub user_data: usize,
     pub generation: u32,
     pub res: i32,
     pub flags: u32,
     pub payload: Option<UP>,
-    pub detail: Option<DriverResult<R>>,
+    pub detail: Option<DriverResult<R, E>>,
 }
 
 /// Unified completion event produced by platform drivers.
@@ -50,36 +56,36 @@ pub struct CompletionEvent {
 }
 
 pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
-pub type SharedCompletionTable<UP, R = usize> = Arc<dyn CompletionAccess<UP, R>>;
+pub type SharedCompletionTable<UP, E, R = usize> = Arc<dyn CompletionAccess<UP, E, R>>;
 
-pub struct CompletionRecord<UP, R = usize> {
+pub struct CompletionRecord<UP, E, R = usize> {
     pub event: CompletionEvent,
     pub payload: Option<UP>,
-    pub detail: Option<DriverResult<R>>,
+    pub detail: Option<DriverResult<R, E>>,
 }
 
 /// Result of a completion poll, enabling detection of recycled slots.
-pub enum PollRecordResult<UP, R = usize> {
+pub enum PollRecordResult<UP, E, R = usize> {
     /// Operation completed successfully or with an error.
-    Ready(CompletionRecord<UP, R>),
+    Ready(CompletionRecord<UP, E, R>),
     /// Operation is still in flight.
     Pending,
     /// Operation lost because the slot has been recycled for a newer generation.
     Stale,
 }
 
-pub trait CompletionAccess<UP, R = usize>: Send + Sync {
+pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
     fn record_completion_with_data(
         &self,
         event: CompletionEvent,
         payload: Option<UP>,
-        detail: Option<DriverResult<R>>,
+        detail: Option<DriverResult<R, E>>,
     );
 
-    fn try_take_record(&self, token: u64) -> PollRecordResult<UP, R>;
+    fn try_take_record(&self, token: u64) -> PollRecordResult<UP, E, R>;
 
     #[inline]
-    fn try_take(&self, token: u64) -> PollRecordResult<UP, R> {
+    fn try_take(&self, token: u64) -> PollRecordResult<UP, E, R> {
         self.try_take_record(token)
     }
 
@@ -106,7 +112,11 @@ pub fn decode_completion_token(token: u64) -> (usize, u32) {
 }
 
 #[inline]
-pub fn event_res_to_result<R: CompletionValue>(res: i32) -> DriverResult<R> {
+pub fn event_res_to_result<R, E>(res: i32) -> DriverResult<R, E>
+where
+    R: CompletionValue,
+    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+{
     R::from_event_res(res)
 }
 
@@ -116,15 +126,15 @@ pub const CELL_STATE_READY: u8 = 2;
 pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
 
-impl<Op: PlatformOp, UP: Send, S: SlotSidecar, R: Send> CompletionAccess<UP, R>
-    for slot::SlotTable<Op, UP, S, R>
+impl<Op: PlatformOp, UP: Send, S: SlotSidecar, E: Send, R: Send> CompletionAccess<UP, E, R>
+    for slot::SlotTable<Op, UP, S, E, R>
 {
     #[inline]
     fn record_completion_with_data(
         &self,
         event: CompletionEvent,
         mut payload: Option<UP>,
-        mut detail: Option<DriverResult<R>>,
+        mut detail: Option<DriverResult<R, E>>,
     ) {
         let (idx, generation) = decode_completion_token(event.user_data);
         if idx >= self.slots.len() {
@@ -253,7 +263,7 @@ impl<Op: PlatformOp, UP: Send, S: SlotSidecar, R: Send> CompletionAccess<UP, R>
     }
 
     #[inline]
-    fn try_take_record(&self, token: u64) -> PollRecordResult<UP, R> {
+    fn try_take_record(&self, token: u64) -> PollRecordResult<UP, E, R> {
         let (idx, generation) = decode_completion_token(token);
         if idx >= self.slots.len() {
             return PollRecordResult::Pending;
