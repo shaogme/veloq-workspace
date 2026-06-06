@@ -19,7 +19,6 @@ use crate::rio::core::registry::RioRegistry;
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, RioTarget};
 use diagweave::prelude::*;
-use tracing::error;
 
 impl RioState {
     pub(crate) fn new(
@@ -114,16 +113,17 @@ impl RioState {
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
-            let diag = format!(
-                "submit_recv_internal: fd={fd:?}, handle={:?}, rq_raw=0x{:x}, buffer_id=0x{:x}, buffer_offset={}, buffer_length={}, outstanding_count={}",
-                handle.raw().as_handle(),
-                rq.0 as usize,
-                rio_buf.BufferId as usize,
-                rio_buf.Offset,
-                rio_buf.Length,
-                self.outstanding_count,
-            );
-            return Err(e.attach_note(diag));
+            return Err(e
+                .with_ctx("scope", "rio.core.submit_ops.try_submit_recv_internal")
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("rq_raw", rq.0 as usize)
+                .with_ctx("buffer_id", rio_buf.BufferId as usize)
+                .with_ctx("buffer_offset", rio_buf.Offset)
+                .with_ctx("buffer_length", rio_buf.Length)
+                .with_ctx("outstanding_count", self.outstanding_count)
+                .attach_note("RIOReceive submit failed"));
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
@@ -157,14 +157,11 @@ impl RioState {
         let rq = {
             let actor = self
                 .ensure_actor((fd, handle), env)
-                .map_err(|e| {
-                    let diag = format!(
-                        "submit_send_ensure_actor: fd={fd:?}, handle={:?}, outstanding_count={}",
-                        handle.raw().as_handle(),
-                        outstanding_snapshot,
-                    );
-                    e.attach_note(diag)
-                })
+                .with_ctx("scope", "rio.core.submit_ops.try_submit_send.ensure_actor")
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("outstanding_count", outstanding_snapshot)
                 .attach_note("failed to ensure RIO actor")?;
 
             actor.rq
@@ -181,27 +178,17 @@ impl RioState {
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
-            let diag = format!(
-                "submit_send_internal: fd={fd:?}, handle={:?}, rq_raw=0x{:x}, buffer_id=0x{:x}, buffer_offset={}, buffer_length={}, outstanding_count={}",
-                handle.raw().as_handle(),
-                rq.0 as usize,
-                rio_buf.BufferId as usize,
-                rio_buf.Offset,
-                rio_buf.Length,
-                self.outstanding_count,
-            );
-            error!(
-                fd = ?fd,
-                handle = ?handle.raw().as_handle(),
-                rq_raw = rq.0 as usize,
-                buffer_id = rio_buf.BufferId as usize,
-                buffer_offset = rio_buf.Offset,
-                buffer_length = rio_buf.Length,
-                outstanding_count = self.outstanding_count,
-                rio_error = %e,
-                "RIOSend submit failed diagnostics"
-            );
-            return Err(e.attach_note(diag));
+            return Err(e
+                .with_ctx("scope", "rio.core.submit_ops.try_submit_send")
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("rq_raw", rq.0 as usize)
+                .with_ctx("buffer_id", rio_buf.BufferId as usize)
+                .with_ctx("buffer_offset", rio_buf.Offset)
+                .with_ctx("buffer_length", rio_buf.Length)
+                .with_ctx("outstanding_count", self.outstanding_count)
+                .attach_note("RIOSend submit failed"));
         }
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)

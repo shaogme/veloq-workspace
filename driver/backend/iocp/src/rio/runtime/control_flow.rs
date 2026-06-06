@@ -13,7 +13,6 @@ use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioCompletionContext, RioEnv, RioState, SocketRuntimeMode, SocketRuntimeState};
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
-use tracing::error;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
@@ -191,38 +190,24 @@ impl RioState {
                 .attach_note("failed to retrieve indexed actor");
         }
 
-        let rq = match self.registry.create_rq((handle, fd), env) {
-            Ok(rq) => rq,
-            Err(e) => {
-                let diag = format!(
-                    "ensure_actor_create_rq: fd={fd:?}, handle={:?}, socket_raw=0x{:x}, rq_depth={}, max_outstanding_recvs={}, max_outstanding_sends={}, max_receive_data_buffers=1, max_send_data_buffers=1, outstanding_count={}, actors_len={}, actor_index_hit={}",
-                    handle.raw().as_handle(),
-                    handle.raw().as_handle() as usize,
-                    self.registry.rq_depth,
-                    self.registry.rq_depth,
-                    self.registry.rq_depth,
-                    self.outstanding_count,
-                    self.actors.len(),
-                    self.actor_by_handle.contains_key(&socket_key),
-                );
-                error!(
-                    fd = ?fd,
-                    handle = ?handle.raw().as_handle(),
-                    socket_raw = handle.raw().as_handle() as usize,
-                    rq_depth = self.registry.rq_depth,
-                    max_outstanding_recvs = self.registry.rq_depth,
-                    max_outstanding_sends = self.registry.rq_depth,
-                    max_receive_data_buffers = 1_u32,
-                    max_send_data_buffers = 1_u32,
-                    outstanding_count = self.outstanding_count,
-                    actors_len = self.actors.len(),
-                    actor_index_hit = self.actor_by_handle.contains_key(&socket_key),
-                    rio_error = %e,
-                    "RIOCreateRequestQueue failed diagnostics"
-                );
-                return Err(e.attach_note(diag));
-            }
-        };
+        let rq = self.registry.create_rq((handle, fd), env)
+            .with_ctx("scope", "rio.runtime.control_flow.ensure_actor")
+            .with_ctx("fd_fixed_index", fd.fixed_index())
+            .with_ctx("fd_generation", fd.generation())
+            .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+            .with_ctx("socket_raw", handle.raw().as_handle() as usize)
+            .with_ctx("rq_depth", self.registry.rq_depth)
+            .with_ctx("max_outstanding_recvs", self.registry.rq_depth)
+            .with_ctx("max_outstanding_sends", self.registry.rq_depth)
+            .with_ctx("max_receive_data_buffers", 1_u32)
+            .with_ctx("max_send_data_buffers", 1_u32)
+            .with_ctx("outstanding_count", self.outstanding_count)
+            .with_ctx("actors_len", self.actors.len())
+            .with_ctx(
+                "actor_index_hit",
+                self.actor_by_handle.contains_key(&socket_key),
+            )
+            .attach_note("RIOCreateRequestQueue failed")?;
 
         let actor = RioSocketActor::new(rq);
         let key = self.actors.insert(actor);
