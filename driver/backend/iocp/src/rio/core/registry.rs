@@ -194,7 +194,7 @@ impl RioRegistry {
                 let id = env
                     .dispatch
                     .register_buffer(ptr, len as u32)
-                    .attach_note(format!(
+                    .attach_note_lazy(|| format!(
                         "RIORegisterBuffer failed for slab page: page_idx={page_idx}, len={len}"
                     ))?;
                 self.slab_rio_pages[page_idx] = Some((id, ptr as usize, len));
@@ -238,7 +238,7 @@ impl RioRegistry {
                 );
                 e.attach_note(diag)
             })
-            .attach_note(format!(
+            .attach_note_lazy(|| format!(
                 "RIOCreateRequestQueue failed: fd={fd:?}, handle={handle:?}, rq_depth={}",
                 self.rq_depth,
                 handle = handle.raw().as_handle()

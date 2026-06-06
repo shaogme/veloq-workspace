@@ -134,7 +134,7 @@ impl<'a> IocpDriver<'a> {
 
         let port_handle = port_val.as_raw();
         debug!(port = ?port_handle, "Initializing IocpDriver");
-        let extensions = crate::ext::Extensions::new().attach_note(format!(
+        let extensions = crate::ext::Extensions::new().attach_note_lazy(|| format!(
             "failed to load IOCP extensions, port={port_handle:?}"
         ))?;
         let rio_state = RioState::new(
@@ -143,7 +143,7 @@ impl<'a> IocpDriver<'a> {
             &extensions,
             registration_mode,
         )
-        .attach_note(format!(
+        .attach_note_lazy(|| format!(
             "failed to initialize RIO state, entries={entries}, port={port_handle:?}"
         ))
         .trans()?;

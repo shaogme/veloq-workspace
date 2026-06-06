@@ -64,7 +64,7 @@ pub(crate) fn submit_recv(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_recv")
-            .attach_note(format!(
+            .attach_note_lazy(|| format!(
                 "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, user_data, generation
             ))
@@ -101,7 +101,7 @@ pub(crate) fn submit_udp_recv(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_udp_recv")
-            .attach_note(format!(
+            .attach_note_lazy(|| format!(
                 "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, header.user_data, header.generation
             ))
@@ -137,7 +137,7 @@ pub(crate) fn submit_send(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_send")
-            .attach_note(format!(
+            .attach_note_lazy(|| format!(
                 "RIO send submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, user_data, generation
             ))
@@ -173,7 +173,7 @@ pub(crate) fn submit_udp_send(
                 ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_udp_send")
-            .attach_note(format!(
+            .attach_note_lazy(|| format!(
                 "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
                 val.fd, user_data, generation
             ))
@@ -286,7 +286,7 @@ fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> IocpResult<u16> {
     })?;
     match storage.family() {
         AF_INET | AF_INET6 => Ok(storage.family()),
-        family => IocpError::InvalidInput.attach_note(format!(
+        family => IocpError::InvalidInput.attach_note_lazy(|| format!(
             "unsupported listen socket family for accept: {family}",
         )),
     }
@@ -361,7 +361,7 @@ pub(crate) fn submit_accept(
             crate::Socket::new_tcp_v6()
         }
         .map(|s| s.into_owned_raw())
-        .attach_note(format!(
+        .attach_note_lazy(|| format!(
             "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
             handle.raw().as_handle() as usize,
             family
@@ -402,7 +402,7 @@ pub(crate) fn submit_accept(
             lp_overlapped: ctx.overlapped,
         })
     }
-    .attach_note(format!(
+    .attach_note_lazy(|| format!(
         "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
         handle.raw().as_handle() as usize,
         accept_socket_raw,
@@ -440,7 +440,7 @@ pub(crate) unsafe fn on_complete_accept(
     if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
         socket.setsockopt(SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_socket)
     }) {
-        return Err(e.attach_note(format!(
+        return Err(e.attach_note_lazy(|| format!(
             "on_complete_accept: setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed: accept_socket=0x{:x}, listen_socket=0x{:x}, optlen={}",
             accept_socket_raw,
             listen_socket,
@@ -511,7 +511,7 @@ pub(crate) fn submit_send_to(
         ctx.rio
             .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
             .with_ctx("outer_scope", "submit_send_to")
-            .attach_note(format!(
+            .attach_note_lazy(|| format!(
                 "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
                 user.fd, header.user_data, header.generation, page_idx
             ))
@@ -553,7 +553,7 @@ pub(crate) fn submit_udp_recv_from(
         ctx.rio
             .try_submit_recv_from(args, ctx.registrar, ctx.slab_resolver)
             .with_ctx("outer_scope", "submit_udp_recv_from")
-            .attach_note(format!(
+            .attach_note_lazy(|| format!(
                 "RIO udp_recv_from submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
                 fd, header.user_data, header.generation, page_idx
             )).trans(),
