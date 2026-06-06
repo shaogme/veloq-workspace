@@ -4,15 +4,10 @@ use crate::op::{UringOp, UringOpPayload, UringUserPayload};
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use veloq_buf::PoolKind;
-use veloq_driver_core::{DriverCoreError, driver_error};
 
 #[inline]
 fn payload_variant_mismatch(scope: &'static str) -> Report<UringError> {
-    driver_error(
-        DriverCoreError::InvalidState,
-        scope,
-        "UringOpPayload variant mismatch",
-    )
+    UringError::InvalidState.report(scope, "UringOpPayload variant mismatch")
 }
 
 macro_rules! impl_lifecycle {
@@ -37,11 +32,12 @@ macro_rules! impl_default_completion {
             if result >= 0 {
                 Ok(result as usize)
             } else {
-                DriverCoreError::Completion
-                    .with_ctx("scope", concat!("uring.op.submit.", stringify!($fn_name)))
-                    .set_error_code(-result)
-                    .attach_note("kernel completion returned error")
-                    .map_inner_err(UringError::from)
+                Err(UringError::CompletionWait
+                    .report(
+                        concat!("uring.op.submit.", stringify!($fn_name)),
+                        "kernel completion returned error",
+                    )
+                    .set_error_code(-result))
             }
         }
     };
@@ -55,11 +51,12 @@ pub(crate) unsafe fn on_complete_default(
     if result >= 0 {
         Ok(result as usize)
     } else {
-        DriverCoreError::Completion
-            .with_ctx("scope", "uring.op.submit.on_complete_default")
-            .set_error_code(-result)
-            .attach_note("kernel completion returned error")
-            .map_inner_err(UringError::from)
+        Err(UringError::CompletionWait
+            .report(
+                "uring.op.submit.on_complete_default",
+                "kernel completion returned error",
+            )
+            .set_error_code(-result))
     }
 }
 
@@ -446,18 +443,18 @@ pub(crate) unsafe fn on_complete_accept(
     result: i32,
 ) -> DriverResult<usize> {
     if result < 0 {
-        return DriverCoreError::Completion
-            .with_ctx("scope", "uring.op.submit.on_complete_accept")
-            .set_error_code(-result)
-            .attach_note("kernel completion returned error")
-            .map_inner_err(UringError::from);
+        return Err(UringError::CompletionWait
+            .report(
+                "uring.op.submit.on_complete_accept",
+                "kernel completion returned error",
+            )
+            .set_error_code(-result));
     }
 
     let accept_op = match payload {
         crate::op::UringUserPayload::Accept(p) => p,
         _ => {
-            return Err(driver_error(
-                DriverCoreError::InvalidState,
+            return Err(UringError::InvalidState.report(
                 "uring.op.submit.on_complete_accept",
                 "payload variant mismatch for accept",
             ));
@@ -573,18 +570,18 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
     result: i32,
 ) -> DriverResult<usize> {
     if result < 0 {
-        return DriverCoreError::Completion
-            .with_ctx("scope", "uring.op.submit.on_complete_udp_recv_from")
-            .set_error_code(-result)
-            .attach_note("kernel completion returned error")
-            .map_inner_err(UringError::from);
+        return Err(UringError::CompletionWait
+            .report(
+                "uring.op.submit.on_complete_udp_recv_from",
+                "kernel completion returned error",
+            )
+            .set_error_code(-result));
     }
 
     let user = match payload {
         crate::op::UringUserPayload::UdpRecvFrom(p) => p,
         _ => {
-            return Err(driver_error(
-                DriverCoreError::InvalidState,
+            return Err(UringError::InvalidState.report(
                 "uring.op.submit.on_complete_udp_recv_from",
                 "payload variant mismatch for udp_recv_from",
             ));
@@ -717,8 +714,7 @@ pub(crate) unsafe fn make_sqe_sync_range(
         if sync_op.nbytes == u64::MAX {
             0
         } else {
-            return Err(driver_error(
-                DriverCoreError::InvalidInput,
+            return Err(UringError::InvalidInput.report(
                 "uring.op.submit.make_sqe_sync_range",
                 format!(
                     "sync_file_range: nbytes ({}) exceeds 32-bit limit and is not u64::MAX (0)",
@@ -765,8 +761,7 @@ pub(crate) unsafe fn make_sqe_sync_range_raw(
         if sync_op.nbytes == u64::MAX {
             0
         } else {
-            return Err(driver_error(
-                DriverCoreError::InvalidInput,
+            return Err(UringError::InvalidInput.report(
                 "uring.op.submit.make_sqe_sync_range_raw",
                 format!(
                     "sync_file_range: nbytes ({}) exceeds 32-bit limit and is not u64::MAX (0)",

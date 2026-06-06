@@ -1,7 +1,7 @@
 use crate::slot;
 use crate::slot::is_runnable_state;
 use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
-use crate::{DriverCoreError, DriverReport, DriverResult};
+use crate::{DriverError, DriverReport, DriverResult};
 
 use std::sync::Arc;
 use std::task::Poll;
@@ -41,7 +41,7 @@ pub trait Driver {
     type Raw: RawHandleMeta;
     type Sidecar: SlotSidecar;
     type Completion: CompletionValue;
-    type Error: std::error::Error + Send + Sync + 'static + From<DriverCoreError>;
+    type Error: DriverError;
 
     fn reserve_op(&mut self) -> DriverResult<(usize, u32), Self::Error>;
 

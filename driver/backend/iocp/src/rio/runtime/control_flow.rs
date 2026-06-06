@@ -14,7 +14,6 @@ use crate::rio::{RioCompletionContext, RioEnv, RioState, SocketRuntimeMode, Sock
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::error;
-use veloq_driver_core::DriverCoreError;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
@@ -84,11 +83,11 @@ impl<'a> RioCompletionRouter<'a> {
                     let mut completion = if res.Status == 0 {
                         Ok(res.BytesTransferred as usize)
                     } else {
-                        DriverCoreError::Completion
+                        Err(IocpError::CompletionWait
+                            .to_report()
                             .with_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
                             .set_error_code(res.Status)
-                            .attach_note("rio completion returned os error")
-                            .map_inner_err(IocpError::from)
+                            .attach_note("rio completion returned os error"))
                     };
                     let socket_key = slot
                         .with_op_mut(|iocp_op| {

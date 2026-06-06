@@ -21,9 +21,7 @@ use veloq_driver_core::driver::{
     RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::slot::{DetachedCancelTable, SlotTable};
-use veloq_driver_core::{
-    DriverCoreError, DriverReport, DriverResult as CoreDriverResult, driver_error,
-};
+use veloq_driver_core::{DriverReport, DriverResult as CoreDriverResult};
 use veloq_wheel::{Wheel, WheelConfig};
 
 use diagweave::prelude::*;
@@ -200,11 +198,7 @@ impl<'a> Driver for IocpDriver<'a> {
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::default())) {
             Ok(handle) => (handle.index, handle.generation),
             Err(_) => {
-                return Err(driver_error(
-                    DriverCoreError::Registration,
-                    "iocp/driver",
-                    "OpRegistry is full",
-                ));
+                return Err(IocpError::Registration.report("iocp/driver", "OpRegistry is full"));
             }
         };
         trace!(user_data, generation, "Reserved op slot");
@@ -252,12 +246,11 @@ impl<'a> Driver for IocpDriver<'a> {
     > {
         if self.shutting_down {
             return binder.err(
-                DriverCoreError::System
+                IocpError::Internal
                     .to_report()
                     .with_ctx("scope", "iocp/driver")
                     .set_error_code(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
-                    .attach_note("driver is shutting down")
-                    .map_err(IocpError::from),
+                    .attach_note("driver is shutting down"),
                 SubmitStatus::Void,
             );
         }
@@ -265,11 +258,8 @@ impl<'a> Driver for IocpDriver<'a> {
             Some(op) => op,
             None => {
                 return binder.err(
-                    DriverCoreError::InvalidInput
-                        .to_report()
-                        .with_ctx("scope", "iocp/driver")
-                        .attach_note("submit called with empty option")
-                        .map_err(IocpError::from),
+                    IocpError::InvalidInput
+                        .report("iocp/driver", "submit called with empty option"),
                     SubmitStatus::Void,
                 );
             }
@@ -302,7 +292,7 @@ impl<'a> Driver for IocpDriver<'a> {
         match mode {
             DriveMode::Poll => {
                 self.get_completion(0).to_driver_result(
-                    DriverCoreError::Completion,
+                    IocpError::CompletionWait,
                     "iocp/driver.drive.poll",
                     "drive(Poll) failed",
                 )?;
@@ -317,7 +307,7 @@ impl<'a> Driver for IocpDriver<'a> {
                     });
                 }
                 self.get_completion(u32::MAX).to_driver_result(
-                    DriverCoreError::Completion,
+                    IocpError::CompletionWait,
                     "iocp/driver.drive.wait",
                     "wait for completion failed",
                 )?;

@@ -1,5 +1,7 @@
+use core::convert::TryFrom;
+
 use diagweave::prelude::*;
-use veloq_driver_core::{DriverCoreError, DriverResult};
+use veloq_driver_core::{DriverCoreError, DriverError, DriverResult};
 
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -32,6 +34,14 @@ pub type UringDriverResult<T> = DriverResult<T, UringError>;
 
 impl UringError {
     #[inline]
+    pub(crate) fn report(self, scope: &'static str, detail: impl ToString) -> Report<Self> {
+        self.to_report()
+            .set_error_code(uring_fallback_errno(self))
+            .with_ctx("scope", scope)
+            .attach_note(detail.to_string())
+    }
+
+    #[inline]
     pub(crate) fn io_report<E>(self, scope: &'static str, error: E) -> Report<Self>
     where
         E: std::error::Error + Send + Sync + 'static,
@@ -54,25 +64,53 @@ impl UringError {
     }
 }
 
-impl From<DriverCoreError> for UringError {
-    fn from(kind: DriverCoreError) -> Self {
-        match kind {
-            DriverCoreError::InvalidInput => Self::InvalidInput,
-            DriverCoreError::InvalidState => Self::InvalidState,
-            DriverCoreError::Submission => Self::Submission,
-            DriverCoreError::Completion | DriverCoreError::Timeout => Self::CompletionWait,
-            DriverCoreError::Registration => Self::Registration,
-            DriverCoreError::Socket => Self::Socket,
-            DriverCoreError::Unsupported => Self::Unsupported,
-            DriverCoreError::Internal | DriverCoreError::System => Self::Internal,
-        }
+impl DriverError for UringError {
+    #[inline]
+    fn from_core_report(report: Report<DriverCoreError>) -> Report<Self> {
+        let kind = *report.inner();
+        report
+            .with_ctx("driver_core_kind", kind.to_string())
+            .map_err(|_| Self::Internal)
     }
+}
+
+#[inline]
+fn neg_code(code: i32) -> Option<i32> {
+    (code != 0).then_some(-code.abs())
+}
+
+#[inline]
+pub(crate) fn uring_fallback_errno(kind: UringError) -> i32 {
+    match kind {
+        UringError::DriverInit => 5,     // EIO
+        UringError::CompletionWait => 5, // EIO
+        UringError::Submission => 11,    // EAGAIN
+        UringError::Registration => 12,  // ENOMEM
+        UringError::ResolveFd => 9,      // EBADF
+        UringError::Socket => 5,         // EIO
+        UringError::InvalidInput => 22,  // EINVAL
+        UringError::InvalidState => 5,   // EIO
+        UringError::Unsupported => 95,   // EOPNOTSUPP
+        UringError::Internal => 5,       // EIO
+    }
+}
+
+#[inline]
+pub(crate) fn uring_report_to_event_res(report: &Report<UringError>) -> i32 {
+    if let Some(code) = report
+        .error_code()
+        .and_then(|code| i32::try_from(code).ok())
+        && let Some(res) = neg_code(code)
+    {
+        return res;
+    }
+    -uring_fallback_errno(*report.inner())
 }
 
 pub(crate) trait UringResultExt<T> {
     fn to_driver_result(
         self,
-        kind: DriverCoreError,
+        kind: UringError,
         scope: &'static str,
         detail: impl ToString,
     ) -> DriverResult<T, UringError>;
@@ -81,7 +119,7 @@ pub(crate) trait UringResultExt<T> {
 impl<T> UringResultExt<T> for UringResult<T> {
     fn to_driver_result(
         self,
-        kind: DriverCoreError,
+        kind: UringError,
         scope: &'static str,
         detail: impl ToString,
     ) -> DriverResult<T, UringError> {
@@ -91,6 +129,7 @@ impl<T> UringResultExt<T> for UringResult<T> {
             report
                 .set_accumulate_src_chain(true)
                 .with_ctx("scope", scope)
+                .with_ctx("driver_error_kind", kind.to_string())
                 .attach_note(detail)
                 .attach_note("driver error report captured")
         })

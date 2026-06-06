@@ -20,9 +20,7 @@ use veloq_driver_core::driver::{
     SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
-use veloq_driver_core::{
-    DriverCoreError, DriverReport, DriverResult as CoreDriverResult, driver_error,
-};
+use veloq_driver_core::{DriverReport, DriverResult as CoreDriverResult};
 
 mod completion;
 mod lifecycle;
@@ -59,12 +57,11 @@ impl RemoteWaker<UringError> for UringWaker {
                 if err.raw_os_error() == Some(libc::EAGAIN) {
                     return Ok(());
                 }
-                return Err(DriverCoreError::System
+                return Err(UringError::Internal
                     .to_report()
                     .with_ctx("scope", "uring.driver.waker.wake")
                     .set_error_code(err.raw_os_error().unwrap_or(libc::EIO))
-                    .attach_note(err.to_string())
-                    .map_err(UringError::from));
+                    .attach_note(err.to_string()));
             }
         }
         Ok(())
@@ -73,23 +70,23 @@ impl RemoteWaker<UringError> for UringWaker {
 
 #[inline]
 pub(crate) fn invalid_state(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::InvalidState).attach_note(format!("{scope}: {}", msg.into()))
+    UringError::InvalidState.report(scope, msg.into())
 }
 
 #[inline]
 pub(crate) fn invalid_input(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::InvalidInput).attach_note(format!("{scope}: {}", msg.into()))
+    UringError::InvalidInput.report(scope, msg.into())
 }
 
 #[inline]
 pub(crate) fn unsupported(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::Unsupported).attach_note(format!("{scope}: {}", msg.into()))
+    UringError::Unsupported.report(scope, msg.into())
 }
 
 #[inline]
 pub(crate) fn map_uring_error(
     report: Report<UringError>,
-    kind: DriverCoreError,
+    kind: UringError,
     scope: &'static str,
     detail: impl ToString,
 ) -> DriverErrorReport {
@@ -97,7 +94,7 @@ pub(crate) fn map_uring_error(
     report
         .set_accumulate_src_chain(true)
         .with_ctx("scope", scope)
-        .with_ctx("driver_core_kind", kind.to_string())
+        .with_ctx("driver_error_kind", kind.to_string())
         .attach_note(detail_text)
 }
 
@@ -259,11 +256,9 @@ impl<'a> Driver for UringDriver<'a> {
                 self.ops.slot_reserve(id);
                 Ok((id, generation))
             }
-            Err(_) => Err(driver_error(
-                DriverCoreError::InvalidState,
-                "uring.driver.reserve_op",
-                "OpRegistry full",
-            )),
+            Err(_) => {
+                Err(UringError::InvalidState.report("uring.driver.reserve_op", "OpRegistry full"))
+            }
         }
     }
 
@@ -311,7 +306,7 @@ impl<'a> Driver for UringDriver<'a> {
             return binder.err(
                 map_uring_error(
                     invalid_state("driver.submit", "submit called with empty Option"),
-                    DriverCoreError::InvalidState,
+                    UringError::InvalidState,
                     "uring.driver.submit",
                     "submit called with empty Option",
                 ),
@@ -323,8 +318,7 @@ impl<'a> Driver for UringDriver<'a> {
         if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
             *op_in = Some(op);
             return binder.err(
-                driver_error(
-                    DriverCoreError::Unsupported,
+                UringError::Unsupported.report(
                     "uring.driver.submit",
                     "background op cannot be submitted normally",
                 ),
@@ -339,7 +333,7 @@ impl<'a> Driver for UringDriver<'a> {
                         "driver.submit",
                         "background strategy reached normal submit path",
                     ),
-                    DriverCoreError::InvalidState,
+                    UringError::InvalidState,
                     "uring.driver.submit",
                     "background strategy reached normal submit path",
                 ),
@@ -358,7 +352,7 @@ impl<'a> Driver for UringDriver<'a> {
         match mode {
             DriveMode::Poll => {
                 self.poll_nonblocking_internal().to_driver_result(
-                    DriverCoreError::Completion,
+                    UringError::CompletionWait,
                     "uring.driver.drive.poll",
                     "poll completions",
                 )?;
@@ -373,7 +367,7 @@ impl<'a> Driver for UringDriver<'a> {
                     });
                 }
                 self.wait_internal().to_driver_result(
-                    DriverCoreError::Completion,
+                    UringError::CompletionWait,
                     "uring.driver.drive.wait",
                     "wait for completions",
                 )?;
@@ -402,7 +396,7 @@ impl<'a> Driver for UringDriver<'a> {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
         self.register_chunk_internal(id, ptr, len).to_driver_result(
-            DriverCoreError::Registration,
+            UringError::Registration,
             "uring.driver.register_chunk",
             "register chunk",
         )
@@ -413,7 +407,7 @@ impl<'a> Driver for UringDriver<'a> {
         files: Vec<RegisterFd<'f, UringRawHandle>>,
     ) -> DriverResult<Vec<IoFd>> {
         self.register_files_internal(files).to_driver_result(
-            DriverCoreError::Registration,
+            UringError::Registration,
             "uring.driver.register_files",
             "register files",
         )
@@ -422,7 +416,7 @@ impl<'a> Driver for UringDriver<'a> {
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
         for fd in files {
             self.unregister_fixed_fd(fd).to_driver_result(
-                DriverCoreError::Registration,
+                UringError::Registration,
                 "uring.driver.unregister_files",
                 "unregister fixed fd",
             )?;

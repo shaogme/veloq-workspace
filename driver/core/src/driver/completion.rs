@@ -1,9 +1,8 @@
 use crate::SlotSidecar;
 use crate::driver::PlatformOp;
 use crate::slot;
-use crate::{DriverCoreError, DriverResult};
+use crate::{DriverCoreError, DriverError, DriverResult};
 use crossbeam_queue::SegQueue;
-use std::error::Error;
 use std::sync::Arc;
 use std::task::Waker;
 use veloq_shim::atomic::Ordering;
@@ -14,23 +13,25 @@ pub trait CompletionValue: Send {
     fn from_event_res<E>(res: i32) -> DriverResult<Self, E>
     where
         Self: Sized,
-        E: Error + Send + Sync + 'static + From<DriverCoreError>;
+        E: DriverError;
 }
 
 impl CompletionValue for usize {
     #[inline]
     fn from_event_res<E>(res: i32) -> DriverResult<Self, E>
     where
-        E: Error + Send + Sync + 'static + From<DriverCoreError>,
+        E: DriverError,
     {
         if res >= 0 {
             Ok(res as usize)
         } else {
-            DriverCoreError::System
-                .with_ctx("scope", "driver-core/completion")
-                .set_error_code(-res)
-                .attach_note("completion reported OS error")
-                .map_inner_err(E::from)
+            Err(E::from_core_report(
+                DriverCoreError::System
+                    .to_report()
+                    .with_ctx("scope", "driver-core/completion")
+                    .set_error_code(-res)
+                    .attach_note("completion reported OS error"),
+            ))
         }
     }
 }
@@ -115,7 +116,7 @@ pub fn decode_completion_token(token: u64) -> (usize, u32) {
 pub fn event_res_to_result<R, E>(res: i32) -> DriverResult<R, E>
 where
     R: CompletionValue,
-    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    E: DriverError,
 {
     R::from_event_res(res)
 }

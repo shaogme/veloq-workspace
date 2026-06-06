@@ -5,10 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use diagweave::prelude::*;
 use tracing::error;
 
-use crate::error::{IocpError, IocpResult, IocpResultExt};
+use crate::error::{IocpError, IocpResult, IocpResultExt, iocp_report_to_event_res};
 use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
-use veloq_driver_core::DriverCoreError;
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionRecord, CompletionSidecar, RemoteWaker, SharedCompletionQueue,
     SharedCompletionTable, encode_completion_token,
@@ -73,46 +72,6 @@ pub(crate) fn io_result_to_event_res(res: &IocpResult<usize>) -> i32 {
 }
 
 #[inline]
-fn neg_code(code: i32) -> Option<i32> {
-    (code != 0).then_some(-code.abs())
-}
-
-#[inline]
-fn fallback_errno_by_iocp_error(kind: IocpError) -> i32 {
-    match kind {
-        IocpError::DriverInit => 5,       // EIO
-        IocpError::CompletionWait => 110, // ETIMEDOUT
-        IocpError::Submission => 11,      // EAGAIN
-        IocpError::Registration => 12,    // ENOMEM
-        IocpError::Rio(_) => 5,           // EIO
-        IocpError::ResolveFd => 9,        // EBADF
-        IocpError::Socket => 5,           // EIO
-        IocpError::Win32 => 5,            // EIO
-        IocpError::InvalidInput => 22,    // EINVAL
-        IocpError::InvalidState => 5,     // EIO
-        IocpError::Unsupported => 95,     // EOPNOTSUPP
-        IocpError::Internal => 5,         // EIO
-    }
-}
-
-#[inline]
-pub(crate) fn iocp_fallback_event_res(kind: IocpError) -> i32 {
-    -fallback_errno_by_iocp_error(kind)
-}
-
-#[inline]
-fn iocp_report_to_event_res(report: &Report<IocpError>) -> i32 {
-    if let Some(code) = report
-        .error_code()
-        .and_then(|code| i32::try_from(code).ok())
-        && let Some(res) = neg_code(code)
-    {
-        return res;
-    }
-    iocp_fallback_event_res(*report.inner())
-}
-
-#[inline]
 pub(crate) fn completion_record(
     sidecar: CompletionSidecar<IocpUserPayload, IocpError>,
 ) -> CompletionRecord<IocpUserPayload, IocpError> {
@@ -156,7 +115,7 @@ impl RemoteWaker<IocpError> for IocpWaker {
         }
         if !self.is_notified.swap(true, Ordering::AcqRel) {
             self.port.notify(WAKEUP_USER_DATA).to_driver_result(
-                DriverCoreError::Submission,
+                IocpError::Submission,
                 "iocp/common",
                 "failed to notify remote waker",
             )?;

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, trace};
 
 use crate::driver::UringDriver;
-use crate::error::{UringDriverResult, UringError, UringResult};
+use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_event_res};
 use crate::op::{
     UringUserPayload,
     slot::{SlotView, UringOpRegistryExt},
@@ -11,7 +11,6 @@ use crate::op::{
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, drain_cancel_requests, encode_completion_token,
 };
-use veloq_driver_core::driver_report_to_event_res;
 
 impl<'a> UringDriver<'a> {
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
@@ -236,6 +235,6 @@ impl<'a> UringDriver<'a> {
 pub(crate) fn driver_result_to_event_res(res: &UringDriverResult<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
-        Err(e) => driver_report_to_event_res(e),
+        Err(e) => uring_report_to_event_res(e),
     }
 }

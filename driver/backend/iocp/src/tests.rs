@@ -10,22 +10,22 @@ use veloq_driver_core::driver::{
     CompletionRecord, DriveMode, Driver, PollRecordResult, encode_completion_token,
     event_res_to_result,
 };
-use veloq_driver_core::driver_report_to_event_res;
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
 use veloq_driver_core::slot::SlotTable;
 
 use crate::driver::IocpDriver;
-use crate::error::{IocpError, IocpResult};
+use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::op::{IocpOp, IocpUserPayload};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);
-    while cur != SlotTable::<
-        crate::op::IocpOp,
-        crate::op::IocpUserPayload,
-        crate::op::OverlappedEntry,
-        IocpError,
-    >::NULL_INDEX
+    while cur
+        != SlotTable::<
+            crate::op::IocpOp,
+            crate::op::IocpUserPayload,
+            crate::op::OverlappedEntry,
+            IocpError,
+        >::NULL_INDEX
     {
         if cur == needle {
             return true;
@@ -40,11 +40,11 @@ pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
 pub(crate) fn submit_test_op<T>(driver: &mut IocpDriver, data: T) -> (usize, u32)
 where
     T: IntoPlatformOp<
-        IocpOp,
-        DriverCompletion = usize,
-        ErasedPayload = IocpUserPayload,
-        Error = IocpError,
-    >,
+            IocpOp,
+            DriverCompletion = usize,
+            ErasedPayload = IocpUserPayload,
+            Error = IocpError,
+        >,
 {
     let (iocp_kernel, payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(data);
     let mut iocp_op = Some(iocp_kernel);
@@ -66,11 +66,11 @@ pub(crate) fn complete_from_record<T>(
 ) -> OpCompletion<T::Output, IocpError, T::Completion>
 where
     T: IntoPlatformOp<
-        IocpOp,
-        DriverCompletion = usize,
-        ErasedPayload = IocpUserPayload,
-        Error = IocpError,
-    >,
+            IocpOp,
+            DriverCompletion = usize,
+            ErasedPayload = IocpUserPayload,
+            Error = IocpError,
+        >,
 {
     let payload_erased = record.payload.expect("completion payload missing");
     let payload = T::payload_from_erased(payload_erased);
@@ -117,7 +117,7 @@ pub(crate) fn wait_completion(
 ) -> IocpResult<usize> {
     let record = wait_completion_record(driver, user_data, generation, timeout)?;
     event_res_to_result::<usize, IocpError>(record.event.res).map_err(|e| {
-        let code = driver_report_to_event_res(&e);
+        let code = iocp_report_to_event_res(&e);
         let io_error = std::io::Error::from_raw_os_error(-code);
         IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error)
     })

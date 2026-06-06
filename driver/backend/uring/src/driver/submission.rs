@@ -12,7 +12,6 @@ use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 use veloq_driver_core::driver::registry::{AllocResult, OpHandle};
 use veloq_driver_core::driver::{Driver, DriverSubmitResult, SubmitBinder, SubmitStatus};
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
-use veloq_driver_core::{DriverCoreError, driver_error};
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 
@@ -304,8 +303,7 @@ impl<'a> UringDriver<'a> {
             }
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
                 return binder.err(
-                    driver_error(
-                        DriverCoreError::InvalidState,
+                    UringError::InvalidState.report(
                         "uring.driver.submit_sqe_internal",
                         "Op slot missing in registry",
                     ),
@@ -332,7 +330,7 @@ impl<'a> UringDriver<'a> {
                 binder.err(
                     map_uring_error(
                         e,
-                        DriverCoreError::Submission,
+                        UringError::Submission,
                         "uring.driver.submit_sqe_internal",
                         "submit sqe",
                     ),
@@ -362,8 +360,7 @@ impl<'a> UringDriver<'a> {
             }
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
                 return binder.err(
-                    driver_error(
-                        DriverCoreError::InvalidState,
+                    UringError::InvalidState.report(
                         "uring.driver.submit_timer_internal",
                         "Op slot missing in registry",
                     ),
@@ -393,7 +390,7 @@ impl<'a> UringDriver<'a> {
                 binder.err(
                     map_uring_error(
                         e,
-                        DriverCoreError::Submission,
+                        UringError::Submission,
                         "uring.driver.submit_timer_internal",
                         "submit timer",
                     ),

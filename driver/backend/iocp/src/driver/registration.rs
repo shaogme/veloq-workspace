@@ -3,7 +3,6 @@ use windows_sys::Win32::Networking::WinSock::{
     SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
 };
 
-use veloq_driver_core::DriverCoreError;
 use veloq_driver_core::driver::RegisterFd;
 
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
@@ -108,7 +107,7 @@ impl<'a> IocpDriver<'a> {
         self.rio_state
             .register_chunk(id, ptr, len)
             .to_driver_result(
-                DriverCoreError::Registration,
+                IocpError::Registration,
                 "iocp/driver",
                 "failed to register RIO chunk",
             )?;
@@ -131,7 +130,7 @@ impl<'a> IocpDriver<'a> {
                 RawHandleKind::Socket => handle,
                 RawHandleKind::File => {
                     if Self::detect_socket_from_file_handle(handle).to_driver_result(
-                        DriverCoreError::InvalidInput,
+                        IocpError::InvalidInput,
                         "iocp/driver",
                         "detect socket from file handle failed",
                     )? {

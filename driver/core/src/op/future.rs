@@ -13,7 +13,9 @@ use crate::driver::{
 };
 use crate::op::{IntoPlatformOp, Op};
 use crate::slot::DetachedCancelTable;
-use crate::{DriverCoreError, DriverReport, DriverResult, driver_error};
+use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
+
+use diagweave::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LostReason {
@@ -116,14 +118,15 @@ impl<T, E, R> OpCompletion<T, E, R> {
 #[inline]
 pub(crate) fn payload_missing_error<E>() -> OpError<E>
 where
-    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    E: DriverError,
 {
     OpError::new(
         LostReason::PayloadMissing,
-        driver_error(
-            DriverCoreError::Internal,
-            "driver-core/op",
-            "operation payload lost: completion sidecar missing",
+        E::from_core_report(
+            DriverCoreError::Internal
+                .to_report()
+                .with_ctx("scope", "driver-core/op")
+                .attach_note("operation payload lost: completion sidecar missing"),
         ),
     )
 }
@@ -131,14 +134,15 @@ where
 #[inline]
 pub(crate) fn generation_mismatch_error<E>() -> OpError<E>
 where
-    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    E: DriverError,
 {
     OpError::new(
         LostReason::GenerationMismatch,
-        driver_error(
-            DriverCoreError::Internal,
-            "driver-core/op",
-            "operation lost: slot recycled (generation mismatch)",
+        E::from_core_report(
+            DriverCoreError::Internal
+                .to_report()
+                .with_ctx("scope", "driver-core/op")
+                .attach_note("operation lost: slot recycled (generation mismatch)"),
         ),
     )
 }
@@ -151,7 +155,7 @@ where
     UP: Send,
     O: PlatformOp,
     T: IntoPlatformOp<O, DriverCompletion = C, ErasedPayload = UP, Error = E>,
-    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    E: DriverError,
     C: crate::driver::CompletionValue,
 {
     let CompletionRecord {
@@ -177,7 +181,7 @@ where
     UP: Send,
     O: PlatformOp,
     T: IntoPlatformOp<O, DriverCompletion = C, ErasedPayload = UP, Error = E>,
-    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    E: DriverError,
     C: crate::driver::CompletionValue,
 {
     match table.try_take_record(token) {
@@ -195,7 +199,7 @@ type DetachedOpMarker<T, UP, E, C, O> = (T, UP, E, C, fn() -> O);
 pub struct DetachedOp<T, O, E, C>
 where
     O: PlatformOp,
-    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    E: DriverError,
     C: crate::driver::CompletionValue,
     T: IntoPlatformOp<O, DriverCompletion = C, Error = E>,
 {
@@ -210,7 +214,7 @@ where
 unsafe impl<
     T: IntoPlatformOp<O, DriverCompletion = C, Error = E> + std::marker::Send,
     O: PlatformOp,
-    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    E: DriverError,
     C: crate::driver::CompletionValue,
 > std::marker::Send for DetachedOp<T, O, E, C>
 {
@@ -219,7 +223,7 @@ unsafe impl<
 impl<T, O, E, C> Drop for DetachedOp<T, O, E, C>
 where
     O: PlatformOp,
-    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    E: DriverError,
     C: crate::driver::CompletionValue,
     T: IntoPlatformOp<O, DriverCompletion = C, Error = E>,
 {
@@ -241,7 +245,7 @@ where
 impl<T, O, E, C> Future for DetachedOp<T, O, E, C>
 where
     O: PlatformOp,
-    E: Error + Send + Sync + 'static + From<DriverCoreError>,
+    E: DriverError,
     C: crate::driver::CompletionValue,
     T: IntoPlatformOp<O, DriverCompletion = C, Error = E>,
 {

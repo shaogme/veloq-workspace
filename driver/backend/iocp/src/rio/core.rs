@@ -3,10 +3,10 @@
 pub(crate) mod registry;
 pub(crate) mod submit_ops;
 
+use crate::error::{IocpError, iocp_report_to_event_res};
 use crate::rio::RioState;
 use crate::rio::error::RioError;
 use diagweave::prelude::*;
-use veloq_driver_core::{DriverCoreError, driver_report_to_event_res};
 
 #[derive(Clone, Copy)]
 pub(crate) enum RioCompletionKind {
@@ -39,7 +39,7 @@ impl Drop for RioOpCtxGuard {
 pub(crate) fn rio_result_to_event_res(res: &crate::error::IocpDriverResult<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
-        Err(e) => driver_report_to_event_res(e),
+        Err(e) => iocp_report_to_event_res(e),
     }
 }
 
@@ -96,7 +96,7 @@ impl RioState {
             .with_ctx("scope", scope)
             .set_error_code(code)
             .attach_note(
-                DriverCoreError::System
+                IocpError::Internal
                     .to_report()
                     .with_ctx("scope", scope)
                     .set_error_code(code as i32)
@@ -131,12 +131,11 @@ mod tests {
             rio_result_to_event_res(&Ok((i32::MAX as usize) + 10)),
             i32::MAX
         );
-        let err = DriverCoreError::System
+        let err = IocpError::Internal
             .to_report()
             .with_ctx("scope", "rio.core.tests")
             .set_error_code(10022)
-            .attach_note("invalid argument")
-            .map_err(crate::error::IocpError::from);
+            .attach_note("invalid argument");
         assert_eq!(rio_result_to_event_res(&Err(err)), -10022);
     }
 

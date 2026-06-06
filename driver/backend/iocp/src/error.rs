@@ -1,5 +1,7 @@
+use core::convert::TryFrom;
+
 use diagweave::prelude::*;
-use veloq_driver_core::{DriverCoreError, DriverResult};
+use veloq_driver_core::{DriverCoreError, DriverError, DriverResult};
 
 use crate::rio::error::RioError;
 
@@ -38,6 +40,14 @@ pub type IocpDriverResult<T> = DriverResult<T, IocpError>;
 
 impl IocpError {
     #[inline]
+    pub(crate) fn report(self, scope: &'static str, detail: impl ToString) -> Report<Self> {
+        self.to_report()
+            .set_error_code(iocp_fallback_errno(self))
+            .with_ctx("scope", scope)
+            .attach_note(detail.to_string())
+    }
+
+    #[inline]
     pub(crate) fn io_report<E>(self, scope: &'static str, error: E) -> Report<Self>
     where
         E: std::error::Error + Send + Sync + 'static,
@@ -60,25 +70,60 @@ impl IocpError {
     }
 }
 
-impl From<DriverCoreError> for IocpError {
-    fn from(kind: DriverCoreError) -> Self {
-        match kind {
-            DriverCoreError::InvalidInput => Self::InvalidInput,
-            DriverCoreError::InvalidState => Self::InvalidState,
-            DriverCoreError::Submission => Self::Submission,
-            DriverCoreError::Completion | DriverCoreError::Timeout => Self::CompletionWait,
-            DriverCoreError::Registration => Self::Registration,
-            DriverCoreError::Socket => Self::Socket,
-            DriverCoreError::Unsupported => Self::Unsupported,
-            DriverCoreError::Internal | DriverCoreError::System => Self::Internal,
-        }
+impl DriverError for IocpError {
+    #[inline]
+    fn from_core_report(report: Report<DriverCoreError>) -> Report<Self> {
+        let kind = *report.inner();
+        report
+            .with_ctx("driver_core_kind", kind.to_string())
+            .map_err(|_| Self::Internal)
     }
+}
+
+#[inline]
+fn neg_code(code: i32) -> Option<i32> {
+    (code != 0).then_some(-code.abs())
+}
+
+#[inline]
+pub(crate) fn iocp_fallback_errno(kind: IocpError) -> i32 {
+    match kind {
+        IocpError::DriverInit => 5,       // EIO
+        IocpError::CompletionWait => 110, // ETIMEDOUT
+        IocpError::Submission => 11,      // EAGAIN
+        IocpError::Registration => 12,    // ENOMEM
+        IocpError::Rio(_) => 5,           // EIO
+        IocpError::ResolveFd => 9,        // EBADF
+        IocpError::Socket => 5,           // EIO
+        IocpError::Win32 => 5,            // EIO
+        IocpError::InvalidInput => 22,    // EINVAL
+        IocpError::InvalidState => 5,     // EIO
+        IocpError::Unsupported => 95,     // EOPNOTSUPP
+        IocpError::Internal => 5,         // EIO
+    }
+}
+
+#[inline]
+pub(crate) fn iocp_fallback_event_res(kind: IocpError) -> i32 {
+    -iocp_fallback_errno(kind)
+}
+
+#[inline]
+pub(crate) fn iocp_report_to_event_res(report: &Report<IocpError>) -> i32 {
+    if let Some(code) = report
+        .error_code()
+        .and_then(|code| i32::try_from(code).ok())
+        && let Some(res) = neg_code(code)
+    {
+        return res;
+    }
+    iocp_fallback_event_res(*report.inner())
 }
 
 pub(crate) trait IocpResultExt<T> {
     fn to_driver_result(
         self,
-        kind: DriverCoreError,
+        kind: IocpError,
         scope: &'static str,
         detail: impl ToString,
     ) -> IocpDriverResult<T>;
@@ -87,7 +132,7 @@ pub(crate) trait IocpResultExt<T> {
 impl<T> IocpResultExt<T> for IocpResult<T> {
     fn to_driver_result(
         self,
-        kind: DriverCoreError,
+        kind: IocpError,
         scope: &'static str,
         detail: impl ToString,
     ) -> IocpDriverResult<T> {
@@ -97,7 +142,7 @@ impl<T> IocpResultExt<T> for IocpResult<T> {
             report
                 .set_accumulate_src_chain(true)
                 .with_ctx("scope", scope)
-                .with_ctx("driver_core_kind", kind.to_string())
+                .with_ctx("driver_error_kind", kind.to_string())
                 .attach_note(detail)
                 .attach_note("driver error report captured")
         })

@@ -1,15 +1,13 @@
-use std::error::Error;
-
 use tracing::trace;
 
 use crate::driver::{Driver, PlatformOp, SubmitBinder, SubmitStatus, encode_completion_token};
-use crate::{DriverCoreError, DriverResult};
+use crate::{DriverError, DriverResult};
 
 pub trait DriverProvider: Clone + Unpin {
     type Op: PlatformOp;
     type UP: std::marker::Send;
     type Completion: crate::driver::CompletionValue;
-    type Error: Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
+    type Error: DriverError;
     type Driver<'a>: crate::driver::Driver<
             Op = Self::Op,
             UP = Self::UP,
@@ -34,7 +32,7 @@ pub trait OpLifecycle: Sized {
     type Output;
     type Raw: crate::RawHandleMeta;
     type CompletionValue;
-    type Error: Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
+    type Error: DriverError;
 
     fn pre_alloc(fd: Self::Raw) -> DriverResult<Self::PreAlloc, Self::Error>;
 
@@ -58,7 +56,7 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     type Output;
     type Completion;
     type DriverCompletion: crate::driver::CompletionValue;
-    type Error: Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
+    type Error: DriverError;
     const PAYLOAD_KIND: OpKind;
 
     fn into_kernel_and_payload(self) -> (O, Self::UserPayload);

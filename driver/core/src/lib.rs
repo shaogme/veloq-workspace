@@ -1,4 +1,3 @@
-use core::convert::TryFrom;
 use core::marker::PhantomData;
 
 use diagweave::prelude::*;
@@ -77,93 +76,18 @@ impl IoFd {
 set! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub DriverCoreError = {
-        #[display("invalid input")]
-        InvalidInput,
-        #[display("invalid state")]
-        InvalidState,
-        #[display("submission failed")]
-        Submission,
-        #[display("completion failed")]
-        Completion,
-        #[display("registration failed")]
-        Registration,
-        #[display("socket operation failed")]
-        Socket,
-        #[display("timeout")]
-        Timeout,
-        #[display("unsupported")]
-        Unsupported,
-        #[display("internal error")]
-        Internal,
         #[display("system error")]
         System,
+        #[display("internal error")]
+        Internal,
     }
 }
 
 pub type DriverResult<T, E> = Result<T, Report<E>>;
-pub type DriverCoreResult<T> = DriverResult<T, DriverCoreError>;
 pub type DriverReport<E> = Report<E>;
 
-#[inline]
-fn neg_code(code: i32) -> Option<i32> {
-    (code != 0).then_some(-code.abs())
-}
-
-#[inline]
-fn diag_code_i32<E>(report: &Report<E>) -> Option<i32> {
-    report
-        .error_code()
-        .and_then(|code| i32::try_from(code).ok())
-        .and_then(neg_code)
-}
-
-#[inline]
-pub fn driver_core_error_fallback_errno(kind: DriverCoreError) -> i32 {
-    match kind {
-        DriverCoreError::InvalidInput => 22, // EINVAL
-        DriverCoreError::InvalidState => 5,  // EIO
-        DriverCoreError::Submission => 11,   // EAGAIN
-        DriverCoreError::Completion => 5,    // EIO
-        DriverCoreError::Registration => 12, // ENOMEM
-        DriverCoreError::Socket => 5,        // EIO
-        DriverCoreError::Timeout => 110,     // ETIMEDOUT
-        DriverCoreError::Unsupported => 95,  // EOPNOTSUPP
-        DriverCoreError::Internal => 5,      // EIO
-        DriverCoreError::System => 5,        // EIO
-    }
-}
-
-#[inline]
-pub fn driver_report_to_event_res<E>(report: &Report<E>) -> i32 {
-    if let Some(res) = diag_code_i32(report) {
-        return res;
-    }
-    -driver_core_error_fallback_errno(DriverCoreError::System)
-}
-
-#[inline]
-pub fn driver_core_error(
-    kind: DriverCoreError,
-    scope: &'static str,
-    detail: impl ToString,
-) -> Report<DriverCoreError> {
-    let detail = detail.to_string();
-    kind.to_report()
-        .set_error_code(driver_core_error_fallback_errno(kind))
-        .with_ctx("scope", scope)
-        .attach_note(detail)
-}
-
-#[inline]
-pub fn driver_error<E>(
-    kind: DriverCoreError,
-    scope: &'static str,
-    detail: impl ToString,
-) -> Report<E>
-where
-    E: std::error::Error + Send + Sync + 'static + From<DriverCoreError>,
-{
-    driver_core_error(kind, scope, detail).map_err(E::from)
+pub trait DriverError: std::error::Error + Send + Sync + 'static + Sized {
+    fn from_core_report(report: Report<DriverCoreError>) -> Report<Self>;
 }
 
 // ============================================================================

@@ -7,7 +7,6 @@ use veloq_driver_core::driver::{
     SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
 };
 use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
-use veloq_driver_core::{DriverCoreError, driver_error};
 
 use diagweave::prelude::*;
 
@@ -72,11 +71,7 @@ impl<'a> IocpDriver<'a> {
 
         while drained < pending_count {
             if Instant::now() >= deadline {
-                return Err(driver_error(
-                    DriverCoreError::Timeout,
-                    "iocp/driver",
-                    "drain timed out",
-                ));
+                return Err(IocpError::CompletionWait.report("iocp/driver", "drain timed out"));
             }
             drained += self.poll_completion()?;
         }
@@ -85,7 +80,7 @@ impl<'a> IocpDriver<'a> {
 
     pub(crate) fn poll_completion(&mut self) -> IocpDriverResult<usize> {
         let status = self.port.get_status(10).to_driver_result(
-            DriverCoreError::Completion,
+            IocpError::CompletionWait,
             "iocp/driver",
             "failed to poll IOCP status",
         )?;
@@ -112,7 +107,7 @@ impl<'a> IocpDriver<'a> {
                             self.drain_deferred_socket_cleanup();
                         })
                         .to_driver_result(
-                            DriverCoreError::Completion,
+                            IocpError::CompletionWait,
                             "iocp/driver",
                             "failed to process rio completions",
                         );
@@ -142,7 +137,7 @@ impl<'a> IocpDriver<'a> {
                     .attach_note("drain pending iocp timed out")
             })?;
             self.rio_state.drain_outstanding(timeout).to_driver_result(
-                DriverCoreError::Completion,
+                IocpError::CompletionWait,
                 "iocp/driver",
                 "failed to drain RIO outstanding requests",
             )?;
@@ -460,11 +455,8 @@ impl<'a> IocpDriver<'a> {
             let _ = self
                 .ops
                 .with_slot_storage_mut(user_data, |_op, result, _payload, _sidecar| {
-                    *result = Some(Err(driver_error(
-                        DriverCoreError::Completion,
-                        "iocp/driver",
-                        "completion without os error",
-                    )));
+                    *result = Some(Err(IocpError::CompletionWait
+                        .report("iocp/driver", "completion without os error")));
                 });
         }
         io_result

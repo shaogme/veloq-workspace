@@ -1,5 +1,4 @@
 use diagweave::prelude::*;
-use veloq_driver_core::DriverCoreError;
 
 use crate::error::{IocpDriverResult, IocpError};
 
@@ -30,7 +29,7 @@ pub type RioResult<T> = Result<T, Report<RioError>>;
 pub(crate) trait RioResultExt<T> {
     fn to_driver_result(
         self,
-        kind: DriverCoreError,
+        kind: IocpError,
         scope: &'static str,
         detail: impl ToString,
     ) -> IocpDriverResult<T>;
@@ -39,7 +38,7 @@ pub(crate) trait RioResultExt<T> {
 impl<T> RioResultExt<T> for RioResult<T> {
     fn to_driver_result(
         self,
-        kind: DriverCoreError,
+        kind: IocpError,
         scope: &'static str,
         detail: impl ToString,
     ) -> IocpDriverResult<T> {
@@ -50,7 +49,7 @@ impl<T> RioResultExt<T> for RioResult<T> {
                 .set_accumulate_src_chain(true)
                 .map_err(IocpError::Rio)
                 .with_ctx("scope", scope)
-                .with_ctx("driver_core_kind", kind.to_string())
+                .with_ctx("driver_error_kind", kind.to_string())
                 .attach_note(detail)
                 .attach_note("driver error report captured")
         })

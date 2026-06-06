@@ -8,11 +8,10 @@ use veloq_driver_core::driver::{
     DriverSubmitResult, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
-use veloq_driver_core::{DriverCoreError, driver_error};
 
-use crate::common::{completion_record, iocp_fallback_event_res, push_completion_shared};
+use crate::common::{completion_record, push_completion_shared};
 use crate::driver::{CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry};
-use crate::error::{IocpError, IocpResult, IocpResultExt};
+use crate::error::{IocpError, IocpResult, IocpResultExt, iocp_fallback_event_res};
 use crate::op::slot::Slot;
 use crate::op::{IocpOp, IocpUserPayload, SubmitContext, submit};
 
@@ -93,11 +92,7 @@ impl<'a> IocpDriver<'a> {
             }
             let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
             ops.recycle(user_data, generation.wrapping_add(1));
-            return Err(driver_error(
-                DriverCoreError::Submission,
-                "iocp/driver",
-                "thread pool overloaded",
-            ));
+            return Err(IocpError::Submission.report("iocp/driver", "thread pool overloaded"));
         }
         Ok(Poll::Pending)
     }
@@ -119,11 +114,8 @@ impl<'a> IocpDriver<'a> {
                 match Self::handle_offload(ops, ctx, user_data, task) {
                     Ok(poll) => binder.ok(poll),
                     Err(_) => binder.err(
-                        driver_error(
-                            DriverCoreError::Submission,
-                            "iocp/driver",
-                            "offload task submission failed",
-                        ),
+                        IocpError::Submission
+                            .report("iocp/driver", "offload task submission failed"),
                         SubmitStatus::InFlight,
                     ),
                 }
@@ -191,15 +183,11 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpDriverResult<IocpDriverResult<submit::SubmissionResult>> {
         let slots_per_page = self.ops.local.len();
         let (slab_ptr, slab_len) = self.ops.get_page_slice(0).ok_or_else(|| {
-            driver_error(
-                DriverCoreError::InvalidState,
-                "iocp/driver",
-                "failed to get page slice",
-            )
+            IocpError::InvalidState.report("iocp/driver", "failed to get page slice")
         })?;
 
         let guard = Self::prep_op_slot(&mut self.ops, user_data, op).to_driver_result(
-            DriverCoreError::InvalidState,
+            IocpError::InvalidState,
             "iocp/driver",
             "failed to prepare op slot",
         )?;
@@ -228,17 +216,9 @@ impl<'a> IocpDriver<'a> {
             .as_mut()
             .and_then(|slot| slot.with_op_mut(|op| op.submit(&mut ctx)))
             .ok_or_else(|| {
-                driver_error(
-                    DriverCoreError::InvalidState,
-                    "iocp/driver",
-                    "op missing during submission",
-                )
+                IocpError::InvalidState.report("iocp/driver", "op missing during submission")
             })?
-            .to_driver_result(
-                DriverCoreError::Submission,
-                "iocp/driver",
-                "op submit failed",
-            );
+            .to_driver_result(IocpError::Submission, "iocp/driver", "op submit failed");
 
         let pending_socket_key = if matches!(result, Ok(submit::SubmissionResult::Pending)) {
             sub_guard
@@ -262,11 +242,7 @@ impl<'a> IocpDriver<'a> {
         let mut sub_guard_opt = Some(sub_guard);
         if result.is_ok() {
             let guard = sub_guard_opt.take().ok_or_else(|| {
-                driver_error(
-                    DriverCoreError::InvalidState,
-                    "iocp/driver",
-                    "submission guard missing",
-                )
+                IocpError::InvalidState.report("iocp/driver", "submission guard missing")
             })?;
             let _ = guard.persist();
         }
