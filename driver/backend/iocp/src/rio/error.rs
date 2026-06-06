@@ -1,7 +1,5 @@
 use diagweave::prelude::*;
 
-use crate::error::{IocpDriverResult, IocpError};
-
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     pub RioError = {
@@ -25,32 +23,3 @@ set! {
 }
 
 pub type RioResult<T> = Result<T, Report<RioError>>;
-
-pub(crate) trait RioResultExt<T> {
-    fn to_driver_result(
-        self,
-        kind: IocpError,
-        scope: &'static str,
-        detail: impl ToString,
-    ) -> IocpDriverResult<T>;
-}
-
-impl<T> RioResultExt<T> for RioResult<T> {
-    fn to_driver_result(
-        self,
-        kind: IocpError,
-        scope: &'static str,
-        detail: impl ToString,
-    ) -> IocpDriverResult<T> {
-        let detail = detail.to_string();
-        self.map_report(|report| {
-            tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
-            report
-                .map_err(IocpError::Rio)
-                .with_ctx("scope", scope)
-                .with_ctx("driver_error_kind", kind.to_string())
-                .attach_note(detail)
-                .attach_note("driver error report captured")
-        })
-    }
-}

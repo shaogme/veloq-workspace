@@ -18,10 +18,9 @@ use crate::config::SocketKey;
 use crate::driver::{
     CloseMode, CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry, RIO_EVENT_KEY,
 };
-use crate::error::{IocpError, IocpResult, IocpResultExt};
+use crate::error::{IocpError, IocpResult};
 use crate::op::slot::Slot;
 use crate::op::{IocpOp, IocpUserPayload, submit};
-use crate::rio::error::RioResultExt;
 
 pub(crate) struct EmitContext<'a> {
     pub(crate) completion_events: &'a SharedCompletionQueue,
@@ -79,11 +78,11 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn poll_completion(&mut self) -> IocpDriverResult<usize> {
-        let status = self.port.get_status(10).to_driver_result(
-            IocpError::CompletionWait,
-            "iocp/driver",
-            "failed to poll IOCP status",
-        )?;
+        let status = self
+            .port
+            .get_status(10)
+            .with_ctx("scope", "iocp/driver")
+            .attach_note("failed to poll IOCP status")?;
 
         match status {
             crate::win32::CompletionStatus::Completed {
@@ -94,7 +93,7 @@ impl<'a> IocpDriver<'a> {
                 error_code,
             } => {
                 if key == RIO_EVENT_KEY {
-                    return self
+                    let processed = self
                         .rio_state
                         .process_completions(
                             &mut self.ops,
@@ -106,11 +105,10 @@ impl<'a> IocpDriver<'a> {
                         .inspect(|_| {
                             self.drain_deferred_socket_cleanup();
                         })
-                        .to_driver_result(
-                            IocpError::CompletionWait,
-                            "iocp/driver",
-                            "failed to process rio completions",
-                        );
+                        .with_ctx("scope", "iocp/driver")
+                        .attach_note("failed to process rio completions")
+                        .trans()?;
+                    return Ok(processed);
                 }
 
                 if !overlapped.is_null() {
@@ -136,11 +134,11 @@ impl<'a> IocpDriver<'a> {
                     .with_ctx("scope", "iocp/driver")
                     .attach_note("drain pending iocp timed out")
             })?;
-            self.rio_state.drain_outstanding(timeout).to_driver_result(
-                IocpError::CompletionWait,
-                "iocp/driver",
-                "failed to drain RIO outstanding requests",
-            )?;
+            self.rio_state
+                .drain_outstanding(timeout)
+                .with_ctx("scope", "iocp/driver")
+                .attach_note("failed to drain RIO outstanding requests")
+                .trans()?;
         }
         self.rio_state.kernel.close();
         self.closed = true;

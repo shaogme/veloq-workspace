@@ -12,7 +12,7 @@ use tracing::{debug, trace};
 use crate::config::{
     BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig, UringRawHandle,
 };
-use crate::error::{UringError, UringResult, UringResultExt};
+use crate::error::{UringError, UringResult};
 use crate::op::{UringOp, UringUserPayload};
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
@@ -342,11 +342,9 @@ impl<'a> Driver for UringDriver<'a> {
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
-                self.poll_nonblocking_internal().to_driver_result(
-                    UringError::CompletionWait,
-                    "uring.driver.drive.poll",
-                    "poll completions",
-                )?;
+                self.poll_nonblocking_internal()
+                    .with_ctx("scope", "uring.driver.drive.poll")
+                    .attach_note("poll completions")?;
             }
             DriveMode::Wait => {
                 let pending_progress =
@@ -357,11 +355,9 @@ impl<'a> Driver for UringDriver<'a> {
                         pending_progress,
                     });
                 }
-                self.wait_internal().to_driver_result(
-                    UringError::CompletionWait,
-                    "uring.driver.drive.wait",
-                    "wait for completions",
-                )?;
+                self.wait_internal()
+                    .with_ctx("scope", "uring.driver.drive.wait")
+                    .attach_note("wait for completions")?;
             }
         }
 
@@ -386,31 +382,26 @@ impl<'a> Driver for UringDriver<'a> {
     }
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
-        self.register_chunk_internal(id, ptr, len).to_driver_result(
-            UringError::Registration,
-            "uring.driver.register_chunk",
-            "register chunk",
-        )
+        self.register_chunk_internal(id, ptr, len)
+            .with_ctx("scope", "uring.driver.register_chunk")
+            .with_ctx("driver_error_kind", UringError::Registration.to_string())
+            .attach_note("register chunk")
     }
 
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, UringRawHandle>>,
     ) -> DriverResult<Vec<IoFd>> {
-        self.register_files_internal(files).to_driver_result(
-            UringError::Registration,
-            "uring.driver.register_files",
-            "register files",
-        )
+        self.register_files_internal(files)
+            .with_ctx("scope", "uring.driver.register_files")
+            .attach_note("register files")
     }
 
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
         for fd in files {
-            self.unregister_fixed_fd(fd).to_driver_result(
-                UringError::Registration,
-                "uring.driver.unregister_files",
-                "unregister fixed fd",
-            )?;
+            self.unregister_fixed_fd(fd)
+                .with_ctx("scope", "uring.driver.unregister_files")
+                .attach_note("unregister fixed fd")?;
         }
         Ok(())
     }

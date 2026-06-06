@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use diagweave::prelude::*;
 use tracing::error;
 
-use crate::error::{IocpError, IocpResult, IocpResultExt, iocp_report_to_event_res};
+use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
 use veloq_driver_core::driver::{
@@ -114,11 +114,10 @@ impl RemoteWaker<IocpError> for IocpWaker {
             return Ok(());
         }
         if !self.is_notified.swap(true, Ordering::AcqRel) {
-            self.port.notify(WAKEUP_USER_DATA).to_driver_result(
-                IocpError::Submission,
-                "iocp/common",
-                "failed to notify remote waker",
-            )?;
+            self.port
+                .notify(WAKEUP_USER_DATA)
+                .with_ctx("scope", "iocp/common")
+                .attach_note("failed to notify remote waker")?;
         }
         Ok(())
     }

@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use diagweave::DiagnosticResult;
+use diagweave::prelude::{DiagnosticResult, ResultReportExt};
 use veloq_blocking::{BlockingTask, get_blocking_pool};
 use veloq_driver_core::driver::{
     DriverSubmitResult, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
@@ -11,7 +11,7 @@ use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::driver::{CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry};
-use crate::error::{IocpError, IocpResult, IocpResultExt, iocp_fallback_event_res};
+use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
 use crate::op::slot::Slot;
 use crate::op::{IocpOp, IocpUserPayload, SubmitContext, submit};
 
@@ -186,11 +186,9 @@ impl<'a> IocpDriver<'a> {
             IocpError::InvalidState.report("iocp/driver", "failed to get page slice")
         })?;
 
-        let guard = Self::prep_op_slot(&mut self.ops, user_data, op).to_driver_result(
-            IocpError::InvalidState,
-            "iocp/driver",
-            "failed to prepare op slot",
-        )?;
+        let guard = Self::prep_op_slot(&mut self.ops, user_data, op)
+            .with_ctx("scope", "iocp/driver")
+            .attach_note("failed to prepare op slot")?;
 
         let overlapped = guard.storage.with_mut(|_result, _payload, sidecar| {
             &mut sidecar.inner as *mut crate::win32::Overlapped
@@ -218,7 +216,8 @@ impl<'a> IocpDriver<'a> {
             .ok_or_else(|| {
                 IocpError::InvalidState.report("iocp/driver", "op missing during submission")
             })?
-            .to_driver_result(IocpError::Submission, "iocp/driver", "op submit failed");
+            .with_ctx("scope", "iocp/driver")
+            .attach_note("op submit failed");
 
         let pending_socket_key = if matches!(result, Ok(submit::SubmissionResult::Pending)) {
             sub_guard

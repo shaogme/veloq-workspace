@@ -29,7 +29,7 @@ use diagweave::prelude::*;
 
 use crate::common::IocpWaker;
 use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, RegisteredHandle};
-use crate::error::{IocpError, IocpResult, IocpResultExt};
+use crate::error::{IocpError, IocpResult};
 use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload};
 use crate::rio::RioState;
 
@@ -290,11 +290,9 @@ impl<'a> Driver for IocpDriver<'a> {
     fn drive(&mut self, mode: DriveMode) -> IocpDriverResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
-                self.get_completion(0).to_driver_result(
-                    IocpError::CompletionWait,
-                    "iocp/driver.drive.poll",
-                    "drive(Poll) failed",
-                )?;
+                self.get_completion(0)
+                    .with_ctx("scope", "iocp/driver.drive.poll")
+                    .attach_note("drive(Poll) failed")?;
             }
             DriveMode::Wait => {
                 let pending_progress =
@@ -305,11 +303,9 @@ impl<'a> Driver for IocpDriver<'a> {
                         pending_progress,
                     });
                 }
-                self.get_completion(u32::MAX).to_driver_result(
-                    IocpError::CompletionWait,
-                    "iocp/driver.drive.wait",
-                    "wait for completion failed",
-                )?;
+                self.get_completion(u32::MAX)
+                    .with_ctx("scope", "iocp/driver.drive.wait")
+                    .attach_note("wait for completion failed")?;
             }
         }
 

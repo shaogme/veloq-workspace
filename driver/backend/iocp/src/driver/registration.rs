@@ -1,13 +1,13 @@
-use crate::rio::error::RioResultExt;
 use windows_sys::Win32::Networking::WinSock::{
     SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
 };
 
+use diagweave::prelude::{ResultReportExt, Transform};
 use veloq_driver_core::driver::RegisterFd;
 
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
 use crate::driver::{IocpDriver, IocpDriverResult};
-use crate::error::{IocpError, IocpResult, IocpResultExt};
+use crate::error::{IocpError, IocpResult};
 
 pub(crate) struct DeferredSocketCleanup {
     pub(crate) handle: SocketKey,
@@ -106,11 +106,9 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpDriverResult<()> {
         self.rio_state
             .register_chunk(id, ptr, len)
-            .to_driver_result(
-                IocpError::Registration,
-                "iocp/driver",
-                "failed to register RIO chunk",
-            )?;
+            .with_ctx("scope", "iocp/driver")
+            .attach_note("failed to register RIO chunk")
+            .trans()?;
         Ok(())
     }
 
@@ -129,11 +127,10 @@ impl<'a> IocpDriver<'a> {
             let mut canonical = match handle.kind() {
                 RawHandleKind::Socket => handle,
                 RawHandleKind::File => {
-                    if Self::detect_socket_from_file_handle(handle).to_driver_result(
-                        IocpError::InvalidInput,
-                        "iocp/driver",
-                        "detect socket from file handle failed",
-                    )? {
+                    if Self::detect_socket_from_file_handle(handle)
+                        .with_ctx("scope", "iocp/driver")
+                        .attach_note("detect socket from file handle failed")?
+                    {
                         RawHandle::new(IocpHandle::for_socket(handle.raw().as_handle()))
                     } else {
                         handle

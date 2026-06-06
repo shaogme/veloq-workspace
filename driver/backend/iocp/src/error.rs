@@ -119,31 +119,3 @@ pub(crate) fn iocp_report_to_event_res(report: &Report<IocpError>) -> i32 {
     }
     iocp_fallback_event_res(*report.inner())
 }
-
-pub(crate) trait IocpResultExt<T> {
-    fn to_driver_result(
-        self,
-        kind: IocpError,
-        scope: &'static str,
-        detail: impl ToString,
-    ) -> IocpDriverResult<T>;
-}
-
-impl<T> IocpResultExt<T> for IocpResult<T> {
-    fn to_driver_result(
-        self,
-        kind: IocpError,
-        scope: &'static str,
-        detail: impl ToString,
-    ) -> IocpDriverResult<T> {
-        let detail = detail.to_string();
-        self.map_report(|report| {
-            tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
-            report
-                .with_ctx("scope", scope)
-                .with_ctx("driver_error_kind", kind.to_string())
-                .attach_note(detail)
-                .attach_note("driver error report captured")
-        })
-    }
-}
