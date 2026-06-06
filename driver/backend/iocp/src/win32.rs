@@ -259,9 +259,7 @@ impl IoCompletionPort {
         let handle =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, threads) };
         if handle.is_null() {
-            return Err(
-                IocpError::Win32.io_report("CreateIoCompletionPort.new", last_os_error())
-            );
+            return Err(IocpError::Win32.io_report("CreateIoCompletionPort.new", last_os_error()));
         }
         Ok(Self(OwnedHandle(handle)))
     }
@@ -304,9 +302,7 @@ impl IoCompletionPort {
             PostQueuedCompletionStatus(self.0.as_raw(), bytes, key, overlapped as *mut OVERLAPPED)
         };
         if res == 0 {
-            return Err(
-                IocpError::Win32.io_report("PostQueuedCompletionStatus", last_os_error())
-            );
+            return Err(IocpError::Win32.io_report("PostQueuedCompletionStatus", last_os_error()));
         }
         Ok(())
     }
@@ -331,9 +327,7 @@ impl IoCompletionPort {
             if err == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
                 return Ok(());
             }
-            return Err(
-                IocpError::Win32.io_report("CancelIoEx", from_raw_os_error(err as i32))
-            );
+            return Err(IocpError::Win32.io_report("CancelIoEx", from_raw_os_error(err as i32)));
         }
         Ok(())
     }
@@ -362,10 +356,8 @@ impl IoCompletionPort {
                 if err == WAIT_TIMEOUT {
                     return Ok(CompletionStatus::Timeout);
                 }
-                return Err(IocpError::Win32.io_report(
-                    "GetQueuedCompletionStatus",
-                    from_raw_os_error(err as i32),
-                ));
+                return Err(IocpError::Win32
+                    .io_report("GetQueuedCompletionStatus", from_raw_os_error(err as i32)));
             } else {
                 return Ok(CompletionStatus::Completed {
                     bytes,

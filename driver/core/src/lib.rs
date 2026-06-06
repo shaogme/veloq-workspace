@@ -1,5 +1,4 @@
 use core::convert::TryFrom;
-use core::fmt;
 use core::marker::PhantomData;
 
 use diagweave::prelude::*;
@@ -151,38 +150,6 @@ pub fn driver_error(
     kind.to_report()
         .with_ctx("scope", scope)
         .attach_note(detail)
-}
-
-pub trait ResultAsDriverExt<T, E> {
-    fn to_driver_result(
-        self,
-        kind: DriverErrorKind,
-        scope: &'static str,
-        detail: impl ToString,
-    ) -> DriverResult<T>;
-}
-
-impl<T, E> ResultAsDriverExt<T, E> for Result<T, Report<E>>
-where
-    E: fmt::Debug + fmt::Display + std::error::Error + Send + Sync + 'static,
-{
-    fn to_driver_result(
-        self,
-        kind: DriverErrorKind,
-        scope: &'static str,
-        detail: impl ToString,
-    ) -> DriverResult<T> {
-        let detail = detail.to_string();
-        self.map_report(|report| {
-            tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
-            report
-                .set_accumulate_src_chain(true)
-                .map_err(|_| kind)
-                .with_ctx("scope", scope)
-                .attach_note(detail)
-                .attach_note("driver error report captured")
-        })
-    }
 }
 
 // ============================================================================

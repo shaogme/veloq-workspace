@@ -1,5 +1,5 @@
 use diagweave::prelude::*;
-use veloq_driver_core::{DriverErrorKind, DriverResult, ResultAsDriverExt};
+use veloq_driver_core::{DriverErrorKind, DriverResult};
 
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -84,6 +84,15 @@ impl<T> UringResultExt<T> for UringResult<T> {
         scope: &'static str,
         detail: impl ToString,
     ) -> DriverResult<T> {
-        ResultAsDriverExt::to_driver_result(self, kind, scope, detail)
+        let detail = detail.to_string();
+        self.map_report(|report| {
+            tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
+            report
+                .set_accumulate_src_chain(true)
+                .map_err(|_| kind)
+                .with_ctx("scope", scope)
+                .attach_note(detail)
+                .attach_note("driver error report captured")
+        })
     }
 }

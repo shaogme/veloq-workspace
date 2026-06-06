@@ -1,5 +1,5 @@
 pub use veloq_driver_core::{
-    DriverErrorKind, DriverErrorReport, DriverResult, ResultAsDriverExt, driver_error,
+    DriverErrorKind, DriverErrorReport, DriverResult, driver_error,
     driver_error_kind_fallback_errno, driver_error_report_to_event_res,
 };
 
