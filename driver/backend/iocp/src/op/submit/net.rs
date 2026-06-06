@@ -361,13 +361,11 @@ pub(crate) fn submit_accept(
             crate::Socket::new_tcp_v6()
         }
         .map(|s| s.into_owned_raw())
-        .map_err(|e| {
-            e.attach_note(format!(
-                "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
-                handle.raw().as_handle() as usize,
-                family
-            ))
-        })?;
+        .attach_note(format!(
+            "submit_accept: create accept socket failed: listen=0x{:x}, family={}",
+            handle.raw().as_handle() as usize,
+            family
+        ))?;
         payload.accept_socket = Some(accept_socket);
     }
     let accept_socket = payload
@@ -404,17 +402,15 @@ pub(crate) fn submit_accept(
             lp_overlapped: ctx.overlapped,
         })
     }
-    .map_err(|e| {
-        e.attach_note(format!(
-            "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
-            handle.raw().as_handle() as usize,
-            accept_socket_raw,
-            split,
-            split,
-            header.user_data,
-            header.generation
-        ))
-    });
+    .attach_note(format!(
+        "submit_accept: AcceptEx failure: listen=0x{:x}, accept=0x{:x}, in_len={}, out_len={}, user_data={}, generation={}",
+        handle.raw().as_handle() as usize,
+        accept_socket_raw,
+        split,
+        split,
+        header.user_data,
+        header.generation
+    ));
     mark_header_in_flight(header, submit_res)
 }
 
