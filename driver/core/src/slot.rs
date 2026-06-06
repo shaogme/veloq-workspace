@@ -349,16 +349,14 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
                 index,
             )
             .map(SlotView::Reserved),
-            SlotState::InFlightWaiting | SlotState::InFlightReady => {
-                Slot::<InFlightWaiting, Spec>::try_bind(
-                    entry,
-                    op,
-                    storage,
-                    &mut op_entry.platform_data,
-                    index,
-                )
-                .map(SlotView::InFlightWaiting)
-            }
+            SlotState::InFlightWaiting => Slot::<InFlightWaiting, Spec>::try_bind(
+                entry,
+                op,
+                storage,
+                &mut op_entry.platform_data,
+                index,
+            )
+            .map(SlotView::InFlightWaiting),
             SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Spec>::try_bind(
                 entry,
                 op,
@@ -367,7 +365,10 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
                 index,
             )
             .map(SlotView::InFlightOrphaned),
-            SlotState::Idle | SlotState::Finalizing | SlotState::ReservedValue => None,
+            SlotState::Idle
+            | SlotState::InFlightReady
+            | SlotState::Finalizing
+            | SlotState::ReservedValue => None,
         }
     }
 
@@ -378,5 +379,59 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
             .expect("slot missing in registry during reserve");
         entry.set_state(SlotState::Reserved, Ordering::Release);
         Slot::new_internal(entry, op, storage, &mut op_entry.platform_data, index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{CompletionAccess, CompletionEvent, PlatformOp, encode_completion_token};
+
+    struct DummyPlatformOp;
+
+    impl PlatformOp for DummyPlatformOp {}
+
+    struct DummySlotSpec;
+
+    impl SlotSpec for DummySlotSpec {
+        type Op = DummyPlatformOp;
+        type UserPayload = ();
+        type PlatformData = ();
+        type Sidecar = ();
+        type Error = ();
+        type Completion = usize;
+    }
+
+    #[test]
+    fn ready_slots_are_owned_by_completion_table_not_slot_view() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let handle = registry.alloc(()).expect("slot allocation failed").handle;
+        let token = encode_completion_token(handle.index, handle.generation);
+
+        {
+            let slot = registry
+                .slot_reserve(handle.index)
+                .init_op_with(DummyPlatformOp, |_| {});
+            let _in_flight = slot.start_submission_with(None).persist();
+        }
+
+        registry.shared.record_completion_with_data(
+            CompletionEvent {
+                user_data: token,
+                res: 0,
+                flags: 0,
+            },
+            Some(()),
+            None,
+        );
+
+        assert!(registry.slot_view(handle.index).is_none());
+        let record = match registry.shared.try_take_record(token) {
+            crate::driver::PollRecordResult::Ready(record) => record,
+            crate::driver::PollRecordResult::Pending => panic!("completion should be ready"),
+            crate::driver::PollRecordResult::Stale => panic!("completion should not be stale"),
+        };
+        assert_eq!(record.event.user_data, token);
+        assert_eq!(record.payload, Some(()));
     }
 }
