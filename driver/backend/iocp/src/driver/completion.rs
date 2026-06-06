@@ -407,7 +407,8 @@ impl<'a> IocpDriver<'a> {
             let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
                 if let Some(res) = blocking_res {
                     io_result = res.map_err(|e| {
-                        IocpError::Win32.io_report("iocp.driver.blocking_completion", e)
+                        e.with_ctx("outer_scope", "iocp.driver.blocking_completion")
+                            .attach_note("blocking completion returned stored error")
                     });
                 } else if matches!(
                     &iocp_op.payload,

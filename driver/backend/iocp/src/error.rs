@@ -53,14 +53,8 @@ impl IocpError {
     }
 
     #[inline]
-    pub(crate) fn io_report<E>(self, scope: &'static str, error: E) -> Report<Self>
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        let error_ref = &error as &dyn std::any::Any;
-        let os_code = error_ref
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error);
+    pub(crate) fn io_report(self, scope: &'static str, error: std::io::Error) -> Report<Self> {
+        let os_code = error.raw_os_error();
         let report = self
             .to_report()
             .with_ctx("scope", scope)

@@ -13,13 +13,13 @@ use crate::config::{
 };
 use crate::error::{UringError, UringResult};
 use crate::op::{UringOp, UringUserPayload};
+use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
     DriveMode, DriveOutcome, Driver, DriverSubmitResult, RegisterFd, RemoteWaker,
     SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
-use veloq_driver_core::{DriverReport, DriverResult as CoreDriverResult};
 
 mod completion;
 mod lifecycle;
@@ -32,8 +32,6 @@ pub(crate) use registration::{MAX_CHUNKS, RegisteredFileEntry, UringRegistration
 use crate::op::slot::{UringOpRegistry, UringOpRegistryExt, UringSlotSpec};
 
 type DriverResult<T> = CoreDriverResult<T, UringError>;
-type DriverErrorReport = DriverReport<UringError>;
-
 pub(crate) struct EventFd {
     pub(crate) fd: OwnedRawHandle,
 }

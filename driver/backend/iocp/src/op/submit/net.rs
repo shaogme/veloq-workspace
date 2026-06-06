@@ -63,14 +63,12 @@ pub(crate) fn submit_recv(
                 &mut val.buf,
                 ctx.registrar,
             )
-            .map_err(|e| {
-                IocpError::Submission
-                    .io_report("submit_recv", e)
-                    .attach_note(format!(
-                        "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
-                        val.fd, user_data, generation
-                    ))
-            }),
+            .with_ctx("outer_scope", "submit_recv")
+            .attach_note(format!(
+                "RIO recv submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, user_data, generation
+            ))
+            .trans(),
     )
 }
 
@@ -102,14 +100,12 @@ pub(crate) fn submit_udp_recv(
                 &mut val.buf,
                 ctx.registrar,
             )
-            .map_err(|e| {
-                IocpError::Submission
-                    .io_report("submit_udp_recv", e)
-                    .attach_note(format!(
-                        "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
-                        val.fd, header.user_data, header.generation
-                    ))
-            }),
+            .with_ctx("outer_scope", "submit_udp_recv")
+            .attach_note(format!(
+                "RIO udp_recv submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, header.user_data, header.generation
+            ))
+            .trans(),
     )
 }
 
@@ -140,14 +136,12 @@ pub(crate) fn submit_send(
                 &val.buf,
                 ctx.registrar,
             )
-            .map_err(|e| {
-                IocpError::Submission
-                    .io_report("submit_send", e)
-                    .attach_note(format!(
-                        "RIO send submit failed: fd={:?}, user_data={}, generation={}",
-                        val.fd, user_data, generation
-                    ))
-            }),
+            .with_ctx("outer_scope", "submit_send")
+            .attach_note(format!(
+                "RIO send submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, user_data, generation
+            ))
+            .trans(),
     )
 }
 
@@ -178,14 +172,12 @@ pub(crate) fn submit_udp_send(
                 &val.buf,
                 ctx.registrar,
             )
-            .map_err(|e| {
-                IocpError::Submission
-                    .io_report("submit_udp_send", e)
-                    .attach_note(format!(
-                        "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
-                        val.fd, user_data, generation
-                    ))
-            }),
+            .with_ctx("outer_scope", "submit_udp_send")
+            .attach_note(format!(
+                "RIO udp_send submit failed: fd={:?}, user_data={}, generation={}",
+                val.fd, user_data, generation
+            ))
+            .trans(),
     )
 }
 
@@ -522,12 +514,12 @@ pub(crate) fn submit_send_to(
         header,
         ctx.rio
             .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
-            .map_err(|e| {
-                IocpError::Submission.io_report("submit_send_to", e).attach_note(format!(
-                    "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
-                    user.fd, header.user_data, header.generation, page_idx
-                ))
-            }),
+            .with_ctx("outer_scope", "submit_send_to")
+            .attach_note(format!(
+                "RIO send_to submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
+                user.fd, header.user_data, header.generation, page_idx
+            ))
+            .trans(),
     )
 }
 
@@ -564,12 +556,11 @@ pub(crate) fn submit_udp_recv_from(
         header,
         ctx.rio
             .try_submit_recv_from(args, ctx.registrar, ctx.slab_resolver)
-            .map_err(|e| {
-            IocpError::Submission.io_report("submit_udp_recv_from", e).attach_note(format!(
+            .with_ctx("outer_scope", "submit_udp_recv_from")
+            .attach_note(format!(
                 "RIO udp_recv_from submit failed: fd={:?}, user_data={}, generation={}, page_idx={}",
                 fd, header.user_data, header.generation, page_idx
-            ))
-        }),
+            )).trans(),
     )
 }
 
