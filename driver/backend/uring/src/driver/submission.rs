@@ -321,7 +321,7 @@ impl<'a> UringDriver<'a> {
                     *op_in = Some(op);
                 }
                 DriverSubmitResult::failed(
-                    e.with_ctx("scope", "uring.driver.submit_sqe_internal")
+                    e.push_ctx("scope", "uring.driver.submit_sqe_internal")
                         .attach_note("submit sqe"),
                     SubmitStatus::Void,
                 )
@@ -376,7 +376,7 @@ impl<'a> UringDriver<'a> {
                     *op_in = Some(op);
                 }
                 DriverSubmitResult::failed(
-                    e.with_ctx("scope", "uring.driver.submit_timer_internal")
+                    e.push_ctx("scope", "uring.driver.submit_timer_internal")
                         .attach_note("submit timer"),
                     SubmitStatus::Void,
                 )

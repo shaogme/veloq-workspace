@@ -93,12 +93,12 @@ impl RioState {
         let code = Self::last_wsa_error_code() as u32;
         context
             .to_report()
-            .with_ctx("scope", scope)
+            .push_ctx("scope", scope)
             .set_error_code(code)
             .attach_note(
                 IocpError::Internal
                     .to_report()
-                    .with_ctx("scope", scope)
+                    .push_ctx("scope", scope)
                     .set_error_code(code as i32)
                     .attach_note("winsock error"),
             )
@@ -133,7 +133,7 @@ mod tests {
         );
         let err = IocpError::Internal
             .to_report()
-            .with_ctx("scope", "rio.core.tests")
+            .push_ctx("scope", "rio.core.tests")
             .set_error_code(10022)
             .attach_note("invalid argument");
         assert_eq!(rio_result_to_event_res(&Err(err)), -10022);

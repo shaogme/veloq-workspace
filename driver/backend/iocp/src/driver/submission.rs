@@ -150,7 +150,7 @@ impl<'a> IocpDriver<'a> {
             ops.recycle(user_data, generation.wrapping_add(1));
             DriverSubmitResult::failed(
                 err.set_accumulate_src_chain(true)
-                    .with_ctx("scope", "iocp/driver")
+                    .push_ctx("scope", "iocp/driver")
                     .attach_note("failed to post completion queue notification"),
                 SubmitStatus::Void,
             )
@@ -184,7 +184,7 @@ impl<'a> IocpDriver<'a> {
         })?;
 
         let guard = Self::prep_op_slot(&mut self.ops, user_data, op)
-            .with_ctx("scope", "iocp/driver")
+            .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
 
         let overlapped = guard.storage.with_mut(|_result, _payload, sidecar| {
@@ -213,7 +213,7 @@ impl<'a> IocpDriver<'a> {
             .ok_or_else(|| {
                 IocpError::InvalidState.report("iocp/driver", "op missing during submission")
             })?
-            .with_ctx("scope", "iocp/driver")
+            .push_ctx("scope", "iocp/driver")
             .attach_note("op submit failed");
 
         let pending_socket_key = if matches!(result, Ok(submit::SubmissionResult::Pending)) {

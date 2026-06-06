@@ -114,7 +114,7 @@ impl RioState {
         if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
             return Err(e
-                .with_ctx("scope", "rio.core.submit_ops.try_submit_recv_internal")
+                .push_ctx("scope", "rio.core.submit_ops.try_submit_recv_internal")
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
                 .with_ctx("handle_raw", handle.raw().as_handle() as usize)
@@ -157,7 +157,7 @@ impl RioState {
         let rq = {
             let actor = self
                 .ensure_actor((fd, handle), env)
-                .with_ctx("scope", "rio.core.submit_ops.try_submit_send.ensure_actor")
+                .push_ctx("scope", "rio.core.submit_ops.try_submit_send.ensure_actor")
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
                 .with_ctx("handle_raw", handle.raw().as_handle() as usize)
@@ -179,7 +179,7 @@ impl RioState {
         if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
             return Err(e
-                .with_ctx("scope", "rio.core.submit_ops.try_submit_send")
+                .push_ctx("scope", "rio.core.submit_ops.try_submit_send")
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
                 .with_ctx("handle_raw", handle.raw().as_handle() as usize)

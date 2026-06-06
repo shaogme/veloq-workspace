@@ -339,9 +339,9 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "diagweave"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a3c5f47cd10ca80180722504e6c95d19a2d976e3a415055c746642b58c9d108"
+checksum = "e148e5431c341c5cf04a8f5e8bb91d82b573a92c4ae827c3e831be03c8448a4c"
 dependencies = [
  "diagweave-macros",
  "ref_str",
@@ -909,9 +909,9 @@ dependencies = [
 
 [[package]]
 name = "ref_str"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97816352048e34e6795566f69f3d4980f2728f21c4b8dbaa7afe87821763d306"
+checksum = "89139ceea9b891d4992981a77dc13ae3a9810a410feb2509b52889fef808eff4"
 dependencies = [
  "serde",
 ]

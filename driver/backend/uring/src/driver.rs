@@ -56,7 +56,7 @@ impl RemoteWaker<UringError> for UringWaker {
                 }
                 return Err(UringError::Internal
                     .to_report()
-                    .with_ctx("scope", "uring.driver.waker.wake")
+                    .push_ctx("scope", "uring.driver.waker.wake")
                     .set_error_code(err.raw_os_error().unwrap_or(libc::EIO))
                     .attach_note(err.to_string()));
             }
@@ -263,7 +263,7 @@ impl<'a> Driver for UringDriver<'a> {
             return DriverSubmitResult::failed(
                 UringError::InvalidState
                     .report("driver.submit", "submit called with empty Option")
-                    .with_ctx("scope", "uring.driver.submit")
+                    .push_ctx("scope", "uring.driver.submit")
                     .attach_note("submit called with empty Option"),
                 SubmitStatus::Void,
             );
@@ -288,7 +288,7 @@ impl<'a> Driver for UringDriver<'a> {
                         "driver.submit",
                         "background strategy reached normal submit path",
                     )
-                    .with_ctx("scope", "uring.driver.submit")
+                    .push_ctx("scope", "uring.driver.submit")
                     .attach_note("background strategy reached normal submit path"),
                 SubmitStatus::Void,
             ),
@@ -305,7 +305,7 @@ impl<'a> Driver for UringDriver<'a> {
         match mode {
             DriveMode::Poll => {
                 self.poll_nonblocking_internal()
-                    .with_ctx("scope", "uring.driver.drive.poll")
+                    .push_ctx("scope", "uring.driver.drive.poll")
                     .attach_note("poll completions")?;
             }
             DriveMode::Wait => {
@@ -318,7 +318,7 @@ impl<'a> Driver for UringDriver<'a> {
                     });
                 }
                 self.wait_internal()
-                    .with_ctx("scope", "uring.driver.drive.wait")
+                    .push_ctx("scope", "uring.driver.drive.wait")
                     .attach_note("wait for completions")?;
             }
         }
@@ -345,7 +345,7 @@ impl<'a> Driver for UringDriver<'a> {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
         self.register_chunk_internal(id, ptr, len)
-            .with_ctx("scope", "uring.driver.register_chunk")
+            .push_ctx("scope", "uring.driver.register_chunk")
             .with_ctx("driver_error_kind", UringError::Registration.to_string())
             .attach_note("register chunk")
     }
@@ -355,14 +355,14 @@ impl<'a> Driver for UringDriver<'a> {
         files: Vec<RegisterFd<'f, UringRawHandle>>,
     ) -> DriverResult<Vec<IoFd>> {
         self.register_files_internal(files)
-            .with_ctx("scope", "uring.driver.register_files")
+            .push_ctx("scope", "uring.driver.register_files")
             .attach_note("register files")
     }
 
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
         for fd in files {
             self.unregister_fixed_fd(fd)
-                .with_ctx("scope", "uring.driver.unregister_files")
+                .push_ctx("scope", "uring.driver.unregister_files")
                 .attach_note("unregister fixed fd")?;
         }
         Ok(())

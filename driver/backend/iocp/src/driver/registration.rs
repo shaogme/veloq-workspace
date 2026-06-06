@@ -106,7 +106,7 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpDriverResult<()> {
         self.rio_state
             .register_chunk(id, ptr, len)
-            .with_ctx("scope", "iocp/driver")
+            .push_ctx("scope", "iocp/driver")
             .attach_note("failed to register RIO chunk")
             .trans()?;
         Ok(())
@@ -128,7 +128,7 @@ impl<'a> IocpDriver<'a> {
                 RawHandleKind::Socket => handle,
                 RawHandleKind::File => {
                     if Self::detect_socket_from_file_handle(handle)
-                        .with_ctx("scope", "iocp/driver")
+                        .push_ctx("scope", "iocp/driver")
                         .attach_note("detect socket from file handle failed")?
                     {
                         RawHandle::new(IocpHandle::for_socket(handle.raw().as_handle()))

@@ -26,7 +26,7 @@ impl CompletionValue for usize {
             Err(E::from_core_report(
                 DriverCoreError::System
                     .to_report()
-                    .with_ctx("scope", "driver-core/completion")
+                    .push_ctx("scope", "driver-core/completion")
                     .set_error_code(-res)
                     .attach_note("completion reported OS error"),
             ))

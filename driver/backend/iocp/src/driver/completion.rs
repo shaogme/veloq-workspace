@@ -81,7 +81,7 @@ impl<'a> IocpDriver<'a> {
         let status = self
             .port
             .get_status(10)
-            .with_ctx("scope", "iocp/driver")
+            .push_ctx("scope", "iocp/driver")
             .attach_note("failed to poll IOCP status")?;
 
         match status {
@@ -105,7 +105,7 @@ impl<'a> IocpDriver<'a> {
                         .inspect(|_| {
                             self.drain_deferred_socket_cleanup();
                         })
-                        .with_ctx("scope", "iocp/driver")
+                        .push_ctx("scope", "iocp/driver")
                         .attach_note("failed to process rio completions")
                         .trans()?;
                     return Ok(processed);
@@ -130,11 +130,11 @@ impl<'a> IocpDriver<'a> {
         let pending = self.shutdown_ops();
         if let CloseMode::Strict { timeout } = mode {
             self.drain_pending_iocp(pending, timeout)
-                .with_ctx("scope", "iocp/driver")
+                .push_ctx("scope", "iocp/driver")
                 .attach_note("drain pending iocp timed out")?;
             self.rio_state
                 .drain_outstanding(timeout)
-                .with_ctx("scope", "iocp/driver")
+                .push_ctx("scope", "iocp/driver")
                 .attach_note("failed to drain RIO outstanding requests")
                 .trans()?;
         }

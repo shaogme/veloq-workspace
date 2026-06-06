@@ -125,7 +125,7 @@ where
         E::from_core_report(
             DriverCoreError::Internal
                 .to_report()
-                .with_ctx("scope", "driver-core/op")
+                .push_ctx("scope", "driver-core/op")
                 .attach_note("operation payload lost: completion sidecar missing"),
         ),
     )
@@ -141,7 +141,7 @@ where
         E::from_core_report(
             DriverCoreError::Internal
                 .to_report()
-                .with_ctx("scope", "driver-core/op")
+                .push_ctx("scope", "driver-core/op")
                 .attach_note("operation lost: slot recycled (generation mismatch)"),
         ),
     )

@@ -48,7 +48,7 @@ impl IocpError {
     ) -> Report<Self> {
         self.to_report()
             .set_error_code(iocp_fallback_errno(self))
-            .with_ctx("scope", scope)
+            .push_ctx("scope", scope)
             .attach_note(detail)
     }
 
@@ -57,7 +57,7 @@ impl IocpError {
         let os_code = error.raw_os_error();
         let report = self
             .to_report()
-            .with_ctx("scope", scope)
+            .push_ctx("scope", scope)
             .with_diag_src_err(error);
         if let Some(code) = os_code {
             report.set_error_code(code)

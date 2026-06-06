@@ -243,7 +243,7 @@ impl<'a> Driver for IocpDriver<'a> {
             return DriverSubmitResult::failed(
                 IocpError::Internal
                     .to_report()
-                    .with_ctx("scope", "iocp/driver")
+                    .push_ctx("scope", "iocp/driver")
                     .set_error_code(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
                     .attach_note("driver is shutting down"),
                 SubmitStatus::Void,
@@ -264,7 +264,7 @@ impl<'a> Driver for IocpDriver<'a> {
             Ok(res) => res,
             Err(e) => {
                 return DriverSubmitResult::failed(
-                    e.with_ctx("scope", "iocp/driver")
+                    e.push_ctx("scope", "iocp/driver")
                         .attach_note("call_op_submit failed"),
                     SubmitStatus::Void,
                 );
@@ -285,7 +285,7 @@ impl<'a> Driver for IocpDriver<'a> {
         match mode {
             DriveMode::Poll => {
                 self.get_completion(0)
-                    .with_ctx("scope", "iocp/driver.drive.poll")
+                    .push_ctx("scope", "iocp/driver.drive.poll")
                     .attach_note("drive(Poll) failed")?;
             }
             DriveMode::Wait => {
@@ -298,7 +298,7 @@ impl<'a> Driver for IocpDriver<'a> {
                     });
                 }
                 self.get_completion(u32::MAX)
-                    .with_ctx("scope", "iocp/driver.drive.wait")
+                    .push_ctx("scope", "iocp/driver.drive.wait")
                     .attach_note("wait for completion failed")?;
             }
         }
@@ -325,7 +325,7 @@ impl<'a> Driver for IocpDriver<'a> {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> IocpDriverResult<()> {
         IocpDriver::register_chunk(self, id, ptr, len)
-            .with_ctx("scope", "iocp/driver")
+            .push_ctx("scope", "iocp/driver")
             .attach_note("register chunk failed")
     }
 

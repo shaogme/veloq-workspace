@@ -48,7 +48,7 @@ pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Repo
     let detail = detail.into();
     let report = IocpError::from(ctx)
         .to_report()
-        .with_ctx("scope", "iocp/common")
+        .push_ctx("scope", "iocp/common")
         .with_ctx("detail", sanitize_field(&detail))
         .attach_note(detail);
     error!(
@@ -116,7 +116,7 @@ impl RemoteWaker<IocpError> for IocpWaker {
         if !self.is_notified.swap(true, Ordering::AcqRel) {
             self.port
                 .notify(WAKEUP_USER_DATA)
-                .with_ctx("scope", "iocp/common")
+                .push_ctx("scope", "iocp/common")
                 .attach_note("failed to notify remote waker")?;
         }
         Ok(())

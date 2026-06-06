@@ -37,7 +37,7 @@ impl UringError {
     pub(crate) fn report(self, scope: &'static str, detail: impl ToString) -> Report<Self> {
         self.to_report()
             .set_error_code(uring_fallback_errno(self))
-            .with_ctx("scope", scope)
+            .push_ctx("scope", scope)
             .attach_note(detail.to_string())
     }
 
@@ -47,7 +47,7 @@ impl UringError {
         let detail = error.to_string();
         let report = self
             .to_report()
-            .with_ctx("scope", scope)
+            .push_ctx("scope", scope)
             .attach_note(detail)
             .with_diag_src_err(error);
         if let Some(code) = os_code {

@@ -84,7 +84,7 @@ impl<'a> RioCompletionRouter<'a> {
                     } else {
                         Err(IocpError::CompletionWait
                             .to_report()
-                            .with_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
+                            .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
                             .set_error_code(res.Status)
                             .attach_note("rio completion returned os error"))
                     };
@@ -193,7 +193,7 @@ impl RioState {
         let rq = self
             .registry
             .create_rq((handle, fd), env)
-            .with_ctx("scope", "rio.runtime.control_flow.ensure_actor")
+            .push_ctx("scope", "rio.runtime.control_flow.ensure_actor")
             .with_ctx("fd_fixed_index", fd.fixed_index())
             .with_ctx("fd_generation", fd.generation())
             .with_ctx("handle_raw", handle.raw().as_handle() as usize)
