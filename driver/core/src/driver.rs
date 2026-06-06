@@ -26,6 +26,14 @@ pub enum DriverControlCommand {
 }
 
 pub type SharedSlotTable<Op, UP, S, E, C = usize> = Arc<slot::SlotTable<Op, UP, S, E, C>>;
+pub type SharedDriverSlotTable<D> = SharedSlotTable<
+    <D as Driver>::Op,
+    <D as Driver>::UP,
+    <D as Driver>::Sidecar,
+    <D as Driver>::Error,
+    <D as Driver>::Completion,
+>;
+pub type DriverSubmitResult<E> = Outcome<Result<Poll<()>, (DriverReport<E>, SubmitStatus)>>;
 
 pub trait Driver {
     type Op: PlatformOp;
@@ -37,9 +45,7 @@ pub trait Driver {
 
     fn reserve_op(&mut self) -> DriverResult<(usize, u32), Self::Error>;
 
-    fn slot_table(
-        &self,
-    ) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Error, Self::Completion>;
+    fn slot_table(&self) -> SharedDriverSlotTable<Self>;
 
     fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable>;
 
@@ -52,7 +58,7 @@ pub trait Driver {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>>;
+    ) -> DriverSubmitResult<Self::Error>;
 
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error>;
 
@@ -101,9 +107,7 @@ impl<D: Driver + ?Sized> Driver for &mut D {
     }
 
     #[inline]
-    fn slot_table(
-        &self,
-    ) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Error, Self::Completion> {
+    fn slot_table(&self) -> SharedDriverSlotTable<Self> {
         (**self).slot_table()
     }
 
@@ -128,7 +132,7 @@ impl<D: Driver + ?Sized> Driver for &mut D {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>> {
+    ) -> DriverSubmitResult<Self::Error> {
         (**self).submit(user_data, op_in, binder)
     }
 
@@ -216,9 +220,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 
     #[inline]
-    fn slot_table(
-        &self,
-    ) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Error, Self::Completion> {
+    fn slot_table(&self) -> SharedDriverSlotTable<Self> {
         self.provider.with_driver_ref(|d| d.slot_table())
     }
 
@@ -245,7 +247,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>> {
+    ) -> DriverSubmitResult<Self::Error> {
         self.provider
             .with_driver_mut(|d| d.submit(user_data, op_in, binder))
     }
@@ -372,10 +374,7 @@ impl SubmitBinder {
     }
 
     #[inline]
-    pub fn ok<E>(
-        self,
-        poll: Poll<()>,
-    ) -> Outcome<Result<Poll<()>, (DriverReport<E>, SubmitStatus)>>
+    pub fn ok<E>(self, poll: Poll<()>) -> DriverSubmitResult<E>
     where
         E: std::error::Error + Send + Sync + 'static,
     {
@@ -383,11 +382,7 @@ impl SubmitBinder {
     }
 
     #[inline]
-    pub fn err<E>(
-        self,
-        err: DriverReport<E>,
-        status: SubmitStatus,
-    ) -> Outcome<Result<Poll<()>, (DriverReport<E>, SubmitStatus)>>
+    pub fn err<E>(self, err: DriverReport<E>, status: SubmitStatus) -> DriverSubmitResult<E>
     where
         E: std::error::Error + Send + Sync + 'static,
     {

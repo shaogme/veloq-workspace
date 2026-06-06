@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, trace};
 
 use crate::driver::UringDriver;
-use crate::error::{UringError, UringResult};
+use crate::error::{UringDriverResult, UringError, UringResult};
 use crate::op::{
     UringUserPayload,
     slot::{SlotView, UringOpRegistryExt},
@@ -11,7 +11,7 @@ use crate::op::{
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionSidecar, drain_cancel_requests, encode_completion_token,
 };
-use veloq_driver_core::{DriverResult, driver_error_report_to_event_res};
+use veloq_driver_core::driver_report_to_event_res;
 
 impl<'a> UringDriver<'a> {
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
@@ -72,7 +72,7 @@ impl<'a> UringDriver<'a> {
                     let _ = completed.take_op();
                     let (payload, detail) = completed.take_completion_data();
 
-                    Some(CompletionSidecar::<UringUserPayload> {
+                    Some(CompletionSidecar::<UringUserPayload, UringError> {
                         user_data,
                         generation,
                         res: 0,
@@ -119,7 +119,7 @@ impl<'a> UringDriver<'a> {
         };
 
         let mut needs_waker_resubmit = false;
-        let mut pending_events: Vec<CompletionSidecar<UringUserPayload>> = Vec::new();
+        let mut pending_events: Vec<CompletionSidecar<UringUserPayload, UringError>> = Vec::new();
 
         let mut cqes = Vec::new();
         {
@@ -167,7 +167,7 @@ impl<'a> UringDriver<'a> {
                     }
                     let _ = completed.take_op();
 
-                    Some(CompletionSidecar::<UringUserPayload> {
+                    Some(CompletionSidecar::<UringUserPayload, UringError> {
                         user_data,
                         generation,
                         res: res_code,
@@ -182,7 +182,7 @@ impl<'a> UringDriver<'a> {
                     let (payload, detail) = completed.take_completion_data();
                     let _ = completed.take_op();
 
-                    Some(CompletionSidecar::<UringUserPayload> {
+                    Some(CompletionSidecar::<UringUserPayload, UringError> {
                         user_data,
                         generation,
                         res: cqe_res,
@@ -216,7 +216,10 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    pub(crate) fn push_completion_event(&mut self, sidecar: CompletionSidecar<UringUserPayload>) {
+    pub(crate) fn push_completion_event(
+        &mut self,
+        sidecar: CompletionSidecar<UringUserPayload, UringError>,
+    ) {
         let token = encode_completion_token(sidecar.user_data, sidecar.generation);
         let event = CompletionEvent {
             user_data: token,
@@ -230,9 +233,9 @@ impl<'a> UringDriver<'a> {
 }
 
 #[inline]
-pub(crate) fn driver_result_to_event_res(res: &DriverResult<usize>) -> i32 {
+pub(crate) fn driver_result_to_event_res(res: &UringDriverResult<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
-        Err(e) => driver_error_report_to_event_res(e),
+        Err(e) => driver_report_to_event_res(e),
     }
 }

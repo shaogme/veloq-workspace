@@ -21,16 +21,22 @@ use veloq_driver_core::driver::{
     RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::slot::{DetachedCancelTable, SlotTable};
-use veloq_driver_core::{DriverErrorKind, DriverErrorReport, DriverResult, driver_error};
+use veloq_driver_core::{
+    DriverCoreError, DriverReport, DriverResult as CoreDriverResult, driver_error,
+};
 use veloq_wheel::{Wheel, WheelConfig};
 
 use diagweave::prelude::*;
 
 use crate::common::IocpWaker;
 use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, RegisteredHandle};
-use crate::error::{IocpResult, IocpResultExt};
+use crate::error::{IocpError, IocpResult, IocpResultExt};
 use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload, OverlappedEntry};
 use crate::rio::RioState;
+
+pub(crate) type IocpDriverResult<T> = CoreDriverResult<T, IocpError>;
+pub(crate) type IocpOpRegistry =
+    OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry, IocpError>;
 
 // ============================================================================
 // State & Lifecycle Types
@@ -39,7 +45,7 @@ use crate::rio::RioState;
 /// The IOCP driver implementation that manages I/O completion ports and operations.
 pub struct IocpDriver<'a> {
     pub(crate) port: Arc<crate::win32::IoCompletionPort>,
-    pub(crate) ops: OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+    pub(crate) ops: IocpOpRegistry,
     pub(crate) extensions: crate::ext::Extensions,
     pub(crate) wheel: Wheel<usize>,
     pub(crate) timer_buffer: Vec<usize>,
@@ -49,7 +55,7 @@ pub struct IocpDriver<'a> {
     pub(crate) free_slots: Vec<usize>,
     pub(crate) is_notified: Arc<AtomicBool>,
     pub(crate) completion_events: SharedCompletionQueue,
-    pub(crate) completion_table: SharedCompletionTable<IocpUserPayload>,
+    pub(crate) completion_table: SharedCompletionTable<IocpUserPayload, IocpError>,
     pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
 
     // RIO Support (required)
@@ -83,7 +89,7 @@ pub enum CloseMode {
     Strict { timeout: Duration },
 }
 
-pub(crate) type CompletionSidecar = CoreCompletionSidecar<IocpUserPayload>;
+pub(crate) type CompletionSidecar = CoreCompletionSidecar<IocpUserPayload, IocpError>;
 
 impl<'a> IocpDriver<'a> {
     /// Checks if the provided operation is a RIO-based operation.
@@ -145,7 +151,8 @@ impl<'a> IocpDriver<'a> {
         ))
         .trans()?;
         let ops = OpRegistry::new(entries as usize);
-        let completion_table: SharedCompletionTable<IocpUserPayload> = ops.shared.clone();
+        let completion_table: SharedCompletionTable<IocpUserPayload, IocpError> =
+            ops.shared.clone();
         Ok(Self {
             port: Arc::new(port_val),
             ops,
@@ -173,7 +180,7 @@ impl<'a> IocpDriver<'a> {
         self.ops.has_active_ops()
     }
 
-    pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker> {
+    pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
         Arc::new(IocpWaker {
             port: self.port.clone(),
             is_notified: self.is_notified.clone(),
@@ -187,13 +194,14 @@ impl<'a> Driver for IocpDriver<'a> {
     type Raw = IocpHandle;
     type Sidecar = crate::op::OverlappedEntry;
     type Completion = usize;
+    type Error = IocpError;
 
-    fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
+    fn reserve_op(&mut self) -> IocpDriverResult<(usize, u32)> {
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::default())) {
             Ok(handle) => (handle.index, handle.generation),
             Err(_) => {
                 return Err(driver_error(
-                    DriverErrorKind::Registration,
+                    DriverCoreError::Registration,
                     "iocp/driver",
                     "OpRegistry is full",
                 ));
@@ -203,7 +211,9 @@ impl<'a> Driver for IocpDriver<'a> {
         Ok((user_data, generation))
     }
 
-    fn slot_table(&self) -> Arc<SlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion>> {
+    fn slot_table(
+        &self,
+    ) -> Arc<SlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Error, Self::Completion>> {
         self.ops.shared.clone()
     }
 
@@ -237,15 +247,17 @@ impl<'a> Driver for IocpDriver<'a> {
         user_data: usize,
         op_in: &mut Option<Self::Op>,
         binder: SubmitBinder,
-    ) -> veloq_driver_core::driver::Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>>
-    {
+    ) -> veloq_driver_core::driver::Outcome<
+        Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>,
+    > {
         if self.shutting_down {
             return binder.err(
-                DriverErrorKind::System
+                DriverCoreError::System
                     .to_report()
                     .with_ctx("scope", "iocp/driver")
                     .set_error_code(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
-                    .attach_note("driver is shutting down"),
+                    .attach_note("driver is shutting down")
+                    .map_err(IocpError::from),
                 SubmitStatus::Void,
             );
         }
@@ -253,10 +265,11 @@ impl<'a> Driver for IocpDriver<'a> {
             Some(op) => op,
             None => {
                 return binder.err(
-                    DriverErrorKind::InvalidInput
+                    DriverCoreError::InvalidInput
                         .to_report()
                         .with_ctx("scope", "iocp/driver")
-                        .attach_note("submit called with empty option"),
+                        .attach_note("submit called with empty option")
+                        .map_err(IocpError::from),
                     SubmitStatus::Void,
                 );
             }
@@ -267,7 +280,7 @@ impl<'a> Driver for IocpDriver<'a> {
             Err(e) => {
                 return binder.err(
                     e.set_accumulate_src_chain(true)
-                        .map_err(|_| DriverErrorKind::Submission)
+                        .map_err(|_| IocpError::Submission)
                         .with_ctx("scope", "iocp/driver")
                         .attach_note("call_op_submit failed"),
                     SubmitStatus::Void,
@@ -285,11 +298,11 @@ impl<'a> Driver for IocpDriver<'a> {
         Self::on_submit_res(&mut self.ops, ctx, result, user_data, op_in, binder)
     }
 
-    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+    fn drive(&mut self, mode: DriveMode) -> IocpDriverResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
                 self.get_completion(0).to_driver_result(
-                    DriverErrorKind::Completion,
+                    DriverCoreError::Completion,
                     "iocp/driver.drive.poll",
                     "drive(Poll) failed",
                 )?;
@@ -304,7 +317,7 @@ impl<'a> Driver for IocpDriver<'a> {
                     });
                 }
                 self.get_completion(u32::MAX).to_driver_result(
-                    DriverErrorKind::Completion,
+                    DriverCoreError::Completion,
                     "iocp/driver.drive.wait",
                     "wait for completion failed",
                 )?;
@@ -323,7 +336,7 @@ impl<'a> Driver for IocpDriver<'a> {
         self.completion_events.clone()
     }
 
-    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion> {
+    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion> {
         self.completion_table.clone()
     }
 
@@ -331,10 +344,10 @@ impl<'a> Driver for IocpDriver<'a> {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
+    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> IocpDriverResult<()> {
         IocpDriver::register_chunk(self, id, ptr, len).map_err(|e| {
             e.set_accumulate_src_chain(true)
-                .map_err(|_| DriverErrorKind::Registration)
+                .map_err(|_| IocpError::Registration)
                 .with_ctx("scope", "iocp/driver")
                 .attach_note("register chunk failed")
         })
@@ -343,15 +356,15 @@ impl<'a> Driver for IocpDriver<'a> {
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, IocpHandle>>,
-    ) -> DriverResult<Vec<IoFd>> {
+    ) -> IocpDriverResult<Vec<IoFd>> {
         IocpDriver::register_files(self, files)
     }
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpDriverResult<()> {
         IocpDriver::unregister_files(self, files)
     }
 
-    fn create_waker(&self) -> Arc<dyn RemoteWaker> {
+    fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
         IocpDriver::create_waker(self)
     }
 }

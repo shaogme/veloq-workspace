@@ -3,11 +3,11 @@ use windows_sys::Win32::Networking::WinSock::{
     SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
 };
 
+use veloq_driver_core::DriverCoreError;
 use veloq_driver_core::driver::RegisterFd;
-use veloq_driver_core::{DriverErrorKind, DriverResult};
 
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
-use crate::driver::IocpDriver;
+use crate::driver::{IocpDriver, IocpDriverResult};
 use crate::error::{IocpError, IocpResult, IocpResultExt};
 
 pub(crate) struct DeferredSocketCleanup {
@@ -104,11 +104,11 @@ impl<'a> IocpDriver<'a> {
         id: u16,
         ptr: *const u8,
         len: usize,
-    ) -> DriverResult<()> {
+    ) -> IocpDriverResult<()> {
         self.rio_state
             .register_chunk(id, ptr, len)
             .to_driver_result(
-                DriverErrorKind::Registration,
+                DriverCoreError::Registration,
                 "iocp/driver",
                 "failed to register RIO chunk",
             )?;
@@ -119,7 +119,7 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn register_files<'h>(
         &mut self,
         files: Vec<RegisterFd<'h, IocpHandle>>,
-    ) -> DriverResult<Vec<IoFd>> {
+    ) -> IocpDriverResult<Vec<IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for file in files {
             let (handle, is_owned_input) = match file {
@@ -131,7 +131,7 @@ impl<'a> IocpDriver<'a> {
                 RawHandleKind::Socket => handle,
                 RawHandleKind::File => {
                     if Self::detect_socket_from_file_handle(handle).to_driver_result(
-                        DriverErrorKind::InvalidInput,
+                        DriverCoreError::InvalidInput,
                         "iocp/driver",
                         "detect socket from file handle failed",
                     )? {
@@ -183,7 +183,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     /// Unregisters a set of previously registered files.
-    pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
+    pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpDriverResult<()> {
         for fd in files {
             let idx = fd.fixed_index() as usize;
             if idx < self.registered_files.len() {

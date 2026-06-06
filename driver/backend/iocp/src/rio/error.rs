@@ -1,5 +1,7 @@
 use diagweave::prelude::*;
-use veloq_driver_core::{DriverErrorKind, DriverResult};
+use veloq_driver_core::DriverCoreError;
+
+use crate::error::{IocpDriverResult, IocpError};
 
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -28,26 +30,27 @@ pub type RioResult<T> = Result<T, Report<RioError>>;
 pub(crate) trait RioResultExt<T> {
     fn to_driver_result(
         self,
-        kind: DriverErrorKind,
+        kind: DriverCoreError,
         scope: &'static str,
         detail: impl ToString,
-    ) -> DriverResult<T>;
+    ) -> IocpDriverResult<T>;
 }
 
 impl<T> RioResultExt<T> for RioResult<T> {
     fn to_driver_result(
         self,
-        kind: DriverErrorKind,
+        kind: DriverCoreError,
         scope: &'static str,
         detail: impl ToString,
-    ) -> DriverResult<T> {
+    ) -> IocpDriverResult<T> {
         let detail = detail.to_string();
         self.map_report(|report| {
             tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
             report
                 .set_accumulate_src_chain(true)
-                .map_err(|_| kind)
+                .map_err(IocpError::Rio)
                 .with_ctx("scope", scope)
+                .with_ctx("driver_core_kind", kind.to_string())
                 .attach_note(detail)
                 .attach_note("driver error report captured")
         })

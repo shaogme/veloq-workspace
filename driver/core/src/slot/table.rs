@@ -4,6 +4,7 @@ use crossbeam_utils::CachePadded;
 use veloq_shim::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub type SlotEntry<Op, UP, S, E, R = usize> = CachePadded<SlotData<Op, UP, S, E, R>>;
+pub type SlotEntries<Op, UP, S, E, R = usize> = Box<[SlotEntry<Op, UP, S, E, R>]>;
 
 pub struct DetachedCancelTable {
     slot_count: usize,
@@ -73,7 +74,7 @@ impl DetachedCancelTable {
 }
 
 pub struct SlotTable<Op, UP, S: SlotSidecar, E, R = usize> {
-    pub slots: Box<[SlotEntry<Op, UP, S, E, R>]>,
+    pub slots: SlotEntries<Op, UP, S, E, R>,
     pub remote_free_head: AtomicUsize,
     ready_completion_count: AtomicUsize,
 }

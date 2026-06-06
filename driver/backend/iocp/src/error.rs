@@ -1,5 +1,5 @@
 use diagweave::prelude::*;
-use veloq_driver_core::{DriverErrorKind, DriverResult};
+use veloq_driver_core::{DriverCoreError, DriverResult};
 
 use crate::rio::error::RioError;
 
@@ -12,6 +12,8 @@ set! {
         CompletionWait,
         #[display("IOCP operation submission failed")]
         Submission,
+        #[display("IOCP registration failed")]
+        Registration,
         #[display(transparent)]
         Rio(#[from] RioError),
         #[display("failed to resolve IO handle")]
@@ -24,12 +26,15 @@ set! {
         InvalidInput,
         #[display("invalid internal state")]
         InvalidState,
+        #[display("unsupported operation")]
+        Unsupported,
         #[display("internal error")]
         Internal,
     }
 }
 
 pub type IocpResult<T> = Result<T, Report<IocpError>>;
+pub type IocpDriverResult<T> = DriverResult<T, IocpError>;
 
 impl IocpError {
     #[inline]
@@ -55,29 +60,44 @@ impl IocpError {
     }
 }
 
+impl From<DriverCoreError> for IocpError {
+    fn from(kind: DriverCoreError) -> Self {
+        match kind {
+            DriverCoreError::InvalidInput => Self::InvalidInput,
+            DriverCoreError::InvalidState => Self::InvalidState,
+            DriverCoreError::Submission => Self::Submission,
+            DriverCoreError::Completion | DriverCoreError::Timeout => Self::CompletionWait,
+            DriverCoreError::Registration => Self::Registration,
+            DriverCoreError::Socket => Self::Socket,
+            DriverCoreError::Unsupported => Self::Unsupported,
+            DriverCoreError::Internal | DriverCoreError::System => Self::Internal,
+        }
+    }
+}
+
 pub(crate) trait IocpResultExt<T> {
     fn to_driver_result(
         self,
-        kind: DriverErrorKind,
+        kind: DriverCoreError,
         scope: &'static str,
         detail: impl ToString,
-    ) -> DriverResult<T>;
+    ) -> IocpDriverResult<T>;
 }
 
 impl<T> IocpResultExt<T> for IocpResult<T> {
     fn to_driver_result(
         self,
-        kind: DriverErrorKind,
+        kind: DriverCoreError,
         scope: &'static str,
         detail: impl ToString,
-    ) -> DriverResult<T> {
+    ) -> IocpDriverResult<T> {
         let detail = detail.to_string();
         self.map_report(|report| {
             tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
             report
                 .set_accumulate_src_chain(true)
-                .map_err(|_| kind)
                 .with_ctx("scope", scope)
+                .with_ctx("driver_core_kind", kind.to_string())
                 .attach_note(detail)
                 .attach_note("driver error report captured")
         })

@@ -64,9 +64,7 @@ pub type SlotEntryOpBundle<'a, Op, UP, P, S, E, R = usize> = (
 pub type SlotEntryAndOpEntry<'a, Op, UP, P, S, E, R = usize> =
     (&'a SlotEntry<Op, UP, S, E, R>, &'a mut OpEntry<P>);
 
-impl<Op: PlatformOp, UP: Send, P: Default, S: SlotSidecar, E, R>
-    OpRegistry<Op, UP, P, S, E, R>
-{
+impl<Op: PlatformOp, UP: Send, P: Default, S: SlotSidecar, E, R> OpRegistry<Op, UP, P, S, E, R> {
     pub fn new(capacity: usize) -> Self {
         let shared = Arc::new(SlotTable::new(capacity));
         let mut local: Vec<LocalSlot<Op, UP, P, S, E, R>> = Vec::with_capacity(capacity);
@@ -81,7 +79,7 @@ impl<Op: PlatformOp, UP: Send, P: Default, S: SlotSidecar, E, R>
         Self {
             shared,
             local: local.into_boxed_slice(),
-            local_free_head: SlotTable::<Op, UP, S, R>::NULL_INDEX,
+            local_free_head: SlotTable::<Op, UP, S, E, R>::NULL_INDEX,
             active_count: 0,
         }
     }
@@ -253,9 +251,7 @@ impl<Op: PlatformOp, UP: Send, P: Default, S: SlotSidecar, E, R>
     }
 }
 
-impl<Op: PlatformOp, UP, P, S: SlotSidecar, E, R> Index<usize>
-    for OpRegistry<Op, UP, P, S, E, R>
-{
+impl<Op: PlatformOp, UP, P, S: SlotSidecar, E, R> Index<usize> for OpRegistry<Op, UP, P, S, E, R> {
     type Output = OpEntry<P>;
 
     fn index(&self, index: usize) -> &Self::Output {

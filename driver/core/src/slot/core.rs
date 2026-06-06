@@ -1,5 +1,5 @@
-use crate::SlotSidecar;
 use crate::DriverResult;
+use crate::SlotSidecar;
 use bilge::prelude::*;
 use std::marker::PhantomData;
 use veloq_atomic_waker::AtomicWaker;
@@ -114,12 +114,7 @@ impl<Op, UP, S: SlotSidecar, E, R> SlotStorage<Op, UP, S, E, R> {
     #[inline]
     pub fn with_mut<F, X>(&mut self, f: F) -> X
     where
-        F: FnOnce(
-            &mut Option<Op>,
-            &mut Option<DriverResult<R, E>>,
-            &mut Option<UP>,
-            &mut S,
-        ) -> X,
+        F: FnOnce(&mut Option<Op>, &mut Option<DriverResult<R, E>>, &mut Option<UP>, &mut S) -> X,
     {
         f(
             &mut self.op,

@@ -2,21 +2,20 @@ use std::error::Error;
 
 use tracing::trace;
 
-use crate::{DriverCoreError, DriverResult};
 use crate::driver::{Driver, PlatformOp, SubmitBinder, SubmitStatus, encode_completion_token};
+use crate::{DriverCoreError, DriverResult};
 
 pub trait DriverProvider: Clone + Unpin {
     type Op: PlatformOp;
     type UP: std::marker::Send;
     type Completion: crate::driver::CompletionValue;
-    type Error:
-        Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
+    type Error: Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
     type Driver<'a>: crate::driver::Driver<
-        Op = Self::Op,
-        UP = Self::UP,
-        Completion = Self::Completion,
-        Error = Self::Error,
-    >
+            Op = Self::Op,
+            UP = Self::UP,
+            Completion = Self::Completion,
+            Error = Self::Error,
+        >
     where
         Self: 'a;
 
@@ -35,8 +34,7 @@ pub trait OpLifecycle: Sized {
     type Output;
     type Raw: crate::RawHandleMeta;
     type CompletionValue;
-    type Error:
-        Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
+    type Error: Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
 
     fn pre_alloc(fd: Self::Raw) -> DriverResult<Self::PreAlloc, Self::Error>;
 
@@ -60,8 +58,7 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
     type Output;
     type Completion;
     type DriverCompletion: crate::driver::CompletionValue;
-    type Error:
-        Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
+    type Error: Error + std::marker::Send + Sync + 'static + From<DriverCoreError>;
     const PAYLOAD_KIND: OpKind;
 
     fn into_kernel_and_payload(self) -> (O, Self::UserPayload);
@@ -93,8 +90,7 @@ impl<T> Op<T> {
                 DriverCompletion = D::Completion,
                 ErasedPayload = D::UP,
                 Error = D::Error,
-            >
-            + std::marker::Send,
+            > + std::marker::Send,
         D: Driver,
     {
         let data = self.data;
@@ -180,11 +176,11 @@ impl<T> Op<T> {
     pub fn submit_local<'a, P: DriverProvider>(self, provider: P) -> LocalOp<'a, T, P>
     where
         T: IntoPlatformOp<
-            P::Op,
-            DriverCompletion = P::Completion,
-            ErasedPayload = P::UP,
-            Error = P::Error,
-        >,
+                P::Op,
+                DriverCompletion = P::Completion,
+                ErasedPayload = P::UP,
+                Error = P::Error,
+            >,
     {
         LocalOp::new(self.data, provider)
     }

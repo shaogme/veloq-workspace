@@ -4,30 +4,29 @@ use std::time::{Duration, Instant};
 
 use diagweave::DiagnosticResult;
 use veloq_blocking::{BlockingTask, get_blocking_pool};
-use veloq_driver_core::driver::registry::OpRegistry;
 use veloq_driver_core::driver::{
-    SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    DriverSubmitResult, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
 };
 use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
-use veloq_driver_core::{DriverErrorKind, DriverResult, driver_error};
+use veloq_driver_core::{DriverCoreError, driver_error};
 
 use crate::common::{completion_record, iocp_fallback_event_res, push_completion_shared};
-use crate::driver::{CompletionSidecar, IocpDriver, IocpOpState};
+use crate::driver::{CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry};
 use crate::error::{IocpError, IocpResult, IocpResultExt};
 use crate::op::slot::Slot;
-use crate::op::{IocpOp, IocpUserPayload, OverlappedEntry, SubmitContext, submit};
+use crate::op::{IocpOp, IocpUserPayload, SubmitContext, submit};
 
 pub(crate) struct SubmitContextInternal<'a> {
     pub(crate) port: &'a crate::win32::IoCompletionPort,
     pub(crate) wheel: &'a mut veloq_wheel::Wheel<usize>,
     pub(crate) completion_events: &'a SharedCompletionQueue,
-    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
+    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
 }
 
 impl<'a> IocpDriver<'a> {
     #[inline]
     pub(crate) fn prep_op_slot(
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
         user_data: usize,
         op: IocpOp,
     ) -> IocpResult<Slot<'_, Reserved>> {
@@ -68,11 +67,11 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn handle_offload(
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
         user_data: usize,
         task: BlockingTask,
-    ) -> DriverResult<Poll<()>> {
+    ) -> IocpDriverResult<Poll<()>> {
         if get_blocking_pool().execute(task).is_err() {
             if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                 let mut guard = slot.complete();
@@ -95,7 +94,7 @@ impl<'a> IocpDriver<'a> {
             let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
             ops.recycle(user_data, generation.wrapping_add(1));
             return Err(driver_error(
-                DriverErrorKind::Submission,
+                DriverCoreError::Submission,
                 "iocp/driver",
                 "thread pool overloaded",
             ));
@@ -104,15 +103,13 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn on_submit_res(
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
-        result: DriverResult<submit::SubmissionResult>,
+        result: IocpDriverResult<submit::SubmissionResult>,
         user_data: usize,
         op_in: &mut Option<IocpOp>,
         binder: SubmitBinder,
-    ) -> veloq_driver_core::driver::Outcome<
-        Result<Poll<()>, (veloq_driver_core::DriverErrorReport, SubmitStatus)>,
-    > {
+    ) -> DriverSubmitResult<IocpError> {
         match result {
             Ok(submit::SubmissionResult::Pending) => binder.ok(Poll::Pending),
             Ok(submit::SubmissionResult::PostToQueue) => {
@@ -123,7 +120,7 @@ impl<'a> IocpDriver<'a> {
                     Ok(poll) => binder.ok(poll),
                     Err(_) => binder.err(
                         driver_error(
-                            DriverErrorKind::Submission,
+                            DriverCoreError::Submission,
                             "iocp/driver",
                             "offload task submission failed",
                         ),
@@ -134,17 +131,13 @@ impl<'a> IocpDriver<'a> {
             Ok(submit::SubmissionResult::Timer(duration)) => {
                 Self::handle_timer_sub(ops, ctx, user_data, duration, binder)
             }
-            Err(_e) => {
+            Err(e) => {
                 if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                     let mut guard = slot.complete();
                     *op_in = guard.take_op();
                 }
                 binder.err(
-                    driver_error(
-                        DriverErrorKind::Submission,
-                        "iocp/driver",
-                        "operation submission failed",
-                    ),
+                    e.attach_note("operation submission failed"),
                     SubmitStatus::Void,
                 )
             }
@@ -152,14 +145,12 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn handle_post_to_queue(
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
         user_data: usize,
         op_in: &mut Option<IocpOp>,
         binder: SubmitBinder,
-    ) -> veloq_driver_core::driver::Outcome<
-        Result<Poll<()>, (veloq_driver_core::DriverErrorReport, SubmitStatus)>,
-    > {
+    ) -> DriverSubmitResult<IocpError> {
         if let Err(err) = ctx.port.notify(user_data) {
             if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                 let mut guard = slot.complete();
@@ -169,7 +160,6 @@ impl<'a> IocpDriver<'a> {
             ops.recycle(user_data, generation.wrapping_add(1));
             binder.err(
                 err.set_accumulate_src_chain(true)
-                    .map_err(|_| DriverErrorKind::Submission)
                     .with_ctx("scope", "iocp/driver")
                     .attach_note("failed to post completion queue notification"),
                 SubmitStatus::Void,
@@ -180,14 +170,12 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn handle_timer_sub(
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
         user_data: usize,
         duration: Duration,
         binder: SubmitBinder,
-    ) -> veloq_driver_core::driver::Outcome<
-        Result<Poll<()>, (veloq_driver_core::DriverErrorReport, SubmitStatus)>,
-    > {
+    ) -> DriverSubmitResult<IocpError> {
         let timeout = ctx.wheel.insert(user_data, duration);
         if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
             op_entry.platform_data.timer_id = Some(timeout);
@@ -200,18 +188,18 @@ impl<'a> IocpDriver<'a> {
         &mut self,
         user_data: usize,
         op: IocpOp,
-    ) -> DriverResult<DriverResult<submit::SubmissionResult>> {
+    ) -> IocpDriverResult<IocpDriverResult<submit::SubmissionResult>> {
         let slots_per_page = self.ops.local.len();
         let (slab_ptr, slab_len) = self.ops.get_page_slice(0).ok_or_else(|| {
             driver_error(
-                DriverErrorKind::InvalidState,
+                DriverCoreError::InvalidState,
                 "iocp/driver",
                 "failed to get page slice",
             )
         })?;
 
         let guard = Self::prep_op_slot(&mut self.ops, user_data, op).to_driver_result(
-            DriverErrorKind::InvalidState,
+            DriverCoreError::InvalidState,
             "iocp/driver",
             "failed to prepare op slot",
         )?;
@@ -241,13 +229,13 @@ impl<'a> IocpDriver<'a> {
             .and_then(|slot| slot.with_op_mut(|op| op.submit(&mut ctx)))
             .ok_or_else(|| {
                 driver_error(
-                    DriverErrorKind::InvalidState,
+                    DriverCoreError::InvalidState,
                     "iocp/driver",
                     "op missing during submission",
                 )
             })?
             .to_driver_result(
-                DriverErrorKind::Submission,
+                DriverCoreError::Submission,
                 "iocp/driver",
                 "op submit failed",
             );
@@ -275,7 +263,7 @@ impl<'a> IocpDriver<'a> {
         if result.is_ok() {
             let guard = sub_guard_opt.take().ok_or_else(|| {
                 driver_error(
-                    DriverErrorKind::InvalidState,
+                    DriverCoreError::InvalidState,
                     "iocp/driver",
                     "submission guard missing",
                 )

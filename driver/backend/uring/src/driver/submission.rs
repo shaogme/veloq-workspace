@@ -10,8 +10,9 @@ use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
 use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 
 use veloq_driver_core::driver::registry::{AllocResult, OpHandle};
-use veloq_driver_core::driver::{Driver, Outcome, SubmitBinder, SubmitStatus};
+use veloq_driver_core::driver::{Driver, DriverSubmitResult, SubmitBinder, SubmitStatus};
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
+use veloq_driver_core::{DriverCoreError, driver_error};
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 
@@ -64,7 +65,6 @@ impl<'a> UringDriver<'a> {
                         (vtable.make_sqe)(op, &mut *driver_ptr, user_data)
                             .map_report(|e| {
                                 e.set_accumulate_src_chain(true)
-                                    .map_err(UringError::from)
                                     .attach_note("driver.submit_from_slot_raw.make_sqe")
                             })?
                             .user_data(user_data as u64)
@@ -290,7 +290,7 @@ impl<'a> UringDriver<'a> {
         op: UringOp,
         op_in: &mut Option<UringOp>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (veloq_driver_core::DriverErrorReport, SubmitStatus)>> {
+    ) -> DriverSubmitResult<UringError> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
             Some(SlotView::Reserved(slot)) => {
@@ -304,8 +304,8 @@ impl<'a> UringDriver<'a> {
             }
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
                 return binder.err(
-                    veloq_driver_core::driver_error(
-                        veloq_driver_core::DriverErrorKind::InvalidState,
+                    driver_error(
+                        DriverCoreError::InvalidState,
                         "uring.driver.submit_sqe_internal",
                         "Op slot missing in registry",
                     ),
@@ -332,7 +332,7 @@ impl<'a> UringDriver<'a> {
                 binder.err(
                     map_uring_error(
                         e,
-                        veloq_driver_core::DriverErrorKind::Submission,
+                        DriverCoreError::Submission,
                         "uring.driver.submit_sqe_internal",
                         "submit sqe",
                     ),
@@ -348,7 +348,7 @@ impl<'a> UringDriver<'a> {
         op: UringOp,
         op_in: &mut Option<UringOp>,
         binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (veloq_driver_core::DriverErrorReport, SubmitStatus)>> {
+    ) -> DriverSubmitResult<UringError> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
             Some(SlotView::Reserved(slot)) => {
@@ -362,8 +362,8 @@ impl<'a> UringDriver<'a> {
             }
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
                 return binder.err(
-                    veloq_driver_core::driver_error(
-                        veloq_driver_core::DriverErrorKind::InvalidState,
+                    driver_error(
+                        DriverCoreError::InvalidState,
                         "uring.driver.submit_timer_internal",
                         "Op slot missing in registry",
                     ),
@@ -393,7 +393,7 @@ impl<'a> UringDriver<'a> {
                 binder.err(
                     map_uring_error(
                         e,
-                        veloq_driver_core::DriverErrorKind::Submission,
+                        DriverCoreError::Submission,
                         "uring.driver.submit_timer_internal",
                         "submit timer",
                     ),

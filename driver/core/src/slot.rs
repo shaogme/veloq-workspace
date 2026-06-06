@@ -73,9 +73,7 @@ pub fn is_runnable_state(state: SlotState) -> bool {
     matches!(state, SlotState::Reserved | SlotState::InFlightWaiting)
 }
 
-impl<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R>
-    Slot<'a, Reserved, Op, UP, P, S, E, R>
-{
+impl<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R> Slot<'a, Reserved, Op, UP, P, S, E, R> {
     #[inline]
     pub(crate) fn try_bind(
         entry: &'a SlotEntry<Op, UP, S, E, R>,
@@ -228,9 +226,7 @@ impl<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R>
     }
 }
 
-impl<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R>
-    Slot<'a, Completed, Op, UP, P, S, E, R>
-{
+impl<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R> Slot<'a, Completed, Op, UP, P, S, E, R> {
     pub fn reset(self) -> Slot<'a, Reserved, Op, UP, P, S, E, R> {
         let _ = self.op.take();
         let generation = self.entry.generation(Ordering::Acquire);
@@ -283,8 +279,7 @@ impl<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R>
     }
 }
 
-type SubmissionRollback<'a, Op, UP, P, S, E, R> =
-    fn(&mut Slot<'a, Reserved, Op, UP, P, S, E, R>);
+type SubmissionRollback<'a, Op, UP, P, S, E, R> = fn(&mut Slot<'a, Reserved, Op, UP, P, S, E, R>);
 
 pub struct SubmissionGuard<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R = usize> {
     pub slot: Option<Slot<'a, Reserved, Op, UP, P, S, E, R>>,
@@ -292,9 +287,7 @@ pub struct SubmissionGuard<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R = usi
     persisted: bool,
 }
 
-impl<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R>
-    SubmissionGuard<'a, Op, UP, P, S, E, R>
-{
+impl<'a, Op: PlatformOp, UP, P, S: SlotSidecar, E, R> SubmissionGuard<'a, Op, UP, P, S, E, R> {
     pub fn persist(mut self) -> Slot<'a, InFlightWaiting, Op, UP, P, S, E, R> {
         self.persisted = true;
         let slot = self
@@ -331,8 +324,8 @@ pub trait SlotRegistryExt<Op: PlatformOp, UP: Send, P, S: SlotSidecar, E, R = us
     fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Op, UP, P, S, E, R>;
 }
 
-impl<Op: PlatformOp, UP: Send, P: Default, S: SlotSidecar, E, R>
-    SlotRegistryExt<Op, UP, P, S, E, R> for OpRegistry<Op, UP, P, S, E, R>
+impl<Op: PlatformOp, UP: Send, P: Default, S: SlotSidecar, E, R> SlotRegistryExt<Op, UP, P, S, E, R>
+    for OpRegistry<Op, UP, P, S, E, R>
 {
     #[inline]
     fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Op, UP, P, S, E, R>> {

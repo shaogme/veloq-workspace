@@ -3,12 +3,11 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
-use veloq_driver_core::driver::registry::OpRegistry;
 use veloq_driver_core::driver::{
     SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
 };
 use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
-use veloq_driver_core::{DriverErrorKind, DriverResult, driver_error};
+use veloq_driver_core::{DriverCoreError, driver_error};
 
 use diagweave::prelude::*;
 
@@ -17,21 +16,23 @@ use crate::common::{
     push_completion_shared,
 };
 use crate::config::SocketKey;
-use crate::driver::{CloseMode, CompletionSidecar, IocpDriver, IocpOpState, RIO_EVENT_KEY};
+use crate::driver::{
+    CloseMode, CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry, RIO_EVENT_KEY,
+};
 use crate::error::{IocpError, IocpResult, IocpResultExt};
 use crate::op::slot::Slot;
-use crate::op::{IocpOp, IocpUserPayload, OverlappedEntry, submit};
+use crate::op::{IocpOp, IocpUserPayload, submit};
 use crate::rio::error::RioResultExt;
 
 pub(crate) struct EmitContext<'a> {
     pub(crate) completion_events: &'a SharedCompletionQueue,
-    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
+    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
 }
 
 pub(crate) struct CancelContext<'a> {
     pub(crate) registered_files: &'a [Option<crate::config::RegisteredHandle>],
     pub(crate) completion_events: &'a SharedCompletionQueue,
-    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
+    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
 }
 
 impl<'a> IocpDriver<'a> {
@@ -62,7 +63,7 @@ impl<'a> IocpDriver<'a> {
         &mut self,
         pending_count: usize,
         timeout: Duration,
-    ) -> DriverResult<()> {
+    ) -> IocpDriverResult<()> {
         if pending_count == 0 {
             return Ok(());
         }
@@ -72,7 +73,7 @@ impl<'a> IocpDriver<'a> {
         while drained < pending_count {
             if Instant::now() >= deadline {
                 return Err(driver_error(
-                    DriverErrorKind::Timeout,
+                    DriverCoreError::Timeout,
                     "iocp/driver",
                     "drain timed out",
                 ));
@@ -82,9 +83,9 @@ impl<'a> IocpDriver<'a> {
         Ok(())
     }
 
-    pub(crate) fn poll_completion(&mut self) -> DriverResult<usize> {
+    pub(crate) fn poll_completion(&mut self) -> IocpDriverResult<usize> {
         let status = self.port.get_status(10).to_driver_result(
-            DriverErrorKind::Completion,
+            DriverCoreError::Completion,
             "iocp/driver",
             "failed to poll IOCP status",
         )?;
@@ -111,7 +112,7 @@ impl<'a> IocpDriver<'a> {
                             self.drain_deferred_socket_cleanup();
                         })
                         .to_driver_result(
-                            DriverErrorKind::Completion,
+                            DriverCoreError::Completion,
                             "iocp/driver",
                             "failed to process rio completions",
                         );
@@ -129,7 +130,7 @@ impl<'a> IocpDriver<'a> {
         Ok(0)
     }
 
-    pub(crate) fn close_impl(&mut self, mode: CloseMode) -> DriverResult<()> {
+    pub(crate) fn close_impl(&mut self, mode: CloseMode) -> IocpDriverResult<()> {
         if self.closed {
             return Ok(());
         }
@@ -137,12 +138,11 @@ impl<'a> IocpDriver<'a> {
         if let CloseMode::Strict { timeout } = mode {
             self.drain_pending_iocp(pending, timeout).map_err(|e| {
                 e.set_accumulate_src_chain(true)
-                    .map_err(|_| DriverErrorKind::Timeout)
                     .with_ctx("scope", "iocp/driver")
                     .attach_note("drain pending iocp timed out")
             })?;
             self.rio_state.drain_outstanding(timeout).to_driver_result(
-                DriverErrorKind::Completion,
+                DriverCoreError::Completion,
                 "iocp/driver",
                 "failed to drain RIO outstanding requests",
             )?;
@@ -302,7 +302,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn finish_timer_op(
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
         user_data: usize,
         pending_events: &mut Vec<CompletionSidecar>,
     ) {
@@ -390,7 +390,7 @@ impl<'a> IocpDriver<'a> {
 
     #[inline]
     pub(crate) fn with_inflight_slot<R>(
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
         index: usize,
         f: impl FnOnce(Slot<'_, InFlightWaiting>) -> R,
     ) -> Option<R> {
@@ -461,7 +461,7 @@ impl<'a> IocpDriver<'a> {
                 .ops
                 .with_slot_storage_mut(user_data, |_op, result, _payload, _sidecar| {
                     *result = Some(Err(driver_error(
-                        DriverErrorKind::Completion,
+                        DriverCoreError::Completion,
                         "iocp/driver",
                         "completion without os error",
                     )));
@@ -472,7 +472,7 @@ impl<'a> IocpDriver<'a> {
 
     pub(crate) fn emit_event_inner(
         ctx: EmitContext<'_>,
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
         user_data: usize,
         slot_generation: u32,
         io_result: IocpResult<usize>,
@@ -571,7 +571,7 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn perform_cancel(
         ctx: CancelContext<'_>,
         user_data: usize,
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
     ) -> Option<SocketKey> {
         let mut should_emit_aborted = false;
         let mut aborted_socket_key = None;
@@ -631,7 +631,7 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn emit_aborted_inner(
         ctx: EmitContext<'_>,
         user_data: usize,
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
+        ops: &mut IocpOpRegistry,
     ) {
         let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
         let inflight = Self::with_inflight_slot(ops, user_data, |guard| {

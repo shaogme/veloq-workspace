@@ -1,5 +1,5 @@
 use diagweave::prelude::*;
-use veloq_driver_core::{DriverErrorKind, DriverResult};
+use veloq_driver_core::{DriverCoreError, DriverResult};
 
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -28,6 +28,7 @@ set! {
 }
 
 pub type UringResult<T> = Result<T, Report<UringError>>;
+pub type UringDriverResult<T> = DriverResult<T, UringError>;
 
 impl UringError {
     #[inline]
@@ -53,17 +54,17 @@ impl UringError {
     }
 }
 
-impl From<DriverErrorKind> for UringError {
-    fn from(kind: DriverErrorKind) -> Self {
+impl From<DriverCoreError> for UringError {
+    fn from(kind: DriverCoreError) -> Self {
         match kind {
-            DriverErrorKind::InvalidInput => Self::InvalidInput,
-            DriverErrorKind::InvalidState => Self::InvalidState,
-            DriverErrorKind::Submission => Self::Submission,
-            DriverErrorKind::Completion | DriverErrorKind::Timeout => Self::CompletionWait,
-            DriverErrorKind::Registration => Self::Registration,
-            DriverErrorKind::Socket => Self::Socket,
-            DriverErrorKind::Unsupported => Self::Unsupported,
-            DriverErrorKind::Internal | DriverErrorKind::System => Self::Internal,
+            DriverCoreError::InvalidInput => Self::InvalidInput,
+            DriverCoreError::InvalidState => Self::InvalidState,
+            DriverCoreError::Submission => Self::Submission,
+            DriverCoreError::Completion | DriverCoreError::Timeout => Self::CompletionWait,
+            DriverCoreError::Registration => Self::Registration,
+            DriverCoreError::Socket => Self::Socket,
+            DriverCoreError::Unsupported => Self::Unsupported,
+            DriverCoreError::Internal | DriverCoreError::System => Self::Internal,
         }
     }
 }
@@ -71,25 +72,24 @@ impl From<DriverErrorKind> for UringError {
 pub(crate) trait UringResultExt<T> {
     fn to_driver_result(
         self,
-        kind: DriverErrorKind,
+        kind: DriverCoreError,
         scope: &'static str,
         detail: impl ToString,
-    ) -> DriverResult<T>;
+    ) -> DriverResult<T, UringError>;
 }
 
 impl<T> UringResultExt<T> for UringResult<T> {
     fn to_driver_result(
         self,
-        kind: DriverErrorKind,
+        kind: DriverCoreError,
         scope: &'static str,
         detail: impl ToString,
-    ) -> DriverResult<T> {
+    ) -> DriverResult<T, UringError> {
         let detail = detail.to_string();
         self.map_report(|report| {
             tracing::error!(kind = %kind, scope = %scope, detail = %detail, "driver error report");
             report
                 .set_accumulate_src_chain(true)
-                .map_err(|_| kind)
                 .with_ctx("scope", scope)
                 .attach_note(detail)
                 .attach_note("driver error report captured")

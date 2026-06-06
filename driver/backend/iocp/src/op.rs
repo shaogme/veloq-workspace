@@ -15,14 +15,13 @@ pub(crate) use submit::SubmissionResult;
 use std::ptr::NonNull;
 
 use crate::config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle, RegisteredHandle};
-use crate::error::{IocpError, IocpResult};
+use crate::error::{IocpDriverResult as DriverResult, IocpError, IocpResult};
 use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioState;
 
 use diagweave::prelude::*;
 
-use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
@@ -182,6 +181,7 @@ macro_rules! define_iocp_ops {
                 type Output = $OpType;
                 type Completion = define_iocp_ops!(@completion_type $($completion)?);
                 type DriverCompletion = usize;
+                type Error = IocpError;
                 const PAYLOAD_KIND: OpKind = $kind;
 
                 fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
@@ -232,7 +232,7 @@ macro_rules! define_iocp_ops {
                 fn complete(
                     payload: Self::UserPayload,
                     res: DriverResult<usize>,
-                ) -> OpCompletion<Self::Output, Self::Completion> {
+                ) -> OpCompletion<Self::Output, IocpError, Self::Completion> {
                     let completion = define_iocp_ops!(@map_completion &payload, res, $($map_completion)?);
                     let output = define_iocp_ops!(@destruct payload, $($destruct)?);
                     OpCompletion::new(completion, output)

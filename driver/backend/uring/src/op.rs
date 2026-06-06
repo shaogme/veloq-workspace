@@ -2,10 +2,10 @@
 
 use crate::config::UringRawHandle;
 use crate::driver::UringDriver;
+use crate::error::{UringDriverResult as DriverResult, UringError};
 use crate::{OwnedRawHandle, RawHandle};
 use io_uring::squeue;
 use std::time::Duration;
-use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion, OpKind};
 
@@ -119,6 +119,7 @@ macro_rules! define_uring_ops {
                 type Output = $OpType;
                 type Completion = define_uring_ops!(@completion_type $($completion)?);
                 type DriverCompletion = usize;
+                type Error = UringError;
                 const PAYLOAD_KIND: OpKind = $kind;
 
                 fn into_kernel_and_payload(self) -> (UringKernelOp, Self::UserPayload) {
@@ -158,7 +159,7 @@ macro_rules! define_uring_ops {
                 fn complete(
                     payload: Self::UserPayload,
                     res: DriverResult<usize>,
-                ) -> OpCompletion<Self::Output, Self::Completion> {
+                ) -> OpCompletion<Self::Output, UringError, Self::Completion> {
                     let completion = define_uring_ops!(@map_completion &payload, res, $($map_completion)?);
                     OpCompletion::new(completion, payload)
                 }

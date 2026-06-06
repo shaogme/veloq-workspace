@@ -1,8 +1,8 @@
 use crate::driver::UringDriver;
 use crate::driver::submission::CANCEL_USER_DATA;
+use crate::error::{UringDriverResult, UringError};
 use io_uring::opcode;
 use std::sync::atomic::Ordering;
-use veloq_driver_core::DriverResult;
 use veloq_driver_core::driver::CompletionSidecar;
 
 use crate::op::{
@@ -46,7 +46,7 @@ impl<'a> UringDriver<'a> {
 
                         (
                             tid,
-                            CompletionSidecar::<UringUserPayload> {
+                            CompletionSidecar::<UringUserPayload, UringError> {
                                 user_data,
                                 generation,
                                 res: -libc::ECANCELED,
@@ -163,17 +163,17 @@ impl<'a> UringDriver<'a> {
 fn cancel_slot_immediate<'a, S: SlotState>(
     slot: Slot<'a, S>,
     user_data: usize,
-) -> CompletionSidecar<UringUserPayload> {
+) -> CompletionSidecar<UringUserPayload, UringError> {
     let generation = slot.entry.generation(Ordering::Acquire);
     let (payload, detail) = slot.storage.with_mut(
         |_op: &mut Option<crate::op::UringOp>,
-         result: &mut Option<DriverResult<usize>>,
+         result: &mut Option<UringDriverResult<usize>>,
          payload: &mut Option<UringUserPayload>,
          _sidecar| (payload.take(), result.take()),
     );
     let _ = slot.op.take();
 
-    CompletionSidecar::<UringUserPayload> {
+    CompletionSidecar::<UringUserPayload, UringError> {
         user_data,
         generation,
         res: -libc::ECANCELED,

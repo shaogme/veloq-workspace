@@ -8,11 +8,11 @@ use tracing::error;
 use crate::error::{IocpError, IocpResult, IocpResultExt};
 use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
+use veloq_driver_core::DriverCoreError;
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionRecord, CompletionSidecar, RemoteWaker, SharedCompletionQueue,
     SharedCompletionTable, encode_completion_token,
 };
-use veloq_driver_core::{DriverErrorKind, DriverResult};
 
 // ============================================================================
 // Error Context & Logic
@@ -83,12 +83,14 @@ fn fallback_errno_by_iocp_error(kind: IocpError) -> i32 {
         IocpError::DriverInit => 5,       // EIO
         IocpError::CompletionWait => 110, // ETIMEDOUT
         IocpError::Submission => 11,      // EAGAIN
+        IocpError::Registration => 12,    // ENOMEM
         IocpError::Rio(_) => 5,           // EIO
         IocpError::ResolveFd => 9,        // EBADF
         IocpError::Socket => 5,           // EIO
         IocpError::Win32 => 5,            // EIO
         IocpError::InvalidInput => 22,    // EINVAL
         IocpError::InvalidState => 5,     // EIO
+        IocpError::Unsupported => 95,     // EOPNOTSUPP
         IocpError::Internal => 5,         // EIO
     }
 }
@@ -112,8 +114,8 @@ fn iocp_report_to_event_res(report: &Report<IocpError>) -> i32 {
 
 #[inline]
 pub(crate) fn completion_record(
-    sidecar: CompletionSidecar<IocpUserPayload>,
-) -> CompletionRecord<IocpUserPayload> {
+    sidecar: CompletionSidecar<IocpUserPayload, IocpError>,
+) -> CompletionRecord<IocpUserPayload, IocpError> {
     CompletionRecord {
         event: CompletionEvent {
             user_data: encode_completion_token(sidecar.user_data, sidecar.generation),
@@ -128,8 +130,8 @@ pub(crate) fn completion_record(
 #[inline]
 pub(crate) fn push_completion_shared(
     queue: &SharedCompletionQueue,
-    table: &SharedCompletionTable<IocpUserPayload>,
-    record: CompletionRecord<IocpUserPayload>,
+    table: &SharedCompletionTable<IocpUserPayload, IocpError>,
+    record: CompletionRecord<IocpUserPayload, IocpError>,
 ) {
     table.record_completion_with_data(record.event, record.payload, record.detail);
     queue.push(record.event);
@@ -147,14 +149,14 @@ pub(crate) struct IocpWaker {
     pub(crate) is_notified: Arc<AtomicBool>,
 }
 
-impl RemoteWaker for IocpWaker {
-    fn wake(&self) -> DriverResult<()> {
+impl RemoteWaker<IocpError> for IocpWaker {
+    fn wake(&self) -> crate::error::IocpDriverResult<()> {
         if self.is_notified.load(Ordering::Relaxed) {
             return Ok(());
         }
         if !self.is_notified.swap(true, Ordering::AcqRel) {
             self.port.notify(WAKEUP_USER_DATA).to_driver_result(
-                DriverErrorKind::Submission,
+                DriverCoreError::Submission,
                 "iocp/common",
                 "failed to notify remote waker",
             )?;

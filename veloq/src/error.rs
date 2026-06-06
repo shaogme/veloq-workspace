@@ -3,7 +3,7 @@ use diagweave::{report::Report, union};
 union! {
     pub enum Error =
         crate::net::error::NetError as Net |
-        veloq_driver_native::error::DriverErrorKind as DriverKind |
+        veloq_driver_native::error::DriverCoreError as DriverKind |
         veloq_driver_native::error::Error as Driver |
         veloq_buf::BufError as Buf |
         crate::fs::error::FsError as Fs |

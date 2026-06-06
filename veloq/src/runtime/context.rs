@@ -214,6 +214,7 @@ impl<'a, 'ctx> veloq_driver_native::op::DriverProvider for RuntimeContext<'a, 'c
     type Op = veloq_driver_native::driver::PlatformOp;
     type UP = veloq_driver_native::driver::PlatformUP;
     type Completion = usize;
+    type Error = <PlatformDriver<'ctx> as Driver>::Error;
     type Driver<'d>
         = RuntimeContextDriver<'d, PlatformDriver<'ctx>, RuntimeContext<'a, 'ctx>>
     where
@@ -314,6 +315,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
                 <PlatformDriver<'ctx> as Driver>::Op,
                 DriverCompletion = <PlatformDriver<'ctx> as Driver>::Completion,
                 ErasedPayload = <PlatformDriver<'ctx> as Driver>::UP,
+                Error = <PlatformDriver<'ctx> as Driver>::Error,
             > + Send,
     {
         self.sync_registrar();
@@ -332,7 +334,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
     ) -> VeloqResult<(
         Result<
             <T as IntoPlatformOp<<PlatformDriver<'ctx> as Driver>::Op>>::Completion,
-            veloq_driver_native::error::DriverErrorReport,
+            veloq_driver_native::error::DriverReport<veloq_driver_native::error::Error>,
         >,
         T::Output,
     )>
@@ -341,6 +343,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
                 <PlatformDriver<'ctx> as Driver>::Op,
                 DriverCompletion = <PlatformDriver<'ctx> as Driver>::Completion,
                 ErasedPayload = <PlatformDriver<'ctx> as Driver>::UP,
+                Error = <PlatformDriver<'ctx> as Driver>::Error,
             > + Send
             + 'd + 'ctx,
     {

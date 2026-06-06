@@ -2,8 +2,8 @@
 
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
-use crate::driver::IocpOpState;
-use crate::op::IocpOp;
+use crate::driver::IocpOpRegistry;
+use crate::error::IocpError;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpCtxGuard;
 use crate::rio::core::registry::RioRegistry;
@@ -14,8 +14,7 @@ use crate::rio::{RioCompletionContext, RioEnv, RioState, SocketRuntimeMode, Sock
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::error;
-use veloq_driver_core::DriverErrorKind;
-use veloq_driver_core::driver::registry::OpRegistry;
+use veloq_driver_core::DriverCoreError;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
@@ -85,10 +84,11 @@ impl<'a> RioCompletionRouter<'a> {
                     let mut completion = if res.Status == 0 {
                         Ok(res.BytesTransferred as usize)
                     } else {
-                        DriverErrorKind::Completion
+                        DriverCoreError::Completion
                             .with_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
                             .set_error_code(res.Status)
                             .attach_note("rio completion returned os error")
+                            .map_inner_err(IocpError::from)
                     };
                     let socket_key = slot
                         .with_op_mut(|iocp_op| {
@@ -106,7 +106,7 @@ impl<'a> RioCompletionRouter<'a> {
                                 completion =
                                     iocp_op.on_complete(bytes, self.comp.ext).map_report(|e| {
                                         e.set_accumulate_src_chain(true)
-                                            .map_err(|_| DriverErrorKind::Completion)
+                                            .map_err(|_| IocpError::CompletionWait)
                                             .with_ctx(
                                                 "scope",
                                                 "rio.runtime.control_flow.handle_op_completion",
@@ -262,32 +262,22 @@ impl RioState {
 
     pub(crate) fn process_completions(
         &mut self,
-        ops: &mut OpRegistry<
-            IocpOp,
-            crate::op::IocpUserPayload,
-            IocpOpState,
-            crate::op::OverlappedEntry,
-        >,
+        ops: &mut IocpOpRegistry,
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
-        completion_table: &SharedCompletionTable<crate::op::IocpUserPayload>,
+        completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
     ) -> RioResult<usize> {
         self.process_completions_internal(ops, ext, registrar, completion_events, completion_table)
     }
 
     fn process_completions_internal(
         &mut self,
-        ops: &mut OpRegistry<
-            IocpOp,
-            crate::op::IocpUserPayload,
-            IocpOpState,
-            crate::op::OverlappedEntry,
-        >,
+        ops: &mut IocpOpRegistry,
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
-        completion_table: &SharedCompletionTable<crate::op::IocpUserPayload>,
+        completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
     ) -> RioResult<usize> {
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
