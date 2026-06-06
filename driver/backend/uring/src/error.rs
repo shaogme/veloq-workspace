@@ -29,6 +29,21 @@ set! {
 
 pub type UringResult<T> = Result<T, Report<UringError>>;
 
+impl From<DriverErrorKind> for UringError {
+    fn from(kind: DriverErrorKind) -> Self {
+        match kind {
+            DriverErrorKind::InvalidInput => Self::InvalidInput,
+            DriverErrorKind::InvalidState => Self::InvalidState,
+            DriverErrorKind::Submission => Self::Submission,
+            DriverErrorKind::Completion | DriverErrorKind::Timeout => Self::CompletionWait,
+            DriverErrorKind::Registration => Self::Registration,
+            DriverErrorKind::Socket => Self::Socket,
+            DriverErrorKind::Unsupported => Self::Unsupported,
+            DriverErrorKind::Internal | DriverErrorKind::System => Self::Internal,
+        }
+    }
+}
+
 pub(crate) trait UringResultExt<T> {
     fn to_driver_result(
         self,

@@ -344,13 +344,11 @@ impl<'a> Driver for UringDriver<'a> {
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
-                self.poll_nonblocking_internal().map_err(|e| {
-                    driver_error(
-                        DriverErrorKind::Completion,
-                        "uring.driver.drive.poll",
-                        format!("{e:#}"),
-                    )
-                })?;
+                self.poll_nonblocking_internal().to_driver_result(
+                    DriverErrorKind::Completion,
+                    "uring.driver.drive.poll",
+                    "poll completions",
+                )?;
             }
             DriveMode::Wait => {
                 let pending_progress =

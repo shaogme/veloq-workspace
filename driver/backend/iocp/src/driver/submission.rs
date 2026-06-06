@@ -168,11 +168,10 @@ impl<'a> IocpDriver<'a> {
             let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
             ops.recycle(user_data, generation.wrapping_add(1));
             binder.err(
-                driver_error(
-                    DriverErrorKind::Submission,
-                    "iocp/driver",
-                    format!("failed to post completion queue notification: {err:#}"),
-                ),
+                err.set_accumulate_src_chain(true)
+                    .map_err(|_| DriverErrorKind::Submission)
+                    .with_ctx("scope", "iocp/driver")
+                    .attach_note("failed to post completion queue notification"),
                 SubmitStatus::Void,
             )
         } else {
@@ -211,13 +210,11 @@ impl<'a> IocpDriver<'a> {
             )
         })?;
 
-        let guard = Self::prep_op_slot(&mut self.ops, user_data, op).map_err(|e| {
-            driver_error(
-                DriverErrorKind::InvalidState,
-                "iocp/driver",
-                format!("failed to prepare op slot: {e:#}"),
-            )
-        })?;
+        let guard = Self::prep_op_slot(&mut self.ops, user_data, op).to_driver_result(
+            DriverErrorKind::InvalidState,
+            "iocp/driver",
+            "failed to prepare op slot",
+        )?;
 
         let overlapped = guard.storage.with_mut(|_op, _result, _payload, sidecar| {
             &mut sidecar.inner as *mut crate::win32::Overlapped

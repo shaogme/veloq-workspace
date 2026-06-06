@@ -4,11 +4,11 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use veloq_driver_core::driver::RegisterFd;
-use veloq_driver_core::{DriverErrorKind, DriverResult, driver_error};
+use veloq_driver_core::{DriverErrorKind, DriverResult};
 
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
 use crate::driver::IocpDriver;
-use crate::error::{IocpError, IocpResult, from_io_error};
+use crate::error::{IocpError, IocpResult, IocpResultExt, from_io_error};
 
 pub(crate) struct DeferredSocketCleanup {
     pub(crate) handle: SocketKey,
@@ -131,13 +131,11 @@ impl<'a> IocpDriver<'a> {
             let mut canonical = match handle.kind() {
                 RawHandleKind::Socket => handle,
                 RawHandleKind::File => {
-                    if Self::detect_socket_from_file_handle(handle).map_err(|e| {
-                        driver_error(
-                            DriverErrorKind::InvalidInput,
-                            "iocp/driver",
-                            format!("detect socket from file handle failed: {e:#}"),
-                        )
-                    })? {
+                    if Self::detect_socket_from_file_handle(handle).to_driver_result(
+                        DriverErrorKind::InvalidInput,
+                        "iocp/driver",
+                        "detect socket from file handle failed",
+                    )? {
                         RawHandle::new(IocpHandle::for_socket(handle.raw().as_handle()))
                     } else {
                         handle

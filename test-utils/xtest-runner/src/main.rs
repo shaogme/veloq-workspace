@@ -215,7 +215,7 @@ struct Runner {
 
 impl Runner {
     fn new(config: Config) -> Result<Self, Report<RunnerError>> {
-        let workspace_root = workspace_root().map_err(|e| e)?;
+        let workspace_root = workspace_root()?;
         let mode = determine_mode(config.target, &workspace_root).with_ctx(
             "workspace_root",
             workspace_root.to_string_lossy().to_string(),
@@ -664,7 +664,7 @@ fn main() -> ExitCode {
 }
 
 fn run_app(cli: Cli) -> Result<(), Report<RunnerError>> {
-    let config = Config::try_from(cli).map_err(|e| e)?;
+    let config = Config::try_from(cli)?;
     let runner = Runner::new(config)?;
     runner.run()?;
     Ok(())

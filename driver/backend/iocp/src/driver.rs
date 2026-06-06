@@ -28,7 +28,7 @@ use diagweave::prelude::*;
 
 use crate::common::IocpWaker;
 use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, RegisteredHandle};
-use crate::error::IocpResult;
+use crate::error::{IocpResult, IocpResultExt};
 use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload, OverlappedEntry};
 use crate::rio::RioState;
 
@@ -266,10 +266,10 @@ impl<'a> Driver for IocpDriver<'a> {
             Ok(res) => res,
             Err(e) => {
                 return binder.err(
-                    DriverErrorKind::Submission
-                        .to_report()
+                    e.set_accumulate_src_chain(true)
+                        .map_err(|_| DriverErrorKind::Submission)
                         .with_ctx("scope", "iocp/driver")
-                        .attach_note(format!("call_op_submit failed: {e:#}")),
+                        .attach_note("call_op_submit failed"),
                     SubmitStatus::Void,
                 );
             }
@@ -288,12 +288,11 @@ impl<'a> Driver for IocpDriver<'a> {
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
-                self.get_completion(0).map_err(|e| {
-                    DriverErrorKind::Completion
-                        .to_report()
-                        .with_ctx("scope", "iocp/driver.drive.poll")
-                        .attach_note(format!("drive(Poll) failed: {e:#}"))
-                })?;
+                self.get_completion(0).to_driver_result(
+                    DriverErrorKind::Completion,
+                    "iocp/driver.drive.poll",
+                    "drive(Poll) failed",
+                )?;
             }
             DriveMode::Wait => {
                 let pending_progress =
@@ -304,12 +303,11 @@ impl<'a> Driver for IocpDriver<'a> {
                         pending_progress,
                     });
                 }
-                self.get_completion(u32::MAX).map_err(|e| {
-                    DriverErrorKind::Completion
-                        .to_report()
-                        .with_ctx("scope", "iocp/driver.drive.wait")
-                        .attach_note(format!("wait for completion failed: {e:#}"))
-                })?;
+                self.get_completion(u32::MAX).to_driver_result(
+                    DriverErrorKind::Completion,
+                    "iocp/driver.drive.wait",
+                    "wait for completion failed",
+                )?;
             }
         }
 
@@ -335,10 +333,10 @@ impl<'a> Driver for IocpDriver<'a> {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
         IocpDriver::register_chunk(self, id, ptr, len).map_err(|e| {
-            DriverErrorKind::Registration
-                .to_report()
+            e.set_accumulate_src_chain(true)
+                .map_err(|_| DriverErrorKind::Registration)
                 .with_ctx("scope", "iocp/driver")
-                .attach_note(format!("register chunk failed: {e:#}"))
+                .attach_note("register chunk failed")
         })
     }
 
