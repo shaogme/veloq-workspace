@@ -8,21 +8,20 @@ pub(crate) type PreInit = crate::win32::IoCompletionPort;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
 
 use veloq_buf::BufferRegistrar;
+use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::OpEntry;
 use veloq_driver_core::driver::{
-    CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver, RegisterFd,
-    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitBinder,
-    SubmitStatus,
+    CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver,
+    DriverSubmitResult, RegisterFd, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
-use veloq_driver_core::{DriverReport, DriverResult as CoreDriverResult};
 use veloq_wheel::{Wheel, WheelConfig};
 
 use diagweave::prelude::*;
@@ -239,12 +238,9 @@ impl<'a> Driver for IocpDriver<'a> {
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,
-        binder: SubmitBinder,
-    ) -> veloq_driver_core::driver::Outcome<
-        Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>,
-    > {
+    ) -> DriverSubmitResult<Self::Error> {
         if self.shutting_down {
-            return binder.err(
+            return DriverSubmitResult::failed(
                 IocpError::Internal
                     .to_report()
                     .with_ctx("scope", "iocp/driver")
@@ -256,7 +252,7 @@ impl<'a> Driver for IocpDriver<'a> {
         let op = match op_in.take() {
             Some(op) => op,
             None => {
-                return binder.err(
+                return DriverSubmitResult::failed(
                     IocpError::InvalidInput
                         .report("iocp/driver", "submit called with empty option"),
                     SubmitStatus::Void,
@@ -267,10 +263,8 @@ impl<'a> Driver for IocpDriver<'a> {
         let result = match self.call_op_submit(user_data, op) {
             Ok(res) => res,
             Err(e) => {
-                return binder.err(
-                    e.set_accumulate_src_chain(true)
-                        .map_err(|_| IocpError::Submission)
-                        .with_ctx("scope", "iocp/driver")
+                return DriverSubmitResult::failed(
+                    e.with_ctx("scope", "iocp/driver")
                         .attach_note("call_op_submit failed"),
                     SubmitStatus::Void,
                 );
@@ -284,7 +278,7 @@ impl<'a> Driver for IocpDriver<'a> {
             completion_table: &self.completion_table,
         };
 
-        Self::on_submit_res(&mut self.ops, ctx, result, user_data, op_in, binder)
+        Self::on_submit_res(&mut self.ops, ctx, result, user_data, op_in)
     }
 
     fn drive(&mut self, mode: DriveMode) -> IocpDriverResult<DriveOutcome> {
@@ -331,9 +325,7 @@ impl<'a> Driver for IocpDriver<'a> {
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> IocpDriverResult<()> {
         IocpDriver::register_chunk(self, id, ptr, len).map_err(|e| {
-            e.set_accumulate_src_chain(true)
-                .map_err(|_| IocpError::Registration)
-                .with_ctx("scope", "iocp/driver")
+            e.with_ctx("scope", "iocp/driver")
                 .attach_note("register chunk failed")
         })
     }

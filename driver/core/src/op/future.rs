@@ -8,8 +8,8 @@ use std::{
 use tracing::trace;
 
 use crate::driver::{
-    CompletionRecord, Driver, PlatformOp, PollRecordResult, RemoteWaker, SharedCompletionTable,
-    SubmitBinder, SubmitStatus, encode_completion_token, event_res_to_result,
+    CompletionRecord, Driver, DriverSubmitResult, PlatformOp, PollRecordResult, RemoteWaker,
+    SharedCompletionTable, SubmitStatus, encode_completion_token, event_res_to_result,
 };
 use crate::op::{IntoPlatformOp, Op};
 use crate::slot::DetachedCancelTable;
@@ -355,18 +355,24 @@ where
                 driver.slot_set_payload(user_data, T::payload_into_erased(payload));
 
                 let mut driver_op_opt = Some(driver_op);
-                let result = driver
-                    .submit(user_data, &mut driver_op_opt, SubmitBinder::new())
-                    .into_inner();
+                let result = driver.submit(user_data, &mut driver_op_opt);
 
                 let mut fallback_payload = None;
-                if let Err((_, status)) = &result
-                    && *status == SubmitStatus::Void
-                {
-                    if let Some(val) = driver_op_opt.take() {
-                        drop(val);
+                match &result {
+                    DriverSubmitResult::Submitted(_)
+                    | DriverSubmitResult::Failed {
+                        status: SubmitStatus::InFlight,
+                        ..
+                    } => {}
+                    DriverSubmitResult::Failed {
+                        status: SubmitStatus::Void,
+                        ..
+                    } => {
+                        if let Some(val) = driver_op_opt.take() {
+                            drop(val);
+                        }
+                        fallback_payload = Some(driver.slot_take_payload(user_data).unwrap());
                     }
-                    fallback_payload = Some(driver.slot_take_payload(user_data).unwrap());
                 }
                 Ok((user_data, token, result, fallback_payload))
             });
@@ -381,7 +387,7 @@ where
                     op.user_data = user_data;
                     op.token = token;
                     match result {
-                        Ok(_) => {
+                        DriverSubmitResult::Submitted(_) => {
                             op.state = LocalState::Submitted;
                             trace!(
                                 op = %std::any::type_name::<T>(),
@@ -390,23 +396,24 @@ where
                                 "LocalOp::poll: submitted"
                             );
                         }
-                        Err((e, status)) => {
-                            if status == SubmitStatus::Void {
+                        DriverSubmitResult::Failed { report, status } => match status {
+                            SubmitStatus::Void => {
                                 let payload_erased = fallback_payload.unwrap();
                                 let payload = T::payload_from_erased(payload_erased);
                                 trace!(
                                     op = %std::any::type_name::<T>(),
                                     user_data = op.user_data,
                                     status = ?status,
-                                    error = %e,
+                                    error = %report,
                                     "LocalOp::poll: submit failed synchronously"
                                 );
-                                let completion = T::complete(payload, Err(e));
+                                let completion = T::complete(payload, Err(report));
                                 return Poll::Ready(OpResult::Completed(
                                     completion.result,
                                     completion.output,
                                 ));
-                            } else {
+                            }
+                            SubmitStatus::InFlight => {
                                 op.state = LocalState::Submitted;
                                 trace!(
                                     op = %std::any::type_name::<T>(),
@@ -416,7 +423,7 @@ where
                                     "LocalOp::poll: submitted in flight"
                                 );
                             }
-                        }
+                        },
                     }
                 }
             }

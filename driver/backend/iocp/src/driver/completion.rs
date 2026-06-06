@@ -158,11 +158,7 @@ impl<'a> IocpDriver<'a> {
         self.last_timer_poll = now;
 
         let status = status
-            .map_report(|e| {
-                e.set_accumulate_src_chain(true)
-                    .map_err(|_| IocpError::CompletionWait)
-                    .attach_note("failed to get IOCP completion status")
-            })
+            .map_report(|e| e.attach_note("failed to get IOCP completion status"))
             .trans()?;
 
         match status {
@@ -432,11 +428,9 @@ impl<'a> IocpDriver<'a> {
                     io_result = IocpError::CompletionWait
                         .attach_note("missing blocking result for offloaded file completion");
                 } else if let Ok(val) = io_result {
-                    io_result = iocp_op.on_complete(val, &self.extensions).map_report(|e| {
-                        e.set_accumulate_src_chain(true)
-                            .map_err(|_| IocpError::CompletionWait)
-                            .attach_note("IOCP completion hook failed")
-                    })
+                    io_result = iocp_op
+                        .on_complete(val, &self.extensions)
+                        .map_report(|e| e.attach_note("IOCP completion hook failed"))
                 }
             });
         });

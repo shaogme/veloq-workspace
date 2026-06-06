@@ -10,7 +10,7 @@ use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
 use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 
 use veloq_driver_core::driver::registry::{AllocResult, OpHandle};
-use veloq_driver_core::driver::{Driver, DriverSubmitResult, SubmitBinder, SubmitStatus};
+use veloq_driver_core::driver::{Driver, DriverSubmitResult, SubmitStatus};
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 
 pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
@@ -285,7 +285,6 @@ impl<'a> UringDriver<'a> {
         user_data: usize,
         op: UringOp,
         op_in: &mut Option<UringOp>,
-        binder: SubmitBinder,
     ) -> DriverSubmitResult<UringError> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
@@ -299,7 +298,7 @@ impl<'a> UringDriver<'a> {
                 }
             }
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
-                return binder.err(
+                return DriverSubmitResult::failed(
                     UringError::InvalidState.report(
                         "uring.driver.submit_sqe_internal",
                         "Op slot missing in registry",
@@ -310,11 +309,11 @@ impl<'a> UringDriver<'a> {
         };
 
         match unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) } {
-            Ok(true) => binder.ok(Poll::Ready(())),
+            Ok(true) => DriverSubmitResult::submitted(Poll::Ready(())),
             Ok(false) => {
                 debug!(user_data, "SQ full, pushing to backlog");
                 self.push_backlog(user_data);
-                binder.ok(Poll::Pending)
+                DriverSubmitResult::submitted(Poll::Pending)
             }
             Err(e) => {
                 if let Some(op) = self
@@ -324,7 +323,7 @@ impl<'a> UringDriver<'a> {
                 {
                     *op_in = Some(op);
                 }
-                binder.err(
+                DriverSubmitResult::failed(
                     e.with_ctx("scope", "uring.driver.submit_sqe_internal")
                         .attach_note("submit sqe"),
                     SubmitStatus::Void,
@@ -338,7 +337,6 @@ impl<'a> UringDriver<'a> {
         user_data: usize,
         op: UringOp,
         op_in: &mut Option<UringOp>,
-        binder: SubmitBinder,
     ) -> DriverSubmitResult<UringError> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.slot_view(user_data) {
@@ -352,7 +350,7 @@ impl<'a> UringDriver<'a> {
                 }
             }
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
-                return binder.err(
+                return DriverSubmitResult::failed(
                     UringError::InvalidState.report(
                         "uring.driver.submit_timer_internal",
                         "Op slot missing in registry",
@@ -363,14 +361,14 @@ impl<'a> UringDriver<'a> {
         };
 
         match unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) } {
-            Ok(true) => binder.ok(Poll::Ready(())),
+            Ok(true) => DriverSubmitResult::submitted(Poll::Ready(())),
             Ok(false) => {
                 debug!(
                     user_data,
                     "SQ full (unexpected for timer), pushing to backlog"
                 );
                 self.push_backlog(user_data);
-                binder.ok(Poll::Pending)
+                DriverSubmitResult::submitted(Poll::Pending)
             }
             Err(e) => {
                 if let Some(op) = self
@@ -380,7 +378,7 @@ impl<'a> UringDriver<'a> {
                 {
                     *op_in = Some(op);
                 }
-                binder.err(
+                DriverSubmitResult::failed(
                     e.with_ctx("scope", "uring.driver.submit_timer_internal")
                         .attach_note("submit timer"),
                     SubmitStatus::Void,

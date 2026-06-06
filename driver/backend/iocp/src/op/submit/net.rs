@@ -1,4 +1,4 @@
-use diagweave::DiagnosticResult;
+use diagweave::prelude::*;
 use std::mem::ManuallyDrop;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use veloq_pod::{bytes_of_mut, from_bytes_mut};
@@ -592,7 +592,6 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
     };
     val.addr = Some(
         addr::to_socket_addr(addr_bytes)
-            .map_err(|_| IocpError::InvalidState)
             .attach_note("failed to parse RIO udp_recv_from source address")?,
     );
     Ok(result)

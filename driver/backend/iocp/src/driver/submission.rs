@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::{DiagnosticResult, ResultReportExt};
 use veloq_blocking::{BlockingTask, get_blocking_pool};
 use veloq_driver_core::driver::{
-    DriverSubmitResult, SharedCompletionQueue, SharedCompletionTable, SubmitBinder, SubmitStatus,
+    DriverSubmitResult, SharedCompletionQueue, SharedCompletionTable, SubmitStatus,
 };
 use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
 
@@ -103,17 +103,16 @@ impl<'a> IocpDriver<'a> {
         result: IocpDriverResult<submit::SubmissionResult>,
         user_data: usize,
         op_in: &mut Option<IocpOp>,
-        binder: SubmitBinder,
     ) -> DriverSubmitResult<IocpError> {
         match result {
-            Ok(submit::SubmissionResult::Pending) => binder.ok(Poll::Pending),
+            Ok(submit::SubmissionResult::Pending) => DriverSubmitResult::submitted(Poll::Pending),
             Ok(submit::SubmissionResult::PostToQueue) => {
-                Self::handle_post_to_queue(ops, ctx, user_data, op_in, binder)
+                Self::handle_post_to_queue(ops, ctx, user_data, op_in)
             }
             Ok(submit::SubmissionResult::Offload(task)) => {
                 match Self::handle_offload(ops, ctx, user_data, task) {
-                    Ok(poll) => binder.ok(poll),
-                    Err(_) => binder.err(
+                    Ok(poll) => DriverSubmitResult::submitted(poll),
+                    Err(_) => DriverSubmitResult::failed(
                         IocpError::Submission
                             .report("iocp/driver", "offload task submission failed"),
                         SubmitStatus::InFlight,
@@ -121,14 +120,14 @@ impl<'a> IocpDriver<'a> {
                 }
             }
             Ok(submit::SubmissionResult::Timer(duration)) => {
-                Self::handle_timer_sub(ops, ctx, user_data, duration, binder)
+                Self::handle_timer_sub(ops, ctx, user_data, duration)
             }
             Err(e) => {
                 if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                     let mut guard = slot.complete();
                     *op_in = guard.take_op();
                 }
-                binder.err(
+                DriverSubmitResult::failed(
                     e.attach_note("operation submission failed"),
                     SubmitStatus::Void,
                 )
@@ -141,7 +140,6 @@ impl<'a> IocpDriver<'a> {
         ctx: SubmitContextInternal<'_>,
         user_data: usize,
         op_in: &mut Option<IocpOp>,
-        binder: SubmitBinder,
     ) -> DriverSubmitResult<IocpError> {
         if let Err(err) = ctx.port.notify(user_data) {
             if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
@@ -150,14 +148,14 @@ impl<'a> IocpDriver<'a> {
             }
             let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
             ops.recycle(user_data, generation.wrapping_add(1));
-            binder.err(
+            DriverSubmitResult::failed(
                 err.set_accumulate_src_chain(true)
                     .with_ctx("scope", "iocp/driver")
                     .attach_note("failed to post completion queue notification"),
                 SubmitStatus::Void,
             )
         } else {
-            binder.ok(Poll::Pending)
+            DriverSubmitResult::submitted(Poll::Pending)
         }
     }
 
@@ -166,14 +164,13 @@ impl<'a> IocpDriver<'a> {
         ctx: SubmitContextInternal<'_>,
         user_data: usize,
         duration: Duration,
-        binder: SubmitBinder,
     ) -> DriverSubmitResult<IocpError> {
         let timeout = ctx.wheel.insert(user_data, duration);
         if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
             op_entry.platform_data.timer_id = Some(timeout);
             op_entry.platform_data.timer_deadline = Some(Instant::now() + duration);
         }
-        binder.ok(Poll::Pending)
+        DriverSubmitResult::submitted(Poll::Pending)
     }
 
     pub(crate) fn call_op_submit(

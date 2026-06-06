@@ -4,7 +4,6 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::Poll;
 use std::time::Instant;
 
 use tracing::{debug, trace};
@@ -16,8 +15,8 @@ use crate::error::{UringError, UringResult};
 use crate::op::{UringOp, UringUserPayload};
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
-    DriveMode, DriveOutcome, Driver, Outcome, RegisterFd, RemoteWaker, SharedCompletionQueue,
-    SharedCompletionTable, SharedDriverSlotTable, SubmitBinder, SubmitStatus,
+    DriveMode, DriveOutcome, Driver, DriverSubmitResult, RegisterFd, RemoteWaker,
+    SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
 use veloq_driver_core::{DriverReport, DriverResult as CoreDriverResult};
@@ -261,10 +260,9 @@ impl<'a> Driver for UringDriver<'a> {
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,
-        binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverReport<Self::Error>, SubmitStatus)>> {
+    ) -> DriverSubmitResult<Self::Error> {
         let Some(op) = op_in.take() else {
-            return binder.err(
+            return DriverSubmitResult::failed(
                 UringError::InvalidState
                     .report("driver.submit", "submit called with empty Option")
                     .with_ctx("scope", "uring.driver.submit")
@@ -276,7 +274,7 @@ impl<'a> Driver for UringDriver<'a> {
         let strategy = op.vtable.strategy;
         if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
             *op_in = Some(op);
-            return binder.err(
+            return DriverSubmitResult::failed(
                 UringError::Unsupported.report(
                     "uring.driver.submit",
                     "background op cannot be submitted normally",
@@ -286,7 +284,7 @@ impl<'a> Driver for UringDriver<'a> {
         }
 
         match strategy {
-            crate::op::SubmissionStrategy::BackgroundOnly => binder.err(
+            crate::op::SubmissionStrategy::BackgroundOnly => DriverSubmitResult::failed(
                 UringError::InvalidState
                     .report(
                         "driver.submit",
@@ -297,10 +295,10 @@ impl<'a> Driver for UringDriver<'a> {
                 SubmitStatus::Void,
             ),
             crate::op::SubmissionStrategy::SubmitSqe => {
-                self.submit_sqe_internal(user_data, op, op_in, binder)
+                self.submit_sqe_internal(user_data, op, op_in)
             }
             crate::op::SubmissionStrategy::SoftwareTimer => {
-                self.submit_timer_internal(user_data, op, op_in, binder)
+                self.submit_timer_internal(user_data, op, op_in)
             }
         }
     }

@@ -7,8 +7,8 @@ use core::convert::TryFrom;
 use diagweave::prelude::*;
 use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::{
-    CompletionRecord, DriveMode, Driver, PollRecordResult, encode_completion_token,
-    event_res_to_result,
+    CompletionRecord, DriveMode, Driver, DriverSubmitResult, PollRecordResult,
+    encode_completion_token, event_res_to_result,
 };
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
 use veloq_driver_core::slot::SlotTable;
@@ -43,14 +43,12 @@ where
     let mut iocp_op = Some(iocp_kernel);
     let (user_data, generation) = driver.reserve_op().expect("reserve op failed");
     driver.slot_set_payload(user_data, T::payload_into_erased(payload));
-    let _ = driver
-        .submit(
-            user_data,
-            &mut iocp_op,
-            veloq_driver_core::driver::SubmitBinder::new(),
-        )
-        .into_inner()
-        .expect("submit op failed");
+    match driver.submit(user_data, &mut iocp_op) {
+        DriverSubmitResult::Submitted(_) => {}
+        DriverSubmitResult::Failed { report, status } => {
+            panic!("submit op failed: status={status:?}, error={report}")
+        }
+    }
     (user_data, generation)
 }
 

@@ -1,6 +1,8 @@
 use tracing::trace;
 
-use crate::driver::{Driver, PlatformOp, SubmitBinder, SubmitStatus, encode_completion_token};
+use crate::driver::{
+    Driver, DriverSubmitResult, PlatformOp, SubmitStatus, encode_completion_token,
+};
 use crate::{DriverError, DriverResult};
 
 pub trait DriverProvider: Clone + Unpin {
@@ -104,12 +106,8 @@ impl<T> Op<T> {
                 let cancel_waker = driver.create_waker();
                 driver.slot_set_payload(user_data, T::payload_into_erased(payload));
 
-                let result = driver
-                    .submit(user_data, &mut op_platform, SubmitBinder::new())
-                    .into_inner();
-
-                match result {
-                    Ok(_) => {
+                match driver.submit(user_data, &mut op_platform) {
+                    DriverSubmitResult::Submitted(_) => {
                         completion_table.mark_waiting(token);
                         DetachedOp {
                             completion_table: Some(completion_table),
@@ -120,37 +118,44 @@ impl<T> Op<T> {
                             _phantom: std::marker::PhantomData,
                         }
                     }
-                    Err((e, status)) => {
-                        trace!("Submit failed synchronously: {} (status={:?})", e, status);
-                        if status == SubmitStatus::Void {
-                            let payload_erased = driver.slot_take_payload(user_data).unwrap_or_else(|| {
-                                panic!(
-                                    "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
-                                    user_data, status, e
-                                )
-                            });
+                    DriverSubmitResult::Failed { report, status } => {
+                        trace!(
+                            "Submit failed synchronously: {} (status={:?})",
+                            report, status
+                        );
+                        match status {
+                            SubmitStatus::Void => {
+                                let payload_erased =
+                                    driver.slot_take_payload(user_data).unwrap_or_else(|| {
+                                        panic!(
+                                            "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
+                                            user_data, status, report
+                                        )
+                                    });
 
-                            let payload = T::payload_from_erased(payload_erased);
-                            if let Some(op) = op_platform.take() {
-                                drop(op);
+                                let payload = T::payload_from_erased(payload_erased);
+                                if let Some(op) = op_platform.take() {
+                                    drop(op);
+                                }
+                                DetachedOp {
+                                    completion_table: None,
+                                    cancel_signal: None,
+                                    cancel_waker: None,
+                                    token: 0,
+                                    immediate_failure: Some((report, payload)),
+                                    _phantom: std::marker::PhantomData,
+                                }
                             }
-                            DetachedOp {
-                                completion_table: None,
-                                cancel_signal: None,
-                                cancel_waker: None,
-                                token: 0,
-                                immediate_failure: Some((e, payload)),
-                                _phantom: std::marker::PhantomData,
-                            }
-                        } else {
-                            completion_table.mark_waiting(token);
-                            DetachedOp {
-                                completion_table: Some(completion_table),
-                                cancel_signal: Some(cancel_signal),
-                                cancel_waker: Some(cancel_waker),
-                                token,
-                                immediate_failure: None,
-                                _phantom: std::marker::PhantomData,
+                            SubmitStatus::InFlight => {
+                                completion_table.mark_waiting(token);
+                                DetachedOp {
+                                    completion_table: Some(completion_table),
+                                    cancel_signal: Some(cancel_signal),
+                                    cancel_waker: Some(cancel_waker),
+                                    token,
+                                    immediate_failure: None,
+                                    _phantom: std::marker::PhantomData,
+                                }
                             }
                         }
                     }

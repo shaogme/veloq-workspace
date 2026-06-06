@@ -28,7 +28,27 @@ pub enum DriverControlCommand {
 
 pub type SharedSlotTable<Spec> = Arc<slot::SlotTable<Spec>>;
 pub type SharedDriverSlotTable<D> = SharedSlotTable<<D as Driver>::SlotSpec>;
-pub type DriverSubmitResult<E> = Outcome<Result<Poll<()>, (DriverReport<E>, SubmitStatus)>>;
+
+#[must_use]
+pub enum DriverSubmitResult<E> {
+    Submitted(Poll<()>),
+    Failed {
+        report: DriverReport<E>,
+        status: SubmitStatus,
+    },
+}
+
+impl<E> DriverSubmitResult<E> {
+    #[inline]
+    pub fn submitted(poll: Poll<()>) -> Self {
+        Self::Submitted(poll)
+    }
+
+    #[inline]
+    pub fn failed(report: DriverReport<E>, status: SubmitStatus) -> Self {
+        Self::Failed { report, status }
+    }
+}
 
 pub trait Driver {
     type Op: PlatformOp;
@@ -59,7 +79,6 @@ pub trait Driver {
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,
-        binder: SubmitBinder,
     ) -> DriverSubmitResult<Self::Error>;
 
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error>;
@@ -157,10 +176,9 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,
-        binder: SubmitBinder,
     ) -> DriverSubmitResult<Self::Error> {
         self.provider
-            .with_driver_mut(|d| d.submit(user_data, op_in, binder))
+            .with_driver_mut(|d| d.submit(user_data, op_in))
     }
 
     #[inline]
@@ -256,16 +274,6 @@ where
     fn wake(&self) -> DriverResult<(), E>;
 }
 
-#[must_use]
-pub struct Outcome<T>(T);
-
-impl<T> Outcome<T> {
-    #[inline]
-    pub fn into_inner(self) -> T {
-        self.0
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitStatus {
     /// Operation successfully submitted or queued. It *will* eventually produce
@@ -273,32 +281,6 @@ pub enum SubmitStatus {
     InFlight,
     /// Operation failed synchronously and no completion result will be produced.
     Void,
-}
-
-#[derive(Default)]
-pub struct SubmitBinder;
-
-impl SubmitBinder {
-    #[inline]
-    pub fn new() -> Self {
-        Self
-    }
-
-    #[inline]
-    pub fn ok<E>(self, poll: Poll<()>) -> DriverSubmitResult<E>
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        Outcome(Ok(poll))
-    }
-
-    #[inline]
-    pub fn err<E>(self, err: DriverReport<E>, status: SubmitStatus) -> DriverSubmitResult<E>
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        Outcome(Err((err, status)))
-    }
 }
 
 #[cfg(feature = "test-hooks")]
