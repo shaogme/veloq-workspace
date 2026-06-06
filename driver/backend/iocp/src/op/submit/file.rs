@@ -62,7 +62,7 @@ macro_rules! submit_io_op {
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
-                .map_err(|e| e.attach_note(format!(
+                .attach_note(format!(
                     "{}: syscall failed: fd={:?}, handle={:?}, user_data={}, generation={}, offset={}, buf_offset={}, len={}",
                     stringify!($fn_name),
                     val.fd,
@@ -72,7 +72,7 @@ macro_rules! submit_io_op {
                     val.offset,
                     val.buf_offset,
                     len
-                )));
+                ));
             mark_header_in_flight(header, submit_res)
         }
     };

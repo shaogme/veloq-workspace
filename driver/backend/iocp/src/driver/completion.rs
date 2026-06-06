@@ -129,11 +129,9 @@ impl<'a> IocpDriver<'a> {
         }
         let pending = self.shutdown_ops();
         if let CloseMode::Strict { timeout } = mode {
-            self.drain_pending_iocp(pending, timeout).map_err(|e| {
-                e.set_accumulate_src_chain(true)
-                    .with_ctx("scope", "iocp/driver")
-                    .attach_note("drain pending iocp timed out")
-            })?;
+            self.drain_pending_iocp(pending, timeout)
+                .with_ctx("scope", "iocp/driver")
+                .attach_note("drain pending iocp timed out")?;
             self.rio_state
                 .drain_outstanding(timeout)
                 .with_ctx("scope", "iocp/driver")

@@ -324,10 +324,9 @@ impl<'a> Driver for IocpDriver<'a> {
     }
 
     fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> IocpDriverResult<()> {
-        IocpDriver::register_chunk(self, id, ptr, len).map_err(|e| {
-            e.with_ctx("scope", "iocp/driver")
-                .attach_note("register chunk failed")
-        })
+        IocpDriver::register_chunk(self, id, ptr, len)
+            .with_ctx("scope", "iocp/driver")
+            .attach_note("register chunk failed")
     }
 
     fn register_files<'f>(

@@ -190,7 +190,9 @@ impl RioState {
                 .attach_note("failed to retrieve indexed actor");
         }
 
-        let rq = self.registry.create_rq((handle, fd), env)
+        let rq = self
+            .registry
+            .create_rq((handle, fd), env)
             .with_ctx("scope", "rio.runtime.control_flow.ensure_actor")
             .with_ctx("fd_fixed_index", fd.fixed_index())
             .with_ctx("fd_generation", fd.generation())
