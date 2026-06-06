@@ -102,14 +102,13 @@ impl<'a> RioCompletionRouter<'a> {
                                 None
                             };
                             if let Ok(bytes) = completion {
-                                completion =
-                                    iocp_op.on_complete(bytes, self.comp.ext).map_report(|e| {
-                                        e.with_ctx(
-                                            "scope",
-                                            "rio.runtime.control_flow.handle_op_completion",
-                                        )
-                                        .attach_note("rio op completion hook failed")
-                                    });
+                                completion = iocp_op
+                                    .on_complete(bytes, self.comp.ext)
+                                    .with_ctx(
+                                        "scope",
+                                        "rio.runtime.control_flow.handle_op_completion",
+                                    )
+                                    .attach_note("rio op completion hook failed");
                             }
                             socket_key
                         })
