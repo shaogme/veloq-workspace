@@ -197,7 +197,7 @@ impl<'a> Driver for IocpDriver<'a> {
         let completion = &self.completion;
         let timer = &mut self.timer;
         let ctx = submission::SubmitContextInternal::new(
-            completion.port(),
+            completion.port_arc(),
             timer.wheel_mut(),
             completion.events(),
             completion.table(),

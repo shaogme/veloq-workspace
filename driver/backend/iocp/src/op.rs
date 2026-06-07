@@ -13,6 +13,7 @@ pub use overlapped::OverlappedEntry;
 pub(crate) use submit::SubmissionResult;
 
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use crate::config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle, RegisteredHandle};
 use crate::error::{IocpDriverResult as DriverResult, IocpError, IocpResult};
@@ -67,7 +68,7 @@ pub(crate) type Wakeup = WakeupBase;
 
 /// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
-    pub(crate) port: &'a crate::win32::IoCompletionPort,
+    pub(crate) port: Arc<crate::win32::IoCompletionPort>,
     pub(crate) overlapped: *mut crate::win32::Overlapped,
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_files: &'a [Option<RegisteredHandle>],

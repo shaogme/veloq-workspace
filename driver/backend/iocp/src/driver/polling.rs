@@ -41,6 +41,10 @@ impl CompletionPump {
         self.port.as_ref()
     }
 
+    pub(super) fn port_arc(&self) -> Arc<crate::win32::IoCompletionPort> {
+        self.port.clone()
+    }
+
     pub(super) fn events(&self) -> &SharedCompletionQueue {
         &self.events
     }

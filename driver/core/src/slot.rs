@@ -81,6 +81,11 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
     }
 
     #[inline]
+    pub fn platform(&self) -> &SlotPlatformData<Spec> {
+        self.platform
+    }
+
+    #[inline]
     pub fn platform_mut(&mut self) -> &mut SlotPlatformData<Spec> {
         self.platform
     }

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use crate::op::slot::Slot;
 use crate::op::{IocpOp, IocpUserPayload, SubmitContext, submit};
 
 pub(crate) struct SubmitContextInternal<'a> {
-    port: &'a crate::win32::IoCompletionPort,
+    port: Arc<crate::win32::IoCompletionPort>,
     wheel: &'a mut veloq_wheel::Wheel<usize>,
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
@@ -24,7 +25,7 @@ pub(crate) struct SubmitContextInternal<'a> {
 
 impl<'a> SubmitContextInternal<'a> {
     pub(crate) fn new(
-        port: &'a crate::win32::IoCompletionPort,
+        port: Arc<crate::win32::IoCompletionPort>,
         wheel: &'a mut veloq_wheel::Wheel<usize>,
         completion_events: &'a SharedCompletionQueue,
         completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
@@ -59,7 +60,7 @@ impl<'a> IocpDriver<'a> {
         let mut guard = guard.init_op_with(op, |sidecar| {
             sidecar.user_data = user_data;
             sidecar.generation = generation;
-            sidecar.blocking_result = None;
+            sidecar.blocking_completion = None;
             sidecar.in_flight = false;
             sidecar.resolved_handle = None;
         });
@@ -68,6 +69,7 @@ impl<'a> IocpDriver<'a> {
             .with_op_mut(|op_ref| {
                 op_ref.header.user_data = user_data;
                 op_ref.header.generation = generation;
+                op_ref.header.blocking_completion = None;
                 op_ref.header.resolved_handle = None;
             })
             .ok_or(IocpError::InvalidState)
@@ -212,7 +214,7 @@ impl<'a> IocpDriver<'a> {
 
         let (rio, registrar) = self.rio.state_and_registrar_mut();
         let mut ctx = SubmitContext {
-            port: self.completion.port(),
+            port: self.completion.port_arc(),
             overlapped,
             ext: &self.extensions,
             registered_files: self.handles.registered_files(),

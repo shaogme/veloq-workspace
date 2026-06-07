@@ -164,10 +164,12 @@ impl<'a> IocpDriver<'a> {
         };
 
         let processed = Self::with_inflight_slot(&mut self.ops, user_data, |mut guard| {
-            // SAFETY: InFlight state grants sidecar mutable access.
-            let blocking_res = unsafe { guard.sidecar_unchecked(|s| s.blocking_result.take()) };
-
             let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
+                let blocking_res = iocp_op
+                    .header
+                    .blocking_completion
+                    .take()
+                    .and_then(|completion| completion.take_result());
                 if let Some(res) = blocking_res {
                     io_result = res
                         .with_ctx("outer_scope", "iocp.driver.blocking_completion")

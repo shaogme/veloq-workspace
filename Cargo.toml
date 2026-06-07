@@ -86,6 +86,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_Memory",
+    "Win32_System_Threading",
 ] }
 tracing = "0.1.44"
 parking_lot = "0.12"

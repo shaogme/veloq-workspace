@@ -214,7 +214,7 @@ pub(crate) fn submit_connect(
         ctx.registered_files,
         ctx.file_generations,
     )?);
-    ensure_iocp_association(handle, ctx.port)
+    ensure_iocp_association(handle, ctx.port.as_ref())
         .push_ctx("scope", "submit_connect")
         .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
         .with_ctx("fd_generation", connect_op.fd.generation())
@@ -402,7 +402,7 @@ pub(crate) fn submit_accept(
         .attach_note("accept socket not initialized")?;
     let accept_socket_raw = accept_socket.raw().as_socket();
 
-    ensure_iocp_association(handle, ctx.port)
+    ensure_iocp_association(handle, ctx.port.as_ref())
         .push_ctx("scope", "submit_accept")
         .with_ctx("listen_handle_raw", handle.raw().as_handle() as usize)
         .with_ctx("user_data", header.user_data)
@@ -426,7 +426,7 @@ pub(crate) fn submit_accept(
     }
     .push_ctx("scope", "submit_accept")
     .with_ctx("listen_handle_raw", handle.raw().as_handle() as usize)
-    .with_ctx("accept_socket_raw", accept_socket_raw as usize)
+    .with_ctx("accept_socket_raw", accept_socket_raw)
     .with_ctx("accept_input_length", split)
     .with_ctx("accept_output_length", split)
     .with_ctx("user_data", header.user_data)
@@ -463,8 +463,8 @@ pub(crate) unsafe fn on_complete_accept(
     }) {
         return Err(e
             .push_ctx("scope", "on_complete_accept")
-            .with_ctx("accept_socket_raw", accept_socket_raw as usize)
-            .with_ctx("listen_socket_raw", listen_socket as usize)
+            .with_ctx("accept_socket_raw", accept_socket_raw)
+            .with_ctx("listen_socket_raw", listen_socket)
             .with_ctx("socket_opt_len", std::mem::size_of::<SOCKET>())
             .attach_note("setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed"));
     }

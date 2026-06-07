@@ -74,79 +74,80 @@ impl<'a> RioCompletionRouter<'a> {
         let ops = &mut self.comp.ops;
         if user_data < ops.local.len() {
             match ops.slot_view(user_data) {
-                Some(SlotView::InFlightWaiting(mut slot)) => {
-                    if slot.platform_mut().generation == generation {
-                        let mut completion = if res.Status == 0 {
-                            Ok(res.BytesTransferred as usize)
-                        } else {
-                            Err(IocpError::CompletionWait
-                                .to_report()
-                                .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
-                                .set_error_code(res.Status)
-                                .attach_note("rio completion returned os error"))
-                        };
-                        let socket_key = slot
-                            .with_op_mut(|iocp_op| {
-                                if let Some(addr_slot) = addr_slot
-                                    && let crate::op::IocpOpPayload::UdpRecvFrom(payload) =
-                                        &mut iocp_op.payload
-                                    && completion.is_ok()
-                                    && let Err(e) = self
-                                        .registry
-                                        .copy_addr_slot_to(addr_slot, &mut payload.addr)
-                                        .trans()
-                                {
-                                    completion =
-                                        Err(e.attach_note("failed to copy RIO recv_from address"));
-                                }
-                                let socket_key = if iocp_op.header.in_flight {
-                                    iocp_op.header.in_flight = false;
-                                    iocp_op
-                                        .header
-                                        .resolved_handle
-                                        .filter(|handle| handle.is_socket())
-                                        .map(|handle| handle.actor_key())
-                                } else {
-                                    None
-                                };
-                                if let Ok(bytes) = completion.as_ref().copied() {
-                                    completion = iocp_op
-                                        .on_complete(bytes, self.comp.ext)
-                                        .with_ctx(
-                                            "scope",
-                                            "rio.runtime.control_flow.handle_op_completion",
-                                        )
-                                        .attach_note("rio op completion hook failed");
-                                }
-                                socket_key
-                            })
-                            .flatten();
-                        let res_code = rio_result_to_event_res(&completion);
-                        {
-                            let mut guard = slot.complete();
-                            let _ = guard.take_op();
-                            let (payload, detail) = guard.take_completion_data();
-                            let event = CompletionEvent {
-                                user_data: encode_completion_token(user_data, generation),
-                                res: res_code,
-                                flags: 0,
+                Some(SlotView::InFlightWaiting(mut slot))
+                    if slot.platform().generation == generation =>
+                {
+                    let mut completion = if res.Status == 0 {
+                        Ok(res.BytesTransferred as usize)
+                    } else {
+                        Err(IocpError::CompletionWait
+                            .to_report()
+                            .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
+                            .set_error_code(res.Status)
+                            .attach_note("rio completion returned os error"))
+                    };
+                    let socket_key = slot
+                        .with_op_mut(|iocp_op| {
+                            if let Some(addr_slot) = addr_slot
+                                && let crate::op::IocpOpPayload::UdpRecvFrom(payload) =
+                                    &mut iocp_op.payload
+                                && completion.is_ok()
+                                && let Err(e) = self
+                                    .registry
+                                    .copy_addr_slot_to(addr_slot, &mut payload.addr)
+                                    .trans()
+                            {
+                                completion =
+                                    Err(e.attach_note("failed to copy RIO recv_from address"));
+                            }
+                            let socket_key = if iocp_op.header.in_flight {
+                                iocp_op.header.in_flight = false;
+                                iocp_op
+                                    .header
+                                    .resolved_handle
+                                    .filter(|handle| handle.is_socket())
+                                    .map(|handle| handle.actor_key())
+                            } else {
+                                None
                             };
+                            if let Ok(bytes) = completion.as_ref().copied() {
+                                completion = iocp_op
+                                    .on_complete(bytes, self.comp.ext)
+                                    .with_ctx(
+                                        "scope",
+                                        "rio.runtime.control_flow.handle_op_completion",
+                                    )
+                                    .attach_note("rio op completion hook failed");
+                            }
+                            socket_key
+                        })
+                        .flatten();
+                    let res_code = rio_result_to_event_res(&completion);
+                    {
+                        let mut guard = slot.complete();
+                        let _ = guard.take_op();
+                        let (payload, detail) = guard.take_completion_data();
+                        let event = CompletionEvent {
+                            user_data: encode_completion_token(user_data, generation),
+                            res: res_code,
+                            flags: 0,
+                        };
 
-                            self.comp.table.record_completion_with_data(
-                                event,
-                                payload,
-                                detail.or(Some(completion)),
-                            );
-                            self.comp.events.push(event);
-                        }
-                        let _ = self.comp.ops.remove(user_data);
-                        if let Some(socket_key) = socket_key {
-                            self.release_socket_inflight(socket_key);
-                        }
+                        self.comp.table.record_completion_with_data(
+                            event,
+                            payload,
+                            detail.or(Some(completion)),
+                        );
+                        self.comp.events.push(event);
+                    }
+                    let _ = self.comp.ops.remove(user_data);
+                    if let Some(socket_key) = socket_key {
+                        self.release_socket_inflight(socket_key);
                     }
                 }
                 Some(SlotView::InFlightOrphaned(mut slot)) => {
-                    if slot.platform_mut().generation == generation {
+                    if slot.platform_mut().generation != generation {
+                    } else {
                         let mut guard = slot.complete();
                         let _ = guard.take_op();
                         let _ = guard.take_completion_data();
