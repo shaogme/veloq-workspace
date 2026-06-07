@@ -25,6 +25,7 @@ pub(crate) struct DeferredRioCleanup {
     actor_by_handle: FxHashMap<SocketKey, ActorKey>,
     socket_runtime: FxHashMap<SocketKey, crate::rio::SocketRuntimeState>,
     outstanding_count: usize,
+    next_request_id: u64,
 }
 
 // SAFETY: DeferredRioCleanup is transferred by ownership to a single reaper thread.
@@ -40,6 +41,7 @@ impl DeferredRioCleanup {
             actor_by_handle: self.actor_by_handle,
             socket_runtime: self.socket_runtime,
             outstanding_count: self.outstanding_count,
+            next_request_id: self.next_request_id,
         };
         state.begin_shutdown();
         if let Err(e) = state.drain_outstanding(RIO_REAPER_DRAIN_TIMEOUT) {
@@ -74,6 +76,7 @@ impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) {
         match Self::decode_req_ctx(res.RequestContext) {
             Some(RioCompletionKind::Op {
+                socket_key,
                 addr_slot,
                 heap_lease,
                 ctx_ptr,
@@ -82,6 +85,7 @@ impl RioState {
                 let _ctx_guard = RioOpCtxGuard(ctx_ptr);
                 self.registry.free_addr_slot(addr_slot);
                 self.registry.release_heap_lease(heap_lease);
+                self.release_socket_inflight(socket_key);
             }
             None => {}
         }
@@ -152,6 +156,7 @@ impl RioState {
             actor_by_handle: std::mem::take(&mut self.actor_by_handle),
             socket_runtime: std::mem::take(&mut self.socket_runtime),
             outstanding_count: std::mem::take(&mut self.outstanding_count),
+            next_request_id: self.next_request_id,
         })
     }
 }

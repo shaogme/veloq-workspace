@@ -394,16 +394,11 @@ pub(crate) fn submit_accept(
         .attach_note("accept socket not initialized")?;
     let accept_socket_raw = accept_socket.raw().as_socket();
 
-    ensure_iocp_association(
-        &user.fd,
-        raw,
-        ctx.port.as_ref(),
-        &mut *ctx.registered_slots,
-    )
-    .push_ctx("scope", "submit_accept")
-    .with_ctx("listen_handle_raw", raw.as_handle() as usize)
-    .with_ctx("user_data", header.user_data)
-    .with_ctx("generation", header.generation)?;
+    ensure_iocp_association(&user.fd, raw, ctx.port.as_ref(), &mut *ctx.registered_slots)
+        .push_ctx("scope", "submit_accept")
+        .with_ctx("listen_handle_raw", raw.as_handle() as usize)
+        .with_ctx("user_data", header.user_data)
+        .with_ctx("generation", header.generation)?;
 
     let split = ACCEPT_EX_ADDR_SECTION_LEN;
     let mut bytes_received = 0;

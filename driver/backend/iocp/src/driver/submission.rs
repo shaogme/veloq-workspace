@@ -289,6 +289,9 @@ impl<'a> IocpDriver<'a> {
                 .as_mut()
                 .and_then(|slot| {
                     slot.with_op_mut(|op| {
+                        if Self::is_rio_op(op) {
+                            return None;
+                        }
                         op.header
                             .in_flight
                             .then_some(op.header.resolved_handle)

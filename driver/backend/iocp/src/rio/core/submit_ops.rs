@@ -16,6 +16,7 @@ use crate::config::BorrowedRawHandle;
 use crate::ext::Extensions;
 use crate::op::submit::SubmissionResult;
 use crate::rio::core::registry::{RioRegistry, RioSubmissionKind};
+use crate::rio::core::{RioOpKind, RioSubmissionSpec, RioSubmitErrorContext};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, RioTarget};
 use diagweave::prelude::*;
@@ -41,6 +42,7 @@ impl RioState {
             actor_by_handle: rustc_hash::FxHashMap::default(),
             socket_runtime: rustc_hash::FxHashMap::default(),
             outstanding_count: 0,
+            next_request_id: 0,
         })
     }
 
@@ -98,28 +100,33 @@ impl RioState {
         let data_buf = self
             .registry
             .prepare_submission(buf, buf_offset, buf_len, env)?;
-        let request_context =
-            Self::encode_req_ctx(user_data, generation, None, data_buf.heap_lease);
-        if let Err(e) = self
-            .kernel
-            .submit_receive(rq, &data_buf.rio_buf, request_context)
-        {
-            Self::free_op_req_ctx(request_context as u64);
-            return Err(e
-                .push_ctx("scope", "rio.core.submit_ops.try_submit_recv_internal")
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
-                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
-                .with_ctx("rq_raw", rq.0 as usize)
-                .with_ctx("buffer_id", data_buf.rio_buf.BufferId as usize)
-                .with_ctx("buffer_offset", data_buf.rio_buf.Offset)
-                .with_ctx("buffer_length", data_buf.rio_buf.Length)
-                .with_ctx("outstanding_count", self.outstanding_count)
-                .attach_note("RIOReceive submit failed"));
-        }
-        self.registry.commit_heap_lease(data_buf.heap_lease);
-        self.outstanding_count += 1;
-        Ok(SubmissionResult::Pending)
+        let socket_key = handle.raw().actor_key();
+        self.prepare_submission_lease(RioSubmissionSpec {
+            user_data,
+            generation,
+            socket_key,
+            op_kind: RioOpKind::Recv,
+            rq,
+            data_buf,
+            addr: None,
+        })
+        .submit_with(|kernel, request| {
+            kernel
+                .submit_receive(request.rq, &request.data_buf.rio_buf, request.context)
+                .map_err(|e| {
+                    request.attach_submit_error(
+                        e,
+                        RioSubmitErrorContext {
+                            scope: "rio.core.submit_ops.try_submit_recv_internal",
+                            fd,
+                            handle,
+                            user_data,
+                            generation,
+                            note: "RIOReceive submit failed",
+                        },
+                    )
+                })
+        })
     }
 
     pub(crate) fn try_submit_send(
@@ -164,27 +171,32 @@ impl RioState {
         let data_buf = self
             .registry
             .prepare_submission(buf, buf_offset, buf_len, env)?;
-        let request_context =
-            Self::encode_req_ctx(user_data, generation, None, data_buf.heap_lease);
-        if let Err(e) = self
-            .kernel
-            .submit_send(rq, &data_buf.rio_buf, request_context)
-        {
-            Self::free_op_req_ctx(request_context as u64);
-            return Err(e
-                .push_ctx("scope", "rio.core.submit_ops.try_submit_send")
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
-                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
-                .with_ctx("rq_raw", rq.0 as usize)
-                .with_ctx("buffer_id", data_buf.rio_buf.BufferId as usize)
-                .with_ctx("buffer_offset", data_buf.rio_buf.Offset)
-                .with_ctx("buffer_length", data_buf.rio_buf.Length)
-                .with_ctx("outstanding_count", self.outstanding_count)
-                .attach_note("RIOSend submit failed"));
-        }
-        self.registry.commit_heap_lease(data_buf.heap_lease);
-        self.outstanding_count += 1;
-        Ok(SubmissionResult::Pending)
+        let socket_key = handle.raw().actor_key();
+        self.prepare_submission_lease(RioSubmissionSpec {
+            user_data,
+            generation,
+            socket_key,
+            op_kind: RioOpKind::Send,
+            rq,
+            data_buf,
+            addr: None,
+        })
+        .submit_with(|kernel, request| {
+            kernel
+                .submit_send(request.rq, &request.data_buf.rio_buf, request.context)
+                .map_err(|e| {
+                    request.attach_submit_error(
+                        e,
+                        RioSubmitErrorContext {
+                            scope: "rio.core.submit_ops.try_submit_send",
+                            fd,
+                            handle,
+                            user_data,
+                            generation,
+                            note: "RIOSend submit failed",
+                        },
+                    )
+                })
+        })
     }
 }

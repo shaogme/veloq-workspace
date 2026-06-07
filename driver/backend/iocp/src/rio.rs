@@ -77,4 +77,5 @@ pub(crate) struct RioState {
     pub(crate) actor_by_handle: FxHashMap<SocketKey, ActorKey>,
     pub(crate) socket_runtime: FxHashMap<SocketKey, SocketRuntimeState>,
     pub(crate) outstanding_count: usize,
+    pub(crate) next_request_id: u64,
 }

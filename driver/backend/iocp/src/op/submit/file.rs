@@ -44,20 +44,15 @@ macro_rules! submit_io_op {
 
             let raw = resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
             header.resolved_handle = Some(raw);
-            ensure_iocp_association(
-                &val.fd,
-                raw,
-                ctx.port.as_ref(),
-                &mut *ctx.registered_slots,
-            )
-            .push_ctx("scope", stringify!($fn_name))
-            .with_ctx("fd_fixed_index", val.fd.fixed_index())
-            .with_ctx("fd_generation", val.fd.generation())
-            .with_ctx("handle_raw", raw.as_handle() as usize)
-            .with_ctx("user_data", header.user_data)
-            .with_ctx("generation", header.generation)
-            .with_ctx("offset", val.offset)
-            .with_ctx("buffer_length", val.buf.len())?;
+            ensure_iocp_association(&val.fd, raw, ctx.port.as_ref(), &mut *ctx.registered_slots)
+                .push_ctx("scope", stringify!($fn_name))
+                .with_ctx("fd_fixed_index", val.fd.fixed_index())
+                .with_ctx("fd_generation", val.fd.generation())
+                .with_ctx("handle_raw", raw.as_handle() as usize)
+                .with_ctx("user_data", header.user_data)
+                .with_ctx("generation", header.generation)
+                .with_ctx("offset", val.offset)
+                .with_ctx("buffer_length", val.buf.len())?;
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             if val.buf_offset > val.buf.len() {

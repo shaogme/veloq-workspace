@@ -7,6 +7,7 @@ use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::op::SubmissionResult;
 use crate::rio::core::registry::RioSubmissionKind;
 use crate::rio::core::submit_ops::{RioExConfig, RioProvider};
+use crate::rio::core::{RioOpKind, RioSubmissionSpec, RioSubmitErrorContext};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, SocketLifecycleState, SocketRuntimeState};
 use diagweave::prelude::*;
@@ -69,6 +70,12 @@ impl RioState {
         }
         state.inflight = state.inflight.saturating_add(1);
         true
+    }
+
+    #[inline]
+    pub(crate) fn acquire_socket_kernel_inflight(&mut self, actor_key: SocketKey) {
+        let state = self.socket_runtime_mut(actor_key);
+        state.inflight = state.inflight.saturating_add(1);
     }
 
     #[inline]
@@ -137,35 +144,41 @@ impl RioState {
             .registry
             .prepare_submission(buf, buf_offset, buf_len, env)?;
         let addr = self.registry.prepare_send_addr(addr_ptr, addr_len, env)?;
-        let request_context =
-            Self::encode_req_ctx(user_data, generation, Some(addr.slot), data_buf.heap_lease);
-
-        if let Err(e) =
-            self.kernel
-                .submit_send_ex(rq, &data_buf.rio_buf, &addr.rio_buf, request_context)
-        {
-            Self::free_op_req_ctx(request_context as u64);
-            self.registry.free_addr_slot(Some(addr.slot));
-            return Err(e
-                .push_ctx("scope", "rio.runtime.try_submit_send_to_internal")
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
-                .with_ctx("user_data", user_data)
-                .with_ctx("generation", generation)
-                .with_ctx("addr_slot", addr.slot)
-                .with_ctx("rq_raw", rq.0 as usize)
-                .with_ctx("data_buffer_id", data_buf.rio_buf.BufferId as usize)
-                .with_ctx("data_buffer_offset", data_buf.rio_buf.Offset)
-                .with_ctx("data_buffer_length", data_buf.rio_buf.Length)
-                .with_ctx("addr_buffer_id", addr.rio_buf.BufferId as usize)
-                .with_ctx("addr_buffer_offset", addr.rio_buf.Offset)
-                .with_ctx("addr_buffer_length", addr.rio_buf.Length)
-                .with_ctx("outstanding_count", self.outstanding_count)
-                .attach_note("RIOSendEx submit failed"));
-        }
-        self.registry.commit_heap_lease(data_buf.heap_lease);
-        self.outstanding_count += 1;
-        Ok(SubmissionResult::Pending)
+        let socket_key = handle.raw().actor_key();
+        self.prepare_submission_lease(RioSubmissionSpec {
+            user_data,
+            generation,
+            socket_key,
+            op_kind: RioOpKind::SendTo,
+            rq,
+            data_buf,
+            addr: Some(addr),
+        })
+        .submit_with(|kernel, request| {
+            let Some(addr) = request.addr.as_ref() else {
+                return RioError::Internal.attach_note("RIO send_to missing prepared address");
+            };
+            kernel
+                .submit_send_ex(
+                    request.rq,
+                    &request.data_buf.rio_buf,
+                    &addr.rio_buf,
+                    request.context,
+                )
+                .map_err(|e| {
+                    request.attach_submit_error(
+                        e,
+                        RioSubmitErrorContext {
+                            scope: "rio.runtime.try_submit_send_to_internal",
+                            fd,
+                            handle,
+                            user_data,
+                            generation,
+                            note: "RIOSendEx submit failed",
+                        },
+                    )
+                })
+        })
     }
 
     pub(crate) fn try_submit_recv_from(
@@ -217,44 +230,45 @@ impl RioState {
         let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>() as u32;
         let mut addr = self.registry.prepare_recv_addr(env)?;
         addr.rio_buf.Length = rio_addr_len;
-        let request_context =
-            Self::encode_req_ctx(user_data, generation, Some(addr.slot), data_buf.heap_lease);
-
-        let submit_res = dispatch.receive_ex(RioExConfig {
+        let socket_key = handle.raw().actor_key();
+        self.prepare_submission_lease(RioSubmissionSpec {
+            user_data,
+            generation,
+            socket_key,
+            op_kind: RioOpKind::RecvFrom,
             rq,
-            data_buf: &data_buf.rio_buf,
-            data_buf_count: 1,
-            local_addr: std::ptr::null(),
-            remote_addr: &addr.rio_buf,
-            control_buf: std::ptr::null(),
-            flags_buf: std::ptr::null(),
-            flags: 0,
-            context: request_context,
-        });
-
-        if let Err(e) = submit_res {
-            Self::free_op_req_ctx(request_context as u64);
-            self.registry.free_addr_slot(Some(addr.slot));
-            return Err(e
-                .push_ctx("scope", "rio.runtime.try_submit_recv_from_internal")
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
-                .with_ctx("user_data", user_data)
-                .with_ctx("generation", generation)
-                .with_ctx("addr_slot", addr.slot)
-                .with_ctx("rq_raw", rq.0 as usize)
-                .with_ctx("data_buffer_id", data_buf.rio_buf.BufferId as usize)
-                .with_ctx("data_buffer_offset", data_buf.rio_buf.Offset)
-                .with_ctx("data_buffer_length", data_buf.rio_buf.Length)
-                .with_ctx("addr_buffer_id", addr.rio_buf.BufferId as usize)
-                .with_ctx("addr_buffer_offset", addr.rio_buf.Offset)
-                .with_ctx("addr_buffer_length", addr.rio_buf.Length)
-                .with_ctx("outstanding_count", self.outstanding_count)
-                .attach_note("RIOReceiveEx submit failed"));
-        };
-
-        self.registry.commit_heap_lease(data_buf.heap_lease);
-        self.outstanding_count += 1;
-        Ok(SubmissionResult::Pending)
+            data_buf,
+            addr: Some(addr),
+        })
+        .submit_with(|_kernel, request| {
+            let Some(addr) = request.addr.as_ref() else {
+                return RioError::Internal.attach_note("RIO recv_from missing prepared address");
+            };
+            dispatch
+                .receive_ex(RioExConfig {
+                    rq: request.rq,
+                    data_buf: &request.data_buf.rio_buf,
+                    data_buf_count: 1,
+                    local_addr: std::ptr::null(),
+                    remote_addr: &addr.rio_buf,
+                    control_buf: std::ptr::null(),
+                    flags_buf: std::ptr::null(),
+                    flags: 0,
+                    context: request.context,
+                })
+                .map_err(|e| {
+                    request.attach_submit_error(
+                        e,
+                        RioSubmitErrorContext {
+                            scope: "rio.runtime.try_submit_recv_from_internal",
+                            fd,
+                            handle,
+                            user_data,
+                            generation,
+                            note: "RIOReceiveEx submit failed",
+                        },
+                    )
+                })
+        })
     }
 }

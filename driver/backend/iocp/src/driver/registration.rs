@@ -109,11 +109,13 @@ impl HandleRegistry {
                     .attach_note("registered file table index exceeds IoFd range")
             })?;
             let generation = self.next_file_generation();
-            self.slots
-                .push(RegisteredSlot::occupied(entry, generation));
+            self.slots.push(RegisteredSlot::occupied(entry, generation));
             (fixed_index as usize, fixed_index)
         };
-        Ok(IoFd::fixed_with_generation(fixed_index, self.slots[idx].generation))
+        Ok(IoFd::fixed_with_generation(
+            fixed_index,
+            self.slots[idx].generation,
+        ))
     }
 
     fn take_for_unregister(&mut self, fd: IoFd) -> Option<(u32, RegisteredHandle)> {
@@ -163,7 +165,10 @@ impl HandleRegistry {
     fn release_slot(&mut self, idx: u32) {
         let generation = self.next_file_generation();
         let slot = &mut self.slots[idx as usize];
-        debug_assert!(slot.handle.is_none(), "released registered slot is occupied");
+        debug_assert!(
+            slot.handle.is_none(),
+            "released registered slot is occupied"
+        );
         slot.generation = generation;
         slot.association = None;
         self.free_slots.push(idx);

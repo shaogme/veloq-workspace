@@ -4,7 +4,6 @@ use tracing::debug;
 use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
-use crate::config::SocketKey;
 use crate::driver::completion::EmitContext;
 use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
 use crate::op::submit;
@@ -47,10 +46,7 @@ impl<'a> IocpDriver<'a> {
                     completion_events: self.completion.events(),
                     completion_table: self.completion.table(),
                 };
-                if let Some(key) = Self::perform_cancel(ctx, user_data, &mut self.ops) {
-                    self.rio.state_mut().release_socket_inflight(key);
-                    self.drain_deferred_socket_cleanup();
-                }
+                Self::perform_cancel(ctx, user_data, &mut self.ops);
             }
             _ => {
                 Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
@@ -58,13 +54,8 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    fn perform_cancel(
-        ctx: CancelContext<'_>,
-        user_data: usize,
-        ops: &mut IocpOpRegistry,
-    ) -> Option<SocketKey> {
+    fn perform_cancel(ctx: CancelContext<'_>, user_data: usize, ops: &mut IocpOpRegistry) {
         let mut should_emit_aborted = false;
-        let mut aborted_socket_key = None;
         let handled = match ops.slot_view(user_data) {
             Some(SlotView::InFlightWaiting(mut guard)) => {
                 let raw_handle = guard
@@ -86,8 +77,6 @@ impl<'a> IocpDriver<'a> {
                             iocp_op.header.in_flight = false;
                         });
                         should_emit_aborted = true;
-                        aborted_socket_key =
-                            raw_handle.is_socket().then_some(raw_handle.actor_key());
                     } else {
                         // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
                         let overlapped_ptr =
@@ -121,8 +110,6 @@ impl<'a> IocpDriver<'a> {
                             iocp_op.header.in_flight = false;
                         }
                         should_emit_aborted = true;
-                        aborted_socket_key =
-                            raw_handle.is_socket().then_some(raw_handle.actor_key());
                     } else {
                         let overlapped_ptr =
                             guard.storage.with_mut(|_result, _payload, sidecar| {
@@ -146,9 +133,7 @@ impl<'a> IocpDriver<'a> {
                 completion_table: ctx.completion_table,
             };
             Self::emit_aborted_inner(emit_ctx, user_data, ops);
-            return aborted_socket_key;
         }
-        None
     }
 
     fn emit_aborted_inner(ctx: EmitContext<'_>, user_data: usize, ops: &mut IocpOpRegistry) {
