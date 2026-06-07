@@ -4,7 +4,7 @@ use crate::config::SocketKey;
 use crate::rio::ActorKey;
 use crate::rio::RioState;
 use crate::rio::core::RioCompletionKind;
-use crate::rio::core::RioOpCtxGuard;
+use crate::rio::core::RioOpRequestInit;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
 use crate::rio::error::{RioError, RioResult};
@@ -76,13 +76,15 @@ impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) {
         match Self::decode_req_ctx(res.RequestContext) {
             Some(RioCompletionKind::Op {
-                socket_key,
-                addr_slot,
-                heap_lease,
-                ctx_ptr,
-                ..
+                init:
+                    RioOpRequestInit {
+                        socket_key,
+                        addr_slot,
+                        heap_lease,
+                        ..
+                    },
+                context: _completed_context,
             }) => {
-                let _ctx_guard = RioOpCtxGuard(ctx_ptr);
                 self.registry.free_addr_slot(addr_slot);
                 self.registry.release_heap_lease(heap_lease);
                 self.release_socket_inflight(socket_key);

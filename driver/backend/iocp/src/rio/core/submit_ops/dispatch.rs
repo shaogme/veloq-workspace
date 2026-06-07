@@ -1,5 +1,6 @@
 use crate::BufferRegistrationMode;
 use crate::config::BorrowedRawHandle;
+use crate::driver::RIO_EVENT_KEY;
 use crate::ext::Extensions;
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState};
@@ -384,7 +385,6 @@ impl RioKernel {
     }
 
     fn new(port: BorrowedRawHandle<'_>, entries: u32, dispatch: RioDispatch) -> RioResult<Self> {
-        const RIO_EVENT_KEY: usize = usize::MAX - 1;
         let mut notify_ov = Box::new(Overlapped::zeroed());
         let notification = RIO_NOTIFICATION_COMPLETION {
             Type: RIO_IOCP_COMPLETION,
@@ -479,6 +479,31 @@ impl RioKernel {
             .ok_or(RioError::Internal)
             .attach_note("RIO dispatch context lost")?;
         dispatch.send_ex(RioExConfig {
+            rq,
+            data_buf,
+            data_buf_count: 1,
+            local_addr: std::ptr::null(),
+            remote_addr: addr_buf,
+            control_buf: std::ptr::null(),
+            flags_buf: std::ptr::null(),
+            flags: 0,
+            context: ctx,
+        })
+    }
+
+    pub(crate) fn submit_receive_ex(
+        &self,
+        rq: RioRq,
+        data_buf: &RIO_BUF,
+        addr_buf: &RIO_BUF,
+        ctx: *const std::ffi::c_void,
+    ) -> RioResult<()> {
+        let dispatch = self
+            .dispatch
+            .as_ref()
+            .ok_or(RioError::Internal)
+            .attach_note("RIO dispatch context lost")?;
+        dispatch.receive_ex(RioExConfig {
             rq,
             data_buf,
             data_buf_count: 1,

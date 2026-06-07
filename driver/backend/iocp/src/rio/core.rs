@@ -6,12 +6,17 @@ pub(crate) mod submit_ops;
 use crate::config::{BorrowedRawHandle, IoFd, SocketKey};
 use crate::error::{IocpError, iocp_report_to_event_res};
 use crate::op::submit::SubmissionResult;
+use crate::rio::RioEnv;
 use crate::rio::RioState;
-use crate::rio::core::registry::{RioAddrReservation, RioHeapLeaseToken, RioPreparedBuffer};
+use crate::rio::core::registry::{
+    RioAddrReservation, RioHeapLeaseToken, RioPreparedBuffer, RioSubmissionKind,
+};
 use crate::rio::core::submit_ops::{RioKernel, RioRq};
 use crate::rio::error::{RioError, RioResult};
 use diagweave::prelude::*;
-use windows_sys::Win32::Networking::WinSock::RIO_BUF;
+use std::ffi::c_void;
+use std::ptr::NonNull;
+use windows_sys::Win32::Networking::WinSock::{RIO_BUF, SOCKADDR_INET};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RioOpKind {
@@ -66,6 +71,7 @@ impl RioRequestDiagnostics {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct RioOpRequestInit {
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
@@ -77,42 +83,117 @@ pub(crate) struct RioOpRequestInit {
     pub(crate) diagnostics: RioRequestDiagnostics,
 }
 
-#[derive(Clone, Copy)]
 pub(crate) enum RioCompletionKind {
     Op {
-        user_data: usize,
-        generation: u32,
-        socket_key: SocketKey,
-        op_kind: RioOpKind,
-        request_id: u64,
-        addr_slot: Option<usize>,
-        heap_lease: Option<RioHeapLeaseToken>,
-        diagnostics: RioRequestDiagnostics,
-        ctx_ptr: *mut RioOpRequestContext,
+        init: RioOpRequestInit,
+        context: RioCompletedRequestContext,
     },
 }
 
 #[repr(C)]
 pub(crate) struct RioOpRequestContext {
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
-    pub(crate) socket_key: SocketKey,
-    pub(crate) op_kind: RioOpKind,
-    pub(crate) request_id: u64,
-    pub(crate) addr_slot: usize,
-    pub(crate) heap_lease: Option<RioHeapLeaseToken>,
-    pub(crate) diagnostics: RioRequestDiagnostics,
+    pub(crate) init: RioOpRequestInit,
 }
 
-pub(crate) struct RioOpCtxGuard(pub(crate) *mut RioOpRequestContext);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct RioRequestContextHandle(NonNull<RioOpRequestContext>);
 
-impl Drop for RioOpCtxGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: self.0 was created from Box::into_raw in encode_req_ctx.
-            unsafe { drop(Box::from_raw(self.0)) };
-            self.0 = std::ptr::null_mut();
+pub(crate) struct RioPreparedRequestContext {
+    handle: RioRequestContextHandle,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RioSubmittedRequestContext {
+    handle: RioRequestContextHandle,
+}
+
+pub(crate) struct RioCompletedRequestContext {
+    handle: RioRequestContextHandle,
+}
+
+impl RioRequestContextHandle {
+    fn new(ctx: RioOpRequestContext) -> Self {
+        let ptr = Box::into_raw(Box::new(ctx));
+        // SAFETY: Box::into_raw never returns a null pointer.
+        Self(unsafe { NonNull::new_unchecked(ptr) })
+    }
+
+    #[inline]
+    pub(crate) fn as_request_context(&self) -> *const c_void {
+        self.0.as_ptr().cast::<c_void>()
+    }
+
+    #[inline]
+    fn from_request_context(ctx: u64) -> Option<Self> {
+        NonNull::new(ctx as usize as *mut RioOpRequestContext).map(Self)
+    }
+
+    #[inline]
+    fn as_ref(&self) -> &RioOpRequestContext {
+        // SAFETY: all handles are created from a live Box<RioOpRequestContext>
+        // and are only decoded once the kernel returns the request context.
+        unsafe { self.0.as_ref() }
+    }
+
+    #[inline]
+    fn free(self) {
+        // SAFETY: the typed owner calling this method is responsible for owning
+        // the allocation represented by the handle.
+        unsafe { drop(Box::from_raw(self.0.as_ptr())) };
+    }
+}
+
+impl RioPreparedRequestContext {
+    #[inline]
+    pub(crate) fn new(init: RioOpRequestInit) -> Self {
+        Self {
+            handle: RioRequestContextHandle::new(RioOpRequestContext { init }),
         }
+    }
+
+    #[inline]
+    pub(crate) fn as_request_context(&self) -> *const c_void {
+        self.handle.as_request_context()
+    }
+
+    #[inline]
+    fn into_submitted(self) -> RioSubmittedRequestContext {
+        let this = std::mem::ManuallyDrop::new(self);
+        RioSubmittedRequestContext {
+            handle: this.handle,
+        }
+    }
+}
+
+impl Drop for RioPreparedRequestContext {
+    fn drop(&mut self) {
+        self.handle.free();
+    }
+}
+
+impl RioSubmittedRequestContext {
+    #[inline]
+    fn as_request_context(&self) -> *const c_void {
+        self.handle.as_request_context()
+    }
+}
+
+impl RioCompletedRequestContext {
+    #[inline]
+    fn from_request_context(ctx: u64) -> Option<Self> {
+        RioRequestContextHandle::from_request_context(ctx).map(|handle| Self { handle })
+    }
+
+    #[inline]
+    fn init(&self) -> RioOpRequestInit {
+        self.handle.as_ref().init
+    }
+}
+
+impl Drop for RioCompletedRequestContext {
+    fn drop(&mut self) {
+        self.handle.free();
     }
 }
 
@@ -131,7 +212,7 @@ pub(crate) struct RioPreparedRequest {
     pub(crate) op_kind: RioOpKind,
     pub(crate) request_id: u64,
     pub(crate) rq: RioRq,
-    pub(crate) context: *const std::ffi::c_void,
+    context: Option<RioPreparedRequestContext>,
     pub(crate) data_buf: RioPreparedBuffer,
     pub(crate) addr: Option<RioAddrReservation>,
     pub(crate) diagnostics: RioRequestDiagnostics,
@@ -147,6 +228,36 @@ pub(crate) struct RioSubmitErrorContext<'a> {
     pub(crate) note: &'static str,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum RioAddressPolicy {
+    None,
+    SendTo {
+        addr_ptr: *const c_void,
+        addr_len: i32,
+    },
+    RecvFrom {
+        addr_ptr: *mut c_void,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RioSubmitPlan<'a> {
+    pub(crate) fd: IoFd,
+    pub(crate) handle: BorrowedRawHandle<'a>,
+    pub(crate) user_data: usize,
+    pub(crate) generation: u32,
+    pub(crate) op_kind: RioOpKind,
+    pub(crate) buffer_kind: RioSubmissionKind,
+    pub(crate) buffer: &'a veloq_buf::FixedBuf,
+    pub(crate) buffer_offset: usize,
+    pub(crate) operation: &'static str,
+    pub(crate) address: RioAddressPolicy,
+    pub(crate) dispatch_error: RioError,
+    pub(crate) dispatch_note: &'static str,
+    pub(crate) submit_scope: &'static str,
+    pub(crate) submit_note: &'static str,
+}
+
 pub(crate) struct RioSubmissionLease<'a> {
     state: &'a mut RioState,
     request: RioPreparedRequest,
@@ -154,6 +265,22 @@ pub(crate) struct RioSubmissionLease<'a> {
 }
 
 impl RioPreparedRequest {
+    #[inline]
+    pub(crate) fn as_request_context(&self) -> *const c_void {
+        self.context
+            .as_ref()
+            .expect("RIO prepared request context missing")
+            .as_request_context()
+    }
+
+    #[inline]
+    fn mark_submitted(&mut self) -> RioSubmittedRequestContext {
+        self.context
+            .take()
+            .expect("RIO prepared request context already submitted")
+            .into_submitted()
+    }
+
     pub(crate) fn attach_submit_error(
         &self,
         error: Report<RioError>,
@@ -186,6 +313,20 @@ impl RioPreparedRequest {
     }
 }
 
+impl<'a> RioSubmitPlan<'a> {
+    #[inline]
+    fn submit_error_context(&self) -> RioSubmitErrorContext<'a> {
+        RioSubmitErrorContext {
+            scope: self.submit_scope,
+            fd: self.fd,
+            handle: self.handle,
+            user_data: self.user_data,
+            generation: self.generation,
+            note: self.submit_note,
+        }
+    }
+}
+
 impl<'a> RioSubmissionLease<'a> {
     pub(crate) fn submit_with(
         mut self,
@@ -200,6 +341,8 @@ impl<'a> RioSubmissionLease<'a> {
         if self.submitted {
             return;
         }
+        let submitted_context = self.request.mark_submitted();
+        debug_assert!(!submitted_context.as_request_context().is_null());
         self.state
             .registry
             .commit_heap_lease(self.request.data_buf.heap_lease);
@@ -215,7 +358,6 @@ impl Drop for RioSubmissionLease<'_> {
         if self.submitted {
             return;
         }
-        RioState::free_op_req_ctx(self.request.context as u64);
         self.state
             .registry
             .free_addr_slot(self.request.addr.map(|addr| addr.slot));
@@ -232,18 +374,89 @@ pub(crate) fn rio_result_to_event_res(res: &crate::error::IocpDriverResult<usize
 
 impl RioState {
     #[inline]
-    pub(crate) fn encode_req_ctx(init: RioOpRequestInit) -> *const std::ffi::c_void {
-        let ctx = Box::new(RioOpRequestContext {
-            user_data: init.user_data,
-            generation: init.generation,
-            socket_key: init.socket_key,
-            op_kind: init.op_kind,
-            request_id: init.request_id,
-            addr_slot: init.addr_slot.unwrap_or(usize::MAX),
-            heap_lease: init.heap_lease,
-            diagnostics: init.diagnostics,
-        });
-        Box::into_raw(ctx).cast::<std::ffi::c_void>()
+    pub(crate) fn encode_req_ctx(init: RioOpRequestInit) -> RioPreparedRequestContext {
+        RioPreparedRequestContext::new(init)
+    }
+
+    pub(crate) fn submit_rio(
+        &mut self,
+        plan: RioSubmitPlan<'_>,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+        submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
+    ) -> RioResult<SubmissionResult> {
+        let buf_len = plan
+            .buffer_kind
+            .data_len(plan.buffer, plan.buffer_offset, plan.operation)?;
+        let dispatch = self
+            .kernel
+            .dispatch
+            .ok_or(plan.dispatch_error)
+            .attach_note(plan.dispatch_note)?;
+        let env = RioEnv {
+            registrar,
+            dispatch: &dispatch,
+            cq: self.kernel.cq,
+            registration_mode: self.registration_mode,
+        };
+        let outstanding_snapshot = self.outstanding_count;
+        let rq = {
+            let actor = self
+                .ensure_actor((plan.fd, plan.handle), env)
+                .push_ctx("scope", "rio.core.submit_plan.ensure_actor")
+                .with_ctx("fd_fixed_index", plan.fd.fixed_index())
+                .with_ctx("fd_generation", plan.fd.generation())
+                .with_ctx("handle_raw", plan.handle.raw().as_handle() as usize)
+                .with_ctx("socket_raw", plan.handle.raw().as_handle() as usize)
+                .with_ctx("user_data", plan.user_data)
+                .with_ctx("generation", plan.generation)
+                .with_ctx("rio_op_kind", plan.op_kind.as_str())
+                .with_ctx("rio_operation", plan.operation)
+                .with_ctx("outstanding_count", outstanding_snapshot)
+                .attach_note("failed to ensure RIO actor")?;
+            actor.rq
+        };
+        let data_buf =
+            self.registry
+                .prepare_submission(plan.buffer, plan.buffer_offset, buf_len, env)?;
+        let addr = self.prepare_submit_address(plan.address, env)?;
+        let socket_key = plan.handle.raw().actor_key();
+        let error_context = plan.submit_error_context();
+        self.prepare_submission_lease(RioSubmissionSpec {
+            user_data: plan.user_data,
+            generation: plan.generation,
+            socket_key,
+            op_kind: plan.op_kind,
+            rq,
+            data_buf,
+            addr,
+        })
+        .submit_with(|kernel, request| {
+            submit(kernel, request)
+                .map_err(|error| request.attach_submit_error(error, error_context))
+        })
+    }
+
+    fn prepare_submit_address(
+        &mut self,
+        policy: RioAddressPolicy,
+        env: RioEnv<'_>,
+    ) -> RioResult<Option<RioAddrReservation>> {
+        match policy {
+            RioAddressPolicy::None => Ok(None),
+            RioAddressPolicy::SendTo { addr_ptr, addr_len } => self
+                .registry
+                .prepare_send_addr(addr_ptr, addr_len, env)
+                .map(Some),
+            RioAddressPolicy::RecvFrom { addr_ptr } => {
+                if addr_ptr.is_null() {
+                    return RioError::Internal
+                        .attach_note("RIO recv_from received null address buffer");
+                }
+                let mut addr = self.registry.prepare_recv_addr(env)?;
+                addr.rio_buf.Length = std::mem::size_of::<SOCKADDR_INET>() as u32;
+                Ok(Some(addr))
+            }
+        }
     }
 
     #[inline]
@@ -269,7 +482,7 @@ impl RioState {
             op_kind: spec.op_kind,
             request_id,
             rq: spec.rq,
-            context,
+            context: Some(context),
             data_buf: spec.data_buf,
             addr: spec.addr,
             diagnostics,
@@ -284,38 +497,11 @@ impl RioState {
 
     #[inline]
     pub(crate) fn decode_req_ctx(ctx: u64) -> Option<RioCompletionKind> {
-        if ctx == 0 {
-            return None;
-        }
-        let ctx_ptr = ctx as usize as *mut RioOpRequestContext;
-        if ctx_ptr.is_null() {
-            return None;
-        }
-        // SAFETY: ctx_ptr is a valid pointer to RioOpRequestContext.
-        let op_ctx = unsafe { &*ctx_ptr };
+        let context = RioCompletedRequestContext::from_request_context(ctx)?;
         Some(RioCompletionKind::Op {
-            user_data: op_ctx.user_data,
-            generation: op_ctx.generation,
-            socket_key: op_ctx.socket_key,
-            op_kind: op_ctx.op_kind,
-            request_id: op_ctx.request_id,
-            addr_slot: (op_ctx.addr_slot != usize::MAX).then_some(op_ctx.addr_slot),
-            heap_lease: op_ctx.heap_lease,
-            diagnostics: op_ctx.diagnostics,
-            ctx_ptr,
+            init: context.init(),
+            context,
         })
-    }
-
-    #[inline]
-    pub(crate) fn free_op_req_ctx(ctx: u64) {
-        if ctx == 0 {
-            return;
-        }
-        let ptr = ctx as usize as *mut RioOpRequestContext;
-        if !ptr.is_null() {
-            // SAFETY: ptr was created from Box::into_raw in encode_req_ctx.
-            unsafe { drop(Box::from_raw(ptr)) };
-        }
     }
 
     #[inline]
@@ -369,38 +555,46 @@ mod tests {
 
     #[test]
     fn op_ctx_roundtrip_decode_and_free() {
-        let ptr = RioState::encode_req_ctx(test_req_init(None));
-        let decoded = RioState::decode_req_ctx(ptr as u64);
+        let context = RioState::encode_req_ctx(test_req_init(None));
+        let raw = context.as_request_context() as usize as u64;
+        let _submitted = context.into_submitted();
+        let decoded = RioState::decode_req_ctx(raw);
         assert!(matches!(
             decoded,
             Some(RioCompletionKind::Op {
-                user_data: 11,
-                generation: 17,
-                op_kind: RioOpKind::Recv,
-                request_id: 23,
-                addr_slot: None,
+                init: RioOpRequestInit {
+                    user_data: 11,
+                    generation: 17,
+                    op_kind: RioOpKind::Recv,
+                    request_id: 23,
+                    addr_slot: None,
+                    ..
+                },
                 ..
             })
         ));
-        RioState::free_op_req_ctx(ptr as u64);
     }
 
     #[test]
     fn op_ctx_with_addr_roundtrip_decode_and_free() {
-        let ptr = RioState::encode_req_ctx(test_req_init(Some(3)));
-        let decoded = RioState::decode_req_ctx(ptr as u64);
+        let context = RioState::encode_req_ctx(test_req_init(Some(3)));
+        let raw = context.as_request_context() as usize as u64;
+        let _submitted = context.into_submitted();
+        let decoded = RioState::decode_req_ctx(raw);
         assert!(matches!(
             decoded,
             Some(RioCompletionKind::Op {
-                user_data: 11,
-                generation: 17,
-                op_kind: RioOpKind::Recv,
-                request_id: 23,
-                addr_slot: Some(3),
+                init: RioOpRequestInit {
+                    user_data: 11,
+                    generation: 17,
+                    op_kind: RioOpKind::Recv,
+                    request_id: 23,
+                    addr_slot: Some(3),
+                    ..
+                },
                 ..
             })
         ));
-        RioState::free_op_req_ctx(ptr as u64);
     }
 
     #[test]
@@ -419,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn free_zero_context_is_noop() {
-        RioState::free_op_req_ctx(0);
+    fn decode_zero_context_is_noop() {
+        assert!(RioState::decode_req_ctx(0).is_none());
     }
 }

@@ -4,11 +4,10 @@ use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::driver::IocpOpRegistry;
 use crate::error::IocpError;
-use crate::rio::core::RioOpCtxGuard;
-use crate::rio::core::registry::{RioHeapLeaseToken, RioRegistry};
+use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
-use crate::rio::core::{RioCompletionKind, RioOpKind, RioRequestDiagnostics};
+use crate::rio::core::{RioCompletionKind, RioOpRequestInit};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioCompletionContext, RioEnv, RioState, SocketRuntimeState};
 use diagweave::prelude::*;
@@ -38,18 +37,6 @@ struct RioCompletionRouter<'a> {
     completed_count: usize,
 }
 
-#[derive(Clone, Copy)]
-struct RioCompletedOp {
-    user_data: usize,
-    generation: u32,
-    socket_key: SocketKey,
-    op_kind: RioOpKind,
-    request_id: u64,
-    addr_slot: Option<usize>,
-    heap_lease: Option<RioHeapLeaseToken>,
-    diagnostics: RioRequestDiagnostics,
-}
-
 impl<'a> RioCompletionRouter<'a> {
     fn new(
         outstanding_count: &'a mut usize,
@@ -76,8 +63,8 @@ impl<'a> RioCompletionRouter<'a> {
         }
     }
 
-    fn handle_op_completion(&mut self, op: RioCompletedOp, res: &RIORESULT) -> RioResult<()> {
-        let RioCompletedOp {
+    fn handle_op_completion(&mut self, init: RioOpRequestInit, res: &RIORESULT) -> RioResult<()> {
+        let RioOpRequestInit {
             user_data,
             generation,
             socket_key,
@@ -86,7 +73,7 @@ impl<'a> RioCompletionRouter<'a> {
             addr_slot,
             heap_lease,
             diagnostics,
-        } = op;
+        } = init;
         let ops = &mut self.comp.ops;
         if user_data < ops.local.len() {
             match ops.slot_view(user_data) {
@@ -187,31 +174,9 @@ impl<'a> RioCompletionRouter<'a> {
         };
         match kind {
             RioCompletionKind::Op {
-                user_data,
-                generation,
-                socket_key,
-                op_kind,
-                request_id,
-                addr_slot,
-                heap_lease,
-                diagnostics,
-                ctx_ptr,
-            } => {
-                let _ctx_guard = RioOpCtxGuard(ctx_ptr);
-                self.handle_op_completion(
-                    RioCompletedOp {
-                        user_data,
-                        generation,
-                        socket_key,
-                        op_kind,
-                        request_id,
-                        addr_slot,
-                        heap_lease,
-                        diagnostics,
-                    },
-                    res,
-                )
-            }
+                init,
+                context: _completed_context,
+            } => self.handle_op_completion(init, res),
         }
     }
 }

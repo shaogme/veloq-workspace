@@ -16,10 +16,9 @@ use crate::config::BorrowedRawHandle;
 use crate::ext::Extensions;
 use crate::op::submit::SubmissionResult;
 use crate::rio::core::registry::{RioRegistry, RioSubmissionKind};
-use crate::rio::core::{RioOpKind, RioSubmissionSpec, RioSubmitErrorContext};
+use crate::rio::core::{RioAddressPolicy, RioOpKind, RioSubmitPlan};
 use crate::rio::error::{RioError, RioResult};
-use crate::rio::{RioEnv, RioState, RioTarget};
-use diagweave::prelude::*;
+use crate::rio::{RioState, RioTarget};
 
 impl RioState {
     pub(crate) fn new(
@@ -79,54 +78,32 @@ impl RioState {
             buf_offset,
             operation,
         } = target;
-        let buf_len = RioSubmissionKind::Recv.data_len(buf, buf_offset, operation)?;
-        let dispatch = self
-            .kernel
-            .dispatch
-            .ok_or(RioError::NotSupported)
-            .attach_note("RIO not supported or dispatch table missing")?;
-        let env = RioEnv {
+        self.submit_rio(
+            RioSubmitPlan {
+                fd,
+                handle,
+                user_data,
+                generation,
+                op_kind: RioOpKind::Recv,
+                buffer_kind: RioSubmissionKind::Recv,
+                buffer: buf,
+                buffer_offset: buf_offset,
+                operation,
+                address: RioAddressPolicy::None,
+                dispatch_error: RioError::NotSupported,
+                dispatch_note: "RIO not supported or dispatch table missing",
+                submit_scope: "rio.core.submit_ops.try_submit_recv_internal",
+                submit_note: "RIOReceive submit failed",
+            },
             registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
-            registration_mode: self.registration_mode,
-        };
-        let rq = {
-            let actor = self
-                .ensure_actor((fd, handle), env)
-                .attach_note("failed to ensure RIO actor")?;
-            actor.rq
-        };
-        let data_buf = self
-            .registry
-            .prepare_submission(buf, buf_offset, buf_len, env)?;
-        let socket_key = handle.raw().actor_key();
-        self.prepare_submission_lease(RioSubmissionSpec {
-            user_data,
-            generation,
-            socket_key,
-            op_kind: RioOpKind::Recv,
-            rq,
-            data_buf,
-            addr: None,
-        })
-        .submit_with(|kernel, request| {
-            kernel
-                .submit_receive(request.rq, &request.data_buf.rio_buf, request.context)
-                .map_err(|e| {
-                    request.attach_submit_error(
-                        e,
-                        RioSubmitErrorContext {
-                            scope: "rio.core.submit_ops.try_submit_recv_internal",
-                            fd,
-                            handle,
-                            user_data,
-                            generation,
-                            note: "RIOReceive submit failed",
-                        },
-                    )
-                })
-        })
+            |kernel, request| {
+                kernel.submit_receive(
+                    request.rq,
+                    &request.data_buf.rio_buf,
+                    request.as_request_context(),
+                )
+            },
+        )
     }
 
     pub(crate) fn try_submit_send(
@@ -143,60 +120,31 @@ impl RioState {
             buf_offset,
             operation,
         } = target;
-        let buf_len = RioSubmissionKind::Send.data_len(buf, buf_offset, operation)?;
-        let dispatch = self
-            .kernel
-            .dispatch
-            .ok_or(RioError::NotSupported)
-            .attach_note("RIO not supported or dispatch table missing")?;
-        let env = RioEnv {
+        self.submit_rio(
+            RioSubmitPlan {
+                fd,
+                handle,
+                user_data,
+                generation,
+                op_kind: RioOpKind::Send,
+                buffer_kind: RioSubmissionKind::Send,
+                buffer: buf,
+                buffer_offset: buf_offset,
+                operation,
+                address: RioAddressPolicy::None,
+                dispatch_error: RioError::NotSupported,
+                dispatch_note: "RIO not supported or dispatch table missing",
+                submit_scope: "rio.core.submit_ops.try_submit_send",
+                submit_note: "RIOSend submit failed",
+            },
             registrar,
-            dispatch: &dispatch,
-            cq: self.kernel.cq,
-            registration_mode: self.registration_mode,
-        };
-        let outstanding_snapshot = self.outstanding_count;
-        let rq = {
-            let actor = self
-                .ensure_actor((fd, handle), env)
-                .push_ctx("scope", "rio.core.submit_ops.try_submit_send.ensure_actor")
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
-                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
-                .with_ctx("outstanding_count", outstanding_snapshot)
-                .attach_note("failed to ensure RIO actor")?;
-
-            actor.rq
-        };
-        let data_buf = self
-            .registry
-            .prepare_submission(buf, buf_offset, buf_len, env)?;
-        let socket_key = handle.raw().actor_key();
-        self.prepare_submission_lease(RioSubmissionSpec {
-            user_data,
-            generation,
-            socket_key,
-            op_kind: RioOpKind::Send,
-            rq,
-            data_buf,
-            addr: None,
-        })
-        .submit_with(|kernel, request| {
-            kernel
-                .submit_send(request.rq, &request.data_buf.rio_buf, request.context)
-                .map_err(|e| {
-                    request.attach_submit_error(
-                        e,
-                        RioSubmitErrorContext {
-                            scope: "rio.core.submit_ops.try_submit_send",
-                            fd,
-                            handle,
-                            user_data,
-                            generation,
-                            note: "RIOSend submit failed",
-                        },
-                    )
-                })
-        })
+            |kernel, request| {
+                kernel.submit_send(
+                    request.rq,
+                    &request.data_buf.rio_buf,
+                    request.as_request_context(),
+                )
+            },
+        )
     }
 }
