@@ -19,7 +19,7 @@ use crate::error::{IocpError, IocpResult};
 use crate::op::overlapped::{BlockingCompletion, BlockingSuccessCleanup};
 use crate::op::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write,
-    mark_header_in_flight, resolve_fd_borrowed, resolve_registered_raw_file, unpack_kernel_ref,
+    mark_header_in_flight, resolve_fd_handle, resolve_registered_raw_file, unpack_kernel_ref,
 };
 use crate::op::{
     Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, KernelRef, OpenPayload, OverlappedEntry,
@@ -42,18 +42,18 @@ macro_rules! submit_io_op {
 
             overlapped.set_offset(val.offset);
 
-            let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files, ctx.file_generations)?;
-            header.resolved_handle = Some(handle.raw());
+            let raw = resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
+            header.resolved_handle = Some(raw);
             ensure_iocp_association(
                 &val.fd,
-                handle,
+                raw,
                 ctx.port.as_ref(),
-                &mut *ctx.iocp_associations,
+                &mut *ctx.registered_slots,
             )
             .push_ctx("scope", stringify!($fn_name))
             .with_ctx("fd_fixed_index", val.fd.fixed_index())
             .with_ctx("fd_generation", val.fd.generation())
-            .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+            .with_ctx("handle_raw", raw.as_handle() as usize)
             .with_ctx("user_data", header.user_data)
             .with_ctx("generation", header.generation)
             .with_ctx("offset", val.offset)
@@ -71,12 +71,14 @@ macro_rules! submit_io_op {
             // SAFETY: buf_offset <= buf.len() is verified above.
             let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
+            let raw_handle = crate::config::RawHandle::new(raw);
+            let handle = raw_handle.borrow();
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
                 .push_ctx("scope", stringify!($fn_name))
                 .with_ctx("fd_fixed_index", val.fd.fixed_index())
                 .with_ctx("fd_generation", val.fd.generation())
-                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("handle_raw", raw.as_handle() as usize)
                 .with_ctx("user_data", header.user_data)
                 .with_ctx("generation", header.generation)
                 .with_ctx("offset", val.offset)
@@ -100,14 +102,13 @@ macro_rules! submit_raw_io_op {
 
             overlapped.set_offset(val.offset);
 
-            let (fd, handle) =
-                resolve_registered_raw_file(val.fd, ctx.registered_files, ctx.file_generations)?;
-            header.resolved_handle = Some(handle.raw());
-            ensure_iocp_association(&fd, handle, ctx.port.as_ref(), &mut *ctx.iocp_associations)
+            let (fd, raw) = resolve_registered_raw_file(val.fd, &*ctx.registered_slots)?;
+            header.resolved_handle = Some(raw);
+            ensure_iocp_association(&fd, raw, ctx.port.as_ref(), &mut *ctx.registered_slots)
                 .push_ctx("scope", stringify!($fn_name))
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
-                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("handle_raw", raw.as_handle() as usize)
                 .with_ctx("user_data", header.user_data)
                 .with_ctx("generation", header.generation)
                 .with_ctx("offset", val.offset)
@@ -123,9 +124,11 @@ macro_rules! submit_raw_io_op {
             let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
             let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
             let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
+            let raw_handle = crate::config::RawHandle::new(raw);
+            let handle = raw_handle.borrow();
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
                 .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("handle_raw", raw.as_handle() as usize)
                 .with_ctx("user_data", header.user_data)
                 .with_ctx("generation", header.generation)
                 .with_ctx("offset", val.offset)
@@ -372,10 +375,10 @@ pub(crate) fn submit_fsync(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(handle.raw());
+    let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
+    header.resolved_handle = Some(raw);
 
-    let handle = duplicate_file_handle(handle.raw().as_handle())
+    let handle = duplicate_file_handle(raw.as_handle())
         .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.fsync", e))?;
     let completion = make_blocking_completion(header, ctx, None);
     let task = blocking_job(completion, move || flush_file_buffers(handle.as_raw()));
@@ -409,10 +412,10 @@ pub(crate) fn submit_sync_range(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(handle.raw());
+    let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
+    header.resolved_handle = Some(raw);
 
-    let handle = duplicate_file_handle(handle.raw().as_handle())
+    let handle = duplicate_file_handle(raw.as_handle())
         .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.sync_range", e))?;
     let completion = make_blocking_completion(header, ctx, None);
     let task = blocking_job(completion, move || flush_file_buffers(handle.as_raw()));
@@ -446,13 +449,13 @@ pub(crate) fn submit_fallocate(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(handle.raw());
+    let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
+    header.resolved_handle = Some(raw);
 
     let mode = user.mode;
     let offset = user.offset;
     let len = user.len;
-    let handle = duplicate_file_handle(handle.raw().as_handle())
+    let handle = duplicate_file_handle(raw.as_handle())
         .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.fallocate", e))?;
     let completion = make_blocking_completion(header, ctx, None);
     let task = blocking_job(completion, move || {

@@ -216,5 +216,23 @@ impl RegisteredHandle {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RegisteredSlot {
+    pub(crate) handle: Option<RegisteredHandle>,
+    pub(crate) generation: u64,
+    pub(crate) association: Option<IocpAssociation>,
+}
+
+impl RegisteredSlot {
+    #[inline]
+    pub(crate) fn occupied(handle: RegisteredHandle, generation: u64) -> Self {
+        Self {
+            handle: Some(handle),
+            generation,
+            association: None,
+        }
+    }
+}
+
 /// Type alias for I/O descriptors using RawHandle.
 pub type IoFd = CoreIoFd;

@@ -10,7 +10,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use crate::config::{
-    IoFd, IocpAssociation, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey,
+    IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, RegisteredSlot, SocketKey,
 };
 use crate::driver::{IocpDriver, IocpDriverResult};
 use crate::error::{IocpError, IocpResult};
@@ -21,12 +21,13 @@ pub(super) struct DeferredSocketCleanup {
     entry: RegisteredHandle,
 }
 
+const REGISTERED_SLOT_SHRINK_MIN_CAPACITY: usize = 1024;
+
 pub(super) struct HandleRegistry {
-    registered_files: Vec<Option<RegisteredHandle>>,
-    file_generations: Vec<u64>,
-    iocp_associations: Vec<Option<IocpAssociation>>,
+    slots: Vec<RegisteredSlot>,
     free_slots: Vec<u32>,
     deferred_socket_cleanup: VecDeque<DeferredSocketCleanup>,
+    file_generation_counter: u64,
     socket_generation_counter: u64,
 }
 
@@ -47,40 +48,34 @@ impl DeferredSocketCleanup {
 impl HandleRegistry {
     pub(super) fn new() -> Self {
         Self {
-            registered_files: Vec::new(),
-            file_generations: Vec::new(),
-            iocp_associations: Vec::new(),
+            slots: Vec::new(),
             free_slots: Vec::new(),
             deferred_socket_cleanup: VecDeque::new(),
+            file_generation_counter: 1,
             socket_generation_counter: 1,
         }
     }
 
-    pub(super) fn registered_files(&self) -> &[Option<RegisteredHandle>] {
-        &self.registered_files
+    pub(super) fn registered_slots(&self) -> &[RegisteredSlot] {
+        &self.slots
     }
 
-    pub(super) fn file_generations(&self) -> &[u64] {
-        &self.file_generations
-    }
-
-    pub(super) fn submission_parts(
-        &mut self,
-    ) -> (
-        &[Option<RegisteredHandle>],
-        &[u64],
-        &mut [Option<IocpAssociation>],
-    ) {
-        (
-            &self.registered_files,
-            &self.file_generations,
-            &mut self.iocp_associations,
-        )
+    pub(super) fn submission_slots(&mut self) -> &mut [RegisteredSlot] {
+        &mut self.slots
     }
 
     #[cfg(test)]
     pub(crate) fn registered_file(&self, idx: usize) -> Option<&RegisteredHandle> {
-        self.registered_files.get(idx).and_then(Option::as_ref)
+        self.slots.get(idx).and_then(|slot| slot.handle.as_ref())
+    }
+
+    fn next_file_generation(&mut self) -> u64 {
+        let generation = self.file_generation_counter;
+        self.file_generation_counter = self.file_generation_counter.wrapping_add(1);
+        if self.file_generation_counter == 0 {
+            self.file_generation_counter = 1;
+        }
+        generation
     }
 
     fn next_socket_generation(&mut self) -> u64 {
@@ -95,68 +90,63 @@ impl HandleRegistry {
     fn insert_registered(&mut self, entry: RegisteredHandle) -> IocpResult<IoFd> {
         let (idx, fixed_index) = if let Some(fixed_index) = self.free_slots.pop() {
             let idx = fixed_index as usize;
-            self.registered_files[idx] = Some(entry);
-            self.iocp_associations[idx] = None;
+            let slot_len = self.slots.len();
+            let Some(slot) = self.slots.get_mut(idx) else {
+                return IocpError::Internal
+                    .with_ctx("free_slot_index", idx)
+                    .with_ctx("registered_slot_len", slot_len)
+                    .attach_note("free registered file slot index out of bounds");
+            };
+            debug_assert!(slot.handle.is_none(), "free registered slot is occupied");
+            slot.handle = Some(entry);
+            slot.association = None;
             (idx, fixed_index)
         } else {
-            let fixed_index = u32::try_from(self.registered_files.len()).map_err(|_| {
+            let fixed_index = u32::try_from(self.slots.len()).map_err(|_| {
                 IocpError::Registration
                     .to_report()
-                    .with_ctx("registered_files_len", self.registered_files.len())
+                    .with_ctx("registered_slot_len", self.slots.len())
                     .attach_note("registered file table index exceeds IoFd range")
             })?;
-            self.registered_files.push(Some(entry));
-            self.file_generations.push(0);
-            self.iocp_associations.push(None);
+            let generation = self.next_file_generation();
+            self.slots
+                .push(RegisteredSlot::occupied(entry, generation));
             (fixed_index as usize, fixed_index)
         };
-        Ok(IoFd::fixed_with_generation(
-            fixed_index,
-            self.file_generations[idx],
-        ))
+        Ok(IoFd::fixed_with_generation(fixed_index, self.slots[idx].generation))
     }
 
     fn take_for_unregister(&mut self, fd: IoFd) -> Option<(u32, RegisteredHandle)> {
         let idx = fd.fixed_index();
-        if idx as usize >= self.registered_files.len() {
+        let slot = self.slots.get_mut(idx as usize)?;
+        if slot.generation != fd.generation() {
             return None;
         }
-        if self.file_generations.get(idx as usize).copied() != Some(fd.generation()) {
-            return None;
-        }
-        self.registered_files[idx as usize]
-            .take()
-            .map(|entry| (idx, entry))
+        slot.handle.take().map(|entry| (idx, entry))
     }
 
     fn take_owned_for_close(&mut self, fd: IoFd) -> IocpResult<(u32, RegisteredHandle)> {
         let idx = fd.fixed_index();
-        let Some(&generation) = self.file_generations.get(idx as usize) else {
+        let Some(slot) = self.slots.get_mut(idx as usize) else {
             return IocpError::ResolveFd
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
                 .attach_note("registered file descriptor index out of bounds");
         };
 
-        if generation != fd.generation() {
+        if slot.generation != fd.generation() {
             return IocpError::ResolveFd
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
-                .with_ctx("current_generation", generation)
+                .with_ctx("current_generation", slot.generation)
                 .attach_note("stale registered file descriptor generation");
         }
 
-        let Some(slot) = self.registered_files.get_mut(idx as usize) else {
-            return IocpError::ResolveFd
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
-                .attach_note("registered file descriptor index out of bounds");
-        };
-
-        match slot {
+        match slot.handle.as_ref() {
             Some(RegisteredHandle::Owned(_)) => Ok((
                 idx,
-                slot.take()
+                slot.handle
+                    .take()
                     .expect("owned registered handle disappeared during close"),
             )),
             Some(RegisteredHandle::Weak(_)) => IocpError::InvalidInput
@@ -171,9 +161,43 @@ impl HandleRegistry {
     }
 
     fn release_slot(&mut self, idx: u32) {
+        let generation = self.next_file_generation();
+        let slot = &mut self.slots[idx as usize];
+        debug_assert!(slot.handle.is_none(), "released registered slot is occupied");
+        slot.generation = generation;
+        slot.association = None;
         self.free_slots.push(idx);
-        self.file_generations[idx as usize] = self.file_generations[idx as usize].wrapping_add(1);
-        self.iocp_associations[idx as usize] = None;
+        self.compact_tail_slots();
+    }
+
+    fn compact_tail_slots(&mut self) {
+        let old_len = self.slots.len();
+        while self.slots.last().is_some_and(|slot| slot.handle.is_none()) {
+            self.slots.pop();
+        }
+
+        let new_len = self.slots.len();
+        if new_len == old_len {
+            return;
+        }
+
+        self.free_slots.retain(|&idx| (idx as usize) < new_len);
+        self.shrink_slot_capacity_if_needed();
+    }
+
+    fn shrink_slot_capacity_if_needed(&mut self) {
+        let slot_target = self.slots.len().max(REGISTERED_SLOT_SHRINK_MIN_CAPACITY);
+        if self.slots.capacity() > slot_target.saturating_mul(2) {
+            self.slots.shrink_to(slot_target);
+        }
+
+        let free_target = self
+            .free_slots
+            .len()
+            .max(REGISTERED_SLOT_SHRINK_MIN_CAPACITY);
+        if self.free_slots.capacity() > free_target.saturating_mul(2) {
+            self.free_slots.shrink_to(free_target);
+        }
     }
 
     fn deferred_cleanup_len(&self) -> usize {

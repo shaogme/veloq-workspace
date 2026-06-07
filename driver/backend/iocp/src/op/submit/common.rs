@@ -5,7 +5,7 @@ use windows_sys::Win32::Networking::WinSock::SOCKET;
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-use crate::config::{BorrowedRawHandle, IoFd, IocpAssociation, IocpHandle, RegisteredHandle};
+use crate::config::{BorrowedRawHandle, IoFd, IocpAssociation, IocpHandle, RegisteredSlot};
 use crate::error::{IocpError, IocpResult};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
 use crate::op::{KernelRef, OverlappedEntry};
@@ -178,29 +178,28 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> IocpResult<Sub
 // Helper Functions
 // ============================================================================
 
-pub(crate) fn resolve_fd_borrowed<'a>(
-    fd: &'a IoFd,
-    registered_files: &'a [Option<RegisteredHandle>],
-    file_generations: &[u64],
-) -> IocpResult<BorrowedRawHandle<'a>> {
+pub(crate) fn resolve_fd_handle(
+    fd: &IoFd,
+    registered_slots: &[RegisteredSlot],
+) -> IocpResult<IocpHandle> {
     let idx = fd.fixed_index();
-    let Some(&generation) = file_generations.get(idx as usize) else {
+    let Some(slot) = registered_slots.get(idx as usize) else {
         return IocpError::ResolveFd
             .with_ctx("fd_fixed_index", idx)
             .with_ctx("fd_generation", fd.generation())
             .attach_note("registered file descriptor index out of bounds");
     };
 
-    if generation != fd.generation() {
+    if slot.generation != fd.generation() {
         return IocpError::ResolveFd
             .with_ctx("fd_fixed_index", idx)
             .with_ctx("fd_generation", fd.generation())
-            .with_ctx("current_generation", generation)
+            .with_ctx("current_generation", slot.generation)
             .attach_note("stale registered file descriptor generation");
     }
 
-    if let Some(Some(h)) = registered_files.get(idx as usize) {
-        Ok(h.as_borrowed())
+    if let Some(handle) = slot.handle.as_ref() {
+        Ok(handle.as_raw().raw())
     } else {
         IocpError::ResolveFd
             .with_ctx("fd_fixed_index", idx)
@@ -209,47 +208,32 @@ pub(crate) fn resolve_fd_borrowed<'a>(
     }
 }
 
-pub(crate) fn resolve_fd_handle(
-    fd: &IoFd,
-    registered_files: &[Option<RegisteredHandle>],
-    file_generations: &[u64],
-) -> IocpResult<IocpHandle> {
-    resolve_fd_borrowed(fd, registered_files, file_generations).map(|h| h.raw())
-}
-
-pub(crate) fn resolve_registered_raw_file<'a>(
+pub(crate) fn resolve_registered_raw_file(
     raw: IocpHandle,
-    registered_files: &'a [Option<RegisteredHandle>],
-    file_generations: &[u64],
-) -> IocpResult<(IoFd, BorrowedRawHandle<'a>)> {
+    registered_slots: &[RegisteredSlot],
+) -> IocpResult<(IoFd, IocpHandle)> {
     if !raw.is_file() {
         return IocpError::InvalidInput
             .with_ctx("handle_raw", raw.as_handle() as usize)
             .attach_note("raw file I/O only accepts file handles");
     }
 
-    for (idx, entry) in registered_files.iter().enumerate() {
-        let Some(entry) = entry else {
+    for (idx, slot) in registered_slots.iter().enumerate() {
+        let Some(entry) = slot.handle.as_ref() else {
             continue;
         };
         if entry.as_raw().raw() != raw {
             continue;
         }
 
-        let Some(&generation) = file_generations.get(idx) else {
-            return IocpError::ResolveFd
-                .with_ctx("registered_index", idx)
-                .with_ctx("handle_raw", raw.as_handle() as usize)
-                .attach_note("registered file descriptor generation missing");
-        };
         let fixed_index = u32::try_from(idx).map_err(|_| {
             IocpError::Internal
                 .to_report()
                 .with_ctx("registered_index", idx)
                 .attach_note("registered file index exceeds IoFd range")
         })?;
-        let fd = IoFd::fixed_with_generation(fixed_index, generation);
-        return Ok((fd, entry.as_borrowed()));
+        let fd = IoFd::fixed_with_generation(fixed_index, slot.generation);
+        return Ok((fd, entry.as_raw().raw()));
     }
 
     IocpError::InvalidInput
@@ -278,30 +262,45 @@ pub(crate) unsafe fn unpack_kernel_ref<T>(
 ///
 pub(crate) fn ensure_iocp_association(
     fd: &IoFd,
-    handle: BorrowedRawHandle<'_>,
+    handle: IocpHandle,
     port: &IoCompletionPort,
-    iocp_associations: &mut [Option<IocpAssociation>],
+    registered_slots: &mut [RegisteredSlot],
 ) -> IocpResult<()> {
     let idx = fd.fixed_index() as usize;
-    let Some(association) = iocp_associations.get_mut(idx) else {
+    let Some(slot) = registered_slots.get_mut(idx) else {
         return IocpError::ResolveFd
             .with_ctx("fd_fixed_index", fd.fixed_index())
             .with_ctx("fd_generation", fd.generation())
             .attach_note("registered file descriptor index out of bounds");
     };
 
-    ensure_handle_iocp_association(handle, port, association)
+    if slot.generation != fd.generation() {
+        return IocpError::ResolveFd
+            .with_ctx("fd_fixed_index", fd.fixed_index())
+            .with_ctx("fd_generation", fd.generation())
+            .with_ctx("current_generation", slot.generation)
+            .attach_note("stale registered file descriptor generation");
+    }
+
+    if slot.handle.is_none() {
+        return IocpError::ResolveFd
+            .with_ctx("fd_fixed_index", fd.fixed_index())
+            .with_ctx("fd_generation", fd.generation())
+            .attach_note("invalid registered file descriptor");
+    }
+
+    ensure_handle_iocp_association(handle, port, &mut slot.association)
 }
 
 fn ensure_handle_iocp_association(
-    handle: BorrowedRawHandle<'_>,
+    handle: IocpHandle,
     port: &IoCompletionPort,
     association: &mut Option<IocpAssociation>,
 ) -> IocpResult<()> {
     let port_raw_value = port.as_raw() as usize;
     let Some(port_raw) = std::num::NonZeroUsize::new(port_raw_value) else {
         return IocpError::InvalidState
-            .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+            .with_ctx("handle_raw", handle.as_handle() as usize)
             .with_ctx("port_raw", port_raw_value)
             .attach_note("IOCP port handle is null");
     };
@@ -312,7 +311,7 @@ fn ensure_handle_iocp_association(
         Some(existing) if existing == requested => return Ok(()),
         Some(existing) => {
             return IocpError::InvalidState
-                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("handle_raw", handle.as_handle() as usize)
                 .with_ctx("port_raw", port_raw_value)
                 .with_ctx("completion_key", completion_key)
                 .with_ctx("existing_port_raw", existing.port_raw())
@@ -323,7 +322,7 @@ fn ensure_handle_iocp_association(
     }
 
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
-    unsafe { port.associate(handle.raw().as_handle(), 0) }
+    unsafe { port.associate(handle.as_handle(), 0) }
         .attach_note("CreateIoCompletionPort association failed")?;
     *association = Some(requested);
     Ok(())

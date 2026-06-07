@@ -10,8 +10,7 @@ use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
 use crate::op::submit;
 
 struct CancelContext<'a> {
-    registered_files: &'a [Option<crate::config::RegisteredHandle>],
-    file_generations: &'a [u64],
+    registered_slots: &'a [crate::config::RegisteredSlot],
     completion_events: &'a veloq_driver_core::driver::SharedCompletionQueue,
     completion_table: &'a veloq_driver_core::driver::SharedCompletionTable<
         crate::op::IocpUserPayload,
@@ -44,8 +43,7 @@ impl<'a> IocpDriver<'a> {
         match state {
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) => {
                 let ctx = CancelContext {
-                    registered_files: self.handles.registered_files(),
-                    file_generations: self.handles.file_generations(),
+                    registered_slots: self.handles.registered_slots(),
                     completion_events: self.completion.events(),
                     completion_table: self.completion.table(),
                 };
@@ -74,8 +72,7 @@ impl<'a> IocpDriver<'a> {
                     .flatten()
                     .or_else(|| {
                         let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten()?;
-                        submit::resolve_fd_handle(&fd, ctx.registered_files, ctx.file_generations)
-                            .ok()
+                        submit::resolve_fd_handle(&fd, ctx.registered_slots).ok()
                     });
 
                 if let Some(raw_handle) = raw_handle {
@@ -112,8 +109,7 @@ impl<'a> IocpDriver<'a> {
                     .and_then(|iocp_op| iocp_op.header.resolved_handle)
                     .or_else(|| {
                         let fd = guard.op.as_mut().and_then(|iocp_op| iocp_op.get_fd())?;
-                        submit::resolve_fd_handle(&fd, ctx.registered_files, ctx.file_generations)
-                            .ok()
+                        submit::resolve_fd_handle(&fd, ctx.registered_slots).ok()
                     });
 
                 if let Some(raw_handle) = raw_handle {
