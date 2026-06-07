@@ -1,8 +1,6 @@
 use tracing::trace;
 
-use crate::driver::{
-    Driver, DriverSubmitResult, PlatformOp, SubmitStatus, encode_completion_token,
-};
+use crate::driver::{Driver, DriverSubmitResult, PlatformOp, SubmitStatus};
 use crate::{DriverError, DriverResult};
 
 pub trait DriverProvider: Clone + Unpin {
@@ -97,17 +95,18 @@ impl<T> Op<T> {
         trace!("Submitting detached op");
 
         match driver.reserve_op() {
-            Ok((user_data, generation)) => {
+            Ok(mut slot) => {
                 let (kernel_op, payload) = data.into_kernel_and_payload();
                 let mut op_platform = Some(kernel_op);
-                let token = encode_completion_token(user_data, generation);
-                let completion_table = driver.completion_table();
-                let cancel_signal = driver.detached_cancel_table();
-                let cancel_waker = driver.create_waker();
-                driver.slot_set_payload(user_data, T::payload_into_erased(payload));
+                let user_data = slot.user_data();
+                let completion_table = slot.completion_table();
+                let cancel_signal = slot.detached_cancel_table();
+                let cancel_waker = slot.create_waker();
+                slot.set_payload(T::payload_into_erased(payload));
 
-                match driver.submit(user_data, &mut op_platform) {
+                match slot.submit(&mut op_platform) {
                     DriverSubmitResult::Submitted(_) => {
+                        let token = slot.persist().token();
                         completion_table.mark_waiting(token);
                         DetachedOp {
                             completion_table: Some(completion_table),
@@ -126,7 +125,7 @@ impl<T> Op<T> {
                         match status {
                             SubmitStatus::Void => {
                                 let payload_erased =
-                                    driver.slot_take_payload(user_data).unwrap_or_else(|| {
+                                    slot.recover_payload().unwrap_or_else(|| {
                                         panic!(
                                             "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
                                             user_data, status, report
@@ -147,6 +146,7 @@ impl<T> Op<T> {
                                 }
                             }
                             SubmitStatus::InFlight => {
+                                let token = slot.persist().token();
                                 completion_table.mark_waiting(token);
                                 DetachedOp {
                                     completion_table: Some(completion_table),

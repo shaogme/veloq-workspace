@@ -41,10 +41,10 @@ where
 {
     let (iocp_kernel, payload) = op.into_kernel_and_payload();
     let mut iocp_op = Some(iocp_kernel);
-    let (user_data, _) = driver.reserve_op().expect("reserve op failed");
-    driver.slot_set_payload(user_data, T::payload_into_erased(payload));
+    let mut slot = driver.reserve_op().expect("reserve op failed");
+    slot.set_payload(T::payload_into_erased(payload));
 
-    match driver.submit(user_data, &mut iocp_op) {
+    match slot.submit(&mut iocp_op) {
         DriverSubmitResult::Failed {
             report: _,
             status: SubmitStatus::Void,
@@ -55,7 +55,7 @@ where
         DriverSubmitResult::Submitted(_) => panic!("{context}: submit unexpectedly succeeded"),
     }
 
-    let recovered = driver.slot_take_payload(user_data);
+    let recovered = slot.recover_payload();
     assert!(
         recovered.is_some(),
         "{context}: payload should be recoverable after void failure"
@@ -148,13 +148,10 @@ fn test_stale_registered_fd_generation_rejected_on_submit() {
     };
     let (iocp_kernel, payload) = op.into_kernel_and_payload();
     let mut iocp_op = Some(iocp_kernel);
-    let (user_data, _) = driver.reserve_op().expect("reserve op failed");
-    driver.slot_set_payload(
-        user_data,
-        <Fsync as IntoPlatformOp<crate::IocpOp>>::payload_into_erased(payload),
-    );
+    let mut slot = driver.reserve_op().expect("reserve op failed");
+    slot.set_payload(<Fsync as IntoPlatformOp<crate::IocpOp>>::payload_into_erased(payload));
 
-    match driver.submit(user_data, &mut iocp_op) {
+    match slot.submit(&mut iocp_op) {
         DriverSubmitResult::Failed {
             report: _,
             status: SubmitStatus::Void,
@@ -165,7 +162,7 @@ fn test_stale_registered_fd_generation_rejected_on_submit() {
         DriverSubmitResult::Submitted(_) => panic!("stale fd submit unexpectedly succeeded"),
     }
 
-    let recovered = driver.slot_take_payload(user_data);
+    let recovered = slot.recover_payload();
     assert!(
         recovered.is_some(),
         "payload should be recoverable after void failure"

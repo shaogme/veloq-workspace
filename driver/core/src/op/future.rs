@@ -9,7 +9,7 @@ use tracing::trace;
 
 use crate::driver::{
     CompletionRecord, Driver, DriverSubmitResult, PlatformOp, PollRecordResult, RemoteWaker,
-    SharedCompletionTable, SubmitStatus, encode_completion_token, event_res_to_result,
+    SharedCompletionTable, SubmitStatus, event_res_to_result,
 };
 use crate::op::{IntoPlatformOp, Op};
 use crate::slot::DetachedCancelTable;
@@ -347,15 +347,16 @@ where
             let (driver_op, payload) = data.into_kernel_and_payload();
 
             let submit_res = op.provider.with_driver(|mut driver| {
-                let (user_data, generation) = match driver.reserve_op() {
+                let mut slot = match driver.reserve_op() {
                     Ok(v) => v,
                     Err(e) => return Err((e, driver_op, payload)),
                 };
-                let token = encode_completion_token(user_data, generation);
-                driver.slot_set_payload(user_data, T::payload_into_erased(payload));
+                let user_data = slot.user_data();
+                let token = slot.token();
+                slot.set_payload(T::payload_into_erased(payload));
 
                 let mut driver_op_opt = Some(driver_op);
-                let result = driver.submit(user_data, &mut driver_op_opt);
+                let result = slot.submit(&mut driver_op_opt);
 
                 let mut fallback_payload = None;
                 match &result {
@@ -363,7 +364,9 @@ where
                     | DriverSubmitResult::Failed {
                         status: SubmitStatus::InFlight,
                         ..
-                    } => {}
+                    } => {
+                        let _ = slot.persist();
+                    }
                     DriverSubmitResult::Failed {
                         status: SubmitStatus::Void,
                         ..
@@ -371,7 +374,7 @@ where
                         if let Some(val) = driver_op_opt.take() {
                             drop(val);
                         }
-                        fallback_payload = Some(driver.slot_take_payload(user_data).unwrap());
+                        fallback_payload = Some(slot.recover_payload().unwrap());
                     }
                 }
                 Ok((user_data, token, result, fallback_payload))

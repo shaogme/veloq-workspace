@@ -213,7 +213,7 @@ impl<'a> UringDriver<'a> {
         }) = result
         {
             self.waker_token = Some(user_data);
-            self.slot_set_payload(user_data, UringUserPayload::Wakeup(payload));
+            self.slot_set_payload_raw(user_data, UringUserPayload::Wakeup(payload));
 
             let driver_ptr = self as *mut UringDriver;
             let slot = self

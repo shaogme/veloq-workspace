@@ -214,7 +214,7 @@ impl<'a> Driver for UringDriver<'a> {
     type Error = UringError;
     type SlotSpec = UringSlotSpec;
 
-    fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
+    fn reserve_op_raw(&mut self) -> DriverResult<(usize, u32)> {
         match self.ops.insert(OpEntry::new(UringOpState::new())) {
             Ok(OpHandle {
                 index: id,
@@ -238,7 +238,7 @@ impl<'a> Driver for UringDriver<'a> {
         self.detached_cancel_table.clone()
     }
 
-    fn slot_set_payload(&mut self, user_data: usize, payload: UringUserPayload) {
+    fn slot_set_payload_raw(&mut self, user_data: usize, payload: UringUserPayload) {
         let _ = self
             .ops
             .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
@@ -246,7 +246,7 @@ impl<'a> Driver for UringDriver<'a> {
             });
     }
 
-    fn slot_take_payload(&mut self, user_data: usize) -> Option<UringUserPayload> {
+    fn slot_take_payload_raw(&mut self, user_data: usize) -> Option<UringUserPayload> {
         self.ops
             .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
                 payload_cell.take()
@@ -254,7 +254,11 @@ impl<'a> Driver for UringDriver<'a> {
             .flatten()
     }
 
-    fn submit(
+    fn release_op_slot_raw(&mut self, user_data: usize) {
+        let _ = self.ops.remove_if_active(user_data);
+    }
+
+    fn submit_op_raw(
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,

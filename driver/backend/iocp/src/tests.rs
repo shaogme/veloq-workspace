@@ -30,15 +30,17 @@ where
 {
     let (iocp_kernel, payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(data);
     let mut iocp_op = Some(iocp_kernel);
-    let (user_data, generation) = driver.reserve_op().expect("reserve op failed");
-    driver.slot_set_payload(user_data, T::payload_into_erased(payload));
-    match driver.submit(user_data, &mut iocp_op) {
-        DriverSubmitResult::Submitted(_) => {}
+    let mut slot = driver.reserve_op().expect("reserve op failed");
+    slot.set_payload(T::payload_into_erased(payload));
+    match slot.submit(&mut iocp_op) {
+        DriverSubmitResult::Submitted(_) => {
+            let submitted = slot.persist();
+            (submitted.user_data, submitted.generation)
+        }
         DriverSubmitResult::Failed { report, status } => {
             panic!("submit op failed: status={status:?}, error={report}")
         }
     }
-    (user_data, generation)
 }
 
 pub(crate) fn complete_from_record<T>(

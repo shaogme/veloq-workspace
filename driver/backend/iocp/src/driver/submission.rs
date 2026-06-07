@@ -184,8 +184,6 @@ impl<'a> IocpDriver<'a> {
                 let mut guard = slot.complete();
                 *op_in = guard.take_op();
             }
-            let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
-            ops.recycle(user_data, generation.wrapping_add(1));
             DriverSubmitResult::failed(
                 err.set_accumulate_src_chain(true)
                     .push_ctx("scope", "iocp/driver")

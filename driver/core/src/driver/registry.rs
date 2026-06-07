@@ -260,6 +260,17 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         }
     }
 
+    pub fn remove_if_active(&mut self, user_data: usize) -> bool {
+        if user_data >= self.local.len()
+            || self.shared.slots[user_data].state(Ordering::Acquire) == SlotState::Idle
+        {
+            return false;
+        }
+
+        let _ = self.remove(user_data);
+        true
+    }
+
     pub fn recycle(&mut self, user_data: usize, generation: u32) {
         assert!(
             user_data < self.local.len(),
@@ -277,6 +288,17 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         self.shared.slots[user_data].reset(generation);
         self.shared.push_free(user_data);
         self.active_count -= 1;
+    }
+
+    pub fn recycle_if_active(&mut self, user_data: usize, generation: u32) -> bool {
+        if user_data >= self.local.len()
+            || self.shared.slots[user_data].state(Ordering::Acquire) == SlotState::Idle
+        {
+            return false;
+        }
+
+        self.recycle(user_data, generation);
+        true
     }
 
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {

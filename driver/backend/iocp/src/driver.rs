@@ -121,7 +121,7 @@ impl<'a> Driver for IocpDriver<'a> {
     type Error = IocpError;
     type SlotSpec = IocpSlotSpec;
 
-    fn reserve_op(&mut self) -> IocpDriverResult<(usize, u32)> {
+    fn reserve_op_raw(&mut self) -> IocpDriverResult<(usize, u32)> {
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::default())) {
             Ok(handle) => (handle.index, handle.generation),
             Err(_) => {
@@ -140,7 +140,7 @@ impl<'a> Driver for IocpDriver<'a> {
         self.detached_cancel_table.clone()
     }
 
-    fn slot_set_payload(&mut self, user_data: usize, payload: Self::UP) {
+    fn slot_set_payload_raw(&mut self, user_data: usize, payload: Self::UP) {
         let _ = self
             .ops
             .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
@@ -148,20 +148,27 @@ impl<'a> Driver for IocpDriver<'a> {
             });
     }
 
-    fn slot_take_payload(&mut self, user_data: usize) -> Option<Self::UP> {
-        use std::sync::atomic::Ordering;
-        let payload = self
-            .ops
+    fn slot_take_payload_raw(&mut self, user_data: usize) -> Option<Self::UP> {
+        self.ops
             .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
                 payload_cell.take()
             })
-            .flatten();
-        let generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
-        self.ops.recycle(user_data, generation.wrapping_add(1));
-        payload
+            .flatten()
     }
 
-    fn submit(
+    fn release_op_slot_raw(&mut self, user_data: usize) {
+        use std::sync::atomic::Ordering;
+
+        let Some(slot) = self.ops.shared.slots.get(user_data) else {
+            return;
+        };
+        let generation = slot.generation(Ordering::Acquire);
+        let _ = self
+            .ops
+            .recycle_if_active(user_data, generation.wrapping_add(1));
+    }
+
+    fn submit_op_raw(
         &mut self,
         user_data: usize,
         op_in: &mut Option<Self::Op>,
