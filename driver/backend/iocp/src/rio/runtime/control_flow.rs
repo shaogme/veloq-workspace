@@ -6,7 +6,7 @@ use crate::driver::IocpOpRegistry;
 use crate::error::IocpError;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpCtxGuard;
-use crate::rio::core::registry::RioRegistry;
+use crate::rio::core::registry::{RioHeapLeaseToken, RioRegistry};
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
 use crate::rio::error::{RioError, RioResult};
@@ -69,6 +69,7 @@ impl<'a> RioCompletionRouter<'a> {
         user_data: usize,
         generation: u32,
         addr_slot: Option<usize>,
+        heap_lease: Option<RioHeapLeaseToken>,
         res: &RIORESULT,
     ) -> RioResult<()> {
         let ops = &mut self.comp.ops;
@@ -160,6 +161,7 @@ impl<'a> RioCompletionRouter<'a> {
         }
 
         self.registry.free_addr_slot(addr_slot);
+        self.registry.release_heap_lease(heap_lease);
         if *self.outstanding_count > 0 {
             *self.outstanding_count -= 1;
         }
@@ -176,10 +178,11 @@ impl<'a> RioCompletionRouter<'a> {
                 user_data,
                 generation,
                 addr_slot,
+                heap_lease,
                 ctx_ptr,
             } => {
                 let _ctx_guard = RioOpCtxGuard(ctx_ptr);
-                self.handle_op_completion(user_data, generation, addr_slot, res)
+                self.handle_op_completion(user_data, generation, addr_slot, heap_lease, res)
             }
         }
     }

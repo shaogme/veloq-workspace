@@ -95,11 +95,15 @@ impl RioState {
                 .attach_note("failed to ensure RIO actor")?;
             actor.rq
         };
-        let rio_buf = self
+        let data_buf = self
             .registry
             .prepare_submission(buf, buf_offset, buf_len, env)?;
-        let request_context = Self::encode_req_ctx(user_data, generation);
-        if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
+        let request_context =
+            Self::encode_req_ctx(user_data, generation, None, data_buf.heap_lease);
+        if let Err(e) = self
+            .kernel
+            .submit_receive(rq, &data_buf.rio_buf, request_context)
+        {
             Self::free_op_req_ctx(request_context as u64);
             return Err(e
                 .push_ctx("scope", "rio.core.submit_ops.try_submit_recv_internal")
@@ -107,12 +111,13 @@ impl RioState {
                 .with_ctx("fd_generation", fd.generation())
                 .with_ctx("handle_raw", handle.raw().as_handle() as usize)
                 .with_ctx("rq_raw", rq.0 as usize)
-                .with_ctx("buffer_id", rio_buf.BufferId as usize)
-                .with_ctx("buffer_offset", rio_buf.Offset)
-                .with_ctx("buffer_length", rio_buf.Length)
+                .with_ctx("buffer_id", data_buf.rio_buf.BufferId as usize)
+                .with_ctx("buffer_offset", data_buf.rio_buf.Offset)
+                .with_ctx("buffer_length", data_buf.rio_buf.Length)
                 .with_ctx("outstanding_count", self.outstanding_count)
                 .attach_note("RIOReceive submit failed"));
         }
+        self.registry.commit_heap_lease(data_buf.heap_lease);
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }
@@ -156,11 +161,15 @@ impl RioState {
 
             actor.rq
         };
-        let rio_buf = self
+        let data_buf = self
             .registry
             .prepare_submission(buf, buf_offset, buf_len, env)?;
-        let request_context = Self::encode_req_ctx(user_data, generation);
-        if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
+        let request_context =
+            Self::encode_req_ctx(user_data, generation, None, data_buf.heap_lease);
+        if let Err(e) = self
+            .kernel
+            .submit_send(rq, &data_buf.rio_buf, request_context)
+        {
             Self::free_op_req_ctx(request_context as u64);
             return Err(e
                 .push_ctx("scope", "rio.core.submit_ops.try_submit_send")
@@ -168,12 +177,13 @@ impl RioState {
                 .with_ctx("fd_generation", fd.generation())
                 .with_ctx("handle_raw", handle.raw().as_handle() as usize)
                 .with_ctx("rq_raw", rq.0 as usize)
-                .with_ctx("buffer_id", rio_buf.BufferId as usize)
-                .with_ctx("buffer_offset", rio_buf.Offset)
-                .with_ctx("buffer_length", rio_buf.Length)
+                .with_ctx("buffer_id", data_buf.rio_buf.BufferId as usize)
+                .with_ctx("buffer_offset", data_buf.rio_buf.Offset)
+                .with_ctx("buffer_length", data_buf.rio_buf.Length)
                 .with_ctx("outstanding_count", self.outstanding_count)
                 .attach_note("RIOSend submit failed"));
         }
+        self.registry.commit_heap_lease(data_buf.heap_lease);
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }

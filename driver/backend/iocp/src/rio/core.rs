@@ -5,6 +5,7 @@ pub(crate) mod submit_ops;
 
 use crate::error::{IocpError, iocp_report_to_event_res};
 use crate::rio::RioState;
+use crate::rio::core::registry::RioHeapLeaseToken;
 use crate::rio::error::RioError;
 use diagweave::prelude::*;
 
@@ -14,6 +15,7 @@ pub(crate) enum RioCompletionKind {
         user_data: usize,
         generation: u32,
         addr_slot: Option<usize>,
+        heap_lease: Option<RioHeapLeaseToken>,
         ctx_ptr: *mut RioOpRequestContext,
     },
 }
@@ -23,6 +25,7 @@ pub(crate) struct RioOpRequestContext {
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
     pub(crate) addr_slot: usize,
+    pub(crate) heap_lease: Option<RioHeapLeaseToken>,
 }
 
 pub(crate) struct RioOpCtxGuard(pub(crate) *mut RioOpRequestContext);
@@ -47,20 +50,17 @@ pub(crate) fn rio_result_to_event_res(res: &crate::error::IocpDriverResult<usize
 
 impl RioState {
     #[inline]
-    pub(crate) fn encode_req_ctx(user_data: usize, generation: u32) -> *const std::ffi::c_void {
-        Self::encode_req_ctx_with_addr(user_data, generation, None)
-    }
-
-    #[inline]
-    pub(crate) fn encode_req_ctx_with_addr(
+    pub(crate) fn encode_req_ctx(
         user_data: usize,
         generation: u32,
         addr_slot: Option<usize>,
+        heap_lease: Option<RioHeapLeaseToken>,
     ) -> *const std::ffi::c_void {
         let ctx = Box::new(RioOpRequestContext {
             user_data,
             generation,
             addr_slot: addr_slot.unwrap_or(usize::MAX),
+            heap_lease,
         });
         Box::into_raw(ctx).cast::<std::ffi::c_void>()
     }
@@ -80,6 +80,7 @@ impl RioState {
             user_data: op_ctx.user_data,
             generation: op_ctx.generation,
             addr_slot: (op_ctx.addr_slot != usize::MAX).then_some(op_ctx.addr_slot),
+            heap_lease: op_ctx.heap_lease,
             ctx_ptr,
         })
     }
@@ -124,7 +125,7 @@ mod tests {
 
     #[test]
     fn op_ctx_roundtrip_decode_and_free() {
-        let ptr = RioState::encode_req_ctx(11, 17);
+        let ptr = RioState::encode_req_ctx(11, 17, None, None);
         let decoded = RioState::decode_req_ctx(ptr as u64);
         assert!(matches!(
             decoded,
@@ -140,7 +141,7 @@ mod tests {
 
     #[test]
     fn op_ctx_with_addr_roundtrip_decode_and_free() {
-        let ptr = RioState::encode_req_ctx_with_addr(11, 17, Some(3));
+        let ptr = RioState::encode_req_ctx(11, 17, Some(3), None);
         let decoded = RioState::decode_req_ctx(ptr as u64);
         assert!(matches!(
             decoded,

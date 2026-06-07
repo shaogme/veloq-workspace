@@ -74,10 +74,14 @@ impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) {
         match Self::decode_req_ctx(res.RequestContext) {
             Some(RioCompletionKind::Op {
-                addr_slot, ctx_ptr, ..
+                addr_slot,
+                heap_lease,
+                ctx_ptr,
+                ..
             }) => {
                 let _ctx_guard = RioOpCtxGuard(ctx_ptr);
                 self.registry.free_addr_slot(addr_slot);
+                self.registry.release_heap_lease(heap_lease);
             }
             None => {}
         }

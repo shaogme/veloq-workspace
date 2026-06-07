@@ -138,11 +138,11 @@ impl RioState {
             .prepare_submission(buf, buf_offset, buf_len, env)?;
         let addr = self.registry.prepare_send_addr(addr_ptr, addr_len, env)?;
         let request_context =
-            Self::encode_req_ctx_with_addr(user_data, generation, Some(addr.slot));
+            Self::encode_req_ctx(user_data, generation, Some(addr.slot), data_buf.heap_lease);
 
-        if let Err(e) = self
-            .kernel
-            .submit_send_ex(rq, &data_buf, &addr.rio_buf, request_context)
+        if let Err(e) =
+            self.kernel
+                .submit_send_ex(rq, &data_buf.rio_buf, &addr.rio_buf, request_context)
         {
             Self::free_op_req_ctx(request_context as u64);
             self.registry.free_addr_slot(Some(addr.slot));
@@ -154,15 +154,16 @@ impl RioState {
                 .with_ctx("generation", generation)
                 .with_ctx("addr_slot", addr.slot)
                 .with_ctx("rq_raw", rq.0 as usize)
-                .with_ctx("data_buffer_id", data_buf.BufferId as usize)
-                .with_ctx("data_buffer_offset", data_buf.Offset)
-                .with_ctx("data_buffer_length", data_buf.Length)
+                .with_ctx("data_buffer_id", data_buf.rio_buf.BufferId as usize)
+                .with_ctx("data_buffer_offset", data_buf.rio_buf.Offset)
+                .with_ctx("data_buffer_length", data_buf.rio_buf.Length)
                 .with_ctx("addr_buffer_id", addr.rio_buf.BufferId as usize)
                 .with_ctx("addr_buffer_offset", addr.rio_buf.Offset)
                 .with_ctx("addr_buffer_length", addr.rio_buf.Length)
                 .with_ctx("outstanding_count", self.outstanding_count)
                 .attach_note("RIOSendEx submit failed"));
         }
+        self.registry.commit_heap_lease(data_buf.heap_lease);
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }
@@ -217,11 +218,11 @@ impl RioState {
         let mut addr = self.registry.prepare_recv_addr(env)?;
         addr.rio_buf.Length = rio_addr_len;
         let request_context =
-            Self::encode_req_ctx_with_addr(user_data, generation, Some(addr.slot));
+            Self::encode_req_ctx(user_data, generation, Some(addr.slot), data_buf.heap_lease);
 
         let submit_res = dispatch.receive_ex(RioExConfig {
             rq,
-            data_buf: &data_buf,
+            data_buf: &data_buf.rio_buf,
             data_buf_count: 1,
             local_addr: std::ptr::null(),
             remote_addr: &addr.rio_buf,
@@ -242,9 +243,9 @@ impl RioState {
                 .with_ctx("generation", generation)
                 .with_ctx("addr_slot", addr.slot)
                 .with_ctx("rq_raw", rq.0 as usize)
-                .with_ctx("data_buffer_id", data_buf.BufferId as usize)
-                .with_ctx("data_buffer_offset", data_buf.Offset)
-                .with_ctx("data_buffer_length", data_buf.Length)
+                .with_ctx("data_buffer_id", data_buf.rio_buf.BufferId as usize)
+                .with_ctx("data_buffer_offset", data_buf.rio_buf.Offset)
+                .with_ctx("data_buffer_length", data_buf.rio_buf.Length)
                 .with_ctx("addr_buffer_id", addr.rio_buf.BufferId as usize)
                 .with_ctx("addr_buffer_offset", addr.rio_buf.Offset)
                 .with_ctx("addr_buffer_length", addr.rio_buf.Length)
@@ -252,6 +253,7 @@ impl RioState {
                 .attach_note("RIOReceiveEx submit failed"));
         };
 
+        self.registry.commit_heap_lease(data_buf.heap_lease);
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)
     }

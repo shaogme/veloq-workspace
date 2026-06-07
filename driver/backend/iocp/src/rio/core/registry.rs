@@ -24,6 +24,33 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
+const HEAP_REGISTRATION_CACHE_LIMIT: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RioHeapBufferKey {
+    ptr: usize,
+    cap: usize,
+    cookie: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RioHeapLeaseToken {
+    key: RioHeapBufferKey,
+    id: RioBufferId,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RioPreparedBuffer {
+    pub(crate) rio_buf: RIO_BUF,
+    pub(crate) heap_lease: Option<RioHeapLeaseToken>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RioHeapRegistration {
+    id: RioBufferId,
+    active_refs: usize,
+    retired: bool,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RioRegistrationStats {
@@ -43,13 +70,13 @@ pub(crate) struct RioRegistry {
     addr_slot_in_use: Vec<bool>,
     addr_free_slots: Vec<usize>,
     addr_buffer_id: RioBufferId,
-    /// Heap-buffer lazy registrations: (ptr, cap, cookie) -> RioBufferId
-    pub(crate) heap_rio_bufs: FxHashMap<(usize, usize, u64), RioBufferId>,
+    /// Heap-buffer lazy registrations: (ptr, cap, cookie) -> RIO buffer registration.
+    pub(crate) heap_rio_bufs: FxHashMap<RioHeapBufferKey, RioHeapRegistration>,
     pub(crate) pending_deregistrations: Vec<RioBufferId>,
     pub(crate) rq_depth: u32,
     pub(crate) registration_stats: RioRegistrationStats,
     chunk_register_failures_recent: FxHashMap<u16, Instant>,
-    heap_register_failures_recent: FxHashMap<(usize, usize, u64), Instant>,
+    heap_register_failures_recent: FxHashMap<RioHeapBufferKey, Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -145,7 +172,7 @@ impl RioRegistry {
         &mut self,
         buf: &FixedBuf,
         env: RioEnv<'_>,
-    ) -> RioResult<(RioBufferId, usize)> {
+    ) -> RioResult<(RioBufferId, usize, Option<RioHeapLeaseToken>)> {
         let info = buf.resolve_region_info();
 
         if info.pool_kind == PoolKind::Heap {
@@ -169,7 +196,7 @@ impl RioRegistry {
         }
 
         match buffer_id {
-            Some(id) => Ok((id, info.offset)),
+            Some(id) => Ok((id, info.offset, None)),
             None => RioError::Internal
                 .with_ctx("chunk_id", info.id as usize)
                 .attach_note("RIO chunk not registered"),
@@ -182,7 +209,7 @@ impl RioRegistry {
         buf_offset: usize,
         len: u32,
         env: RioEnv<'_>,
-    ) -> RioResult<RIO_BUF> {
+    ) -> RioResult<RioPreparedBuffer> {
         let buf_offset_u32 = u32::try_from(buf_offset).map_err(|_| {
             RioError::InvalidInput
                 .to_report()
@@ -192,14 +219,17 @@ impl RioRegistry {
                 .with_ctx("submission_length", len)
                 .attach_note("RIO buffer offset exceeds u32")
         })?;
-        let (buffer_id, offset) = self.resolve_buffer_id(buf, env)?;
+        let (buffer_id, offset, heap_lease) = self.resolve_buffer_id(buf, env)?;
         let offset = Self::checked_rio_buffer_offset(offset, buf_offset_u32, len, buf)?;
         let rio_buf = RIO_BUF {
             BufferId: buffer_id.0,
             Offset: offset,
             Length: len,
         };
-        Ok(rio_buf)
+        Ok(RioPreparedBuffer {
+            rio_buf,
+            heap_lease,
+        })
     }
 
     fn checked_rio_buffer_offset(
@@ -351,7 +381,7 @@ impl RioRegistry {
         if !addr_buffer_id.is_invalid() && deregistered.insert(addr_buffer_id.0 as usize) {
             env.dispatch.deregister_buffer(addr_buffer_id);
         }
-        for id in self.heap_rio_bufs.values().copied() {
+        for id in self.heap_rio_bufs.values().map(|entry| entry.id) {
             if !id.is_invalid() && deregistered.insert(id.0 as usize) {
                 env.dispatch.deregister_buffer(id);
             }
@@ -369,14 +399,15 @@ impl RioRegistry {
         buf: &FixedBuf,
         offset: usize,
         env: RioEnv<'_>,
-    ) -> RioResult<(RioBufferId, usize)> {
-        let key = (
-            buf.as_ptr() as usize,
-            buf.capacity(),
-            buf.resolve_region_info().cookie,
-        );
-        if let Some(&id) = self.heap_rio_bufs.get(&key) {
-            return Ok((id, offset));
+    ) -> RioResult<(RioBufferId, usize, Option<RioHeapLeaseToken>)> {
+        let key = RioHeapBufferKey {
+            ptr: buf.as_ptr() as usize,
+            cap: buf.capacity(),
+            cookie: buf.resolve_region_info().cookie,
+        };
+        if let Some(entry) = self.heap_rio_bufs.get(&key) {
+            let lease = RioHeapLeaseToken { key, id: entry.id };
+            return Ok((entry.id, offset, Some(lease)));
         }
 
         if let Some(last_fail) = self.heap_register_failures_recent.get(&key)
@@ -388,27 +419,23 @@ impl RioRegistry {
                 .saturating_add(1);
             return RioError::ResourceExhaustion
                 .with_ctx("registration_mode", env.registration_mode.as_str())
-                .with_ctx("buffer_ptr", key.0)
-                .with_ctx("buffer_capacity", key.1)
-                .with_ctx("buffer_cookie", key.2)
+                .with_ctx("buffer_ptr", key.ptr)
+                .with_ctx("buffer_capacity", key.cap)
+                .with_ctx("buffer_cookie", key.cookie)
                 .attach_note("RIO heap registration skipped due to recent failure");
         }
 
-        if self.heap_rio_bufs.len() >= 1024 {
-            for id in self.heap_rio_bufs.values().copied() {
-                self.pending_deregistrations.push(id);
-            }
-            self.heap_rio_bufs.clear();
-        }
+        self.retire_heap_cache_for_insert();
 
         let id = self.register_heap_raw(buf, key, env)?;
-        Ok((id, offset))
+        let lease = RioHeapLeaseToken { key, id };
+        Ok((id, offset, Some(lease)))
     }
 
     fn register_heap_raw(
         &mut self,
         buf: &FixedBuf,
-        key: (usize, usize, u64),
+        key: RioHeapBufferKey,
         env: RioEnv<'_>,
     ) -> RioResult<RioBufferId> {
         self.registration_stats.heap_register_attempts = self
@@ -430,20 +457,86 @@ impl RioRegistry {
                     .insert(key, Instant::now());
                 return Err(e)
                     .with_ctx("registration_mode", env.registration_mode.as_str())
-                    .with_ctx("buffer_ptr", key.0)
-                    .with_ctx("buffer_capacity", key.1)
-                    .with_ctx("buffer_cookie", key.2)
+                    .with_ctx("buffer_ptr", key.ptr)
+                    .with_ctx("buffer_capacity", key.cap)
+                    .with_ctx("buffer_cookie", key.cookie)
                     .attach_note("RIORegisterBuffer failed for heap buffer");
             }
         };
 
-        self.heap_rio_bufs.insert(key, id);
+        self.heap_rio_bufs.insert(
+            key,
+            RioHeapRegistration {
+                id,
+                active_refs: 0,
+                retired: false,
+            },
+        );
         self.heap_register_failures_recent.remove(&key);
         self.registration_stats.heap_register_success = self
             .registration_stats
             .heap_register_success
             .saturating_add(1);
         Ok(id)
+    }
+
+    pub(crate) fn commit_heap_lease(&mut self, lease: Option<RioHeapLeaseToken>) {
+        let Some(lease) = lease else {
+            return;
+        };
+        let Some(entry) = self.heap_rio_bufs.get_mut(&lease.key) else {
+            debug_assert!(false, "committed unknown RIO heap lease");
+            return;
+        };
+        if entry.id != lease.id {
+            debug_assert!(false, "committed stale RIO heap lease");
+            return;
+        }
+        entry.active_refs = entry.active_refs.saturating_add(1);
+    }
+
+    pub(crate) fn release_heap_lease(&mut self, lease: Option<RioHeapLeaseToken>) {
+        let Some(lease) = lease else {
+            return;
+        };
+
+        let mut remove = false;
+        if let Some(entry) = self.heap_rio_bufs.get_mut(&lease.key) {
+            if entry.id != lease.id {
+                debug_assert!(false, "released stale RIO heap lease");
+                return;
+            }
+            debug_assert!(entry.active_refs > 0, "released inactive RIO heap lease");
+            if entry.active_refs > 0 {
+                entry.active_refs -= 1;
+            }
+            remove = entry.active_refs == 0 && entry.retired;
+        }
+
+        if remove && let Some(entry) = self.heap_rio_bufs.remove(&lease.key) {
+            self.pending_deregistrations.push(entry.id);
+        }
+    }
+
+    fn retire_heap_cache_for_insert(&mut self) {
+        if self.heap_rio_bufs.len() < HEAP_REGISTRATION_CACHE_LIMIT {
+            return;
+        }
+
+        let mut idle_keys = Vec::new();
+        for (key, entry) in &mut self.heap_rio_bufs {
+            if entry.active_refs == 0 {
+                idle_keys.push(*key);
+            } else {
+                entry.retired = true;
+            }
+        }
+
+        for key in idle_keys {
+            if let Some(entry) = self.heap_rio_bufs.remove(&key) {
+                self.pending_deregistrations.push(entry.id);
+            }
+        }
     }
 
     pub(crate) fn prepare_send_addr(
