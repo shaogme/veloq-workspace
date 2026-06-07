@@ -22,6 +22,16 @@ impl UringOpState {
 }
 
 impl<'a> UringDriver<'a> {
+    fn submit_cancel_request(&mut self, user_data: usize) {
+        let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
+            .build()
+            .user_data(CANCEL_USER_DATA);
+
+        if !self.push_entry(cancel_sqe) {
+            self.pending_cancellations.push_back(user_data);
+        }
+    }
+
     pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
         let Some(slot) = self.ops.slot_view(user_data) else {
             return;
@@ -65,17 +75,21 @@ impl<'a> UringDriver<'a> {
                     return;
                 }
 
-                let cancel_sqe = opcode::AsyncCancel::new(user_data as u64)
-                    .build()
-                    .user_data(CANCEL_USER_DATA);
-
-                if !self.push_entry(cancel_sqe) {
-                    self.pending_cancellations.push_back(user_data);
-                }
+                self.submit_cancel_request(user_data);
 
                 // Cancellation is async, we wait for CQE to clean up.
             }
-            SlotView::InFlightOrphaned(_) => {}
+            SlotView::InFlightOrphaned(mut slot) => {
+                if let Some(tid) = slot.platform_mut().timer_id {
+                    let sidecar = cancel_slot_immediate(slot, user_data);
+                    self.wheel.cancel(tid);
+                    self.push_completion_event(sidecar);
+                    self.ops.remove(user_data);
+                    return;
+                }
+
+                self.submit_cancel_request(user_data);
+            }
         }
     }
 

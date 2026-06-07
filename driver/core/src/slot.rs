@@ -88,7 +88,10 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
 
 #[inline]
 pub fn is_runnable_state(state: SlotState) -> bool {
-    matches!(state, SlotState::Reserved | SlotState::InFlightWaiting)
+    matches!(
+        state,
+        SlotState::Reserved | SlotState::InFlightWaiting | SlotState::InFlightOrphaned
+    )
 }
 
 impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {

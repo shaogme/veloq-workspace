@@ -29,6 +29,7 @@ pub(crate) struct EmitContext<'a> {
 
 pub(crate) struct CancelContext<'a> {
     pub(crate) registered_files: &'a [Option<crate::config::RegisteredHandle>],
+    pub(crate) file_generations: &'a [u64],
     pub(crate) completion_events: &'a SharedCompletionQueue,
     pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
 }
@@ -525,14 +526,10 @@ impl<'a> IocpDriver<'a> {
 
         let state = self.ops.slot_view(user_data);
         match state {
-            Some(SlotView::InFlightOrphaned(_)) => {
-                if self.shutting_down {
-                    Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
-                }
-            }
-            Some(SlotView::InFlightWaiting(_)) => {
+            Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) => {
                 let ctx = CancelContext {
                     registered_files: &self.registered_files,
+                    file_generations: &self.file_generations,
                     completion_events: &self.completion_events,
                     completion_table: &self.completion_table,
                 };
@@ -561,7 +558,8 @@ impl<'a> IocpDriver<'a> {
                     .flatten()
                     .or_else(|| {
                         let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten()?;
-                        submit::resolve_fd_handle(&fd, ctx.registered_files).ok()
+                        submit::resolve_fd_handle(&fd, ctx.registered_files, ctx.file_generations)
+                            .ok()
                     });
 
                 if let Some(raw_handle) = raw_handle {
@@ -584,6 +582,40 @@ impl<'a> IocpDriver<'a> {
                                 &mut sidecar.inner as *mut crate::win32::Overlapped
                             });
                         // SAFETY: handle and overlapped_ptr are valid for this operation.
+                        let _ = unsafe {
+                            crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
+                        };
+                    }
+                }
+                Some(())
+            }
+            Some(SlotView::InFlightOrphaned(guard)) => {
+                let raw_handle = guard
+                    .op
+                    .as_mut()
+                    .and_then(|iocp_op| iocp_op.header.resolved_handle)
+                    .or_else(|| {
+                        let fd = guard.op.as_mut().and_then(|iocp_op| iocp_op.get_fd())?;
+                        submit::resolve_fd_handle(&fd, ctx.registered_files, ctx.file_generations)
+                            .ok()
+                    });
+
+                if let Some(raw_handle) = raw_handle {
+                    let handle = raw_handle.as_handle();
+                    let is_rio = guard.op.as_ref().map(Self::is_rio_op).unwrap_or(false);
+
+                    if is_rio {
+                        if let Some(iocp_op) = guard.op.as_mut() {
+                            iocp_op.header.in_flight = false;
+                        }
+                        should_emit_aborted = true;
+                        aborted_socket_key =
+                            raw_handle.is_socket().then_some(raw_handle.actor_key());
+                    } else {
+                        let overlapped_ptr =
+                            guard.storage.with_mut(|_result, _payload, sidecar| {
+                                &mut sidecar.inner as *mut crate::win32::Overlapped
+                            });
                         let _ = unsafe {
                             crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
                         };

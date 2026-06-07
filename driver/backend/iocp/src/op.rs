@@ -71,6 +71,7 @@ pub(crate) struct SubmitContext<'a> {
     pub(crate) overlapped: *mut crate::win32::Overlapped,
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_files: &'a [Option<RegisteredHandle>],
+    pub(crate) file_generations: &'a [u64],
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
 
     // RIO Support

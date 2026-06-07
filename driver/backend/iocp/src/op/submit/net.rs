@@ -45,8 +45,12 @@ pub(crate) fn submit_recv(
     overlapped.set_offset(0);
 
     let fd = val.fd;
-    let handle = resolve_fd_borrowed(&fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
     let user_data = header.user_data;
     let generation = header.generation;
     mark_header_in_flight(
@@ -83,8 +87,12 @@ pub(crate) fn submit_udp_recv(
     overlapped.set_offset(0);
 
     let fd = val.fd;
-    let handle = resolve_fd_borrowed(&fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
     let user_data = header.user_data;
     let generation = header.generation;
     mark_header_in_flight(
@@ -120,8 +128,12 @@ pub(crate) fn submit_send(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&val.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &val.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
     let user_data = header.user_data;
     let generation = header.generation;
     mark_header_in_flight(
@@ -157,8 +169,12 @@ pub(crate) fn submit_udp_send(
     let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     overlapped.set_offset(0);
 
-    let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&val.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &val.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
     let user_data = header.user_data;
     let generation = header.generation;
     mark_header_in_flight(
@@ -192,8 +208,12 @@ pub(crate) fn submit_connect(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
-    let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&connect_op.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &connect_op.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
     ensure_iocp_association(handle, ctx.port)
         .push_ctx("scope", "submit_connect")
         .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
@@ -318,8 +338,12 @@ pub(crate) fn submit_udp_connect(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
-    let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&connect_op.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &connect_op.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
     with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: address pointer/length are validated by caller and come from op payload.
         unsafe {
@@ -351,8 +375,12 @@ pub(crate) fn submit_accept(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &user.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
     if payload.accept_socket.is_none() {
         let family = socket_family_from_handle(handle)?;
         let accept_socket = if family == AF_INET {
@@ -483,8 +511,12 @@ pub(crate) fn submit_send_to(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &user.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
 
     // RIO path is mandatory for socket send_to.
     let page_idx = header.user_data / ctx.slots_per_page;
@@ -530,8 +562,12 @@ pub(crate) fn submit_udp_recv_from(
     };
     overlapped.set_offset(0);
     let fd = val.fd;
-    let handle = resolve_fd_borrowed(&fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
     let page_idx = header.user_data / ctx.slots_per_page;
 
     let args = RioUdpRecvFromArgs {

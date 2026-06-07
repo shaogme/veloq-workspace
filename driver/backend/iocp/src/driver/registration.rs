@@ -11,7 +11,7 @@ use crate::error::{IocpError, IocpResult};
 
 pub(crate) struct DeferredSocketCleanup {
     pub(crate) handle: SocketKey,
-    pub(crate) registered_fd: Option<IoFd>,
+    pub(crate) entry: RegisteredHandle,
 }
 
 impl<'a> IocpDriver<'a> {
@@ -87,10 +87,8 @@ impl<'a> IocpDriver<'a> {
 
             if ready {
                 self.rio_state.shutdown_actor(key);
-                if let Some(fd) = pending.registered_fd {
-                    let _ = self.unregister_files(vec![fd]);
-                }
                 self.rio_state.forget_socket_runtime(key);
+                drop(pending.entry);
             } else {
                 self.deferred_socket_cleanup.push_back(pending);
             }
@@ -190,8 +188,14 @@ impl<'a> IocpDriver<'a> {
                     continue;
                 };
                 if entry.as_raw().kind() == RawHandleKind::Socket {
-                    self.rio_state
-                        .shutdown_actor(entry.as_raw().raw().actor_key());
+                    let key = entry.as_raw().raw().actor_key();
+                    if self.rio_state.begin_socket_cleanup(key) {
+                        self.rio_state.shutdown_actor(key);
+                        self.rio_state.forget_socket_runtime(key);
+                    } else {
+                        self.deferred_socket_cleanup
+                            .push_back(DeferredSocketCleanup { handle: key, entry });
+                    }
                 }
                 self.rio_state.clear_registered_rq(idx);
                 self.free_slots.push(idx);

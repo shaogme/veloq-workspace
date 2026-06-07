@@ -181,8 +181,24 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> IocpResult<Sub
 pub(crate) fn resolve_fd_borrowed<'a>(
     fd: &'a IoFd,
     registered_files: &'a [Option<RegisteredHandle>],
+    file_generations: &[u64],
 ) -> IocpResult<BorrowedRawHandle<'a>> {
     let idx = fd.fixed_index();
+    let Some(&generation) = file_generations.get(idx as usize) else {
+        return IocpError::ResolveFd
+            .with_ctx("fd_fixed_index", idx)
+            .with_ctx("fd_generation", fd.generation())
+            .attach_note("registered file descriptor index out of bounds");
+    };
+
+    if generation != fd.generation() {
+        return IocpError::ResolveFd
+            .with_ctx("fd_fixed_index", idx)
+            .with_ctx("fd_generation", fd.generation())
+            .with_ctx("current_generation", generation)
+            .attach_note("stale registered file descriptor generation");
+    }
+
     if let Some(Some(h)) = registered_files.get(idx as usize) {
         Ok(h.as_borrowed())
     } else {
@@ -196,8 +212,9 @@ pub(crate) fn resolve_fd_borrowed<'a>(
 pub(crate) fn resolve_fd_handle(
     fd: &IoFd,
     registered_files: &[Option<RegisteredHandle>],
+    file_generations: &[u64],
 ) -> IocpResult<IocpHandle> {
-    resolve_fd_borrowed(fd, registered_files).map(|h| h.raw())
+    resolve_fd_borrowed(fd, registered_files, file_generations).map(|h| h.raw())
 }
 
 /// Unpacks a [`KernelRef<T>`] and slot overlapped pointer from submit context.

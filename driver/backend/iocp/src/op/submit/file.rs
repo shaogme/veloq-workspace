@@ -30,8 +30,12 @@ macro_rules! submit_io_op {
 
             overlapped.set_offset(val.offset);
 
-            let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files)?;
-            header.resolved_handle = Some(resolve_fd_handle(&val.fd, ctx.registered_files)?);
+            let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files, ctx.file_generations)?;
+            header.resolved_handle = Some(resolve_fd_handle(
+                &val.fd,
+                ctx.registered_files,
+                ctx.file_generations,
+            )?);
             ensure_iocp_association(handle, ctx.port)
                 .push_ctx("scope", stringify!($fn_name))
                 .with_ctx("fd_fixed_index", val.fd.fixed_index())
@@ -200,8 +204,12 @@ pub(crate) fn submit_close(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &user.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
 
     let user_data = header.user_data;
     let completion = make_blocking_completion(ctx, user_data);
@@ -223,8 +231,12 @@ pub(crate) fn submit_fsync(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &user.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
 
     let user_data = header.user_data;
     let completion = make_blocking_completion(ctx, user_data);
@@ -266,8 +278,12 @@ pub(crate) fn submit_sync_range(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &user.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
 
     let user_data = header.user_data;
     let completion = make_blocking_completion(ctx, user_data);
@@ -309,8 +325,12 @@ pub(crate) fn submit_fallocate(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files)?;
-    header.resolved_handle = Some(resolve_fd_handle(&user.fd, ctx.registered_files)?);
+    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
+    header.resolved_handle = Some(resolve_fd_handle(
+        &user.fd,
+        ctx.registered_files,
+        ctx.file_generations,
+    )?);
 
     let user_data = header.user_data;
     let completion = make_blocking_completion(ctx, user_data);

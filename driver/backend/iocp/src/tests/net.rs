@@ -199,6 +199,78 @@ fn test_iocp_recv_with_buffer_pool() {
 }
 
 #[test]
+fn test_unregister_owned_socket_waits_for_inflight_recv() {
+    use std::sync::mpsc;
+
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+
+    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let topology = UniformSlot::new(multiplier);
+    let global_pool = topology.create_pool(1).expect("Create pool failed");
+    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx_send, rx_send) = mpsc::channel::<()>();
+
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = rx_send.recv();
+        stream.write_all(b"recv-after-unregister").unwrap();
+    });
+
+    let client = Socket::new_tcp_v4().expect("client socket create failed");
+    let client_fd = register_owned_socket(&mut driver, client);
+    let (addr_storage, addr_len) = socket_addr_to_storage(addr);
+    let connect_op = Connect {
+        fd: client_fd,
+        addr: addr_storage,
+        addr_len: addr_len as u32,
+    };
+    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
+    wait_completion(
+        &mut driver,
+        connect_user_data,
+        connect_generation,
+        Duration::from_secs(5),
+    )
+    .expect("Connect failed");
+
+    let buf = reg_pool
+        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .expect("Failed to alloc buffer");
+    let region = buf.resolve_region_info();
+    let chunk = global_pool
+        .chunk_info(region.id)
+        .expect("Chunk info for buffer not found");
+    driver
+        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .expect("register chunk failed");
+
+    let recv_op = Recv {
+        fd: client_fd,
+        buf,
+        buf_offset: 0,
+    };
+    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
+
+    driver
+        .unregister_files(vec![client_fd])
+        .expect("unregister while recv in flight should defer cleanup");
+
+    let _ = tx_send.send(());
+    let record = wait_completion_record(&mut driver, user_data, generation, Duration::from_secs(5))
+        .expect("recv completion missing");
+    let completion = complete_from_record::<Recv>(record);
+    let (result, mut op) = completion.into_parts();
+    let bytes_read = result.expect("Recv failed after unregister");
+    op.buf.set_len(bytes_read);
+    assert_eq!(&op.buf.as_slice()[..bytes_read], b"recv-after-unregister");
+
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn test_rio_cancel_poll_returns_aborted_without_hang() {
     use std::sync::mpsc;
 

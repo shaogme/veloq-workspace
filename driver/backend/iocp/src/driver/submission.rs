@@ -196,6 +196,7 @@ impl<'a> IocpDriver<'a> {
             overlapped,
             ext: &self.extensions,
             registered_files: &self.registered_files,
+            file_generations: &self.file_generations,
             registrar: self.registrar.as_ref(),
             rio: &mut self.rio_state,
             slots_per_page,
