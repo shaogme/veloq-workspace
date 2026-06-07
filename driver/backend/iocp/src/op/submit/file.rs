@@ -19,7 +19,8 @@ use crate::error::{IocpError, IocpResult};
 use crate::op::overlapped::{BlockingCompletion, BlockingSuccessCleanup};
 use crate::op::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write,
-    mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle, unpack_kernel_ref,
+    mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle, resolve_registered_raw_file,
+    unpack_kernel_ref,
 };
 use crate::op::{
     Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, KernelRef, OpenPayload, OverlappedEntry,
@@ -104,14 +105,13 @@ macro_rules! submit_raw_io_op {
 
             overlapped.set_offset(val.offset);
 
-            header.resolved_handle = Some(val.fd);
-            let raw_handle = crate::config::RawHandle::new(val.fd);
-            let handle = raw_handle.borrow();
-            // SAFETY: raw operations require the caller to provide a valid handle
-            // that has not already been associated with another completion port.
-            unsafe { ctx.port.associate(handle.raw().as_handle(), 0) }
-                .attach_note("CreateIoCompletionPort association failed")
+            let (fd, handle) =
+                resolve_registered_raw_file(val.fd, ctx.registered_files, ctx.file_generations)?;
+            header.resolved_handle = Some(handle.raw());
+            ensure_iocp_association(&fd, handle, ctx.port.as_ref(), &mut *ctx.iocp_associations)
                 .push_ctx("scope", stringify!($fn_name))
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
                 .with_ctx("handle_raw", handle.raw().as_handle() as usize)
                 .with_ctx("user_data", header.user_data)
                 .with_ctx("generation", header.generation)

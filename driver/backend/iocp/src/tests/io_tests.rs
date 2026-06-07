@@ -8,9 +8,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use veloq_buf::{FixedBuf, NoopRegistrar};
-use veloq_driver_core::driver::RegisterFd;
-use veloq_driver_core::op::{ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw};
+use veloq_driver_core::driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus};
+use veloq_driver_core::op::{IntoPlatformOp, ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw};
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+
+use crate::error::IocpError;
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -112,6 +114,27 @@ fn submit_raw_write(driver: &mut IocpDriver<'_>, handle: IocpHandle, offset: u64
     assert_eq!(written, bytes.len());
 }
 
+fn submit_raw_write_result(
+    driver: &mut IocpDriver<'_>,
+    handle: IocpHandle,
+    offset: u64,
+    bytes: &[u8],
+) -> DriverSubmitResult<IocpError> {
+    let op = WriteRaw {
+        fd: handle,
+        buf: fixed_buf_from_bytes(bytes),
+        offset,
+        buf_offset: 0,
+    };
+    let (iocp_kernel, payload) = IntoPlatformOp::<crate::op::IocpOp>::into_kernel_and_payload(op);
+    let mut iocp_op = Some(iocp_kernel);
+    let mut slot = driver.reserve_op().expect("reserve op failed");
+    slot.set_payload(<WriteRaw<IocpHandle> as IntoPlatformOp<
+        crate::op::IocpOp,
+    >>::payload_into_erased(payload));
+    slot.submit(&mut iocp_op)
+}
+
 fn read_raw(driver: &mut IocpDriver<'_>, handle: IocpHandle, offset: u64, len: usize) -> Vec<u8> {
     let op = ReadRaw {
         fd: handle,
@@ -183,6 +206,7 @@ fn test_iocp_raw_file_read_write_respects_nonzero_offsets() {
     let mut driver = new_driver();
     let (path, file) = open_overlapped_temp_file("raw-offset");
     let handle = IocpHandle::for_file(file.as_raw_handle() as _);
+    let fd = register_borrowed_file(&mut driver, &file);
 
     submit_raw_write(&mut driver, handle, 9, b"raw-tail");
     submit_raw_write(&mut driver, handle, 0, b"raw-a");
@@ -193,6 +217,26 @@ fn test_iocp_raw_file_read_write_respects_nonzero_offsets() {
     expected.extend_from_slice(&[0; 4]);
     expected.extend_from_slice(b"raw-tail");
     assert_eq!(read_raw(&mut driver, handle, 0, expected.len()), expected);
+
+    driver.unregister_files(vec![fd]).unwrap();
+    remove_temp_file(path, file);
+}
+
+#[test]
+fn test_iocp_raw_file_write_requires_registered_handle() {
+    let mut driver = new_driver();
+    let (path, file) = open_overlapped_temp_file("raw-requires-registration");
+    let handle = IocpHandle::for_file(file.as_raw_handle() as _);
+
+    match submit_raw_write_result(&mut driver, handle, 0, b"raw") {
+        DriverSubmitResult::Failed { report, status } => {
+            assert_eq!(status, SubmitStatus::Void);
+            assert_eq!(*report.inner(), IocpError::InvalidInput);
+        }
+        DriverSubmitResult::Submitted(_) => {
+            panic!("unregistered raw file write should fail synchronously");
+        }
+    }
 
     remove_temp_file(path, file);
 }

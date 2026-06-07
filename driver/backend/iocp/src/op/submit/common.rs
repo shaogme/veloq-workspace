@@ -9,7 +9,7 @@ use crate::config::{BorrowedRawHandle, IoFd, IocpAssociation, IocpHandle, Regist
 use crate::error::{IocpError, IocpResult};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
 use crate::op::{KernelRef, OverlappedEntry};
-use crate::win32::Overlapped;
+use crate::win32::{IoCompletionPort, Overlapped};
 
 // ============================================================================
 // Submission Result
@@ -217,6 +217,46 @@ pub(crate) fn resolve_fd_handle(
     resolve_fd_borrowed(fd, registered_files, file_generations).map(|h| h.raw())
 }
 
+pub(crate) fn resolve_registered_raw_file<'a>(
+    raw: IocpHandle,
+    registered_files: &'a [Option<RegisteredHandle>],
+    file_generations: &[u64],
+) -> IocpResult<(IoFd, BorrowedRawHandle<'a>)> {
+    if !raw.is_file() {
+        return IocpError::InvalidInput
+            .with_ctx("handle_raw", raw.as_handle() as usize)
+            .attach_note("raw file I/O only accepts file handles");
+    }
+
+    for (idx, entry) in registered_files.iter().enumerate() {
+        let Some(entry) = entry else {
+            continue;
+        };
+        if entry.as_raw().raw() != raw {
+            continue;
+        }
+
+        let Some(&generation) = file_generations.get(idx) else {
+            return IocpError::ResolveFd
+                .with_ctx("registered_index", idx)
+                .with_ctx("handle_raw", raw.as_handle() as usize)
+                .attach_note("registered file descriptor generation missing");
+        };
+        let fixed_index = u32::try_from(idx).map_err(|_| {
+            IocpError::Internal
+                .to_report()
+                .with_ctx("registered_index", idx)
+                .attach_note("registered file index exceeds IoFd range")
+        })?;
+        let fd = IoFd::fixed_with_generation(fixed_index, generation);
+        return Ok((fd, entry.as_borrowed()));
+    }
+
+    IocpError::InvalidInput
+        .with_ctx("handle_raw", raw.as_handle() as usize)
+        .attach_note("raw file I/O requires the handle to be registered first")
+}
+
 /// Unpacks a [`KernelRef<T>`] and slot overlapped pointer from submit context.
 ///
 /// # Safety
@@ -239,13 +279,10 @@ pub(crate) unsafe fn unpack_kernel_ref<T>(
 pub(crate) fn ensure_iocp_association(
     fd: &IoFd,
     handle: BorrowedRawHandle<'_>,
-    port: &crate::win32::IoCompletionPort,
+    port: &IoCompletionPort,
     iocp_associations: &mut [Option<IocpAssociation>],
 ) -> IocpResult<()> {
     let idx = fd.fixed_index() as usize;
-    let port_raw = port.as_raw() as usize;
-    let completion_key = 0;
-    let requested = IocpAssociation::new(port_raw, completion_key);
     let Some(association) = iocp_associations.get_mut(idx) else {
         return IocpError::ResolveFd
             .with_ctx("fd_fixed_index", fd.fixed_index())
@@ -253,12 +290,22 @@ pub(crate) fn ensure_iocp_association(
             .attach_note("registered file descriptor index out of bounds");
     };
 
+    ensure_handle_iocp_association(handle, port, association)
+}
+
+fn ensure_handle_iocp_association(
+    handle: BorrowedRawHandle<'_>,
+    port: &IoCompletionPort,
+    association: &mut Option<IocpAssociation>,
+) -> IocpResult<()> {
+    let port_raw = port.as_raw() as usize;
+    let completion_key = 0;
+    let requested = IocpAssociation::new(port_raw, completion_key);
+
     match *association {
         Some(existing) if existing == requested => return Ok(()),
         Some(existing) => {
             return IocpError::InvalidState
-                .with_ctx("fd_fixed_index", fd.fixed_index())
-                .with_ctx("fd_generation", fd.generation())
                 .with_ctx("handle_raw", handle.raw().as_handle() as usize)
                 .with_ctx("port_raw", port_raw)
                 .with_ctx("completion_key", completion_key)
