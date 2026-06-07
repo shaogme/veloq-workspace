@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use veloq_buf::nz;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
@@ -170,17 +170,22 @@ pub type SocketKey = IocpHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IocpAssociation {
-    pub(crate) port_raw: usize,
+    pub(crate) port_raw: NonZeroUsize,
     pub(crate) completion_key: usize,
 }
 
 impl IocpAssociation {
     #[inline]
-    pub(crate) const fn new(port_raw: usize, completion_key: usize) -> Self {
+    pub(crate) const fn new(port_raw: NonZeroUsize, completion_key: usize) -> Self {
         Self {
             port_raw,
             completion_key,
         }
+    }
+
+    #[inline]
+    pub(crate) const fn port_raw(self) -> usize {
+        self.port_raw.get()
     }
 }
 

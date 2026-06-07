@@ -298,7 +298,13 @@ fn ensure_handle_iocp_association(
     port: &IoCompletionPort,
     association: &mut Option<IocpAssociation>,
 ) -> IocpResult<()> {
-    let port_raw = port.as_raw() as usize;
+    let port_raw_value = port.as_raw() as usize;
+    let Some(port_raw) = std::num::NonZeroUsize::new(port_raw_value) else {
+        return IocpError::InvalidState
+            .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+            .with_ctx("port_raw", port_raw_value)
+            .attach_note("IOCP port handle is null");
+    };
     let completion_key = 0;
     let requested = IocpAssociation::new(port_raw, completion_key);
 
@@ -307,9 +313,9 @@ fn ensure_handle_iocp_association(
         Some(existing) => {
             return IocpError::InvalidState
                 .with_ctx("handle_raw", handle.raw().as_handle() as usize)
-                .with_ctx("port_raw", port_raw)
+                .with_ctx("port_raw", port_raw_value)
                 .with_ctx("completion_key", completion_key)
-                .with_ctx("existing_port_raw", existing.port_raw)
+                .with_ctx("existing_port_raw", existing.port_raw())
                 .with_ctx("existing_completion_key", existing.completion_key)
                 .attach_note("handle already associated with a different IOCP context");
         }

@@ -19,8 +19,7 @@ use crate::error::{IocpError, IocpResult};
 use crate::op::overlapped::{BlockingCompletion, BlockingSuccessCleanup};
 use crate::op::submit::common::{
     SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write,
-    mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle, resolve_registered_raw_file,
-    unpack_kernel_ref,
+    mark_header_in_flight, resolve_fd_borrowed, resolve_registered_raw_file, unpack_kernel_ref,
 };
 use crate::op::{
     Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, KernelRef, OpenPayload, OverlappedEntry,
@@ -44,11 +43,7 @@ macro_rules! submit_io_op {
             overlapped.set_offset(val.offset);
 
             let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files, ctx.file_generations)?;
-            header.resolved_handle = Some(resolve_fd_handle(
-                &val.fd,
-                ctx.registered_files,
-                ctx.file_generations,
-            )?);
+            header.resolved_handle = Some(handle.raw());
             ensure_iocp_association(
                 &val.fd,
                 handle,
@@ -378,11 +373,7 @@ pub(crate) fn submit_fsync(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &user.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
 
     let handle = duplicate_file_handle(handle.raw().as_handle())
         .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.fsync", e))?;
@@ -419,11 +410,7 @@ pub(crate) fn submit_sync_range(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &user.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
 
     let handle = duplicate_file_handle(handle.raw().as_handle())
         .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.sync_range", e))?;
@@ -460,11 +447,7 @@ pub(crate) fn submit_fallocate(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &user.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
 
     let mode = user.mode;
     let offset = user.offset;

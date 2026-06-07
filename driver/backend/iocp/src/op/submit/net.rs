@@ -13,8 +13,7 @@ use crate::ext::Extensions;
 use crate::net::addr::{self, SockAddrStorage};
 use crate::op::submit::common::{
     AcceptExArgs, ConnectExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex,
-    iocp_submit_connect_ex, mark_header_in_flight, resolve_fd_borrowed, resolve_fd_handle,
-    unpack_kernel_ref,
+    iocp_submit_connect_ex, mark_header_in_flight, resolve_fd_borrowed, unpack_kernel_ref,
 };
 use crate::op::{
     ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv,
@@ -46,11 +45,7 @@ pub(crate) fn submit_recv(
 
     let fd = val.fd;
     let handle = resolve_fd_borrowed(&fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
     let user_data = header.user_data;
     let generation = header.generation;
     mark_header_in_flight(
@@ -89,11 +84,7 @@ pub(crate) fn submit_udp_recv(
 
     let fd = val.fd;
     let handle = resolve_fd_borrowed(&fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
     let user_data = header.user_data;
     let generation = header.generation;
     mark_header_in_flight(
@@ -131,11 +122,7 @@ pub(crate) fn submit_send(
     overlapped.set_offset(0);
 
     let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &val.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
     let user_data = header.user_data;
     let generation = header.generation;
     mark_header_in_flight(
@@ -173,11 +160,7 @@ pub(crate) fn submit_udp_send(
     overlapped.set_offset(0);
 
     let handle = resolve_fd_borrowed(&val.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &val.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
     let user_data = header.user_data;
     let generation = header.generation;
     mark_header_in_flight(
@@ -213,11 +196,7 @@ pub(crate) fn submit_connect(
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &connect_op.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
     ensure_iocp_association(
         &connect_op.fd,
         handle,
@@ -348,11 +327,7 @@ pub(crate) fn submit_udp_connect(
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
     let handle = resolve_fd_borrowed(&connect_op.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &connect_op.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
     with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: address pointer/length are validated by caller and come from op payload.
         unsafe {
@@ -385,11 +360,7 @@ pub(crate) fn submit_accept(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_mut() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &user.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
     if payload.accept_socket.is_none() {
         let family = socket_family_from_handle(handle)?;
         let accept_socket = if family == AF_INET {
@@ -526,11 +497,7 @@ pub(crate) fn submit_send_to(
     // SAFETY: The caller guarantees that payload is valid.
     let user = unsafe { payload.user.as_ref() };
     let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &user.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
 
     let args = crate::rio::RioSendToArgs {
         fd: user.fd,
@@ -573,11 +540,7 @@ pub(crate) fn submit_udp_recv_from(
     overlapped.set_offset(0);
     let fd = val.fd;
     let handle = resolve_fd_borrowed(&fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
+    header.resolved_handle = Some(handle.raw());
     let args = RioUdpRecvFromArgs {
         fd,
         handle,

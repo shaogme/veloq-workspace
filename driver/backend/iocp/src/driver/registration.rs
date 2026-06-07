@@ -25,7 +25,7 @@ pub(super) struct HandleRegistry {
     registered_files: Vec<Option<RegisteredHandle>>,
     file_generations: Vec<u64>,
     iocp_associations: Vec<Option<IocpAssociation>>,
-    free_slots: Vec<usize>,
+    free_slots: Vec<u32>,
     deferred_socket_cleanup: VecDeque<DeferredSocketCleanup>,
     socket_generation_counter: u64,
 }
@@ -92,34 +92,46 @@ impl HandleRegistry {
         generation
     }
 
-    fn insert_registered(&mut self, entry: RegisteredHandle) -> IoFd {
-        let idx = if let Some(idx) = self.free_slots.pop() {
+    fn insert_registered(&mut self, entry: RegisteredHandle) -> IocpResult<IoFd> {
+        let (idx, fixed_index) = if let Some(fixed_index) = self.free_slots.pop() {
+            let idx = fixed_index as usize;
             self.registered_files[idx] = Some(entry);
             self.iocp_associations[idx] = None;
-            idx
+            (idx, fixed_index)
         } else {
+            let fixed_index = u32::try_from(self.registered_files.len()).map_err(|_| {
+                IocpError::Registration
+                    .to_report()
+                    .with_ctx("registered_files_len", self.registered_files.len())
+                    .attach_note("registered file table index exceeds IoFd range")
+            })?;
             self.registered_files.push(Some(entry));
             self.file_generations.push(0);
             self.iocp_associations.push(None);
-            self.registered_files.len() - 1
+            (fixed_index as usize, fixed_index)
         };
-        IoFd::fixed_with_generation(idx as u32, self.file_generations[idx])
+        Ok(IoFd::fixed_with_generation(
+            fixed_index,
+            self.file_generations[idx],
+        ))
     }
 
-    fn take_for_unregister(&mut self, fd: IoFd) -> Option<(usize, RegisteredHandle)> {
-        let idx = fd.fixed_index() as usize;
-        if idx >= self.registered_files.len() {
+    fn take_for_unregister(&mut self, fd: IoFd) -> Option<(u32, RegisteredHandle)> {
+        let idx = fd.fixed_index();
+        if idx as usize >= self.registered_files.len() {
             return None;
         }
-        if self.file_generations.get(idx).copied() != Some(fd.generation()) {
+        if self.file_generations.get(idx as usize).copied() != Some(fd.generation()) {
             return None;
         }
-        self.registered_files[idx].take().map(|entry| (idx, entry))
+        self.registered_files[idx as usize]
+            .take()
+            .map(|entry| (idx, entry))
     }
 
-    fn take_owned_for_close(&mut self, fd: IoFd) -> IocpResult<(usize, RegisteredHandle)> {
-        let idx = fd.fixed_index() as usize;
-        let Some(&generation) = self.file_generations.get(idx) else {
+    fn take_owned_for_close(&mut self, fd: IoFd) -> IocpResult<(u32, RegisteredHandle)> {
+        let idx = fd.fixed_index();
+        let Some(&generation) = self.file_generations.get(idx as usize) else {
             return IocpError::ResolveFd
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
@@ -134,7 +146,7 @@ impl HandleRegistry {
                 .attach_note("stale registered file descriptor generation");
         }
 
-        let Some(slot) = self.registered_files.get_mut(idx) else {
+        let Some(slot) = self.registered_files.get_mut(idx as usize) else {
             return IocpError::ResolveFd
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
@@ -158,10 +170,10 @@ impl HandleRegistry {
         }
     }
 
-    fn release_slot(&mut self, idx: usize) {
+    fn release_slot(&mut self, idx: u32) {
         self.free_slots.push(idx);
-        self.file_generations[idx] = self.file_generations[idx].wrapping_add(1);
-        self.iocp_associations[idx] = None;
+        self.file_generations[idx as usize] = self.file_generations[idx as usize].wrapping_add(1);
+        self.iocp_associations[idx as usize] = None;
     }
 
     fn deferred_cleanup_len(&self) -> usize {
@@ -342,12 +354,44 @@ impl<'a> IocpDriver<'a> {
         &mut self,
         files: Vec<RegisterFd<'h, crate::config::IocpHandle>>,
     ) -> IocpDriverResult<Vec<IoFd>> {
-        let mut registered = Vec::with_capacity(files.len());
+        enum InputHandle {
+            Borrowed(RawHandle),
+            Owned(crate::OwnedRawHandle),
+        }
+
+        impl InputHandle {
+            fn raw(&self) -> RawHandle {
+                match self {
+                    Self::Borrowed(handle) => *handle,
+                    Self::Owned(handle) => RawHandle::new(handle.raw()),
+                }
+            }
+
+            fn into_entry(self, canonical: RawHandle) -> RegisteredHandle {
+                match self {
+                    Self::Borrowed(_) => {
+                        // Borrowed handles must remain non-owning to avoid accidental close/double-close.
+                        RegisteredHandle::Weak(canonical)
+                    }
+                    Self::Owned(handle) => {
+                        let _ = handle.into_raw();
+                        // SAFETY: ownership comes from RegisterFd::Owned and is transferred
+                        // into the registered slot for deterministic lifecycle management.
+                        RegisteredHandle::Owned(unsafe {
+                            crate::OwnedRawHandle::from_raw_owned(canonical)
+                        })
+                    }
+                }
+            }
+        }
+
+        let mut prepared = Vec::with_capacity(files.len());
         for file in files {
-            let (handle, is_owned_input) = match file {
-                RegisterFd::Borrowed(h) => (RawHandle::new(h.raw()), false),
-                RegisterFd::Owned(h) => (h.into_raw(), true),
+            let input = match file {
+                RegisterFd::Borrowed(h) => InputHandle::Borrowed(RawHandle::new(h.raw())),
+                RegisterFd::Owned(h) => InputHandle::Owned(h),
             };
+            let handle = input.raw();
             // Trust enum semantics first; only probe file-tagged handles as fallback.
             let mut canonical = match handle.kind() {
                 RawHandleKind::Socket => handle,
@@ -373,20 +417,38 @@ impl<'a> IocpDriver<'a> {
                     *g = self.handles.next_socket_generation();
                 }
                 canonical = RawHandle::new(raw);
-
-                self.rio
-                    .state_mut()
-                    .mark_socket_registered(canonical.raw().actor_key());
             }
-            let entry = if is_owned_input {
-                // SAFETY: ownership comes from RegisterFd::Owned and is transferred
-                // into the registered slot for deterministic lifecycle management.
-                RegisteredHandle::Owned(unsafe { crate::OwnedRawHandle::from_raw_owned(canonical) })
-            } else {
-                // Borrowed handles must remain non-owning to avoid accidental close/double-close.
-                RegisteredHandle::Weak(canonical)
-            };
-            registered.push(self.handles.insert_registered(entry));
+
+            let socket_key = canonical
+                .raw()
+                .is_socket()
+                .then_some(canonical.raw().actor_key());
+            prepared.push((input.into_entry(canonical), socket_key));
+        }
+
+        let mut registered = Vec::with_capacity(prepared.len());
+        let mut socket_keys = Vec::new();
+        for (entry, socket_key) in prepared {
+            match self.handles.insert_registered(entry) {
+                Ok(fd) => {
+                    if let Some(key) = socket_key {
+                        socket_keys.push(key);
+                    }
+                    registered.push(fd);
+                }
+                Err(report) => {
+                    for fd in registered.drain(..) {
+                        if let Some((idx, _entry)) = self.handles.take_for_unregister(fd) {
+                            self.handles.release_slot(idx);
+                        }
+                    }
+                    return Err(report);
+                }
+            }
+        }
+
+        for key in socket_keys {
+            self.rio.state_mut().mark_socket_registered(key);
         }
         Ok(registered)
     }
