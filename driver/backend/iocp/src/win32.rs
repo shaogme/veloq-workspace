@@ -2,7 +2,7 @@ use std::io::Error as IoError;
 use std::ptr;
 
 use crate::error::{IocpError, IocpResult};
-use veloq_pod::{Pod, Zeroable, bytes_of, bytes_of_mut, zeroed};
+use veloq_pod::{Pod, Zeroable, zeroed};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
@@ -55,18 +55,18 @@ impl Overlapped {
 
     /// Sets the offset of the overlapped operation.
     pub fn set_offset(&mut self, offset: u64) {
-        let bytes = bytes_of_mut(self);
-        let low = (offset as u32).to_ne_bytes();
-        let high = ((offset >> 32) as u32).to_ne_bytes();
-        bytes[0..4].copy_from_slice(&low);
-        bytes[4..8].copy_from_slice(&high);
+        // SAFETY: File offset uses the documented Offset/OffsetHigh view of the OVERLAPPED union.
+        let parts = unsafe { &mut self.0.Anonymous.Anonymous };
+        parts.Offset = offset as u32;
+        parts.OffsetHigh = (offset >> 32) as u32;
     }
 
     /// Returns the offset of the overlapped operation.
     pub fn offset(&self) -> u64 {
-        let bytes = bytes_of(self);
-        let low = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
-        let high = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as u64;
+        // SAFETY: File offset uses the documented Offset/OffsetHigh view of the OVERLAPPED union.
+        let parts = unsafe { self.0.Anonymous.Anonymous };
+        let low = u64::from(parts.Offset);
+        let high = u64::from(parts.OffsetHigh);
         low | (high << 32)
     }
 }
@@ -74,6 +74,40 @@ impl Overlapped {
 impl Default for Overlapped {
     fn default() -> Self {
         Self::zeroed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0_0};
+
+    #[test]
+    fn overlapped_offset_fields_follow_win32_layout() {
+        assert_eq!(offset_of!(OVERLAPPED, Anonymous), size_of::<usize>() * 2);
+        assert_eq!(offset_of!(OVERLAPPED_0_0, Offset), 0);
+        assert_eq!(offset_of!(OVERLAPPED_0_0, OffsetHigh), size_of::<u32>());
+    }
+
+    #[test]
+    fn set_offset_writes_offset_union_without_touching_internal_status() {
+        let mut overlapped = Overlapped::zeroed();
+        let internal = usize::MAX;
+        let internal_high = usize::MAX - 1;
+        overlapped.0.Internal = internal;
+        overlapped.0.InternalHigh = internal_high;
+
+        overlapped.set_offset(0x99aa_bbcc_ddee_ff00);
+
+        assert_eq!(overlapped.0.Internal, internal);
+        assert_eq!(overlapped.0.InternalHigh, internal_high);
+        assert_eq!(overlapped.offset(), 0x99aa_bbcc_ddee_ff00);
+
+        // SAFETY: The test verifies the same documented file-offset union view used by set_offset.
+        let parts = unsafe { overlapped.0.Anonymous.Anonymous };
+        assert_eq!(parts.Offset, 0xddee_ff00);
+        assert_eq!(parts.OffsetHigh, 0x99aa_bbcc);
     }
 }
 
