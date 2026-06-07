@@ -5,6 +5,7 @@ pub(crate) mod control_flow;
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::op::SubmissionResult;
+use crate::rio::core::registry::RioSubmissionKind;
 use crate::rio::core::submit_ops::{RioExConfig, RioProvider};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, SocketLifecycleState, SocketRuntimeState};
@@ -18,6 +19,7 @@ pub(crate) struct RioTarget<'a> {
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
     pub(crate) buf_offset: usize,
+    pub(crate) operation: &'static str,
 }
 
 pub(crate) struct RioSendToArgs<'a> {
@@ -114,6 +116,7 @@ impl RioState {
             buf_offset,
             ..
         } = args;
+        let buf_len = RioSubmissionKind::Send.data_len(buf, buf_offset, "send_to")?;
 
         let dispatch = self
             .kernel
@@ -130,12 +133,9 @@ impl RioState {
             let actor = self.ensure_actor((fd, handle), env)?;
             actor.rq
         };
-        let data_buf = self.registry.prepare_submission(
-            buf,
-            buf_offset,
-            (buf.len().saturating_sub(buf_offset)) as u32,
-            env,
-        )?;
+        let data_buf = self
+            .registry
+            .prepare_submission(buf, buf_offset, buf_len, env)?;
         let addr = self.registry.prepare_send_addr(addr_ptr, addr_len, env)?;
         let request_context =
             Self::encode_req_ctx_with_addr(user_data, generation, Some(addr.slot));
@@ -188,6 +188,9 @@ impl RioState {
             user_data,
             generation,
         } = args;
+        let buf_offset = recv_from_op.buf_offset;
+        let buf_len =
+            RioSubmissionKind::Recv.data_len(&recv_from_op.buf, buf_offset, "udp_recv_from")?;
         let dispatch = self
             .kernel
             .dispatch
@@ -203,8 +206,6 @@ impl RioState {
             let actor = self.ensure_actor((fd, handle), env)?;
             actor.rq
         };
-        let buf_offset = recv_from_op.buf_offset;
-        let buf_len = recv_from_op.buf.capacity().saturating_sub(buf_offset) as u32;
         let data_buf =
             self.registry
                 .prepare_submission(&recv_from_op.buf, buf_offset, buf_len, env)?;

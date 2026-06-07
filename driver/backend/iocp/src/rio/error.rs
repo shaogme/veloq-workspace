@@ -13,6 +13,8 @@ set! {
         RqCreation,
         #[display("RIO datapath operation error")]
         Datapath,
+        #[display("RIO invalid input")]
+        InvalidInput,
         #[display("RIO resource limit reached")]
         ResourceExhaustion,
         #[display("RIO not supported or initialized")]

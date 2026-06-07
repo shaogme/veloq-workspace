@@ -58,6 +58,66 @@ pub(crate) struct RioAddrReservation {
     pub(crate) rio_buf: RIO_BUF,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RioSubmissionKind {
+    Recv,
+    Send,
+}
+
+impl RioSubmissionKind {
+    pub(crate) fn data_len(
+        self,
+        buf: &FixedBuf,
+        buf_offset: usize,
+        operation: &'static str,
+    ) -> RioResult<u32> {
+        let bound = self.bound(buf);
+        if buf_offset > bound {
+            return RioError::InvalidInput
+                .with_ctx("rio_operation", operation)
+                .with_ctx("buffer_offset", buf_offset)
+                .with_ctx("buffer_length", buf.len())
+                .with_ctx("buffer_capacity", buf.capacity())
+                .with_ctx("buffer_bound", bound)
+                .with_ctx("buffer_bound_kind", self.bound_name())
+                .attach_note(self.offset_exceeded_note());
+        }
+
+        let len = bound - buf_offset;
+        u32::try_from(len).map_err(|_| {
+            RioError::ResourceExhaustion
+                .to_report()
+                .with_ctx("rio_operation", operation)
+                .with_ctx("buffer_offset", buf_offset)
+                .with_ctx("buffer_length", buf.len())
+                .with_ctx("buffer_capacity", buf.capacity())
+                .with_ctx("submission_length", len)
+                .attach_note("RIO data buffer length exceeds u32")
+        })
+    }
+
+    fn bound(self, buf: &FixedBuf) -> usize {
+        match self {
+            Self::Recv => buf.capacity(),
+            Self::Send => buf.len(),
+        }
+    }
+
+    fn bound_name(self) -> &'static str {
+        match self {
+            Self::Recv => "capacity",
+            Self::Send => "length",
+        }
+    }
+
+    fn offset_exceeded_note(self) -> &'static str {
+        match self {
+            Self::Recv => "RIO recv buffer offset exceeds buffer capacity",
+            Self::Send => "RIO send buffer offset exceeds buffer length",
+        }
+    }
+}
+
 impl RioRegistry {
     pub(crate) fn new(rq_depth: u32, addr_capacity: usize) -> Self {
         let addr_capacity = addr_capacity.max(1);
@@ -85,7 +145,7 @@ impl RioRegistry {
         &mut self,
         buf: &FixedBuf,
         env: RioEnv<'_>,
-    ) -> RioResult<(RioBufferId, u32)> {
+    ) -> RioResult<(RioBufferId, usize)> {
         let info = buf.resolve_region_info();
 
         if info.pool_kind == PoolKind::Heap {
@@ -109,7 +169,7 @@ impl RioRegistry {
         }
 
         match buffer_id {
-            Some(id) => Ok((id, info.offset as u32)),
+            Some(id) => Ok((id, info.offset)),
             None => RioError::Internal
                 .with_ctx("chunk_id", info.id as usize)
                 .attach_note("RIO chunk not registered"),
@@ -123,13 +183,51 @@ impl RioRegistry {
         len: u32,
         env: RioEnv<'_>,
     ) -> RioResult<RIO_BUF> {
+        let buf_offset_u32 = u32::try_from(buf_offset).map_err(|_| {
+            RioError::InvalidInput
+                .to_report()
+                .with_ctx("buffer_offset", buf_offset)
+                .with_ctx("buffer_length", buf.len())
+                .with_ctx("buffer_capacity", buf.capacity())
+                .with_ctx("submission_length", len)
+                .attach_note("RIO buffer offset exceeds u32")
+        })?;
         let (buffer_id, offset) = self.resolve_buffer_id(buf, env)?;
+        let offset = Self::checked_rio_buffer_offset(offset, buf_offset_u32, len, buf)?;
         let rio_buf = RIO_BUF {
             BufferId: buffer_id.0,
-            Offset: offset + buf_offset as u32,
+            Offset: offset,
             Length: len,
         };
         Ok(rio_buf)
+    }
+
+    fn checked_rio_buffer_offset(
+        base_offset: usize,
+        buf_offset: u32,
+        len: u32,
+        buf: &FixedBuf,
+    ) -> RioResult<u32> {
+        let base_offset_u32 = u32::try_from(base_offset).map_err(|_| {
+            RioError::ResourceExhaustion
+                .to_report()
+                .with_ctx("rio_base_offset", base_offset)
+                .with_ctx("buffer_offset", buf_offset)
+                .with_ctx("buffer_length", buf.len())
+                .with_ctx("buffer_capacity", buf.capacity())
+                .with_ctx("submission_length", len)
+                .attach_note("RIO registered buffer base offset exceeds u32")
+        })?;
+        base_offset_u32.checked_add(buf_offset).ok_or_else(|| {
+            RioError::ResourceExhaustion
+                .to_report()
+                .with_ctx("rio_base_offset", base_offset)
+                .with_ctx("buffer_offset", buf_offset)
+                .with_ctx("buffer_length", buf.len())
+                .with_ctx("buffer_capacity", buf.capacity())
+                .with_ctx("submission_length", len)
+                .attach_note("RIO buffer offset addition overflow")
+        })
     }
 
     pub(crate) fn register_chunk(
@@ -271,14 +369,14 @@ impl RioRegistry {
         buf: &FixedBuf,
         offset: usize,
         env: RioEnv<'_>,
-    ) -> RioResult<(RioBufferId, u32)> {
+    ) -> RioResult<(RioBufferId, usize)> {
         let key = (
             buf.as_ptr() as usize,
             buf.capacity(),
             buf.resolve_region_info().cookie,
         );
         if let Some(&id) = self.heap_rio_bufs.get(&key) {
-            return Ok((id, offset as u32));
+            return Ok((id, offset));
         }
 
         if let Some(last_fail) = self.heap_register_failures_recent.get(&key)
@@ -304,7 +402,7 @@ impl RioRegistry {
         }
 
         let id = self.register_heap_raw(buf, key, env)?;
-        Ok((id, offset as u32))
+        Ok((id, offset))
     }
 
     fn register_heap_raw(
@@ -506,5 +604,69 @@ impl RioRegistry {
             *in_use = false;
             self.addr_free_slots.push(slot);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    fn fixed_buf(capacity: usize, len: usize) -> FixedBuf {
+        let mut buf = FixedBuf::alloc_heap(NonZeroUsize::new(capacity).expect("non-zero capacity"))
+            .expect("heap buffer allocation failed");
+        buf.set_len(len);
+        buf
+    }
+
+    #[test]
+    fn rio_submission_len_allows_exact_boundaries() {
+        let buf = fixed_buf(8, 4);
+
+        assert_eq!(
+            RioSubmissionKind::Recv
+                .data_len(&buf, buf.capacity(), "recv")
+                .expect("recv boundary should be allowed"),
+            0
+        );
+        assert_eq!(
+            RioSubmissionKind::Send
+                .data_len(&buf, buf.len(), "send")
+                .expect("send boundary should be allowed"),
+            0
+        );
+    }
+
+    #[test]
+    fn rio_submission_len_rejects_out_of_bounds_offsets_for_all_entries() {
+        let buf = fixed_buf(8, 4);
+        let cases = [
+            (RioSubmissionKind::Recv, "recv", buf.capacity() + 1),
+            (RioSubmissionKind::Send, "send", buf.len() + 1),
+            (RioSubmissionKind::Recv, "udp_recv", buf.capacity() + 1),
+            (RioSubmissionKind::Send, "udp_send", buf.len() + 1),
+            (RioSubmissionKind::Send, "send_to", buf.len() + 1),
+            (RioSubmissionKind::Recv, "udp_recv_from", buf.capacity() + 1),
+        ];
+
+        for (kind, operation, offset) in cases {
+            let err = kind
+                .data_len(&buf, offset, operation)
+                .expect_err("out-of-bounds RIO offset should fail");
+            assert_eq!(*err.inner(), RioError::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn rio_buffer_offset_rejects_u32_overflow() {
+        let buf = fixed_buf(8, 4);
+
+        let err = RioRegistry::checked_rio_buffer_offset((u32::MAX as usize) + 1, 0, 0, &buf)
+            .expect_err("base offset above u32 should fail");
+        assert_eq!(*err.inner(), RioError::ResourceExhaustion);
+
+        let err = RioRegistry::checked_rio_buffer_offset(u32::MAX as usize, 1, 0, &buf)
+            .expect_err("combined RIO offset should overflow");
+        assert_eq!(*err.inner(), RioError::ResourceExhaustion);
     }
 }

@@ -15,7 +15,7 @@ use crate::BufferRegistrationMode;
 use crate::config::BorrowedRawHandle;
 use crate::ext::Extensions;
 use crate::op::submit::SubmissionResult;
-use crate::rio::core::registry::RioRegistry;
+use crate::rio::core::registry::{RioRegistry, RioSubmissionKind};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioEnv, RioState, RioTarget};
 use diagweave::prelude::*;
@@ -75,7 +75,9 @@ impl RioState {
             user_data,
             generation,
             buf_offset,
+            operation,
         } = target;
+        let buf_len = RioSubmissionKind::Recv.data_len(buf, buf_offset, operation)?;
         let dispatch = self
             .kernel
             .dispatch
@@ -93,12 +95,9 @@ impl RioState {
                 .attach_note("failed to ensure RIO actor")?;
             actor.rq
         };
-        let rio_buf = self.registry.prepare_submission(
-            buf,
-            buf_offset,
-            (buf.capacity().saturating_sub(buf_offset)) as u32,
-            env,
-        )?;
+        let rio_buf = self
+            .registry
+            .prepare_submission(buf, buf_offset, buf_len, env)?;
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_receive(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
@@ -130,7 +129,9 @@ impl RioState {
             user_data,
             generation,
             buf_offset,
+            operation,
         } = target;
+        let buf_len = RioSubmissionKind::Send.data_len(buf, buf_offset, operation)?;
         let dispatch = self
             .kernel
             .dispatch
@@ -155,12 +156,9 @@ impl RioState {
 
             actor.rq
         };
-        let rio_buf = self.registry.prepare_submission(
-            buf,
-            buf_offset,
-            (buf.len().saturating_sub(buf_offset)) as u32,
-            env,
-        )?;
+        let rio_buf = self
+            .registry
+            .prepare_submission(buf, buf_offset, buf_len, env)?;
         let request_context = Self::encode_req_ctx(user_data, generation);
         if let Err(e) = self.kernel.submit_send(rq, &rio_buf, request_context) {
             Self::free_op_req_ctx(request_context as u64);
