@@ -22,6 +22,13 @@ pub(super) struct IocpRioRuntime<'a> {
     registrar: Box<dyn BufferRegistrar + 'a>,
 }
 
+/// Owns one successful Winsock startup for an IOCP driver.
+///
+/// Winsock keeps a process-wide reference count. Each driver acquires one
+/// reference so initialization failures and driver drops release exactly the
+/// startup performed for that driver.
+pub(super) struct WinsockGuard;
+
 impl<'a> IocpRioRuntime<'a> {
     pub(super) fn new(
         port: BorrowedRawHandle<'_>,
@@ -76,7 +83,7 @@ impl<'a> IocpDriver<'a> {
         registration_mode: BufferRegistrationMode,
         registrar: Box<dyn BufferRegistrar + 'a>,
     ) -> IocpResult<Self> {
-        Self::start_winsock()?;
+        let winsock = Self::start_winsock()?;
 
         let port_handle = port_val.as_raw();
         debug!(port = ?port_handle, "Initializing IocpDriver");
@@ -104,10 +111,11 @@ impl<'a> IocpDriver<'a> {
             rio,
             shutting_down: false,
             closed: false,
+            _winsock: winsock,
         })
     }
 
-    fn start_winsock() -> IocpResult<()> {
+    fn start_winsock() -> IocpResult<WinsockGuard> {
         use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
 
         // SAFETY: WSAStartup is required before Windows socket APIs are used.
@@ -122,7 +130,7 @@ impl<'a> IocpDriver<'a> {
                 .set_error_code(ret)
                 .attach_note("WSAStartup failed"));
         }
-        Ok(())
+        Ok(WinsockGuard)
     }
 
     pub(super) fn shutdown_ops(&mut self) -> usize {
@@ -201,6 +209,20 @@ impl Drop for IocpDriver<'_> {
         debug!("Dropping IocpDriver");
         if let Err(e) = self.close_impl(CloseMode::Fast) {
             tracing::error!(report = ?e, "iocp close_impl fast failed during drop");
+        }
+    }
+}
+
+impl Drop for WinsockGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSAGetLastError};
+
+        // SAFETY: This guard is only constructed after a successful WSAStartup.
+        let ret = unsafe { WSACleanup() };
+        if ret != 0 {
+            // SAFETY: WSAGetLastError reads the calling thread's Winsock error code.
+            let code = unsafe { WSAGetLastError() };
+            tracing::error!(error_code = code, "WSACleanup failed");
         }
     }
 }

@@ -49,6 +49,10 @@ pub struct IocpDriver<'a> {
     rio: lifecycle::IocpRioRuntime<'a>,
     shutting_down: bool,
     closed: bool,
+
+    // Rust drops fields in declaration order; keep this last so WSACleanup runs
+    // after socket/RIO-backed state has been torn down.
+    _winsock: lifecycle::WinsockGuard,
 }
 
 /// Closing mode for the driver or operations.

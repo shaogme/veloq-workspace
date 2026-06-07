@@ -7,15 +7,27 @@ use std::time::Duration;
 use veloq_buf::NoopRegistrar;
 use veloq_driver_core::driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus};
 use veloq_driver_core::op::{Close, Fsync, IntoPlatformOp};
-use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
 
-fn init_winsock() {
+struct TestWinsockGuard;
+
+impl Drop for TestWinsockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            WSACleanup();
+        }
+    }
+}
+
+fn init_winsock() -> TestWinsockGuard {
     // Ensure Winsock is initialized for the current process/thread.
-    // WSAStartup is reference-counted and safe to call multiple times.
+    // WSAStartup is reference-counted and paired with TestWinsockGuard cleanup.
     unsafe {
         let mut data: WSADATA = std::mem::zeroed();
-        let _ = WSAStartup(0x0202, &mut data);
+        let ret = WSAStartup(0x0202, &mut data);
+        assert_eq!(ret, 0, "WSAStartup failed: {ret}");
     }
+    TestWinsockGuard
 }
 
 fn submit_expect_void_failure<T>(driver: &mut IocpDriver<'_>, op: T, context: &str)
@@ -52,7 +64,7 @@ where
 
 #[test]
 fn test_extensions_load() {
-    init_winsock();
+    let _winsock = init_winsock();
     let ext = Extensions::new();
     assert!(ext.is_ok(), "Extensions should load on Windows");
 }
@@ -221,6 +233,6 @@ fn test_close_borrowed_registered_file_is_rejected_without_unregistering() {
 
 #[test]
 fn test_rio_extensions_load() {
-    init_winsock();
+    let _winsock = init_winsock();
     let _ext = Extensions::new().expect("RIO Extensions should load");
 }
