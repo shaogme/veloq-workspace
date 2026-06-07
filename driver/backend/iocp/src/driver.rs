@@ -241,12 +241,14 @@ impl<'a> Driver for IocpDriver<'a> {
             }
         };
 
-        let ctx = submission::SubmitContextInternal {
-            port: self.completion.port.as_ref(),
-            wheel: &mut self.timer.wheel,
-            completion_events: &self.completion.events,
-            completion_table: &self.completion.table,
-        };
+        let completion = &self.completion;
+        let timer = &mut self.timer;
+        let ctx = submission::SubmitContextInternal::new(
+            completion.port(),
+            timer.wheel_mut(),
+            completion.events(),
+            completion.table(),
+        );
 
         Self::on_submit_res(&mut self.ops, ctx, result, user_data, op_in)
     }
@@ -263,7 +265,7 @@ impl<'a> Driver for IocpDriver<'a> {
                     self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
                 if !pending_progress {
                     return Ok(DriveOutcome {
-                        next_timeout_hint: self.timer.wheel.next_timeout(),
+                        next_timeout_hint: self.timer.next_timeout(),
                         pending_progress,
                     });
                 }
@@ -276,17 +278,17 @@ impl<'a> Driver for IocpDriver<'a> {
         let pending_progress =
             self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
         Ok(DriveOutcome {
-            next_timeout_hint: self.timer.wheel.next_timeout(),
+            next_timeout_hint: self.timer.next_timeout(),
             pending_progress,
         })
     }
 
     fn completion_queue(&self) -> SharedCompletionQueue {
-        self.completion.events.clone()
+        self.completion.completion_queue()
     }
 
     fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion> {
-        self.completion.table.clone()
+        self.completion.completion_table()
     }
 
     fn cancel_op(&mut self, user_data: usize) {
@@ -328,7 +330,7 @@ impl Drop for IocpDriver<'_> {
 impl veloq_driver_core::driver::test_hooks::DriverTestHooks for IocpDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.rio
-            .state
+            .state()
             .registry
             .registration_stats
             .chunk_register_attempts

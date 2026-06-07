@@ -19,10 +19,26 @@ use crate::op::slot::Slot;
 use crate::op::{IocpOp, IocpUserPayload, SubmitContext, submit};
 
 pub(crate) struct SubmitContextInternal<'a> {
-    pub(crate) port: &'a crate::win32::IoCompletionPort,
-    pub(crate) wheel: &'a mut veloq_wheel::Wheel<usize>,
-    pub(crate) completion_events: &'a SharedCompletionQueue,
-    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
+    port: &'a crate::win32::IoCompletionPort,
+    wheel: &'a mut veloq_wheel::Wheel<usize>,
+    completion_events: &'a SharedCompletionQueue,
+    completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
+}
+
+impl<'a> SubmitContextInternal<'a> {
+    pub(crate) fn new(
+        port: &'a crate::win32::IoCompletionPort,
+        wheel: &'a mut veloq_wheel::Wheel<usize>,
+        completion_events: &'a SharedCompletionQueue,
+        completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
+    ) -> Self {
+        Self {
+            port,
+            wheel,
+            completion_events,
+            completion_table,
+        }
+    }
 }
 
 impl<'a> IocpDriver<'a> {
@@ -189,14 +205,15 @@ impl<'a> IocpDriver<'a> {
             &mut sidecar.inner as *mut crate::win32::Overlapped
         });
 
+        let (rio, registrar) = self.rio.state_and_registrar_mut();
         let mut ctx = SubmitContext {
-            port: self.completion.port.as_ref(),
+            port: self.completion.port(),
             overlapped,
             ext: &self.extensions,
-            registered_files: &self.handles.registered_files,
-            file_generations: &self.handles.file_generations,
-            registrar: self.rio.registrar.as_ref(),
-            rio: &mut self.rio.state,
+            registered_files: self.handles.registered_files(),
+            file_generations: self.handles.file_generations(),
+            registrar,
+            rio,
         };
 
         let mut sub_guard = guard.start_submission_with(Some(|slot| {

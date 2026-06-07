@@ -1,7 +1,7 @@
 use crate::config::UringRawHandle;
 use crate::error::{UringError, UringResult};
 use crate::{OwnedRawHandle, RawHandle, SockAddrStorage};
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};

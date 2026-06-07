@@ -6,7 +6,6 @@ use diagweave::prelude::{ResultReportExt, Transform};
 use veloq_driver_core::driver::RegisterFd;
 
 use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
-use crate::driver::handle_registry::DeferredSocketCleanup;
 use crate::driver::{IocpDriver, IocpDriverResult};
 use crate::error::{IocpError, IocpResult};
 
@@ -45,7 +44,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn track_socket_submit_pending(&mut self, key: SocketKey) {
-        let _ = self.rio.state.try_acquire_socket_inflight(key);
+        let _ = self.rio.state_mut().try_acquire_socket_inflight(key);
     }
 
     pub(crate) fn release_socket_inflight_for_op(&mut self, user_data: usize) {
@@ -65,28 +64,28 @@ impl<'a> IocpDriver<'a> {
             });
 
         if let Some(key) = socket_key {
-            self.rio.state.release_socket_inflight(key);
+            self.rio.state_mut().release_socket_inflight(key);
             self.drain_deferred_socket_cleanup();
         }
     }
 
     pub(crate) fn drain_deferred_socket_cleanup(&mut self) {
-        let mut rounds = self.handles.deferred_socket_cleanup.len();
+        let mut rounds = self.handles.deferred_cleanup_len();
         while rounds > 0 {
             rounds -= 1;
-            let Some(pending) = self.handles.deferred_socket_cleanup.pop_front() else {
+            let Some(pending) = self.handles.pop_deferred_cleanup() else {
                 break;
             };
 
-            let key = pending.handle;
-            let ready = self.rio.state.socket_ready_for_cleanup(key);
+            let key = pending.handle();
+            let ready = self.rio.state().socket_ready_for_cleanup(key);
 
             if ready {
-                self.rio.state.shutdown_actor(key);
-                self.rio.state.forget_socket_runtime(key);
-                drop(pending.entry);
+                self.rio.state_mut().shutdown_actor(key);
+                self.rio.state_mut().forget_socket_runtime(key);
+                drop(pending.into_entry());
             } else {
-                self.handles.deferred_socket_cleanup.push_back(pending);
+                self.handles.push_deferred_cleanup(pending);
             }
         }
     }
@@ -99,7 +98,7 @@ impl<'a> IocpDriver<'a> {
         len: usize,
     ) -> IocpDriverResult<()> {
         self.rio
-            .state
+            .state_mut()
             .register_chunk(id, ptr, len)
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to register RIO chunk")
@@ -138,17 +137,12 @@ impl<'a> IocpDriver<'a> {
                 if let IocpHandle::Socket { generation: g, .. } = &mut raw
                     && *g == 0
                 {
-                    *g = self.handles.socket_generation_counter;
-                    self.handles.socket_generation_counter =
-                        self.handles.socket_generation_counter.wrapping_add(1);
-                    if self.handles.socket_generation_counter == 0 {
-                        self.handles.socket_generation_counter = 1;
-                    }
+                    *g = self.handles.next_socket_generation();
                 }
                 canonical = RawHandle::new(raw);
 
                 self.rio
-                    .state
+                    .state_mut()
                     .mark_socket_registered(canonical.raw().actor_key());
             }
             let entry = if is_owned_input {
@@ -159,16 +153,7 @@ impl<'a> IocpDriver<'a> {
                 // Borrowed handles must remain non-owning to avoid accidental close/double-close.
                 RegisteredHandle::Weak(canonical)
             };
-            let idx = if let Some(idx) = self.handles.free_slots.pop() {
-                self.handles.registered_files[idx] = Some(entry);
-                idx
-            } else {
-                self.handles.registered_files.push(Some(entry));
-                self.handles.file_generations.push(0);
-                self.handles.registered_files.len() - 1
-            };
-            let generation = self.handles.file_generations[idx];
-            registered.push(IoFd::fixed_with_generation(idx as u32, generation));
+            registered.push(self.handles.insert_registered(entry));
         }
         Ok(registered)
     }
@@ -176,28 +161,17 @@ impl<'a> IocpDriver<'a> {
     /// Unregisters a set of previously registered files.
     pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpDriverResult<()> {
         for fd in files {
-            let idx = fd.fixed_index() as usize;
-            if idx < self.handles.registered_files.len() {
-                if self.handles.file_generations.get(idx).copied() != Some(fd.generation()) {
-                    continue;
-                }
-                let Some(entry) = self.handles.registered_files[idx].take() else {
-                    continue;
-                };
+            if let Some((idx, entry)) = self.handles.take_for_unregister(fd) {
                 if entry.as_raw().kind() == RawHandleKind::Socket {
                     let key = entry.as_raw().raw().actor_key();
-                    if self.rio.state.begin_socket_cleanup(key) {
-                        self.rio.state.shutdown_actor(key);
-                        self.rio.state.forget_socket_runtime(key);
+                    if self.rio.state_mut().begin_socket_cleanup(key) {
+                        self.rio.state_mut().shutdown_actor(key);
+                        self.rio.state_mut().forget_socket_runtime(key);
                     } else {
-                        self.handles
-                            .deferred_socket_cleanup
-                            .push_back(DeferredSocketCleanup { handle: key, entry });
+                        self.handles.defer_socket_cleanup(key, entry);
                     }
                 }
-                self.handles.free_slots.push(idx);
-                self.handles.file_generations[idx] =
-                    self.handles.file_generations[idx].wrapping_add(1);
+                self.handles.release_slot(idx);
             }
         }
         Ok(())

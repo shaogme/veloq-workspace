@@ -8,8 +8,8 @@ use crate::ext::Extensions;
 use crate::rio::RioState;
 
 pub(crate) struct IocpRioRuntime<'a> {
-    pub(crate) state: RioState,
-    pub(crate) registrar: Box<dyn BufferRegistrar + 'a>,
+    state: RioState,
+    registrar: Box<dyn BufferRegistrar + 'a>,
 }
 
 impl<'a> IocpRioRuntime<'a> {
@@ -26,5 +26,19 @@ impl<'a> IocpRioRuntime<'a> {
             .attach_note("failed to initialize RIO state")
             .trans()?;
         Ok(Self { state, registrar })
+    }
+
+    pub(crate) fn state(&self) -> &RioState {
+        &self.state
+    }
+
+    pub(crate) fn state_mut(&mut self) -> &mut RioState {
+        &mut self.state
+    }
+
+    pub(crate) fn state_and_registrar_mut(
+        &mut self,
+    ) -> (&mut RioState, &(dyn BufferRegistrar + 'a)) {
+        (&mut self.state, self.registrar.as_ref())
     }
 }
