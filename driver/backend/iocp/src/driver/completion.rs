@@ -40,7 +40,7 @@ impl<'a> IocpDriver<'a> {
             return 0;
         }
         self.shutting_down = true;
-        self.rio_state.begin_shutdown();
+        self.rio.state.begin_shutdown();
 
         let mut in_flight = Vec::new();
         for user_data in 0..self.ops.local.len() {
@@ -80,6 +80,7 @@ impl<'a> IocpDriver<'a> {
 
     pub(crate) fn poll_completion(&mut self) -> IocpDriverResult<usize> {
         let status = self
+            .completion
             .port
             .get_status(10)
             .push_ctx("scope", "iocp/driver")
@@ -95,13 +96,14 @@ impl<'a> IocpDriver<'a> {
             } => {
                 if key == RIO_EVENT_KEY {
                     let processed = self
-                        .rio_state
+                        .rio
+                        .state
                         .process_completions(
                             &mut self.ops,
                             &self.extensions,
-                            &*self.registrar,
-                            &self.completion_events,
-                            &self.completion_table,
+                            &*self.rio.registrar,
+                            &self.completion.events,
+                            &self.completion.table,
                         )
                         .inspect(|_| {
                             self.drain_deferred_socket_cleanup();
@@ -133,13 +135,14 @@ impl<'a> IocpDriver<'a> {
             self.drain_pending_iocp(pending, timeout)
                 .push_ctx("scope", "iocp/driver")
                 .attach_note("drain pending iocp timed out")?;
-            self.rio_state
+            self.rio
+                .state
                 .drain_outstanding(timeout)
                 .push_ctx("scope", "iocp/driver")
                 .attach_note("failed to drain RIO outstanding requests")
                 .trans()?;
         }
-        self.rio_state.kernel.close();
+        self.rio.state.kernel.close();
         self.closed = true;
         Ok(())
     }
@@ -149,12 +152,12 @@ impl<'a> IocpDriver<'a> {
         drain_cancel_requests(self);
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
-        let status = self.port.get_status(wait_ms);
+        let status = self.completion.port.get_status(wait_ms);
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last_timer_poll);
-        self.wheel.advance(elapsed, &mut self.timer_buffer);
+        let elapsed = now.saturating_duration_since(self.timer.last_poll);
+        self.timer.wheel.advance(elapsed, &mut self.timer.buffer);
         self.process_timers();
-        self.last_timer_poll = now;
+        self.timer.last_poll = now;
 
         let status = status
             .attach_note("failed to get IOCP completion status")
@@ -169,13 +172,14 @@ impl<'a> IocpDriver<'a> {
                 error_code,
             } => {
                 if key == RIO_EVENT_KEY {
-                    self.rio_state
+                    self.rio
+                        .state
                         .process_completions(
                             &mut self.ops,
                             &self.extensions,
-                            &*self.registrar,
-                            &self.completion_events,
-                            &self.completion_table,
+                            &*self.rio.registrar,
+                            &self.completion.events,
+                            &self.completion.table,
                         )
                         .inspect(|_| {
                             self.drain_deferred_socket_cleanup();
@@ -188,7 +192,7 @@ impl<'a> IocpDriver<'a> {
                 let user_data = self.resolve_user_data(overlapped, success, key, error_code)?;
 
                 if user_data == WAKEUP_USER_DATA {
-                    self.is_notified.store(false, Ordering::Release);
+                    self.completion.is_notified.store(false, Ordering::Release);
                     return Ok(());
                 }
                 self.process_completion(user_data, success, error_code, bytes);
@@ -199,7 +203,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn calculate_wait_ms(&self, timeout_ms: u32) -> u32 {
-        if let Some(delay) = self.wheel.next_timeout() {
+        if let Some(delay) = self.timer.wheel.next_timeout() {
             let millis = delay.as_millis().min(u32::MAX as u128) as u32;
             std::cmp::min(timeout_ms, millis)
         } else {
@@ -244,7 +248,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn process_timers(&mut self) {
-        let timer_buffer = std::mem::take(&mut self.timer_buffer);
+        let timer_buffer = std::mem::take(&mut self.timer.buffer);
         let mut pending_events: Vec<CompletionSidecar> = Vec::new();
         let now = Instant::now();
 
@@ -261,7 +265,7 @@ impl<'a> IocpDriver<'a> {
                     {
                         let remain = deadline.saturating_duration_since(now);
                         op.entry.platform_data.timer_id =
-                            Some(self.wheel.insert(user_data, remain));
+                            Some(self.timer.wheel.insert(user_data, remain));
                         continue;
                     }
                     expired.push(user_data);
@@ -277,13 +281,13 @@ impl<'a> IocpDriver<'a> {
 
         for completion in pending_events {
             push_completion_shared(
-                &self.completion_events,
-                &self.completion_table,
+                &self.completion.events,
+                &self.completion.table,
                 completion_record(completion),
             );
         }
-        self.timer_buffer = timer_buffer;
-        self.timer_buffer.clear();
+        self.timer.buffer = timer_buffer;
+        self.timer.buffer.clear();
     }
 
     pub(crate) fn finish_timer_op(
@@ -338,8 +342,8 @@ impl<'a> IocpDriver<'a> {
 
                 self.release_socket_inflight_for_op(user_data);
                 let ctx = EmitContext {
-                    completion_events: &self.completion_events,
-                    completion_table: &self.completion_table,
+                    completion_events: &self.completion.events,
+                    completion_table: &self.completion.table,
                 };
                 Self::emit_event_inner(ctx, &mut self.ops, user_data, slot_generation, io_result);
             }
@@ -352,19 +356,7 @@ impl<'a> IocpDriver<'a> {
                 };
                 let mut completed = slot.complete();
                 let _ = completed.take_op();
-                let (payload, detail) = completed.take_completion_data();
-                push_completion_shared(
-                    &self.completion_events,
-                    &self.completion_table,
-                    completion_record(CompletionSidecar {
-                        user_data,
-                        generation: slot_generation,
-                        res: io_result_to_event_res(&io_result),
-                        flags: 0,
-                        payload,
-                        detail,
-                    }),
-                );
+                let _ = completed.take_completion_data();
                 self.ops.recycle(user_data, slot_generation.wrapping_add(1));
             }
             _ => {
@@ -481,11 +473,9 @@ impl<'a> IocpDriver<'a> {
                     payload,
                     detail,
                 });
-                if !guard.platform_mut().rio_needs_drain || guard.platform_mut().rio_drained {
-                    let _ = guard.take_op();
-                    let _data = std::mem::take(guard.platform_mut());
-                    should_free = true;
-                }
+                let _ = guard.take_op();
+                let _data = std::mem::take(guard.platform_mut());
+                should_free = true;
             }
         });
 
@@ -510,8 +500,8 @@ impl<'a> IocpDriver<'a> {
         }
 
         let emit_ctx = EmitContext {
-            completion_events: &self.completion_events,
-            completion_table: &self.completion_table,
+            completion_events: &self.completion.events,
+            completion_table: &self.completion.table,
         };
 
         let timer_id = self
@@ -519,7 +509,7 @@ impl<'a> IocpDriver<'a> {
             .get_mut(user_data)
             .and_then(|op| op.platform_data.timer_id);
         if let Some(tid) = timer_id {
-            self.wheel.cancel(tid);
+            self.timer.wheel.cancel(tid);
             Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
             return;
         }
@@ -528,13 +518,13 @@ impl<'a> IocpDriver<'a> {
         match state {
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) => {
                 let ctx = CancelContext {
-                    registered_files: &self.registered_files,
-                    file_generations: &self.file_generations,
-                    completion_events: &self.completion_events,
-                    completion_table: &self.completion_table,
+                    registered_files: &self.handles.registered_files,
+                    file_generations: &self.handles.file_generations,
+                    completion_events: &self.completion.events,
+                    completion_table: &self.completion.table,
                 };
                 if let Some(key) = Self::perform_cancel(ctx, user_data, &mut self.ops) {
-                    self.rio_state.release_socket_inflight(key);
+                    self.rio.state.release_socket_inflight(key);
                     self.drain_deferred_socket_cleanup();
                 }
             }

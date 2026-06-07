@@ -3,7 +3,7 @@
 //! `RioRegistry` owns all registration metadata required to submit operations:
 //! - chunk registrations for pre-registered slab regions,
 //! - lazy heap-buffer registrations with bounded cache behavior,
-//! - slab-page registrations for address buffers used by `RIOSendEx`,
+//! - a dedicated registered address scratch buffer for RIO address operations,
 //! - deferred deregistration queues for safe teardown sequencing.
 //!
 //! This module is focused on resource identity and lifetime bookkeeping; it
@@ -11,6 +11,7 @@
 
 use crate::IoFd;
 use crate::config::BorrowedRawHandle;
+use crate::net::addr::SockAddrStorage;
 use crate::rio::RioEnv;
 use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
 use crate::rio::error::{RioError, RioResult};
@@ -18,7 +19,9 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 use veloq_buf::{FixedBuf, PoolKind};
-use windows_sys::Win32::Networking::WinSock::RIO_BUF;
+use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, AF_INET6, RIO_BUF, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
+};
 
 const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
 
@@ -36,9 +39,10 @@ pub(crate) struct RioRegistrationStats {
 
 pub(crate) struct RioRegistry {
     pub(crate) chunk_registry: Vec<RioBufferId>,
-    /// RIO Registration for Slab Pages (for Address Buffers)
-    /// Maps PageIndex -> (RioBufferId, BaseAddress, Length)
-    pub(crate) slab_rio_pages: Vec<Option<(RioBufferId, usize, usize)>>,
+    addr_slots: Box<[SockAddrStorage]>,
+    addr_slot_in_use: Vec<bool>,
+    addr_free_slots: Vec<usize>,
+    addr_buffer_id: RioBufferId,
     /// Heap-buffer lazy registrations: (ptr, cap, cookie) -> RioBufferId
     pub(crate) heap_rio_bufs: FxHashMap<(usize, usize, u64), RioBufferId>,
     pub(crate) pending_deregistrations: Vec<RioBufferId>,
@@ -48,11 +52,26 @@ pub(crate) struct RioRegistry {
     heap_register_failures_recent: FxHashMap<(usize, usize, u64), Instant>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RioAddrReservation {
+    pub(crate) slot: usize,
+    pub(crate) rio_buf: RIO_BUF,
+}
+
 impl RioRegistry {
-    pub(crate) fn new(rq_depth: u32) -> Self {
+    pub(crate) fn new(rq_depth: u32, addr_capacity: usize) -> Self {
+        let addr_capacity = addr_capacity.max(1);
+        let mut addr_free_slots = Vec::with_capacity(addr_capacity);
+        for slot in (0..addr_capacity).rev() {
+            addr_free_slots.push(slot);
+        }
+
         Self {
             chunk_registry: Vec::new(),
-            slab_rio_pages: Vec::new(),
+            addr_slots: vec![SockAddrStorage::default(); addr_capacity].into_boxed_slice(),
+            addr_slot_in_use: vec![false; addr_capacity],
+            addr_free_slots,
+            addr_buffer_id: RioBufferId::INVALID,
             heap_rio_bufs: FxHashMap::default(),
             pending_deregistrations: Vec::new(),
             rq_depth,
@@ -112,10 +131,6 @@ impl RioRegistry {
         };
         Ok(rio_buf)
     }
-
-    pub(crate) fn resize_rqs(&mut self, _size: usize) {}
-
-    pub(crate) fn clear_registered_rq(&mut self, _idx: usize) {}
 
     pub(crate) fn register_chunk(
         &mut self,
@@ -179,34 +194,6 @@ impl RioRegistry {
         Ok(())
     }
 
-    pub(crate) fn ensure_page_reg(
-        &mut self,
-        page_idx: usize,
-        resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
-        env: RioEnv<'_>,
-    ) -> RioResult<()> {
-        if page_idx >= self.slab_rio_pages.len() {
-            self.slab_rio_pages.resize(page_idx + 1, None);
-        }
-
-        if self.slab_rio_pages[page_idx].is_none() {
-            if let Some((ptr, len)) = resolver(page_idx) {
-                let id = env
-                    .dispatch
-                    .register_buffer(ptr, len as u32)
-                    .with_ctx("page_idx", page_idx)
-                    .with_ctx("buffer_length", len)
-                    .attach_note("RIORegisterBuffer failed for slab page")?;
-                self.slab_rio_pages[page_idx] = Some((id, ptr as usize, len));
-            } else {
-                return RioError::Internal
-                    .with_ctx("page_idx", page_idx)
-                    .attach_note("RIO slab page not found in registry");
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn create_rq(
         &mut self,
         target: (BorrowedRawHandle<'_>, IoFd),
@@ -262,10 +249,9 @@ impl RioRegistry {
                 env.dispatch.deregister_buffer(id);
             }
         }
-        for (id, _, _) in self.slab_rio_pages.iter().flatten().copied() {
-            if !id.is_invalid() && deregistered.insert(id.0 as usize) {
-                env.dispatch.deregister_buffer(id);
-            }
+        let addr_buffer_id = std::mem::replace(&mut self.addr_buffer_id, RioBufferId::INVALID);
+        if !addr_buffer_id.is_invalid() && deregistered.insert(addr_buffer_id.0 as usize) {
+            env.dispatch.deregister_buffer(addr_buffer_id);
         }
         for id in self.heap_rio_bufs.values().copied() {
             if !id.is_invalid() && deregistered.insert(id.0 as usize) {
@@ -274,7 +260,7 @@ impl RioRegistry {
         }
 
         self.chunk_registry.clear();
-        self.slab_rio_pages.clear();
+        self.reset_addr_slots();
         self.heap_rio_bufs.clear();
         self.chunk_register_failures_recent.clear();
         self.heap_register_failures_recent.clear();
@@ -360,5 +346,165 @@ impl RioRegistry {
             .heap_register_success
             .saturating_add(1);
         Ok(id)
+    }
+
+    pub(crate) fn prepare_send_addr(
+        &mut self,
+        addr_ptr: *const std::ffi::c_void,
+        addr_len: i32,
+        env: RioEnv<'_>,
+    ) -> RioResult<RioAddrReservation> {
+        let rio_addr_len = Self::validate_send_addr(addr_ptr, addr_len)?;
+        let reservation = self.allocate_addr_slot(env)?;
+        let dst = (&mut self.addr_slots[reservation.slot] as *mut SockAddrStorage).cast::<u8>();
+        let copy_len = (addr_len as usize).min(rio_addr_len as usize);
+        // SAFETY: `dst` points at an owned scratch slot, and `addr_ptr` was
+        // validated as non-null with at least `copy_len` readable bytes.
+        unsafe {
+            std::ptr::write_bytes(dst, 0, std::mem::size_of::<SockAddrStorage>());
+            std::ptr::copy_nonoverlapping(addr_ptr.cast::<u8>(), dst, copy_len);
+        }
+        Ok(RioAddrReservation {
+            rio_buf: RIO_BUF {
+                Length: rio_addr_len,
+                ..reservation.rio_buf
+            },
+            ..reservation
+        })
+    }
+
+    pub(crate) fn prepare_recv_addr(&mut self, env: RioEnv<'_>) -> RioResult<RioAddrReservation> {
+        let reservation = self.allocate_addr_slot(env)?;
+        let dst = (&mut self.addr_slots[reservation.slot] as *mut SockAddrStorage).cast::<u8>();
+        // SAFETY: `dst` points at an owned scratch slot.
+        unsafe {
+            std::ptr::write_bytes(dst, 0, std::mem::size_of::<SockAddrStorage>());
+        }
+        Ok(reservation)
+    }
+
+    pub(crate) fn copy_addr_slot_to(
+        &self,
+        slot: usize,
+        dst: *mut SockAddrStorage,
+    ) -> RioResult<()> {
+        if dst.is_null() {
+            return RioError::Internal
+                .attach_note("RIO recv_from completion missing output address");
+        }
+        let Some(src) = self.addr_slots.get(slot) else {
+            return RioError::Internal
+                .with_ctx("addr_slot", slot)
+                .attach_note("RIO address slot out of bounds");
+        };
+        // SAFETY: `src` is a live scratch slot and `dst` points at the op payload.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src as *const SockAddrStorage, dst, 1);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn free_addr_slot(&mut self, slot: Option<usize>) {
+        let Some(slot) = slot else {
+            return;
+        };
+        if let Some(in_use) = self.addr_slot_in_use.get_mut(slot)
+            && *in_use
+        {
+            *in_use = false;
+            self.addr_free_slots.push(slot);
+        }
+    }
+
+    fn allocate_addr_slot(&mut self, env: RioEnv<'_>) -> RioResult<RioAddrReservation> {
+        let buffer_id = self.ensure_addr_buffer_registered(env)?;
+        let Some(slot) = self.addr_free_slots.pop() else {
+            return RioError::ResourceExhaustion
+                .with_ctx("addr_capacity", self.addr_slots.len())
+                .attach_note("RIO address scratch buffer exhausted");
+        };
+        self.addr_slot_in_use[slot] = true;
+        let offset = Self::addr_slot_offset(slot)?;
+        Ok(RioAddrReservation {
+            slot,
+            rio_buf: RIO_BUF {
+                BufferId: buffer_id.0,
+                Offset: offset,
+                Length: std::mem::size_of::<SOCKADDR_INET>() as u32,
+            },
+        })
+    }
+
+    fn ensure_addr_buffer_registered(&mut self, env: RioEnv<'_>) -> RioResult<RioBufferId> {
+        if !self.addr_buffer_id.is_invalid() {
+            return Ok(self.addr_buffer_id);
+        }
+
+        let len = std::mem::size_of_val(&*self.addr_slots);
+        let len_u32 = u32::try_from(len).map_err(|_| {
+            RioError::ResourceExhaustion
+                .to_report()
+                .with_ctx("addr_buffer_length", len)
+                .attach_note("RIO address scratch buffer too large")
+        })?;
+        let id = env
+            .dispatch
+            .register_buffer(self.addr_slots.as_ptr().cast::<u8>(), len_u32)
+            .with_ctx("buffer_length", len)
+            .attach_note("RIORegisterBuffer failed for address scratch buffer")?;
+        self.addr_buffer_id = id;
+        Ok(id)
+    }
+
+    fn validate_send_addr(addr_ptr: *const std::ffi::c_void, addr_len: i32) -> RioResult<u32> {
+        if addr_ptr.is_null() {
+            return RioError::Internal.attach_note("RIO send_to received null address");
+        }
+        if addr_len < 0 {
+            return RioError::Internal
+                .with_ctx("address_len", addr_len)
+                .attach_note("RIO send_to invalid negative address length");
+        }
+        // SAFETY: addr_ptr is checked for null, and sa_family is a standard field in SOCKADDR.
+        let family = unsafe { (*(addr_ptr as *const SOCKADDR)).sa_family };
+        let min_len = match family {
+            AF_INET => std::mem::size_of::<SOCKADDR_IN>(),
+            AF_INET6 => std::mem::size_of::<SOCKADDR_IN6>(),
+            _ => {
+                return RioError::Internal
+                    .with_ctx("address_family", family)
+                    .attach_note("RIO unsupported address family");
+            }
+        };
+        if (addr_len as usize) < min_len {
+            return RioError::Internal
+                .with_ctx("address_len", addr_len)
+                .with_ctx("min_address_len", min_len)
+                .attach_note("RIO send_to invalid address length");
+        }
+
+        Ok(std::mem::size_of::<SOCKADDR_INET>() as u32)
+    }
+
+    fn addr_slot_offset(slot: usize) -> RioResult<u32> {
+        let offset = slot
+            .checked_mul(std::mem::size_of::<SockAddrStorage>())
+            .ok_or(RioError::ResourceExhaustion)
+            .attach_note("RIO address slot offset overflow")?;
+        u32::try_from(offset).map_err(|_| {
+            RioError::ResourceExhaustion
+                .to_report()
+                .with_ctx("addr_slot", slot)
+                .with_ctx("addr_slot_offset", offset)
+                .attach_note("RIO address slot offset exceeds u32")
+        })
+    }
+
+    fn reset_addr_slots(&mut self) {
+        self.addr_free_slots.clear();
+        for (slot, in_use) in self.addr_slot_in_use.iter_mut().enumerate().rev() {
+            *in_use = false;
+            self.addr_free_slots.push(slot);
+        }
     }
 }

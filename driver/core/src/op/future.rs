@@ -504,8 +504,8 @@ where
             let user_data = self.user_data;
             let token = self.token;
             self.provider.with_driver(|mut driver| {
-                driver.cancel_op(user_data);
                 driver.completion_table().mark_orphaned(token);
+                driver.cancel_op(user_data);
             });
         }
     }

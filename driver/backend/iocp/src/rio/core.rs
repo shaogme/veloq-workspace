@@ -13,6 +13,7 @@ pub(crate) enum RioCompletionKind {
     Op {
         user_data: usize,
         generation: u32,
+        addr_slot: Option<usize>,
         ctx_ptr: *mut RioOpRequestContext,
     },
 }
@@ -21,6 +22,7 @@ pub(crate) enum RioCompletionKind {
 pub(crate) struct RioOpRequestContext {
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
+    pub(crate) addr_slot: usize,
 }
 
 pub(crate) struct RioOpCtxGuard(pub(crate) *mut RioOpRequestContext);
@@ -46,9 +48,19 @@ pub(crate) fn rio_result_to_event_res(res: &crate::error::IocpDriverResult<usize
 impl RioState {
     #[inline]
     pub(crate) fn encode_req_ctx(user_data: usize, generation: u32) -> *const std::ffi::c_void {
+        Self::encode_req_ctx_with_addr(user_data, generation, None)
+    }
+
+    #[inline]
+    pub(crate) fn encode_req_ctx_with_addr(
+        user_data: usize,
+        generation: u32,
+        addr_slot: Option<usize>,
+    ) -> *const std::ffi::c_void {
         let ctx = Box::new(RioOpRequestContext {
             user_data,
             generation,
+            addr_slot: addr_slot.unwrap_or(usize::MAX),
         });
         Box::into_raw(ctx).cast::<std::ffi::c_void>()
     }
@@ -67,6 +79,7 @@ impl RioState {
         Some(RioCompletionKind::Op {
             user_data: op_ctx.user_data,
             generation: op_ctx.generation,
+            addr_slot: (op_ctx.addr_slot != usize::MAX).then_some(op_ctx.addr_slot),
             ctx_ptr,
         })
     }
@@ -118,6 +131,23 @@ mod tests {
             Some(RioCompletionKind::Op {
                 user_data: 11,
                 generation: 17,
+                addr_slot: None,
+                ..
+            })
+        ));
+        RioState::free_op_req_ctx(ptr as u64);
+    }
+
+    #[test]
+    fn op_ctx_with_addr_roundtrip_decode_and_free() {
+        let ptr = RioState::encode_req_ctx_with_addr(11, 17, Some(3));
+        let decoded = RioState::decode_req_ctx(ptr as u64);
+        assert!(matches!(
+            decoded,
+            Some(RioCompletionKind::Op {
+                user_data: 11,
+                generation: 17,
+                addr_slot: Some(3),
                 ..
             })
         ));

@@ -73,8 +73,11 @@ fn reaper_sender() -> Option<&'static std::sync::mpsc::Sender<DeferredRioCleanup
 impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) {
         match Self::decode_req_ctx(res.RequestContext) {
-            Some(RioCompletionKind::Op { ctx_ptr, .. }) => {
+            Some(RioCompletionKind::Op {
+                addr_slot, ctx_ptr, ..
+            }) => {
                 let _ctx_guard = RioOpCtxGuard(ctx_ptr);
+                self.registry.free_addr_slot(addr_slot);
             }
             None => {}
         }
@@ -136,7 +139,7 @@ impl RioState {
             return None;
         }
         let kernel = std::mem::replace(&mut self.kernel, RioKernel::noop());
-        let registry = std::mem::replace(&mut self.registry, RioRegistry::new(32));
+        let registry = std::mem::replace(&mut self.registry, RioRegistry::new(32, 1));
         Some(DeferredRioCleanup {
             kernel,
             registry,

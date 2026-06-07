@@ -76,8 +76,6 @@ pub(crate) struct SubmitContext<'a> {
 
     // RIO Support
     pub(crate) rio: &'a mut RioState,
-    pub(crate) slots_per_page: usize,
-    pub(crate) slab_resolver: &'a dyn Fn(usize) -> Option<(*const u8, usize)>,
 }
 
 // ============================================================================

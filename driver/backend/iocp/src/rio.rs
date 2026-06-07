@@ -34,12 +34,6 @@ new_key_type! {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SocketRuntimeMode {
-    RioPreferred,
-    IocpFallback,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SocketLifecycleState {
     Open,
     Closing,
@@ -47,19 +41,15 @@ pub(crate) enum SocketLifecycleState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SocketRuntimeState {
-    pub(crate) mode: SocketRuntimeMode,
     pub(crate) lifecycle: SocketLifecycleState,
     pub(crate) inflight: u32,
-    pub(crate) iocp_associated: bool,
 }
 
 impl Default for SocketRuntimeState {
     fn default() -> Self {
         Self {
-            mode: SocketRuntimeMode::RioPreferred,
             lifecycle: SocketLifecycleState::Open,
             inflight: 0,
-            iocp_associated: false,
         }
     }
 }

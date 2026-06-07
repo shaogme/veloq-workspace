@@ -1,16 +1,18 @@
+pub(crate) mod blocking_bridge;
 pub(crate) mod completion;
+pub(crate) mod completion_pump;
+pub(crate) mod handle_registry;
 pub(crate) mod registration;
+pub(crate) mod rio_runtime;
 pub(crate) mod submission;
+pub(crate) mod timer_engine;
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use crossbeam_queue::SegQueue;
 use tracing::{debug, trace};
 
 use veloq_buf::BufferRegistrar;
@@ -22,15 +24,12 @@ use veloq_driver_core::driver::{
     SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
-use veloq_wheel::{Wheel, WheelConfig};
 
 use diagweave::prelude::*;
 
-use crate::common::IocpWaker;
-use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, RegisteredHandle};
+use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle};
 use crate::error::{IocpError, IocpResult};
 use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload};
-use crate::rio::RioState;
 
 pub(crate) type IocpDriverResult<T> = CoreDriverResult<T, IocpError>;
 pub(crate) use crate::op::slot::{IocpOpRegistry, IocpSlotSpec};
@@ -41,27 +40,17 @@ pub(crate) use crate::op::slot::{IocpOpRegistry, IocpSlotSpec};
 
 /// The IOCP driver implementation that manages I/O completion ports and operations.
 pub struct IocpDriver<'a> {
-    pub(crate) port: Arc<crate::win32::IoCompletionPort>,
+    pub(crate) completion: completion_pump::CompletionPump,
     pub(crate) ops: IocpOpRegistry,
     pub(crate) extensions: crate::ext::Extensions,
-    pub(crate) wheel: Wheel<usize>,
-    pub(crate) timer_buffer: Vec<usize>,
-    pub(crate) last_timer_poll: Instant,
-    pub(crate) registered_files: Vec<Option<RegisteredHandle>>,
-    pub(crate) file_generations: Vec<u64>,
-    pub(crate) free_slots: Vec<usize>,
-    pub(crate) is_notified: Arc<AtomicBool>,
-    pub(crate) completion_events: SharedCompletionQueue,
-    pub(crate) completion_table: SharedCompletionTable<IocpUserPayload, IocpError>,
+    pub(crate) timer: timer_engine::TimerEngine,
+    pub(crate) handles: handle_registry::HandleRegistry,
     pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
 
     // RIO Support (required)
-    pub(crate) rio_state: RioState,
-    pub(crate) registrar: Box<dyn BufferRegistrar + 'a>,
+    pub(crate) rio: rio_runtime::IocpRioRuntime<'a>,
     pub(crate) shutting_down: bool,
     pub(crate) closed: bool,
-    pub(crate) deferred_socket_cleanup: VecDeque<registration::DeferredSocketCleanup>,
-    pub(crate) socket_generation_counter: u64,
 }
 
 /// State associated with an IOCP operation.
@@ -71,10 +60,6 @@ pub struct IocpOpState {
     pub(crate) timer_id: Option<veloq_wheel::TaskId>,
     pub(crate) timer_deadline: Option<Instant>,
     pub(crate) is_background: bool,
-    // For RIO cancel path: the slot can be recycled only after both:
-    // 1) user has consumed completion; 2) late RIO CQE has been drained.
-    pub(crate) rio_needs_drain: bool,
-    pub(crate) rio_drained: bool,
 }
 
 /// Closing mode for the driver or operations.
@@ -137,39 +122,27 @@ impl<'a> IocpDriver<'a> {
         let extensions = crate::ext::Extensions::new()
             .with_ctx("port_raw", port_handle as usize)
             .attach_note("failed to load IOCP extensions")?;
-        let rio_state = RioState::new(
+        let rio = rio_runtime::IocpRioRuntime::new(
             crate::config::RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
             &extensions,
             registration_mode,
+            registrar,
         )
-        .with_ctx("entries", entries)
-        .with_ctx("port_raw", port_handle as usize)
-        .attach_note("failed to initialize RIO state")
-        .trans()?;
+        .attach_note("failed to initialize RIO runtime")?;
         let ops = IocpOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<IocpUserPayload, IocpError> =
             ops.shared.clone();
         Ok(Self {
-            port: Arc::new(port_val),
+            completion: completion_pump::CompletionPump::new(port_val, completion_table),
             ops,
             extensions,
-            wheel: Wheel::new(WheelConfig::default()),
-            timer_buffer: Vec::new(),
-            last_timer_poll: Instant::now(),
-            registered_files: Vec::new(),
-            file_generations: Vec::new(),
-            free_slots: Vec::new(),
-            is_notified: Arc::new(AtomicBool::new(false)),
-            completion_events: Arc::new(SegQueue::new()),
-            completion_table,
+            timer: timer_engine::TimerEngine::new(),
+            handles: handle_registry::HandleRegistry::new(),
             detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
-            rio_state,
-            registrar,
+            rio,
             shutting_down: false,
             closed: false,
-            deferred_socket_cleanup: VecDeque::new(),
-            socket_generation_counter: 1,
         })
     }
 
@@ -178,10 +151,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
-        Arc::new(IocpWaker {
-            port: self.port.clone(),
-            is_notified: self.is_notified.clone(),
-        })
+        self.completion.create_waker()
     }
 }
 
@@ -272,10 +242,10 @@ impl<'a> Driver for IocpDriver<'a> {
         };
 
         let ctx = submission::SubmitContextInternal {
-            port: self.port.as_ref(),
-            wheel: &mut self.wheel,
-            completion_events: &self.completion_events,
-            completion_table: &self.completion_table,
+            port: self.completion.port.as_ref(),
+            wheel: &mut self.timer.wheel,
+            completion_events: &self.completion.events,
+            completion_table: &self.completion.table,
         };
 
         Self::on_submit_res(&mut self.ops, ctx, result, user_data, op_in)
@@ -293,7 +263,7 @@ impl<'a> Driver for IocpDriver<'a> {
                     self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
                 if !pending_progress {
                     return Ok(DriveOutcome {
-                        next_timeout_hint: self.wheel.next_timeout(),
+                        next_timeout_hint: self.timer.wheel.next_timeout(),
                         pending_progress,
                     });
                 }
@@ -306,17 +276,17 @@ impl<'a> Driver for IocpDriver<'a> {
         let pending_progress =
             self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
         Ok(DriveOutcome {
-            next_timeout_hint: self.wheel.next_timeout(),
+            next_timeout_hint: self.timer.wheel.next_timeout(),
             pending_progress,
         })
     }
 
     fn completion_queue(&self) -> SharedCompletionQueue {
-        self.completion_events.clone()
+        self.completion.events.clone()
     }
 
     fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion> {
-        self.completion_table.clone()
+        self.completion.table.clone()
     }
 
     fn cancel_op(&mut self, user_data: usize) {
@@ -357,7 +327,8 @@ impl Drop for IocpDriver<'_> {
 #[cfg(feature = "test-hooks")]
 impl veloq_driver_core::driver::test_hooks::DriverTestHooks for IocpDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
-        self.rio_state
+        self.rio
+            .state
             .registry
             .registration_stats
             .chunk_register_attempts

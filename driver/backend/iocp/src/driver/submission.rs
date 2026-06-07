@@ -3,14 +3,17 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use diagweave::prelude::{DiagnosticResult, ResultReportExt};
-use veloq_blocking::{BlockingTask, get_blocking_pool};
+use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
     DriverSubmitResult, SharedCompletionQueue, SharedCompletionTable, SubmitStatus,
 };
 use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
-use crate::driver::{CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry};
+use crate::driver::{
+    CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry,
+    blocking_bridge::BlockingBridge,
+};
 use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
 use crate::op::slot::Slot;
 use crate::op::{IocpOp, IocpUserPayload, SubmitContext, submit};
@@ -71,7 +74,7 @@ impl<'a> IocpDriver<'a> {
         user_data: usize,
         task: BlockingTask,
     ) -> IocpDriverResult<Poll<()>> {
-        if get_blocking_pool().execute(task).is_err() {
+        if !BlockingBridge::submit(task) {
             if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                 let mut guard = slot.complete();
                 let _ = guard.take_op();
@@ -178,11 +181,6 @@ impl<'a> IocpDriver<'a> {
         user_data: usize,
         op: IocpOp,
     ) -> IocpDriverResult<IocpDriverResult<submit::SubmissionResult>> {
-        let slots_per_page = self.ops.local.len();
-        let (slab_ptr, slab_len) = self.ops.get_page_slice(0).ok_or_else(|| {
-            IocpError::InvalidState.report("iocp/driver", "failed to get page slice")
-        })?;
-
         let guard = Self::prep_op_slot(&mut self.ops, user_data, op)
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
@@ -192,15 +190,13 @@ impl<'a> IocpDriver<'a> {
         });
 
         let mut ctx = SubmitContext {
-            port: self.port.as_ref(),
+            port: self.completion.port.as_ref(),
             overlapped,
             ext: &self.extensions,
-            registered_files: &self.registered_files,
-            file_generations: &self.file_generations,
-            registrar: self.registrar.as_ref(),
-            rio: &mut self.rio_state,
-            slots_per_page,
-            slab_resolver: &|idx| (idx == 0).then_some((slab_ptr, slab_len)),
+            registered_files: &self.handles.registered_files,
+            file_generations: &self.handles.file_generations,
+            registrar: self.rio.registrar.as_ref(),
+            rio: &mut self.rio.state,
         };
 
         let mut sub_guard = guard.start_submission_with(Some(|slot| {

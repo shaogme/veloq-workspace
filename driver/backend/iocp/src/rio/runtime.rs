@@ -7,12 +7,10 @@ use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::op::SubmissionResult;
 use crate::rio::core::submit_ops::{RioExConfig, RioProvider};
 use crate::rio::error::{RioError, RioResult};
-use crate::rio::{RioEnv, RioState, SocketLifecycleState, SocketRuntimeMode, SocketRuntimeState};
+use crate::rio::{RioEnv, RioState, SocketLifecycleState, SocketRuntimeState};
 use diagweave::prelude::*;
 use veloq_driver_core::op::UdpRecvFrom;
-use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, RIO_BUF, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
-};
+use windows_sys::Win32::Networking::WinSock::SOCKADDR_INET;
 
 pub(crate) struct RioTarget<'a> {
     pub(crate) fd: IoFd,
@@ -30,7 +28,6 @@ pub(crate) struct RioSendToArgs<'a> {
     pub(crate) addr_len: i32,
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
-    pub(crate) page_idx: usize,
     pub(crate) buf_offset: usize,
 }
 
@@ -41,7 +38,6 @@ pub(crate) struct RioUdpRecvFromArgs<'a> {
     pub(crate) addr_ptr: *mut std::ffi::c_void,
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
-    pub(crate) page_idx: usize,
 }
 
 impl RioState {
@@ -94,96 +90,18 @@ impl RioState {
         self.socket_runtime.remove(&actor_key);
     }
 
-    #[inline]
-    pub(crate) fn is_iocp_fallback(&self, actor_key: SocketKey) -> bool {
-        self.socket_runtime
-            .get(&actor_key)
-            .is_some_and(|state| state.mode == SocketRuntimeMode::IocpFallback)
-    }
-
-    fn validate_rio_addr(
-        addr_ptr: *const std::ffi::c_void,
-        addr_len: i32,
-        base_addr: usize,
-        slab_len: usize,
-        page_idx: usize,
-    ) -> RioResult<(u32, usize)> {
-        if addr_ptr.is_null() {
-            return RioError::Internal.attach_note("RIO send_to received null address");
-        }
-        // SAFETY: addr_ptr is checked for null, and sa_family is a standard field in SOCKADDR.
-        let family = unsafe { (*(addr_ptr as *const SOCKADDR)).sa_family };
-        let min_len = match family {
-            AF_INET => std::mem::size_of::<SOCKADDR_IN>(),
-            AF_INET6 => std::mem::size_of::<SOCKADDR_IN6>(),
-            _ => {
-                return RioError::Internal
-                    .with_ctx("address_family", family)
-                    .attach_note("RIO unsupported address family");
-            }
-        };
-        if (addr_len as usize) < min_len {
-            return RioError::Internal
-                .with_ctx("address_len", addr_len)
-                .with_ctx("min_address_len", min_len)
-                .attach_note("RIO send_to invalid address length");
-        }
-
-        let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>();
-        let addr_addr = addr_ptr as usize;
-        let slab_end = base_addr.saturating_add(slab_len);
-        if addr_addr < base_addr || addr_addr.saturating_add(rio_addr_len) > slab_end {
-            return RioError::Internal
-                .with_ctx("page_idx", page_idx)
-                .with_ctx("addr_raw", addr_addr)
-                .with_ctx("base_addr", base_addr)
-                .with_ctx("slab_len", slab_len)
-                .with_ctx("rio_addr_len", rio_addr_len)
-                .attach_note("RIO address outside slab");
-        }
-
-        Ok((rio_addr_len as u32, (addr_addr - base_addr) as u32 as usize))
-    }
-
-    fn validate_rio_addr_output(
-        addr_ptr: *mut std::ffi::c_void,
-        rio_addr_len: u32,
-        base_addr: usize,
-        slab_len: usize,
-        page_idx: usize,
-    ) -> RioResult<usize> {
-        if addr_ptr.is_null() {
-            return RioError::Internal.attach_note("RIO recv_from received null address buffer");
-        }
-        let addr_addr = addr_ptr as usize;
-        let slab_end = base_addr.saturating_add(slab_len);
-        if addr_addr < base_addr || addr_addr.saturating_add(rio_addr_len as usize) > slab_end {
-            return RioError::Internal
-                .with_ctx("page_idx", page_idx)
-                .with_ctx("addr_raw", addr_addr)
-                .with_ctx("base_addr", base_addr)
-                .with_ctx("slab_len", slab_len)
-                .with_ctx("rio_addr_len", rio_addr_len)
-                .attach_note("RIO recv_from address outside slab");
-        }
-
-        Ok((addr_addr - base_addr) as u32 as usize)
-    }
-
     pub(crate) fn try_submit_send_to(
         &mut self,
         args: RioSendToArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> RioResult<SubmissionResult> {
-        self.try_submit_send_to_internal(args, registrar, slab_resolver)
+        self.try_submit_send_to_internal(args, registrar)
     }
 
     fn try_submit_send_to_internal(
         &mut self,
         args: RioSendToArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> RioResult<SubmissionResult> {
         let RioSendToArgs {
             fd,
@@ -193,7 +111,6 @@ impl RioState {
             addr_len,
             user_data,
             generation,
-            page_idx,
             buf_offset,
             ..
         } = args;
@@ -213,51 +130,36 @@ impl RioState {
             let actor = self.ensure_actor((fd, handle), env)?;
             actor.rq
         };
-        let socket_key = handle.raw().actor_key();
-        if self.is_iocp_fallback(socket_key) {
-            return RioError::NotSupported.attach_note("Socket is marked for IOCP fallback");
-        }
         let data_buf = self.registry.prepare_submission(
             buf,
             buf_offset,
             (buf.len().saturating_sub(buf_offset)) as u32,
             env,
         )?;
-        self.registry
-            .ensure_page_reg(page_idx, slab_resolver, env)?;
-
-        let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx]
-            .ok_or(RioError::Internal)
-            .attach_note("missing slab page")?;
-
-        let (rio_addr_len, addr_offset) =
-            Self::validate_rio_addr(addr_ptr, addr_len, base_addr, slab_len, page_idx)?;
-        let addr_buf = RIO_BUF {
-            BufferId: addr_buf_id.0,
-            Offset: addr_offset as u32,
-            Length: rio_addr_len,
-        };
-        let request_context = Self::encode_req_ctx(user_data, generation);
+        let addr = self.registry.prepare_send_addr(addr_ptr, addr_len, env)?;
+        let request_context =
+            Self::encode_req_ctx_with_addr(user_data, generation, Some(addr.slot));
 
         if let Err(e) = self
             .kernel
-            .submit_send_ex(rq, &data_buf, &addr_buf, request_context)
+            .submit_send_ex(rq, &data_buf, &addr.rio_buf, request_context)
         {
             Self::free_op_req_ctx(request_context as u64);
+            self.registry.free_addr_slot(Some(addr.slot));
             return Err(e
                 .push_ctx("scope", "rio.runtime.try_submit_send_to_internal")
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
                 .with_ctx("user_data", user_data)
                 .with_ctx("generation", generation)
-                .with_ctx("page_idx", page_idx)
+                .with_ctx("addr_slot", addr.slot)
                 .with_ctx("rq_raw", rq.0 as usize)
                 .with_ctx("data_buffer_id", data_buf.BufferId as usize)
                 .with_ctx("data_buffer_offset", data_buf.Offset)
                 .with_ctx("data_buffer_length", data_buf.Length)
-                .with_ctx("addr_buffer_id", addr_buf.BufferId as usize)
-                .with_ctx("addr_buffer_offset", addr_buf.Offset)
-                .with_ctx("addr_buffer_length", addr_buf.Length)
+                .with_ctx("addr_buffer_id", addr.rio_buf.BufferId as usize)
+                .with_ctx("addr_buffer_offset", addr.rio_buf.Offset)
+                .with_ctx("addr_buffer_length", addr.rio_buf.Length)
                 .with_ctx("outstanding_count", self.outstanding_count)
                 .attach_note("RIOSendEx submit failed"));
         }
@@ -269,16 +171,14 @@ impl RioState {
         &mut self,
         args: RioUdpRecvFromArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> RioResult<SubmissionResult> {
-        self.try_submit_recv_from_internal(args, registrar, slab_resolver)
+        self.try_submit_recv_from_internal(args, registrar)
     }
 
     fn try_submit_recv_from_internal(
         &mut self,
         args: RioUdpRecvFromArgs<'_>,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        slab_resolver: &dyn Fn(usize) -> Option<(*const u8, usize)>,
     ) -> RioResult<SubmissionResult> {
         let RioUdpRecvFromArgs {
             fd,
@@ -287,7 +187,6 @@ impl RioState {
             addr_ptr,
             user_data,
             generation,
-            page_idx,
         } = args;
         let dispatch = self
             .kernel
@@ -304,60 +203,53 @@ impl RioState {
             let actor = self.ensure_actor((fd, handle), env)?;
             actor.rq
         };
-        let socket_key = handle.raw().actor_key();
-        if self.is_iocp_fallback(socket_key) {
-            return RioError::NotSupported.attach_note("Socket is marked for IOCP fallback");
-        }
         let buf_offset = recv_from_op.buf_offset;
         let buf_len = recv_from_op.buf.capacity().saturating_sub(buf_offset) as u32;
         let data_buf =
             self.registry
                 .prepare_submission(&recv_from_op.buf, buf_offset, buf_len, env)?;
-        self.registry
-            .ensure_page_reg(page_idx, slab_resolver, env)?;
+        if addr_ptr.is_null() {
+            return RioError::Internal.attach_note("RIO recv_from received null address buffer");
+        }
 
         let rio_addr_len = std::mem::size_of::<SOCKADDR_INET>() as u32;
-        let (addr_buf_id, base_addr, slab_len) = self.registry.slab_rio_pages[page_idx]
-            .ok_or(RioError::Internal)
-            .attach_note("missing slab page")?;
-        let addr_offset =
-            Self::validate_rio_addr_output(addr_ptr, rio_addr_len, base_addr, slab_len, page_idx)?;
-        let addr_buf = RIO_BUF {
-            BufferId: addr_buf_id.0,
-            Offset: addr_offset as u32,
-            Length: rio_addr_len,
-        };
-        let request_context = Self::encode_req_ctx(user_data, generation);
+        let mut addr = self.registry.prepare_recv_addr(env)?;
+        addr.rio_buf.Length = rio_addr_len;
+        let request_context =
+            Self::encode_req_ctx_with_addr(user_data, generation, Some(addr.slot));
 
-        if let Err(e) = dispatch.receive_ex(RioExConfig {
+        let submit_res = dispatch.receive_ex(RioExConfig {
             rq,
             data_buf: &data_buf,
             data_buf_count: 1,
             local_addr: std::ptr::null(),
-            remote_addr: &addr_buf,
+            remote_addr: &addr.rio_buf,
             control_buf: std::ptr::null(),
             flags_buf: std::ptr::null(),
             flags: 0,
             context: request_context,
-        }) {
+        });
+
+        if let Err(e) = submit_res {
             Self::free_op_req_ctx(request_context as u64);
+            self.registry.free_addr_slot(Some(addr.slot));
             return Err(e
                 .push_ctx("scope", "rio.runtime.try_submit_recv_from_internal")
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
                 .with_ctx("user_data", user_data)
                 .with_ctx("generation", generation)
-                .with_ctx("page_idx", page_idx)
+                .with_ctx("addr_slot", addr.slot)
                 .with_ctx("rq_raw", rq.0 as usize)
                 .with_ctx("data_buffer_id", data_buf.BufferId as usize)
                 .with_ctx("data_buffer_offset", data_buf.Offset)
                 .with_ctx("data_buffer_length", data_buf.Length)
-                .with_ctx("addr_buffer_id", addr_buf.BufferId as usize)
-                .with_ctx("addr_buffer_offset", addr_buf.Offset)
-                .with_ctx("addr_buffer_length", addr_buf.Length)
+                .with_ctx("addr_buffer_id", addr.rio_buf.BufferId as usize)
+                .with_ctx("addr_buffer_offset", addr.rio_buf.Offset)
+                .with_ctx("addr_buffer_length", addr.rio_buf.Length)
                 .with_ctx("outstanding_count", self.outstanding_count)
                 .attach_note("RIOReceiveEx submit failed"));
-        }
+        };
 
         self.outstanding_count += 1;
         Ok(SubmissionResult::Pending)

@@ -518,8 +518,6 @@ pub(crate) fn submit_send_to(
         ctx.file_generations,
     )?);
 
-    // RIO path is mandatory for socket send_to.
-    let page_idx = header.user_data / ctx.slots_per_page;
     let args = crate::rio::RioSendToArgs {
         fd: user.fd,
         handle,
@@ -528,19 +526,17 @@ pub(crate) fn submit_send_to(
         addr_len: payload.addr_len,
         user_data: header.user_data,
         generation: header.generation,
-        page_idx,
         buf_offset: user.buf_offset,
     };
     mark_header_in_flight(
         header,
         ctx.rio
-            .try_submit_send_to(args, ctx.registrar, ctx.slab_resolver)
+            .try_submit_send_to(args, ctx.registrar)
             .with_ctx("outer_scope", "submit_send_to")
             .with_ctx("fd_fixed_index", user.fd.fixed_index())
             .with_ctx("fd_generation", user.fd.generation())
             .with_ctx("user_data", header.user_data)
             .with_ctx("generation", header.generation)
-            .with_ctx("page_idx", page_idx)
             .attach_note("RIO send_to submit failed")
             .trans(),
     )
@@ -568,8 +564,6 @@ pub(crate) fn submit_udp_recv_from(
         ctx.registered_files,
         ctx.file_generations,
     )?);
-    let page_idx = header.user_data / ctx.slots_per_page;
-
     let args = RioUdpRecvFromArgs {
         fd,
         handle,
@@ -577,18 +571,16 @@ pub(crate) fn submit_udp_recv_from(
         addr_ptr: (&mut payload.addr as *mut SockAddrStorage).cast::<std::ffi::c_void>(),
         user_data: header.user_data,
         generation: header.generation,
-        page_idx,
     };
     mark_header_in_flight(
         header,
         ctx.rio
-            .try_submit_recv_from(args, ctx.registrar, ctx.slab_resolver)
+            .try_submit_recv_from(args, ctx.registrar)
             .with_ctx("outer_scope", "submit_udp_recv_from")
             .with_ctx("fd_fixed_index", fd.fixed_index())
             .with_ctx("fd_generation", fd.generation())
             .with_ctx("user_data", header.user_data)
             .with_ctx("generation", header.generation)
-            .with_ctx("page_idx", page_idx)
             .attach_note("RIO udp_recv_from submit failed")
             .trans(),
     )

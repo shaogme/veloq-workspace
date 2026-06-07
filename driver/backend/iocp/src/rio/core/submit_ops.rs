@@ -35,21 +35,13 @@ impl RioState {
 
         Ok(Self {
             kernel,
-            registry: RioRegistry::new(rq_depth),
+            registry: RioRegistry::new(rq_depth, entries as usize),
             registration_mode,
             actors: slotmap::SlotMap::with_key(),
             actor_by_handle: rustc_hash::FxHashMap::default(),
             socket_runtime: rustc_hash::FxHashMap::default(),
             outstanding_count: 0,
         })
-    }
-
-    pub(crate) fn resize_rqs(&mut self, size: usize) {
-        self.registry.resize_rqs(size);
-    }
-
-    pub(crate) fn clear_registered_rq(&mut self, idx: usize) {
-        self.registry.clear_registered_rq(idx);
     }
 
     pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> RioResult<()> {
@@ -101,9 +93,6 @@ impl RioState {
                 .attach_note("failed to ensure RIO actor")?;
             actor.rq
         };
-        if self.is_iocp_fallback(handle.raw().actor_key()) {
-            return RioError::NotSupported.attach_note("Socket is marked for IOCP fallback");
-        }
         let rio_buf = self.registry.prepare_submission(
             buf,
             buf_offset,
@@ -166,9 +155,6 @@ impl RioState {
 
             actor.rq
         };
-        if self.is_iocp_fallback(handle.raw().actor_key()) {
-            return RioError::NotSupported.attach_note("Socket is marked for IOCP fallback");
-        }
         let rio_buf = self.registry.prepare_submission(
             buf,
             buf_offset,
