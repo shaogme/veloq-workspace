@@ -12,6 +12,7 @@ pub struct IocpOpState {
     pub(crate) timer_id: Option<veloq_wheel::TaskId>,
     pub(crate) timer_deadline: Option<Instant>,
     pub(crate) is_background: bool,
+    pub(crate) rio_cancel_requested: bool,
 }
 
 pub enum IocpSlotSpec {}

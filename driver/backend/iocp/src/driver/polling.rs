@@ -17,6 +17,12 @@ use crate::op::IocpUserPayload;
 
 use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY};
 
+#[derive(Default)]
+pub(super) struct CompletionProgress {
+    pub(super) iocp: usize,
+    pub(super) rio: usize,
+}
+
 pub(super) struct CompletionPump {
     port: Arc<crate::win32::IoCompletionPort>,
     is_notified: Arc<AtomicBool>,
@@ -121,7 +127,10 @@ impl TimerEngine {
 }
 
 impl<'a> IocpDriver<'a> {
-    pub(super) fn poll_completion(&mut self, timeout: Duration) -> IocpDriverResult<usize> {
+    pub(super) fn poll_completion(
+        &mut self,
+        timeout: Duration,
+    ) -> IocpDriverResult<CompletionProgress> {
         let status = self
             .completion
             .port()
@@ -137,7 +146,7 @@ impl<'a> IocpDriver<'a> {
                 success,
                 error_code,
             } => self.handle_completion_status(bytes, key, overlapped, success, error_code),
-            crate::win32::CompletionStatus::Timeout => Ok(0),
+            crate::win32::CompletionStatus::Timeout => Ok(CompletionProgress::default()),
         }
     }
 
@@ -163,7 +172,8 @@ impl<'a> IocpDriver<'a> {
                 success,
                 error_code,
             } => {
-                self.handle_completion_status(bytes, key, overlapped, success, error_code)?;
+                let _ =
+                    self.handle_completion_status(bytes, key, overlapped, success, error_code)?;
             }
             crate::win32::CompletionStatus::Timeout => {}
         }
@@ -186,7 +196,7 @@ impl<'a> IocpDriver<'a> {
         overlapped: *mut crate::win32::Overlapped,
         success: bool,
         error_code: Option<u32>,
-    ) -> IocpDriverResult<usize> {
+    ) -> IocpDriverResult<CompletionProgress> {
         if key == RIO_EVENT_KEY {
             let processed = {
                 let (rio_state, registrar) = self.rio.state_and_registrar_mut();
@@ -204,17 +214,20 @@ impl<'a> IocpDriver<'a> {
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to process rio completions")
             .trans()?;
-            return Ok(processed);
+            return Ok(CompletionProgress {
+                iocp: 0,
+                rio: processed,
+            });
         }
 
         let user_data = self.resolve_user_data(overlapped, success, key, error_code)?;
         if user_data == WAKEUP_USER_DATA {
             self.completion.clear_notification();
-            return Ok(0);
+            return Ok(CompletionProgress::default());
         }
 
         self.process_completion(user_data, success, error_code, bytes);
-        Ok(1)
+        Ok(CompletionProgress { iocp: 1, rio: 0 })
     }
 
     fn resolve_user_data(
@@ -234,12 +247,11 @@ impl<'a> IocpDriver<'a> {
                     slots = self.ops.local.len(),
                     "completed index out of bounds"
                 );
-                return Err(IocpError::CompletionWait
-                    .to_report()
+                return IocpError::CompletionWait
                     .push_ctx("scope", "iocp/driver")
                     .with_ctx("completed_index", idx)
                     .with_ctx("slot_count", self.ops.local.len())
-                    .attach_note("completed index out of bounds"));
+                    .attach_note("completed index out of bounds");
             }
             Ok(idx)
         } else {

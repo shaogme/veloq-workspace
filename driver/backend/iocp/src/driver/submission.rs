@@ -69,6 +69,7 @@ impl<'a> IocpDriver<'a> {
         let mut guard = ops.slot_reserve(user_data);
         let generation = guard.entry.generation(Ordering::Acquire);
         guard.platform_mut().generation = generation;
+        guard.platform_mut().rio_cancel_requested = false;
         let mut guard = guard.init_op_with(op, |sidecar| {
             sidecar.user_data = user_data;
             sidecar.generation = generation;

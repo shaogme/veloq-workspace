@@ -194,6 +194,7 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
     server
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("server bind failed");
+    let server_addr = server.local_addr().expect("server local_addr failed");
     let server_fd = register_owned_socket(&mut driver, server);
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
@@ -214,11 +215,15 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
     let (ud, generation) = submit_test_op(&mut driver, recv_op);
 
     driver.cancel_op(ud);
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client bind failed");
+    client
+        .send_to(b"cancel-drain", server_addr)
+        .expect("client send_to failed");
     let err = wait_completion(
         &mut driver,
         ud,
         generation,
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(5),
     )
     .expect_err("cancelled udp_recv_from should fail");
     assert_eq!(

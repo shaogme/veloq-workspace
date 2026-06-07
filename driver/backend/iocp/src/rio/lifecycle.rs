@@ -26,6 +26,7 @@ pub(crate) struct DeferredRioCleanup {
     socket_runtime: FxHashMap<SocketKey, crate::rio::SocketRuntimeState>,
     outstanding_count: usize,
     next_request_id: u64,
+    deferred_payloads: Vec<crate::op::IocpUserPayload>,
 }
 
 // SAFETY: DeferredRioCleanup is transferred by ownership to a single reaper thread.
@@ -42,10 +43,19 @@ impl DeferredRioCleanup {
             socket_runtime: self.socket_runtime,
             outstanding_count: self.outstanding_count,
             next_request_id: self.next_request_id,
+            deferred_payloads: self.deferred_payloads,
         };
         state.begin_shutdown();
         if let Err(e) = state.drain_outstanding(RIO_REAPER_DRAIN_TIMEOUT) {
             tracing::warn!(error = ?e, "RioReaper: background drain timed out");
+            if state.outstanding_count > 0 {
+                tracing::warn!(
+                    outstanding_count = state.outstanding_count,
+                    "RioReaper: leaking deferred RIO state to keep in-flight buffers alive"
+                );
+                std::mem::forget(state);
+                return;
+            }
         }
         state.finalize_cleanup();
     }
@@ -159,7 +169,12 @@ impl RioState {
             socket_runtime: std::mem::take(&mut self.socket_runtime),
             outstanding_count: std::mem::take(&mut self.outstanding_count),
             next_request_id: self.next_request_id,
+            deferred_payloads: std::mem::take(&mut self.deferred_payloads),
         })
+    }
+
+    pub(crate) fn defer_payloads(&mut self, payloads: Vec<crate::op::IocpUserPayload>) {
+        self.deferred_payloads.extend(payloads);
     }
 }
 

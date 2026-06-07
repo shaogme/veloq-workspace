@@ -649,26 +649,35 @@ impl RioRegistry {
 
     fn validate_send_addr(addr_ptr: *const std::ffi::c_void, addr_len: i32) -> RioResult<u32> {
         if addr_ptr.is_null() {
-            return RioError::Internal.attach_note("RIO send_to received null address");
+            return RioError::InvalidInput.attach_note("RIO send_to received null address");
         }
         if addr_len < 0 {
-            return RioError::Internal
+            return RioError::InvalidInput
                 .with_ctx("address_len", addr_len)
                 .attach_note("RIO send_to invalid negative address length");
         }
-        // SAFETY: addr_ptr is checked for null, and sa_family is a standard field in SOCKADDR.
-        let family = unsafe { (*(addr_ptr as *const SOCKADDR)).sa_family };
+        if (addr_len as usize) < std::mem::size_of::<SOCKADDR>() {
+            return RioError::InvalidInput
+                .with_ctx("address_len", addr_len)
+                .with_ctx("min_address_len", std::mem::size_of::<SOCKADDR>())
+                .attach_note("RIO send_to address too short for SOCKADDR");
+        }
+        // SAFETY: addr_ptr is non-null and at least SOCKADDR-sized; read_unaligned avoids
+        // imposing alignment requirements on future raw-pointer callers.
+        let family = unsafe {
+            std::ptr::addr_of!((*(addr_ptr as *const SOCKADDR)).sa_family).read_unaligned()
+        };
         let min_len = match family {
             AF_INET => std::mem::size_of::<SOCKADDR_IN>(),
             AF_INET6 => std::mem::size_of::<SOCKADDR_IN6>(),
             _ => {
-                return RioError::Internal
+                return RioError::InvalidInput
                     .with_ctx("address_family", family)
                     .attach_note("RIO unsupported address family");
             }
         };
         if (addr_len as usize) < min_len {
-            return RioError::Internal
+            return RioError::InvalidInput
                 .with_ctx("address_len", addr_len)
                 .with_ctx("min_address_len", min_len)
                 .attach_note("RIO send_to invalid address length");
@@ -748,6 +757,63 @@ mod tests {
                 .expect_err("out-of-bounds RIO offset should fail");
             assert_eq!(*err.inner(), RioError::InvalidInput);
         }
+    }
+
+    #[test]
+    fn rio_send_addr_validation_rejects_short_sockaddr_before_family_read() {
+        let bytes = [0_u8; 1];
+        let err = RioRegistry::validate_send_addr(bytes.as_ptr().cast(), bytes.len() as i32)
+            .expect_err("short sockaddr should fail before reading sa_family");
+
+        assert_eq!(*err.inner(), RioError::InvalidInput);
+    }
+
+    #[test]
+    fn rio_send_addr_validation_rejects_invalid_lengths_and_families() {
+        // SAFETY: SOCKADDR is a plain WinSock address header and all-zero bytes are valid here.
+        let mut sockaddr: SOCKADDR = unsafe { std::mem::zeroed() };
+        let err = RioRegistry::validate_send_addr((&sockaddr as *const SOCKADDR).cast(), -1)
+            .expect_err("negative sockaddr length should fail");
+        assert_eq!(*err.inner(), RioError::InvalidInput);
+
+        sockaddr.sa_family = AF_INET6;
+        let err = RioRegistry::validate_send_addr(
+            (&sockaddr as *const SOCKADDR).cast(),
+            std::mem::size_of::<SOCKADDR>() as i32,
+        )
+        .expect_err("IPv6 sockaddr shorter than SOCKADDR_IN6 should fail");
+        assert_eq!(*err.inner(), RioError::InvalidInput);
+
+        sockaddr.sa_family = 0x7fff;
+        let err = RioRegistry::validate_send_addr(
+            (&sockaddr as *const SOCKADDR).cast(),
+            std::mem::size_of::<SOCKADDR>() as i32,
+        )
+        .expect_err("unsupported sockaddr family should fail");
+        assert_eq!(*err.inner(), RioError::InvalidInput);
+    }
+
+    #[test]
+    fn rio_send_addr_validation_accepts_ipv4_and_ipv6_lengths() {
+        // SAFETY: SOCKADDR_IN is POD; the test fills the family field explicitly.
+        let mut ipv4: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        ipv4.sin_family = AF_INET;
+        let rio_len = RioRegistry::validate_send_addr(
+            (&ipv4 as *const SOCKADDR_IN).cast(),
+            std::mem::size_of::<SOCKADDR_IN>() as i32,
+        )
+        .expect("valid IPv4 sockaddr should pass");
+        assert_eq!(rio_len, std::mem::size_of::<SOCKADDR_INET>() as u32);
+
+        // SAFETY: SOCKADDR_IN6 is POD; the test fills the family field explicitly.
+        let mut ipv6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
+        ipv6.sin6_family = AF_INET6;
+        let rio_len = RioRegistry::validate_send_addr(
+            (&ipv6 as *const SOCKADDR_IN6).cast(),
+            std::mem::size_of::<SOCKADDR_IN6>() as i32,
+        )
+        .expect("valid IPv6 sockaddr should pass");
+        assert_eq!(rio_len, std::mem::size_of::<SOCKADDR_INET>() as u32);
     }
 
     #[test]

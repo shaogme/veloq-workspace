@@ -332,15 +332,15 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let (user_data, generation) = submit_test_op(&mut driver, recv_op);
 
     driver.cancel_op(user_data);
+    let _ = tx_send.send(());
 
-    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(1));
+    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(5));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
         completion_os_error_code(&err),
         Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
     );
 
-    let _ = tx_send.send(());
     server_thread.join().unwrap();
     driver.unregister_files(vec![client_fd]).unwrap();
 }
@@ -408,19 +408,20 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
 
     driver.cancel_op(user_data);
 
-    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(1));
+    assert!(
+        !remote_free_contains(&driver, user_data),
+        "取消后真实 RIO completion 到来前不应回收槽位"
+    );
+
+    let _ = tx_send.send(());
+
+    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(5));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
         completion_os_error_code(&err),
         Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
     );
 
-    assert!(
-        remote_free_contains(&driver, user_data),
-        "取消完成后应立即回收槽位"
-    );
-
-    let _ = tx_send.send(());
     let drain_start = std::time::Instant::now();
     while drain_start.elapsed() < Duration::from_secs(2) {
         let _ = driver.drive(DriveMode::Poll);

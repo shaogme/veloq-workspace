@@ -78,4 +78,5 @@ pub(crate) struct RioState {
     pub(crate) socket_runtime: FxHashMap<SocketKey, SocketRuntimeState>,
     pub(crate) outstanding_count: usize,
     pub(crate) next_request_id: u64,
+    pub(crate) deferred_payloads: Vec<crate::op::IocpUserPayload>,
 }

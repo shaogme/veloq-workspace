@@ -17,6 +17,19 @@ use super::polling::{CompletionPump, TimerEngine};
 use super::registration::HandleRegistry;
 use super::{CloseMode, IocpDriver, IocpDriverResult, IocpOpRegistry, PreInit};
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct ShutdownPending {
+    pub(super) iocp_pending: usize,
+    pub(super) rio_pending: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownOpKind {
+    Iocp,
+    Rio,
+    Immediate,
+}
+
 pub(super) struct IocpRioRuntime<'a> {
     state: RioState,
     registrar: Box<dyn BufferRegistrar + 'a>,
@@ -124,36 +137,63 @@ impl<'a> IocpDriver<'a> {
             WSAStartup(0x0202, &mut data)
         };
         if ret != 0 {
-            return Err(IocpError::DriverInit
-                .to_report()
+            return IocpError::DriverInit
                 .push_ctx("scope", "iocp/driver")
                 .set_error_code(ret)
-                .attach_note("WSAStartup failed"));
+                .attach_note("WSAStartup failed");
         }
         Ok(WinsockGuard)
     }
 
-    pub(super) fn shutdown_ops(&mut self) -> usize {
+    pub(super) fn shutdown_ops(&mut self) -> ShutdownPending {
         if self.shutting_down {
-            return 0;
+            return ShutdownPending::default();
         }
         self.shutting_down = true;
         self.rio.state_mut().begin_shutdown();
 
         let mut in_flight = Vec::new();
+        let mut pending = ShutdownPending::default();
         for user_data in 0..self.ops.local.len() {
-            if matches!(
-                self.ops.slot_view(user_data),
-                Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_))
-            ) {
-                in_flight.push(user_data);
+            let kind = match self.ops.slot_view(user_data) {
+                Some(SlotView::InFlightWaiting(mut slot)) => {
+                    if slot.platform().timer_id.is_some() {
+                        Some(ShutdownOpKind::Immediate)
+                    } else if slot
+                        .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                        .unwrap_or(false)
+                    {
+                        Some(ShutdownOpKind::Rio)
+                    } else {
+                        Some(ShutdownOpKind::Iocp)
+                    }
+                }
+                Some(SlotView::InFlightOrphaned(slot)) => {
+                    if slot.platform().timer_id.is_some() {
+                        Some(ShutdownOpKind::Immediate)
+                    } else if slot.op.as_ref().map(Self::is_rio_op).unwrap_or(false) {
+                        Some(ShutdownOpKind::Rio)
+                    } else {
+                        Some(ShutdownOpKind::Iocp)
+                    }
+                }
+                _ => None,
+            };
+
+            let Some(kind) = kind else {
+                continue;
+            };
+            match kind {
+                ShutdownOpKind::Iocp => pending.iocp_pending += 1,
+                ShutdownOpKind::Rio => pending.rio_pending += 1,
+                ShutdownOpKind::Immediate => {}
             }
+            in_flight.push(user_data);
         }
-        let count = in_flight.len();
         for user_data in in_flight {
             self.cancel_op_internal(user_data);
         }
-        count
+        pending
     }
 
     pub(super) fn drain_pending_iocp(
@@ -177,9 +217,56 @@ impl<'a> IocpDriver<'a> {
             if now >= deadline {
                 return Err(IocpError::CompletionWait.report("iocp/driver", "drain timed out"));
             }
-            drained += self.poll_completion(deadline.saturating_duration_since(now))?;
+            let progress = self.poll_completion(deadline.saturating_duration_since(now))?;
+            drained += progress.iocp;
+            let _rio_progress = progress.rio;
         }
         Ok(())
+    }
+
+    fn preserve_rio_payloads_for_fast_close(&mut self) {
+        let mut rio_slots = Vec::new();
+        for user_data in 0..self.ops.local.len() {
+            let is_rio = match self.ops.slot_view(user_data) {
+                Some(SlotView::InFlightWaiting(mut slot)) => slot
+                    .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                    .unwrap_or(false),
+                Some(SlotView::InFlightOrphaned(slot)) => {
+                    slot.op.as_ref().map(Self::is_rio_op).unwrap_or(false)
+                }
+                _ => false,
+            };
+            if is_rio {
+                rio_slots.push(user_data);
+            }
+        }
+
+        let mut payloads = Vec::new();
+        for user_data in rio_slots {
+            match self.ops.slot_view(user_data) {
+                Some(SlotView::InFlightWaiting(mut slot)) => {
+                    slot.platform_mut().rio_cancel_requested = true;
+                    let _ = slot.with_op_mut(|iocp_op| iocp_op.unbind_user_payload());
+                }
+                Some(SlotView::InFlightOrphaned(mut slot)) => {
+                    slot.platform_mut().rio_cancel_requested = true;
+                    if let Some(iocp_op) = slot.op.as_mut() {
+                        iocp_op.unbind_user_payload();
+                    }
+                }
+                _ => {}
+            }
+
+            if let Some(payload) = self
+                .ops
+                .with_slot_storage_mut(user_data, |_result, payload, _sidecar| payload.take())
+                .flatten()
+            {
+                payloads.push(payload);
+            }
+        }
+
+        self.rio.state_mut().defer_payloads(payloads);
     }
 
     pub(super) fn close_impl(&mut self, mode: CloseMode) -> IocpDriverResult<()> {
@@ -188,17 +275,30 @@ impl<'a> IocpDriver<'a> {
         }
         let pending = self.shutdown_ops();
         if let CloseMode::Strict { timeout } = mode {
-            self.drain_pending_iocp(pending, timeout)
+            self.drain_pending_iocp(pending.iocp_pending, timeout)
                 .push_ctx("scope", "iocp/driver")
                 .attach_note("drain pending iocp timed out")?;
-            self.rio
-                .state_mut()
-                .drain_outstanding(timeout)
-                .push_ctx("scope", "iocp/driver")
-                .attach_note("failed to drain RIO outstanding requests")
-                .trans()?;
+            {
+                let completion_events = self.completion.events();
+                let completion_table = self.completion.table();
+                let (rio_state, registrar) = self.rio.state_and_registrar_mut();
+                rio_state
+                    .drain_outstanding_with_ops(
+                        timeout,
+                        &mut self.ops,
+                        &self.extensions,
+                        registrar,
+                        completion_events,
+                        completion_table,
+                    )
+                    .push_ctx("scope", "iocp/driver")
+                    .attach_note("failed to drain RIO outstanding requests")
+                    .trans()?;
+            }
+            self.rio.state_mut().kernel.close();
+        } else if pending.rio_pending > 0 || self.rio.state().outstanding_count > 0 {
+            self.preserve_rio_payloads_for_fast_close();
         }
-        self.rio.state_mut().kernel.close();
         self.closed = true;
         Ok(())
     }

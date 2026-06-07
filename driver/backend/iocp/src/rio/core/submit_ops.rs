@@ -42,6 +42,7 @@ impl RioState {
             socket_runtime: rustc_hash::FxHashMap::default(),
             outstanding_count: 0,
             next_request_id: 0,
+            deferred_payloads: Vec::new(),
         })
     }
 

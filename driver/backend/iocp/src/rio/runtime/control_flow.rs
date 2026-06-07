@@ -16,6 +16,7 @@ use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
 use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
+use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 pub(crate) struct RioSocketActor {
@@ -80,11 +81,20 @@ impl<'a> RioCompletionRouter<'a> {
                 Some(SlotView::InFlightWaiting(mut slot))
                     if slot.platform().generation == generation =>
                 {
-                    let mut completion = if res.Status == 0 {
-                        Ok(res.BytesTransferred as usize)
-                    } else {
+                    let cancelled = slot.platform().rio_cancel_requested;
+                    let mut completion = if cancelled {
                         Err(IocpError::CompletionWait
                             .to_report()
+                            .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
+                            .with_ctx("socket_raw", socket_key.as_handle() as usize)
+                            .with_ctx("rio_op_kind", op_kind.as_str())
+                            .with_ctx("rio_request_id", request_id)
+                            .set_error_code(ERROR_OPERATION_ABORTED as i32)
+                            .attach_note("RIO operation was cancelled before kernel completion"))
+                    } else if res.Status == 0 {
+                        Ok(res.BytesTransferred as usize)
+                    } else {
+                        IocpError::CompletionWait
                             .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
                             .with_ctx("socket_raw", socket_key.as_handle() as usize)
                             .with_ctx("rio_op_kind", op_kind.as_str())
@@ -95,12 +105,13 @@ impl<'a> RioCompletionRouter<'a> {
                             .with_ctx("data_buffer_length", diagnostics.data_buffer_length)
                             .with_ctx("addr_slot", addr_slot.unwrap_or(usize::MAX))
                             .set_error_code(res.Status)
-                            .attach_note("rio completion returned os error"))
+                            .attach_note("rio completion returned os error")
                     };
                     let _ = slot.with_op_mut(|iocp_op| {
                         if let Some(addr_slot) = addr_slot
                             && let crate::op::IocpOpPayload::UdpRecvFrom(payload) =
                                 &mut iocp_op.payload
+                            && !cancelled
                             && completion.is_ok()
                             && let Err(e) = self
                                 .registry
@@ -117,7 +128,7 @@ impl<'a> RioCompletionRouter<'a> {
                         if iocp_op.header.in_flight {
                             iocp_op.header.in_flight = false;
                         }
-                        if let Ok(bytes) = completion.as_ref().copied() {
+                        if !cancelled && let Ok(bytes) = completion.as_ref().copied() {
                             completion = iocp_op
                                 .on_complete(bytes, self.comp.ext)
                                 .with_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
@@ -308,5 +319,42 @@ impl RioState {
             router.registry.flush_deregs(router.env);
         }
         Ok(router.completed_count)
+    }
+
+    pub(crate) fn drain_outstanding_with_ops(
+        &mut self,
+        timeout: std::time::Duration,
+        ops: &mut IocpOpRegistry,
+        ext: &crate::ext::Extensions,
+        registrar: &dyn veloq_buf::BufferRegistrar,
+        completion_events: &SharedCompletionQueue,
+        completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
+    ) -> RioResult<()> {
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| {
+                RioError::Internal
+                    .to_report()
+                    .with_ctx("timeout_ms", timeout.as_millis() as u64)
+                    .attach_note("strict close RIO drain timeout is too large")
+            })?;
+
+        while self.outstanding_count > 0 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return RioError::Internal
+                    .with_ctx("outstanding_count", self.outstanding_count)
+                    .with_ctx("timeout_ms", timeout.as_millis() as u64)
+                    .attach_note("strict close timed out while draining RIO outstanding requests");
+            }
+
+            let processed =
+                self.process_completions(ops, ext, registrar, completion_events, completion_table)?;
+            if processed == 0 {
+                std::thread::yield_now();
+            }
+        }
+
+        Ok(())
     }
 }
