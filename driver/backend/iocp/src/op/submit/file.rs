@@ -206,15 +206,6 @@ fn close_unconsumed_file_handle(raw: usize) {
     }
 }
 
-fn close_file_handle(handle: HANDLE) -> io::Result<usize> {
-    let ret = unsafe { CloseHandle(handle) };
-    if ret == 0 {
-        Err(last_os_error())
-    } else {
-        Ok(0)
-    }
-}
-
 fn duplicate_file_handle(handle: HANDLE) -> io::Result<crate::win32::OwnedHandle> {
     let process = unsafe { GetCurrentProcess() };
     let mut duplicated = ptr::null_mut();
@@ -361,23 +352,11 @@ pub(crate) fn submit_open(
 ///
 /// The caller must ensure that header, payload, and ctx are valid for the duration of the call.
 pub(crate) fn submit_close(
-    header: &mut OverlappedEntry,
-    payload: &mut KernelRef<Close>,
-    ctx: &mut SubmitContext,
+    _header: &mut OverlappedEntry,
+    _payload: &mut KernelRef<Close>,
+    _ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
-    // SAFETY: The caller guarantees that payload is valid.
-    let user = unsafe { payload.user.as_ref() };
-    let handle = resolve_fd_borrowed(&user.fd, ctx.registered_files, ctx.file_generations)?;
-    header.resolved_handle = Some(resolve_fd_handle(
-        &user.fd,
-        ctx.registered_files,
-        ctx.file_generations,
-    )?);
-
-    let result = close_file_handle(handle.raw().as_handle());
-    let completion = make_blocking_completion(header, ctx, None);
-    completion.store_result(result);
-    Ok(SubmissionResult::PostToQueue)
+    IocpError::InvalidState.attach_note("registered Close operations are handled by the driver")
 }
 
 /// # Safety

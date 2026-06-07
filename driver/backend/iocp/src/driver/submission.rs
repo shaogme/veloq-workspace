@@ -11,10 +11,12 @@ use veloq_driver_core::driver::{
 use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
+use crate::config::IoFd;
 use crate::driver::{CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry};
 use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
+use crate::op::overlapped::BlockingCompletion;
 use crate::op::slot::Slot;
-use crate::op::{IocpOp, IocpUserPayload, SubmitContext, submit};
+use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload, SubmitContext, submit};
 
 pub(crate) struct SubmitContextInternal<'a> {
     port: Arc<crate::win32::IoCompletionPort>,
@@ -44,6 +46,16 @@ struct BlockingBridge;
 impl BlockingBridge {
     fn submit(task: BlockingTask) -> bool {
         veloq_blocking::get_blocking_pool().execute(task).is_ok()
+    }
+}
+
+fn close_fd_from_op(op: &IocpOp) -> Option<IoFd> {
+    match &op.payload {
+        IocpOpPayload::Close(payload) => {
+            // SAFETY: the slot payload is bound before submission starts.
+            Some(unsafe { payload.user.as_ref() }.fd)
+        }
+        _ => None,
     }
 }
 
@@ -212,30 +224,66 @@ impl<'a> IocpDriver<'a> {
             &mut sidecar.inner as *mut crate::win32::Overlapped
         });
 
-        let (rio, registrar) = self.rio.state_and_registrar_mut();
-        let mut ctx = SubmitContext {
-            port: self.completion.port_arc(),
-            overlapped,
-            ext: &self.extensions,
-            registered_files: self.handles.registered_files(),
-            file_generations: self.handles.file_generations(),
-            registrar,
-            rio,
-        };
-
         let mut sub_guard = guard.start_submission_with(Some(|slot| {
             slot.storage
                 .with_mut(|_result, _payload, sidecar| sidecar.in_flight = false);
         }));
-        let result = sub_guard
+        let close_fd = sub_guard
             .slot
             .as_mut()
-            .and_then(|slot| slot.with_op_mut(|op| op.submit(&mut ctx)))
-            .ok_or_else(|| {
-                IocpError::InvalidState.report("iocp/driver", "op missing during submission")
-            })?
-            .push_ctx("scope", "iocp/driver")
-            .attach_note("op submit failed");
+            .and_then(|slot| slot.with_op_mut(|op| close_fd_from_op(op)))
+            .flatten();
+
+        let result = if let Some(fd) = close_fd {
+            let close_result = super::registration::close_registered_owned_fd(
+                &mut self.handles,
+                self.rio.state_mut(),
+                fd,
+            );
+
+            close_result.and_then(|(raw_handle, io_result)| {
+                let completion =
+                    BlockingCompletion::new(self.completion.port_arc(), user_data, None);
+                completion.store_result(io_result);
+
+                sub_guard
+                    .slot
+                    .as_mut()
+                    .and_then(|slot| {
+                        slot.with_op_mut(|op| {
+                            op.header.resolved_handle = Some(raw_handle);
+                            op.header.blocking_completion = Some(completion);
+                        })
+                    })
+                    .ok_or_else(|| {
+                        IocpError::InvalidState
+                            .report("iocp/driver", "op missing during Close submission")
+                    })?;
+
+                Ok(submit::SubmissionResult::PostToQueue)
+            })
+        } else {
+            let (rio, registrar) = self.rio.state_and_registrar_mut();
+            let mut ctx = SubmitContext {
+                port: self.completion.port_arc(),
+                overlapped,
+                ext: &self.extensions,
+                registered_files: self.handles.registered_files(),
+                file_generations: self.handles.file_generations(),
+                registrar,
+                rio,
+            };
+
+            sub_guard
+                .slot
+                .as_mut()
+                .and_then(|slot| slot.with_op_mut(|op| op.submit(&mut ctx)))
+                .ok_or_else(|| {
+                    IocpError::InvalidState.report("iocp/driver", "op missing during submission")
+                })?
+        }
+        .push_ctx("scope", "iocp/driver")
+        .attach_note("op submit failed");
 
         let pending_socket_key = if matches!(result, Ok(submit::SubmissionResult::Pending)) {
             sub_guard

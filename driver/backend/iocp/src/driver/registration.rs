@@ -1,14 +1,18 @@
 use std::collections::VecDeque;
+use std::io;
 
-use diagweave::prelude::{ResultReportExt, Transform};
+use diagweave::prelude::*;
 use veloq_driver_core::driver::RegisterFd;
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Networking::WinSock::{
-    SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
+    INVALID_SOCKET, SO_TYPE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError,
+    closesocket, getsockopt,
 };
 
-use crate::config::{IoFd, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
+use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
 use crate::driver::{IocpDriver, IocpDriverResult};
 use crate::error::{IocpError, IocpResult};
+use crate::rio::RioState;
 
 pub(super) struct DeferredSocketCleanup {
     handle: SocketKey,
@@ -93,6 +97,47 @@ impl HandleRegistry {
         self.registered_files[idx].take().map(|entry| (idx, entry))
     }
 
+    fn take_owned_for_close(&mut self, fd: IoFd) -> IocpResult<(usize, RegisteredHandle)> {
+        let idx = fd.fixed_index() as usize;
+        let Some(&generation) = self.file_generations.get(idx) else {
+            return IocpError::ResolveFd
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .attach_note("registered file descriptor index out of bounds");
+        };
+
+        if generation != fd.generation() {
+            return IocpError::ResolveFd
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("current_generation", generation)
+                .attach_note("stale registered file descriptor generation");
+        }
+
+        let Some(slot) = self.registered_files.get_mut(idx) else {
+            return IocpError::ResolveFd
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .attach_note("registered file descriptor index out of bounds");
+        };
+
+        match slot {
+            Some(RegisteredHandle::Owned(_)) => Ok((
+                idx,
+                slot.take()
+                    .expect("owned registered handle disappeared during close"),
+            )),
+            Some(RegisteredHandle::Weak(_)) => IocpError::InvalidInput
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .attach_note("Close is only valid for owned registered file descriptors"),
+            None => IocpError::ResolveFd
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .attach_note("invalid registered file descriptor"),
+        }
+    }
+
     fn release_slot(&mut self, idx: usize) {
         self.free_slots.push(idx);
         self.file_generations[idx] = self.file_generations[idx].wrapping_add(1);
@@ -114,6 +159,64 @@ impl HandleRegistry {
         self.deferred_socket_cleanup
             .push_back(DeferredSocketCleanup::new(handle, entry));
     }
+}
+
+fn close_iocp_handle(handle: IocpHandle) -> io::Result<usize> {
+    match handle {
+        IocpHandle::File { handle } => {
+            let ret = unsafe { CloseHandle(handle) };
+            if ret == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(0)
+            }
+        }
+        IocpHandle::Socket { handle, .. } => {
+            let socket = handle as SOCKET;
+            let ret = unsafe { closesocket(socket) };
+            if ret == SOCKET_ERROR || socket == INVALID_SOCKET {
+                Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+            } else {
+                Ok(0)
+            }
+        }
+    }
+}
+
+fn close_owned_entry_now(entry: RegisteredHandle) -> io::Result<usize> {
+    match entry {
+        RegisteredHandle::Owned(handle) => close_iocp_handle(handle.into_raw().raw()),
+        RegisteredHandle::Weak(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Close is only valid for owned registered file descriptors",
+        )),
+    }
+}
+
+pub(super) fn close_registered_owned_fd(
+    handles: &mut HandleRegistry,
+    rio: &mut RioState,
+    fd: IoFd,
+) -> IocpResult<(IocpHandle, io::Result<usize>)> {
+    let (idx, entry) = handles.take_owned_for_close(fd)?;
+    let raw = entry.as_raw().raw();
+    handles.release_slot(idx);
+
+    let result = if raw.kind() == RawHandleKind::Socket {
+        let key = raw.actor_key();
+        if rio.begin_socket_cleanup(key) {
+            rio.shutdown_actor(key);
+            rio.forget_socket_runtime(key);
+            close_owned_entry_now(entry)
+        } else {
+            handles.defer_socket_cleanup(key, entry);
+            Ok(0)
+        }
+    } else {
+        close_owned_entry_now(entry)
+    };
+
+    Ok((raw, result))
 }
 
 impl<'a> IocpDriver<'a> {
