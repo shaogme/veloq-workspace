@@ -1,252 +1,24 @@
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-use tracing::debug;
-use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
-
-use veloq_driver_core::driver::{
-    SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
-};
-use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
+use std::time::Instant;
 
 use diagweave::prelude::*;
+use tracing::debug;
+use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
 
-use crate::common::{
-    IocpErrorContext, WAKEUP_USER_DATA, completion_record, io_result_to_event_res, iocp_msg,
-    push_completion_shared,
-};
-use crate::config::SocketKey;
-use crate::driver::{
-    CloseMode, CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry, RIO_EVENT_KEY,
-};
+use crate::common::{completion_record, io_result_to_event_res, push_completion_shared};
+use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
 use crate::error::{IocpError, IocpResult};
 use crate::op::slot::Slot;
-use crate::op::{IocpOp, IocpUserPayload, submit};
+use crate::op::{IocpOp, IocpUserPayload};
 
-pub(crate) struct EmitContext<'a> {
-    completion_events: &'a SharedCompletionQueue,
-    completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
-}
-
-pub(crate) struct CancelContext<'a> {
-    registered_files: &'a [Option<crate::config::RegisteredHandle>],
-    file_generations: &'a [u64],
-    completion_events: &'a SharedCompletionQueue,
-    completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
+pub(super) struct EmitContext<'a> {
+    pub(super) completion_events: &'a veloq_driver_core::driver::SharedCompletionQueue,
+    pub(super) completion_table:
+        &'a veloq_driver_core::driver::SharedCompletionTable<IocpUserPayload, IocpError>,
 }
 
 impl<'a> IocpDriver<'a> {
-    pub(crate) fn shutdown_ops(&mut self) -> usize {
-        if self.shutting_down {
-            return 0;
-        }
-        self.shutting_down = true;
-        self.rio.state_mut().begin_shutdown();
-
-        let mut in_flight = Vec::new();
-        for user_data in 0..self.ops.local.len() {
-            if matches!(
-                self.ops.slot_view(user_data),
-                Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_))
-            ) {
-                in_flight.push(user_data);
-            }
-        }
-        let count = in_flight.len();
-        for user_data in in_flight {
-            self.cancel_op_internal(user_data);
-        }
-        count
-    }
-
-    pub(crate) fn drain_pending_iocp(
-        &mut self,
-        pending_count: usize,
-        timeout: Duration,
-    ) -> IocpDriverResult<()> {
-        if pending_count == 0 {
-            return Ok(());
-        }
-        let mut drained = 0usize;
-        let deadline = Instant::now() + timeout;
-
-        while drained < pending_count {
-            if Instant::now() >= deadline {
-                return Err(IocpError::CompletionWait.report("iocp/driver", "drain timed out"));
-            }
-            drained += self.poll_completion()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn poll_completion(&mut self) -> IocpDriverResult<usize> {
-        let status = self
-            .completion
-            .port()
-            .get_status(10)
-            .push_ctx("scope", "iocp/driver")
-            .attach_note("failed to poll IOCP status")?;
-
-        match status {
-            crate::win32::CompletionStatus::Completed {
-                bytes,
-                key,
-                overlapped,
-                success,
-                error_code,
-            } => {
-                if key == RIO_EVENT_KEY {
-                    let processed = {
-                        let (rio_state, registrar) = self.rio.state_and_registrar_mut();
-                        rio_state.process_completions(
-                            &mut self.ops,
-                            &self.extensions,
-                            registrar,
-                            self.completion.events(),
-                            self.completion.table(),
-                        )
-                    }
-                    .inspect(|_| {
-                        self.drain_deferred_socket_cleanup();
-                    })
-                    .push_ctx("scope", "iocp/driver")
-                    .attach_note("failed to process rio completions")
-                    .trans()?;
-                    return Ok(processed);
-                }
-
-                if !overlapped.is_null() {
-                    // SAFETY: overlapped pointer is guaranteed to be valid during IOCP completion.
-                    let id = unsafe { crate::win32::OverlappedId::from_ptr(overlapped) };
-                    self.process_completion(id.as_usize(), success, error_code, bytes);
-                    return Ok(1);
-                }
-            }
-            crate::win32::CompletionStatus::Timeout => {}
-        }
-        Ok(0)
-    }
-
-    pub(crate) fn close_impl(&mut self, mode: CloseMode) -> IocpDriverResult<()> {
-        if self.closed {
-            return Ok(());
-        }
-        let pending = self.shutdown_ops();
-        if let CloseMode::Strict { timeout } = mode {
-            self.drain_pending_iocp(pending, timeout)
-                .push_ctx("scope", "iocp/driver")
-                .attach_note("drain pending iocp timed out")?;
-            self.rio
-                .state_mut()
-                .drain_outstanding(timeout)
-                .push_ctx("scope", "iocp/driver")
-                .attach_note("failed to drain RIO outstanding requests")
-                .trans()?;
-        }
-        self.rio.state_mut().kernel.close();
-        self.closed = true;
-        Ok(())
-    }
-
-    /// Retrieves completion events from the I/O completion port.
-    pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> IocpResult<()> {
-        drain_cancel_requests(self);
-        let wait_ms = self.calculate_wait_ms(timeout_ms);
-
-        let status = self.completion.port().get_status(wait_ms);
-        let now = Instant::now();
-        self.timer.advance_to(now);
-        self.process_timers();
-
-        let status = status
-            .attach_note("failed to get IOCP completion status")
-            .trans()?;
-
-        match status {
-            crate::win32::CompletionStatus::Completed {
-                bytes,
-                key,
-                overlapped,
-                success,
-                error_code,
-            } => {
-                if key == RIO_EVENT_KEY {
-                    {
-                        let (rio_state, registrar) = self.rio.state_and_registrar_mut();
-                        rio_state.process_completions(
-                            &mut self.ops,
-                            &self.extensions,
-                            registrar,
-                            self.completion.events(),
-                            self.completion.table(),
-                        )
-                    }
-                    .inspect(|_| {
-                        self.drain_deferred_socket_cleanup();
-                    })
-                    .attach_note("failed to process RIO completions")
-                    .trans()?;
-                    return Ok(());
-                }
-
-                let user_data = self.resolve_user_data(overlapped, success, key, error_code)?;
-
-                if user_data == WAKEUP_USER_DATA {
-                    self.completion.clear_notification();
-                    return Ok(());
-                }
-                self.process_completion(user_data, success, error_code, bytes);
-            }
-            crate::win32::CompletionStatus::Timeout => {}
-        }
-        Ok(())
-    }
-
-    pub(crate) fn calculate_wait_ms(&self, timeout_ms: u32) -> u32 {
-        if let Some(delay) = self.timer.next_timeout() {
-            let millis = delay.as_millis().min(u32::MAX as u128) as u32;
-            std::cmp::min(timeout_ms, millis)
-        } else {
-            timeout_ms
-        }
-    }
-
-    pub(crate) fn resolve_user_data(
-        &self,
-        overlapped: *mut crate::win32::Overlapped,
-        success: bool,
-        completion_key: usize,
-        error_code: Option<u32>,
-    ) -> IocpResult<usize> {
-        if !overlapped.is_null() {
-            // SAFETY: overlapped is non-null and corresponds to a valid OverlappedEntry.
-            let id = unsafe { crate::win32::OverlappedId::from_ptr(overlapped) };
-            let idx = id.as_usize();
-            if idx >= self.ops.local.len() {
-                debug!(idx, "Completed index out of bounds");
-                return Ok(usize::MAX - 2);
-            }
-            Ok(idx)
-        } else {
-            if !success {
-                let err = error_code.unwrap_or(0);
-                if err == WAIT_TIMEOUT {
-                    return Ok(WAKEUP_USER_DATA);
-                }
-                if completion_key == 0 {
-                    return Err(iocp_msg(
-                        IocpErrorContext::CompletionWait,
-                        "GetQueuedCompletionStatus failed with null overlapped",
-                    )
-                    .with_ctx("os_error_code", err)
-                    .with_ctx("completion_key", completion_key)
-                    .with_ctx("overlapped_is_null", true));
-                }
-            }
-            Ok(completion_key)
-        }
-    }
-
-    pub(crate) fn process_timers(&mut self) {
+    pub(super) fn process_timers(&mut self) {
         let timer_buffer = self.timer.take_buffer();
         let mut pending_events: Vec<CompletionSidecar> = Vec::new();
         let now = Instant::now();
@@ -288,7 +60,7 @@ impl<'a> IocpDriver<'a> {
         self.timer.restore_cleared_buffer(timer_buffer);
     }
 
-    pub(crate) fn finish_timer_op(
+    fn finish_timer_op(
         ops: &mut IocpOpRegistry,
         user_data: usize,
         pending_events: &mut Vec<CompletionSidecar>,
@@ -312,7 +84,7 @@ impl<'a> IocpDriver<'a> {
         ops.remove(user_data);
     }
 
-    pub(crate) fn process_completion(
+    pub(super) fn process_completion(
         &mut self,
         user_data: usize,
         success: bool,
@@ -364,7 +136,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     #[inline]
-    pub(crate) fn with_inflight_slot<R>(
+    pub(super) fn with_inflight_slot<R>(
         ops: &mut IocpOpRegistry,
         index: usize,
         f: impl FnOnce(Slot<'_, InFlightWaiting>) -> R,
@@ -375,7 +147,7 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    pub(crate) fn calculate_io_result(
+    fn calculate_io_result(
         &mut self,
         user_data: usize,
         success: bool,
@@ -411,12 +183,14 @@ impl<'a> IocpDriver<'a> {
                         | crate::op::IocpOpPayload::Fallocate(_)
                         | crate::op::IocpOpPayload::FallocateRaw(_)
                 ) {
-                    io_result = IocpError::CompletionWait
-                        .attach_note("missing blocking result for offloaded file completion");
+                    io_result = Err(IocpError::CompletionWait
+                        .to_report()
+                        .push_ctx("scope", "iocp/driver")
+                        .attach_note("missing blocking result for offloaded file completion"));
                 } else if let Ok(val) = io_result {
                     io_result = iocp_op
                         .on_complete(val, &self.extensions)
-                        .attach_note("IOCP completion hook failed")
+                        .attach_note("IOCP completion hook failed");
                 }
             });
         });
@@ -429,18 +203,10 @@ impl<'a> IocpDriver<'a> {
             return io_result;
         }
 
-        if io_result.is_err() {
-            let _ = self
-                .ops
-                .with_slot_storage_mut(user_data, |result, _payload, _sidecar| {
-                    *result = Some(Err(IocpError::CompletionWait
-                        .report("iocp/driver", "completion without os error")));
-                });
-        }
         io_result
     }
 
-    pub(crate) fn emit_event_inner(
+    pub(super) fn emit_event_inner(
         ctx: EmitContext<'_>,
         ops: &mut IocpOpRegistry,
         user_data: usize,
@@ -451,6 +217,7 @@ impl<'a> IocpDriver<'a> {
         let mut sidecar_to_push = None;
         let handled = Self::with_inflight_slot(ops, user_data, |guard| {
             let completion_res = io_result_to_event_res(&io_result);
+            let mut io_detail = io_result.err().map(Err);
             let mut guard = guard.complete();
 
             if guard.platform_mut().is_background {
@@ -469,7 +236,7 @@ impl<'a> IocpDriver<'a> {
                     res: completion_res,
                     flags: 0,
                     payload,
-                    detail,
+                    detail: detail.or_else(|| io_detail.take()),
                 });
                 let _ = guard.take_op();
                 let _data = std::mem::take(guard.platform_mut());
@@ -490,179 +257,5 @@ impl<'a> IocpDriver<'a> {
                 completion_record(sidecar),
             );
         }
-    }
-
-    pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
-        if !self.ops.contains(user_data) {
-            return;
-        }
-
-        let emit_ctx = EmitContext {
-            completion_events: self.completion.events(),
-            completion_table: self.completion.table(),
-        };
-
-        let timer_id = self
-            .ops
-            .get_mut(user_data)
-            .and_then(|op| op.platform_data.timer_id);
-        if let Some(tid) = timer_id {
-            self.timer.cancel(tid);
-            Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
-            return;
-        }
-
-        let state = self.ops.slot_view(user_data);
-        match state {
-            Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) => {
-                let ctx = CancelContext {
-                    registered_files: self.handles.registered_files(),
-                    file_generations: self.handles.file_generations(),
-                    completion_events: self.completion.events(),
-                    completion_table: self.completion.table(),
-                };
-                if let Some(key) = Self::perform_cancel(ctx, user_data, &mut self.ops) {
-                    self.rio.state_mut().release_socket_inflight(key);
-                    self.drain_deferred_socket_cleanup();
-                }
-            }
-            _ => {
-                Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
-            }
-        }
-    }
-
-    pub(crate) fn perform_cancel(
-        ctx: CancelContext<'_>,
-        user_data: usize,
-        ops: &mut IocpOpRegistry,
-    ) -> Option<SocketKey> {
-        let mut should_emit_aborted = false;
-        let mut aborted_socket_key = None;
-        let handled = match ops.slot_view(user_data) {
-            Some(SlotView::InFlightWaiting(mut guard)) => {
-                let raw_handle = guard
-                    .with_op_mut(|iocp_op| iocp_op.header.resolved_handle)
-                    .flatten()
-                    .or_else(|| {
-                        let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten()?;
-                        submit::resolve_fd_handle(&fd, ctx.registered_files, ctx.file_generations)
-                            .ok()
-                    });
-
-                if let Some(raw_handle) = raw_handle {
-                    let handle = raw_handle.as_handle();
-                    let is_rio = guard
-                        .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
-                        .unwrap_or(false);
-
-                    if is_rio {
-                        let _ = guard.with_op_mut(|iocp_op| {
-                            iocp_op.header.in_flight = false;
-                        });
-                        should_emit_aborted = true;
-                        aborted_socket_key =
-                            raw_handle.is_socket().then_some(raw_handle.actor_key());
-                    } else {
-                        // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
-                        let overlapped_ptr =
-                            guard.storage.with_mut(|_result, _payload, sidecar| {
-                                &mut sidecar.inner as *mut crate::win32::Overlapped
-                            });
-                        // SAFETY: handle and overlapped_ptr are valid for this operation.
-                        let _ = unsafe {
-                            crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
-                        };
-                    }
-                }
-                Some(())
-            }
-            Some(SlotView::InFlightOrphaned(guard)) => {
-                let raw_handle = guard
-                    .op
-                    .as_mut()
-                    .and_then(|iocp_op| iocp_op.header.resolved_handle)
-                    .or_else(|| {
-                        let fd = guard.op.as_mut().and_then(|iocp_op| iocp_op.get_fd())?;
-                        submit::resolve_fd_handle(&fd, ctx.registered_files, ctx.file_generations)
-                            .ok()
-                    });
-
-                if let Some(raw_handle) = raw_handle {
-                    let handle = raw_handle.as_handle();
-                    let is_rio = guard.op.as_ref().map(Self::is_rio_op).unwrap_or(false);
-
-                    if is_rio {
-                        if let Some(iocp_op) = guard.op.as_mut() {
-                            iocp_op.header.in_flight = false;
-                        }
-                        should_emit_aborted = true;
-                        aborted_socket_key =
-                            raw_handle.is_socket().then_some(raw_handle.actor_key());
-                    } else {
-                        let overlapped_ptr =
-                            guard.storage.with_mut(|_result, _payload, sidecar| {
-                                &mut sidecar.inner as *mut crate::win32::Overlapped
-                            });
-                        let _ = unsafe {
-                            crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
-                        };
-                    }
-                }
-                Some(())
-            }
-            _ => None,
-        };
-
-        if handled.is_none() {
-            debug!(user_data, "Skipping cancel for non in-flight slot");
-        } else if should_emit_aborted {
-            let emit_ctx = EmitContext {
-                completion_events: ctx.completion_events,
-                completion_table: ctx.completion_table,
-            };
-            Self::emit_aborted_inner(emit_ctx, user_data, ops);
-            return aborted_socket_key;
-        }
-        None
-    }
-
-    pub(crate) fn emit_aborted_inner(
-        ctx: EmitContext<'_>,
-        user_data: usize,
-        ops: &mut IocpOpRegistry,
-    ) {
-        let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
-        let inflight = Self::with_inflight_slot(ops, user_data, |guard| {
-            let mut guard = guard.complete();
-            let _ = guard.take_op();
-            let data = guard.take_completion_data();
-            let _ = guard.reset();
-            data
-        });
-
-        let (payload, detail) = if let Some(data) = inflight {
-            data
-        } else {
-            ops.with_slot_storage_mut(user_data, |result, payload, _sidecar| {
-                (payload.take(), result.take())
-            })
-            .unwrap_or((None, None))
-        };
-
-        push_completion_shared(
-            ctx.completion_events,
-            ctx.completion_table,
-            completion_record(CompletionSidecar {
-                user_data,
-                generation,
-                res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                flags: 0,
-                payload,
-                detail,
-            }),
-        );
-
-        ops.remove(user_data);
     }
 }

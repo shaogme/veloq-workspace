@@ -10,10 +10,7 @@ use veloq_driver_core::driver::{
 use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
-use crate::driver::{
-    CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry,
-    blocking_bridge::BlockingBridge,
-};
+use crate::driver::{CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry};
 use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
 use crate::op::slot::Slot;
 use crate::op::{IocpOp, IocpUserPayload, SubmitContext, submit};
@@ -38,6 +35,14 @@ impl<'a> SubmitContextInternal<'a> {
             completion_events,
             completion_table,
         }
+    }
+}
+
+struct BlockingBridge;
+
+impl BlockingBridge {
+    fn submit(task: BlockingTask) -> bool {
+        veloq_blocking::get_blocking_pool().execute(task).is_ok()
     }
 }
 

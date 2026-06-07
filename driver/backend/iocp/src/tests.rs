@@ -5,29 +5,18 @@ pub(crate) mod net_udp;
 
 use core::convert::TryFrom;
 use diagweave::prelude::*;
-use std::sync::atomic::Ordering;
 use veloq_driver_core::driver::{
     CompletionRecord, DriveMode, Driver, DriverSubmitResult, PollRecordResult,
     encode_completion_token, event_res_to_result,
 };
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
-use veloq_driver_core::slot::SlotTable;
 
 use crate::driver::IocpDriver;
 use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::op::{IocpOp, IocpUserPayload};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
-    let mut cur = driver.ops.shared.remote_free_head.load(Ordering::Acquire);
-    while cur != SlotTable::<crate::op::slot::IocpSlotSpec>::NULL_INDEX {
-        if cur == needle {
-            return true;
-        }
-        cur = driver.ops.shared.slots[cur]
-            .next_free
-            .load(Ordering::Relaxed);
-    }
-    false
+    driver.debug_remote_free_contains(needle)
 }
 
 pub(crate) fn submit_test_op<T>(driver: &mut IocpDriver, data: T) -> (usize, u32)

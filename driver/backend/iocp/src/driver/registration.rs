@@ -1,13 +1,120 @@
+use std::collections::VecDeque;
+
+use diagweave::prelude::{ResultReportExt, Transform};
+use veloq_driver_core::driver::RegisterFd;
 use windows_sys::Win32::Networking::WinSock::{
     SO_TYPE, SOCKET, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError, getsockopt,
 };
 
-use diagweave::prelude::{ResultReportExt, Transform};
-use veloq_driver_core::driver::RegisterFd;
-
-use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
+use crate::config::{IoFd, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
 use crate::driver::{IocpDriver, IocpDriverResult};
 use crate::error::{IocpError, IocpResult};
+
+pub(super) struct DeferredSocketCleanup {
+    handle: SocketKey,
+    entry: RegisteredHandle,
+}
+
+pub(super) struct HandleRegistry {
+    registered_files: Vec<Option<RegisteredHandle>>,
+    file_generations: Vec<u64>,
+    free_slots: Vec<usize>,
+    deferred_socket_cleanup: VecDeque<DeferredSocketCleanup>,
+    socket_generation_counter: u64,
+}
+
+impl DeferredSocketCleanup {
+    fn new(handle: SocketKey, entry: RegisteredHandle) -> Self {
+        Self { handle, entry }
+    }
+
+    fn handle(&self) -> SocketKey {
+        self.handle
+    }
+
+    fn into_entry(self) -> RegisteredHandle {
+        self.entry
+    }
+}
+
+impl HandleRegistry {
+    pub(super) fn new() -> Self {
+        Self {
+            registered_files: Vec::new(),
+            file_generations: Vec::new(),
+            free_slots: Vec::new(),
+            deferred_socket_cleanup: VecDeque::new(),
+            socket_generation_counter: 1,
+        }
+    }
+
+    pub(super) fn registered_files(&self) -> &[Option<RegisteredHandle>] {
+        &self.registered_files
+    }
+
+    pub(super) fn file_generations(&self) -> &[u64] {
+        &self.file_generations
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registered_file(&self, idx: usize) -> Option<&RegisteredHandle> {
+        self.registered_files.get(idx).and_then(Option::as_ref)
+    }
+
+    fn next_socket_generation(&mut self) -> u64 {
+        let generation = self.socket_generation_counter;
+        self.socket_generation_counter = self.socket_generation_counter.wrapping_add(1);
+        if self.socket_generation_counter == 0 {
+            self.socket_generation_counter = 1;
+        }
+        generation
+    }
+
+    fn insert_registered(&mut self, entry: RegisteredHandle) -> IoFd {
+        let idx = if let Some(idx) = self.free_slots.pop() {
+            self.registered_files[idx] = Some(entry);
+            idx
+        } else {
+            self.registered_files.push(Some(entry));
+            self.file_generations.push(0);
+            self.registered_files.len() - 1
+        };
+        IoFd::fixed_with_generation(idx as u32, self.file_generations[idx])
+    }
+
+    fn take_for_unregister(&mut self, fd: IoFd) -> Option<(usize, RegisteredHandle)> {
+        let idx = fd.fixed_index() as usize;
+        if idx >= self.registered_files.len() {
+            return None;
+        }
+        if self.file_generations.get(idx).copied() != Some(fd.generation()) {
+            return None;
+        }
+        self.registered_files[idx].take().map(|entry| (idx, entry))
+    }
+
+    fn release_slot(&mut self, idx: usize) {
+        self.free_slots.push(idx);
+        self.file_generations[idx] = self.file_generations[idx].wrapping_add(1);
+    }
+
+    fn deferred_cleanup_len(&self) -> usize {
+        self.deferred_socket_cleanup.len()
+    }
+
+    fn pop_deferred_cleanup(&mut self) -> Option<DeferredSocketCleanup> {
+        self.deferred_socket_cleanup.pop_front()
+    }
+
+    fn push_deferred_cleanup(&mut self, pending: DeferredSocketCleanup) {
+        self.deferred_socket_cleanup.push_back(pending);
+    }
+
+    fn defer_socket_cleanup(&mut self, handle: SocketKey, entry: RegisteredHandle) {
+        self.deferred_socket_cleanup
+            .push_back(DeferredSocketCleanup::new(handle, entry));
+    }
+}
 
 impl<'a> IocpDriver<'a> {
     /// Fallback probe for potentially untrusted raw handles.
@@ -43,11 +150,11 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    pub(crate) fn track_socket_submit_pending(&mut self, key: SocketKey) {
+    pub(super) fn track_socket_submit_pending(&mut self, key: SocketKey) {
         let _ = self.rio.state_mut().try_acquire_socket_inflight(key);
     }
 
-    pub(crate) fn release_socket_inflight_for_op(&mut self, user_data: usize) {
+    pub(super) fn release_socket_inflight_for_op(&mut self, user_data: usize) {
         let socket_key = self
             .ops
             .get_slot_entry_op_storage_and_entry_mut(user_data)
@@ -69,7 +176,7 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    pub(crate) fn drain_deferred_socket_cleanup(&mut self) {
+    pub(super) fn drain_deferred_socket_cleanup(&mut self) {
         let mut rounds = self.handles.deferred_cleanup_len();
         while rounds > 0 {
             rounds -= 1;
@@ -109,7 +216,7 @@ impl<'a> IocpDriver<'a> {
     /// Registers a set of file/socket handles for use with the driver.
     pub(crate) fn register_files<'h>(
         &mut self,
-        files: Vec<RegisterFd<'h, IocpHandle>>,
+        files: Vec<RegisterFd<'h, crate::config::IocpHandle>>,
     ) -> IocpDriverResult<Vec<IoFd>> {
         let mut registered = Vec::with_capacity(files.len());
         for file in files {
@@ -125,7 +232,9 @@ impl<'a> IocpDriver<'a> {
                         .push_ctx("scope", "iocp/driver")
                         .attach_note("detect socket from file handle failed")?
                     {
-                        RawHandle::new(IocpHandle::for_socket(handle.raw().as_handle()))
+                        RawHandle::new(crate::config::IocpHandle::for_socket(
+                            handle.raw().as_handle(),
+                        ))
                     } else {
                         handle
                     }
@@ -134,7 +243,7 @@ impl<'a> IocpDriver<'a> {
             let kind = canonical.kind();
             if kind == RawHandleKind::Socket {
                 let mut raw = canonical.raw();
-                if let IocpHandle::Socket { generation: g, .. } = &mut raw
+                if let crate::config::IocpHandle::Socket { generation: g, .. } = &mut raw
                     && *g == 0
                 {
                     *g = self.handles.next_socket_generation();

@@ -61,7 +61,7 @@ fn test_register_borrowed_file_keeps_weak_ownership() {
 
     assert!(
         matches!(
-            driver.handles.registered_file(idx),
+            driver.debug_registered_file(idx),
             Some(crate::config::RegisteredHandle::Weak(_))
         ),
         "borrowed file registration must not transfer ownership to driver"

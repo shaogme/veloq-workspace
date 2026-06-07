@@ -1,21 +1,18 @@
-pub(crate) mod blocking_bridge;
-pub(crate) mod completion;
-pub(crate) mod completion_pump;
-pub(crate) mod handle_registry;
-pub(crate) mod registration;
-pub(crate) mod rio_runtime;
-pub(crate) mod submission;
-pub(crate) mod timer_engine;
+mod cancellation;
+mod completion;
+mod lifecycle;
+mod polling;
+mod registration;
+mod submission;
 
 pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
 pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tracing::{debug, trace};
+use tracing::trace;
 
-use veloq_buf::BufferRegistrar;
 use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::OpEntry;
 use veloq_driver_core::driver::{
@@ -27,11 +24,12 @@ use veloq_driver_core::slot::DetachedCancelTable;
 
 use diagweave::prelude::*;
 
-use crate::config::{BufferRegistrationMode, IoFd, IocpConfig, IocpHandle};
-use crate::error::{IocpError, IocpResult};
+use crate::config::{IoFd, IocpHandle};
+use crate::error::IocpError;
 use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload};
 
 pub(crate) type IocpDriverResult<T> = CoreDriverResult<T, IocpError>;
+pub use crate::op::slot::IocpOpState;
 pub(crate) use crate::op::slot::{IocpOpRegistry, IocpSlotSpec};
 
 // ============================================================================
@@ -40,26 +38,17 @@ pub(crate) use crate::op::slot::{IocpOpRegistry, IocpSlotSpec};
 
 /// The IOCP driver implementation that manages I/O completion ports and operations.
 pub struct IocpDriver<'a> {
-    pub(crate) completion: completion_pump::CompletionPump,
-    pub(crate) ops: IocpOpRegistry,
-    pub(crate) extensions: crate::ext::Extensions,
-    pub(crate) timer: timer_engine::TimerEngine,
-    pub(crate) handles: handle_registry::HandleRegistry,
-    pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
+    completion: polling::CompletionPump,
+    ops: IocpOpRegistry,
+    extensions: crate::ext::Extensions,
+    timer: polling::TimerEngine,
+    handles: registration::HandleRegistry,
+    detached_cancel_table: Arc<DetachedCancelTable>,
 
     // RIO Support (required)
-    pub(crate) rio: rio_runtime::IocpRioRuntime<'a>,
-    pub(crate) shutting_down: bool,
-    pub(crate) closed: bool,
-}
-
-/// State associated with an IOCP operation.
-#[derive(Default)]
-pub struct IocpOpState {
-    pub(crate) generation: u32,
-    pub(crate) timer_id: Option<veloq_wheel::TaskId>,
-    pub(crate) timer_deadline: Option<Instant>,
-    pub(crate) is_background: bool,
+    rio: lifecycle::IocpRioRuntime<'a>,
+    shutting_down: bool,
+    closed: bool,
 }
 
 /// Closing mode for the driver or operations.
@@ -87,71 +76,35 @@ impl<'a> IocpDriver<'a> {
         )
     }
 
-    /// Creates a pre-initialization completion port handle.
-    pub(crate) fn create_pre_init() -> IocpResult<PreInit> {
-        crate::win32::IoCompletionPort::new(0).attach_note("failed to create pre-init IOCP")
-    }
-
-    /// Creates a new IOCP driver instance.
-    pub fn new(
-        config: impl AsRef<IocpConfig>,
-        registrar: Box<dyn BufferRegistrar + 'a>,
-    ) -> IocpResult<Self> {
-        let cfg = config.as_ref();
-        let pre = Self::create_pre_init()?;
-        Self::new_from_pre_init(cfg.entries.get(), pre, cfg.registration_mode, registrar)
-    }
-
-    /// Creates a new IOCP driver from a pre-initialized handle.
-    pub(crate) fn new_from_pre_init(
-        entries: u32,
-        port_val: PreInit,
-        registration_mode: BufferRegistrationMode,
-        registrar: Box<dyn BufferRegistrar + 'a>,
-    ) -> IocpResult<Self> {
-        use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
-        // SAFETY: WSAStartup is required for networking on Windows.
-        // It is called here to avoid global static initialization.
-        unsafe {
-            let mut data: WSADATA = std::mem::zeroed();
-            let _ = WSAStartup(0x0202, &mut data);
-        }
-
-        let port_handle = port_val.as_raw();
-        debug!(port = ?port_handle, "Initializing IocpDriver");
-        let extensions = crate::ext::Extensions::new()
-            .with_ctx("port_raw", port_handle as usize)
-            .attach_note("failed to load IOCP extensions")?;
-        let rio = rio_runtime::IocpRioRuntime::new(
-            crate::config::RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
-            entries,
-            &extensions,
-            registration_mode,
-            registrar,
-        )
-        .attach_note("failed to initialize RIO runtime")?;
-        let ops = IocpOpRegistry::new(entries as usize);
-        let completion_table: SharedCompletionTable<IocpUserPayload, IocpError> =
-            ops.shared.clone();
-        Ok(Self {
-            completion: completion_pump::CompletionPump::new(port_val, completion_table),
-            ops,
-            extensions,
-            timer: timer_engine::TimerEngine::new(),
-            handles: handle_registry::HandleRegistry::new(),
-            detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
-            rio,
-            shutting_down: false,
-            closed: false,
-        })
-    }
-
     pub(crate) fn has_active_ops_internal(&mut self) -> bool {
         self.ops.has_active_ops()
     }
 
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
         self.completion.create_waker()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_registered_file(
+        &self,
+        idx: usize,
+    ) -> Option<&crate::config::RegisteredHandle> {
+        self.handles.registered_file(idx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_remote_free_contains(&self, needle: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        use veloq_driver_core::slot::SlotTable;
+
+        let mut cur = self.ops.shared.remote_free_head.load(Ordering::Acquire);
+        while cur != SlotTable::<crate::op::slot::IocpSlotSpec>::NULL_INDEX {
+            if cur == needle {
+                return true;
+            }
+            cur = self.ops.shared.slots[cur].next_free.load(Ordering::Relaxed);
+        }
+        false
     }
 }
 
@@ -314,15 +267,6 @@ impl<'a> Driver for IocpDriver<'a> {
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
         IocpDriver::create_waker(self)
-    }
-}
-
-impl Drop for IocpDriver<'_> {
-    fn drop(&mut self) {
-        debug!("Dropping IocpDriver");
-        if let Err(e) = self.close_impl(CloseMode::Fast) {
-            tracing::error!(report = ?e, "iocp close_impl fast failed during drop");
-        }
     }
 }
 
