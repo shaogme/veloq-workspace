@@ -5,7 +5,7 @@ use windows_sys::Win32::Networking::WinSock::SOCKET;
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-use crate::config::{BorrowedRawHandle, IoFd, IocpHandle, RegisteredHandle};
+use crate::config::{BorrowedRawHandle, IoFd, IocpAssociation, IocpHandle, RegisteredHandle};
 use crate::error::{IocpError, IocpResult};
 use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
 use crate::op::{KernelRef, OverlappedEntry};
@@ -237,12 +237,43 @@ pub(crate) unsafe fn unpack_kernel_ref<T>(
 /// Associates a handle with an IOCP.
 ///
 pub(crate) fn ensure_iocp_association(
+    fd: &IoFd,
     handle: BorrowedRawHandle<'_>,
     port: &crate::win32::IoCompletionPort,
+    iocp_associations: &mut [Option<IocpAssociation>],
 ) -> IocpResult<()> {
+    let idx = fd.fixed_index() as usize;
+    let port_raw = port.as_raw() as usize;
+    let completion_key = 0;
+    let requested = IocpAssociation::new(port_raw, completion_key);
+    let Some(association) = iocp_associations.get_mut(idx) else {
+        return IocpError::ResolveFd
+            .with_ctx("fd_fixed_index", fd.fixed_index())
+            .with_ctx("fd_generation", fd.generation())
+            .attach_note("registered file descriptor index out of bounds");
+    };
+
+    match *association {
+        Some(existing) if existing == requested => return Ok(()),
+        Some(existing) => {
+            return IocpError::InvalidState
+                .with_ctx("fd_fixed_index", fd.fixed_index())
+                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+                .with_ctx("port_raw", port_raw)
+                .with_ctx("completion_key", completion_key)
+                .with_ctx("existing_port_raw", existing.port_raw)
+                .with_ctx("existing_completion_key", existing.completion_key)
+                .attach_note("handle already associated with a different IOCP context");
+        }
+        None => {}
+    }
+
     // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
     unsafe { port.associate(handle.raw().as_handle(), 0) }
-        .attach_note("CreateIoCompletionPort association failed")
+        .attach_note("CreateIoCompletionPort association failed")?;
+    *association = Some(requested);
+    Ok(())
 }
 
 #[inline]

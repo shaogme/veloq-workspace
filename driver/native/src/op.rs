@@ -14,11 +14,7 @@ type FileRawHandle = veloq_driver_uring::UringRawHandle;
 #[cfg(windows)]
 type FileRawHandle = veloq_driver_iocp::IocpHandle;
 
-pub type FileReadRaw = veloq_driver_core::op::ReadRaw<FileRawHandle>;
-pub type FileWriteRaw = veloq_driver_core::op::WriteRaw<FileRawHandle>;
-pub type FileFsyncRaw = veloq_driver_core::op::FsyncRaw<FileRawHandle>;
 pub type FileSyncFileRangeRaw = veloq_driver_core::op::SyncFileRangeRaw<FileRawHandle>;
-pub type FileFallocateRaw = veloq_driver_core::op::FallocateRaw<FileRawHandle>;
 pub type ReadFixed = veloq_driver_core::op::ReadFixed;
 pub type WriteFixed = veloq_driver_core::op::WriteFixed;
 pub type Recv = veloq_driver_core::op::Recv;

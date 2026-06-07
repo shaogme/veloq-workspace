@@ -264,12 +264,15 @@ impl<'a> IocpDriver<'a> {
             })
         } else {
             let (rio, registrar) = self.rio.state_and_registrar_mut();
+            let (registered_files, file_generations, iocp_associations) =
+                self.handles.submission_parts();
             let mut ctx = SubmitContext {
                 port: self.completion.port_arc(),
                 overlapped,
                 ext: &self.extensions,
-                registered_files: self.handles.registered_files(),
-                file_generations: self.handles.file_generations(),
+                registered_files,
+                file_generations,
+                iocp_associations,
                 registrar,
                 rio,
             };

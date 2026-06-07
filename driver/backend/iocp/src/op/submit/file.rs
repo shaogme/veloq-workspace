@@ -48,15 +48,20 @@ macro_rules! submit_io_op {
                 ctx.registered_files,
                 ctx.file_generations,
             )?);
-            ensure_iocp_association(handle, ctx.port.as_ref())
-                .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("fd_fixed_index", val.fd.fixed_index())
-                .with_ctx("fd_generation", val.fd.generation())
-                .with_ctx("handle_raw", handle.raw().as_handle() as usize)
-                .with_ctx("user_data", header.user_data)
-                .with_ctx("generation", header.generation)
-                .with_ctx("offset", val.offset)
-                .with_ctx("buffer_length", val.buf.len())?;
+            ensure_iocp_association(
+                &val.fd,
+                handle,
+                ctx.port.as_ref(),
+                &mut *ctx.iocp_associations,
+            )
+            .push_ctx("scope", stringify!($fn_name))
+            .with_ctx("fd_fixed_index", val.fd.fixed_index())
+            .with_ctx("fd_generation", val.fd.generation())
+            .with_ctx("handle_raw", handle.raw().as_handle() as usize)
+            .with_ctx("user_data", header.user_data)
+            .with_ctx("generation", header.generation)
+            .with_ctx("offset", val.offset)
+            .with_ctx("buffer_length", val.buf.len())?;
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             if val.buf_offset > val.buf.len() {
@@ -102,7 +107,10 @@ macro_rules! submit_raw_io_op {
             header.resolved_handle = Some(val.fd);
             let raw_handle = crate::config::RawHandle::new(val.fd);
             let handle = raw_handle.borrow();
-            ensure_iocp_association(handle, ctx.port.as_ref())
+            // SAFETY: raw operations require the caller to provide a valid handle
+            // that has not already been associated with another completion port.
+            unsafe { ctx.port.associate(handle.raw().as_handle(), 0) }
+                .attach_note("CreateIoCompletionPort association failed")
                 .push_ctx("scope", stringify!($fn_name))
                 .with_ctx("handle_raw", handle.raw().as_handle() as usize)
                 .with_ctx("user_data", header.user_data)

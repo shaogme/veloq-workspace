@@ -1,13 +1,13 @@
 use super::open_options::OpenOptions;
 use crate::fs::error::FsError;
-use crate::runtime::context::RuntimeContext;
+use crate::runtime::context::{RuntimeContext, submit_control_task};
 
 use diagweave::prelude::*;
 use veloq_buf::FixedBuf;
 use veloq_driver_native::driver::Driver;
 use veloq_driver_native::op::{
-    DetachedSubmitter, Fallocate, FileFallocateRaw, FileFsyncRaw, FileReadRaw,
-    FileSyncFileRangeRaw, FileWriteRaw, Fsync, IoFd, LocalSubmitter, Op, ReadFixed, WriteFixed,
+    DetachedSubmitter, Fallocate, FileSyncFileRangeRaw, Fsync, IoFd, LocalSubmitter, Op, ReadFixed,
+    WriteFixed,
 };
 use veloq_driver_native::{RawHandle, RawHandleKind};
 
@@ -59,6 +59,8 @@ pub struct LocalFile<'a, 'ctx> {
 
 pub struct File<'a, 'ctx> {
     pub(crate) raw: RawHandle,
+    pub(crate) fd: IoFd,
+    pub(crate) owner_worker_id: usize,
     pub(crate) submitter: DetachedSubmitter,
     pub(crate) pos: AtomicU64,
     pub(crate) ctx: RuntimeContext<'a, 'ctx>,
@@ -76,7 +78,15 @@ impl<'a, 'ctx> Drop for LocalFile<'a, 'ctx> {
 
 impl<'a, 'ctx> Drop for File<'a, 'ctx> {
     fn drop(&mut self) {
-        close_raw_handle(self.raw);
+        let current_worker_id = self.ctx.scope.worker_id();
+        if current_worker_id == self.owner_worker_id {
+            self.ctx.scope.shared().extra_tls.with(|extra| {
+                let mut driver = extra.driver.borrow_mut();
+                let _ = driver.unregister_files(vec![self.fd]);
+            });
+        } else {
+            submit_control_task(self.ctx.scope.shared(), self.owner_worker_id, self.fd);
+        }
     }
 }
 
@@ -291,15 +301,17 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         offset: u64,
         buf_offset: usize,
     ) -> Result<(usize, FixedBuf)> {
-        let op: FileReadRaw = FileReadRaw {
-            fd: self.raw.raw(),
+        let op = ReadFixed {
+            fd: self.fd,
             buf,
             offset,
             buf_offset,
         };
 
-        let owner = self.ctx.scope.worker_id();
-        let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
+        let (res, op) = self
+            .ctx
+            .submit_to(self.owner_worker_id, Op::new(op))
+            .await?;
         let buf = op.buf;
         let res = res
             .with_ctx("op", "read_at_subset")
@@ -316,15 +328,17 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         offset: u64,
         buf_offset: usize,
     ) -> Result<(usize, FixedBuf)> {
-        let op: FileWriteRaw = FileWriteRaw {
-            fd: self.raw.raw(),
+        let op = WriteFixed {
+            fd: self.fd,
             buf,
             offset,
             buf_offset,
         };
 
-        let owner = self.ctx.scope.worker_id();
-        let (res, op) = self.ctx.submit_to(owner, Op::new(op)).await?;
+        let (res, op) = self
+            .ctx
+            .submit_to(self.owner_worker_id, Op::new(op))
+            .await?;
         let buf = op.buf;
         let res = res
             .with_ctx("op", "write_at_subset")
@@ -336,37 +350,43 @@ impl<'a, 'ctx> File<'a, 'ctx> {
     }
 
     pub async fn sync_all(&self) -> Result<()> {
-        let op: FileFsyncRaw = FileFsyncRaw {
-            fd: self.raw.raw(),
+        let op = Fsync {
+            fd: self.fd,
             datasync: false,
         };
 
-        let owner = self.ctx.scope.worker_id();
-        let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
+        let (res, _) = self
+            .ctx
+            .submit_to(self.owner_worker_id, Op::new(op))
+            .await?;
         res.map(|_| ()).trans()
     }
 
     pub async fn sync_data(&self) -> Result<()> {
-        let op: FileFsyncRaw = FileFsyncRaw {
-            fd: self.raw.raw(),
+        let op = Fsync {
+            fd: self.fd,
             datasync: true,
         };
 
-        let owner = self.ctx.scope.worker_id();
-        let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
+        let (res, _) = self
+            .ctx
+            .submit_to(self.owner_worker_id, Op::new(op))
+            .await?;
         res.map(|_| ()).trans()
     }
 
     pub async fn fallocate(&self, offset: u64, len: u64) -> Result<()> {
-        let op: FileFallocateRaw = FileFallocateRaw {
-            fd: self.raw.raw(),
+        let op = Fallocate {
+            fd: self.fd,
             mode: 0,
             offset,
             len,
         };
 
-        let owner = self.ctx.scope.worker_id();
-        let (res, _) = self.ctx.submit_to(owner, Op::new(op)).await?;
+        let (res, _) = self
+            .ctx
+            .submit_to(self.owner_worker_id, Op::new(op))
+            .await?;
         res.map(|_| ()).trans()
     }
 
@@ -441,7 +461,7 @@ impl<'f, 'a, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'a, 'ctx> {
     type IntoFuture = SyncRangeFuture<'a, 'ctx>;
 
     fn into_future(self) -> Self::IntoFuture {
-        let op: FileSyncFileRangeRaw = FileSyncFileRangeRaw {
+        let op = FileSyncFileRangeRaw {
             fd: self.file.raw.raw(),
             offset: self.offset,
             nbytes: self.nbytes,

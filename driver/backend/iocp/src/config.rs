@@ -168,6 +168,22 @@ pub type OwnedRawHandle = CoreOwnedRawHandle<IocpHandle>;
 pub type BorrowedRawHandle<'a> = CoreBorrowedRawHandle<'a, IocpHandle>;
 pub type SocketKey = IocpHandle;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IocpAssociation {
+    pub(crate) port_raw: usize,
+    pub(crate) completion_key: usize,
+}
+
+impl IocpAssociation {
+    #[inline]
+    pub(crate) const fn new(port_raw: usize, completion_key: usize) -> Self {
+        Self {
+            port_raw,
+            completion_key,
+        }
+    }
+}
+
 /// Registered descriptor entry used by driver-side fixed-file table.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegisteredHandle {

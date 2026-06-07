@@ -142,11 +142,24 @@ impl OpenOptions {
         let owner = ctx.scope.worker_id();
         let (res, _) = ctx.submit_to(owner, Op::new(op)).await?;
         let owned = res.trans()?;
-        let fd = owned.into_raw();
+        let raw = owned.into_raw();
+        // SAFETY: ownership is transferred into the owner driver's registered file table.
+        let owned = unsafe { veloq_driver_native::OwnedRawHandle::from_raw_owned(raw) };
+        let fd = ctx.driver(|mut driver| {
+            driver
+                .register_files(vec![RegisterFd::Owned(owned)])
+                .trans()?
+                .into_iter()
+                .next()
+                .ok_or(FsError::RegisterFailed)
+                .trans()
+        })?;
         use std::sync::atomic::AtomicU64;
 
         Ok(super::file::File {
-            raw: fd,
+            raw,
+            fd,
+            owner_worker_id: owner,
             submitter,
             pos: AtomicU64::new(0),
             ctx,

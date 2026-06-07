@@ -15,7 +15,9 @@ pub(crate) use submit::SubmissionResult;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle, RegisteredHandle};
+use crate::config::{
+    IoFd, IocpAssociation, IocpHandle, OwnedRawHandle, RawHandle, RegisteredHandle,
+};
 use crate::error::{IocpDriverResult as DriverResult, IocpError, IocpResult};
 use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
@@ -73,6 +75,7 @@ pub(crate) struct SubmitContext<'a> {
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_files: &'a [Option<RegisteredHandle>],
     pub(crate) file_generations: &'a [u64],
+    pub(crate) iocp_associations: &'a mut [Option<IocpAssociation>],
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
 
     // RIO Support

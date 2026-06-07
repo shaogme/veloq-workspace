@@ -9,7 +9,9 @@ use windows_sys::Win32::Networking::WinSock::{
     closesocket, getsockopt,
 };
 
-use crate::config::{IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey};
+use crate::config::{
+    IoFd, IocpAssociation, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey,
+};
 use crate::driver::{IocpDriver, IocpDriverResult};
 use crate::error::{IocpError, IocpResult};
 use crate::rio::RioState;
@@ -22,6 +24,7 @@ pub(super) struct DeferredSocketCleanup {
 pub(super) struct HandleRegistry {
     registered_files: Vec<Option<RegisteredHandle>>,
     file_generations: Vec<u64>,
+    iocp_associations: Vec<Option<IocpAssociation>>,
     free_slots: Vec<usize>,
     deferred_socket_cleanup: VecDeque<DeferredSocketCleanup>,
     socket_generation_counter: u64,
@@ -46,6 +49,7 @@ impl HandleRegistry {
         Self {
             registered_files: Vec::new(),
             file_generations: Vec::new(),
+            iocp_associations: Vec::new(),
             free_slots: Vec::new(),
             deferred_socket_cleanup: VecDeque::new(),
             socket_generation_counter: 1,
@@ -58,6 +62,20 @@ impl HandleRegistry {
 
     pub(super) fn file_generations(&self) -> &[u64] {
         &self.file_generations
+    }
+
+    pub(super) fn submission_parts(
+        &mut self,
+    ) -> (
+        &[Option<RegisteredHandle>],
+        &[u64],
+        &mut [Option<IocpAssociation>],
+    ) {
+        (
+            &self.registered_files,
+            &self.file_generations,
+            &mut self.iocp_associations,
+        )
     }
 
     #[cfg(test)]
@@ -77,10 +95,12 @@ impl HandleRegistry {
     fn insert_registered(&mut self, entry: RegisteredHandle) -> IoFd {
         let idx = if let Some(idx) = self.free_slots.pop() {
             self.registered_files[idx] = Some(entry);
+            self.iocp_associations[idx] = None;
             idx
         } else {
             self.registered_files.push(Some(entry));
             self.file_generations.push(0);
+            self.iocp_associations.push(None);
             self.registered_files.len() - 1
         };
         IoFd::fixed_with_generation(idx as u32, self.file_generations[idx])
@@ -141,6 +161,7 @@ impl HandleRegistry {
     fn release_slot(&mut self, idx: usize) {
         self.free_slots.push(idx);
         self.file_generations[idx] = self.file_generations[idx].wrapping_add(1);
+        self.iocp_associations[idx] = None;
     }
 
     fn deferred_cleanup_len(&self) -> usize {

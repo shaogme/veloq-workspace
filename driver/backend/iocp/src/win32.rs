@@ -304,18 +304,24 @@ impl IoCompletionPort {
     ///
     /// The caller must ensure that `handle` is valid and not already associated.
     pub unsafe fn associate(&self, handle: HANDLE, completion_key: usize) -> IocpResult<()> {
+        let port = self.0.as_raw();
+        let handle_raw = handle as usize;
+        let port_raw = port as usize;
+
         // SAFETY: The caller ensures that `handle` is valid and not already associated.
-        let res = unsafe { CreateIoCompletionPort(handle, self.0.as_raw(), completion_key, 0) };
+        let res = unsafe { CreateIoCompletionPort(handle, port, completion_key, 0) };
         if res.is_null() {
             // SAFETY: GetLastError is safe to call after a failed Win32 API call.
             let err = unsafe { GetLastError() };
-            if err == windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER {
-                return Ok(());
-            }
-            return Err(IocpError::Win32.io_report(
-                "CreateIoCompletionPort.associate",
-                from_raw_os_error(err as i32),
-            ));
+            return Err(IocpError::Win32
+                .io_report(
+                    "CreateIoCompletionPort.associate",
+                    from_raw_os_error(err as i32),
+                )
+                .with_ctx("handle_raw", handle_raw)
+                .with_ctx("port_raw", port_raw)
+                .with_ctx("completion_key", completion_key)
+                .with_ctx("os_error_code", err));
         }
         Ok(())
     }
