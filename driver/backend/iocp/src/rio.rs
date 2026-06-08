@@ -19,7 +19,9 @@ use crate::driver::IocpOpRegistry;
 use crate::error::IocpError;
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
-use veloq_driver_core::driver::{SharedCompletionQueue, SharedCompletionTable};
+use veloq_driver_core::driver::{
+    DriverCompletionDiagnostics, SharedCompletionQueue, SharedCompletionTable,
+};
 
 use self::core::registry::RioRegistry;
 use self::core::submit_ops::{RioCq, RioDispatch, RioKernel};
@@ -90,6 +92,7 @@ pub(crate) struct RioCompletionContext<'a> {
     pub(crate) ext: &'a crate::ext::Extensions,
     pub(crate) events: &'a SharedCompletionQueue,
     pub(crate) table: &'a SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
+    pub(crate) diagnostics: &'a mut DriverCompletionDiagnostics,
 }
 
 pub(crate) struct RioState {

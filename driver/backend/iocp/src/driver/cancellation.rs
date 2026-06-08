@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use tracing::{debug, warn};
-use veloq_driver_core::driver::CancelRequest;
+use veloq_driver_core::driver::{CancelMode, CancelRequest, RecordCompletionOutcome};
 use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
@@ -59,12 +59,20 @@ impl<'a> IocpDriver<'a> {
             .and_then(|op| op.platform_data.timer_id);
         if let Some(tid) = timer_id {
             self.timer.cancel(tid);
-            Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
+            if let Some(outcome) = Self::abort_slot_inner(
+                emit_ctx,
+                user_data,
+                &mut self.ops,
+                request.mode == CancelMode::UserVisible,
+            ) {
+                self.completion_diagnostics
+                    .record_completion_outcome(&outcome);
+            }
             self.completion_diagnostics.inc_cancel_submitted();
             return;
         }
 
-        let state = self.ops.slot_view(user_data);
+        let state = self.ops.unchecked_slot_view(user_data);
         match state {
             Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) => {
                 let ctx = CancelContext {
@@ -74,7 +82,15 @@ impl<'a> IocpDriver<'a> {
                 self.record_cancel_status(status);
             }
             _ => {
-                Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
+                if let Some(outcome) = Self::abort_slot_inner(
+                    emit_ctx,
+                    user_data,
+                    &mut self.ops,
+                    request.mode == CancelMode::UserVisible,
+                ) {
+                    self.completion_diagnostics
+                        .record_completion_outcome(&outcome);
+                }
                 self.completion_diagnostics.inc_cancel_submitted();
             }
         }
@@ -104,7 +120,7 @@ impl<'a> IocpDriver<'a> {
         user_data: usize,
         ops: &mut IocpOpRegistry,
     ) -> IocpResult<CancelPerformStatus> {
-        let status = match ops.slot_view(user_data) {
+        let status = match ops.unchecked_slot_view(user_data) {
             Some(SlotView::InFlightWaiting(mut guard)) => {
                 let is_rio = guard
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
@@ -183,15 +199,26 @@ impl<'a> IocpDriver<'a> {
         Ok(status)
     }
 
-    fn emit_aborted_inner(ctx: EmitContext<'_>, user_data: usize, ops: &mut IocpOpRegistry) {
+    fn abort_slot_inner(
+        ctx: EmitContext<'_>,
+        user_data: usize,
+        ops: &mut IocpOpRegistry,
+        emit_completion: bool,
+    ) -> Option<RecordCompletionOutcome> {
         let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
-        let inflight = Self::with_inflight_slot(ops, user_data, |guard| {
-            let mut guard = guard.complete();
-            let _ = guard.take_op();
-            let data = guard.take_completion_data();
-            let _ = guard.reset();
-            data
-        });
+        let inflight = match ops.unchecked_slot_view(user_data) {
+            Some(SlotView::InFlightWaiting(guard)) => {
+                let mut guard = guard.complete();
+                let _ = guard.take_op();
+                Some(guard.take_completion_data())
+            }
+            Some(SlotView::InFlightOrphaned(guard)) => {
+                let mut guard = guard.complete();
+                let _ = guard.take_op();
+                Some(guard.take_completion_data())
+            }
+            _ => None,
+        };
 
         let (payload, detail) = if let Some(data) = inflight {
             data
@@ -202,19 +229,26 @@ impl<'a> IocpDriver<'a> {
             .unwrap_or((None, None))
         };
 
-        push_completion_shared(
-            ctx.completion_events,
-            ctx.completion_table,
-            completion_record(CompletionSidecar {
-                user_data,
-                generation,
-                res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                flags: 0,
-                payload,
-                detail,
-            }),
-        );
+        let outcome = if emit_completion {
+            Some(push_completion_shared(
+                ctx.completion_events,
+                ctx.completion_table,
+                completion_record(CompletionSidecar {
+                    user_data,
+                    generation,
+                    res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                    flags: 0,
+                    payload,
+                    detail,
+                }),
+            ))
+        } else {
+            drop(payload);
+            drop(detail);
+            None
+        };
 
         ops.remove(user_data);
+        outcome
     }
 }

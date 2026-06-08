@@ -5,7 +5,8 @@ mod polling;
 mod registration;
 mod submission;
 
-pub(crate) const RIO_EVENT_KEY: usize = usize::MAX - 1;
+pub(crate) const RIO_EVENT_KEY: usize =
+    veloq_driver_core::driver::CompletionToken::rio_wake(0).raw() as usize;
 pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
 use std::sync::Arc;

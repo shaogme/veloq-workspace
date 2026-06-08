@@ -236,6 +236,7 @@ where
     pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<E>>>,
     pub(crate) token: Option<CompletionToken>,
     pub(crate) immediate_failure: Option<(DriverReport<E>, T::UserPayload)>,
+    pub(crate) immediate_resource_lost: Option<OpError<E>>,
     pub(crate) _phantom: std::marker::PhantomData<DetachedOpMarker<T, T::ErasedPayload, E, C, O>>,
 }
 
@@ -287,6 +288,9 @@ where
         if let Some((e, payload)) = this.immediate_failure.take() {
             let completion = T::complete(payload, Err(e));
             return Poll::Ready(OpResult::Completed(completion.result, completion.output));
+        }
+        if let Some(err) = this.immediate_resource_lost.take() {
+            return Poll::Ready(OpResult::ResourceLost(err));
         }
 
         let table = this
@@ -407,7 +411,7 @@ where
                         if let Some(val) = driver_op_opt.take() {
                             drop(val);
                         }
-                        fallback_payload = Some(slot.recover_payload().unwrap());
+                        fallback_payload = slot.recover_payload();
                     }
                 }
                 Ok((user_data, token, result, fallback_payload))
@@ -434,7 +438,11 @@ where
                         }
                         DriverSubmitResult::Failed { report, status } => match status {
                             SubmitStatus::Void => {
-                                let payload_erased = fallback_payload.unwrap();
+                                let Some(payload_erased) = fallback_payload else {
+                                    return Poll::Ready(OpResult::ResourceLost(
+                                        payload_missing_error(),
+                                    ));
+                                };
                                 let payload = T::payload_from_erased(payload_erased);
                                 trace!(
                                     op = %std::any::type_name::<T>(),

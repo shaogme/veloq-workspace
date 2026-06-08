@@ -78,26 +78,29 @@ impl<'a> UringDriver<'a> {
 
         let timer_buffer = std::mem::take(&mut self.timer_buffer);
         for user_data in timer_buffer {
-            let sidecar = self.ops.slot_view(user_data).and_then(|slot| match slot {
-                SlotView::InFlightWaiting(mut slot) => {
-                    slot.platform_mut().timer_id = None;
-                    let mut completed = slot.complete();
+            let sidecar = self
+                .ops
+                .unchecked_slot_view(user_data)
+                .and_then(|slot| match slot {
+                    SlotView::InFlightWaiting(mut slot) => {
+                        slot.platform_mut().timer_id = None;
+                        let mut completed = slot.complete();
 
-                    let generation = completed.entry.generation(Ordering::Acquire);
-                    let _ = completed.take_op();
-                    let (payload, detail) = completed.take_completion_data();
+                        let generation = completed.entry.generation(Ordering::Acquire);
+                        let _ = completed.take_op();
+                        let (payload, detail) = completed.take_completion_data();
 
-                    Some(CompletionSidecar::<UringUserPayload, UringError> {
-                        user_data,
-                        generation,
-                        res: 0,
-                        flags: 0,
-                        payload,
-                        detail,
-                    })
-                }
-                _ => None,
-            });
+                        Some(CompletionSidecar::<UringUserPayload, UringError> {
+                            user_data,
+                            generation,
+                            res: 0,
+                            flags: 0,
+                            payload,
+                            detail,
+                        })
+                    }
+                    _ => None,
+                });
 
             if let Some(sidecar) = sidecar {
                 self.push_completion_event(sidecar);
@@ -179,17 +182,16 @@ impl<'a> UringDriver<'a> {
         cqe_res: i32,
         cqe_flags: u32,
     ) -> usize {
-        match self.ops.checked_slot_view(user_data, generation) {
+        let token = CompletionToken::user(user_data, generation);
+        match self.ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
                 let sidecar = complete_waiting_slot(slot, user_data, cqe_res, cqe_flags);
-                self.completion_diagnostics.inc_user_completed();
                 self.push_completion_event(sidecar);
                 self.ops.remove(user_data);
                 1
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
                 let sidecar = complete_orphaned_slot(slot, user_data, cqe_res, cqe_flags);
-                self.completion_diagnostics.inc_user_orphan_completed();
                 self.push_completion_event(sidecar);
                 self.ops.remove(user_data);
                 1
@@ -206,7 +208,7 @@ impl<'a> UringDriver<'a> {
                 self.emit_corrupt_completion(snapshot, cqe_res, cqe_flags, "reserved slot");
                 0
             }
-            CheckedSlotView::Missing { .. } => {
+            CheckedSlotView::NonUser { .. } | CheckedSlotView::Missing { .. } => {
                 self.completion_diagnostics.inc_unknown_completion();
                 debug!(user_data, generation, "completion for missing slot");
                 0
@@ -368,11 +370,13 @@ impl<'a> UringDriver<'a> {
             res: sidecar.res,
             flags: sidecar.flags,
         };
-        let _ = self.completion_table.record_completion_with_data(
+        let outcome = self.completion_table.record_completion_with_data(
             event,
             sidecar.payload,
             sidecar.detail,
         );
+        self.completion_diagnostics
+            .record_completion_outcome(&outcome);
         self.completion_events.push(event);
     }
 }
@@ -391,31 +395,57 @@ fn classify_completion(raw: u64) -> UringCompletionKind {
             kind: CompletionControlKind::Cancel,
             id,
         } => UringCompletionKind::Cancel { id },
+        CompletionTokenClass::Control { .. } => UringCompletionKind::Unknown { token },
         CompletionTokenClass::UnknownControl { .. } => UringCompletionKind::Unknown { token },
     }
 }
 
 fn complete_waiting_slot(
-    slot: crate::op::slot::Slot<'_, veloq_driver_core::slot::InFlightWaiting>,
+    mut slot: crate::op::slot::Slot<'_, veloq_driver_core::slot::InFlightWaiting>,
     user_data: usize,
     cqe_res: i32,
     cqe_flags: u32,
 ) -> CompletionSidecar<UringUserPayload, UringError> {
-    let final_res = {
-        let payload = slot
+    let generation = slot.entry.generation(Ordering::Acquire);
+    let has_op = slot.op.is_some();
+    let has_payload = slot.storage.payload.is_some();
+    if !has_op || !has_payload {
+        let (payload, detail) = slot
             .storage
-            .payload
-            .as_mut()
-            .expect("checked in-flight slot must contain payload");
-        let op = slot
-            .op
-            .as_mut()
-            .expect("checked in-flight slot must contain op");
+            .with_mut(|result, payload, _sidecar| (payload.take(), result.take()));
+        let _ = slot.op.take();
+        return CompletionSidecar::<UringUserPayload, UringError> {
+            user_data,
+            generation,
+            res: -libc::EIO,
+            flags: cqe_flags,
+            payload,
+            detail: detail.or_else(|| {
+                Some(Err(UringError::InvalidState
+                    .to_report()
+                    .push_ctx("scope", "uring.driver.completion")
+                    .with_ctx("user_data", user_data)
+                    .with_ctx("generation", generation)
+                    .with_ctx("has_op", has_op)
+                    .with_ctx("has_payload", has_payload)
+                    .attach_note(
+                        "in-flight uring completion missing op or payload",
+                    )))
+            }),
+        };
+    }
+
+    let final_res = {
+        let Some(payload) = slot.storage.payload.as_mut() else {
+            unreachable!("payload presence checked above");
+        };
+        let Some(op) = slot.op.as_mut() else {
+            unreachable!("op presence checked above");
+        };
         unsafe { (op.vtable.on_complete)(op, payload, cqe_res) }
     };
 
     let mut completed = slot.complete();
-    let generation = completed.entry.generation(Ordering::Acquire);
     let res_code = driver_result_to_event_res(&final_res);
 
     let (payload, mut detail) = completed.take_completion_data();

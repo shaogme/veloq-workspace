@@ -175,7 +175,7 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn submit_from_slot_index(&mut self, user_data: usize) -> UringResult<bool> {
         let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.slot_view(user_data) {
+        let slot = match self.ops.unchecked_slot_view(user_data) {
             Some(SlotView::Reserved(slot)) => slot,
             _ => {
                 return Err(UringError::InvalidState
@@ -294,7 +294,7 @@ impl<'a> UringDriver<'a> {
         op_in: &mut Option<UringOp>,
     ) -> DriverSubmitResult<UringError> {
         let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.slot_view(user_data) {
+        let slot = match self.ops.unchecked_slot_view(user_data) {
             Some(SlotView::Reserved(slot)) => {
                 if slot.has_op() {
                     let mut slot = slot;
@@ -346,7 +346,7 @@ impl<'a> UringDriver<'a> {
         op_in: &mut Option<UringOp>,
     ) -> DriverSubmitResult<UringError> {
         let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.slot_view(user_data) {
+        let slot = match self.ops.unchecked_slot_view(user_data) {
             Some(SlotView::Reserved(slot)) => {
                 if slot.has_op() {
                     let mut slot = slot;

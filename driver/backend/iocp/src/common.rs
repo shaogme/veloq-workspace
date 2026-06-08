@@ -9,8 +9,8 @@ use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionRecord, CompletionSidecar, CompletionToken, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable,
+    CompletionEvent, CompletionRecord, CompletionSidecar, CompletionToken, RecordCompletionOutcome,
+    RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
 };
 
 // ============================================================================
@@ -91,9 +91,23 @@ pub(crate) fn push_completion_shared(
     queue: &SharedCompletionQueue,
     table: &SharedCompletionTable<IocpUserPayload, IocpError>,
     record: CompletionRecord<IocpUserPayload, IocpError>,
-) {
-    let _ = table.record_completion_with_data(record.event, record.payload, record.detail);
-    queue.push(record.event);
+) -> RecordCompletionOutcome {
+    let event = record.event;
+    let outcome = table.record_completion_with_data(record.event, record.payload, record.detail);
+    match &outcome {
+        RecordCompletionOutcome::Recorded | RecordCompletionOutcome::OrphanedDropped => {}
+        anomaly => {
+            tracing::debug!(
+                token = event.token.raw(),
+                res = event.res,
+                flags = event.flags,
+                outcome = ?anomaly,
+                "IOCP completion table did not record completion normally"
+            );
+        }
+    }
+    queue.push(event);
+    outcome
 }
 
 // ============================================================================

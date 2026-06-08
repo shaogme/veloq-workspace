@@ -91,6 +91,7 @@ macro_rules! define_iocp_ops {
                 kind: $kind:expr,
                 submit: $submit:path,
                 $(on_complete: $complete:path,)?
+                $(orphan_cleanup: $orphan_cleanup:path,)?
                 $(completion: $completion:ty,)?
                 $(map_completion: $map_completion:expr,)?
                 get_fd: $get_fd:path,
@@ -115,11 +116,12 @@ macro_rules! define_iocp_ops {
         }
 
         /// Virtual table for dynamic dispatch of IOCP operations.
-        pub(crate) struct OpVTable {
-            pub(crate) submit: fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult>,
-            pub(crate) on_complete: Option<unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> IocpResult<usize>>,
-            pub(crate) get_fd: unsafe fn(op: &IocpKernelOp) -> Option<IoFd>,
-        }
+            pub(crate) struct OpVTable {
+                pub(crate) submit: fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult>,
+                pub(crate) on_complete: Option<unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> IocpResult<usize>>,
+                pub(crate) orphan_cleanup: unsafe fn(op: &mut IocpKernelOp, result: &IocpResult<usize>, ext: &Extensions),
+                pub(crate) get_fd: unsafe fn(op: &IocpKernelOp) -> Option<IoFd>,
+            }
 
         /// A type-erased IOCP kernel operation.
         pub struct IocpKernelOp {
@@ -171,6 +173,9 @@ macro_rules! define_iocp_ops {
                     Ok(result)
                 }
             }
+            pub(crate) fn orphan_cleanup(&mut self, result: &IocpResult<usize>, ext: &Extensions) {
+                unsafe { (self.vtable.as_ref().orphan_cleanup)(self, result, ext) };
+            }
         }
 
         $(
@@ -195,6 +200,7 @@ macro_rules! define_iocp_ops {
                             }
                         },
                         on_complete: define_iocp_ops!(@optional_complete_shim $OpType, $Variant, $($complete)?),
+                        orphan_cleanup: define_iocp_ops!(@orphan_cleanup $($orphan_cleanup)?),
                         get_fd: |op| unsafe {
                             if let IocpOpPayload::$Variant(ref p) = op.payload {
                                 $get_fd(p)
@@ -255,6 +261,9 @@ macro_rules! define_iocp_ops {
         })
     };
 
+    (@orphan_cleanup ) => { orphan_cleanup_noop };
+    (@orphan_cleanup $func:path) => { $func };
+
     // Default construct: keep only a pointer to user payload
     (@construct $user:expr, , $OpType:ty) => { KernelRef { user: PayloadRef::unbound() } };
     // Custom construct
@@ -270,6 +279,13 @@ macro_rules! define_iocp_ops {
 
     (@map_completion $this:expr, $res:expr, ) => { $res };
     (@map_completion $this:expr, $res:expr, $expr:expr) => { ($expr)($this, $res) };
+}
+
+unsafe fn orphan_cleanup_noop(
+    _op: &mut IocpKernelOp,
+    _result: &IocpResult<usize>,
+    _ext: &Extensions,
+) {
 }
 
 // ============================================================================

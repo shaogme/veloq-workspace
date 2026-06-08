@@ -18,9 +18,10 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionToken, SharedCompletionQueue, SharedCompletionTable,
+    CompletionEvent, CompletionToken, DriverCompletionDiagnostics, SharedCompletionQueue,
+    SharedCompletionTable,
 };
-use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
@@ -78,11 +79,39 @@ impl<'a> RioCompletionRouter<'a> {
         } = init;
         let socket_key = socket_inflight.socket_key();
         let ops = &mut self.comp.ops;
-        if user_data < ops.local.len() {
-            match ops.slot_view(user_data) {
-                Some(SlotView::InFlightWaiting(mut slot))
-                    if slot.platform().generation == generation =>
-                {
+        let token = CompletionToken::user(user_data, generation);
+        match ops.checked_slot_view(token) {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+                if slot.platform().generation != generation {
+                    let report = IocpError::Internal
+                        .to_report()
+                        .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
+                        .with_ctx("user_data", user_data)
+                        .with_ctx("generation", generation)
+                        .with_ctx("platform_generation", slot.platform().generation)
+                        .with_ctx("rio_op_kind", op_kind.as_str())
+                        .with_ctx("rio_request_id", request_id)
+                        .attach_note("RIO slot platform generation mismatch");
+                    self.comp.diagnostics.inc_slot_corruption();
+                    let mut guard = slot.complete();
+                    let _ = guard.take_op();
+                    let (payload, detail) = guard.take_completion_data();
+                    let completion = Err(report);
+                    let event = CompletionEvent {
+                        token,
+                        res: rio_result_to_event_res(&completion),
+                        flags: 0,
+                    };
+                    drop(guard);
+                    let outcome = self.comp.table.record_completion_with_data(
+                        event,
+                        payload,
+                        detail.or(Some(completion)),
+                    );
+                    self.comp.diagnostics.record_completion_outcome(&outcome);
+                    self.comp.events.push(event);
+                    let _ = ops.remove(user_data);
+                } else {
                     let cancelled = slot.platform().rio_cancel_requested;
                     let mut completion = if cancelled {
                         Err(IocpError::CompletionWait
@@ -143,52 +172,91 @@ impl<'a> RioCompletionRouter<'a> {
                         let _ = guard.take_op();
                         let (payload, detail) = guard.take_completion_data();
                         let event = CompletionEvent {
-                            token: CompletionToken::user(user_data, generation),
+                            token,
                             res: res_code,
                             flags: 0,
                         };
 
-                        let _ = self.comp.table.record_completion_with_data(
+                        let outcome = self.comp.table.record_completion_with_data(
                             event,
                             payload,
                             detail.or(Some(completion)),
                         );
+                        self.comp.diagnostics.record_completion_outcome(&outcome);
                         self.comp.events.push(event);
                     }
-                    let _ = self.comp.ops.remove(user_data);
+                    let _ = ops.remove(user_data);
                 }
-                Some(SlotView::InFlightOrphaned(mut slot)) => {
-                    if slot.platform_mut().generation != generation {
-                        debug!(
-                            user_data,
-                            generation,
-                            actual_generation = slot.platform().generation,
-                            "ignoring stale orphaned RIO completion"
-                        );
-                    } else {
-                        let mut guard = slot.complete();
-                        let _ = guard.take_op();
-                        let _ = guard.take_completion_data();
-                        let _ = std::mem::take(guard.platform_mut());
-                        self.comp.ops.recycle(user_data, generation.wrapping_add(1));
-                    }
-                }
-                other => {
+            }
+            CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+                if slot.platform_mut().generation != generation {
+                    self.comp.diagnostics.inc_slot_corruption();
                     debug!(
                         user_data,
                         generation,
-                        slot_state = ?other.as_ref().map(|_| "non-waiting"),
-                        "RIO completion for non-active slot"
+                        actual_generation = slot.platform().generation,
+                        "RIO orphaned completion found platform generation mismatch"
                     );
+                } else {
+                    self.comp.diagnostics.inc_user_orphan_completed();
+                    let mut guard = slot.complete();
+                    let orphan_result = if res.Status == 0 {
+                        Ok(res.BytesTransferred as usize)
+                    } else {
+                        IocpError::CompletionWait
+                            .push_ctx("scope", "rio.runtime.control_flow.orphan_cleanup")
+                            .with_ctx("socket_raw", socket_key.as_handle() as usize)
+                            .with_ctx("rio_op_kind", op_kind.as_str())
+                            .with_ctx("rio_request_id", request_id)
+                            .set_error_code(res.Status)
+                            .attach_note("orphaned RIO completion returned os error")
+                    };
+                    if let Some(op) = guard.op.as_mut() {
+                        op.orphan_cleanup(&orphan_result, self.comp.ext);
+                    }
+                    let _ = guard.take_op();
+                    let _ = guard.take_completion_data();
+                    let _ = std::mem::take(guard.platform_mut());
+                    drop(guard);
+                    ops.recycle(user_data, generation.wrapping_add(1));
                 }
             }
-        } else {
-            debug!(
-                user_data,
-                generation,
-                slots = ops.local.len(),
-                "RIO completion for missing slot"
-            );
+            CheckedSlotView::Valid(SlotView::Reserved(_)) | CheckedSlotView::Corrupt(_) => {
+                self.comp.diagnostics.inc_slot_corruption();
+                debug!(
+                    user_data,
+                    generation, "RIO completion found corrupt or reserved slot"
+                );
+                let _ = ops.recycle_if_active(user_data, generation.wrapping_add(1));
+            }
+            CheckedSlotView::Missing { .. } | CheckedSlotView::NonUser { .. } => {
+                self.comp.diagnostics.inc_unknown_completion();
+                debug!(
+                    user_data,
+                    generation,
+                    slots = ops.local.len(),
+                    "RIO completion for missing slot"
+                );
+            }
+            CheckedSlotView::Empty(snapshot) => {
+                self.comp.diagnostics.inc_unknown_completion();
+                debug!(
+                    user_data,
+                    generation,
+                    state = ?snapshot.state,
+                    "RIO completion for non-active slot"
+                );
+            }
+            CheckedSlotView::Stale(snapshot) => {
+                self.comp.diagnostics.inc_stale_completion();
+                debug!(
+                    user_data,
+                    generation,
+                    actual_generation = snapshot.generation,
+                    state = ?snapshot.state,
+                    "RIO completion for stale slot"
+                );
+            }
         }
 
         self.registry.free_addr_slot(addr_slot);
@@ -203,6 +271,7 @@ impl<'a> RioCompletionRouter<'a> {
 
     fn handle_one(&mut self, res: &RIORESULT) -> RioResult<()> {
         let Some(kind) = RioState::decode_req_ctx(res.RequestContext) else {
+            self.comp.diagnostics.inc_unknown_completion();
             debug!(
                 request_context = res.RequestContext,
                 status = res.Status,
@@ -313,8 +382,16 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
+        diagnostics: &mut DriverCompletionDiagnostics,
     ) -> RioResult<usize> {
-        self.process_completions_internal(ops, ext, registrar, completion_events, completion_table)
+        self.process_completions_internal(
+            ops,
+            ext,
+            registrar,
+            completion_events,
+            completion_table,
+            diagnostics,
+        )
     }
 
     fn process_completions_internal(
@@ -324,6 +401,7 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
+        diagnostics: &mut DriverCompletionDiagnostics,
     ) -> RioResult<usize> {
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
@@ -338,6 +416,7 @@ impl RioState {
                 ext,
                 events: completion_events,
                 table: completion_table,
+                diagnostics,
             },
             (&mut self.registry, env),
         );
@@ -376,6 +455,7 @@ impl RioState {
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
+        diagnostics: &mut DriverCompletionDiagnostics,
     ) -> RioResult<()> {
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
@@ -395,8 +475,14 @@ impl RioState {
                     .attach_note("strict close timed out while draining RIO outstanding requests");
             }
 
-            let processed =
-                self.process_completions(ops, ext, registrar, completion_events, completion_table)?;
+            let processed = self.process_completions(
+                ops,
+                ext,
+                registrar,
+                completion_events,
+                completion_table,
+                diagnostics,
+            )?;
             if processed == 0 {
                 std::thread::yield_now();
             }

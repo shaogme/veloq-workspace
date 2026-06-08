@@ -209,6 +209,7 @@ impl<'a> IocpDriver<'a> {
                     registrar,
                     self.completion.events(),
                     self.completion.table(),
+                    &mut self.completion_diagnostics,
                 )
             }
             .inspect(|_| {

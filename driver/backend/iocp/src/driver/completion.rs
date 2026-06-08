@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use diagweave::prelude::*;
 use tracing::{debug, error};
+use veloq_driver_core::driver::{CompletionToken, RecordCompletionOutcome};
 use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, io_result_to_event_res, push_completion_shared};
@@ -35,7 +36,7 @@ impl<'a> IocpDriver<'a> {
         let mut expired = Vec::new();
         for &user_data in &timer_buffer {
             let in_flight = matches!(
-                self.ops.slot_view(user_data),
+                self.ops.unchecked_slot_view(user_data),
                 Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_))
             );
             if let Some(op) = self.ops.local.get_mut(user_data) {
@@ -63,11 +64,13 @@ impl<'a> IocpDriver<'a> {
         }
 
         for completion in pending_events {
-            push_completion_shared(
+            let outcome = push_completion_shared(
                 self.completion.events(),
                 self.completion.table(),
                 completion_record(completion),
             );
+            self.completion_diagnostics
+                .record_completion_outcome(&outcome);
         }
         for user_data in finished_timers {
             self.ops.remove(user_data);
@@ -80,7 +83,7 @@ impl<'a> IocpDriver<'a> {
         user_data: usize,
         pending_events: &mut Vec<CompletionSidecar>,
     ) -> bool {
-        let mut guard = match ops.slot_view(user_data) {
+        let mut guard = match ops.unchecked_slot_view(user_data) {
             Some(SlotView::InFlightWaiting(slot)) => slot.complete(),
             _ => return false,
         };
@@ -125,21 +128,36 @@ impl<'a> IocpDriver<'a> {
                     completion_events: self.completion.events(),
                     completion_table: self.completion.table(),
                 };
-                Self::emit_event_inner(
+                if let Some(outcome) = Self::emit_event_inner(
                     ctx,
                     &mut self.ops,
                     user_data,
                     completed_generation,
                     io_result,
-                );
-                self.completion_diagnostics.inc_user_completed();
+                ) {
+                    self.completion_diagnostics
+                        .record_completion_outcome(&outcome);
+                }
             }
             CompletionRoute::Orphaned => {
                 self.release_socket_inflight_for_op(user_data);
-                let Some(SlotView::InFlightOrphaned(slot)) = self.ops.slot_view(user_data) else {
+                let Some(SlotView::InFlightOrphaned(slot)) =
+                    self.ops.unchecked_slot_view(user_data)
+                else {
                     return;
                 };
                 let mut completed = slot.complete();
+                let io_result = if success {
+                    Ok(bytes_transferred as usize)
+                } else {
+                    Err(IocpError::CompletionWait.io_report(
+                        "iocp.driver.process_completion.orphaned",
+                        std::io::Error::from_raw_os_error(error_code.unwrap_or(0) as i32),
+                    ))
+                };
+                if let Some(op) = completed.op.as_mut() {
+                    op.orphan_cleanup(&io_result, &self.extensions);
+                }
                 let _ = completed.take_op();
                 let _ = completed.take_completion_data();
                 self.ops
@@ -174,13 +192,18 @@ impl<'a> IocpDriver<'a> {
     }
 
     fn completion_route(&mut self, user_data: usize, generation: u32) -> CompletionRoute {
-        match self.ops.checked_slot_view(user_data, generation) {
+        match self
+            .ops
+            .checked_slot_view(CompletionToken::user(user_data, generation))
+        {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(_)) => CompletionRoute::Waiting,
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(_)) => CompletionRoute::Orphaned,
             CheckedSlotView::Valid(SlotView::Reserved(_)) | CheckedSlotView::Corrupt(_) => {
                 CompletionRoute::Corrupt
             }
-            CheckedSlotView::Missing { .. } => CompletionRoute::Missing,
+            CheckedSlotView::NonUser { .. } | CheckedSlotView::Missing { .. } => {
+                CompletionRoute::Missing
+            }
             CheckedSlotView::Empty(_) => CompletionRoute::Empty,
             CheckedSlotView::Stale(_) => CompletionRoute::Stale,
         }
@@ -192,7 +215,7 @@ impl<'a> IocpDriver<'a> {
         index: usize,
         f: impl FnOnce(Slot<'_, InFlightWaiting>) -> R,
     ) -> Option<R> {
-        match ops.slot_view(index)? {
+        match ops.unchecked_slot_view(index)? {
             SlotView::InFlightWaiting(slot) => Some(f(slot)),
             _ => None,
         }
@@ -265,7 +288,7 @@ impl<'a> IocpDriver<'a> {
         user_data: usize,
         slot_generation: u32,
         io_result: IocpResult<usize>,
-    ) {
+    ) -> Option<RecordCompletionOutcome> {
         let mut should_free = false;
         let mut sidecar_to_push = None;
         let handled = Self::with_inflight_slot(ops, user_data, |guard| {
@@ -302,15 +325,20 @@ impl<'a> IocpDriver<'a> {
         }
 
         if let Some(sidecar) = sidecar_to_push {
-            push_completion_shared(
+            let outcome = push_completion_shared(
                 ctx.completion_events,
                 ctx.completion_table,
                 completion_record(sidecar),
             );
+            if handled.is_some() && should_free {
+                ops.remove(user_data);
+            }
+            return Some(outcome);
         }
 
         if handled.is_some() && should_free {
             ops.remove(user_data);
         }
+        None
     }
 }

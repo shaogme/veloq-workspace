@@ -43,6 +43,7 @@ const CONTROL_TOKEN_ID_SHIFT: u32 = 32;
 pub enum CompletionControlKind {
     Waker = 1,
     Cancel = 2,
+    RioWake = 3,
 }
 
 impl CompletionControlKind {
@@ -51,6 +52,7 @@ impl CompletionControlKind {
         match raw {
             1 => Some(Self::Waker),
             2 => Some(Self::Cancel),
+            3 => Some(Self::RioWake),
             _ => None,
         }
     }
@@ -112,6 +114,11 @@ impl CompletionToken {
     #[inline]
     pub const fn cancel(id: u16) -> Self {
         Self::internal(CompletionControlKind::Cancel, id)
+    }
+
+    #[inline]
+    pub const fn rio_wake(id: u16) -> Self {
+        Self::internal(CompletionControlKind::RioWake, id)
     }
 
     #[inline]
@@ -273,6 +280,61 @@ pub struct CompletionSidecar<UP, E, R = usize> {
     pub detail: Option<DriverResult<R, E>>,
 }
 
+pub struct CompletionPacket<UP, E, R = usize> {
+    pub event: CompletionEvent,
+    pub payload: Option<UP>,
+    pub detail: Option<DriverResult<R, E>>,
+}
+
+impl<UP, E, R> CompletionPacket<UP, E, R> {
+    #[inline]
+    pub fn new(
+        event: CompletionEvent,
+        payload: Option<UP>,
+        detail: Option<DriverResult<R, E>>,
+    ) -> Self {
+        Self {
+            event,
+            payload,
+            detail,
+        }
+    }
+
+    #[inline]
+    pub fn user(
+        index: usize,
+        generation: u32,
+        res: i32,
+        flags: u32,
+        payload: Option<UP>,
+        detail: Option<DriverResult<R, E>>,
+    ) -> Self {
+        Self::new(
+            CompletionEvent {
+                token: CompletionToken::user(index, generation),
+                res,
+                flags,
+            },
+            payload,
+            detail,
+        )
+    }
+}
+
+impl<UP, E, R> From<CompletionSidecar<UP, E, R>> for CompletionPacket<UP, E, R> {
+    #[inline]
+    fn from(sidecar: CompletionSidecar<UP, E, R>) -> Self {
+        Self::user(
+            sidecar.user_data,
+            sidecar.generation,
+            sidecar.res,
+            sidecar.flags,
+            sidecar.payload,
+            sidecar.detail,
+        )
+    }
+}
+
 /// Unified completion event produced by platform drivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompletionEvent {
@@ -298,6 +360,17 @@ pub struct CompletionRecord<UP, E, R = usize> {
     pub event: CompletionEvent,
     pub payload: Option<UP>,
     pub detail: Option<DriverResult<R, E>>,
+}
+
+impl<UP, E, R> From<CompletionPacket<UP, E, R>> for CompletionRecord<UP, E, R> {
+    #[inline]
+    fn from(packet: CompletionPacket<UP, E, R>) -> Self {
+        Self {
+            event: packet.event,
+            payload: packet.payload,
+            detail: packet.detail,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +451,23 @@ impl CompletionAnomaly {
             reason: CompletionAnomalyReason::NonActiveSlot,
         }
     }
+
+    #[inline]
+    pub fn corrupt(
+        token: CompletionToken,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: Some(generation),
+            state: Some(state),
+            reason: CompletionAnomalyReason::SlotCorruption,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,6 +478,21 @@ pub enum RecordCompletionOutcome {
     Stale(CompletionAnomaly),
     NonActive(CompletionAnomaly),
     Corrupt(CompletionAnomaly),
+}
+
+impl DriverCompletionDiagnostics {
+    #[inline]
+    pub fn record_completion_outcome(&mut self, outcome: &RecordCompletionOutcome) {
+        match outcome {
+            RecordCompletionOutcome::Recorded => self.inc_user_completed(),
+            RecordCompletionOutcome::OrphanedDropped => self.inc_user_orphan_completed(),
+            RecordCompletionOutcome::Missing(_) | RecordCompletionOutcome::NonActive(_) => {
+                self.inc_unknown_completion();
+            }
+            RecordCompletionOutcome::Stale(_) => self.inc_stale_completion(),
+            RecordCompletionOutcome::Corrupt(_) => self.inc_slot_corruption(),
+        }
+    }
 }
 
 /// Result of a completion poll, enabling detection of recycled slots.

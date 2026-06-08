@@ -77,7 +77,8 @@ impl<'a> UringDriver<'a> {
             return;
         };
 
-        match self.ops.checked_slot_view(user_data, generation) {
+        let token = CompletionToken::user(user_data, generation);
+        match self.ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 let sidecar = cancel_slot_immediate(slot, user_data);
                 if request.mode == CancelMode::UserVisible {
@@ -127,7 +128,9 @@ impl<'a> UringDriver<'a> {
 
                 self.submit_cancel_request(request);
             }
-            CheckedSlotView::Missing { .. } | CheckedSlotView::Empty(_) => {
+            CheckedSlotView::NonUser { .. }
+            | CheckedSlotView::Missing { .. }
+            | CheckedSlotView::Empty(_) => {
                 self.completion_diagnostics.inc_unknown_completion();
                 debug!(
                     user_data,
@@ -177,7 +180,8 @@ impl<'a> UringDriver<'a> {
                 };
 
                 let stale_or_missing = !matches!(
-                    self.ops.checked_slot_view(user_data, generation),
+                    self.ops
+                        .checked_slot_view(CompletionToken::user(user_data, generation)),
                     CheckedSlotView::Valid(_)
                 );
                 if stale_or_missing {
@@ -213,7 +217,7 @@ impl<'a> UringDriver<'a> {
         }
 
         while let Some(&user_data) = self.backlog.front() {
-            let action = match self.ops.slot_view(user_data) {
+            let action = match self.ops.unchecked_slot_view(user_data) {
                 Some(SlotView::InFlightOrphaned(_)) => BacklogAction::Cancel,
                 Some(SlotView::Reserved(slot)) => {
                     if slot_has_op(slot) {

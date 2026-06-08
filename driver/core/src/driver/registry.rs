@@ -1,6 +1,4 @@
 use crate::DriverResult;
-use crate::SlotSidecar;
-use crate::driver::PlatformOp;
 use crate::slot::{
     SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData, SlotSidecarData,
     SlotSpec, SlotState, SlotStorage, SlotTable,
@@ -8,25 +6,6 @@ use crate::slot::{
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 use veloq_shim::atomic::Ordering;
-
-/// Legacy compatibility shim for older slot registry specifications.
-pub trait SlotRegistrySpec {
-    type Op: PlatformOp;
-    type UserPayload: Send;
-    type PlatformData: Default;
-    type Sidecar: SlotSidecar;
-    type Error;
-    type Completion;
-}
-
-impl<T: SlotRegistrySpec> SlotSpec for T {
-    type Op = <T as SlotRegistrySpec>::Op;
-    type UserPayload = <T as SlotRegistrySpec>::UserPayload;
-    type PlatformData = <T as SlotRegistrySpec>::PlatformData;
-    type Sidecar = <T as SlotRegistrySpec>::Sidecar;
-    type Error = <T as SlotRegistrySpec>::Error;
-    type Completion = <T as SlotRegistrySpec>::Completion;
-}
 
 pub type RegistryOp<T> = SlotOp<T>;
 pub type RegistryPayload<T> = SlotPayload<T>;

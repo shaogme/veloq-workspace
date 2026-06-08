@@ -113,7 +113,7 @@ impl<'a> IocpDriver<'a> {
         task: BlockingTask,
     ) -> IocpDriverResult<Poll<()>> {
         if !BlockingBridge::submit(task) {
-            if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
+            if let Some(SlotView::InFlightWaiting(slot)) = ops.unchecked_slot_view(user_data) {
                 let mut guard = slot.complete();
                 let _ = guard.take_op();
                 let (payload, detail) = guard.take_completion_data();
@@ -164,7 +164,7 @@ impl<'a> IocpDriver<'a> {
                 Self::handle_timer_sub(ops, ctx, user_data, duration)
             }
             Err(e) => {
-                if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
+                if let Some(SlotView::InFlightWaiting(slot)) = ops.unchecked_slot_view(user_data) {
                     let mut guard = slot.complete();
                     *op_in = guard.take_op();
                 }
@@ -185,7 +185,7 @@ impl<'a> IocpDriver<'a> {
         let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
         let completion_key = CompletionToken::user(user_data, generation).raw() as usize;
         if let Err(err) = ctx.port.notify(completion_key) {
-            if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
+            if let Some(SlotView::InFlightWaiting(slot)) = ops.unchecked_slot_view(user_data) {
                 let mut guard = slot.complete();
                 *op_in = guard.take_op();
             }

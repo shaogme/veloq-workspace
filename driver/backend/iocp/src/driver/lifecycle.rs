@@ -158,7 +158,7 @@ impl<'a> IocpDriver<'a> {
         let mut in_flight = Vec::new();
         let mut pending = ShutdownPending::default();
         for user_data in 0..self.ops.local.len() {
-            let kind = match self.ops.slot_view(user_data) {
+            let kind = match self.ops.unchecked_slot_view(user_data) {
                 Some(SlotView::InFlightWaiting(mut slot)) => {
                     if slot.platform().timer_id.is_some() {
                         Some(ShutdownOpKind::Immediate)
@@ -234,7 +234,7 @@ impl<'a> IocpDriver<'a> {
     fn preserve_rio_payloads_for_fast_close(&mut self) {
         let mut rio_slots = Vec::new();
         for user_data in 0..self.ops.local.len() {
-            let is_rio = match self.ops.slot_view(user_data) {
+            let is_rio = match self.ops.unchecked_slot_view(user_data) {
                 Some(SlotView::InFlightWaiting(mut slot)) => slot
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                     .unwrap_or(false),
@@ -250,7 +250,7 @@ impl<'a> IocpDriver<'a> {
 
         let mut payloads = Vec::new();
         for user_data in rio_slots {
-            match self.ops.slot_view(user_data) {
+            match self.ops.unchecked_slot_view(user_data) {
                 Some(SlotView::InFlightWaiting(mut slot)) => {
                     slot.platform_mut().rio_cancel_requested = true;
                     let _ = slot.with_op_mut(|iocp_op| iocp_op.unbind_user_payload());
@@ -297,6 +297,7 @@ impl<'a> IocpDriver<'a> {
                         registrar,
                         completion_events,
                         completion_table,
+                        &mut self.completion_diagnostics,
                     )
                     .push_ctx("scope", "iocp/driver")
                     .attach_note("failed to drain RIO outstanding requests")

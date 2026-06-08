@@ -100,7 +100,6 @@ impl<T> Op<T> {
             Ok(mut slot) => {
                 let (kernel_op, payload) = data.into_kernel_and_payload();
                 let mut op_platform = Some(kernel_op);
-                let user_data = slot.user_data();
                 let completion_table = slot.completion_table();
                 let cancel_signal = slot.detached_cancel_table();
                 let cancel_waker = slot.create_waker();
@@ -116,6 +115,7 @@ impl<T> Op<T> {
                             cancel_waker: Some(cancel_waker),
                             token: Some(token),
                             immediate_failure: None,
+                            immediate_resource_lost: None,
                             _phantom: std::marker::PhantomData,
                         }
                     }
@@ -126,13 +126,22 @@ impl<T> Op<T> {
                         );
                         match status {
                             SubmitStatus::Void => {
-                                let payload_erased =
-                                    slot.recover_payload().unwrap_or_else(|| {
-                                        panic!(
-                                            "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
-                                            user_data, status, report
-                                        )
-                                    });
+                                let Some(payload_erased) = slot.recover_payload() else {
+                                    if let Some(op) = op_platform.take() {
+                                        drop(op);
+                                    }
+                                    return DetachedOp {
+                                        completion_table: None,
+                                        cancel_signal: None,
+                                        cancel_waker: None,
+                                        token: None,
+                                        immediate_failure: None,
+                                        immediate_resource_lost: Some(
+                                            future::payload_missing_error(),
+                                        ),
+                                        _phantom: std::marker::PhantomData,
+                                    };
+                                };
 
                                 let payload = T::payload_from_erased(payload_erased);
                                 if let Some(op) = op_platform.take() {
@@ -144,6 +153,7 @@ impl<T> Op<T> {
                                     cancel_waker: None,
                                     token: None,
                                     immediate_failure: Some((report, payload)),
+                                    immediate_resource_lost: None,
                                     _phantom: std::marker::PhantomData,
                                 }
                             }
@@ -156,6 +166,7 @@ impl<T> Op<T> {
                                     cancel_waker: Some(cancel_waker),
                                     token: Some(token),
                                     immediate_failure: None,
+                                    immediate_resource_lost: None,
                                     _phantom: std::marker::PhantomData,
                                 }
                             }
@@ -172,6 +183,7 @@ impl<T> Op<T> {
                     cancel_waker: None,
                     token: None,
                     immediate_failure: Some((e, payload)),
+                    immediate_resource_lost: None,
                     _phantom: std::marker::PhantomData,
                 }
             }
