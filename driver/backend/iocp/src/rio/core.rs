@@ -16,6 +16,7 @@ use crate::rio::{RioState, SocketInflightToken};
 use diagweave::prelude::*;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use veloq_driver_core::driver::OpToken;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, SOCKADDR_INET};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,8 +73,7 @@ impl RioRequestDiagnostics {
 }
 
 pub(crate) struct RioOpRequestInit {
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
+    pub(crate) token: OpToken,
     pub(crate) socket_inflight: SocketInflightToken,
     pub(crate) op_kind: RioOpKind,
     pub(crate) request_id: u64,
@@ -225,8 +225,7 @@ impl Drop for RioCompletedRequestContext {
 }
 
 pub(crate) struct RioSubmissionSpec {
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
+    pub(crate) token: OpToken,
     pub(crate) socket_inflight: SocketInflightToken,
     pub(crate) op_kind: RioOpKind,
     pub(crate) rq: RioRq,
@@ -249,8 +248,7 @@ pub(crate) struct RioSubmitErrorContext<'a> {
     pub(crate) scope: &'static str,
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
+    pub(crate) token: OpToken,
     pub(crate) note: &'static str,
 }
 
@@ -270,8 +268,7 @@ pub(crate) enum RioAddressPolicy {
 pub(crate) struct RioSubmitPlan<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
+    pub(crate) token: OpToken,
     pub(crate) op_kind: RioOpKind,
     pub(crate) buffer_kind: RioSubmissionKind,
     pub(crate) buffer: &'a veloq_buf::FixedBuf,
@@ -341,8 +338,8 @@ impl RioPreparedRequest {
             .with_ctx("fd_generation", ctx.fd.generation())
             .with_ctx("handle_raw", ctx.handle.raw().as_handle() as usize)
             .with_ctx("socket_raw", socket_key.as_handle() as usize)
-            .with_ctx("user_data", ctx.user_data)
-            .with_ctx("generation", ctx.generation)
+            .with_ctx("user_data", ctx.token.index())
+            .with_ctx("generation", ctx.token.generation())
             .with_ctx("rio_op_kind", self.op_kind.as_str())
             .with_ctx("rio_request_id", self.request_id)
             .with_ctx(
@@ -368,8 +365,7 @@ impl<'a> RioSubmitPlan<'a> {
             scope: self.submit_scope,
             fd: self.fd,
             handle: self.handle,
-            user_data: self.user_data,
-            generation: self.generation,
+            token: self.token,
             note: self.submit_note,
         }
     }
@@ -518,8 +514,8 @@ impl RioState {
                 .with_ctx("fd_generation", plan.fd.generation())
                 .with_ctx("handle_raw", plan.handle.raw().as_handle() as usize)
                 .with_ctx("socket_raw", plan.handle.raw().as_handle() as usize)
-                .with_ctx("user_data", plan.user_data)
-                .with_ctx("generation", plan.generation)
+                .with_ctx("user_data", plan.token.index())
+                .with_ctx("generation", plan.token.generation())
                 .with_ctx("rio_op_kind", plan.op_kind.as_str())
                 .with_ctx("rio_operation", plan.operation)
                 .with_ctx("outstanding_count", outstanding_snapshot)
@@ -541,8 +537,8 @@ impl RioState {
                     .with_ctx("fd_generation", plan.fd.generation())
                     .with_ctx("handle_raw", plan.handle.raw().as_handle() as usize)
                     .with_ctx("socket_raw", socket_key.as_handle() as usize)
-                    .with_ctx("user_data", plan.user_data)
-                    .with_ctx("generation", plan.generation)
+                    .with_ctx("user_data", plan.token.index())
+                    .with_ctx("generation", plan.token.generation())
                     .with_ctx("rio_op_kind", plan.op_kind.as_str())
                     .with_ctx("rio_operation", plan.operation)
                     .attach_note("failed to acquire socket inflight slot for RIO submission"));
@@ -550,8 +546,7 @@ impl RioState {
         };
         let error_context = plan.submit_error_context();
         self.prepare_submission_lease(RioSubmissionSpec {
-            user_data: plan.user_data,
-            generation: plan.generation,
+            token: plan.token,
             socket_inflight,
             op_kind: plan.op_kind,
             rq,
@@ -596,8 +591,7 @@ impl RioState {
             RioRequestDiagnostics::new(spec.rq, &spec.data_buf.rio_buf, spec.addr.as_ref());
         let request_id = self.next_request_id();
         let context = Self::encode_req_ctx(RioOpRequestInit {
-            user_data: spec.user_data,
-            generation: spec.generation,
+            token: spec.token,
             socket_inflight: spec.socket_inflight,
             op_kind: spec.op_kind,
             request_id,
@@ -669,8 +663,7 @@ mod tests {
     fn test_req_init(addr_slot: Option<usize>) -> RioOpRequestInit {
         let socket_key = IocpHandle::for_socket(std::ptr::null_mut());
         RioOpRequestInit {
-            user_data: 11,
-            generation: 17,
+            token: OpToken::new(11, 17),
             socket_inflight: SocketInflightToken::new(socket_key),
             op_kind: RioOpKind::Recv,
             request_id: 23,
@@ -690,16 +683,14 @@ mod tests {
             decoded,
             Some(RioCompletionKind::Op {
                 init: RioOpRequestInit {
-                    user_data: 11,
-                    generation: 17,
+                    token,
                     op_kind: RioOpKind::Recv,
                     request_id: 23,
                     addr_slot: None,
                     ..
                 },
                 ..
-            })
-        ));
+            }) if token == OpToken::new(11, 17)));
     }
 
     #[test]
@@ -712,16 +703,14 @@ mod tests {
             decoded,
             Some(RioCompletionKind::Op {
                 init: RioOpRequestInit {
-                    user_data: 11,
-                    generation: 17,
+                    token,
                     op_kind: RioOpKind::Recv,
                     request_id: 23,
                     addr_slot: Some(3),
                     ..
                 },
                 ..
-            })
-        ));
+            }) if token == OpToken::new(11, 17)));
     }
 
     #[test]

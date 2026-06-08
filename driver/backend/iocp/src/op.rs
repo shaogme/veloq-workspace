@@ -23,7 +23,7 @@ use crate::rio::RioState;
 
 use diagweave::prelude::*;
 
-use veloq_driver_core::driver::PlatformOp;
+use veloq_driver_core::driver::{CompletionToken, OpToken, PlatformOp};
 use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
     FallocateRaw as FallocateRawBase, Fsync as FsyncBase, FsyncRaw as FsyncRawBase, IntoPlatformOp,
@@ -72,6 +72,8 @@ pub(crate) type Wakeup = WakeupBase;
 pub(crate) struct SubmitContext<'a> {
     pub(crate) port: Arc<crate::win32::IoCompletionPort>,
     pub(crate) overlapped: *mut crate::win32::Overlapped,
+    pub(crate) op_token: OpToken,
+    pub(crate) completion_token: CompletionToken,
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_slots: &'a mut [RegisteredSlot],
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
@@ -217,7 +219,7 @@ macro_rules! define_iocp_ops {
                     let op = IocpKernelOp {
                         // SAFETY: TABLE is a static and its address is guaranteed to be non-null.
                         vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
-                        header: OverlappedEntry::new(0),
+                        header: OverlappedEntry::new(OpToken::new(0, 0)),
                         payload: IocpOpPayload::$Variant(payload),
                     };
                     (op, self)

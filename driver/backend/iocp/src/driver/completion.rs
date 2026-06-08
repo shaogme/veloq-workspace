@@ -2,7 +2,11 @@ use std::time::Instant;
 
 use diagweave::prelude::*;
 use tracing::{debug, error};
-use veloq_driver_core::driver::{CompletionCleanupGuard, OpToken, RecordCompletionOutcome};
+use veloq_driver_core::driver::{
+    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, DriverCompletionDiagnostics,
+    OpToken, RawCompletion, RecordCompletionOutcome, RoutedSlotCompletion,
+    record_completion_anomaly, record_lost_completion, route_checked_slot_completion,
+};
 use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, io_result_to_event_res, push_completion_shared};
@@ -20,10 +24,10 @@ pub(super) struct EmitContext<'a> {
 enum CompletionRoute {
     Waiting,
     Orphaned,
-    Missing,
-    Empty,
-    Stale,
-    Corrupt,
+    Missing(CompletionAnomaly),
+    Empty(CompletionAnomaly),
+    Stale(CompletionAnomaly),
+    Corrupt(CompletionAnomaly),
 }
 
 impl<'a> IocpDriver<'a> {
@@ -67,10 +71,10 @@ impl<'a> IocpDriver<'a> {
             let outcome = push_completion_shared(
                 self.completion.events(),
                 self.completion.table(),
+                &mut self.completion_diagnostics,
                 completion_record(completion),
             );
-            self.completion_diagnostics
-                .record_completion_outcome(&outcome);
+            let _ = outcome;
         }
         for token in finished_timers {
             let _ = self.ops.remove_token(token);
@@ -109,8 +113,14 @@ impl<'a> IocpDriver<'a> {
         bytes_transferred: u32,
     ) {
         let (user_data, completed_generation) = token.parts();
+        let raw = RawCompletion::new(
+            CompletionBackend::Iocp,
+            veloq_driver_core::driver::CompletionToken::user(token),
+            iocp_completion_res(success, error_code, bytes_transferred),
+            0,
+        );
 
-        match self.completion_route(token) {
+        match self.completion_route(token, raw) {
             CompletionRoute::Waiting => {
                 let io_result =
                     self.calculate_io_result(token, success, error_code, bytes_transferred);
@@ -119,11 +129,13 @@ impl<'a> IocpDriver<'a> {
                     completion_events: self.completion.events(),
                     completion_table: self.completion.table(),
                 };
-                if let Some(outcome) = Self::emit_event_inner(ctx, &mut self.ops, token, io_result)
-                {
-                    self.completion_diagnostics
-                        .record_completion_outcome(&outcome);
-                }
+                let _ = Self::emit_event_inner(
+                    ctx,
+                    &mut self.ops,
+                    &mut self.completion_diagnostics,
+                    token,
+                    io_result,
+                );
             }
             CompletionRoute::Orphaned => {
                 self.release_socket_inflight_for_op(user_data);
@@ -146,29 +158,44 @@ impl<'a> IocpDriver<'a> {
                     .as_mut()
                     .map(|op| op.completion_cleanup(&io_result))
                     .unwrap_or_default();
-                drop(cleanup);
                 let _ = completed.take_op();
                 let _ = completed.take_completion_data();
-                self.ops
+                drop(completed);
+                let anomaly = CompletionAnomaly::non_active(
+                    raw.token,
+                    user_data,
+                    completed_generation,
+                    veloq_driver_core::slot::SlotState::InFlightOrphaned,
+                )
+                .with_raw_completion(raw);
+                let _ = record_lost_completion(
+                    self.completion.events(),
+                    self.completion.table(),
+                    &mut self.completion_diagnostics,
+                    raw.event(),
+                    anomaly,
+                    cleanup,
+                );
+                let _ = self
+                    .ops
                     .recycle_token(token, completed_generation.wrapping_add(1));
-                self.completion_diagnostics.inc_user_orphan_completed();
             }
-            CompletionRoute::Missing | CompletionRoute::Empty => {
-                self.completion_diagnostics.inc_unknown_completion();
+            CompletionRoute::Missing(anomaly) | CompletionRoute::Empty(anomaly) => {
+                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                 debug!(
                     user_data,
                     completed_generation, "ignoring completion for non-active slot"
                 );
             }
-            CompletionRoute::Stale => {
-                self.completion_diagnostics.inc_stale_completion();
+            CompletionRoute::Stale(anomaly) => {
+                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                 debug!(
                     user_data,
                     completed_generation, "ignoring stale IOCP completion"
                 );
             }
-            CompletionRoute::Corrupt => {
-                self.completion_diagnostics.inc_slot_corruption();
+            CompletionRoute::Corrupt(anomaly) => {
+                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                 error!(
                     user_data,
                     completed_generation, "IOCP completion found corrupt slot; recycling"
@@ -180,16 +207,14 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    fn completion_route(&mut self, token: OpToken) -> CompletionRoute {
-        match self.ops.checked_slot_view(token) {
-            CheckedSlotView::Valid(SlotView::InFlightWaiting(_)) => CompletionRoute::Waiting,
-            CheckedSlotView::Valid(SlotView::InFlightOrphaned(_)) => CompletionRoute::Orphaned,
-            CheckedSlotView::Valid(SlotView::Reserved(_)) | CheckedSlotView::Corrupt(_) => {
-                CompletionRoute::Corrupt
-            }
-            CheckedSlotView::Missing { .. } => CompletionRoute::Missing,
-            CheckedSlotView::Empty(_) => CompletionRoute::Empty,
-            CheckedSlotView::Stale(_) => CompletionRoute::Stale,
+    fn completion_route(&mut self, token: OpToken, raw: RawCompletion) -> CompletionRoute {
+        match route_checked_slot_completion(raw, self.ops.checked_slot_view(token)) {
+            RoutedSlotCompletion::Waiting(_) => CompletionRoute::Waiting,
+            RoutedSlotCompletion::Orphaned(_) => CompletionRoute::Orphaned,
+            RoutedSlotCompletion::Missing(anomaly) => CompletionRoute::Missing(anomaly),
+            RoutedSlotCompletion::Empty(anomaly) => CompletionRoute::Empty(anomaly),
+            RoutedSlotCompletion::Stale(anomaly) => CompletionRoute::Stale(anomaly),
+            RoutedSlotCompletion::Corrupt(anomaly) => CompletionRoute::Corrupt(anomaly),
         }
     }
 
@@ -270,6 +295,7 @@ impl<'a> IocpDriver<'a> {
     pub(super) fn emit_event_inner(
         ctx: EmitContext<'_>,
         ops: &mut IocpOpRegistry,
+        diagnostics: &mut DriverCompletionDiagnostics,
         token: OpToken,
         io_result: IocpResult<usize>,
     ) -> Option<RecordCompletionOutcome> {
@@ -318,6 +344,7 @@ impl<'a> IocpDriver<'a> {
             let outcome = push_completion_shared(
                 ctx.completion_events,
                 ctx.completion_table,
+                diagnostics,
                 completion_record(sidecar),
             );
             if handled.is_some() && should_free {
@@ -330,5 +357,14 @@ impl<'a> IocpDriver<'a> {
             let _ = ops.remove_token(token);
         }
         None
+    }
+}
+
+#[inline]
+fn iocp_completion_res(success: bool, error_code: Option<u32>, bytes_transferred: u32) -> i32 {
+    if success {
+        bytes_transferred.min(i32::MAX as u32) as i32
+    } else {
+        -(error_code.unwrap_or(0).min(i32::MAX as u32) as i32)
     }
 }

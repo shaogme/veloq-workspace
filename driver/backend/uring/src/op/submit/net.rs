@@ -2,6 +2,7 @@ use crate::driver::UringDriver;
 use crate::error::{UringDriverResult as DriverResult, UringError};
 use crate::op::{UringOp, UringOpPayload, UringUserPayload};
 use io_uring::{opcode, squeue};
+use veloq_driver_core::driver::SubmitTokenContext;
 use veloq_driver_core::op::{checked_read_buf_range, checked_write_buf_range};
 
 use super::{invalid_buf_io_range, payload_variant_mismatch, resolve_socket_fd};
@@ -11,11 +12,14 @@ macro_rules! make_buf_op {
         pub(crate) unsafe fn $fn_name(
             _op: &mut UringOp,
             driver: &mut UringDriver,
-            user_data: usize,
+            token: SubmitTokenContext,
         ) -> DriverResult<squeue::Entry> {
-            let storage = driver.ops.slot_storage_mut(user_data).ok_or_else(|| {
-                payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-            })?;
+            let storage = driver
+                .ops
+                .slot_storage_mut_token(token.op_token)
+                .ok_or_else(|| {
+                    payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
+                })?;
             let payload = storage.payload.as_mut().ok_or_else(|| {
                 payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
             })?;
@@ -45,11 +49,14 @@ macro_rules! make_buf_op {
         pub(crate) unsafe fn $fn_name(
             _op: &mut UringOp,
             driver: &mut UringDriver,
-            user_data: usize,
+            token: SubmitTokenContext,
         ) -> DriverResult<squeue::Entry> {
-            let storage = driver.ops.slot_storage_mut(user_data).ok_or_else(|| {
-                payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-            })?;
+            let storage = driver
+                .ops
+                .slot_storage_mut_token(token.op_token)
+                .ok_or_else(|| {
+                    payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
+                })?;
             let payload = storage.payload.as_mut().ok_or_else(|| {
                 payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
             })?;
@@ -95,11 +102,11 @@ impl_lifecycle!(drop_udp_send, UdpSend, direct_fd);
 pub(crate) unsafe fn make_sqe_connect(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_connect"))?;
     let payload = storage
         .payload
@@ -123,11 +130,11 @@ impl_lifecycle!(drop_connect, Connect, direct_fd);
 pub(crate) unsafe fn make_sqe_udp_connect(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_connect"))?;
     let payload = storage
         .payload
@@ -155,11 +162,11 @@ impl_lifecycle!(drop_udp_connect, UdpConnect, direct_fd);
 pub(crate) unsafe fn make_sqe_accept(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_accept"))?;
     let payload = storage
         .payload
@@ -224,11 +231,11 @@ impl_lifecycle!(drop_accept, Accept, nested_fd);
 pub(crate) unsafe fn make_sqe_send_to(
     op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_send_to"))?;
     let payload = storage
         .payload
@@ -273,11 +280,11 @@ impl_lifecycle!(drop_send_to, SendTo, nested_fd);
 pub(crate) unsafe fn make_sqe_udp_recv_from(
     op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_recv_from"))?;
     let payload = storage
         .payload

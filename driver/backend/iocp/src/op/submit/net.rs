@@ -67,7 +67,8 @@ pub(crate) fn submit_recv(
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
-    let (user_data, generation) = header.token.parts();
+    let token = ctx.op_token;
+    let (user_data, generation) = token.parts();
     mark_header_in_flight(
         header,
         ctx.rio
@@ -75,8 +76,7 @@ pub(crate) fn submit_recv(
                 RioTarget {
                     fd,
                     handle,
-                    user_data,
-                    generation,
+                    token,
                     buf_offset: val.buf_offset,
                     operation: "recv",
                 },
@@ -107,7 +107,8 @@ pub(crate) fn submit_udp_recv(
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
-    let (user_data, generation) = header.token.parts();
+    let token = ctx.op_token;
+    let (user_data, generation) = token.parts();
     mark_header_in_flight(
         header,
         ctx.rio
@@ -115,8 +116,7 @@ pub(crate) fn submit_udp_recv(
                 RioTarget {
                     fd,
                     handle,
-                    user_data,
-                    generation,
+                    token,
                     buf_offset: val.buf_offset,
                     operation: "udp_recv",
                 },
@@ -146,7 +146,8 @@ pub(crate) fn submit_send(
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
-    let (user_data, generation) = header.token.parts();
+    let token = ctx.op_token;
+    let (user_data, generation) = token.parts();
     mark_header_in_flight(
         header,
         ctx.rio
@@ -154,8 +155,7 @@ pub(crate) fn submit_send(
                 RioTarget {
                     fd: val.fd,
                     handle,
-                    user_data,
-                    generation,
+                    token,
                     buf_offset: val.buf_offset,
                     operation: "send",
                 },
@@ -185,7 +185,8 @@ pub(crate) fn submit_udp_send(
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
-    let (user_data, generation) = header.token.parts();
+    let token = ctx.op_token;
+    let (user_data, generation) = token.parts();
     mark_header_in_flight(
         header,
         ctx.rio
@@ -193,8 +194,7 @@ pub(crate) fn submit_udp_send(
                 RioTarget {
                     fd: val.fd,
                     handle,
-                    user_data,
-                    generation,
+                    token,
                     buf_offset: val.buf_offset,
                     operation: "udp_send",
                 },
@@ -569,8 +569,7 @@ pub(crate) fn submit_send_to(
         buf: &user.buf,
         addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
         addr_len: payload.addr_len,
-        user_data: header.token.index(),
-        generation: header.token.generation(),
+        token: ctx.op_token,
         buf_offset: user.buf_offset,
     };
     mark_header_in_flight(
@@ -612,8 +611,7 @@ pub(crate) fn submit_udp_recv_from(
         handle,
         recv_from_op: val,
         addr_ptr: (&mut payload.addr as *mut SockAddrStorage).cast::<std::ffi::c_void>(),
-        user_data: header.token.index(),
-        generation: header.token.generation(),
+        token: ctx.op_token,
     };
     mark_header_in_flight(
         header,

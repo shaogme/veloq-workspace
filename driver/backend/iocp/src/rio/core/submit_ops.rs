@@ -80,8 +80,7 @@ impl RioState {
         let RioTarget {
             fd,
             handle,
-            user_data,
-            generation,
+            token,
             buf_offset,
             operation,
         } = target;
@@ -89,8 +88,7 @@ impl RioState {
             RioSubmitPlan {
                 fd,
                 handle,
-                user_data,
-                generation,
+                token,
                 op_kind: RioOpKind::Recv,
                 buffer_kind: RioSubmissionKind::Recv,
                 buffer: buf,
@@ -122,8 +120,7 @@ impl RioState {
         let RioTarget {
             fd,
             handle,
-            user_data,
-            generation,
+            token,
             buf_offset,
             operation,
         } = target;
@@ -131,8 +128,7 @@ impl RioState {
             RioSubmitPlan {
                 fd,
                 handle,
-                user_data,
-                generation,
+                token,
                 op_kind: RioOpKind::Send,
                 buffer_kind: RioSubmissionKind::Send,
                 buffer: buf,

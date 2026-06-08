@@ -143,18 +143,16 @@ impl<'a> Driver for IocpDriver<'a> {
     }
 
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP) {
-        let user_data = token.index();
         let _ = self
             .ops
-            .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
+            .with_slot_storage_mut_token(token, |_result, payload_cell, _sidecar| {
                 *payload_cell = Some(payload);
             });
     }
 
     fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP> {
-        let user_data = token.index();
         self.ops
-            .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
+            .with_slot_storage_mut_token(token, |_result, payload_cell, _sidecar| {
                 payload_cell.take()
             })
             .flatten()
@@ -205,11 +203,13 @@ impl<'a> Driver for IocpDriver<'a> {
 
         let completion = &self.completion;
         let timer = &mut self.timer;
+        let diagnostics = &mut self.completion_diagnostics;
         let ctx = submission::SubmitContextInternal::new(
             completion.port_arc(),
             timer.wheel_mut(),
             completion.events(),
             completion.table(),
+            diagnostics,
         );
 
         Self::on_submit_res(&mut self.ops, ctx, result, token, op_in)

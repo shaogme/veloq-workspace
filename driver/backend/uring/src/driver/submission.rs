@@ -11,7 +11,7 @@ use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 
 use veloq_driver_core::driver::registry::{AllocResult, OpHandle};
 use veloq_driver_core::driver::{
-    CompletionToken, Driver, DriverSubmitResult, OpToken, SubmitStatus,
+    CompletionToken, Driver, DriverSubmitResult, OpToken, SubmitStatus, SubmitTokenContext,
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 use veloq_driver_core::slot::SlotAccessError;
@@ -87,9 +87,13 @@ impl<'a> UringDriver<'a> {
                         CompletionToken::user(token)
                     };
                     let sqe = unsafe {
-                        (vtable.make_sqe)(op, &mut *driver_ptr, user_data)
-                            .attach_note("driver.submit_from_slot_raw.make_sqe")?
-                            .user_data(completion_token.raw())
+                        (vtable.make_sqe)(
+                            op,
+                            &mut *driver_ptr,
+                            SubmitTokenContext::new(token, completion_token),
+                        )
+                        .attach_note("driver.submit_from_slot_raw.make_sqe")?
+                        .user_data(completion_token.raw())
                     };
                     (count, sqe)
                 };
@@ -177,7 +181,7 @@ impl<'a> UringDriver<'a> {
                 };
                 if let Some(duration) = duration_opt {
                     let task_id = driver.wheel.insert(token, duration);
-                    if let Some(entry) = driver.ops.get_mut(user_data) {
+                    if let Some(entry) = driver.ops.get_mut_token(token) {
                         entry.platform_data.timer_id = Some(task_id);
                     }
                     let _ = sub_guard.persist();
@@ -374,7 +378,7 @@ impl<'a> UringDriver<'a> {
             Err(e) => {
                 if let Some(op) = self
                     .ops
-                    .get_slot_entry_op_storage_and_entry_mut(user_data)
+                    .get_slot_entry_op_storage_and_entry_mut_token(token)
                     .and_then(|(_, _, op, _)| op.take())
                 {
                     *op_in = Some(op);
@@ -452,7 +456,7 @@ impl<'a> UringDriver<'a> {
             Err(e) => {
                 if let Some(op) = self
                     .ops
-                    .get_slot_entry_op_storage_and_entry_mut(user_data)
+                    .get_slot_entry_op_storage_and_entry_mut_token(token)
                     .and_then(|(_, _, op, _)| op.take())
                 {
                     *op_in = Some(op);

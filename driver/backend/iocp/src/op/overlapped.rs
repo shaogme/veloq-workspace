@@ -82,22 +82,33 @@ pub struct OverlappedEntry {
 }
 
 impl OverlappedEntry {
-    /// Creates a new `OverlappedEntry` with the given user data.
-    pub(crate) fn new(user_data: usize) -> Self {
-        Self {
+    /// Creates a new `OverlappedEntry` with the given operation token.
+    pub(crate) fn new(token: OpToken) -> Self {
+        let mut entry = Self {
             inner: Overlapped::zeroed(),
-            token: OpToken::new(user_data, 0),
+            token,
             in_flight: false,
             blocking_completion: None,
             resolved_handle: None,
             socket_inflight: None,
-        }
+        };
+        entry.reset_for_token(token);
+        entry
+    }
+
+    pub(crate) fn reset_for_token(&mut self, token: OpToken) {
+        self.inner = Overlapped::zeroed();
+        self.token = token;
+        self.in_flight = false;
+        self.blocking_completion = None;
+        self.resolved_handle = None;
+        self.socket_inflight = None;
     }
 }
 
 impl Default for OverlappedEntry {
     fn default() -> Self {
-        Self::new(0)
+        Self::new(OpToken::new(0, 0))
     }
 }
 

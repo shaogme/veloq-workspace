@@ -268,18 +268,16 @@ impl<'a> Driver for UringDriver<'a> {
     }
 
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: UringUserPayload) {
-        let user_data = token.index();
         let _ = self
             .ops
-            .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
+            .with_slot_storage_mut_token(token, |_result, payload_cell, _sidecar| {
                 *payload_cell = Some(payload);
             });
     }
 
     fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<UringUserPayload> {
-        let user_data = token.index();
         self.ops
-            .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
+            .with_slot_storage_mut_token(token, |_result, payload_cell, _sidecar| {
                 payload_cell.take()
             })
             .flatten()

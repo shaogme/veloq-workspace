@@ -8,6 +8,7 @@ use io_uring::squeue;
 use std::time::Duration;
 use veloq_driver_core::driver::CompletionCleanupGuard;
 use veloq_driver_core::driver::PlatformOp;
+use veloq_driver_core::driver::SubmitTokenContext;
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion, OpKind};
 
 mod payload;
@@ -28,7 +29,7 @@ pub(crate) use payload::{
 pub(crate) type MakeSqeFn = unsafe fn(
     op: &mut UringKernelOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry>;
 pub(crate) type OnCompleteFn = unsafe fn(
     op: &mut UringKernelOp,

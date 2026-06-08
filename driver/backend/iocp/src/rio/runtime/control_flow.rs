@@ -19,10 +19,12 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionPacket, CompletionToken, DriverCompletionDiagnostics, OpToken,
-    SharedCompletionQueue, SharedCompletionTable,
+    CompletionAnomaly, CompletionBackend, CompletionEvent, CompletionPacket, CompletionToken,
+    DriverCompletionDiagnostics, RawCompletion, RoutedSlotCompletion, SharedCompletionQueue,
+    SharedCompletionTable, record_completion_anomaly, record_lost_completion,
+    route_checked_slot_completion,
 };
-use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::SlotRegistryExt;
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
@@ -69,8 +71,7 @@ impl<'a> RioCompletionRouter<'a> {
 
     fn handle_op_completion(&mut self, init: RioOpRequestInit, res: &RIORESULT) -> RioResult<()> {
         let RioOpRequestInit {
-            user_data,
-            generation,
+            token: op_token,
             socket_inflight,
             op_kind,
             request_id,
@@ -78,13 +79,29 @@ impl<'a> RioCompletionRouter<'a> {
             buffer_lease,
             diagnostics,
         } = init;
+        let (user_data, generation) = op_token.parts();
         let socket_key = socket_inflight.socket_key();
         let ops = &mut self.comp.ops;
-        let op_token = OpToken::new(user_data, generation);
         let completion_token = CompletionToken::user(op_token);
-        match ops.checked_slot_view(op_token) {
-            CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+        let raw = RawCompletion::new(
+            CompletionBackend::Rio,
+            completion_token,
+            rio_raw_res(res),
+            0,
+        );
+        match route_checked_slot_completion(raw, ops.checked_slot_view(op_token)) {
+            RoutedSlotCompletion::Waiting(mut slot) => {
                 if slot.platform().generation != generation {
+                    let snapshot = slot.snapshot();
+                    let anomaly = CompletionAnomaly::corrupt(
+                        completion_token,
+                        snapshot.index,
+                        snapshot.generation,
+                        snapshot.state,
+                    )
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                    record_completion_anomaly(self.comp.diagnostics, &anomaly);
                     let report = IocpError::Internal
                         .to_report()
                         .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
@@ -94,23 +111,24 @@ impl<'a> RioCompletionRouter<'a> {
                         .with_ctx("rio_op_kind", op_kind.as_str())
                         .with_ctx("rio_request_id", request_id)
                         .attach_note("RIO slot platform generation mismatch");
-                    self.comp.diagnostics.inc_slot_corruption();
                     let mut guard = slot.complete();
-                    let _ = guard.take_op();
-                    let (payload, detail) = guard.take_completion_data();
                     let completion = Err(report);
-                    let event = CompletionEvent {
-                        token: completion_token,
-                        res: rio_result_to_event_res(&completion),
-                        flags: 0,
-                    };
+                    let cleanup = guard
+                        .op
+                        .as_mut()
+                        .map(|op| op.completion_cleanup(&completion))
+                        .unwrap_or_default();
+                    let _ = guard.take_op();
+                    let _ = guard.take_completion_data();
                     drop(guard);
-                    let outcome = push_completion_shared(
+                    let _ = record_lost_completion(
                         self.comp.events,
                         self.comp.table,
-                        CompletionPacket::new(event, payload, detail.or(Some(completion))),
+                        self.comp.diagnostics,
+                        raw.event(),
+                        anomaly,
+                        cleanup,
                     );
-                    self.comp.diagnostics.record_completion_outcome(&outcome);
                     let _ = ops.remove_token(op_token);
                 } else {
                     let cancelled = slot.platform().rio_cancel_requested;
@@ -181,24 +199,58 @@ impl<'a> RioCompletionRouter<'a> {
                         let outcome = push_completion_shared(
                             self.comp.events,
                             self.comp.table,
+                            self.comp.diagnostics,
                             CompletionPacket::new(event, payload, detail.or(Some(completion))),
                         );
-                        self.comp.diagnostics.record_completion_outcome(&outcome);
+                        let _ = outcome;
                     }
                     let _ = ops.remove_token(op_token);
                 }
             }
-            CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+            RoutedSlotCompletion::Orphaned(mut slot) => {
                 if slot.platform_mut().generation != generation {
-                    self.comp.diagnostics.inc_slot_corruption();
+                    let snapshot = slot.snapshot();
+                    let anomaly = CompletionAnomaly::corrupt(
+                        completion_token,
+                        snapshot.index,
+                        snapshot.generation,
+                        snapshot.state,
+                    )
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                    record_completion_anomaly(self.comp.diagnostics, &anomaly);
                     debug!(
                         user_data,
                         generation,
                         actual_generation = slot.platform().generation,
                         "RIO orphaned completion found platform generation mismatch"
                     );
+                    let orphan_result = IocpError::CompletionWait
+                        .push_ctx("scope", "rio.runtime.control_flow.orphan_cleanup")
+                        .with_ctx("socket_raw", socket_key.as_handle() as usize)
+                        .with_ctx("rio_op_kind", op_kind.as_str())
+                        .with_ctx("rio_request_id", request_id)
+                        .attach_note("orphaned RIO completion had platform generation mismatch");
+                    let mut guard = slot.complete();
+                    let cleanup = guard
+                        .op
+                        .as_mut()
+                        .map(|op| op.completion_cleanup(&orphan_result))
+                        .unwrap_or_default();
+                    let _ = guard.take_op();
+                    let _ = guard.take_completion_data();
+                    let _ = std::mem::take(guard.platform_mut());
+                    drop(guard);
+                    let _ = record_lost_completion(
+                        self.comp.events,
+                        self.comp.table,
+                        self.comp.diagnostics,
+                        raw.event(),
+                        anomaly,
+                        cleanup,
+                    );
+                    let _ = ops.recycle_token(op_token, generation.wrapping_add(1));
                 } else {
-                    self.comp.diagnostics.inc_user_orphan_completed();
                     let mut guard = slot.complete();
                     let orphan_result = if res.Status == 0 {
                         Ok(res.BytesTransferred as usize)
@@ -216,24 +268,38 @@ impl<'a> RioCompletionRouter<'a> {
                         .as_mut()
                         .map(|op| op.completion_cleanup(&orphan_result))
                         .unwrap_or_default();
-                    drop(cleanup);
                     let _ = guard.take_op();
                     let _ = guard.take_completion_data();
                     let _ = std::mem::take(guard.platform_mut());
                     drop(guard);
+                    let anomaly = CompletionAnomaly::non_active(
+                        completion_token,
+                        user_data,
+                        generation,
+                        veloq_driver_core::slot::SlotState::InFlightOrphaned,
+                    )
+                    .with_raw_completion(raw);
+                    let _ = record_lost_completion(
+                        self.comp.events,
+                        self.comp.table,
+                        self.comp.diagnostics,
+                        raw.event(),
+                        anomaly,
+                        cleanup,
+                    );
                     let _ = ops.recycle_token(op_token, generation.wrapping_add(1));
                 }
             }
-            CheckedSlotView::Valid(SlotView::Reserved(_)) | CheckedSlotView::Corrupt(_) => {
-                self.comp.diagnostics.inc_slot_corruption();
+            RoutedSlotCompletion::Corrupt(anomaly) => {
+                record_completion_anomaly(self.comp.diagnostics, &anomaly);
                 debug!(
                     user_data,
                     generation, "RIO completion found corrupt or reserved slot"
                 );
                 let _ = ops.recycle_token(op_token, generation.wrapping_add(1));
             }
-            CheckedSlotView::Missing { .. } => {
-                self.comp.diagnostics.inc_unknown_completion();
+            RoutedSlotCompletion::Missing(anomaly) => {
+                record_completion_anomaly(self.comp.diagnostics, &anomaly);
                 debug!(
                     user_data,
                     generation,
@@ -241,22 +307,22 @@ impl<'a> RioCompletionRouter<'a> {
                     "RIO completion for missing slot"
                 );
             }
-            CheckedSlotView::Empty(snapshot) => {
-                self.comp.diagnostics.inc_unknown_completion();
+            RoutedSlotCompletion::Empty(anomaly) => {
+                record_completion_anomaly(self.comp.diagnostics, &anomaly);
                 debug!(
                     user_data,
                     generation,
-                    state = ?snapshot.state,
+                    state = ?anomaly.state,
                     "RIO completion for non-active slot"
                 );
             }
-            CheckedSlotView::Stale(snapshot) => {
-                self.comp.diagnostics.inc_stale_completion();
+            RoutedSlotCompletion::Stale(anomaly) => {
+                record_completion_anomaly(self.comp.diagnostics, &anomaly);
                 debug!(
                     user_data,
                     generation,
-                    actual_generation = snapshot.generation,
-                    state = ?snapshot.state,
+                    actual_generation = anomaly.actual_generation,
+                    state = ?anomaly.state,
                     "RIO completion for stale slot"
                 );
             }
@@ -274,7 +340,14 @@ impl<'a> RioCompletionRouter<'a> {
 
     fn handle_one(&mut self, res: &RIORESULT) -> RioResult<()> {
         let Some(kind) = RioState::decode_req_ctx(res.RequestContext) else {
-            self.comp.diagnostics.inc_unknown_completion();
+            let raw = RawCompletion::new(
+                CompletionBackend::Rio,
+                CompletionToken::from_raw(res.RequestContext),
+                rio_raw_res(res),
+                0,
+            );
+            let anomaly = CompletionAnomaly::unknown_control(raw.token).with_raw_completion(raw);
+            record_completion_anomaly(self.comp.diagnostics, &anomaly);
             debug!(
                 request_context = res.RequestContext,
                 status = res.Status,
@@ -289,6 +362,17 @@ impl<'a> RioCompletionRouter<'a> {
                 context: _completed_context,
             } => self.handle_op_completion(init, res),
         }
+    }
+}
+
+#[inline]
+fn rio_raw_res(res: &RIORESULT) -> i32 {
+    if res.Status == 0 {
+        res.BytesTransferred.min(i32::MAX as u32) as i32
+    } else if res.Status > 0 {
+        -res.Status
+    } else {
+        res.Status
     }
 }
 

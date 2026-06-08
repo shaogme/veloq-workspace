@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
-    CompletionCleanupGuard, CompletionToken, DriverSubmitResult, OpToken, SharedCompletionQueue,
-    SharedCompletionTable, SubmitStatus,
+    CompletionCleanupGuard, CompletionToken, DriverCompletionDiagnostics, DriverSubmitResult,
+    OpToken, SharedCompletionQueue, SharedCompletionTable, SubmitStatus,
 };
 use veloq_driver_core::slot::{
     CheckedSlotView, Reserved, SlotAccessError, SlotRegistryExt, SlotView,
@@ -25,6 +25,7 @@ pub(crate) struct SubmitContextInternal<'a> {
     wheel: &'a mut veloq_wheel::Wheel<OpToken>,
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
+    diagnostics: &'a mut DriverCompletionDiagnostics,
 }
 
 impl<'a> SubmitContextInternal<'a> {
@@ -33,12 +34,14 @@ impl<'a> SubmitContextInternal<'a> {
         wheel: &'a mut veloq_wheel::Wheel<OpToken>,
         completion_events: &'a SharedCompletionQueue,
         completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
+        diagnostics: &'a mut DriverCompletionDiagnostics,
     ) -> Self {
         Self {
             port,
             wheel,
             completion_events,
             completion_table,
+            diagnostics,
         }
     }
 }
@@ -97,20 +100,13 @@ impl<'a> IocpDriver<'a> {
         guard.platform_mut().rio_cancel_requested = false;
         let mut guard = guard
             .init_op_with(op, |sidecar| {
-                sidecar.token = token;
-                sidecar.blocking_completion = None;
-                sidecar.in_flight = false;
-                sidecar.resolved_handle = None;
-                sidecar.socket_inflight = None;
+                sidecar.reset_for_token(token);
             })
             .map_err(|err| slot_access_report("iocp.driver.prep_op_slot.init_op", err))?;
 
         guard
             .with_op_mut(|op_ref| {
-                op_ref.header.token = token;
-                op_ref.header.blocking_completion = None;
-                op_ref.header.resolved_handle = None;
-                op_ref.header.socket_inflight = None;
+                op_ref.header.reset_for_token(token);
             })
             .map_err(|err| slot_access_report("iocp.driver.prep_op_slot.op_mut", err))?;
 
@@ -154,6 +150,7 @@ impl<'a> IocpDriver<'a> {
                 push_completion_shared(
                     ctx.completion_events,
                     ctx.completion_table,
+                    ctx.diagnostics,
                     completion_record(sidecar),
                 );
             }
@@ -299,6 +296,8 @@ impl<'a> IocpDriver<'a> {
             let mut ctx = SubmitContext {
                 port: self.completion.port_arc(),
                 overlapped,
+                op_token: token,
+                completion_token: CompletionToken::user(token),
                 ext: &self.extensions,
                 registered_slots,
                 registrar,

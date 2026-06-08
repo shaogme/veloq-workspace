@@ -17,7 +17,7 @@ use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use tracing::warn;
 use veloq_driver_core::DriverCoreError;
-use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard};
+use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard, SubmitTokenContext};
 use veloq_driver_core::op::BufIoRangeError;
 
 #[inline]
@@ -136,11 +136,11 @@ pub(crate) unsafe fn completion_cleanup_close_raw_fd(
 pub(crate) unsafe fn make_sqe_timeout(
     op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_timeout"))?;
     let payload = storage
         .payload
@@ -169,11 +169,11 @@ impl_lifecycle!(drop_timeout, Timeout, no_fd);
 pub(crate) unsafe fn make_sqe_wakeup(
     op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_wakeup"))?;
     let payload = storage
         .payload

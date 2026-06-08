@@ -13,13 +13,13 @@ use crate::rio::{
 };
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
+use veloq_driver_core::driver::OpToken;
 use veloq_driver_core::op::UdpRecvFrom;
 
 pub(crate) struct RioTarget<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
+    pub(crate) token: OpToken,
     pub(crate) buf_offset: usize,
     pub(crate) operation: &'static str,
 }
@@ -30,8 +30,7 @@ pub(crate) struct RioSendToArgs<'a> {
     pub(crate) buf: &'a veloq_buf::FixedBuf,
     pub(crate) addr_ptr: *const std::ffi::c_void,
     pub(crate) addr_len: i32,
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
+    pub(crate) token: OpToken,
     pub(crate) buf_offset: usize,
 }
 
@@ -40,8 +39,7 @@ pub(crate) struct RioUdpRecvFromArgs<'a> {
     pub(crate) handle: BorrowedRawHandle<'a>,
     pub(crate) recv_from_op: &'a mut UdpRecvFrom,
     pub(crate) addr_ptr: *mut std::ffi::c_void,
-    pub(crate) user_data: usize,
-    pub(crate) generation: u32,
+    pub(crate) token: OpToken,
 }
 
 impl RioState {
@@ -161,8 +159,7 @@ impl RioState {
             buf,
             addr_ptr,
             addr_len,
-            user_data,
-            generation,
+            token,
             buf_offset,
             ..
         } = args;
@@ -170,8 +167,7 @@ impl RioState {
             RioSubmitPlan {
                 fd,
                 handle,
-                user_data,
-                generation,
+                token,
                 op_kind: RioOpKind::SendTo,
                 buffer_kind: RioSubmissionKind::Send,
                 buffer: buf,
@@ -216,16 +212,14 @@ impl RioState {
             handle,
             recv_from_op,
             addr_ptr,
-            user_data,
-            generation,
+            token,
         } = args;
         let buf_offset = recv_from_op.buf_offset;
         self.submit_rio(
             RioSubmitPlan {
                 fd,
                 handle,
-                user_data,
-                generation,
+                token,
                 op_kind: RioOpKind::RecvFrom,
                 buffer_kind: RioSubmissionKind::Recv,
                 buffer: &recv_from_op.buf,

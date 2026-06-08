@@ -8,25 +8,20 @@ use crate::driver::UringDriver;
 use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_event_res};
 use crate::op::{
     UringUserPayload,
-    slot::{CheckedSlotView, SlotSnapshot, SlotView, UringOpRegistryExt},
+    slot::{CheckedSlotView, SlotView, UringOpRegistryExt},
 };
 use veloq_driver_core::driver::{
-    CompletionCleanupGuard, CompletionControlKind, CompletionEvent, CompletionPacket,
-    CompletionSidecar, CompletionToken, CompletionTokenClass, OpToken, RecordCompletionResult,
-    drain_cancel_requests,
+    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionDispatch,
+    CompletionEvent, CompletionPacket, CompletionSidecar, CompletionToken, OpToken, RawCompletion,
+    RoutedSlotCompletion, dispatch_raw_completion, drain_cancel_requests,
+    record_completion_anomaly, record_lost_completion, record_user_completion,
+    route_checked_slot_completion,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompletionProgress {
     pub(crate) user: usize,
     pub(crate) internal: usize,
-}
-
-enum UringCompletionKind {
-    User { token: OpToken },
-    Waker,
-    Cancel { id: u16 },
-    Unknown { token: CompletionToken },
 }
 
 impl<'a> UringDriver<'a> {
@@ -99,16 +94,75 @@ impl<'a> UringDriver<'a> {
                     }
                     _ => None,
                 },
-                CheckedSlotView::Missing { .. } | CheckedSlotView::Empty(_) => {
-                    self.completion_diagnostics.inc_unknown_completion();
+                CheckedSlotView::Missing {
+                    index,
+                    expected_generation,
+                } => {
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Uring,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly =
+                        CompletionAnomaly::unknown_slot(raw.token, index, expected_generation)
+                            .with_raw_completion(raw);
+                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                     None
                 }
-                CheckedSlotView::Stale(_) => {
-                    self.completion_diagnostics.inc_stale_completion();
+                CheckedSlotView::Empty(snapshot) => {
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Uring,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly = CompletionAnomaly::non_active(
+                        raw.token,
+                        snapshot.index,
+                        token.generation(),
+                        snapshot.state,
+                    )
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                    None
+                }
+                CheckedSlotView::Stale(snapshot) => {
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Uring,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly = CompletionAnomaly::stale(
+                        raw.token,
+                        snapshot.index,
+                        token.generation(),
+                        snapshot.generation,
+                        snapshot.state,
+                    )
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                     None
                 }
                 CheckedSlotView::Corrupt(snapshot) => {
-                    self.emit_corrupt_completion(snapshot, 0, 0, "timer found corrupt slot");
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Uring,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly = CompletionAnomaly::corrupt(
+                        raw.token,
+                        snapshot.index,
+                        snapshot.generation,
+                        snapshot.state,
+                    )
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                    self.emit_corrupt_completion(anomaly, "timer found corrupt slot");
                     None
                 }
             };
@@ -158,24 +212,26 @@ impl<'a> UringDriver<'a> {
 
         let mut progress = CompletionProgress::default();
         for (raw_token, cqe_res, cqe_flags) in cqes {
-            match classify_completion(raw_token) {
-                UringCompletionKind::User { token } => {
-                    progress.user += self.handle_user_completion(token, cqe_res, cqe_flags);
+            match dispatch_raw_completion(CompletionBackend::Uring, raw_token, cqe_res, cqe_flags) {
+                CompletionDispatch::User { token, raw } => {
+                    progress.user += self.handle_user_completion(token, raw);
                 }
-                UringCompletionKind::Waker => {
+                CompletionDispatch::Waker { raw, .. } => {
                     progress.internal += 1;
-                    self.handle_waker_completion(cqe_res)?;
+                    self.handle_waker_completion(raw.res)?;
                 }
-                UringCompletionKind::Cancel { id } => {
+                CompletionDispatch::Cancel { id, raw } => {
                     progress.internal += 1;
-                    self.handle_cancel_completion(id, cqe_res);
+                    self.handle_cancel_completion(id, raw.res);
                 }
-                UringCompletionKind::Unknown { token } => {
-                    self.completion_diagnostics.inc_unknown_completion();
+                CompletionDispatch::RioWake { raw, .. } | CompletionDispatch::Unknown { raw } => {
+                    let anomaly =
+                        CompletionAnomaly::unknown_control(raw.token).with_raw_completion(raw);
+                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                     debug!(
-                        token = token.raw(),
-                        res = cqe_res,
-                        flags = cqe_flags,
+                        token = raw.token.raw(),
+                        res = raw.res,
+                        flags = raw.flags,
                         "unknown uring completion token"
                     );
                 }
@@ -185,61 +241,49 @@ impl<'a> UringDriver<'a> {
         Ok(progress)
     }
 
-    fn handle_user_completion(&mut self, token: OpToken, cqe_res: i32, cqe_flags: u32) -> usize {
+    fn handle_user_completion(&mut self, token: OpToken, raw: RawCompletion) -> usize {
         let (user_data, generation) = token.parts();
-        match self.ops.checked_slot_view(token) {
-            CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
-                let sidecar = complete_waiting_slot(slot, token, cqe_res, cqe_flags);
+        match route_checked_slot_completion(raw, self.ops.checked_slot_view(token)) {
+            RoutedSlotCompletion::Waiting(slot) => {
+                let sidecar = complete_waiting_slot(slot, token, raw.res, raw.flags);
                 self.push_completion_event(sidecar);
                 let _ = self.ops.remove_token(token);
                 1
             }
-            CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
-                let sidecar = complete_orphaned_slot(slot, token, cqe_res, cqe_flags);
+            RoutedSlotCompletion::Orphaned(slot) => {
+                let sidecar = complete_orphaned_slot(slot, token, raw.res, raw.flags);
                 self.push_completion_event(sidecar);
                 let _ = self.ops.remove_token(token);
                 1
             }
-            CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
-                let snapshot = SlotSnapshot {
-                    index: user_data,
-                    generation,
-                    state: veloq_driver_core::slot::SlotState::Reserved,
-                    has_op: slot.op.is_some(),
-                    has_payload: slot.storage.payload.is_some(),
-                };
-                drop(slot);
-                self.emit_corrupt_completion(snapshot, cqe_res, cqe_flags, "reserved slot");
+            RoutedSlotCompletion::Corrupt(anomaly) => {
+                self.emit_corrupt_completion(anomaly, "corrupt slot");
                 0
             }
-            CheckedSlotView::Missing { .. } => {
-                self.completion_diagnostics.inc_unknown_completion();
+            RoutedSlotCompletion::Missing(anomaly) => {
+                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                 debug!(user_data, generation, "completion for missing slot");
                 0
             }
-            CheckedSlotView::Empty(snapshot) => {
-                self.completion_diagnostics.inc_unknown_completion();
+            RoutedSlotCompletion::Empty(anomaly) => {
+                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                 debug!(
                     user_data,
                     generation,
-                    state = ?snapshot.state,
+                    state = ?anomaly.state,
                     "completion for non-active slot"
                 );
                 0
             }
-            CheckedSlotView::Stale(snapshot) => {
-                self.completion_diagnostics.inc_stale_completion();
+            RoutedSlotCompletion::Stale(anomaly) => {
+                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                 debug!(
                     user_data,
                     generation,
-                    actual_generation = snapshot.generation,
-                    state = ?snapshot.state,
+                    actual_generation = anomaly.actual_generation,
+                    state = ?anomaly.state,
                     "stale uring completion"
                 );
-                0
-            }
-            CheckedSlotView::Corrupt(snapshot) => {
-                self.emit_corrupt_completion(snapshot, cqe_res, cqe_flags, "corrupt slot");
                 0
             }
         }
@@ -309,14 +353,14 @@ impl<'a> UringDriver<'a> {
         Ok(())
     }
 
-    fn emit_corrupt_completion(
-        &mut self,
-        snapshot: SlotSnapshot,
-        raw_res: i32,
-        flags: u32,
-        note: &'static str,
-    ) {
-        self.completion_diagnostics.inc_slot_corruption();
+    fn emit_corrupt_completion(&mut self, anomaly: CompletionAnomaly, note: &'static str) {
+        let Some(snapshot) = anomaly.slot_snapshot else {
+            record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+            return;
+        };
+        let raw_res = anomaly.raw_result.unwrap_or(-libc::EIO);
+        let flags = anomaly.flags.unwrap_or(0);
+        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
         error!(
             user_data = snapshot.index,
             generation = snapshot.generation,
@@ -329,14 +373,18 @@ impl<'a> UringDriver<'a> {
 
         let (payload, detail) = self
             .ops
-            .with_slot_storage_mut(snapshot.index, |result, payload, _sidecar| {
-                (payload.take(), result.take())
-            })
+            .with_slot_storage_mut_token(
+                OpToken::new(snapshot.index, snapshot.generation),
+                |result, payload, _sidecar| (payload.take(), result.take()),
+            )
             .unwrap_or((None, None));
         let mut cleanup = CompletionCleanupGuard::default();
-        if let Some((_, _, op, _)) = self
-            .ops
-            .get_slot_entry_op_storage_and_entry_mut(snapshot.index)
+        if let Some((_, _, op, _)) =
+            self.ops
+                .get_slot_entry_op_storage_and_entry_mut_token(OpToken::new(
+                    snapshot.index,
+                    snapshot.generation,
+                ))
         {
             if let Some(op_ref) = op.as_mut() {
                 cleanup = unsafe { (op_ref.vtable.completion_cleanup)(op_ref, raw_res) };
@@ -358,26 +406,22 @@ impl<'a> UringDriver<'a> {
         drop(payload);
         drop(detail);
 
-        let token = OpToken::new(snapshot.index, snapshot.generation);
         let event = CompletionEvent {
-            token: CompletionToken::user(token),
+            token: anomaly.token,
             res: -libc::EIO,
             flags,
         };
-        let anomaly = veloq_driver_core::driver::CompletionAnomaly::corrupt(
-            event.token,
-            snapshot.index,
-            snapshot.generation,
-            snapshot.state,
+        let _ = record_lost_completion(
+            &self.completion_events,
+            &self.completion_table,
+            &mut self.completion_diagnostics,
+            event,
+            anomaly,
+            cleanup,
         );
-        let outcome = self
-            .completion_table
-            .record_lost_completion(event, anomaly, cleanup);
-        self.completion_diagnostics
-            .record_completion_result(&outcome);
-        self.cleanup_rejected_completion(event, outcome);
-        self.completion_events.push(event);
-        let _ = self.ops.remove_token(token);
+        if let Some(token) = event.token.op_token() {
+            let _ = self.ops.remove_token(token);
+        }
     }
 
     pub(crate) fn push_completion_event(
@@ -385,48 +429,12 @@ impl<'a> UringDriver<'a> {
         sidecar: CompletionSidecar<UringUserPayload, UringError>,
     ) {
         let packet = CompletionPacket::from(sidecar);
-        let event = packet.event;
-        let outcome = self.completion_table.record_completion(packet);
-        self.completion_diagnostics
-            .record_completion_result(&outcome);
-        self.cleanup_rejected_completion(event, outcome);
-        self.completion_events.push(event);
-    }
-
-    fn cleanup_rejected_completion(
-        &mut self,
-        event: CompletionEvent,
-        outcome: RecordCompletionResult<UringUserPayload, UringError>,
-    ) {
-        let RecordCompletionResult::Rejected { outcome, packet } = outcome else {
-            return;
-        };
-
-        debug!(
-            token = event.token.raw(),
-            res = event.res,
-            flags = event.flags,
-            outcome = ?outcome,
-            "uring completion table rejected completion"
+        let _ = record_user_completion(
+            &self.completion_events,
+            &self.completion_table,
+            &mut self.completion_diagnostics,
+            packet,
         );
-        drop(packet);
-    }
-}
-
-fn classify_completion(raw: u64) -> UringCompletionKind {
-    let token = CompletionToken::from_raw(raw);
-    match token.classify() {
-        CompletionTokenClass::User(token) => UringCompletionKind::User { token },
-        CompletionTokenClass::Control {
-            kind: CompletionControlKind::Waker,
-            ..
-        } => UringCompletionKind::Waker,
-        CompletionTokenClass::Control {
-            kind: CompletionControlKind::Cancel,
-            id,
-        } => UringCompletionKind::Cancel { id },
-        CompletionTokenClass::Control { .. } => UringCompletionKind::Unknown { token },
-        CompletionTokenClass::UnknownControl { .. } => UringCompletionKind::Unknown { token },
     }
 }
 

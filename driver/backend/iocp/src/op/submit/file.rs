@@ -1,6 +1,5 @@
 use veloq_blocking::BlockingTask;
 use veloq_buf::FixedBuf;
-use veloq_driver_core::driver::CompletionToken;
 use veloq_driver_core::op::{BufIoRangeError, checked_read_buf_range, checked_write_buf_range};
 
 use diagweave::prelude::*;
@@ -197,7 +196,7 @@ fn make_blocking_completion(
     ctx: &SubmitContext<'_>,
     cleanup_success: Option<BlockingSuccessCleanup>,
 ) -> Arc<BlockingCompletion> {
-    let completion_key = CompletionToken::user(header.token).raw() as usize;
+    let completion_key = ctx.completion_token.raw() as usize;
     let completion = BlockingCompletion::new(ctx.port.clone(), completion_key, cleanup_success);
     header.blocking_completion = Some(completion.clone());
     completion

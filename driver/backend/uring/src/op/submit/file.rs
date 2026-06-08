@@ -5,6 +5,7 @@ use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use veloq_buf::PoolKind;
 use veloq_buf::heap::ChunkId;
+use veloq_driver_core::driver::SubmitTokenContext;
 use veloq_driver_core::op::{checked_read_buf_range, checked_write_buf_range};
 
 use super::{invalid_buf_io_range, payload_variant_mismatch, resolve_any_fd, resolve_file_fd};
@@ -14,11 +15,14 @@ macro_rules! make_rw_fixed {
         pub(crate) unsafe fn $fn_name(
             _op: &mut UringOp,
             driver: &mut UringDriver,
-            user_data: usize,
+            token: SubmitTokenContext,
         ) -> DriverResult<squeue::Entry> {
-            let storage = driver.ops.slot_storage_mut(user_data).ok_or_else(|| {
-                payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-            })?;
+            let storage = driver
+                .ops
+                .slot_storage_mut_token(token.op_token)
+                .ok_or_else(|| {
+                    payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
+                })?;
             let payload = storage.payload.as_mut().ok_or_else(|| {
                 payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
             })?;
@@ -68,11 +72,14 @@ macro_rules! make_rw_fixed {
         pub(crate) unsafe fn $fn_name(
             _op: &mut UringOp,
             driver: &mut UringDriver,
-            user_data: usize,
+            token: SubmitTokenContext,
         ) -> DriverResult<squeue::Entry> {
-            let storage = driver.ops.slot_storage_mut(user_data).ok_or_else(|| {
-                payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-            })?;
+            let storage = driver
+                .ops
+                .slot_storage_mut_token(token.op_token)
+                .ok_or_else(|| {
+                    payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
+                })?;
             let payload = storage.payload.as_mut().ok_or_else(|| {
                 payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
             })?;
@@ -124,11 +131,14 @@ macro_rules! make_rw_raw {
         pub(crate) unsafe fn $fn_name(
             _op: &mut UringOp,
             driver: &mut UringDriver,
-            user_data: usize,
+            token: SubmitTokenContext,
         ) -> DriverResult<squeue::Entry> {
-            let storage = driver.ops.slot_storage_mut(user_data).ok_or_else(|| {
-                payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-            })?;
+            let storage = driver
+                .ops
+                .slot_storage_mut_token(token.op_token)
+                .ok_or_else(|| {
+                    payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
+                })?;
             let payload = storage.payload.as_mut().ok_or_else(|| {
                 payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
             })?;
@@ -173,11 +183,14 @@ macro_rules! make_rw_raw {
         pub(crate) unsafe fn $fn_name(
             _op: &mut UringOp,
             driver: &mut UringDriver,
-            user_data: usize,
+            token: SubmitTokenContext,
         ) -> DriverResult<squeue::Entry> {
-            let storage = driver.ops.slot_storage_mut(user_data).ok_or_else(|| {
-                payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-            })?;
+            let storage = driver
+                .ops
+                .slot_storage_mut_token(token.op_token)
+                .ok_or_else(|| {
+                    payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
+                })?;
             let payload = storage.payload.as_mut().ok_or_else(|| {
                 payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
             })?;
@@ -245,11 +258,11 @@ impl_lifecycle!(drop_write_fixed, Write, direct_fd);
 pub(crate) unsafe fn make_sqe_close(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_close"))?;
     let payload = storage
         .payload
@@ -274,11 +287,11 @@ impl_lifecycle!(drop_close, Close, direct_fd);
 pub(crate) unsafe fn make_sqe_fsync(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_fsync"))?;
     let payload = storage
         .payload
@@ -309,11 +322,11 @@ impl_lifecycle!(drop_fsync, Fsync, direct_fd);
 pub(crate) unsafe fn make_sqe_fsync_raw(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_fsync_raw"))?;
     let payload = storage
         .payload
@@ -340,11 +353,11 @@ pub(crate) unsafe fn make_sqe_fsync_raw(
 pub(crate) unsafe fn make_sqe_sync_range(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_sync_range"))?;
     let payload = storage
         .payload
@@ -391,11 +404,11 @@ impl_lifecycle!(drop_sync_range, SyncRange, direct_fd);
 pub(crate) unsafe fn make_sqe_sync_range_raw(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_sync_range_raw"))?;
     let payload = storage
         .payload
@@ -434,11 +447,11 @@ pub(crate) unsafe fn make_sqe_sync_range_raw(
 pub(crate) unsafe fn make_sqe_fallocate(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_fallocate"))?;
     let payload = storage
         .payload
@@ -470,11 +483,11 @@ impl_lifecycle!(drop_fallocate, Fallocate, direct_fd);
 pub(crate) unsafe fn make_sqe_fallocate_raw(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_fallocate_raw"))?;
     let payload = storage
         .payload
@@ -498,11 +511,11 @@ pub(crate) unsafe fn make_sqe_fallocate_raw(
 pub(crate) unsafe fn make_sqe_open(
     _op: &mut UringOp,
     driver: &mut UringDriver,
-    user_data: usize,
+    token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let storage = driver
         .ops
-        .slot_storage_mut(user_data)
+        .slot_storage_mut_token(token.op_token)
         .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_open"))?;
     let payload = storage
         .payload

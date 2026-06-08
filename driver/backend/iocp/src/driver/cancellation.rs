@@ -46,11 +46,11 @@ impl<'a> IocpDriver<'a> {
             if let Some(outcome) = Self::abort_slot_inner(
                 emit_ctx,
                 &mut self.ops,
+                &mut self.completion_diagnostics,
                 request.mode == CancelMode::UserVisible,
                 token,
             ) {
-                self.completion_diagnostics
-                    .record_completion_outcome(&outcome);
+                let _ = outcome;
             }
             self.completion_diagnostics.inc_cancel_submitted();
             return Ok(CancelSubmitOutcome::AlreadyComplete);
@@ -70,11 +70,11 @@ impl<'a> IocpDriver<'a> {
                 if let Some(outcome) = Self::abort_slot_inner(
                     emit_ctx,
                     &mut self.ops,
+                    &mut self.completion_diagnostics,
                     request.mode == CancelMode::UserVisible,
                     token,
                 ) {
-                    self.completion_diagnostics
-                        .record_completion_outcome(&outcome);
+                    let _ = outcome;
                 }
                 self.completion_diagnostics.inc_cancel_submitted();
                 Ok(CancelSubmitOutcome::AlreadyComplete)
@@ -230,6 +230,7 @@ impl<'a> IocpDriver<'a> {
     fn abort_slot_inner(
         ctx: EmitContext<'_>,
         ops: &mut IocpOpRegistry,
+        diagnostics: &mut veloq_driver_core::driver::DriverCompletionDiagnostics,
         emit_completion: bool,
         token: OpToken,
     ) -> Option<RecordCompletionOutcome> {
@@ -261,6 +262,7 @@ impl<'a> IocpDriver<'a> {
             Some(push_completion_shared(
                 ctx.completion_events,
                 ctx.completion_table,
+                diagnostics,
                 completion_record(CompletionSidecar {
                     token,
                     res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
