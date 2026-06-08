@@ -4,21 +4,21 @@ use crate::{DriverCoreError, DriverResult};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DriverCompletionDiagnostics {
-    pub user_completed: u64,
-    pub user_orphan_completed: u64,
-    pub unknown_completion: u64,
-    pub stale_completion: u64,
-    pub slot_corruption: u64,
-    pub cancel_submitted: u64,
-    pub cancel_ack_ok: u64,
-    pub cancel_ack_not_found: u64,
-    pub cancel_ack_error: u64,
-    pub waker_ok: u64,
-    pub waker_error: u64,
-    pub waker_rebuild: u64,
-    pub completion_rejected: u64,
-    pub internal_unknown: u64,
-    pub orphan_cleanup_error: u64,
+    user_completed: u64,
+    user_orphan_completed: u64,
+    unknown_completion: u64,
+    stale_completion: u64,
+    slot_corruption: u64,
+    cancel_submitted: u64,
+    cancel_ack_ok: u64,
+    cancel_ack_not_found: u64,
+    cancel_ack_error: u64,
+    waker_ok: u64,
+    waker_error: u64,
+    waker_rebuild: u64,
+    completion_rejected: u64,
+    internal_unknown: u64,
+    orphan_cleanup_error: u64,
 }
 
 impl DriverCompletionDiagnostics {
