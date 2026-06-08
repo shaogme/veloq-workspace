@@ -79,20 +79,20 @@ pub(crate) type CancelTokenSlot<S, O> =
     <S as Storage>::Lock<Option<GenericCancellationToken<S, O>>>;
 
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
-pub struct GenericAsyncScope<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> {
-    context: RuntimeScopeContext<TExtra>,
+pub struct GenericAsyncScope<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> {
+    context: RuntimeScopeContext<'rt, TExtra>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
     _phantom: std::marker::PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
-pub type AsyncScope<'scope, TExtra> =
-    GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExtra>;
-pub type LocalAsyncScope<'scope, TExtra> =
-    GenericAsyncScope<'scope, LocalStorage, RcOwnership, TExtra>;
+pub type AsyncScope<'rt, 'scope, TExtra> =
+    GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwnership, TExtra>;
+pub type LocalAsyncScope<'rt, 'scope, TExtra> =
+    GenericAsyncScope<'rt, 'scope, LocalStorage, RcOwnership, TExtra>;
 
-impl<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
-    for GenericAsyncScope<'scope, S, O, TExtra>
+impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
+    for GenericAsyncScope<'rt, 'scope, S, O, TExtra>
 {
     type Storage = S;
     type Ownership = O;
@@ -111,10 +111,10 @@ impl<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopeProvider<TExt
     }
 }
 
-impl<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
-    GenericAsyncScope<'scope, S, O, TExtra>
+impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
+    GenericAsyncScope<'rt, 'scope, S, O, TExtra>
 {
-    pub fn new(context: RuntimeScopeContext<TExtra>, parent: Option<AnyScopeRef>) -> Self {
+    pub fn new(context: RuntimeScopeContext<'rt, TExtra>, parent: Option<AnyScopeRef>) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
         if let Some(ref parent) = parent {
@@ -224,8 +224,8 @@ impl<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     }
 }
 
-impl<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
-    for GenericAsyncScope<'scope, S, O, TExtra>
+impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
+    for GenericAsyncScope<'rt, 'scope, S, O, TExtra>
 {
     fn drop(&mut self) {
         if !self.completion.is_done() {
@@ -235,7 +235,7 @@ impl<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
 }
 
 // 线程安全作用域特合方法
-impl<'scope, TExtra> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExtra> {
+impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwnership, TExtra> {
     fn spawn_send_impl<'scope_ref, T: Send, S_>(
         &'scope_ref self,
         worker_id: usize,
@@ -462,7 +462,7 @@ impl<'scope, TExtra> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExt
 }
 
 // 本地作用域特有方法
-impl<'scope, TExtra> GenericAsyncScope<'scope, LocalStorage, RcOwnership, TExtra> {
+impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, LocalStorage, RcOwnership, TExtra> {
     pub fn spawn<'scope_ref, T: Send, S_>(
         &'scope_ref self,
         task: &'scope S_,

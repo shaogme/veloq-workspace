@@ -41,27 +41,38 @@ pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>,
     pub(crate) marker: std::marker::PhantomData<TExtra>,
 }
 
-unsafe impl<'scope_ref, T, TExtra> Send
-    for JoinHandle<'scope_ref, T, SendTaskRef, crate::scope::AsyncScope<'scope_ref, TExtra>, TExtra>
+unsafe impl<'rt, 'scope, 'scope_ref, T, TExtra> Send
+    for JoinHandle<
+        'scope_ref,
+        T,
+        SendTaskRef,
+        crate::scope::AsyncScope<'rt, 'scope, TExtra>,
+        TExtra,
+    >
 where
     T: Send,
 {
 }
 
-pub type LocalJoinHandle<'scope_ref, T, TExtra> = JoinHandle<
+pub type LocalJoinHandle<'rt, 'scope_ref, T, TExtra> = JoinHandle<
     'scope_ref,
     T,
     crate::task::LocalTaskRef,
-    crate::scope::AsyncScope<'scope_ref, TExtra>,
+    crate::scope::AsyncScope<'rt, 'scope_ref, TExtra>,
     TExtra,
 >;
-pub type SendJoinHandle<'scope_ref, T, TExtra> =
-    JoinHandle<'scope_ref, T, SendTaskRef, crate::scope::AsyncScope<'scope_ref, TExtra>, TExtra>;
-pub type LocalAsyncJoinHandle<'scope_ref, T, TExtra> = JoinHandle<
+pub type SendJoinHandle<'rt, 'scope_ref, T, TExtra> = JoinHandle<
+    'scope_ref,
+    T,
+    SendTaskRef,
+    crate::scope::AsyncScope<'rt, 'scope_ref, TExtra>,
+    TExtra,
+>;
+pub type LocalAsyncJoinHandle<'rt, 'scope_ref, T, TExtra> = JoinHandle<
     'scope_ref,
     T,
     crate::task::LocalTaskRef,
-    crate::scope::LocalAsyncScope<'scope_ref, TExtra>,
+    crate::scope::LocalAsyncScope<'rt, 'scope_ref, TExtra>,
     TExtra,
 >;
 

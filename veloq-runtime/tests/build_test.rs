@@ -81,7 +81,7 @@ fn test_nested_scope_build_5() {
     let rt = Runtime::<_, (), _>::new();
     rt.block_on(async |ctx| {
         ctx.scope(async |parent_scope| {
-            async fn run_child_scope(child_scope: &veloq_runtime::scope::AsyncScope<'_, ()>) {
+            async fn run_child_scope(child_scope: &veloq_runtime::scope::AsyncScope<'_, '_, ()>) {
                 child_scope.spawn_boxed(async {});
             }
             parent_scope.spawn_boxed(async {

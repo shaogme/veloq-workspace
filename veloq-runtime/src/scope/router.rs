@@ -216,8 +216,8 @@ impl<'scope_ref, T> Drop for RoutedSpawnState<'scope_ref, T> {
 unsafe impl<'scope_ref, T> Send for RoutedSpawnState<'scope_ref, T> where T: Send {}
 unsafe impl<'scope_ref, T> Sync for RoutedSpawnState<'scope_ref, T> where T: Send {}
 
-pub(crate) fn dispatch_routed<'scope_ref, S: ScopeStorage, O: Ownership, T, F, TExtra>(
-    context: &RuntimeScopeContext<TExtra>,
+pub(crate) fn dispatch_routed<'rt, 'scope_ref, S: ScopeStorage, O: Ownership, T, F, TExtra>(
+    context: &RuntimeScopeContext<'rt, TExtra>,
     completion: &O::Shared<GenericScopeCompletion<S, O>>,
     state: Arc<RoutedSpawnState<'scope_ref, T>>,
     worker_id: usize,

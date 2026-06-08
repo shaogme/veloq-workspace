@@ -98,23 +98,23 @@ unsafe impl Send for RuntimeContext {}
 unsafe impl Sync for RuntimeContext {}
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
-pub struct RuntimeScopeContext<T> {
-    shared: *const RuntimeShared<T>,
+pub struct RuntimeScopeContext<'rt, T> {
+    shared: &'rt RuntimeShared<T>,
 }
 
-unsafe impl<T> Send for RuntimeScopeContext<T> {}
-unsafe impl<T> Sync for RuntimeScopeContext<T> {}
+unsafe impl<'rt, T> Send for RuntimeScopeContext<'rt, T> {}
+unsafe impl<'rt, T> Sync for RuntimeScopeContext<'rt, T> {}
 
-impl<T> Copy for RuntimeScopeContext<T> {}
+impl<'rt, T> Copy for RuntimeScopeContext<'rt, T> {}
 
-impl<T> Clone for RuntimeScopeContext<T> {
+impl<'rt, T> Clone for RuntimeScopeContext<'rt, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T> RuntimeScopeContext<T> {
-    pub fn new(shared: *const RuntimeShared<T>) -> Self {
+impl<'rt, T> RuntimeScopeContext<'rt, T> {
+    pub(crate) fn new(shared: &'rt RuntimeShared<T>) -> Self {
         Self { shared }
     }
 
@@ -134,8 +134,8 @@ impl<T> RuntimeScopeContext<T> {
     }
 
     /// Returns the shared runtime state.
-    pub fn shared<'a>(&self) -> &'a RuntimeShared<T> {
-        unsafe { &*self.shared }
+    pub fn shared(&self) -> &'rt RuntimeShared<T> {
+        self.shared
     }
 
     pub fn route_to<'scope_ref, F, Fut>(
@@ -259,15 +259,10 @@ impl<T> RuntimeScopeContext<T> {
     /// Creates a new thread-safe (Send) asynchronous scope.
     pub async fn scope<'scope, R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'scope, T>) -> R,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'rt, 'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = AsyncScope::new(
-            RuntimeScopeContext {
-                shared: self.shared,
-            },
-            parent,
-        );
+        let s = AsyncScope::new(*self, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
@@ -276,15 +271,10 @@ impl<T> RuntimeScopeContext<T> {
     /// Creates a new thread-local asynchronous scope.
     pub async fn scope_local<'scope, R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'scope, T>) -> R,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'rt, 'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = LocalAsyncScope::new(
-            RuntimeScopeContext {
-                shared: self.shared,
-            },
-            parent,
-        );
+        let s = LocalAsyncScope::new(*self, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
@@ -351,10 +341,8 @@ impl<'scope, T> WorkerInitContext<'scope, T> {
 
     /// Returns the runtime scope context.
     #[inline]
-    pub fn scope(&self) -> RuntimeScopeContext<T> {
-        RuntimeScopeContext {
-            shared: self.shared,
-        }
+    pub fn scope(&self) -> RuntimeScopeContext<'scope, T> {
+        RuntimeScopeContext::new(self.shared)
     }
 
     /// Returns the custom worker extra state.
