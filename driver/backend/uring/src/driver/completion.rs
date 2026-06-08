@@ -249,7 +249,7 @@ impl<'a> UringDriver<'a> {
         let request = self.pending_cancel_cqes.remove(&cancel_id);
         match cqe_res {
             value if value >= 0 => {
-                self.completion_diagnostics.inc_cancel_cqe_ok();
+                self.completion_diagnostics.inc_cancel_ack_ok();
                 trace!(
                     cancel_id,
                     ?request,
@@ -258,7 +258,7 @@ impl<'a> UringDriver<'a> {
                 );
             }
             value if value == -libc::ENOENT => {
-                self.completion_diagnostics.inc_cancel_cqe_enoent();
+                self.completion_diagnostics.inc_cancel_ack_not_found();
                 debug!(
                     cancel_id,
                     ?request,
@@ -266,7 +266,7 @@ impl<'a> UringDriver<'a> {
                 );
             }
             value => {
-                self.completion_diagnostics.inc_cancel_cqe_error();
+                self.completion_diagnostics.inc_cancel_ack_error();
                 warn!(
                     cancel_id,
                     ?request,

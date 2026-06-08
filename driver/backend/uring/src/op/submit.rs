@@ -16,6 +16,7 @@ use crate::op::{UringOp, UringOpPayload, UringUserPayload};
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use tracing::warn;
+use veloq_driver_core::DriverCoreError;
 use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard};
 use veloq_driver_core::op::BufIoRangeError;
 
@@ -116,12 +117,19 @@ pub(crate) unsafe fn completion_cleanup_close_raw_fd(
         // SAFETY: successful open/accept CQEs transfer a fresh raw fd that no user future owns yet.
         let close_res = unsafe { libc::close(result) };
         if close_res != 0 {
+            let error = std::io::Error::last_os_error();
             warn!(
                 fd = result,
-                errno = std::io::Error::last_os_error().raw_os_error(),
+                errno = error.raw_os_error(),
                 "failed to close unconsumed uring completion fd"
             );
+            return Err(DriverCoreError::System
+                .to_report()
+                .push_ctx("scope", "uring.op.submit.completion_cleanup_close_raw_fd")
+                .set_error_code(error.raw_os_error().unwrap_or(libc::EIO))
+                .attach_note(error.to_string()));
         }
+        Ok(())
     }))
 }
 

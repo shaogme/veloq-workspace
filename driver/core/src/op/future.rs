@@ -25,6 +25,8 @@ pub enum LostReason {
     GenerationMismatch,
     /// 内部错误：操作负载丢失 (Completion sidecar missing)。
     PayloadMissing,
+    /// 内部错误：擦除后的 payload 与操作类型不匹配。
+    PayloadTypeMismatch,
     /// 其它未知原因造成的资源丢失。
     Other,
 }
@@ -34,6 +36,7 @@ impl std::fmt::Display for LostReason {
         match self {
             Self::GenerationMismatch => write!(f, "generation mismatch (slot recycled)"),
             Self::PayloadMissing => write!(f, "payload missing"),
+            Self::PayloadTypeMismatch => write!(f, "payload type mismatch"),
             Self::Other => write!(f, "unknown resource loss"),
         }
     }
@@ -133,6 +136,14 @@ where
 }
 
 #[inline]
+pub(crate) fn payload_projection_error<E>(source: DriverReport<E>) -> OpError<E>
+where
+    E: DriverError,
+{
+    OpError::new(LostReason::PayloadTypeMismatch, source)
+}
+
+#[inline]
 pub(crate) fn completion_anomaly_error<E>(anomaly: CompletionAnomaly) -> OpError<E>
 where
     E: DriverError,
@@ -164,6 +175,20 @@ where
     if let Some(state) = anomaly.state {
         report = report.with_ctx("slot_state", format!("{state:?}"));
     }
+    if let Some(backend) = anomaly.backend {
+        report = report.with_ctx("completion_backend", format!("{backend:?}"));
+    }
+    if let Some(raw_result) = anomaly.raw_result {
+        report = report.with_ctx("raw_result", raw_result);
+    }
+    if let Some(flags) = anomaly.flags {
+        report = report.with_ctx("completion_flags", flags);
+    }
+    if let Some(snapshot) = anomaly.slot_snapshot {
+        report = report
+            .with_ctx("snapshot_has_op", snapshot.has_op)
+            .with_ctx("snapshot_has_payload", snapshot.has_payload);
+    }
 
     OpError::new(reason, E::from_core_report(report))
 }
@@ -185,8 +210,14 @@ where
     let Some(payload_erased) = payload_erased else {
         return Poll::Ready(OpResult::ResourceLost(payload_missing_error()));
     };
+    let payload = match T::try_payload_from_erased(payload_erased) {
+        Ok(payload) => payload,
+        Err(report) => {
+            let _ = record.cleanup.run();
+            return Poll::Ready(OpResult::ResourceLost(payload_projection_error(report)));
+        }
+    };
     record.disarm_cleanup();
-    let payload = T::payload_from_erased(payload_erased);
     let res = detail.unwrap_or_else(|| event_res_to_result::<C, E>(event.res));
     let completion = T::complete(payload, res);
     Poll::Ready(OpResult::Completed(completion.result, completion.output))
@@ -444,7 +475,14 @@ where
                                         payload_missing_error(),
                                     ));
                                 };
-                                let payload = T::payload_from_erased(payload_erased);
+                                let payload = match T::try_payload_from_erased(payload_erased) {
+                                    Ok(payload) => payload,
+                                    Err(report) => {
+                                        return Poll::Ready(OpResult::ResourceLost(
+                                            payload_projection_error(report),
+                                        ));
+                                    }
+                                };
                                 trace!(
                                     op = %std::any::type_name::<T>(),
                                     status = ?status,

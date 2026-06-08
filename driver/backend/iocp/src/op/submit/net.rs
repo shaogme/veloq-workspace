@@ -547,6 +547,7 @@ pub(crate) unsafe fn completion_cleanup_close_socket(
     };
     CompletionCleanupGuard::new(CompletionCleanup::new(move || {
         crate::config::IocpHandle::for_socket(raw as _).close();
+        Ok(())
     }))
 }
 

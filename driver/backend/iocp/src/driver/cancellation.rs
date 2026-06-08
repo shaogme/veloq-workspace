@@ -122,7 +122,7 @@ impl<'a> IocpDriver<'a> {
                 Ok(CancelSubmitOutcome::Submitted)
             }
             Ok(CancelPerformStatus::NotFound) => {
-                self.completion_diagnostics.inc_cancel_cqe_enoent();
+                self.completion_diagnostics.inc_cancel_ack_not_found();
                 debug!("CancelIoEx target was already complete or absent");
                 Ok(CancelSubmitOutcome::NotFound)
             }
@@ -131,7 +131,7 @@ impl<'a> IocpDriver<'a> {
                 Ok(CancelSubmitOutcome::NoHandle)
             }
             Err(report) => {
-                self.completion_diagnostics.inc_cancel_cqe_error();
+                self.completion_diagnostics.inc_cancel_ack_error();
                 warn!(report = ?report, "CancelIoEx failed");
                 Err(report)
             }
@@ -156,9 +156,13 @@ impl<'a> IocpDriver<'a> {
                 } else {
                     let raw_handle = guard
                         .with_op_mut(|iocp_op| iocp_op.header.resolved_handle)
+                        .ok()
                         .flatten()
                         .or_else(|| {
-                            let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten()?;
+                            let fd = guard
+                                .with_op_mut(|iocp_op| iocp_op.get_fd())
+                                .ok()
+                                .flatten()?;
                             submit::resolve_fd_handle(&fd, ctx.registered_slots).ok()
                         });
 

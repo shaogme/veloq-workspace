@@ -89,6 +89,30 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
     pub fn platform_mut(&mut self) -> &mut SlotPlatformData<Spec> {
         self.platform
     }
+
+    #[inline]
+    pub fn snapshot(&self) -> SlotSnapshot {
+        SlotSnapshot {
+            index: self.index,
+            generation: self.entry.generation(Ordering::Acquire),
+            state: self.entry.state(Ordering::Acquire),
+            has_op: self.op.is_some(),
+            has_payload: self.storage.payload.is_some(),
+        }
+    }
+
+    #[inline]
+    fn access_error(
+        &self,
+        action: SlotAccessAction,
+        reason: SlotAccessErrorReason,
+    ) -> SlotAccessError {
+        SlotAccessError {
+            action,
+            reason,
+            snapshot: self.snapshot(),
+        }
+    }
 }
 
 #[inline]
@@ -120,59 +144,69 @@ impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
         self.op.is_some()
     }
 
-    pub fn init_op_with<F>(self, op: SlotOp<Spec>, init_sidecar: F) -> Slot<'a, Reserved, Spec>
+    pub fn init_op_with<F>(
+        self,
+        op: SlotOp<Spec>,
+        init_sidecar: F,
+    ) -> SlotAccessOutcome<Slot<'a, Reserved, Spec>>
     where
         F: FnOnce(&mut SlotSidecarData<Spec>),
     {
-        assert!(
-            self.op.is_none(),
-            "slot {} entering Reserved state must not already contain an op",
-            self.index
-        );
+        if self.op.is_some() {
+            return Err(self.access_error(
+                SlotAccessAction::InitOp,
+                SlotAccessErrorReason::UnexpectedOp,
+            ));
+        }
         *self.op = Some(op);
         self.storage
             .with_mut(|_result, _payload, sidecar| init_sidecar(sidecar));
 
-        Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
+        Ok(Slot::new_internal(
+            self.entry,
+            self.op,
+            self.storage,
+            self.platform,
+            self.index,
+        ))
     }
 
     pub fn start_submission_with(
         self,
         rollback: Option<SubmissionRollback<'a, Spec>>,
-    ) -> SubmissionGuard<'a, Spec> {
-        assert!(
-            self.op.is_some(),
-            "slot {} in Reserved state must contain an op",
-            self.index
-        );
+    ) -> SlotAccessOutcome<SubmissionGuard<'a, Spec>> {
+        if self.op.is_none() {
+            return Err(self.access_error(
+                SlotAccessAction::StartSubmission,
+                SlotAccessErrorReason::MissingOp,
+            ));
+        }
         self.entry
             .set_state(SlotState::InFlightWaiting, Ordering::Release);
 
-        SubmissionGuard {
+        Ok(SubmissionGuard {
             slot: Some(self),
             rollback,
             persisted: false,
-        }
+        })
     }
 
     #[inline]
-    pub fn with_op_mut<F, X>(&mut self, f: F) -> Option<X>
+    pub fn with_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
     where
         F: FnOnce(&mut SlotOp<Spec>) -> X,
     {
-        assert!(
-            self.op.is_some(),
-            "slot {} in Reserved state must contain an op",
-            self.index
-        );
-        self.op.as_mut().map(f)
+        self.op_mut().map(f)
     }
 
     #[inline]
-    pub fn op_mut(&mut self) -> &mut SlotOp<Spec> {
-        self.op
-            .as_mut()
-            .expect("slot in Reserved state must contain an op")
+    pub fn op_mut(&mut self) -> SlotAccessOutcome<&mut SlotOp<Spec>> {
+        if self.op.is_none() {
+            return Err(
+                self.access_error(SlotAccessAction::OpMut, SlotAccessErrorReason::MissingOp)
+            );
+        }
+        Ok(self.op.as_mut().expect("checked Some above"))
     }
 }
 
@@ -193,43 +227,31 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightWaiting, Spec> {
     }
 
     pub fn complete(self) -> Slot<'a, Completed, Spec> {
-        assert!(
-            self.op.is_some(),
-            "slot {} in InFlight state must contain an op",
-            self.index
-        );
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
     pub fn cancel(self) -> Slot<'a, InFlightOrphaned, Spec> {
-        assert!(
-            self.op.is_some(),
-            "slot {} in InFlight state must contain an op",
-            self.index
-        );
         self.entry
             .set_state(SlotState::InFlightOrphaned, Ordering::Release);
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
     #[inline]
-    pub fn with_op_mut<F, X>(&mut self, f: F) -> Option<X>
+    pub fn with_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
     where
         F: FnOnce(&mut SlotOp<Spec>) -> X,
     {
-        assert!(
-            self.op.is_some(),
-            "slot {} in InFlight state must contain an op",
-            self.index
-        );
-        self.op.as_mut().map(f)
+        self.op_mut().map(f)
     }
 
     #[inline]
-    pub fn op_mut(&mut self) -> &mut SlotOp<Spec> {
-        self.op
-            .as_mut()
-            .expect("slot in InFlight state must contain an op")
+    pub fn op_mut(&mut self) -> SlotAccessOutcome<&mut SlotOp<Spec>> {
+        if self.op.is_none() {
+            return Err(
+                self.access_error(SlotAccessAction::OpMut, SlotAccessErrorReason::MissingOp)
+            );
+        }
+        Ok(self.op.as_mut().expect("checked Some above"))
     }
 
     /// Access sidecar without state checks.
@@ -257,13 +279,10 @@ impl<'a, Spec: SlotSpec> Slot<'a, Completed, Spec> {
     }
 
     #[inline]
-    pub fn take_op(&mut self) -> Option<SlotOp<Spec>> {
-        assert!(
-            self.op.is_some(),
-            "slot {} in Completed state must contain an op",
-            self.index
-        );
-        self.op.take()
+    pub fn take_op(&mut self) -> SlotAccessOutcome<SlotOp<Spec>> {
+        self.op.take().ok_or_else(|| {
+            self.access_error(SlotAccessAction::TakeOp, SlotAccessErrorReason::MissingOp)
+        })
     }
 
     pub fn take_completion_data(&mut self) -> SlotCompletionData<Spec> {
@@ -339,6 +358,29 @@ pub struct SlotSnapshot {
     pub has_op: bool,
     pub has_payload: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotAccessAction {
+    InitOp,
+    StartSubmission,
+    OpMut,
+    TakeOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotAccessErrorReason {
+    MissingOp,
+    UnexpectedOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotAccessError {
+    pub action: SlotAccessAction,
+    pub reason: SlotAccessErrorReason,
+    pub snapshot: SlotSnapshot,
+}
+
+pub type SlotAccessOutcome<T> = Result<T, SlotAccessError>;
 
 pub enum CheckedSlotView<'a, Spec: SlotSpec> {
     Valid(SlotView<'a, Spec>),
@@ -467,12 +509,15 @@ mod tests {
                 })
                 .expect("slot storage should exist");
             let slot = match registry.checked_slot_view(token) {
-                CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
-                    slot.init_op_with(DummyPlatformOp, |_| {})
-                }
+                CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot
+                    .init_op_with(DummyPlatformOp, |_| {})
+                    .expect("reserved slot should accept op"),
                 _ => panic!("reserved slot should be available"),
             };
-            let _in_flight = slot.start_submission_with(None).persist();
+            let _in_flight = slot
+                .start_submission_with(None)
+                .expect("reserved slot should start submission")
+                .persist();
         }
 
         registry

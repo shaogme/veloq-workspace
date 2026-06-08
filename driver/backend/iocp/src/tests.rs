@@ -55,7 +55,7 @@ where
         >,
 {
     let payload_erased = record.payload.take().expect("completion payload missing");
-    let payload = T::payload_from_erased(payload_erased);
+    let payload = T::try_payload_from_erased(payload_erased).expect("completion payload type");
     let res = record
         .detail
         .take()

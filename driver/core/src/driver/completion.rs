@@ -10,8 +10,9 @@ pub use table::{
     CompletionAccess, PollRecordResult, SharedCompletionQueue, SharedCompletionTable,
 };
 pub use types::{
-    CompletionAnomaly, CompletionAnomalyReason, CompletionCleanup, CompletionCleanupGuard,
-    DriverCompletionDiagnostics, RecordCompletionOutcome, RecordCompletionResult,
+    CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanup,
+    CompletionCleanupGuard, DriverCompletionDiagnostics, RecordCompletionOutcome,
+    RecordCompletionResult,
 };
 
 pub trait CompletionValue: Send {
@@ -76,6 +77,86 @@ pub enum CompletionTokenClass {
         kind: u16,
         id: u16,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawCompletion {
+    pub backend: CompletionBackend,
+    pub token: CompletionToken,
+    pub res: i32,
+    pub flags: u32,
+}
+
+impl RawCompletion {
+    #[inline]
+    pub const fn new(
+        backend: CompletionBackend,
+        token: CompletionToken,
+        res: i32,
+        flags: u32,
+    ) -> Self {
+        Self {
+            backend,
+            token,
+            res,
+            flags,
+        }
+    }
+
+    #[inline]
+    pub const fn event(self) -> CompletionEvent {
+        CompletionEvent {
+            token: self.token,
+            res: self.res,
+            flags: self.flags,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionDispatch {
+    User { token: OpToken, raw: RawCompletion },
+    Waker { id: u16, raw: RawCompletion },
+    Cancel { id: u16, raw: RawCompletion },
+    RioWake { id: u16, raw: RawCompletion },
+    Unknown { raw: RawCompletion },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionRoute {
+    Waiting,
+    Orphaned,
+    Missing(CompletionAnomaly),
+    Empty(CompletionAnomaly),
+    Stale(CompletionAnomaly),
+    Corrupt(CompletionAnomaly),
+}
+
+#[inline]
+pub fn dispatch_raw_completion(
+    backend: CompletionBackend,
+    raw_token: u64,
+    res: i32,
+    flags: u32,
+) -> CompletionDispatch {
+    let token = CompletionToken::from_raw(raw_token);
+    let raw = RawCompletion::new(backend, token, res, flags);
+    match token.classify() {
+        CompletionTokenClass::User(token) => CompletionDispatch::User { token, raw },
+        CompletionTokenClass::Control {
+            kind: CompletionControlKind::Waker,
+            id,
+        } => CompletionDispatch::Waker { id, raw },
+        CompletionTokenClass::Control {
+            kind: CompletionControlKind::Cancel,
+            id,
+        } => CompletionDispatch::Cancel { id, raw },
+        CompletionTokenClass::Control {
+            kind: CompletionControlKind::RioWake,
+            id,
+        } => CompletionDispatch::RioWake { id, raw },
+        CompletionTokenClass::UnknownControl { .. } => CompletionDispatch::Unknown { raw },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -409,6 +490,73 @@ impl<UP, E, R> From<CompletionPacket<UP, E, R>> for CompletionRecord<UP, E, R> {
             record_kind: packet.record_kind,
         }
     }
+}
+
+#[inline]
+fn run_rejected_cleanup<UP, E, R>(
+    diagnostics: &mut DriverCompletionDiagnostics,
+    mut packet: CompletionPacket<UP, E, R>,
+) {
+    if packet.cleanup.run().is_err() {
+        diagnostics.inc_orphan_cleanup_error();
+    }
+    drop(packet);
+}
+
+#[inline]
+pub fn record_user_completion<UP, E, R>(
+    queue: &SharedCompletionQueue,
+    table: &SharedCompletionTable<UP, E, R>,
+    diagnostics: &mut DriverCompletionDiagnostics,
+    packet: CompletionPacket<UP, E, R>,
+) -> RecordCompletionOutcome
+where
+    UP: Send,
+    E: Send,
+    R: Send,
+{
+    let event = packet.event;
+    match table.record_completion(packet) {
+        RecordCompletionResult::Recorded => {
+            let outcome = RecordCompletionOutcome::Recorded;
+            diagnostics.record_completion_outcome(&outcome);
+            queue.push(event);
+            outcome
+        }
+        RecordCompletionResult::Rejected { outcome, packet } => {
+            diagnostics.record_completion_outcome(&outcome);
+            run_rejected_cleanup(diagnostics, packet);
+            queue.push(event);
+            outcome
+        }
+    }
+}
+
+#[inline]
+pub fn record_lost_completion<UP, E, R>(
+    queue: &SharedCompletionQueue,
+    table: &SharedCompletionTable<UP, E, R>,
+    diagnostics: &mut DriverCompletionDiagnostics,
+    event: CompletionEvent,
+    anomaly: CompletionAnomaly,
+    cleanup: CompletionCleanupGuard,
+) -> RecordCompletionOutcome
+where
+    UP: Send,
+    E: Send,
+    R: Send,
+{
+    record_user_completion(
+        queue,
+        table,
+        diagnostics,
+        CompletionPacket::lost(event, anomaly, cleanup),
+    )
+}
+
+#[inline]
+pub fn discard_internal_completion(diagnostics: &mut DriverCompletionDiagnostics) {
+    diagnostics.inc_internal_unknown();
 }
 
 #[inline]

@@ -157,11 +157,14 @@ macro_rules! define_uring_ops {
                     UringUserPayload::$OpType(payload)
                 }
 
-                fn payload_from_erased(erased: UringUserPayload) -> Self::UserPayload {
+                fn try_payload_from_erased(erased: UringUserPayload) -> DriverResult<Self::UserPayload> {
                     match erased {
-                        UringUserPayload::$OpType(p) => p,
+                        UringUserPayload::$OpType(p) => Ok(p),
                         #[allow(unreachable_patterns)]
-                        _ => panic!("wrong payload type for {}", stringify!($OpType)),
+                        _ => Err(veloq_driver_core::op::payload_projection_mismatch_report::<UringError>(
+                            stringify!($OpType),
+                            "UringUserPayload",
+                        )),
                     }
                 }
 

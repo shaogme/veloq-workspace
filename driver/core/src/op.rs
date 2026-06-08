@@ -1,7 +1,8 @@
 use tracing::trace;
 
 use crate::driver::{CompletionToken, Driver, DriverSubmitResult, PlatformOp, SubmitStatus};
-use crate::{DriverError, DriverResult};
+use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
+use diagweave::prelude::*;
 
 pub trait DriverProvider: Clone + Unpin {
     type Op: PlatformOp;
@@ -65,12 +66,32 @@ pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
 
     fn payload_into_erased(payload: Self::UserPayload) -> Self::ErasedPayload;
 
-    fn payload_from_erased(erased: Self::ErasedPayload) -> Self::UserPayload;
+    fn try_payload_from_erased(
+        erased: Self::ErasedPayload,
+    ) -> DriverResult<Self::UserPayload, Self::Error>;
 
     fn complete(
         payload: Self::UserPayload,
         res: DriverResult<Self::DriverCompletion, <Self as IntoPlatformOp<O>>::Error>,
     ) -> OpCompletion<Self::Output, Self::Error, Self::Completion>;
+}
+
+#[inline]
+pub fn payload_projection_mismatch_report<E>(
+    expected_payload: &'static str,
+    erased_payload: &'static str,
+) -> DriverReport<E>
+where
+    E: DriverError,
+{
+    E::from_core_report(
+        DriverCoreError::Internal
+            .to_report()
+            .push_ctx("scope", "driver-core/op/payload_projection")
+            .with_ctx("expected_payload", expected_payload)
+            .with_ctx("erased_payload", erased_payload)
+            .attach_note("operation payload variant mismatch"),
+    )
 }
 
 /// A generic wrapper for IO operation data.
@@ -143,7 +164,25 @@ impl<T> Op<T> {
                                     };
                                 };
 
-                                let payload = T::payload_from_erased(payload_erased);
+                                let payload = match T::try_payload_from_erased(payload_erased) {
+                                    Ok(payload) => payload,
+                                    Err(report) => {
+                                        if let Some(op) = op_platform.take() {
+                                            drop(op);
+                                        }
+                                        return DetachedOp {
+                                            completion_table: None,
+                                            cancel_signal: None,
+                                            cancel_waker: None,
+                                            token: None,
+                                            immediate_failure: None,
+                                            immediate_resource_lost: Some(
+                                                future::payload_projection_error(report),
+                                            ),
+                                            _phantom: std::marker::PhantomData,
+                                        };
+                                    }
+                                };
                                 if let Some(op) = op_platform.take() {
                                     drop(op);
                                 }

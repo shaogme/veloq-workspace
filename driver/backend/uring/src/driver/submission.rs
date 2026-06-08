@@ -14,6 +14,21 @@ use veloq_driver_core::driver::{
     CompletionToken, Driver, DriverSubmitResult, OpToken, SubmitStatus,
 };
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
+use veloq_driver_core::slot::SlotAccessError;
+
+fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<UringError> {
+    UringError::InvalidState
+        .to_report()
+        .push_ctx("scope", scope)
+        .with_ctx("slot_index", err.snapshot.index)
+        .with_ctx("slot_generation", err.snapshot.generation)
+        .with_ctx("slot_state", format!("{:?}", err.snapshot.state))
+        .with_ctx("slot_has_op", err.snapshot.has_op)
+        .with_ctx("slot_has_payload", err.snapshot.has_payload)
+        .with_ctx("slot_access_action", format!("{:?}", err.action))
+        .with_ctx("slot_access_reason", format!("{:?}", err.reason))
+        .attach_note("slot access failed during uring submission")
+}
 
 impl<'a> UringDriver<'a> {
     pub(crate) unsafe fn submit_from_slot_raw(
@@ -23,7 +38,9 @@ impl<'a> UringDriver<'a> {
     ) -> UringResult<bool> {
         let driver = unsafe { &mut *driver };
         let user_data = token.index();
-        let mut sub_guard = slot.start_submission_with(None);
+        let mut sub_guard = slot
+            .start_submission_with(None)
+            .map_err(|err| slot_access_report("driver.submit_from_slot_raw.start", err))?;
         let strategy = sub_guard
             .slot
             .as_mut()
@@ -34,6 +51,7 @@ impl<'a> UringDriver<'a> {
                 )
             })?
             .op_mut()
+            .map_err(|err| slot_access_report("driver.submit_from_slot_raw.strategy", err))?
             .vtable
             .strategy;
 
@@ -231,9 +249,9 @@ impl<'a> UringDriver<'a> {
 
             let driver_ptr = self as *mut UringDriver;
             let slot = match self.ops.checked_slot_view(token) {
-                CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
-                    slot.init_op_with(uring_op, |_| {})
-                }
+                CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot
+                    .init_op_with(uring_op, |_| {})
+                    .map_err(|err| slot_access_report("driver.submit_waker.init_op", err))?,
                 _ => {
                     return Err(UringError::InvalidState
                         .report("driver.submit_waker", "reserved waker slot disappeared"));
@@ -313,10 +331,26 @@ impl<'a> UringDriver<'a> {
             veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 if slot.has_op() {
                     let mut slot = slot;
-                    *slot.op_mut() = op;
+                    match slot.op_mut() {
+                        Ok(slot_op) => *slot_op = op,
+                        Err(err) => {
+                            return DriverSubmitResult::failed(
+                                slot_access_report("uring.driver.submit_sqe_internal.op_mut", err),
+                                SubmitStatus::Void,
+                            );
+                        }
+                    }
                     slot
                 } else {
-                    slot.init_op_with(op, |_| {})
+                    match slot.init_op_with(op, |_| {}) {
+                        Ok(slot) => slot,
+                        Err(err) => {
+                            return DriverSubmitResult::failed(
+                                slot_access_report("uring.driver.submit_sqe_internal.init_op", err),
+                                SubmitStatus::Void,
+                            );
+                        }
+                    }
                 }
             }
             _ => {
@@ -366,10 +400,32 @@ impl<'a> UringDriver<'a> {
             veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 if slot.has_op() {
                     let mut slot = slot;
-                    *slot.op_mut() = op;
+                    match slot.op_mut() {
+                        Ok(slot_op) => *slot_op = op,
+                        Err(err) => {
+                            return DriverSubmitResult::failed(
+                                slot_access_report(
+                                    "uring.driver.submit_timer_internal.op_mut",
+                                    err,
+                                ),
+                                SubmitStatus::Void,
+                            );
+                        }
+                    }
                     slot
                 } else {
-                    slot.init_op_with(op, |_| {})
+                    match slot.init_op_with(op, |_| {}) {
+                        Ok(slot) => slot,
+                        Err(err) => {
+                            return DriverSubmitResult::failed(
+                                slot_access_report(
+                                    "uring.driver.submit_timer_internal.init_op",
+                                    err,
+                                ),
+                                SubmitStatus::Void,
+                            );
+                        }
+                    }
                 }
             }
             _ => {

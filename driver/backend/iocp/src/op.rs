@@ -227,11 +227,14 @@ macro_rules! define_iocp_ops {
                     IocpUserPayload::$OpType(payload)
                 }
 
-                fn payload_from_erased(erased: IocpUserPayload) -> Self::UserPayload {
+                fn try_payload_from_erased(erased: IocpUserPayload) -> DriverResult<Self::UserPayload> {
                     match erased {
-                        IocpUserPayload::$OpType(p) => p,
+                        IocpUserPayload::$OpType(p) => Ok(p),
                         #[allow(unreachable_patterns)]
-                        _ => panic!("wrong payload type for {}", stringify!($OpType)),
+                        _ => Err(veloq_driver_core::op::payload_projection_mismatch_report::<IocpError>(
+                            stringify!($OpType),
+                            "IocpUserPayload",
+                        )),
                     }
                 }
 

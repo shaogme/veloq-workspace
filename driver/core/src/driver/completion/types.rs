@@ -1,5 +1,6 @@
-use crate::driver::completion::{CompletionPacket, CompletionToken};
+use crate::driver::completion::{CompletionEvent, CompletionPacket, CompletionToken};
 use crate::slot;
+use crate::{DriverCoreError, DriverResult};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DriverCompletionDiagnostics {
@@ -9,9 +10,9 @@ pub struct DriverCompletionDiagnostics {
     pub stale_completion: u64,
     pub slot_corruption: u64,
     pub cancel_submitted: u64,
-    pub cancel_cqe_ok: u64,
-    pub cancel_cqe_enoent: u64,
-    pub cancel_cqe_error: u64,
+    pub cancel_ack_ok: u64,
+    pub cancel_ack_not_found: u64,
+    pub cancel_ack_error: u64,
     pub waker_ok: u64,
     pub waker_error: u64,
     pub waker_rebuild: u64,
@@ -52,18 +53,18 @@ impl DriverCompletionDiagnostics {
     }
 
     #[inline]
-    pub fn inc_cancel_cqe_ok(&mut self) {
-        self.cancel_cqe_ok = self.cancel_cqe_ok.saturating_add(1);
+    pub fn inc_cancel_ack_ok(&mut self) {
+        self.cancel_ack_ok = self.cancel_ack_ok.saturating_add(1);
     }
 
     #[inline]
-    pub fn inc_cancel_cqe_enoent(&mut self) {
-        self.cancel_cqe_enoent = self.cancel_cqe_enoent.saturating_add(1);
+    pub fn inc_cancel_ack_not_found(&mut self) {
+        self.cancel_ack_not_found = self.cancel_ack_not_found.saturating_add(1);
     }
 
     #[inline]
-    pub fn inc_cancel_cqe_error(&mut self) {
-        self.cancel_cqe_error = self.cancel_cqe_error.saturating_add(1);
+    pub fn inc_cancel_ack_error(&mut self) {
+        self.cancel_ack_error = self.cancel_ack_error.saturating_add(1);
     }
 
     #[inline]
@@ -107,12 +108,24 @@ pub enum CompletionAnomalyReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionBackend {
+    Core,
+    Uring,
+    Iocp,
+    Rio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompletionAnomaly {
     pub token: CompletionToken,
     pub index: Option<usize>,
     pub expected_generation: Option<u32>,
     pub actual_generation: Option<u32>,
     pub state: Option<slot::SlotState>,
+    pub backend: Option<CompletionBackend>,
+    pub raw_result: Option<i32>,
+    pub flags: Option<u32>,
+    pub slot_snapshot: Option<slot::SlotSnapshot>,
     pub reason: CompletionAnomalyReason,
 }
 
@@ -125,6 +138,10 @@ impl CompletionAnomaly {
             expected_generation: None,
             actual_generation: None,
             state: None,
+            backend: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
             reason: CompletionAnomalyReason::UnknownControlToken,
         }
     }
@@ -137,6 +154,10 @@ impl CompletionAnomaly {
             expected_generation: Some(generation),
             actual_generation: None,
             state: None,
+            backend: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
             reason: CompletionAnomalyReason::UnknownSlot,
         }
     }
@@ -155,6 +176,10 @@ impl CompletionAnomaly {
             expected_generation: Some(expected_generation),
             actual_generation: Some(actual_generation),
             state: Some(state),
+            backend: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
             reason: CompletionAnomalyReason::StaleGeneration,
         }
     }
@@ -172,6 +197,10 @@ impl CompletionAnomaly {
             expected_generation: Some(generation),
             actual_generation: Some(generation),
             state: Some(state),
+            backend: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
             reason: CompletionAnomalyReason::NonActiveSlot,
         }
     }
@@ -189,26 +218,67 @@ impl CompletionAnomaly {
             expected_generation: Some(generation),
             actual_generation: Some(generation),
             state: Some(state),
+            backend: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
             reason: CompletionAnomalyReason::SlotCorruption,
         }
+    }
+
+    #[inline]
+    pub fn with_backend(mut self, backend: CompletionBackend) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    #[inline]
+    pub fn with_event(mut self, event: CompletionEvent) -> Self {
+        self.token = event.token;
+        self.raw_result = Some(event.res);
+        self.flags = Some(event.flags);
+        self
+    }
+
+    #[inline]
+    pub fn with_raw_result(mut self, raw_result: i32) -> Self {
+        self.raw_result = Some(raw_result);
+        self
+    }
+
+    #[inline]
+    pub fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = Some(flags);
+        self
+    }
+
+    #[inline]
+    pub fn with_slot_snapshot(mut self, snapshot: slot::SlotSnapshot) -> Self {
+        self.index = Some(snapshot.index);
+        self.actual_generation = Some(snapshot.generation);
+        self.state = Some(snapshot.state);
+        self.slot_snapshot = Some(snapshot);
+        self
     }
 }
 
 pub struct CompletionCleanup {
-    action: Box<dyn FnOnce() + Send + 'static>,
+    action: Box<dyn FnOnce() -> DriverResult<(), DriverCoreError> + Send + 'static>,
 }
 
 impl CompletionCleanup {
     #[inline]
-    pub fn new(action: impl FnOnce() + Send + 'static) -> Self {
+    pub fn new(
+        action: impl FnOnce() -> DriverResult<(), DriverCoreError> + Send + 'static,
+    ) -> Self {
         Self {
             action: Box::new(action),
         }
     }
 
     #[inline]
-    pub fn run(self) {
-        (self.action)();
+    pub fn run(self) -> DriverResult<(), DriverCoreError> {
+        (self.action)()
     }
 }
 
@@ -245,12 +315,20 @@ impl CompletionCleanupGuard {
     pub fn disarm(&mut self) -> bool {
         self.cleanup.take().is_some()
     }
+
+    #[inline]
+    pub fn run(&mut self) -> DriverResult<bool, DriverCoreError> {
+        let Some(cleanup) = self.cleanup.take() else {
+            return Ok(false);
+        };
+        cleanup.run().map(|()| true)
+    }
 }
 
 impl Drop for CompletionCleanupGuard {
     fn drop(&mut self) {
         if let Some(cleanup) = self.cleanup.take() {
-            cleanup.run();
+            let _ = cleanup.run();
         }
     }
 }

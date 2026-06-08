@@ -2,13 +2,15 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use diagweave::prelude::{DiagnosticResult, ResultReportExt};
+use diagweave::prelude::*;
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
     CompletionCleanupGuard, CompletionToken, DriverSubmitResult, OpToken, SharedCompletionQueue,
     SharedCompletionTable, SubmitStatus,
 };
-use veloq_driver_core::slot::{CheckedSlotView, Reserved, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{
+    CheckedSlotView, Reserved, SlotAccessError, SlotRegistryExt, SlotView,
+};
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::config::IoFd;
@@ -59,6 +61,20 @@ fn close_fd_from_op(op: &IocpOp) -> Option<IoFd> {
     }
 }
 
+fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<IocpError> {
+    IocpError::InvalidState
+        .to_report()
+        .push_ctx("scope", scope)
+        .with_ctx("slot_index", err.snapshot.index)
+        .with_ctx("slot_generation", err.snapshot.generation)
+        .with_ctx("slot_state", format!("{:?}", err.snapshot.state))
+        .with_ctx("slot_has_op", err.snapshot.has_op)
+        .with_ctx("slot_has_payload", err.snapshot.has_payload)
+        .with_ctx("slot_access_action", format!("{:?}", err.action))
+        .with_ctx("slot_access_reason", format!("{:?}", err.reason))
+        .attach_note("slot access failed during IOCP submission")
+}
+
 impl<'a> IocpDriver<'a> {
     #[inline]
     pub(crate) fn prep_op_slot(
@@ -79,13 +95,15 @@ impl<'a> IocpDriver<'a> {
         };
         guard.platform_mut().generation = generation;
         guard.platform_mut().rio_cancel_requested = false;
-        let mut guard = guard.init_op_with(op, |sidecar| {
-            sidecar.token = token;
-            sidecar.blocking_completion = None;
-            sidecar.in_flight = false;
-            sidecar.resolved_handle = None;
-            sidecar.socket_inflight = None;
-        });
+        let mut guard = guard
+            .init_op_with(op, |sidecar| {
+                sidecar.token = token;
+                sidecar.blocking_completion = None;
+                sidecar.in_flight = false;
+                sidecar.resolved_handle = None;
+                sidecar.socket_inflight = None;
+            })
+            .map_err(|err| slot_access_report("iocp.driver.prep_op_slot.init_op", err))?;
 
         guard
             .with_op_mut(|op_ref| {
@@ -94,8 +112,7 @@ impl<'a> IocpDriver<'a> {
                 op_ref.header.resolved_handle = None;
                 op_ref.header.socket_inflight = None;
             })
-            .ok_or(IocpError::InvalidState)
-            .attach_note("Op missing in prep_op_slot")?;
+            .map_err(|err| slot_access_report("iocp.driver.prep_op_slot.op_mut", err))?;
 
         let user_payload = guard
             .storage
@@ -176,7 +193,7 @@ impl<'a> IocpDriver<'a> {
                     ops.checked_slot_view(token)
                 {
                     let mut guard = slot.complete();
-                    *op_in = guard.take_op();
+                    *op_in = guard.take_op().ok();
                 }
                 DriverSubmitResult::failed(
                     e.attach_note("operation submission failed"),
@@ -198,7 +215,7 @@ impl<'a> IocpDriver<'a> {
                 ops.checked_slot_view(token)
             {
                 let mut guard = slot.complete();
-                *op_in = guard.take_op();
+                *op_in = guard.take_op().ok();
             }
             DriverSubmitResult::failed(
                 err.set_accumulate_src_chain(true)
@@ -239,14 +256,16 @@ impl<'a> IocpDriver<'a> {
             &mut sidecar.inner as *mut crate::win32::Overlapped
         });
 
-        let mut sub_guard = guard.start_submission_with(Some(|slot| {
-            slot.storage
-                .with_mut(|_result, _payload, sidecar| sidecar.in_flight = false);
-        }));
+        let mut sub_guard = guard
+            .start_submission_with(Some(|slot| {
+                slot.storage
+                    .with_mut(|_result, _payload, sidecar| sidecar.in_flight = false);
+            }))
+            .map_err(|err| slot_access_report("iocp.driver.call_op_submit.start", err))?;
         let close_fd = sub_guard
             .slot
             .as_mut()
-            .and_then(|slot| slot.with_op_mut(|op| close_fd_from_op(op)))
+            .and_then(|slot| slot.with_op_mut(|op| close_fd_from_op(op)).ok())
             .flatten();
 
         let result = if let Some(fd) = close_fd {
@@ -262,19 +281,15 @@ impl<'a> IocpDriver<'a> {
                     BlockingCompletion::new(self.completion.port_arc(), completion_key, None);
                 completion.store_result(io_result);
 
-                sub_guard
-                    .slot
-                    .as_mut()
-                    .and_then(|slot| {
-                        slot.with_op_mut(|op| {
-                            op.header.resolved_handle = Some(raw_handle);
-                            op.header.blocking_completion = Some(completion);
-                        })
-                    })
-                    .ok_or_else(|| {
-                        IocpError::InvalidState
-                            .report("iocp/driver", "op missing during Close submission")
-                    })?;
+                let slot = sub_guard.slot.as_mut().ok_or_else(|| {
+                    IocpError::InvalidState
+                        .report("iocp/driver", "submission guard slot missing during Close")
+                })?;
+                slot.with_op_mut(|op| {
+                    op.header.resolved_handle = Some(raw_handle);
+                    op.header.blocking_completion = Some(completion);
+                })
+                .map_err(|err| slot_access_report("iocp.driver.call_op_submit.close_op", err))?;
 
                 Ok(submit::SubmissionResult::PostToQueue)
             })
@@ -290,13 +305,14 @@ impl<'a> IocpDriver<'a> {
                 rio,
             };
 
-            sub_guard
-                .slot
-                .as_mut()
-                .and_then(|slot| slot.with_op_mut(|op| op.submit(&mut ctx)))
-                .ok_or_else(|| {
-                    IocpError::InvalidState.report("iocp/driver", "op missing during submission")
-                })?
+            let slot = sub_guard.slot.as_mut().ok_or_else(|| {
+                IocpError::InvalidState.report(
+                    "iocp/driver",
+                    "submission guard slot missing during submission",
+                )
+            })?;
+            slot.with_op_mut(|op| op.submit(&mut ctx))
+                .map_err(|err| slot_access_report("iocp.driver.call_op_submit.submit_op", err))?
         }
         .push_ctx("scope", "iocp/driver")
         .attach_note("op submit failed");
@@ -312,6 +328,7 @@ impl<'a> IocpDriver<'a> {
                             && op.header.resolved_handle.is_some_and(|h| h.is_socket())
                             && op.header.socket_inflight.is_none()
                     })
+                    .ok()
                 })
                 .unwrap_or(false),
             _ => false,
