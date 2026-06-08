@@ -476,6 +476,7 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "loom"))]
 mod tests {
     use super::*;
     use crate::driver::{CompletionAccess, CompletionEvent, CompletionToken, PlatformOp};

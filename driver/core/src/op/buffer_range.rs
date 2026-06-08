@@ -172,6 +172,7 @@ pub fn checked_write_buf_range(
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "loom"))]
 mod tests {
     use super::*;
     use std::num::NonZeroUsize;
