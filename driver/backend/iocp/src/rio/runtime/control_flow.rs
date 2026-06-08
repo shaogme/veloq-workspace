@@ -21,7 +21,7 @@ use tracing::debug;
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionBackend, CompletionEvent, CompletionPacket, CompletionToken,
     DriverCompletionDiagnostics, RawCompletion, RoutedSlotCompletion, SharedCompletionTable,
-    record_completion_anomaly, record_lost_completion, route_checked_slot_completion,
+    record_completion_anomaly, record_lost_completion, route_user_completion,
     run_completion_cleanup,
 };
 use veloq_driver_core::slot::SlotRegistryExt;
@@ -89,7 +89,7 @@ impl<'a> RioCompletionRouter<'a> {
             rio_raw_res(res),
             0,
         );
-        match route_checked_slot_completion(raw, ops.checked_slot_view(op_token)) {
+        match route_user_completion(op_token, raw, ops.checked_slot_view(op_token)) {
             RoutedSlotCompletion::Waiting(mut slot) => {
                 if slot.platform().generation != generation {
                     let snapshot = slot.snapshot();
@@ -276,6 +276,46 @@ impl<'a> RioCompletionRouter<'a> {
                     generation, "RIO completion found corrupt or reserved slot"
                 );
                 if let Some(snapshot) = anomaly.slot_snapshot {
+                    let lost_result = Err(IocpError::InvalidState
+                        .to_report()
+                        .push_ctx("scope", "rio.runtime.control_flow.corrupt_completion")
+                        .with_ctx("user_data", snapshot.index)
+                        .with_ctx("generation", snapshot.generation)
+                        .with_ctx("slot_state", format!("{:?}", snapshot.state))
+                        .with_ctx("has_op", snapshot.has_op)
+                        .with_ctx("has_payload", snapshot.has_payload)
+                        .with_ctx("rio_op_kind", op_kind.as_str())
+                        .with_ctx("rio_request_id", request_id)
+                        .set_error_code(5)
+                        .attach_note("RIO completion found corrupt slot"));
+                    let cleanup = ops
+                        .get_slot_entry_op_storage_and_entry_mut_token(op_token)
+                        .and_then(|(_, _, op, _)| {
+                            let cleanup = op
+                                .as_mut()
+                                .map(|op| op.completion_cleanup(&lost_result))
+                                .unwrap_or_default();
+                            let _ = op.take();
+                            Some(cleanup)
+                        })
+                        .unwrap_or_default();
+                    let _ =
+                        ops.with_slot_storage_mut_token(op_token, |result, payload, _sidecar| {
+                            let _ = result.take();
+                            let _ = payload.take();
+                        });
+                    let event = CompletionEvent {
+                        token: raw.token,
+                        res: -5,
+                        flags: raw.flags,
+                    };
+                    let _ = record_lost_completion(
+                        self.comp.table,
+                        self.comp.diagnostics,
+                        event,
+                        anomaly,
+                        cleanup,
+                    );
                     let _ = ops.finalize_corrupt_slot(snapshot);
                 }
             }
@@ -320,7 +360,7 @@ impl<'a> RioCompletionRouter<'a> {
     }
 
     fn handle_one(&mut self, res: &RIORESULT) -> RioResult<()> {
-        let Some(kind) = RioState::decode_req_ctx(res.RequestContext) else {
+        let Some(kind) = self.registry.decode_request_context(res.RequestContext) else {
             let raw = RawCompletion::new(
                 CompletionBackend::Rio,
                 CompletionToken::from_raw(res.RequestContext),

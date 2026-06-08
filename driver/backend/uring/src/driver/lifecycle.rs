@@ -3,8 +3,8 @@ use crate::error::{UringDriverResult, UringError};
 use io_uring::opcode;
 use tracing::{debug, error, trace};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionCleanupGuard, CompletionSidecar,
-    CompletionToken, OpToken, run_completion_cleanup,
+    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionAnomaly, CompletionCleanupGuard,
+    CompletionSidecar, CompletionToken, OpToken, record_completion_anomaly, run_completion_cleanup,
 };
 
 use crate::op::{
@@ -171,14 +171,59 @@ impl<'a> UringDriver<'a> {
 
         while submitted_count < limit {
             if let Some(request) = self.pending_cancellations.front().copied() {
-                let stale_or_missing = !matches!(
-                    self.ops.checked_slot_view(request.target),
-                    CheckedSlotView::Valid(_)
-                );
-                if stale_or_missing {
-                    self.pending_cancellations.pop_front();
-                    self.completion_diagnostics.inc_stale_completion();
-                    continue;
+                match self.ops.checked_slot_view(request.target) {
+                    CheckedSlotView::Valid(_) => {}
+                    CheckedSlotView::Missing {
+                        index,
+                        expected_generation,
+                    } => {
+                        self.pending_cancellations.pop_front();
+                        let anomaly = CompletionAnomaly::unknown_slot(
+                            CompletionToken::user(request.target),
+                            index,
+                            expected_generation,
+                        );
+                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                        continue;
+                    }
+                    CheckedSlotView::Empty(snapshot) => {
+                        self.pending_cancellations.pop_front();
+                        let anomaly = CompletionAnomaly::non_active(
+                            CompletionToken::user(request.target),
+                            snapshot.index,
+                            request.target.generation(),
+                            snapshot.state,
+                        )
+                        .with_slot_snapshot(snapshot);
+                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                        continue;
+                    }
+                    CheckedSlotView::Stale(snapshot) => {
+                        self.pending_cancellations.pop_front();
+                        let anomaly = CompletionAnomaly::stale(
+                            CompletionToken::user(request.target),
+                            snapshot.index,
+                            request.target.generation(),
+                            snapshot.generation,
+                            snapshot.state,
+                        )
+                        .with_slot_snapshot(snapshot);
+                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                        continue;
+                    }
+                    CheckedSlotView::Corrupt(snapshot) => {
+                        self.pending_cancellations.pop_front();
+                        let anomaly = CompletionAnomaly::corrupt(
+                            CompletionToken::user(request.target),
+                            snapshot.index,
+                            snapshot.generation,
+                            snapshot.state,
+                        )
+                        .with_slot_snapshot(snapshot);
+                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                        let _ = self.ops.finalize_corrupt_slot(snapshot);
+                        continue;
+                    }
                 }
 
                 let cancel_id = self.next_cancel_completion_id();

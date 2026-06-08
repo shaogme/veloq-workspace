@@ -306,14 +306,11 @@ impl CompletionToken {
 }
 
 #[inline]
-pub fn route_checked_slot_completion<'a, Spec: slot::SlotSpec>(
+pub fn route_user_completion<'a, Spec: slot::SlotSpec>(
+    token: OpToken,
     raw: RawCompletion,
     view: CheckedSlotView<'a, Spec>,
 ) -> RoutedSlotCompletion<'a, Spec> {
-    let token = raw
-        .token
-        .op_token()
-        .expect("route_checked_slot_completion requires a user completion token");
     let (index, expected_generation) = token.parts();
     match view {
         CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {

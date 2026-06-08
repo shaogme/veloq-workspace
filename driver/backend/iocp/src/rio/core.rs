@@ -8,14 +8,13 @@ use crate::error::{IocpError, iocp_report_to_event_res};
 use crate::op::submit::SubmissionResult;
 use crate::rio::RioEnv;
 use crate::rio::core::registry::{
-    RioAddrReservation, RioBufferLeaseToken, RioPreparedBuffer, RioSubmissionKind,
+    RioAddrReservation, RioBufferLeaseToken, RioPreparedBuffer, RioRegistry, RioSubmissionKind,
 };
 use crate::rio::core::submit_ops::{RioKernel, RioRq};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioState, SocketInflightToken};
 use diagweave::prelude::*;
 use std::ffi::c_void;
-use std::ptr::NonNull;
 use veloq_driver_core::driver::OpToken;
 use windows_sys::Win32::Networking::WinSock::{RIO_BUF, SOCKADDR_INET};
 
@@ -82,13 +81,6 @@ pub(crate) struct RioOpRequestInit {
     pub(crate) diagnostics: RioRequestDiagnostics,
 }
 
-impl RioOpRequestInit {
-    #[inline]
-    pub(crate) fn socket_key(&self) -> SocketKey {
-        self.socket_inflight.socket_key()
-    }
-}
-
 pub(crate) enum RioCompletionKind {
     Op {
         init: RioOpRequestInit,
@@ -96,131 +88,103 @@ pub(crate) enum RioCompletionKind {
     },
 }
 
-#[repr(C)]
-pub(crate) struct RioOpRequestContext {
-    pub(crate) init: Option<RioOpRequestInit>,
+const RIO_REQUEST_CONTEXT_MAGIC: u64 = 0xA7;
+const RIO_REQUEST_CONTEXT_MAGIC_SHIFT: u32 = 56;
+const RIO_REQUEST_CONTEXT_INDEX_SHIFT: u32 = 32;
+const RIO_REQUEST_CONTEXT_INDEX_MASK: u64 = 0x00ff_ffff;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RioRequestContextId {
+    index: usize,
+    generation: u32,
 }
 
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub(crate) struct RioRequestContextHandle(NonNull<RioOpRequestContext>);
+impl RioRequestContextId {
+    #[inline]
+    pub(crate) fn new(index: usize, generation: u32) -> Self {
+        assert!(
+            index <= RIO_REQUEST_CONTEXT_INDEX_MASK as usize,
+            "RIO request context index exceeds encodable range"
+        );
+        Self { index, generation }
+    }
 
+    #[inline]
+    pub(crate) const fn index(self) -> usize {
+        self.index
+    }
+
+    #[inline]
+    pub(crate) const fn generation(self) -> u32 {
+        self.generation
+    }
+
+    #[inline]
+    pub(crate) fn raw(self) -> u64 {
+        (RIO_REQUEST_CONTEXT_MAGIC << RIO_REQUEST_CONTEXT_MAGIC_SHIFT)
+            | ((self.index as u64) << RIO_REQUEST_CONTEXT_INDEX_SHIFT)
+            | self.generation as u64
+    }
+
+    #[inline]
+    pub(crate) fn from_raw(raw: u64) -> Option<Self> {
+        let magic = raw >> RIO_REQUEST_CONTEXT_MAGIC_SHIFT;
+        if magic != RIO_REQUEST_CONTEXT_MAGIC {
+            return None;
+        }
+        let index =
+            ((raw >> RIO_REQUEST_CONTEXT_INDEX_SHIFT) & RIO_REQUEST_CONTEXT_INDEX_MASK) as usize;
+        let generation = raw as u32;
+        Some(Self { index, generation })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RioPreparedRequestContext {
-    handle: RioRequestContextHandle,
+    id: RioRequestContextId,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RioSubmittedRequestContext {
-    handle: RioRequestContextHandle,
+    id: RioRequestContextId,
 }
 
-pub(crate) struct RioCompletedRequestContext {
-    handle: RioRequestContextHandle,
-}
-
-impl RioRequestContextHandle {
-    fn new(ctx: RioOpRequestContext) -> Self {
-        let ptr = Box::into_raw(Box::new(ctx));
-        // SAFETY: Box::into_raw never returns a null pointer.
-        Self(unsafe { NonNull::new_unchecked(ptr) })
-    }
-
-    #[inline]
-    pub(crate) fn as_request_context(&self) -> *const c_void {
-        self.0.as_ptr().cast::<c_void>()
-    }
-
-    #[inline]
-    fn from_request_context(ctx: u64) -> Option<Self> {
-        NonNull::new(ctx as usize as *mut RioOpRequestContext).map(Self)
-    }
-
-    #[inline]
-    fn as_ref(&self) -> &RioOpRequestContext {
-        // SAFETY: all handles are created from a live Box<RioOpRequestContext>
-        // and are only decoded once the kernel returns the request context.
-        unsafe { self.0.as_ref() }
-    }
-
-    #[inline]
-    fn as_mut(&mut self) -> &mut RioOpRequestContext {
-        // SAFETY: the typed owner has unique access while extracting the init
-        // before freeing the request context.
-        unsafe { self.0.as_mut() }
-    }
-
-    #[inline]
-    fn free(self) {
-        // SAFETY: the typed owner calling this method is responsible for owning
-        // the allocation represented by the handle.
-        unsafe { drop(Box::from_raw(self.0.as_ptr())) };
-    }
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RioCompletedRequestContext;
 
 impl RioPreparedRequestContext {
     #[inline]
-    pub(crate) fn new(init: RioOpRequestInit) -> Self {
-        Self {
-            handle: RioRequestContextHandle::new(RioOpRequestContext { init: Some(init) }),
-        }
+    pub(crate) fn new(id: RioRequestContextId) -> Self {
+        Self { id }
+    }
+
+    #[inline]
+    pub(crate) const fn id(self) -> RioRequestContextId {
+        self.id
     }
 
     #[inline]
     pub(crate) fn as_request_context(&self) -> *const c_void {
-        self.handle.as_request_context()
+        self.id.raw() as usize as *const c_void
     }
 
     #[inline]
     fn into_submitted(self) -> RioSubmittedRequestContext {
-        let this = std::mem::ManuallyDrop::new(self);
-        RioSubmittedRequestContext {
-            handle: this.handle,
-        }
-    }
-
-    #[inline]
-    fn init(&self) -> Option<&RioOpRequestInit> {
-        self.handle.as_ref().init.as_ref()
-    }
-
-    #[inline]
-    fn take_init(&mut self) -> Option<RioOpRequestInit> {
-        self.handle.as_mut().init.take()
-    }
-}
-
-impl Drop for RioPreparedRequestContext {
-    fn drop(&mut self) {
-        debug_assert!(
-            self.handle.as_ref().init.is_none(),
-            "dropping prepared RIO request context without releasing socket inflight token"
-        );
-        self.handle.free();
+        RioSubmittedRequestContext { id: self.id }
     }
 }
 
 impl RioSubmittedRequestContext {
     #[inline]
     fn as_request_context(&self) -> *const c_void {
-        self.handle.as_request_context()
+        self.id.raw() as usize as *const c_void
     }
 }
 
 impl RioCompletedRequestContext {
     #[inline]
-    fn from_request_context(ctx: u64) -> Option<Self> {
-        RioRequestContextHandle::from_request_context(ctx).map(|handle| Self { handle })
-    }
-
-    #[inline]
-    fn take_init(&mut self) -> Option<RioOpRequestInit> {
-        self.handle.as_mut().init.take()
-    }
-}
-
-impl Drop for RioCompletedRequestContext {
-    fn drop(&mut self) {
-        self.handle.free();
+    pub(crate) fn new(_id: RioRequestContextId) -> Self {
+        Self
     }
 }
 
@@ -238,6 +202,9 @@ pub(crate) struct RioPreparedRequest {
     pub(crate) request_id: u64,
     pub(crate) rq: RioRq,
     context: Option<RioPreparedRequestContext>,
+    pub(crate) token: OpToken,
+    pub(crate) socket_key: SocketKey,
+    pub(crate) addr_slot: Option<usize>,
     pub(crate) data_buf: RioPreparedBuffer,
     pub(crate) addr: Option<RioAddrReservation>,
     pub(crate) diagnostics: RioRequestDiagnostics,
@@ -248,7 +215,6 @@ pub(crate) struct RioSubmitErrorContext<'a> {
     pub(crate) scope: &'static str,
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) token: OpToken,
     pub(crate) note: &'static str,
 }
 
@@ -290,23 +256,14 @@ pub(crate) struct RioSubmissionLease<'a> {
 
 impl RioPreparedRequest {
     #[inline]
-    fn init(&self) -> &RioOpRequestInit {
-        self.context
-            .as_ref()
-            .and_then(RioPreparedRequestContext::init)
-            .expect("RIO prepared request init missing")
-    }
-
-    #[inline]
-    fn take_init(&mut self) -> Option<RioOpRequestInit> {
-        self.context
-            .as_mut()
-            .and_then(RioPreparedRequestContext::take_init)
+    fn take_init(&mut self, registry: &mut RioRegistry) -> Option<RioOpRequestInit> {
+        let context = self.context.take()?;
+        registry.take_prepared_request_init(context)
     }
 
     #[inline]
     pub(crate) fn socket_key(&self) -> SocketKey {
-        self.init().socket_key()
+        self.socket_key
     }
 
     #[inline]
@@ -338,14 +295,11 @@ impl RioPreparedRequest {
             .with_ctx("fd_generation", ctx.fd.generation())
             .with_ctx("handle_raw", ctx.handle.raw().as_handle() as usize)
             .with_ctx("socket_raw", socket_key.as_handle() as usize)
-            .with_ctx("user_data", ctx.token.index())
-            .with_ctx("generation", ctx.token.generation())
+            .with_ctx("user_data", self.token.index())
+            .with_ctx("generation", self.token.generation())
             .with_ctx("rio_op_kind", self.op_kind.as_str())
             .with_ctx("rio_request_id", self.request_id)
-            .with_ctx(
-                "addr_slot",
-                self.addr.map(|addr| addr.slot).unwrap_or(usize::MAX),
-            )
+            .with_ctx("addr_slot", self.addr_slot.unwrap_or(usize::MAX))
             .with_ctx("rq_raw", diagnostics.rq_raw)
             .with_ctx("data_buffer_id", diagnostics.data_buffer_id)
             .with_ctx("data_buffer_offset", diagnostics.data_buffer_offset)
@@ -365,7 +319,6 @@ impl<'a> RioSubmitPlan<'a> {
             scope: self.submit_scope,
             fd: self.fd,
             handle: self.handle,
-            token: self.token,
             note: self.submit_note,
         }
     }
@@ -460,7 +413,10 @@ impl Drop for RioSubmissionLease<'_> {
         self.state
             .registry
             .free_addr_slot(self.request.addr.map(|addr| addr.slot));
-        let socket_inflight = self.request.take_init().map(|init| init.socket_inflight);
+        let socket_inflight = self
+            .request
+            .take_init(&mut self.state.registry)
+            .map(|init| init.socket_inflight);
         debug_assert!(
             socket_inflight.is_some(),
             "unsubmitted RIO request missing socket inflight token"
@@ -481,8 +437,8 @@ pub(crate) fn rio_result_to_event_res(res: &crate::error::IocpDriverResult<usize
 
 impl RioState {
     #[inline]
-    pub(crate) fn encode_req_ctx(init: RioOpRequestInit) -> RioPreparedRequestContext {
-        RioPreparedRequestContext::new(init)
+    pub(crate) fn encode_req_ctx(&mut self, init: RioOpRequestInit) -> RioPreparedRequestContext {
+        self.registry.alloc_request_context(init)
     }
 
     pub(crate) fn submit_rio(
@@ -590,12 +546,14 @@ impl RioState {
         let diagnostics =
             RioRequestDiagnostics::new(spec.rq, &spec.data_buf.rio_buf, spec.addr.as_ref());
         let request_id = self.next_request_id();
-        let context = Self::encode_req_ctx(RioOpRequestInit {
+        let socket_key = spec.socket_inflight.socket_key();
+        let addr_slot = spec.addr.map(|addr| addr.slot);
+        let context = self.encode_req_ctx(RioOpRequestInit {
             token: spec.token,
             socket_inflight: spec.socket_inflight,
             op_kind: spec.op_kind,
             request_id,
-            addr_slot: spec.addr.map(|addr| addr.slot),
+            addr_slot,
             buffer_lease: spec.data_buf.lease,
             diagnostics,
         });
@@ -604,6 +562,9 @@ impl RioState {
             request_id,
             rq: spec.rq,
             context: Some(context),
+            token: spec.token,
+            socket_key,
+            addr_slot,
             data_buf: spec.data_buf,
             addr: spec.addr,
             diagnostics,
@@ -618,10 +579,8 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn decode_req_ctx(ctx: u64) -> Option<RioCompletionKind> {
-        let mut context = RioCompletedRequestContext::from_request_context(ctx)?;
-        let init = context.take_init()?;
-        Some(RioCompletionKind::Op { init, context })
+    pub(crate) fn decode_req_ctx(&mut self, ctx: u64) -> Option<RioCompletionKind> {
+        self.registry.decode_request_context(ctx)
     }
 
     #[inline]
@@ -659,6 +618,7 @@ impl RioState {
 mod tests {
     use super::*;
     use crate::config::IocpHandle;
+    use crate::rio::core::registry::RioRegistry;
 
     fn test_req_init(addr_slot: Option<usize>) -> RioOpRequestInit {
         let socket_key = IocpHandle::for_socket(std::ptr::null_mut());
@@ -675,10 +635,11 @@ mod tests {
 
     #[test]
     fn op_ctx_roundtrip_decode_and_free() {
-        let context = RioState::encode_req_ctx(test_req_init(None));
+        let mut registry = RioRegistry::new(32, 1);
+        let context = registry.alloc_request_context(test_req_init(None));
         let raw = context.as_request_context() as usize as u64;
         let _submitted = context.into_submitted();
-        let decoded = RioState::decode_req_ctx(raw);
+        let decoded = registry.decode_request_context(raw);
         assert!(matches!(
             decoded,
             Some(RioCompletionKind::Op {
@@ -695,10 +656,11 @@ mod tests {
 
     #[test]
     fn op_ctx_with_addr_roundtrip_decode_and_free() {
-        let context = RioState::encode_req_ctx(test_req_init(Some(3)));
+        let mut registry = RioRegistry::new(32, 1);
+        let context = registry.alloc_request_context(test_req_init(Some(3)));
         let raw = context.as_request_context() as usize as u64;
         let _submitted = context.into_submitted();
-        let decoded = RioState::decode_req_ctx(raw);
+        let decoded = registry.decode_request_context(raw);
         assert!(matches!(
             decoded,
             Some(RioCompletionKind::Op {
@@ -730,6 +692,17 @@ mod tests {
 
     #[test]
     fn decode_zero_context_is_noop() {
-        assert!(RioState::decode_req_ctx(0).is_none());
+        let mut registry = RioRegistry::new(32, 1);
+        assert!(registry.decode_request_context(0).is_none());
+    }
+
+    #[test]
+    fn decode_unknown_context_does_not_deref_raw_pointer() {
+        let mut registry = RioRegistry::new(32, 1);
+        assert!(
+            registry
+                .decode_request_context(0xa700_0002_0000_0001)
+                .is_none()
+        );
     }
 }

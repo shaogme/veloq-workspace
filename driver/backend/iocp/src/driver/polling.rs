@@ -12,7 +12,7 @@ use veloq_driver_core::driver::{
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
-use crate::common::{IocpErrorContext, IocpWaker, WAKEUP_USER_DATA, iocp_msg};
+use crate::common::{IOCP_WAKEUP_COMPLETION_KEY, IocpErrorContext, IocpWaker, iocp_msg};
 use crate::error::{IocpError, IocpResult};
 use crate::op::IocpUserPayload;
 
@@ -284,7 +284,7 @@ impl<'a> IocpDriver<'a> {
             return Ok(IocpCompletionKind::User { token: entry.token });
         }
 
-        if completion_key == WAKEUP_USER_DATA {
+        if completion_key == IOCP_WAKEUP_COMPLETION_KEY {
             return Ok(IocpCompletionKind::Waker);
         }
 

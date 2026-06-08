@@ -112,20 +112,20 @@ where
                     packet,
                 );
             }
-            if generation > cell_gen && state != slot::SlotState::Idle {
-                return rejected_completion(
+            if generation > cell_gen {
+                let outcome = if state == slot::SlotState::Idle {
+                    RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
+                        token, idx, generation, state,
+                    ))
+                } else {
                     RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
                         token, idx, generation, cell_gen, state,
-                    )),
-                    packet,
-                );
+                    ))
+                };
+                return rejected_completion(outcome, packet);
             }
 
             match state {
-                slot::SlotState::Idle if generation > cell_gen => {
-                    should_note_ready = true;
-                    break current;
-                }
                 slot::SlotState::Reserved
                     if matches!(packet.record_kind, CompletionRecordKind::Lost(_)) =>
                 {
@@ -367,7 +367,6 @@ where
 
         loop {
             let current = cell.load_core_state(Ordering::Acquire);
-            let state = current.state();
             let cell_gen = current.generation();
 
             if cell_gen > generation {
@@ -378,33 +377,7 @@ where
             cell.completion_waker.register(waker);
 
             if cell_gen < generation {
-                if state == slot::SlotState::Idle {
-                    if cell
-                        .core_state
-                        .compare_exchange(
-                            current,
-                            current
-                                .with_state(slot::SlotState::InFlightWaiting)
-                                .with_generation(generation),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        // Check for fast completion.
-                        let current_after = cell.load_core_state(Ordering::Acquire);
-                        if current_after.state() == slot::SlotState::InFlightReady
-                            && current_after.generation() == generation
-                        {
-                            waker.wake_by_ref();
-                        }
-                        return;
-                    } else {
-                        continue;
-                    }
-                } else {
-                    return;
-                }
+                return;
             }
 
             // cell_gen == generation
@@ -439,25 +412,7 @@ where
             }
 
             if cell_generation < generation {
-                if state == slot::SlotState::Idle {
-                    if cell
-                        .core_state
-                        .compare_exchange(
-                            current,
-                            current
-                                .with_state(slot::SlotState::InFlightWaiting)
-                                .with_generation(generation),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        return;
-                    }
-                } else {
-                    // Cannot upgrade yet.
-                    return;
-                }
+                return;
             } else {
                 // cell_generation == generation
                 if state == slot::SlotState::InFlightReady {
@@ -466,29 +421,15 @@ where
                 }
 
                 match state {
-                    slot::SlotState::Idle
-                    | slot::SlotState::InFlightOrphaned
-                    | slot::SlotState::InFlightWaiting
-                    | slot::SlotState::ReservedValue => {
-                        if cell
-                            .core_state
-                            .compare_exchange(
-                                current,
-                                current
-                                    .with_state(slot::SlotState::InFlightWaiting)
-                                    .with_generation(generation),
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            return;
-                        }
-                    }
+                    slot::SlotState::InFlightWaiting => return,
                     slot::SlotState::Finalizing => {
                         return;
                     }
-                    slot::SlotState::Reserved | slot::SlotState::InFlightReady => return,
+                    slot::SlotState::Idle
+                    | slot::SlotState::Reserved
+                    | slot::SlotState::InFlightOrphaned
+                    | slot::SlotState::InFlightReady
+                    | slot::SlotState::ReservedValue => return,
                 }
             }
         }
@@ -566,5 +507,99 @@ where
             slot::SlotState::Reserved => CELL_STATE_IDLE,
             slot::SlotState::ReservedValue => CELL_STATE_IDLE,
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "loom"))]
+mod tests {
+    use super::*;
+    use crate::driver::OpToken;
+    use crate::driver::PlatformOp;
+
+    struct DummyPlatformOp;
+
+    impl PlatformOp for DummyPlatformOp {}
+
+    struct DummySlotSpec;
+
+    impl slot::SlotSpec for DummySlotSpec {
+        type Op = DummyPlatformOp;
+        type UserPayload = ();
+        type PlatformData = ();
+        type Sidecar = ();
+        type Error = ();
+        type Completion = usize;
+    }
+
+    #[test]
+    fn record_completion_rejects_idle_future_generation() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        let token = CompletionToken::user(OpToken::new(0, 1));
+
+        let outcome = table
+            .record_completion(CompletionPacket::new(
+                CompletionEvent {
+                    token,
+                    res: 0,
+                    flags: 0,
+                },
+                None,
+                None,
+            ))
+            .into_outcome();
+
+        assert!(matches!(outcome, RecordCompletionOutcome::NonActive(_)));
+        assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
+    }
+
+    #[test]
+    fn mark_waiting_does_not_activate_idle_future_generation() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        let token = CompletionToken::user(OpToken::new(0, 1));
+
+        table.mark_waiting(token);
+
+        assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
+    }
+
+    #[test]
+    fn mark_waiting_does_not_revive_orphaned_slot() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        table.slots[0].reset(1);
+        table.slots[0].set_state(slot::SlotState::InFlightOrphaned, Ordering::Release);
+        let token = CompletionToken::user(OpToken::new(0, 1));
+
+        table.mark_waiting(token);
+
+        assert_eq!(table.debug_get_state(0), CELL_STATE_ORPHANED);
+    }
+
+    #[test]
+    fn lost_completion_is_observable_as_ready_lost() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        table.slots[0].reset(1);
+        table.slots[0].set_state(slot::SlotState::Reserved, Ordering::Release);
+        let op_token = OpToken::new(0, 1);
+        let token = CompletionToken::user(op_token);
+        let anomaly = CompletionAnomaly::corrupt(token, 0, 1, slot::SlotState::Reserved);
+
+        let outcome = table
+            .record_lost_completion(
+                CompletionEvent {
+                    token,
+                    res: -5,
+                    flags: 0,
+                },
+                anomaly,
+                CompletionCleanupGuard::default(),
+            )
+            .into_outcome();
+
+        assert_eq!(outcome, RecordCompletionOutcome::Recorded);
+        assert!(matches!(
+            table.try_take_record(token),
+            PollRecordResult::ReadyLost(observed) if observed.reason == anomaly.reason
+        ));
     }
 }

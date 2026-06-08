@@ -88,7 +88,7 @@ fn reaper_sender() -> Option<&'static std::sync::mpsc::Sender<DeferredRioCleanup
 impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) -> RioResult<()> {
         let mut release_result = Ok(());
-        match Self::decode_req_ctx(res.RequestContext) {
+        match self.decode_req_ctx(res.RequestContext) {
             Some(RioCompletionKind::Op {
                 init:
                     RioOpRequestInit {

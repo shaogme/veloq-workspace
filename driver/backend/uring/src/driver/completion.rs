@@ -15,7 +15,7 @@ use veloq_driver_core::driver::{
     CompletionEvent, CompletionPacket, CompletionSidecar, CompletionToken, OpToken, RawCompletion,
     RoutedSlotCompletion, dispatch_raw_completion, drain_cancel_requests,
     record_completion_anomaly, record_lost_completion, record_user_completion,
-    route_checked_slot_completion, run_completion_cleanup,
+    route_user_completion, run_completion_cleanup,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -243,7 +243,7 @@ impl<'a> UringDriver<'a> {
 
     fn handle_user_completion(&mut self, token: OpToken, raw: RawCompletion) -> usize {
         let (user_data, generation) = token.parts();
-        match route_checked_slot_completion(raw, self.ops.checked_slot_view(token)) {
+        match route_user_completion(token, raw, self.ops.checked_slot_view(token)) {
             RoutedSlotCompletion::Waiting(slot) => {
                 let sidecar = complete_waiting_slot(slot, token, raw.res, raw.flags);
                 self.push_completion_event(sidecar);

@@ -3,9 +3,10 @@ use std::time::Instant;
 use diagweave::prelude::*;
 use tracing::{debug, error};
 use veloq_driver_core::driver::{
-    CompletionBackend, CompletionCleanupGuard, DriverCompletionDiagnostics, OpToken, RawCompletion,
-    RecordCompletionOutcome, RoutedSlotCompletion, record_completion_anomaly,
-    route_checked_slot_completion, run_completion_cleanup,
+    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionEvent,
+    DriverCompletionDiagnostics, OpToken, RawCompletion, RecordCompletionOutcome,
+    RoutedSlotCompletion, record_completion_anomaly, record_lost_completion, route_user_completion,
+    run_completion_cleanup,
 };
 use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt, SlotView};
 
@@ -110,7 +111,7 @@ impl<'a> IocpDriver<'a> {
             0,
         );
 
-        match route_checked_slot_completion(raw, self.ops.checked_slot_view(token)) {
+        match route_user_completion(token, raw, self.ops.checked_slot_view(token)) {
             RoutedSlotCompletion::Waiting(mut slot) => {
                 let io_result = Self::calculate_io_result_from_slot(
                     &self.extensions,
@@ -182,15 +183,7 @@ impl<'a> IocpDriver<'a> {
                 );
             }
             RoutedSlotCompletion::Corrupt(anomaly) => {
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                error!(
-                    user_data,
-                    completed_generation, "IOCP completion found corrupt slot; recycling"
-                );
-                self.release_socket_inflight_for_op(user_data);
-                if let Some(snapshot) = anomaly.slot_snapshot {
-                    let _ = self.ops.finalize_corrupt_slot(snapshot);
-                }
+                self.emit_corrupt_completion(anomaly, "IOCP completion found corrupt slot");
             }
         }
     }
@@ -298,6 +291,75 @@ impl<'a> IocpDriver<'a> {
         }
 
         None
+    }
+
+    fn emit_corrupt_completion(&mut self, anomaly: CompletionAnomaly, note: &'static str) {
+        let Some(snapshot) = anomaly.slot_snapshot else {
+            record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+            return;
+        };
+        let token = OpToken::new(snapshot.index, snapshot.generation);
+        let raw_res = anomaly.raw_result.unwrap_or(-5);
+        let flags = anomaly.flags.unwrap_or(0);
+
+        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+        error!(
+            user_data = snapshot.index,
+            generation = snapshot.generation,
+            state = ?snapshot.state,
+            has_op = snapshot.has_op,
+            has_payload = snapshot.has_payload,
+            raw_res,
+            "IOCP completion found corrupt slot"
+        );
+
+        self.release_socket_inflight_for_op(snapshot.index);
+
+        let lost_result = Err(IocpError::InvalidState
+            .to_report()
+            .push_ctx("scope", "iocp.driver.completion")
+            .with_ctx("user_data", snapshot.index)
+            .with_ctx("generation", snapshot.generation)
+            .with_ctx("slot_state", format!("{:?}", snapshot.state))
+            .with_ctx("has_op", snapshot.has_op)
+            .with_ctx("has_payload", snapshot.has_payload)
+            .set_error_code((-raw_res).max(1))
+            .attach_note(note));
+
+        let cleanup = self
+            .ops
+            .get_slot_entry_op_storage_and_entry_mut_token(token)
+            .and_then(|(_, _, op, _)| {
+                let cleanup = op
+                    .as_mut()
+                    .map(|op| op.completion_cleanup(&lost_result))
+                    .unwrap_or_default();
+                let _ = op.take();
+                Some(cleanup)
+            })
+            .unwrap_or_default();
+
+        let _ = self
+            .ops
+            .with_slot_storage_mut_token(token, |result, payload, _sidecar| {
+                let _ = result.take();
+                let _ = payload.take();
+            });
+
+        let event = CompletionEvent {
+            token: anomaly.token,
+            res: -5,
+            flags,
+        };
+        let _ = record_lost_completion(
+            self.completion.table(),
+            &mut self.completion_diagnostics,
+            event,
+            anomaly,
+            cleanup,
+        );
+        let _ = self.ops.finalize_corrupt_slot(snapshot);
+        self.drain_deferred_socket_cleanup();
     }
 }
 

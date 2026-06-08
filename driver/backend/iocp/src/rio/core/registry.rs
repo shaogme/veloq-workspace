@@ -23,6 +23,10 @@ use crate::config::BorrowedRawHandle;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioEnv;
 use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
+use crate::rio::core::{
+    RioCompletedRequestContext, RioCompletionKind, RioOpRequestInit, RioPreparedRequestContext,
+    RioRequestContextId,
+};
 use crate::rio::error::{RioError, RioResult};
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
@@ -67,6 +71,15 @@ pub(crate) struct RioRegistry {
     pub(crate) chunk_register_failures_recent: FxHashMap<veloq_buf::heap::ChunkId, Instant>,
     pub(crate) heap_register_failures_recent: FxHashMap<RioHeapBufferKey, Instant>,
     pub(crate) next_registration_generation: u64,
+    request_contexts: Vec<RioRequestContextSlot>,
+    request_context_free: Vec<usize>,
+}
+
+#[derive(Default)]
+struct RioRequestContextSlot {
+    generation: u32,
+    init: Option<RioOpRequestInit>,
+    in_use: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +164,56 @@ impl RioRegistry {
             chunk_register_failures_recent: FxHashMap::default(),
             heap_register_failures_recent: FxHashMap::default(),
             next_registration_generation: 0,
+            request_contexts: Vec::new(),
+            request_context_free: Vec::new(),
         }
+    }
+
+    pub(crate) fn alloc_request_context(
+        &mut self,
+        init: RioOpRequestInit,
+    ) -> RioPreparedRequestContext {
+        let index = self.request_context_free.pop().unwrap_or_else(|| {
+            self.request_contexts.push(RioRequestContextSlot::default());
+            self.request_contexts.len() - 1
+        });
+        let slot = &mut self.request_contexts[index];
+        debug_assert!(!slot.in_use, "reusing active RIO request context slot");
+        let mut generation = slot.generation.wrapping_add(1);
+        if generation == 0 {
+            generation = 1;
+        }
+        slot.generation = generation;
+        slot.init = Some(init);
+        slot.in_use = true;
+        RioPreparedRequestContext::new(RioRequestContextId::new(index, generation))
+    }
+
+    pub(crate) fn take_prepared_request_init(
+        &mut self,
+        context: RioPreparedRequestContext,
+    ) -> Option<RioOpRequestInit> {
+        self.take_request_context_init(context.id())
+    }
+
+    pub(crate) fn decode_request_context(&mut self, raw: u64) -> Option<RioCompletionKind> {
+        let id = RioRequestContextId::from_raw(raw)?;
+        let init = self.take_request_context_init(id)?;
+        Some(RioCompletionKind::Op {
+            init,
+            context: RioCompletedRequestContext::new(id),
+        })
+    }
+
+    fn take_request_context_init(&mut self, id: RioRequestContextId) -> Option<RioOpRequestInit> {
+        let slot = self.request_contexts.get_mut(id.index())?;
+        if !slot.in_use || slot.generation != id.generation() {
+            return None;
+        }
+        let init = slot.init.take()?;
+        slot.in_use = false;
+        self.request_context_free.push(id.index());
+        Some(init)
     }
 
     pub(crate) fn prepare_submission(
