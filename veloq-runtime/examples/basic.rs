@@ -149,9 +149,11 @@ fn main() {
                 let mut handles = Vec::new();
                 let worker_id = target_scope.worker_id();
                 for i in 1..=3 {
-                    let h = target_scope.spawn_boxed_to(1, async move || {
-                        println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
-                    });
+                    let h = target_scope
+                        .spawn_boxed_to(1, async move || {
+                            println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
+                        })
+                        .expect("定向任务分发失败");
                     handles.push(h);
                 }
                 for h in handles {

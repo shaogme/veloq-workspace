@@ -412,34 +412,41 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                 })
                                 .collect();
 
-                            prepare_handles.push(s.spawn_boxed_to(worker_id, async move || {
-                                let mut files = Vec::with_capacity(FILES_PER_WORKER);
-                                for path in &prepare_path_names {
-                                    if path.exists() {
+                            prepare_handles.push(
+                                s.spawn_boxed_to(worker_id, async move || {
+                                    let mut files = Vec::with_capacity(FILES_PER_WORKER);
+                                    for path in &prepare_path_names {
+                                        if path.exists() {
+                                            let _ = std::fs::remove_file(path);
+                                        }
+
+                                        let file = open_and_fallocate(
+                                            ctx,
+                                            path,
+                                            buffering_mode,
+                                            FILE_SIZE,
+                                        )
+                                        .await;
+                                        files.push(file);
+                                    }
+
+                                    let bytes = run_worker_iteration(
+                                        ctx,
+                                        files,
+                                        FILE_SIZE,
+                                        nz!(4 * 1024 * 1024),
+                                        sync_mode,
+                                    )
+                                    .await;
+
+                                    for path in prepare_path_names {
                                         let _ = std::fs::remove_file(path);
                                     }
 
-                                    let file =
-                                        open_and_fallocate(ctx, path, buffering_mode, FILE_SIZE)
-                                            .await;
-                                    files.push(file);
-                                }
-
-                                let bytes = run_worker_iteration(
-                                    ctx,
-                                    files,
-                                    FILE_SIZE,
-                                    nz!(4 * 1024 * 1024),
-                                    sync_mode,
-                                )
-                                .await;
-
-                                for path in prepare_path_names {
-                                    let _ = std::fs::remove_file(path);
-                                }
-
-                                Ok::<u64, std::io::Error>(bytes)
-                            }));
+                                    Ok::<u64, std::io::Error>(bytes)
+                                })
+                                .expect("worker prepare task dispatch failed"),
+                            );
                         }
 
                         let mut total_bytes = 0u64;

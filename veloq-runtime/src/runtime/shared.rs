@@ -8,12 +8,14 @@ use std::sync::mpsc::{self, Receiver};
 use std::task::{Context, Poll};
 
 use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
+use crate::error::{Result, RuntimeError};
 use crate::runtime::primitives::{self, Unparker};
 use crate::scope::{GenericScopeCompletion, ScopeCompletionRegistration};
 use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{StateOptionPtr, Storage};
+use diagweave::DiagnosticResult;
 
 pub(crate) mod infra;
 
@@ -186,6 +188,29 @@ impl RuntimeSharedBase {
             .expect("runtime must have at least one worker")
     }
 
+    #[inline]
+    pub fn validate_worker_id(&self, worker_id: usize) -> Result<()> {
+        let worker_count = self.worker_count().get();
+        if worker_id < worker_count {
+            return Ok(());
+        }
+
+        RuntimeError::WorkerIdOutOfBounds {
+            worker_id,
+            worker_count,
+        }
+        .with_category("runtime.dispatch")
+    }
+
+    #[inline]
+    fn assert_worker_id(&self, worker_id: usize) {
+        let worker_count = self.registry.workers.len();
+        assert!(
+            worker_id < worker_count,
+            "worker_id {worker_id} is out of bounds (worker_count: {worker_count})"
+        );
+    }
+
     /// 将本地任务入队当前线程的本地队列。
     pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
         if task.header().is_completed() {
@@ -203,11 +228,10 @@ impl RuntimeSharedBase {
     }
 
     pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
+        self.assert_worker_id(worker_id);
         if task.header().is_completed() {
             return false;
         }
-        let worker_count = self.registry.workers.len();
-        let worker_id = worker_id % worker_count;
         if task.header().try_mark_queued() {
             self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
@@ -290,11 +314,10 @@ impl RuntimeSharedBase {
     }
 
     pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+        self.assert_worker_id(worker_id);
         if task.header().is_completed() {
             return;
         }
-        let worker_count = self.registry.workers.len();
-        let worker_id = worker_id % worker_count;
         if task.header().try_mark_queued() {
             self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
@@ -334,6 +357,11 @@ impl<T> RuntimeShared<T> {
         self.base.worker_count()
     }
 
+    #[inline]
+    pub fn validate_worker_id(&self, worker_id: usize) -> Result<()> {
+        self.base.validate_worker_id(worker_id)
+    }
+
     pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
         self.base.enqueue_local(worker_id, task);
     }
@@ -357,11 +385,10 @@ impl<T> RuntimeShared<T> {
     }
 
     pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+        self.base.assert_worker_id(worker_id);
         if task.header().is_completed() {
             return;
         }
-        let worker_count = self.base.registry.workers.len();
-        let worker_id = worker_id % worker_count;
 
         let current = self
             .base

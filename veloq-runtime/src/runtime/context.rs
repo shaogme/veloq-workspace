@@ -147,6 +147,8 @@ impl<T> RuntimeScopeContext<T> {
         F: FnOnce() -> Fut + Send + 'scope_ref,
         Fut: Future + Send + 'scope_ref,
     {
+        self.shared().validate_worker_id(worker_id)?;
+
         let slot = RouteCell::new();
         let slot_for_job = slot.clone();
 

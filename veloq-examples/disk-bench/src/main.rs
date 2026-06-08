@@ -456,10 +456,18 @@ fn main() {
             let mut prepare_handles = Vec::with_capacity(args.threads);
             for t_idx in 0..args.threads {
                 let prepare_buffering = buffering_mode;
-                prepare_handles.push(s.spawn_boxed_to(t_idx, async move || {
-                    prepare_files_for_thread(ctx, FILE_SIZE_PER_THREAD, t_idx, prepare_buffering)
+                prepare_handles.push(
+                    s.spawn_boxed_to(t_idx, async move || {
+                        prepare_files_for_thread(
+                            ctx,
+                            FILE_SIZE_PER_THREAD,
+                            t_idx,
+                            prepare_buffering,
+                        )
                         .await;
-                }));
+                    })
+                    .expect("prepare task dispatch failed"),
+                );
             }
             for handle in prepare_handles {
                 handle.await.expect("Preparation task failed");
@@ -477,18 +485,21 @@ fn main() {
                 let worker_sync = sync_mode;
                 let t_idx = config.thread_index;
 
-                worker_handles.push(s.spawn_boxed_to(t_idx, async move || {
-                    run_worker(
-                        ctx,
-                        qdepth,
-                        duration_limit,
-                        min_iters,
-                        worker_buffering,
-                        worker_sync,
-                        config,
-                    )
-                    .await
-                }));
+                worker_handles.push(
+                    s.spawn_boxed_to(t_idx, async move || {
+                        run_worker(
+                            ctx,
+                            qdepth,
+                            duration_limit,
+                            min_iters,
+                            worker_buffering,
+                            worker_sync,
+                            config,
+                        )
+                        .await
+                    })
+                    .expect("worker task dispatch failed"),
+                );
             }
 
             // 3. Aggregate

@@ -1,3 +1,4 @@
+use crate::error::Result as RuntimeResult;
 use crate::runtime::{RuntimeScopeContext, RuntimeShared};
 use crate::task::{
     Arena, GenericArena, GenericTaskHeader, RawScope, RawTask, ScopeRef, SendBoxedTaskNode,
@@ -221,7 +222,8 @@ pub(crate) fn dispatch_routed<'scope_ref, S: Storage, O: Ownership, T, F, TExtra
     state: Arc<RoutedSpawnState<'scope_ref, T>>,
     worker_id: usize,
     job: F,
-) where
+) -> RuntimeResult<()>
+where
     O::Shared<GenericScopeCompletion<S, O>>: Send,
     F: FnOnce() + Send + 'scope_ref,
     T: 'scope_ref,
@@ -234,29 +236,29 @@ pub(crate) fn dispatch_routed<'scope_ref, S: Storage, O: Ownership, T, F, TExtra
 
     let job_boxed: Box<dyn FnOnce() + Send + 'scope_ref> = Box::new(job);
 
-    if context
-        .route_to(worker_id, move || {
-            let state_ref: &RoutedSpawnState<'scope_ref, T> =
-                unsafe { &*(state_send_ptr.as_ptr() as *const RoutedSpawnState<'scope_ref, T>) };
-            let completion_ref: &GenericScopeCompletion<S, O> =
-                unsafe { &*(completion_send_ptr.as_ptr() as *const GenericScopeCompletion<S, O>) };
-            let result = catch_unwind(AssertUnwindSafe(move || {
-                job_boxed();
-            }));
+    match context.route_to(worker_id, move || {
+        let state_ref: &RoutedSpawnState<'scope_ref, T> =
+            unsafe { &*(state_send_ptr.as_ptr() as *const RoutedSpawnState<'scope_ref, T>) };
+        let completion_ref: &GenericScopeCompletion<S, O> =
+            unsafe { &*(completion_send_ptr.as_ptr() as *const GenericScopeCompletion<S, O>) };
+        let result = catch_unwind(AssertUnwindSafe(move || {
+            job_boxed();
+        }));
 
-            if let Err(panic_err) = result {
-                completion_ref.report_panic(panic_err);
-                completion_ref.cancel();
-                state_ref.fail(TaskError::Panic);
-                completion_ref.task_done();
-            }
-            std::future::ready(())
-        })
-        .is_err()
-    {
-        completion.task_done();
-        state.fail(TaskError::Panic);
-        panic!("failed to dispatch routed pinned task");
+        if let Err(panic_err) = result {
+            completion_ref.report_panic(panic_err);
+            completion_ref.cancel();
+            state_ref.fail(TaskError::Panic);
+            completion_ref.task_done();
+        }
+        std::future::ready(())
+    }) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            completion.task_done();
+            state.fail(TaskError::Panic);
+            Err(err)
+        }
     }
 }
 

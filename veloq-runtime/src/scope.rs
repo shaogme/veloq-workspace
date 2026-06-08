@@ -1,3 +1,4 @@
+use crate::error::Result;
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::runtime::{RuntimeScopeContext, RuntimeShared};
 use crate::task::{
@@ -25,11 +26,18 @@ use router::{
     make_spawn_to_access,
 };
 
-#[derive(Copy, Clone)]
 pub(crate) struct SendPtr<T>(NonNull<T>);
 
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> Copy for SendPtr<T> {}
+
+impl<T> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 
 impl<T> SendPtr<T> {
     pub(crate) fn new(ptr: NonNull<T>) -> Self {
@@ -258,15 +266,11 @@ impl<'scope, TExtra> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExt
         &'scope_ref self,
         worker_id: usize,
         task: &'scope S_,
-    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
+    ) -> Result<JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>>
     where
         S_: SendTask<T> + Sized + Sync + 'scope,
     {
-        debug_assert!(
-            worker_id < self.context.shared().worker_count().get(),
-            "worker_id {} is out of bounds",
-            worker_id
-        );
+        self.context.shared().validate_worker_id(worker_id)?;
 
         let state = RoutedSpawnState::new();
         self.completion.add_task();
@@ -307,9 +311,9 @@ impl<'scope, TExtra> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExt
                     access: make_spawn_to_access::<T, S_>(task),
                 });
             },
-        );
+        )?;
 
-        JoinHandle::new_routed(self, state)
+        Ok(JoinHandle::new_routed(self, state))
     }
 
     pub fn spawn<'scope_ref, T: Send, S_>(
@@ -371,15 +375,11 @@ impl<'scope, TExtra> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExt
         &'scope_ref self,
         worker_id: usize,
         job: F,
-    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
+    ) -> Result<JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>>
     where
         F: AsyncFnOnce() -> T + Send + 'scope_ref,
     {
-        debug_assert!(
-            worker_id < self.context.shared().worker_count().get(),
-            "worker_id {} is out of bounds",
-            worker_id
-        );
+        self.context.shared().validate_worker_id(worker_id)?;
 
         let state = RoutedSpawnState::new();
         self.completion.add_task();
@@ -396,11 +396,12 @@ impl<'scope, TExtra> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExt
             ) as *mut RoutedJobCell<F>
         };
         unsafe { write(job_ptr, RoutedJobCell::new(job)) };
-        let mut job_ptr: SendPtr<RoutedJobCell<F>> =
+        let job_ptr: SendPtr<RoutedJobCell<F>> =
             SendPtr::new(unsafe { NonNull::new_unchecked(job_ptr) });
+        let mut job_ptr_for_job = job_ptr;
 
         let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
-        dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
+        if let Err(err) = dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
             &self.context,
             &self.completion,
             state.clone(),
@@ -408,16 +409,18 @@ impl<'scope, TExtra> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExt
             move || {
                 let arena = unsafe { arena_ptr.as_ref() };
                 if state_for_job.is_cancel_requested() {
-                    unsafe { arena.drop_object_raw(job_ptr.as_ptr() as *mut u8, job_layout) };
+                    unsafe {
+                        arena.drop_object_raw(job_ptr_for_job.as_ptr() as *mut u8, job_layout)
+                    };
                     state_for_job.fail(TaskError::Cancelled);
                     completion.task_done();
                     return;
                 }
 
-                let job = unsafe { job_ptr.as_mut().take() };
+                let job = unsafe { job_ptr_for_job.as_mut().take() };
                 let future = job();
 
-                unsafe { arena.drop_object_raw(job_ptr.as_ptr() as *mut u8, job_layout) };
+                unsafe { arena.drop_object_raw(job_ptr_for_job.as_ptr() as *mut u8, job_layout) };
 
                 if state_for_job.is_cancel_requested() {
                     state_for_job.fail(TaskError::Cancelled);
@@ -434,9 +437,15 @@ impl<'scope, TExtra> GenericAsyncScope<'scope, AtomicStorage, ArcOwnership, TExt
                     future,
                 );
             },
-        );
+        ) {
+            unsafe {
+                self.arena
+                    .drop_object_raw(job_ptr.as_ptr() as *mut u8, job_layout)
+            };
+            return Err(err);
+        }
 
-        JoinHandle::new_routed(self, state)
+        Ok(JoinHandle::new_routed(self, state))
     }
 
     pub fn spawn_boxed<'scope_ref, T: Send, F>(
