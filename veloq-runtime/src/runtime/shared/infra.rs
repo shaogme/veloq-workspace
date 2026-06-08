@@ -10,9 +10,9 @@ use crate::runtime::context::{IdleDecision, IdleWaitStrategy};
 use crate::runtime::primitives::{EventCount, Parker, ParkerInner, Unparker};
 use crate::runtime::shared::RuntimeShared;
 use crate::scope::GenericScopeCompletion;
-use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef, TaskHeader};
+use crate::task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicOptionPtr, StateOptionPtr, Storage};
+use crate::utils::storage::{AtomicOptionPtr, StateOptionPtr};
 use crate::utils::{Deque, FastRand, Steal};
 
 pub(crate) struct WorkerQueue {
@@ -346,7 +346,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         Self { shared, worker_id }
     }
 
-    pub(crate) fn run<S: Storage, O: Ownership>(
+    pub(crate) fn run<S: ScopeStorage, O: Ownership>(
         &self,
         completion: Option<&GenericScopeCompletion<S, O>>,
     ) {
@@ -383,7 +383,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         self.leave_idle(group_idx);
     }
 
-    fn should_retry<S: Storage, O: Ownership>(
+    fn should_retry<S: ScopeStorage, O: Ownership>(
         &self,
         seq: usize,
         completion: Option<&GenericScopeCompletion<S, O>>,
@@ -395,7 +395,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             || completion.map(|c| c.is_done()).unwrap_or(false)
     }
 
-    fn park<S: Storage, O: Ownership>(
+    fn park<S: ScopeStorage, O: Ownership>(
         &self,
         wait_strategy: IdleWaitStrategy,
         completion: Option<&GenericScopeCompletion<S, O>>,

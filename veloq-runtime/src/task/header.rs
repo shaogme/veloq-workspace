@@ -1,6 +1,6 @@
 use crate::runtime::RuntimeSharedBase;
 use crate::task::{ScopeRef, SendTaskRef, TaskHandleRef};
-use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
+use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage};
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
@@ -48,8 +48,8 @@ pub struct GenericTaskHeader<S: Storage> {
     vtable: &'static TaskVTable<S>,
 }
 
-unsafe impl<S: Storage + Send> Send for GenericTaskHeader<S> {}
-unsafe impl<S: Storage + Sync> Sync for GenericTaskHeader<S> {}
+unsafe impl<S: ThreadSafeStorage> Send for GenericTaskHeader<S> {}
+unsafe impl<S: ThreadSafeStorage> Sync for GenericTaskHeader<S> {}
 
 impl<S: Storage> GenericTaskHeader<S> {
     pub fn new(

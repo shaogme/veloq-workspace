@@ -10,6 +10,10 @@ pub enum StrategyType {
     Atomic,
 }
 
+mod sealed {
+    pub trait Sealed {}
+}
+
 pub trait Storage: 'static {
     fn strategy_type() -> StrategyType;
     type Usize: StateInt;
@@ -21,7 +25,17 @@ pub trait Storage: 'static {
     type OptionArc<T: ?Sized + Send + Sync>: StateOptionArc<T>;
 }
 
-pub trait StateInt: Send + Sync {
+/// 标记所有底层 primitive 都可跨线程共享的存储策略。
+///
+/// 该 trait 被 sealed，避免外部类型在未满足线程安全不变量时实现它。
+pub trait ThreadSafeStorage: Storage + Send + Sync + sealed::Sealed {}
+
+/// 标记只能在线程本地使用的存储策略。
+///
+/// 该 trait 被 sealed，用于把本地策略从跨线程 API 中排除。
+pub trait LocalOnlyStorage: Storage + sealed::Sealed {}
+
+pub trait StateInt {
     fn new(val: usize) -> Self;
     fn load(&self, order: Ordering) -> usize;
     fn store(&self, val: usize, order: Ordering);
@@ -45,7 +59,7 @@ pub trait StateInt: Send + Sync {
     ) -> Result<usize, usize>;
 }
 
-pub trait StateOptionPtr<T>: Send + Sync {
+pub trait StateOptionPtr<T> {
     fn new(ptr: Option<NonNull<T>>) -> Self;
     fn load(&self, order: Ordering) -> Option<NonNull<T>>;
     fn store(&self, ptr: Option<NonNull<T>>, order: Ordering);
@@ -66,7 +80,7 @@ pub trait StateOptionPtr<T>: Send + Sync {
     ) -> Result<Option<NonNull<T>>, Option<NonNull<T>>>;
 }
 
-pub trait StateNonNullPtr<T>: Send + Sync {
+pub trait StateNonNullPtr<T> {
     fn new(ptr: NonNull<T>) -> Self;
     fn load(&self, order: Ordering) -> NonNull<T>;
     fn store(&self, ptr: NonNull<T>, order: Ordering);
@@ -87,7 +101,7 @@ pub trait StateNonNullPtr<T>: Send + Sync {
     ) -> Result<NonNull<T>, NonNull<T>>;
 }
 
-pub trait StateLock<T>: Send + Sync {
+pub trait StateLock<T> {
     type Guard<'a>: std::ops::DerefMut<Target = T>
     where
         Self: 'a,
@@ -96,13 +110,13 @@ pub trait StateLock<T>: Send + Sync {
     fn lock(&self) -> Self::Guard<'_>;
 }
 
-pub trait StateWakerQueue: Send + Sync + 'static {
+pub trait StateWakerQueue: 'static {
     fn new() -> Self;
     fn register(&self, waker: &Waker);
     fn take_all(&self) -> Vec<Waker>;
 }
 
-pub trait StateOptionBox<T: ?Sized + Send>: Send + Sync {
+pub trait StateOptionBox<T: ?Sized + Send> {
     fn new(opt: Option<Box<T>>) -> Self;
     fn take(&self, order: Ordering) -> Option<Box<T>>;
     fn swap(&self, new: Option<Box<T>>, order: Ordering) -> Option<Box<T>>;
@@ -115,7 +129,7 @@ pub trait StateOptionBox<T: ?Sized + Send>: Send + Sync {
     ) -> Result<(), Box<T>>;
 }
 
-pub trait StateOptionArc<T: ?Sized + Send + Sync>: Send + Sync {
+pub trait StateOptionArc<T: ?Sized + Send + Sync> {
     fn new(opt: Option<Arc<T>>) -> Self;
     fn take(&self, order: Ordering) -> Option<Arc<T>>;
     fn store(&self, opt: Option<Arc<T>>, order: Ordering);
@@ -131,6 +145,9 @@ pub trait StateOptionArc<T: ?Sized + Send + Sync>: Send + Sync {
 // --- Atomic Storage Implementation ---
 
 pub struct AtomicStorage;
+impl sealed::Sealed for AtomicStorage {}
+impl ThreadSafeStorage for AtomicStorage {}
+
 impl Storage for AtomicStorage {
     fn strategy_type() -> StrategyType {
         StrategyType::Atomic
@@ -221,7 +238,10 @@ impl_state_int!(
 
 // --- Local Storage Implementation ---
 
-pub struct LocalStorage;
+pub struct LocalStorage(std::marker::PhantomData<std::rc::Rc<()>>);
+impl sealed::Sealed for LocalStorage {}
+impl LocalOnlyStorage for LocalStorage {}
+
 impl Storage for LocalStorage {
     fn strategy_type() -> StrategyType {
         StrategyType::Local
@@ -248,8 +268,6 @@ impl<T> StateLock<T> for LocalLock<T> {
         self.0.borrow_mut()
     }
 }
-unsafe impl<T> Send for LocalLock<T> {}
-unsafe impl<T> Sync for LocalLock<T> {}
 
 pub struct LocalWakerQueue(RefCell<Vec<Waker>>);
 impl StateWakerQueue for LocalWakerQueue {
@@ -268,12 +286,8 @@ impl StateWakerQueue for LocalWakerQueue {
         std::mem::take(&mut *self.0.borrow_mut())
     }
 }
-unsafe impl Send for LocalWakerQueue {}
-unsafe impl Sync for LocalWakerQueue {}
 
 pub struct NonAtomicUsize(Cell<usize>);
-unsafe impl Send for NonAtomicUsize {}
-unsafe impl Sync for NonAtomicUsize {}
 
 impl_state_int!(
     NonAtomicUsize, self, _order, val, curr, new, success, failure,
@@ -605,8 +619,6 @@ impl_ptr_state_wrapper!(
         }
     },
     compare_exchange_weak(c, n, s, f) { self.compare_exchange(c, n, s, f) },
-    unsafe_impl unsafe impl<T> Send for NonAtomicOptionPtr<T> {}
-    unsafe_impl unsafe impl<T> Sync for NonAtomicOptionPtr<T> {}
 );
 
 impl_ptr_state_wrapper!(
@@ -625,8 +637,6 @@ impl_ptr_state_wrapper!(
         }
     },
     compare_exchange_weak(c, n, s, f) { self.compare_exchange(c, n, s, f) },
-    unsafe_impl unsafe impl<T> Send for NonAtomicNonNullPtr<T> {}
-    unsafe_impl unsafe impl<T> Sync for NonAtomicNonNullPtr<T> {}
 );
 
 // --- AtomicOptionBox ---
@@ -693,8 +703,6 @@ macro_rules! impl_cell_opt_methods {
 // --- NonAtomicOptionBox ---
 
 pub struct NonAtomicOptionBox<T: ?Sized>(Cell<Option<Box<T>>>);
-unsafe impl<T: ?Sized + Send> Send for NonAtomicOptionBox<T> {}
-unsafe impl<T: ?Sized + Send> Sync for NonAtomicOptionBox<T> {}
 
 impl<T: ?Sized + Send> StateOptionBox<T> for NonAtomicOptionBox<T> {
     impl_cell_opt_methods!(Box<T>);
@@ -738,8 +746,6 @@ impl<T: ?Sized + Send + Sync> StateOptionArc<T> for AtomicOptionArc<T> {
 // --- NonAtomicOptionArc ---
 
 pub struct NonAtomicOptionArc<T: ?Sized>(Cell<Option<Arc<T>>>);
-unsafe impl<T: ?Sized + Send + Sync> Send for NonAtomicOptionArc<T> {}
-unsafe impl<T: ?Sized + Send + Sync> Sync for NonAtomicOptionArc<T> {}
 
 impl<T: ?Sized + Send + Sync> StateOptionArc<T> for NonAtomicOptionArc<T> {
     impl_cell_opt_methods!(Arc<T>);

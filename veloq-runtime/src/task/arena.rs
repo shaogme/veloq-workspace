@@ -1,4 +1,4 @@
-use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
+use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage};
 use std::alloc::{Layout, alloc, dealloc};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::Ordering;
@@ -365,26 +365,26 @@ impl<S: Storage> Arena for GenericArena<S> {
 }
 
 // 安全性：GenericArena 的 Send/Sync 性质取决于 Storage 的实现
-unsafe impl<S: Storage> Send for GenericArena<S>
+unsafe impl<S: ThreadSafeStorage> Send for GenericArena<S>
 where
     S::OptionPtr<GenericChunk<S>>: Send,
     S::Lock<LinkedList<ChunkAdapter<S>>>: Send,
 {
 }
-unsafe impl<S: Storage> Sync for GenericArena<S>
+unsafe impl<S: ThreadSafeStorage> Sync for GenericArena<S>
 where
     S::OptionPtr<GenericChunk<S>>: Sync,
     S::Lock<LinkedList<ChunkAdapter<S>>>: Sync,
 {
 }
 
-unsafe impl<S: Storage> Send for GenericChunk<S>
+unsafe impl<S: ThreadSafeStorage> Send for GenericChunk<S>
 where
     S::Usize: Send,
     S::Lock<LinkedList<DropAdapter<S>>>: Send,
 {
 }
-unsafe impl<S: Storage> Sync for GenericChunk<S>
+unsafe impl<S: ThreadSafeStorage> Sync for GenericChunk<S>
 where
     S::Usize: Sync,
     S::Lock<LinkedList<DropAdapter<S>>>: Sync,

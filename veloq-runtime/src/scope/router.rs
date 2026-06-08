@@ -1,11 +1,11 @@
 use crate::error::Result as RuntimeResult;
 use crate::runtime::{RuntimeScopeContext, RuntimeShared};
 use crate::task::{
-    Arena, GenericArena, GenericTaskHeader, RawScope, RawTask, ScopeRef, SendBoxedTaskNode,
-    SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
+    Arena, GenericArena, GenericTaskHeader, RawScope, RawTask, ScopeRef, ScopeStorage,
+    SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
 };
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr, Storage};
+use crate::utils::storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr};
 use std::alloc::Layout;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -216,7 +216,7 @@ impl<'scope_ref, T> Drop for RoutedSpawnState<'scope_ref, T> {
 unsafe impl<'scope_ref, T> Send for RoutedSpawnState<'scope_ref, T> where T: Send {}
 unsafe impl<'scope_ref, T> Sync for RoutedSpawnState<'scope_ref, T> where T: Send {}
 
-pub(crate) fn dispatch_routed<'scope_ref, S: Storage, O: Ownership, T, F, TExtra>(
+pub(crate) fn dispatch_routed<'scope_ref, S: ScopeStorage, O: Ownership, T, F, TExtra>(
     context: &RuntimeScopeContext<TExtra>,
     completion: &O::Shared<GenericScopeCompletion<S, O>>,
     state: Arc<RoutedSpawnState<'scope_ref, T>>,

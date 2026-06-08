@@ -11,10 +11,10 @@ use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
 use crate::error::{Result, RuntimeError};
 use crate::runtime::primitives::{self, Unparker};
 use crate::scope::{GenericScopeCompletion, ScopeCompletionRegistration};
-use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef};
+use crate::task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{StateOptionPtr, Storage};
+use crate::utils::storage::StateOptionPtr;
 use diagweave::DiagnosticResult;
 
 pub(crate) mod infra;
@@ -435,7 +435,7 @@ impl<T> RuntimeShared<T> {
         self.base.shutdown();
     }
 
-    pub fn drive_worker<'a, S: Storage, O: Ownership + 'a>(
+    pub fn drive_worker<'a, S: ScopeStorage, O: Ownership + 'a>(
         &self,
         completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
     ) {
@@ -444,7 +444,7 @@ impl<T> RuntimeShared<T> {
 
     pub fn drive_worker_with_init<
         'scope_ref,
-        S: Storage,
+        S: ScopeStorage,
         O: Ownership + 'scope_ref,
         F: Future<Output = ()>,
     >(

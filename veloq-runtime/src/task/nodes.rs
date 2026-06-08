@@ -2,7 +2,7 @@ use crate::task::{
     GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef, RawTask,
     SendTaskRef, Task, TaskError, TaskHandleRef, TaskResultSetter, TaskVTable, poll_task_internal,
 };
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, Storage};
+use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, Storage, ThreadSafeStorage};
 use std::cell::UnsafeCell;
 use std::future::Future;
 use std::pin::Pin;
@@ -64,6 +64,7 @@ pub struct GenericTaskNode<S: TaskStorage, T, F> {
 
 unsafe impl<S: TaskStorage, T, F> Send for GenericTaskNode<S, T, F>
 where
+    S: ThreadSafeStorage,
     S: TaskBounds<T, F>,
     F: Send,
     T: Send,
@@ -72,6 +73,7 @@ where
 
 unsafe impl<S: TaskStorage, T, F> Sync for GenericTaskNode<S, T, F>
 where
+    S: ThreadSafeStorage,
     S: TaskBounds<T, F>,
     F: Send,
     T: Send,

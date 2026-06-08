@@ -3,8 +3,8 @@ use crate::runtime::primitives::GenericCancellationToken;
 use crate::runtime::{RuntimeScopeContext, RuntimeShared};
 use crate::task::{
     AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, LocalBoxedTaskNode, LocalTask,
-    LocalTaskRef, RawScope, ScopeRef, SendBoxedTaskNode, SendTask, SendTaskRef, TaskError,
-    TaskHandleRef, TaskJoinGate,
+    LocalTaskRef, RawScope, ScopeRef, ScopeStorage, SendBoxedTaskNode, SendTask, SendTaskRef,
+    TaskError, TaskHandleRef, TaskJoinGate,
 };
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
@@ -58,7 +58,7 @@ impl<T> SendPtr<T> {
 }
 
 pub trait ScopeProvider<T> {
-    type Storage: Storage;
+    type Storage: ScopeStorage;
     type Ownership: Ownership;
     type Arena: Arena;
     fn runtime(&self) -> &RuntimeShared<T>;
@@ -79,7 +79,7 @@ pub(crate) type CancelTokenSlot<S, O> =
     <S as Storage>::Lock<Option<GenericCancellationToken<S, O>>>;
 
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
-pub struct GenericAsyncScope<'scope, S: Storage, O: Ownership + 'static, TExtra> {
+pub struct GenericAsyncScope<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> {
     context: RuntimeScopeContext<TExtra>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
@@ -91,7 +91,7 @@ pub type AsyncScope<'scope, TExtra> =
 pub type LocalAsyncScope<'scope, TExtra> =
     GenericAsyncScope<'scope, LocalStorage, RcOwnership, TExtra>;
 
-impl<'scope, S: Storage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
+impl<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
     for GenericAsyncScope<'scope, S, O, TExtra>
 {
     type Storage = S;
@@ -111,7 +111,9 @@ impl<'scope, S: Storage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
     }
 }
 
-impl<'scope, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'scope, S, O, TExtra> {
+impl<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
+    GenericAsyncScope<'scope, S, O, TExtra>
+{
     pub fn new(context: RuntimeScopeContext<TExtra>, parent: Option<AnyScopeRef>) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
@@ -222,7 +224,7 @@ impl<'scope, S: Storage, O: Ownership + 'static, TExtra> GenericAsyncScope<'scop
     }
 }
 
-impl<'scope, S: Storage, O: Ownership + 'static, TExtra> Drop
+impl<'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
     for GenericAsyncScope<'scope, S, O, TExtra>
 {
     fn drop(&mut self) {

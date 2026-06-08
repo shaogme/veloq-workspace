@@ -11,7 +11,8 @@ pub use header::{
 };
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
-    AnyScopeRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope, ScopeRef,
+    AnyScopeRef, AnySendScopeRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,
+    ScopeParent, ScopeRef, ScopeStorage,
 };
 
 use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};

@@ -1,8 +1,8 @@
 use crate::runtime::primitives::GenericCancellationToken;
-use crate::task::AnyScopeRef;
+use crate::task::{AnyScopeRef, ScopeParent, ScopeStorage};
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{
-    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, Storage, StrategyType,
+    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, StrategyType,
 };
 use std::any::Any;
 use std::marker::PhantomData;
@@ -12,15 +12,15 @@ use std::sync::atomic::Ordering;
 use std::task::Waker;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
-pub(crate) struct ScopeWakerNode<S: Storage> {
+pub(crate) struct ScopeWakerNode<S: ScopeStorage> {
     pub(crate) waker: Waker,
     pub(crate) link: Link,
     marker: PhantomData<S>,
 }
 
-intrusive_adapter!(pub(crate) ScopeWakerAdapter<S> = ScopeWakerNode<S> { link: Link } where S: Storage);
+intrusive_adapter!(pub(crate) ScopeWakerAdapter<S> = ScopeWakerNode<S> { link: Link } where S: ScopeStorage);
 
-impl<S: Storage> ScopeWakerNode<S> {
+impl<S: ScopeStorage> ScopeWakerNode<S> {
     fn new(waker: &Waker) -> Self {
         Self {
             waker: waker.clone(),
@@ -30,12 +30,12 @@ impl<S: Storage> ScopeWakerNode<S> {
     }
 }
 
-pub(crate) struct ScopeCompletionRegistration<'a, S: Storage, O: Ownership> {
+pub(crate) struct ScopeCompletionRegistration<'a, S: ScopeStorage, O: Ownership> {
     completion: &'a GenericScopeCompletion<S, O>,
     node: Pin<Box<ScopeWakerNode<S>>>,
 }
 
-impl<'a, S: Storage, O: Ownership> ScopeCompletionRegistration<'a, S, O> {
+impl<'a, S: ScopeStorage, O: Ownership> ScopeCompletionRegistration<'a, S, O> {
     pub(crate) fn new(completion: &'a GenericScopeCompletion<S, O>, waker: &Waker) -> Self {
         Self {
             completion,
@@ -48,7 +48,7 @@ impl<'a, S: Storage, O: Ownership> ScopeCompletionRegistration<'a, S, O> {
     }
 }
 
-impl<S: Storage, O: Ownership> Drop for ScopeCompletionRegistration<'_, S, O> {
+impl<S: ScopeStorage, O: Ownership> Drop for ScopeCompletionRegistration<'_, S, O> {
     fn drop(&mut self) {
         let node = unsafe { NonNull::from(self.node.as_mut().get_unchecked_mut()) };
         unsafe {
@@ -58,25 +58,24 @@ impl<S: Storage, O: Ownership> Drop for ScopeCompletionRegistration<'_, S, O> {
 }
 
 /// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
-pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
+pub struct GenericScopeCompletion<S: ScopeStorage, O: Ownership> {
     remaining: S::Usize,
     wakers: S::Lock<LinkedList<ScopeWakerAdapter<S>>>,
     cancel_token: GenericCancellationToken<S, O>,
     panic_info: S::OptionBox<dyn Any + Send + 'static>,
-    parent: Option<AnyScopeRef>,
+    parent: S::Parent,
 }
 
 pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
 pub type LocalScopeCompletion = GenericScopeCompletion<LocalStorage, RcOwnership>;
 
-impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
+impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
     pub fn new(parent: Option<AnyScopeRef>) -> O::Shared<Self> {
-        let cross_parent = if let Some(ref p) = parent
-            && (S::strategy_type() != StrategyType::Atomic
-                || O::strategy_type() != StrategyType::Atomic)
-            && let AnyScopeRef::Send(_) = p
+        let parent = S::Parent::from_any(parent);
+        let cross_parent = if S::strategy_type() != StrategyType::Atomic
+            || O::strategy_type() != StrategyType::Atomic
         {
-            Some(p.clone())
+            parent.as_send()
         } else {
             None
         };
@@ -113,9 +112,7 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
         if self.cancel_token.is_cancelled() {
             return true;
         }
-        if let Some(ref parent) = self.parent
-            && parent.is_cancelled()
-        {
+        if self.parent.is_cancelled() {
             return true;
         }
         false
@@ -187,12 +184,12 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
         self.panic_info.take(Ordering::AcqRel)
     }
 
-    pub fn parent(&self) -> &Option<crate::task::AnyScopeRef> {
-        &self.parent
+    pub fn parent(&self) -> Option<AnyScopeRef> {
+        self.parent.as_any()
     }
 }
 
-impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
+impl<S: ScopeStorage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     fn drop(&mut self) {
         {
             let mut wakers = self.wakers.lock();
@@ -207,7 +204,9 @@ impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     }
 }
 
-impl<S: Storage, O: Ownership + 'static> crate::task::RawScope for GenericScopeCompletion<S, O> {
+impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
+    for GenericScopeCompletion<S, O>
+{
     #[inline]
     fn task_done(&self) {
         self.task_done();
@@ -242,7 +241,7 @@ impl<S: Storage, O: Ownership + 'static> crate::task::RawScope for GenericScopeC
 
     #[inline]
     fn parent(&self) -> Option<AnyScopeRef> {
-        self.parent().clone()
+        self.parent()
     }
 
     #[inline]

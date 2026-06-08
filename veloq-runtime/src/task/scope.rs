@@ -1,7 +1,9 @@
 use crate::runtime::primitives::GenericCancellationToken;
 use crate::scope::GenericScopeCompletion;
 use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicStorage, LocalStorage, Storage, StrategyType};
+use crate::utils::storage::{
+    AtomicStorage, LocalStorage, Storage, StrategyType, ThreadSafeStorage,
+};
 use std::any::Any;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -29,7 +31,7 @@ impl OpaqueScope {
     /// 调用者必须确保 `ptr` 确实指向一个 `GenericScopeCompletion<S, O>` 实例，
     /// 且 `S` 和 `O` 与调用处的泛型参数匹配。通常通过 `ScopeVTable` 或 `StrategyType` 进行校验。
     #[inline]
-    pub unsafe fn as_concrete<'a, S: Storage, O: Ownership>(
+    pub unsafe fn as_concrete<'a, S: ScopeStorage, O: Ownership>(
         ptr: NonNull<Self>,
     ) -> &'a GenericScopeCompletion<S, O> {
         unsafe { &*(ptr.as_ptr() as *const GenericScopeCompletion<S, O>) }
@@ -88,6 +90,8 @@ pub trait RawScope {
 
 struct DummyScope<S: Storage>(PhantomData<S>);
 
+unsafe impl<S: Storage> Sync for DummyScope<S> {}
+
 impl<S: Storage> RawScope for DummyScope<S> {
     fn task_done(&self) {}
     fn cancel(&self) {}
@@ -125,8 +129,8 @@ impl<S: Storage> std::fmt::Debug for ScopeRef<S> {
     }
 }
 
-unsafe impl<S: Storage> Send for ScopeRef<S> {}
-unsafe impl<S: Storage> Sync for ScopeRef<S> {}
+unsafe impl<S: ThreadSafeStorage> Send for ScopeRef<S> {}
+unsafe impl<S: ThreadSafeStorage> Sync for ScopeRef<S> {}
 
 impl<S: Storage> ScopeRef<S> {
     /// 创建一个新的 `ScopeRef`。
@@ -158,9 +162,9 @@ impl<S: Storage> ScopeRef<S> {
         unsafe { self.inner.as_ref() }
     }
 
-    /// 安全地将 ScopeRef 从一种 Storage 模式转换为另一种 Storage 模式。
+    /// 在 crate 内将 ScopeRef 从一种 Storage 模式转换为另一种 Storage 模式。
     #[inline]
-    pub fn cast<T: Storage>(self) -> ScopeRef<T> {
+    pub(crate) fn cast<T: Storage>(self) -> ScopeRef<T> {
         let this = std::mem::ManuallyDrop::new(self);
         ScopeRef {
             inner: this.inner,
@@ -227,10 +231,10 @@ impl<S: Storage> ScopeRef<S> {
                 inner: this.inner,
                 _marker: PhantomData,
             }),
-            StrategyType::Atomic => AnyScopeRef::Send(ScopeRef {
+            StrategyType::Atomic => AnyScopeRef::Send(AnySendScopeRef(ScopeRef {
                 inner: this.inner,
                 _marker: PhantomData,
-            }),
+            })),
         }
     }
 }
@@ -253,11 +257,53 @@ impl<S: Storage> Drop for ScopeRef<S> {
 #[derive(Debug)]
 pub enum AnyScopeRef {
     Local(ScopeRef<LocalStorage>),
-    Send(ScopeRef<AtomicStorage>),
+    Send(AnySendScopeRef),
 }
 
-unsafe impl Send for AnyScopeRef {}
-unsafe impl Sync for AnyScopeRef {}
+#[derive(Debug)]
+pub struct AnySendScopeRef(ScopeRef<AtomicStorage>);
+
+unsafe impl Send for AnySendScopeRef {}
+unsafe impl Sync for AnySendScopeRef {}
+
+impl Clone for AnySendScopeRef {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl AnySendScopeRef {
+    #[inline]
+    pub fn new(scope: ScopeRef<AtomicStorage>) -> Self {
+        Self(scope)
+    }
+
+    #[inline]
+    pub fn as_scope_ref(&self) -> &ScopeRef<AtomicStorage> {
+        &self.0
+    }
+
+    #[inline]
+    pub fn into_any(self) -> AnyScopeRef {
+        AnyScopeRef::Send(self)
+    }
+
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    #[inline]
+    pub(crate) fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
+        unsafe { self.0.as_ref().try_link_child(child_token) }
+    }
+
+    #[inline]
+    pub fn register_cancel_waker(&self, waker: &Waker) {
+        unsafe { self.0.as_ref().register_cancel_waker(waker) }
+    }
+}
 
 impl Clone for AnyScopeRef {
     #[inline]
@@ -271,10 +317,26 @@ impl Clone for AnyScopeRef {
 
 impl AnyScopeRef {
     #[inline]
+    pub fn as_send(&self) -> Option<AnySendScopeRef> {
+        match self {
+            Self::Local(_) => None,
+            Self::Send(s) => Some(s.clone()),
+        }
+    }
+
+    #[inline]
+    pub fn into_send(self) -> Option<AnySendScopeRef> {
+        match self {
+            Self::Local(_) => None,
+            Self::Send(s) => Some(s),
+        }
+    }
+
+    #[inline]
     pub fn is_cancelled(&self) -> bool {
         match self {
             Self::Local(s) => unsafe { s.as_ref().is_cancelled() },
-            Self::Send(s) => unsafe { s.as_ref().is_cancelled() },
+            Self::Send(s) => s.is_cancelled(),
         }
     }
 
@@ -282,7 +344,7 @@ impl AnyScopeRef {
     pub(crate) fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
         match self {
             Self::Local(s) => unsafe { s.as_ref().try_link_child(child_token) },
-            Self::Send(s) => unsafe { s.as_ref().try_link_child(child_token) },
+            Self::Send(s) => s.try_link_child(child_token),
         }
     }
 
@@ -290,7 +352,82 @@ impl AnyScopeRef {
     pub fn register_cancel_waker(&self, waker: &Waker) {
         match self {
             Self::Local(s) => unsafe { s.as_ref().register_cancel_waker(waker) },
-            Self::Send(s) => unsafe { s.as_ref().register_cancel_waker(waker) },
+            Self::Send(s) => s.register_cancel_waker(waker),
         }
     }
+}
+
+pub trait ScopeParent: Clone + 'static {
+    fn from_any(parent: Option<AnyScopeRef>) -> Self;
+    fn as_any(&self) -> Option<AnyScopeRef>;
+    fn as_send(&self) -> Option<AnySendScopeRef>;
+    fn is_cancelled(&self) -> bool;
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalScopeParent(Option<AnyScopeRef>);
+
+impl ScopeParent for LocalScopeParent {
+    #[inline]
+    fn from_any(parent: Option<AnyScopeRef>) -> Self {
+        Self(parent)
+    }
+
+    #[inline]
+    fn as_any(&self) -> Option<AnyScopeRef> {
+        self.0.clone()
+    }
+
+    #[inline]
+    fn as_send(&self) -> Option<AnySendScopeRef> {
+        self.0.as_ref().and_then(AnyScopeRef::as_send)
+    }
+
+    #[inline]
+    fn is_cancelled(&self) -> bool {
+        self.0
+            .as_ref()
+            .map(AnyScopeRef::is_cancelled)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadSafeScopeParent(Option<AnySendScopeRef>);
+
+impl ScopeParent for ThreadSafeScopeParent {
+    #[inline]
+    fn from_any(parent: Option<AnyScopeRef>) -> Self {
+        Self(parent.and_then(AnyScopeRef::into_send))
+    }
+
+    #[inline]
+    fn as_any(&self) -> Option<AnyScopeRef> {
+        self.0.clone().map(AnySendScopeRef::into_any)
+    }
+
+    #[inline]
+    fn as_send(&self) -> Option<AnySendScopeRef> {
+        self.0.clone()
+    }
+
+    #[inline]
+    fn is_cancelled(&self) -> bool {
+        self.0
+            .as_ref()
+            .map(AnySendScopeRef::is_cancelled)
+            .unwrap_or(false)
+    }
+}
+
+pub trait ScopeStorage: Storage {
+    type Parent: ScopeParent;
+}
+
+impl ScopeStorage for LocalStorage {
+    type Parent = LocalScopeParent;
+}
+
+impl ScopeStorage for AtomicStorage {
+    type Parent = ThreadSafeScopeParent;
 }
