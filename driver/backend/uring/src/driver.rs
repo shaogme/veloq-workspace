@@ -27,7 +27,9 @@ mod registration;
 mod submission;
 
 pub use lifecycle::UringOpState;
-pub(crate) use registration::{MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats};
+pub(crate) use registration::{
+    MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,
+};
 
 use crate::op::slot::{UringOpRegistry, UringOpRegistryExt, UringSlotSpec};
 

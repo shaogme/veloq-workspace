@@ -1,4 +1,5 @@
-use crate::driver::UringDriver;
+use crate::config::{IoFd, RawHandleKind};
+use crate::driver::{RegisteredFileEntry, UringDriver, resolve_registered_fixed_fd};
 use crate::error::{UringDriverResult as DriverResult, UringError};
 use crate::op::{UringOp, UringOpPayload, UringUserPayload};
 use diagweave::prelude::*;
@@ -8,6 +9,51 @@ use veloq_buf::PoolKind;
 #[inline]
 fn payload_variant_mismatch(scope: &'static str) -> Report<UringError> {
     UringError::InvalidState.report(scope, "UringOpPayload variant mismatch")
+}
+
+#[inline]
+fn resolve_file_fd(
+    registered_files: &[Option<RegisteredFileEntry>],
+    file_generations: &[u64],
+    fd: IoFd,
+    scope: &'static str,
+) -> DriverResult<types::Fixed> {
+    resolve_registered_fixed_fd(
+        registered_files,
+        file_generations,
+        fd,
+        Some(RawHandleKind::File),
+        scope,
+    )
+    .map(types::Fixed)
+}
+
+#[inline]
+fn resolve_socket_fd(
+    registered_files: &[Option<RegisteredFileEntry>],
+    file_generations: &[u64],
+    fd: IoFd,
+    scope: &'static str,
+) -> DriverResult<types::Fixed> {
+    resolve_registered_fixed_fd(
+        registered_files,
+        file_generations,
+        fd,
+        Some(RawHandleKind::Socket),
+        scope,
+    )
+    .map(types::Fixed)
+}
+
+#[inline]
+fn resolve_any_fd(
+    registered_files: &[Option<RegisteredFileEntry>],
+    file_generations: &[u64],
+    fd: IoFd,
+    scope: &'static str,
+) -> DriverResult<types::Fixed> {
+    resolve_registered_fixed_fd(registered_files, file_generations, fd, None, scope)
+        .map(types::Fixed)
 }
 
 macro_rules! impl_lifecycle {
@@ -86,6 +132,13 @@ macro_rules! make_rw_fixed {
             let region_info = rw_op.buf.resolve_region_info();
             let ptr = unsafe { rw_op.buf.as_mut_ptr().add(rw_op.buf_offset) };
             let len = (rw_op.buf.capacity() - rw_op.buf_offset) as u32;
+            let offset = rw_op.offset;
+            let fixed_fd = resolve_file_fd(
+                &driver.registered_files,
+                &driver.file_generations,
+                rw_op.fd,
+                concat!("uring.op.submit.", stringify!($fn_name)),
+            )?;
 
             let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
                 driver
@@ -98,15 +151,11 @@ macro_rules! make_rw_fixed {
 
             if is_registered {
                 let fixed_idx = region_info.id;
-                let fd_idx = rw_op.fd.fixed_index();
-                Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
-                    .offset(rw_op.offset)
+                Ok($type_fixed(fixed_fd, ptr, len, fixed_idx)
+                    .offset(offset)
                     .build())
             } else {
-                let fd_idx = rw_op.fd.fixed_index();
-                Ok($type_raw(types::Fixed(fd_idx), ptr, len)
-                    .offset(rw_op.offset)
-                    .build())
+                Ok($type_raw(fixed_fd, ptr, len).offset(offset).build())
             }
         }
     };
@@ -134,6 +183,13 @@ macro_rules! make_rw_fixed {
             let region_info = rw_op.buf.resolve_region_info();
             let ptr = unsafe { rw_op.buf.as_slice().as_ptr().add(rw_op.buf_offset) };
             let len = (rw_op.buf.len() - rw_op.buf_offset) as u32;
+            let offset = rw_op.offset;
+            let fixed_fd = resolve_file_fd(
+                &driver.registered_files,
+                &driver.file_generations,
+                rw_op.fd,
+                concat!("uring.op.submit.", stringify!($fn_name)),
+            )?;
 
             let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
                 driver
@@ -146,15 +202,11 @@ macro_rules! make_rw_fixed {
 
             if is_registered {
                 let fixed_idx = region_info.id;
-                let fd_idx = rw_op.fd.fixed_index();
-                Ok($type_fixed(types::Fixed(fd_idx), ptr, len, fixed_idx)
-                    .offset(rw_op.offset)
+                Ok($type_fixed(fixed_fd, ptr, len, fixed_idx)
+                    .offset(offset)
                     .build())
             } else {
-                let fd_idx = rw_op.fd.fixed_index();
-                Ok($type_raw(types::Fixed(fd_idx), ptr, len)
-                    .offset(rw_op.offset)
-                    .build())
+                Ok($type_raw(fixed_fd, ptr, len).offset(offset).build())
             }
         }
     };
@@ -302,8 +354,13 @@ macro_rules! make_buf_op {
             };
             let ptr = unsafe { val.buf.as_mut_ptr().add(val.buf_offset) };
             let len = (val.buf.capacity() - val.buf_offset) as u32;
-            let idx = val.fd.fixed_index();
-            Ok($opcode(types::Fixed(idx), ptr, len).build())
+            let fixed_fd = resolve_socket_fd(
+                &driver.registered_files,
+                &driver.file_generations,
+                val.fd,
+                concat!("uring.op.submit.", stringify!($fn_name)),
+            )?;
+            Ok($opcode(fixed_fd, ptr, len).build())
         }
     };
     ($fn_name:ident, $OpType:ident, $opcode:path, send_args) => {
@@ -329,8 +386,13 @@ macro_rules! make_buf_op {
             };
             let ptr = unsafe { val.buf.as_slice().as_ptr().add(val.buf_offset) };
             let len = (val.buf.len() - val.buf_offset) as u32;
-            let idx = val.fd.fixed_index();
-            Ok($opcode(types::Fixed(idx), ptr, len).build())
+            let fixed_fd = resolve_socket_fd(
+                &driver.registered_files,
+                &driver.file_generations,
+                val.fd,
+                concat!("uring.op.submit.", stringify!($fn_name)),
+            )?;
+            Ok($opcode(fixed_fd, ptr, len).build())
         }
     };
 }
@@ -368,13 +430,13 @@ pub(crate) unsafe fn make_sqe_connect(
         crate::op::UringUserPayload::Connect(p) => p,
         _ => return Err(payload_variant_mismatch("uring.op.submit.make_sqe_connect")),
     };
-    let idx = val.fd.fixed_index();
-    Ok(opcode::Connect::new(
-        types::Fixed(idx),
-        &val.addr.0 as *const _ as *const _,
-        val.addr_len,
-    )
-    .build())
+    let fixed_fd = resolve_socket_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        val.fd,
+        "uring.op.submit.make_sqe_connect",
+    )?;
+    Ok(opcode::Connect::new(fixed_fd, &val.addr.0 as *const _ as *const _, val.addr_len).build())
 }
 impl_default_completion!(on_complete_connect);
 impl_lifecycle!(drop_connect, Connect, direct_fd);
@@ -400,13 +462,13 @@ pub(crate) unsafe fn make_sqe_udp_connect(
             ));
         }
     };
-    let idx = val.fd.fixed_index();
-    Ok(opcode::Connect::new(
-        types::Fixed(idx),
-        &val.addr.0 as *const _ as *const _,
-        val.addr_len,
-    )
-    .build())
+    let fixed_fd = resolve_socket_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        val.fd,
+        "uring.op.submit.make_sqe_udp_connect",
+    )?;
+    Ok(opcode::Connect::new(fixed_fd, &val.addr.0 as *const _ as *const _, val.addr_len).build())
 }
 impl_default_completion!(on_complete_udp_connect);
 impl_lifecycle!(drop_udp_connect, UdpConnect, direct_fd);
@@ -428,9 +490,14 @@ pub(crate) unsafe fn make_sqe_accept(
         crate::op::UringUserPayload::Accept(p) => p,
         _ => return Err(payload_variant_mismatch("uring.op.submit.make_sqe_accept")),
     };
-    let idx = val.fd.fixed_index();
+    let fixed_fd = resolve_socket_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        val.fd,
+        "uring.op.submit.make_sqe_accept",
+    )?;
     Ok(opcode::Accept::new(
-        types::Fixed(idx),
+        fixed_fd,
         &mut val.addr.0 as *mut _ as *mut _,
         &mut val.addr_len as *mut _,
     )
@@ -511,8 +578,13 @@ pub(crate) unsafe fn make_sqe_send_to(
     kernel.msghdr.msg_iov = kernel.iovec.as_mut_ptr();
     kernel.msghdr.msg_iovlen = 1;
 
-    let idx = user.fd.fixed_index();
-    Ok(opcode::SendMsg::new(types::Fixed(idx), &kernel.msghdr as *const _).build())
+    let fixed_fd = resolve_socket_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        user.fd,
+        "uring.op.submit.make_sqe_send_to",
+    )?;
+    Ok(opcode::SendMsg::new(fixed_fd, &kernel.msghdr as *const _).build())
 }
 
 impl_default_completion!(on_complete_send_to);
@@ -560,8 +632,13 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
     kernel.msghdr.msg_iov = kernel.iovec.as_mut_ptr();
     kernel.msghdr.msg_iovlen = 1;
 
-    let idx = fd.fixed_index();
-    Ok(opcode::RecvMsg::new(types::Fixed(idx), &mut kernel.msghdr as *mut _).build())
+    let fixed_fd = resolve_socket_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        fd,
+        "uring.op.submit.make_sqe_udp_recv_from",
+    )?;
+    Ok(opcode::RecvMsg::new(fixed_fd, &mut kernel.msghdr as *mut _).build())
 }
 
 pub(crate) unsafe fn on_complete_udp_recv_from(
@@ -621,8 +698,13 @@ pub(crate) unsafe fn make_sqe_close(
         crate::op::UringUserPayload::Close(p) => p,
         _ => return Err(payload_variant_mismatch("uring.op.submit.make_sqe_close")),
     };
-    let idx = close_op.fd.fixed_index();
-    Ok(opcode::Close::new(types::Fixed(idx)).build())
+    let fixed_fd = resolve_any_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        close_op.fd,
+        "uring.op.submit.make_sqe_close",
+    )?;
+    Ok(opcode::Close::new(fixed_fd).build())
 }
 
 impl_default_completion!(on_complete_close);
@@ -651,8 +733,13 @@ pub(crate) unsafe fn make_sqe_fsync(
         io_uring::types::FsyncFlags::empty()
     };
 
-    let idx = fsync_op.fd.fixed_index();
-    Ok(opcode::Fsync::new(types::Fixed(idx)).flags(flags).build())
+    let fixed_fd = resolve_file_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        fsync_op.fd,
+        "uring.op.submit.make_sqe_fsync",
+    )?;
+    Ok(opcode::Fsync::new(fixed_fd).flags(flags).build())
 }
 
 impl_default_completion!(on_complete_fsync);
@@ -725,8 +812,13 @@ pub(crate) unsafe fn make_sqe_sync_range(
         sync_op.nbytes as u32
     };
 
-    let idx = sync_op.fd.fixed_index();
-    Ok(opcode::SyncFileRange::new(types::Fixed(idx), nbytes)
+    let fixed_fd = resolve_file_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        sync_op.fd,
+        "uring.op.submit.make_sqe_sync_range",
+    )?;
+    Ok(opcode::SyncFileRange::new(fixed_fd, nbytes)
         .offset(sync_op.offset)
         .flags(sync_op.flags)
         .build())
@@ -799,8 +891,13 @@ pub(crate) unsafe fn make_sqe_fallocate(
             ));
         }
     };
-    let idx = fallocate_op.fd.fixed_index();
-    Ok(opcode::Fallocate::new(types::Fixed(idx), fallocate_op.len)
+    let fixed_fd = resolve_file_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        fallocate_op.fd,
+        "uring.op.submit.make_sqe_fallocate",
+    )?;
+    Ok(opcode::Fallocate::new(fixed_fd, fallocate_op.len)
         .offset(fallocate_op.offset)
         .mode(fallocate_op.mode)
         .build())
@@ -919,8 +1016,13 @@ pub(crate) unsafe fn make_sqe_wakeup(
         _ => return Err(payload_variant_mismatch("uring.op.submit.make_sqe_wakeup")),
     };
 
-    let idx = user.fd.fixed_index();
-    Ok(opcode::Read::new(types::Fixed(idx), kernel.buf.as_mut_ptr(), 8).build())
+    let fixed_fd = resolve_file_fd(
+        &driver.registered_files,
+        &driver.file_generations,
+        user.fd,
+        "uring.op.submit.make_sqe_wakeup",
+    )?;
+    Ok(opcode::Read::new(fixed_fd, kernel.buf.as_mut_ptr(), 8).build())
 }
 
 impl_default_completion!(on_complete_wakeup);

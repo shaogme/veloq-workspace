@@ -3,17 +3,94 @@ use crate::error::{UringError, UringResult};
 use diagweave::prelude::*;
 use std::time::{Duration, Instant};
 
-use crate::config::{IoFd, OwnedRawHandle, UringRawHandle};
+use crate::config::{IoFd, OwnedRawHandle, RawHandleKind, UringRawHandle};
 use veloq_driver_core::driver::RegisterFd;
 
 pub(crate) const MAX_CHUNKS: usize = 1024;
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
 const MIN_FILE_TABLE_CAPACITY: usize = 1;
+const INITIAL_FILE_GENERATION: u64 = 1;
 
 #[derive(Debug)]
 pub(crate) enum RegisteredFileEntry {
-    BorrowedFd(i32),
+    BorrowedFd { fd: i32, kind: RawHandleKind },
     OwnedHandle(OwnedRawHandle),
+}
+
+impl RegisteredFileEntry {
+    #[inline]
+    pub(crate) fn fd(&self) -> i32 {
+        match self {
+            Self::BorrowedFd { fd, .. } => *fd,
+            Self::OwnedHandle(handle) => handle.raw().as_fd(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn kind(&self) -> RawHandleKind {
+        match self {
+            Self::BorrowedFd { kind, .. } => *kind,
+            Self::OwnedHandle(handle) => handle.kind(),
+        }
+    }
+}
+
+pub(crate) fn resolve_registered_fixed_fd(
+    registered_files: &[Option<RegisteredFileEntry>],
+    file_generations: &[u64],
+    fd: IoFd,
+    expected_kind: Option<RawHandleKind>,
+    scope: &'static str,
+) -> UringResult<u32> {
+    let idx = fd.fixed_index();
+    let index = idx as usize;
+    let Some(slot) = registered_files.get(index) else {
+        return Err(UringError::ResolveFd
+            .to_report()
+            .push_ctx("scope", scope)
+            .with_ctx("fd_fixed_index", idx)
+            .with_ctx("fd_generation", fd.generation())
+            .attach_note("registered file descriptor index out of bounds"));
+    };
+
+    let current_generation = file_generations.get(index).copied();
+    if current_generation != Some(fd.generation()) {
+        let mut report = UringError::ResolveFd
+            .to_report()
+            .push_ctx("scope", scope)
+            .with_ctx("fd_fixed_index", idx)
+            .with_ctx("fd_generation", fd.generation())
+            .attach_note("stale registered file descriptor generation");
+        if let Some(current_generation) = current_generation {
+            report = report.with_ctx("current_generation", current_generation);
+        }
+        return Err(report);
+    }
+
+    let Some(entry) = slot.as_ref() else {
+        return Err(UringError::ResolveFd
+            .to_report()
+            .push_ctx("scope", scope)
+            .with_ctx("fd_fixed_index", idx)
+            .with_ctx("fd_generation", fd.generation())
+            .attach_note("invalid registered file descriptor"));
+    };
+
+    if let Some(expected_kind) = expected_kind {
+        let current_kind = entry.kind();
+        if current_kind != expected_kind {
+            return Err(UringError::ResolveFd
+                .to_report()
+                .push_ctx("scope", scope)
+                .with_ctx("fd_fixed_index", idx)
+                .with_ctx("fd_generation", fd.generation())
+                .with_ctx("expected_kind", format!("{expected_kind:?}"))
+                .with_ctx("current_kind", format!("{current_kind:?}"))
+                .attach_note("registered file descriptor kind mismatch"));
+        }
+    }
+
+    Ok(idx)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -26,6 +103,14 @@ pub(crate) struct UringRegistrationStats {
 }
 
 impl<'a> UringDriver<'a> {
+    #[inline]
+    fn advance_file_generation(generation: &mut u64) {
+        *generation = generation.wrapping_add(1);
+        if *generation == 0 {
+            *generation = INITIAL_FILE_GENERATION;
+        }
+    }
+
     pub(crate) fn register_chunk_internal(
         &mut self,
         id: u16,
@@ -112,7 +197,7 @@ impl<'a> UringDriver<'a> {
                 .register_files_update(idx, &[-1])
                 .map_err(|e| UringError::Registration.io_report("driver.unregister_fixed_fd", e))?;
             self.free_file_slots.push(idx);
-            self.file_generations[index] = self.file_generations[index].wrapping_add(1);
+            Self::advance_file_generation(&mut self.file_generations[index]);
         }
         Ok(())
     }
@@ -129,7 +214,7 @@ impl<'a> UringDriver<'a> {
         })?;
 
         self.registered_files = (0..capacity).map(|_| None).collect();
-        self.file_generations = vec![0; capacity];
+        self.file_generations = vec![INITIAL_FILE_GENERATION; capacity];
         self.free_file_slots = (0..capacity as u32).rev().collect();
         self.file_table_initialized = true;
         Ok(())
@@ -144,13 +229,13 @@ impl<'a> UringDriver<'a> {
         let mut fixed_fds = Vec::with_capacity(files.len());
         for file in files {
             let entry = match file {
-                RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd(b.raw().as_fd()),
+                RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd {
+                    fd: b.raw().as_fd(),
+                    kind: b.kind(),
+                },
                 RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
             };
-            let fd = match &entry {
-                RegisteredFileEntry::BorrowedFd(fd) => *fd,
-                RegisteredFileEntry::OwnedHandle(o) => o.raw().as_fd(),
-            };
+            let fd = entry.fd();
             let idx = self.free_file_slots.pop().ok_or_else(|| {
                 UringError::InvalidState.report(
                     "driver.register_files_internal",
