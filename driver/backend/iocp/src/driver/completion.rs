@@ -2,8 +2,8 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use diagweave::prelude::*;
-use tracing::debug;
-use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
+use tracing::{debug, error};
+use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, io_result_to_event_res, push_completion_shared};
 use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
@@ -15,6 +15,15 @@ pub(super) struct EmitContext<'a> {
     pub(super) completion_events: &'a veloq_driver_core::driver::SharedCompletionQueue,
     pub(super) completion_table:
         &'a veloq_driver_core::driver::SharedCompletionTable<IocpUserPayload, IocpError>,
+}
+
+enum CompletionRoute {
+    Waiting,
+    Orphaned,
+    Missing,
+    Empty,
+    Stale,
+    Corrupt,
 }
 
 impl<'a> IocpDriver<'a> {
@@ -87,39 +96,39 @@ impl<'a> IocpDriver<'a> {
     pub(super) fn process_completion(
         &mut self,
         user_data: usize,
+        completed_generation: u32,
         success: bool,
         error_code: Option<u32>,
         bytes_transferred: u32,
     ) {
         if !self.ops.contains(user_data) {
+            self.completion_diagnostics.inc_unknown_completion();
+            debug!(
+                user_data,
+                completed_generation, "IOCP completion for missing slot"
+            );
             return;
         }
 
-        let io_result = self.calculate_io_result(user_data, success, error_code, bytes_transferred);
-        match self.ops.slot_view(user_data) {
-            Some(SlotView::InFlightWaiting(_)) => {
-                let slot_generation;
-                {
-                    let slot = &self.ops.shared.slots[user_data];
-                    let op = &mut self.ops.local[user_data];
-                    slot_generation = slot.generation(Ordering::Acquire);
-
-                    if op.entry.platform_data.generation != slot_generation {
-                        debug!(user_data, "Ignoring stale completion");
-                        return;
-                    }
-                }
-
+        match self.completion_route(user_data, completed_generation) {
+            CompletionRoute::Waiting => {
+                let io_result =
+                    self.calculate_io_result(user_data, success, error_code, bytes_transferred);
                 self.release_socket_inflight_for_op(user_data);
                 let ctx = EmitContext {
                     completion_events: self.completion.events(),
                     completion_table: self.completion.table(),
                 };
-                Self::emit_event_inner(ctx, &mut self.ops, user_data, slot_generation, io_result);
+                Self::emit_event_inner(
+                    ctx,
+                    &mut self.ops,
+                    user_data,
+                    completed_generation,
+                    io_result,
+                );
+                self.completion_diagnostics.inc_user_completed();
             }
-            Some(SlotView::InFlightOrphaned(_)) => {
-                let slot_generation =
-                    self.ops.shared.slots[user_data].generation(Ordering::Acquire);
+            CompletionRoute::Orphaned => {
                 self.release_socket_inflight_for_op(user_data);
                 let Some(SlotView::InFlightOrphaned(slot)) = self.ops.slot_view(user_data) else {
                     return;
@@ -127,11 +136,47 @@ impl<'a> IocpDriver<'a> {
                 let mut completed = slot.complete();
                 let _ = completed.take_op();
                 let _ = completed.take_completion_data();
-                self.ops.recycle(user_data, slot_generation.wrapping_add(1));
+                self.ops
+                    .recycle(user_data, completed_generation.wrapping_add(1));
+                self.completion_diagnostics.inc_user_orphan_completed();
             }
-            _ => {
-                debug!(user_data, "Ignoring completion for non in-flight slot");
+            CompletionRoute::Missing | CompletionRoute::Empty => {
+                self.completion_diagnostics.inc_unknown_completion();
+                debug!(
+                    user_data,
+                    completed_generation, "ignoring completion for non-active slot"
+                );
             }
+            CompletionRoute::Stale => {
+                self.completion_diagnostics.inc_stale_completion();
+                debug!(
+                    user_data,
+                    completed_generation, "ignoring stale IOCP completion"
+                );
+            }
+            CompletionRoute::Corrupt => {
+                self.completion_diagnostics.inc_slot_corruption();
+                error!(
+                    user_data,
+                    completed_generation, "IOCP completion found corrupt slot; recycling"
+                );
+                self.release_socket_inflight_for_op(user_data);
+                self.ops
+                    .recycle_if_active(user_data, completed_generation.wrapping_add(1));
+            }
+        }
+    }
+
+    fn completion_route(&mut self, user_data: usize, generation: u32) -> CompletionRoute {
+        match self.ops.checked_slot_view(user_data, generation) {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(_)) => CompletionRoute::Waiting,
+            CheckedSlotView::Valid(SlotView::InFlightOrphaned(_)) => CompletionRoute::Orphaned,
+            CheckedSlotView::Valid(SlotView::Reserved(_)) | CheckedSlotView::Corrupt(_) => {
+                CompletionRoute::Corrupt
+            }
+            CheckedSlotView::Missing { .. } => CompletionRoute::Missing,
+            CheckedSlotView::Empty(_) => CompletionRoute::Empty,
+            CheckedSlotView::Stale(_) => CompletionRoute::Stale,
         }
     }
 

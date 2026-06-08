@@ -61,6 +61,11 @@ impl SubmittedOpSlot {
     pub fn token(self) -> u64 {
         encode_completion_token(self.user_data, self.generation)
     }
+
+    #[inline]
+    pub fn completion_token(self) -> CompletionToken {
+        CompletionToken::user(self.user_data, self.generation)
+    }
 }
 
 pub struct ReservedOpSlot<'a, D: Driver + ?Sized> {
@@ -94,6 +99,11 @@ impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
     #[inline]
     pub fn token(&self) -> u64 {
         encode_completion_token(self.user_data, self.generation)
+    }
+
+    #[inline]
+    pub fn completion_token(&self) -> CompletionToken {
+        CompletionToken::user(self.user_data, self.generation)
     }
 
     #[inline]
@@ -207,7 +217,7 @@ pub trait Driver {
         self.completion_table().register_waker(token, waker);
     }
 
-    fn cancel_op(&mut self, user_data: usize);
+    fn cancel_op(&mut self, request: CancelRequest);
 
     fn register_chunk(
         &mut self,
@@ -315,8 +325,8 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 
     #[inline]
-    fn cancel_op(&mut self, user_data: usize) {
-        self.provider.with_driver_mut(|d| d.cancel_op(user_data))
+    fn cancel_op(&mut self, request: CancelRequest) {
+        self.provider.with_driver_mut(|d| d.cancel_op(request))
     }
 
     #[inline]
@@ -367,7 +377,9 @@ pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
             if cancel_table.cancel_generation(user_data) == generation as u64
                 && is_runnable_state(state)
             {
-                driver.cancel_op(user_data);
+                driver.cancel_op(CancelRequest::abandon(CompletionToken::user(
+                    user_data, generation,
+                )));
             }
         }
     }

@@ -4,9 +4,10 @@ use std::time::{Duration, Instant};
 
 use crossbeam_queue::SegQueue;
 use diagweave::prelude::*;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use veloq_driver_core::driver::{
-    RemoteWaker, SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
+    CompletionControlKind, CompletionToken, CompletionTokenClass, RemoteWaker,
+    SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
 };
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
@@ -16,6 +17,12 @@ use crate::error::{IocpError, IocpResult};
 use crate::op::IocpUserPayload;
 
 use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY};
+
+enum IocpCompletionKind {
+    Waker,
+    User { index: usize, generation: u32 },
+    Unknown { token: CompletionToken },
+}
 
 #[derive(Default)]
 pub(super) struct CompletionProgress {
@@ -220,27 +227,51 @@ impl<'a> IocpDriver<'a> {
             });
         }
 
-        let user_data = self.resolve_user_data(overlapped, success, key, error_code)?;
-        if user_data == WAKEUP_USER_DATA {
-            self.completion.clear_notification();
-            return Ok(CompletionProgress::default());
+        match self.resolve_completion_kind(overlapped, success, key, error_code)? {
+            IocpCompletionKind::Waker => {
+                self.handle_waker_completion(success, error_code);
+                Ok(CompletionProgress::default())
+            }
+            IocpCompletionKind::User { index, generation } => {
+                self.process_completion(index, generation, success, error_code, bytes);
+                Ok(CompletionProgress { iocp: 1, rio: 0 })
+            }
+            IocpCompletionKind::Unknown { token } => {
+                self.completion_diagnostics.inc_unknown_completion();
+                debug!(
+                    token = token.raw(),
+                    key,
+                    success,
+                    ?error_code,
+                    "unknown IOCP completion token"
+                );
+                Ok(CompletionProgress::default())
+            }
         }
-
-        self.process_completion(user_data, success, error_code, bytes);
-        Ok(CompletionProgress { iocp: 1, rio: 0 })
     }
 
-    fn resolve_user_data(
+    fn handle_waker_completion(&mut self, success: bool, error_code: Option<u32>) {
+        if success {
+            self.completion_diagnostics.inc_waker_ok();
+            self.completion.clear_notification();
+        } else {
+            self.completion_diagnostics.inc_waker_error();
+            warn!(?error_code, "IOCP waker completion reported an error");
+            self.completion.clear_notification();
+        }
+    }
+
+    fn resolve_completion_kind(
         &self,
         overlapped: *mut crate::win32::Overlapped,
         success: bool,
         completion_key: usize,
         error_code: Option<u32>,
-    ) -> IocpResult<usize> {
+    ) -> IocpResult<IocpCompletionKind> {
         if !overlapped.is_null() {
             // SAFETY: overlapped is non-null and corresponds to a valid OverlappedEntry.
-            let id = unsafe { crate::win32::OverlappedId::from_ptr(overlapped) };
-            let idx = id.as_usize();
+            let entry = unsafe { &*(overlapped as *const crate::op::OverlappedEntry) };
+            let idx = entry.user_data;
             if idx >= self.ops.local.len() {
                 error!(
                     idx,
@@ -253,30 +284,50 @@ impl<'a> IocpDriver<'a> {
                     .with_ctx("slot_count", self.ops.local.len())
                     .attach_note("completed index out of bounds");
             }
-            Ok(idx)
-        } else {
-            if !success {
-                let err = error_code.unwrap_or(0);
-                if err == WAIT_TIMEOUT {
-                    return Ok(WAKEUP_USER_DATA);
-                }
-                if completion_key == 0 {
-                    return Err(iocp_msg(
-                        IocpErrorContext::CompletionWait,
-                        "GetQueuedCompletionStatus failed with null overlapped",
-                    )
-                    .with_ctx("os_error_code", err)
-                    .with_ctx("completion_key", completion_key)
-                    .with_ctx("overlapped_is_null", true));
-                }
+            return Ok(IocpCompletionKind::User {
+                index: idx,
+                generation: entry.generation,
+            });
+        }
+
+        if completion_key == WAKEUP_USER_DATA {
+            return Ok(IocpCompletionKind::Waker);
+        }
+
+        if !success {
+            let err = error_code.unwrap_or(0);
+            if err == WAIT_TIMEOUT {
+                return Ok(IocpCompletionKind::Waker);
             }
-            debug!(
-                completion_key,
-                success,
-                ?error_code,
-                "resolved completion from key"
-            );
-            Ok(completion_key)
+            if completion_key == 0 {
+                return Err(iocp_msg(
+                    IocpErrorContext::CompletionWait,
+                    "GetQueuedCompletionStatus failed with null overlapped",
+                )
+                .with_ctx("os_error_code", err)
+                .with_ctx("completion_key", completion_key)
+                .with_ctx("overlapped_is_null", true));
+            }
+        }
+        debug!(
+            completion_key,
+            success,
+            ?error_code,
+            "resolved null-overlapped completion from key"
+        );
+
+        let token = CompletionToken::from_raw(completion_key as u64);
+        match token.classify() {
+            CompletionTokenClass::User { index, generation } => {
+                Ok(IocpCompletionKind::User { index, generation })
+            }
+            CompletionTokenClass::Control {
+                kind: CompletionControlKind::Waker,
+                ..
+            } => Ok(IocpCompletionKind::Waker),
+            CompletionTokenClass::Control { .. } | CompletionTokenClass::UnknownControl { .. } => {
+                Ok(IocpCompletionKind::Unknown { token })
+            }
         }
     }
 }

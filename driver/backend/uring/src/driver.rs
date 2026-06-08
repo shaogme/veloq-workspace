@@ -16,7 +16,8 @@ use crate::op::{UringOp, UringUserPayload};
 use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
-    DriveMode, DriveOutcome, Driver, DriverSubmitResult, RegisterFd, RemoteWaker,
+    CancelMode, CancelRequest, CompletionToken, DriveMode, DriveOutcome, Driver,
+    DriverCompletionDiagnostics, DriverSubmitResult, RegisterFd, RemoteWaker,
     SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
@@ -36,6 +37,27 @@ use crate::op::slot::{UringOpRegistry, UringOpRegistryExt, UringSlotSpec};
 type DriverResult<T> = CoreDriverResult<T, UringError>;
 pub(crate) struct EventFd {
     pub(crate) fd: OwnedRawHandle,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingCancel {
+    pub(crate) token: CompletionToken,
+    pub(crate) mode: CancelMode,
+}
+
+impl PendingCancel {
+    #[inline]
+    pub(crate) const fn new(request: CancelRequest) -> Self {
+        Self {
+            token: request.token,
+            mode: request.mode,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn user_parts(self) -> Option<(usize, u32)> {
+        self.token.user_parts()
+    }
 }
 
 pub(crate) struct UringWaker {
@@ -71,7 +93,10 @@ pub struct UringDriver<'a> {
     pub(crate) ring: IoUring,
     pub(crate) ops: UringOpRegistry,
     pub(crate) backlog: VecDeque<usize>,
-    pub(crate) pending_cancellations: VecDeque<usize>,
+    pub(crate) pending_cancellations: VecDeque<PendingCancel>,
+    pub(crate) pending_cancel_cqes: HashMap<u16, PendingCancel>,
+    pub(crate) next_cancel_id: u16,
+    pub(crate) completion_diagnostics: DriverCompletionDiagnostics,
     pub(crate) completion_events: SharedCompletionQueue,
     pub(crate) completion_table: SharedCompletionTable<UringUserPayload, UringError>,
     pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
@@ -144,6 +169,9 @@ impl<'a> UringDriver<'a> {
             ops,
             backlog: VecDeque::new(),
             pending_cancellations: VecDeque::new(),
+            pending_cancel_cqes: HashMap::new(),
+            next_cancel_id: 1,
+            completion_diagnostics: DriverCompletionDiagnostics::default(),
             completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
             completion_table,
             detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
@@ -345,8 +373,8 @@ impl<'a> Driver for UringDriver<'a> {
         self.completion_table.clone()
     }
 
-    fn cancel_op(&mut self, user_data: usize) {
-        self.cancel_op_internal(user_data);
+    fn cancel_op(&mut self, request: CancelRequest) {
+        self.cancel_op_internal(request);
     }
 
     fn register_chunk(

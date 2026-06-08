@@ -9,7 +9,7 @@ pub(crate) type BlockingSuccessCleanup = fn(usize);
 
 pub(crate) struct BlockingCompletion {
     port: Arc<IoCompletionPort>,
-    user_data: usize,
+    completion_key: usize,
     result: Mutex<Option<IocpResult<usize>>>,
     cleanup_success: Option<BlockingSuccessCleanup>,
 }
@@ -17,12 +17,12 @@ pub(crate) struct BlockingCompletion {
 impl BlockingCompletion {
     pub(crate) fn new(
         port: Arc<IoCompletionPort>,
-        user_data: usize,
+        completion_key: usize,
         cleanup_success: Option<BlockingSuccessCleanup>,
     ) -> Arc<Self> {
         Arc::new(Self {
             port,
-            user_data,
+            completion_key,
             result: Mutex::new(None),
             cleanup_success,
         })
@@ -37,9 +37,9 @@ impl BlockingCompletion {
 
     pub(crate) fn complete(&self, result: io::Result<usize>) {
         self.store_result(result);
-        if let Err(report) = self.port.notify(self.user_data) {
+        if let Err(report) = self.port.notify(self.completion_key) {
             tracing::error!(
-                user_data = self.user_data,
+                completion_key = self.completion_key,
                 report = ?report,
                 "failed to post blocking completion"
             );

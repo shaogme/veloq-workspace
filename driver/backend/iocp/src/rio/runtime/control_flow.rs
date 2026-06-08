@@ -16,6 +16,7 @@ use crate::rio::{
 };
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
+use tracing::debug;
 use veloq_driver_core::driver::{
     CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
@@ -158,6 +159,12 @@ impl<'a> RioCompletionRouter<'a> {
                 }
                 Some(SlotView::InFlightOrphaned(mut slot)) => {
                     if slot.platform_mut().generation != generation {
+                        debug!(
+                            user_data,
+                            generation,
+                            actual_generation = slot.platform().generation,
+                            "ignoring stale orphaned RIO completion"
+                        );
                     } else {
                         let mut guard = slot.complete();
                         let _ = guard.take_op();
@@ -166,8 +173,22 @@ impl<'a> RioCompletionRouter<'a> {
                         self.comp.ops.recycle(user_data, generation.wrapping_add(1));
                     }
                 }
-                _ => {}
+                other => {
+                    debug!(
+                        user_data,
+                        generation,
+                        slot_state = ?other.as_ref().map(|_| "non-waiting"),
+                        "RIO completion for non-active slot"
+                    );
+                }
             }
+        } else {
+            debug!(
+                user_data,
+                generation,
+                slots = ops.local.len(),
+                "RIO completion for missing slot"
+            );
         }
 
         self.registry.free_addr_slot(addr_slot);
@@ -182,6 +203,12 @@ impl<'a> RioCompletionRouter<'a> {
 
     fn handle_one(&mut self, res: &RIORESULT) -> RioResult<()> {
         let Some(kind) = RioState::decode_req_ctx(res.RequestContext) else {
+            debug!(
+                request_context = res.RequestContext,
+                status = res.Status,
+                bytes = res.BytesTransferred,
+                "ignoring unknown RIO request context"
+            );
             return Ok(());
         };
         match kind {

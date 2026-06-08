@@ -286,6 +286,12 @@ unsafe impl Sync for SafeSocket {}
 /// A safe wrapper for an I/O Completion Port.
 pub struct IoCompletionPort(OwnedHandle);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelRequestResult {
+    Submitted,
+    NotFound,
+}
+
 impl IoCompletionPort {
     /// Creates a new, unconnected I/O Completion Port.
     pub fn new(threads: u32) -> IocpResult<Self> {
@@ -358,18 +364,21 @@ impl IoCompletionPort {
     /// # Safety
     ///
     /// The caller must ensure that `handle` and `overlapped` are valid.
-    pub unsafe fn cancel_request(handle: HANDLE, overlapped: *mut Overlapped) -> IocpResult<()> {
+    pub unsafe fn cancel_request(
+        handle: HANDLE,
+        overlapped: *mut Overlapped,
+    ) -> IocpResult<CancelRequestResult> {
         // SAFETY: The caller ensures `handle` and `overlapped` are valid.
         let res = unsafe { CancelIoEx(handle, overlapped as *mut OVERLAPPED) };
         if res == 0 {
             // SAFETY: GetLastError is safe to call after a failed Win32 API call.
             let err = unsafe { GetLastError() };
             if err == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
-                return Ok(());
+                return Ok(CancelRequestResult::NotFound);
             }
             return Err(IocpError::Win32.io_report("CancelIoEx", from_raw_os_error(err as i32)));
         }
-        Ok(())
+        Ok(CancelRequestResult::Submitted)
     }
 
     /// Retrieves a completion status from the port.
@@ -434,32 +443,4 @@ pub enum CompletionStatus {
         error_code: Option<u32>,
     },
     Timeout,
-}
-
-// ============================================================================
-// OverlappedId
-// ============================================================================
-
-/// A handle to an overlapped operation, represented as a slot index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OverlappedId(pub usize);
-
-impl OverlappedId {
-    /// Recovers the OverlappedId from a raw pointer to an Overlapped structure.
-    ///
-    /// # Safety
-    ///
-    /// The pointer must be a valid pointer to an Overlapped structure that is
-    /// embedded at the start of an OverlappedEntry.
-    pub unsafe fn from_ptr(ptr: *const Overlapped) -> Self {
-        use crate::op::OverlappedEntry;
-        // SAFETY: The `inner` field is at the start of `OverlappedEntry` due to `#[repr(C)]`.
-        let user_data = unsafe { (*(ptr as *const OverlappedEntry)).user_data };
-        Self(user_data)
-    }
-
-    /// Returns the raw index.
-    pub fn as_usize(&self) -> usize {
-        self.0
-    }
 }

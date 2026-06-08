@@ -34,6 +34,8 @@ pub(crate) type OnCompleteFn = unsafe fn(
     payload: &mut UringUserPayload,
     result: i32,
 ) -> DriverResult<usize>;
+pub(crate) type OrphanCleanupFn =
+    unsafe fn(op: &mut UringKernelOp, payload: &mut UringUserPayload, result: i32);
 pub(crate) type DropFn = unsafe fn(op: &mut UringKernelOp);
 pub(crate) type GetTimeoutFn =
     unsafe fn(op: &UringKernelOp, payload: &UringUserPayload) -> Option<Duration>;
@@ -56,6 +58,7 @@ pub(crate) enum SubmissionStrategy {
 pub(crate) struct OpVTable {
     pub(crate) make_sqe: MakeSqeFn,
     pub(crate) on_complete: OnCompleteFn,
+    pub(crate) orphan_cleanup: OrphanCleanupFn,
     pub(crate) drop: DropFn,
     pub(crate) strategy: SubmissionStrategy,
     pub(crate) get_timeout: GetTimeoutFn,
@@ -98,6 +101,7 @@ macro_rules! define_uring_ops {
                 kind: $kind:expr,
                 make_sqe: $make_sqe:path,
                 $(on_complete: $complete:path,)?
+                $(orphan_cleanup: $orphan_cleanup:path,)?
                 $(completion: $completion:ty,)?
                 $(map_completion: $map_completion:expr,)?
                 drop: $drop:path,
@@ -129,6 +133,7 @@ macro_rules! define_uring_ops {
                     static TABLE: OpVTable = OpVTable {
                         make_sqe: $make_sqe,
                         on_complete: define_uring_ops!(@on_complete $($complete)?),
+                        orphan_cleanup: define_uring_ops!(@orphan_cleanup $($orphan_cleanup)?),
                         drop: $drop,
                         strategy: define_uring_ops!(@strategy $($strategy)?),
                         get_timeout: define_uring_ops!(@get_timeout $($get_timeout)?),
@@ -187,6 +192,9 @@ macro_rules! define_uring_ops {
 
     (@on_complete ) => { crate::op::submit::on_complete_default };
     (@on_complete $func:path) => { $func };
+
+    (@orphan_cleanup ) => { crate::op::submit::orphan_cleanup_noop };
+    (@orphan_cleanup $func:path) => { $func };
 
     (@completion_type ) => { usize };
     (@completion_type $ty:ty) => { $ty };
@@ -330,6 +338,7 @@ define_uring_ops! {
         kind: OpKind::Accept,
         make_sqe: submit::make_sqe_accept,
         on_complete: submit::on_complete_accept,
+        orphan_cleanup: submit::orphan_cleanup_close_raw_fd,
         completion: OwnedRawHandle,
         map_completion: |_op: &Accept, res: DriverResult<usize>| {
             res.map(|raw| unsafe {
@@ -382,6 +391,7 @@ define_uring_ops! {
         payload: payload::OpenPayload,
         kind: OpKind::Open,
         make_sqe: submit::make_sqe_open,
+        orphan_cleanup: submit::orphan_cleanup_close_raw_fd,
         completion: OwnedRawHandle,
         map_completion: |_op: &Open, res: DriverResult<usize>| {
             res.map(|raw| unsafe {

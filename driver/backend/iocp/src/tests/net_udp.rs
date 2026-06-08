@@ -220,7 +220,9 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
     };
     let (ud, generation) = submit_test_op(&mut driver, recv_op);
 
-    driver.cancel_op(ud);
+    driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
+        veloq_driver_core::driver::CompletionToken::user(ud, generation),
+    ));
     let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client bind failed");
     client
         .send_to(b"cancel-drain", server_addr)

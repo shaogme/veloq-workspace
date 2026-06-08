@@ -16,9 +16,9 @@ use tracing::trace;
 use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::OpEntry;
 use veloq_driver_core::driver::{
-    CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver,
-    DriverSubmitResult, RegisterFd, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
-    SharedDriverSlotTable, SubmitStatus,
+    CancelRequest, CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver,
+    DriverCompletionDiagnostics, DriverSubmitResult, RegisterFd, RemoteWaker,
+    SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
 
@@ -44,6 +44,7 @@ pub struct IocpDriver<'a> {
     timer: polling::TimerEngine,
     handles: registration::HandleRegistry,
     detached_cancel_table: Arc<DetachedCancelTable>,
+    completion_diagnostics: DriverCompletionDiagnostics,
 
     // RIO Support (required)
     rio: lifecycle::IocpRioRuntime<'a>,
@@ -255,8 +256,8 @@ impl<'a> Driver for IocpDriver<'a> {
         self.completion.completion_table()
     }
 
-    fn cancel_op(&mut self, user_data: usize) {
-        self.cancel_op_internal(user_data);
+    fn cancel_op(&mut self, request: CancelRequest) {
+        self.cancel_op_internal(request);
     }
 
     fn register_chunk(

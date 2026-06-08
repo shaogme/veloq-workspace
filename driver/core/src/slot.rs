@@ -185,11 +185,7 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightWaiting, Spec> {
         platform: &'a mut SlotPlatformData<Spec>,
         index: usize,
     ) -> Option<Self> {
-        if entry.state(Ordering::Acquire) == SlotState::InFlightWaiting {
-            assert!(
-                op.is_some(),
-                "slot {index} in InFlight state must contain an op"
-            );
+        if entry.state(Ordering::Acquire) == SlotState::InFlightWaiting && op.is_some() {
             Some(Self::new_internal(entry, op, storage, platform, index))
         } else {
             None
@@ -285,11 +281,7 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightOrphaned, Spec> {
         platform: &'a mut SlotPlatformData<Spec>,
         index: usize,
     ) -> Option<Self> {
-        if entry.state(Ordering::Acquire) == SlotState::InFlightOrphaned {
-            assert!(
-                op.is_some(),
-                "slot {index} in Cancelled state must contain an op"
-            );
+        if entry.state(Ordering::Acquire) == SlotState::InFlightOrphaned && op.is_some() {
             Some(Self::new_internal(entry, op, storage, platform, index))
         } else {
             None
@@ -339,8 +331,33 @@ pub enum SlotView<'a, Spec: SlotSpec> {
     InFlightOrphaned(Slot<'a, InFlightOrphaned, Spec>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotSnapshot {
+    pub index: usize,
+    pub generation: u32,
+    pub state: SlotState,
+    pub has_op: bool,
+    pub has_payload: bool,
+}
+
+pub enum CheckedSlotView<'a, Spec: SlotSpec> {
+    Valid(SlotView<'a, Spec>),
+    Missing {
+        index: usize,
+        expected_generation: u32,
+    },
+    Empty(SlotSnapshot),
+    Stale(SlotSnapshot),
+    Corrupt(SlotSnapshot),
+}
+
 pub trait SlotRegistryExt<Spec: SlotSpec> {
     fn slot_view(&mut self, index: usize) -> Option<SlotView<'_, Spec>>;
+    fn checked_slot_view(
+        &mut self,
+        index: usize,
+        expected_generation: u32,
+    ) -> CheckedSlotView<'_, Spec>;
     fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Spec>;
 }
 
@@ -377,6 +394,89 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
             | SlotState::InFlightReady
             | SlotState::Finalizing
             | SlotState::ReservedValue => None,
+        }
+    }
+
+    #[inline]
+    fn checked_slot_view(
+        &mut self,
+        index: usize,
+        expected_generation: u32,
+    ) -> CheckedSlotView<'_, Spec> {
+        let Some((entry, op_entry, op, storage)) =
+            self.get_slot_entry_op_storage_and_entry_mut(index)
+        else {
+            return CheckedSlotView::Missing {
+                index,
+                expected_generation,
+            };
+        };
+        let generation = entry.generation(Ordering::Acquire);
+        let state = entry.state(Ordering::Acquire);
+        let snapshot = SlotSnapshot {
+            index,
+            generation,
+            state,
+            has_op: op.is_some(),
+            has_payload: storage.payload.is_some(),
+        };
+
+        if generation != expected_generation {
+            return CheckedSlotView::Stale(snapshot);
+        }
+
+        match state {
+            SlotState::InFlightWaiting | SlotState::InFlightOrphaned => {
+                if !snapshot.has_op || !snapshot.has_payload {
+                    return CheckedSlotView::Corrupt(snapshot);
+                }
+            }
+            SlotState::Idle
+            | SlotState::InFlightReady
+            | SlotState::Finalizing
+            | SlotState::ReservedValue => return CheckedSlotView::Empty(snapshot),
+            SlotState::Reserved => {
+                if !snapshot.has_payload {
+                    return CheckedSlotView::Corrupt(snapshot);
+                }
+            }
+        }
+
+        match state {
+            SlotState::Reserved => Slot::<Reserved, Spec>::try_bind(
+                entry,
+                op,
+                storage,
+                &mut op_entry.platform_data,
+                index,
+            )
+            .map_or(CheckedSlotView::Corrupt(snapshot), |slot| {
+                CheckedSlotView::Valid(SlotView::Reserved(slot))
+            }),
+            SlotState::InFlightWaiting => Slot::<InFlightWaiting, Spec>::try_bind(
+                entry,
+                op,
+                storage,
+                &mut op_entry.platform_data,
+                index,
+            )
+            .map_or(CheckedSlotView::Corrupt(snapshot), |slot| {
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(slot))
+            }),
+            SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Spec>::try_bind(
+                entry,
+                op,
+                storage,
+                &mut op_entry.platform_data,
+                index,
+            )
+            .map_or(CheckedSlotView::Corrupt(snapshot), |slot| {
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot))
+            }),
+            SlotState::Idle
+            | SlotState::InFlightReady
+            | SlotState::Finalizing
+            | SlotState::ReservedValue => CheckedSlotView::Empty(snapshot),
         }
     }
 
@@ -438,6 +538,9 @@ mod tests {
             crate::driver::PollRecordResult::Ready(record) => record,
             crate::driver::PollRecordResult::Pending => panic!("completion should be ready"),
             crate::driver::PollRecordResult::Stale => panic!("completion should not be stale"),
+            crate::driver::PollRecordResult::Lost(anomaly) => {
+                panic!("completion should not be lost: {anomaly:?}")
+            }
         };
         assert_eq!(record.event.user_data, token);
         assert_eq!(record.payload, Some(()));

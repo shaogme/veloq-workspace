@@ -1,4 +1,5 @@
 use diagweave::prelude::*;
+use std::sync::atomic::Ordering;
 use std::task::Poll;
 use tracing::{debug, trace};
 
@@ -10,10 +11,8 @@ use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
 use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 
 use veloq_driver_core::driver::registry::{AllocResult, OpHandle};
-use veloq_driver_core::driver::{Driver, DriverSubmitResult, SubmitStatus};
+use veloq_driver_core::driver::{CompletionToken, Driver, DriverSubmitResult, SubmitStatus};
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
-
-pub(crate) const CANCEL_USER_DATA: u64 = u64::MAX - 1;
 
 impl<'a> UringDriver<'a> {
     pub(crate) unsafe fn submit_from_slot_raw(
@@ -60,10 +59,16 @@ impl<'a> UringDriver<'a> {
                         .expect("slot in InFlight state must contain an op");
                     let vtable = op.vtable;
                     let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
+                    let token = if Some(user_data) == driver.waker_token {
+                        CompletionToken::waker(0)
+                    } else {
+                        let generation = slot.entry.generation(Ordering::Acquire);
+                        CompletionToken::user(user_data, generation)
+                    };
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr, user_data)
                             .attach_note("driver.submit_from_slot_raw.make_sqe")?
-                            .user_data(user_data as u64)
+                            .user_data(token.raw())
                     };
                     (count, sqe)
                 };

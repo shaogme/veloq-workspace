@@ -1,20 +1,50 @@
 use std::sync::atomic::Ordering;
 
-use tracing::debug;
+use tracing::{debug, warn};
+use veloq_driver_core::driver::CancelRequest;
 use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::driver::completion::EmitContext;
 use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
+use crate::error::IocpResult;
 use crate::op::submit;
+use crate::win32::CancelRequestResult;
 
 struct CancelContext<'a> {
     registered_slots: &'a [crate::config::RegisteredSlot],
 }
 
+enum CancelPerformStatus {
+    Submitted,
+    NotFound,
+    RioRequested,
+    NoHandle,
+    NonActive,
+}
+
 impl<'a> IocpDriver<'a> {
-    pub(super) fn cancel_op_internal(&mut self, user_data: usize) {
+    pub(super) fn cancel_op_internal(&mut self, request: CancelRequest) {
+        let Some((user_data, generation)) = request.token.user_parts() else {
+            self.completion_diagnostics.inc_unknown_completion();
+            debug!(
+                token = request.token.raw(),
+                "IOCP cancel request token is not user op"
+            );
+            return;
+        };
+
         if !self.ops.contains(user_data) {
+            self.completion_diagnostics.inc_unknown_completion();
+            return;
+        }
+        let current_generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
+        if current_generation != generation {
+            self.completion_diagnostics.inc_stale_completion();
+            debug!(
+                user_data,
+                generation, current_generation, "ignoring stale IOCP cancel request"
+            );
             return;
         }
 
@@ -30,6 +60,7 @@ impl<'a> IocpDriver<'a> {
         if let Some(tid) = timer_id {
             self.timer.cancel(tid);
             Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
+            self.completion_diagnostics.inc_cancel_submitted();
             return;
         }
 
@@ -39,16 +70,41 @@ impl<'a> IocpDriver<'a> {
                 let ctx = CancelContext {
                     registered_slots: self.handles.registered_slots(),
                 };
-                Self::perform_cancel(ctx, user_data, &mut self.ops);
+                let status = Self::perform_cancel(ctx, user_data, &mut self.ops);
+                self.record_cancel_status(status);
             }
             _ => {
                 Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
+                self.completion_diagnostics.inc_cancel_submitted();
             }
         }
     }
 
-    fn perform_cancel(ctx: CancelContext<'_>, user_data: usize, ops: &mut IocpOpRegistry) {
-        let handled = match ops.slot_view(user_data) {
+    fn record_cancel_status(&mut self, status: IocpResult<CancelPerformStatus>) {
+        match status {
+            Ok(CancelPerformStatus::Submitted) | Ok(CancelPerformStatus::RioRequested) => {
+                self.completion_diagnostics.inc_cancel_submitted();
+            }
+            Ok(CancelPerformStatus::NotFound) => {
+                self.completion_diagnostics.inc_cancel_cqe_enoent();
+                debug!("CancelIoEx target was already complete or absent");
+            }
+            Ok(CancelPerformStatus::NoHandle) | Ok(CancelPerformStatus::NonActive) => {
+                self.completion_diagnostics.inc_unknown_completion();
+            }
+            Err(report) => {
+                self.completion_diagnostics.inc_cancel_cqe_error();
+                warn!(report = ?report, "CancelIoEx failed");
+            }
+        }
+    }
+
+    fn perform_cancel(
+        ctx: CancelContext<'_>,
+        user_data: usize,
+        ops: &mut IocpOpRegistry,
+    ) -> IocpResult<CancelPerformStatus> {
+        let status = match ops.slot_view(user_data) {
             Some(SlotView::InFlightWaiting(mut guard)) => {
                 let is_rio = guard
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
@@ -56,6 +112,7 @@ impl<'a> IocpDriver<'a> {
 
                 if is_rio {
                     guard.platform_mut().rio_cancel_requested = true;
+                    CancelPerformStatus::RioRequested
                 } else {
                     let raw_handle = guard
                         .with_op_mut(|iocp_op| iocp_op.header.resolved_handle)
@@ -73,18 +130,23 @@ impl<'a> IocpDriver<'a> {
                                 &mut sidecar.inner as *mut crate::win32::Overlapped
                             });
                         // SAFETY: handle and overlapped_ptr are valid for this operation.
-                        let _ = unsafe {
+                        match unsafe {
                             crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
-                        };
+                        }? {
+                            CancelRequestResult::Submitted => CancelPerformStatus::Submitted,
+                            CancelRequestResult::NotFound => CancelPerformStatus::NotFound,
+                        }
+                    } else {
+                        CancelPerformStatus::NoHandle
                     }
                 }
-                Some(())
             }
             Some(SlotView::InFlightOrphaned(mut guard)) => {
                 let is_rio = guard.op.as_ref().map(Self::is_rio_op).unwrap_or(false);
 
                 if is_rio {
                     guard.platform_mut().rio_cancel_requested = true;
+                    CancelPerformStatus::RioRequested
                 } else {
                     let raw_handle = guard
                         .op
@@ -101,19 +163,24 @@ impl<'a> IocpDriver<'a> {
                             guard.storage.with_mut(|_result, _payload, sidecar| {
                                 &mut sidecar.inner as *mut crate::win32::Overlapped
                             });
-                        let _ = unsafe {
+                        match unsafe {
                             crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
-                        };
+                        }? {
+                            CancelRequestResult::Submitted => CancelPerformStatus::Submitted,
+                            CancelRequestResult::NotFound => CancelPerformStatus::NotFound,
+                        }
+                    } else {
+                        CancelPerformStatus::NoHandle
                     }
                 }
-                Some(())
             }
-            _ => None,
+            _ => CancelPerformStatus::NonActive,
         };
 
-        if handled.is_none() {
+        if matches!(status, CancelPerformStatus::NonActive) {
             debug!(user_data, "Skipping cancel for non in-flight slot");
         }
+        Ok(status)
     }
 
     fn emit_aborted_inner(ctx: EmitContext<'_>, user_data: usize, ops: &mut IocpOpRegistry) {

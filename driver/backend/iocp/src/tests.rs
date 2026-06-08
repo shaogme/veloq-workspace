@@ -86,6 +86,12 @@ pub(crate) fn wait_completion_record(
                 return IocpError::CompletionWait
                     .attach_note("stale completion record (generation mismatch)");
             }
+            PollRecordResult::Lost(anomaly) => {
+                return IocpError::CompletionWait
+                    .with_ctx("completion_token", anomaly.token.raw())
+                    .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason))
+                    .attach_note("lost completion record");
+            }
             PollRecordResult::Pending => {}
         }
         std::thread::sleep(std::time::Duration::from_millis(5));

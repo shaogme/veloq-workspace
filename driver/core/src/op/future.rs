@@ -8,8 +8,9 @@ use std::{
 use tracing::trace;
 
 use crate::driver::{
-    CompletionRecord, Driver, DriverSubmitResult, PlatformOp, PollRecordResult, RemoteWaker,
-    SharedCompletionTable, SubmitStatus, event_res_to_result,
+    CancelRequest, CompletionAnomaly, CompletionAnomalyReason, CompletionRecord, CompletionToken,
+    Driver, DriverSubmitResult, PlatformOp, PollRecordResult, RemoteWaker, SharedCompletionTable,
+    SubmitStatus, event_res_to_result,
 };
 use crate::op::{IntoPlatformOp, Op};
 use crate::slot::DetachedCancelTable;
@@ -148,6 +149,42 @@ where
 }
 
 #[inline]
+pub(crate) fn completion_anomaly_error<E>(anomaly: CompletionAnomaly) -> OpError<E>
+where
+    E: DriverError,
+{
+    let reason = match anomaly.reason {
+        CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
+        CompletionAnomalyReason::UnknownSlot
+        | CompletionAnomalyReason::UnknownControlToken
+        | CompletionAnomalyReason::NonActiveSlot
+        | CompletionAnomalyReason::SlotCorruption => LostReason::Other,
+    };
+
+    let mut report = DriverCoreError::Internal
+        .to_report()
+        .push_ctx("scope", "driver-core/op")
+        .with_ctx("completion_token", anomaly.token.raw())
+        .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason))
+        .attach_note("operation completion became unavailable");
+
+    if let Some(index) = anomaly.index {
+        report = report.with_ctx("slot_index", index);
+    }
+    if let Some(expected_generation) = anomaly.expected_generation {
+        report = report.with_ctx("expected_generation", expected_generation);
+    }
+    if let Some(actual_generation) = anomaly.actual_generation {
+        report = report.with_ctx("actual_generation", actual_generation);
+    }
+    if let Some(state) = anomaly.state {
+        report = report.with_ctx("slot_state", format!("{state:?}"));
+    }
+
+    OpError::new(reason, E::from_core_report(report))
+}
+
+#[inline]
 pub(crate) fn completion_record_to_result<T, O, UP, E, C>(
     record: CompletionRecord<UP, E, C>,
 ) -> Poll<OpResult<T::Output, E, T::Completion>>
@@ -189,6 +226,11 @@ where
         PollRecordResult::Stale => Poll::Ready(
             OpResult::<T::Output, E, T::Completion>::ResourceLost(generation_mismatch_error()),
         ),
+        PollRecordResult::Lost(anomaly) => {
+            Poll::Ready(OpResult::<T::Output, E, T::Completion>::ResourceLost(
+                completion_anomaly_error(anomaly),
+            ))
+        }
         PollRecordResult::Pending => Poll::Pending,
     }
 }
@@ -504,11 +546,10 @@ where
 {
     fn drop(&mut self) {
         if let LocalState::Submitted = self.state {
-            let user_data = self.user_data;
             let token = self.token;
             self.provider.with_driver(|mut driver| {
                 driver.completion_table().mark_orphaned(token);
-                driver.cancel_op(user_data);
+                driver.cancel_op(CancelRequest::abandon(CompletionToken::from_raw(token)));
             });
         }
     }

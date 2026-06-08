@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use tracing::debug;
 use veloq_buf::BufferRegistrar;
-use veloq_driver_core::driver::SharedCompletionTable;
+use veloq_driver_core::driver::{
+    CancelRequest, CompletionToken, DriverCompletionDiagnostics, SharedCompletionTable,
+};
 use veloq_driver_core::slot::{DetachedCancelTable, SlotRegistryExt, SlotView};
 
 use crate::config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle};
@@ -121,6 +123,7 @@ impl<'a> IocpDriver<'a> {
             timer: TimerEngine::new(),
             handles: HandleRegistry::new(),
             detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
+            completion_diagnostics: DriverCompletionDiagnostics::default(),
             rio,
             shutting_down: false,
             closed: false,
@@ -191,7 +194,11 @@ impl<'a> IocpDriver<'a> {
             in_flight.push(user_data);
         }
         for user_data in in_flight {
-            self.cancel_op_internal(user_data);
+            let generation =
+                self.ops.shared.slots[user_data].generation(std::sync::atomic::Ordering::Acquire);
+            self.cancel_op_internal(CancelRequest::abandon(CompletionToken::user(
+                user_data, generation,
+            )));
         }
         pending
     }

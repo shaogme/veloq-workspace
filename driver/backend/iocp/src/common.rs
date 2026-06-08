@@ -9,8 +9,8 @@ use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionRecord, CompletionSidecar, RemoteWaker, SharedCompletionQueue,
-    SharedCompletionTable, encode_completion_token,
+    CompletionEvent, CompletionRecord, CompletionSidecar, CompletionToken, RemoteWaker,
+    SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
 };
 
 // ============================================================================
@@ -100,7 +100,7 @@ pub(crate) fn push_completion_shared(
 // Waker
 // ============================================================================
 
-pub(crate) const WAKEUP_USER_DATA: usize = usize::MAX;
+pub(crate) const WAKEUP_USER_DATA: usize = CompletionToken::waker(0).raw() as usize;
 
 /// A waker that posts a completion status to the port to wake up the event loop.
 pub(crate) struct IocpWaker {

@@ -45,7 +45,7 @@ fn test_completion_table_loom() {
             table_cloned2.mark_waiting(token);
             match table_cloned2.try_take_record(token) {
                 PollRecordResult::Ready(record) => assert_eq!(record.event.user_data, token),
-                PollRecordResult::Pending | PollRecordResult::Stale => {
+                PollRecordResult::Pending | PollRecordResult::Stale | PollRecordResult::Lost(_) => {
                     table_cloned2.mark_orphaned(token);
                 }
             }
@@ -114,6 +114,7 @@ fn test_fast_completion_then_waiting_take_loom() {
             }
             PollRecordResult::Pending => panic!("expected ready after fast completion"),
             PollRecordResult::Stale => panic!("unexpected stale in same generation"),
+            PollRecordResult::Lost(anomaly) => panic!("unexpected lost completion: {anomaly:?}"),
         }
 
         assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
@@ -146,6 +147,9 @@ fn test_stale_after_generation_advance_loom() {
             PollRecordResult::Stale => {}
             PollRecordResult::Ready(_) => panic!("old generation must not become ready"),
             PollRecordResult::Pending => panic!("old generation must be stale"),
+            PollRecordResult::Lost(anomaly) => {
+                panic!("old generation should be stale: {anomaly:?}")
+            }
         }
     });
 }

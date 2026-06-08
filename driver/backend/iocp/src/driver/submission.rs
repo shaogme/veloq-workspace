@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::{DiagnosticResult, ResultReportExt};
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
-    DriverSubmitResult, SharedCompletionQueue, SharedCompletionTable, SubmitStatus,
+    CompletionToken, DriverSubmitResult, SharedCompletionQueue, SharedCompletionTable, SubmitStatus,
 };
 use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
 
@@ -182,7 +182,9 @@ impl<'a> IocpDriver<'a> {
         user_data: usize,
         op_in: &mut Option<IocpOp>,
     ) -> DriverSubmitResult<IocpError> {
-        if let Err(err) = ctx.port.notify(user_data) {
+        let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
+        let completion_key = CompletionToken::user(user_data, generation).raw() as usize;
+        if let Err(err) = ctx.port.notify(completion_key) {
             if let Some(SlotView::InFlightWaiting(slot)) = ops.slot_view(user_data) {
                 let mut guard = slot.complete();
                 *op_in = guard.take_op();
@@ -243,8 +245,14 @@ impl<'a> IocpDriver<'a> {
             );
 
             close_result.and_then(|(raw_handle, io_result)| {
+                let generation = sub_guard
+                    .slot
+                    .as_ref()
+                    .map(|slot| slot.entry.generation(Ordering::Acquire))
+                    .unwrap_or(0);
+                let completion_key = CompletionToken::user(user_data, generation).raw() as usize;
                 let completion =
-                    BlockingCompletion::new(self.completion.port_arc(), user_data, None);
+                    BlockingCompletion::new(self.completion.port_arc(), completion_key, None);
                 completion.store_result(io_result);
 
                 sub_guard
