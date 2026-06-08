@@ -72,7 +72,7 @@ impl<'a> RioCompletionRouter<'a> {
             op_kind,
             request_id,
             addr_slot,
-            heap_lease,
+            buffer_lease,
             diagnostics,
         } = init;
         let ops = &mut self.comp.ops;
@@ -170,7 +170,7 @@ impl<'a> RioCompletionRouter<'a> {
         }
 
         self.registry.free_addr_slot(addr_slot);
-        self.registry.release_heap_lease(heap_lease);
+        self.registry.release_buffer_lease(buffer_lease, self.env);
         self.release_socket_inflight(socket_key);
         if *self.outstanding_count > 0 {
             *self.outstanding_count -= 1;

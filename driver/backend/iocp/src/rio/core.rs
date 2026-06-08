@@ -9,7 +9,7 @@ use crate::op::submit::SubmissionResult;
 use crate::rio::RioEnv;
 use crate::rio::RioState;
 use crate::rio::core::registry::{
-    RioAddrReservation, RioHeapLeaseToken, RioPreparedBuffer, RioSubmissionKind,
+    RioAddrReservation, RioBufferLeaseToken, RioPreparedBuffer, RioSubmissionKind,
 };
 use crate::rio::core::submit_ops::{RioKernel, RioRq};
 use crate::rio::error::{RioError, RioResult};
@@ -79,7 +79,7 @@ pub(crate) struct RioOpRequestInit {
     pub(crate) op_kind: RioOpKind,
     pub(crate) request_id: u64,
     pub(crate) addr_slot: Option<usize>,
-    pub(crate) heap_lease: Option<RioHeapLeaseToken>,
+    pub(crate) buffer_lease: Option<RioBufferLeaseToken>,
     pub(crate) diagnostics: RioRequestDiagnostics,
 }
 
@@ -345,7 +345,7 @@ impl<'a> RioSubmissionLease<'a> {
         debug_assert!(!submitted_context.as_request_context().is_null());
         self.state
             .registry
-            .commit_heap_lease(self.request.data_buf.heap_lease);
+            .commit_buffer_lease(self.request.data_buf.lease);
         self.state.outstanding_count += 1;
         self.state
             .acquire_socket_kernel_inflight(self.request.socket_key);
@@ -474,7 +474,7 @@ impl RioState {
             op_kind: spec.op_kind,
             request_id,
             addr_slot: spec.addr.map(|addr| addr.slot),
-            heap_lease: spec.data_buf.heap_lease,
+            buffer_lease: spec.data_buf.lease,
             diagnostics,
         });
         let request = RioPreparedRequest {
@@ -548,7 +548,7 @@ mod tests {
             op_kind: RioOpKind::Recv,
             request_id: 23,
             addr_slot,
-            heap_lease: None,
+            buffer_lease: None,
             diagnostics: RioRequestDiagnostics::default(),
         }
     }

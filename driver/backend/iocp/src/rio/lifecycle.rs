@@ -90,13 +90,13 @@ impl RioState {
                     RioOpRequestInit {
                         socket_key,
                         addr_slot,
-                        heap_lease,
+                        buffer_lease,
                         ..
                     },
                 context: _completed_context,
             }) => {
                 self.registry.free_addr_slot(addr_slot);
-                self.registry.release_heap_lease(heap_lease);
+                self.registry.release_buffer_lease_deferred(buffer_lease);
                 self.release_socket_inflight(socket_key);
             }
             None => {}
