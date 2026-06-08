@@ -19,7 +19,7 @@ use crate::op::{
     ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv,
     SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvFromPayload, UdpSend,
 };
-use crate::rio::{RioTarget, RioUdpRecvFromArgs};
+use crate::rio::{RioTarget, RioUdpRecvFromArgs, SocketInflightGuard};
 use crate::win32::SafeSocket;
 
 // ============================================================================
@@ -32,6 +32,22 @@ fn with_borrowed_socket<T>(
 ) -> IocpResult<T> {
     let socket = ManuallyDrop::new(SafeSocket(raw));
     f(&socket)
+}
+
+fn mark_socket_header_in_flight(
+    header: &mut OverlappedEntry,
+    inflight: SocketInflightGuard<'_>,
+    res: IocpResult<SubmissionResult>,
+) -> IocpResult<SubmissionResult> {
+    let res = mark_header_in_flight(header, res);
+    if matches!(res, Ok(SubmissionResult::Pending)) {
+        debug_assert!(
+            header.socket_inflight.is_none(),
+            "socket inflight token already attached to op header"
+        );
+        header.socket_inflight = Some(inflight.commit());
+    }
+    res
 }
 
 pub(crate) fn submit_recv(
@@ -220,19 +236,32 @@ pub(crate) fn submit_connect(
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
     ensure_socket_bound(handle, connect_op)?;
+    let connect_ex = ctx.ext.connect_ex;
+    let overlapped = ctx.overlapped;
+    let inflight = ctx
+        .rio
+        .try_acquire_socket_inflight_guard(raw.actor_key())
+        .push_ctx("scope", "submit_connect.acquire_socket_inflight")
+        .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
+        .with_ctx("fd_generation", connect_op.fd.generation())
+        .with_ctx("handle_raw", raw.as_handle() as usize)
+        .with_ctx("user_data", header.user_data)
+        .with_ctx("generation", header.generation)
+        .attach_note("failed to acquire socket inflight slot before ConnectEx")
+        .trans()?;
 
     let mut bytes_sent = 0;
     // SAFETY: iocp_submit_connect_ex is a safe wrapper for the WinSock extension.
-    mark_header_in_flight(header, unsafe {
+    mark_socket_header_in_flight(header, inflight, unsafe {
         iocp_submit_connect_ex(ConnectExArgs {
-            connect_ex: ctx.ext.connect_ex,
+            connect_ex,
             s: handle.raw().as_socket(),
             name: &connect_op.addr as *const _ as *const SOCKADDR,
             namelen: connect_op.addr_len as i32,
             lp_send_buffer: std::ptr::null(),
             dw_send_data_length: 0,
             lp_dw_bytes_sent: &mut bytes_sent,
-            lp_overlapped: ctx.overlapped,
+            lp_overlapped: overlapped,
         })
     })
 }
@@ -402,10 +431,24 @@ pub(crate) fn submit_accept(
 
     let split = ACCEPT_EX_ADDR_SECTION_LEN;
     let mut bytes_received = 0;
+    let accept_ex = ctx.ext.accept_ex;
+    let overlapped = ctx.overlapped;
+    let inflight = ctx
+        .rio
+        .try_acquire_socket_inflight_guard(raw.actor_key())
+        .push_ctx("scope", "submit_accept.acquire_socket_inflight")
+        .with_ctx("fd_fixed_index", user.fd.fixed_index())
+        .with_ctx("fd_generation", user.fd.generation())
+        .with_ctx("listen_handle_raw", raw.as_handle() as usize)
+        .with_ctx("accept_socket_raw", accept_socket_raw)
+        .with_ctx("user_data", header.user_data)
+        .with_ctx("generation", header.generation)
+        .attach_note("failed to acquire socket inflight slot before AcceptEx")
+        .trans()?;
     // SAFETY: iocp_submit_accept_ex is a safe wrapper for the WinSock extension.
     let submit_res = unsafe {
         iocp_submit_accept_ex(AcceptExArgs {
-            accept_ex: ctx.ext.accept_ex,
+            accept_ex,
             s_listen_socket: handle.raw().as_socket(),
             s_accept_socket: accept_socket_raw,
             lp_output_buffer: payload.accept_buffer.as_mut_ptr() as *mut _,
@@ -413,7 +456,7 @@ pub(crate) fn submit_accept(
             dw_local_address_length: split as u32,
             dw_remote_address_length: split as u32,
             lp_dw_bytes_received: &mut bytes_received,
-            lp_overlapped: ctx.overlapped,
+            lp_overlapped: overlapped,
         })
     }
     .push_ctx("scope", "submit_accept")
@@ -424,7 +467,7 @@ pub(crate) fn submit_accept(
     .with_ctx("user_data", header.user_data)
     .with_ctx("generation", header.generation)
     .attach_note("AcceptEx submit failed");
-    mark_header_in_flight(header, submit_res)
+    mark_socket_header_in_flight(header, inflight, submit_res)
 }
 
 /// # Safety

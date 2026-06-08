@@ -9,7 +9,8 @@ use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
 use crate::rio::core::{RioCompletionKind, RioOpRequestInit};
 use crate::rio::error::{RioError, RioResult};
-use crate::rio::{RioCompletionContext, RioEnv, RioState, SocketRuntimeState};
+use crate::rio::runtime::release_socket_inflight_token_from;
+use crate::rio::{RioCompletionContext, RioEnv, RioState, SocketInflightToken, SocketRuntimeState};
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use veloq_driver_core::driver::{
@@ -56,25 +57,22 @@ impl<'a> RioCompletionRouter<'a> {
         }
     }
 
-    fn release_socket_inflight(&mut self, socket_key: SocketKey) {
-        if let Some(state) = self.socket_runtime.get_mut(&socket_key)
-            && state.inflight > 0
-        {
-            state.inflight -= 1;
-        }
+    fn release_socket_inflight(&mut self, socket_inflight: SocketInflightToken) {
+        release_socket_inflight_token_from(self.socket_runtime, socket_inflight);
     }
 
     fn handle_op_completion(&mut self, init: RioOpRequestInit, res: &RIORESULT) -> RioResult<()> {
         let RioOpRequestInit {
             user_data,
             generation,
-            socket_key,
+            socket_inflight,
             op_kind,
             request_id,
             addr_slot,
             buffer_lease,
             diagnostics,
         } = init;
+        let socket_key = socket_inflight.socket_key();
         let ops = &mut self.comp.ops;
         if user_data < ops.local.len() {
             match ops.slot_view(user_data) {
@@ -171,7 +169,7 @@ impl<'a> RioCompletionRouter<'a> {
 
         self.registry.free_addr_slot(addr_slot);
         self.registry.release_buffer_lease(buffer_lease, self.env);
-        self.release_socket_inflight(socket_key);
+        self.release_socket_inflight(socket_inflight);
         if *self.outstanding_count > 0 {
             *self.outstanding_count -= 1;
         }

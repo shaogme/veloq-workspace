@@ -1,5 +1,6 @@
 use crate::IocpHandle;
 use crate::error::{IocpError, IocpResult};
+use crate::rio::SocketInflightToken;
 use crate::win32::{IoCompletionPort, Overlapped};
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -77,6 +78,8 @@ pub struct OverlappedEntry {
     pub(crate) blocking_completion: Option<Arc<BlockingCompletion>>,
     /// Resolved handle captured during submission to avoid re-resolving Fixed fd on hot paths.
     pub(crate) resolved_handle: Option<IocpHandle>,
+    /// Socket inflight ownership acquired before a kernel-pending socket submit.
+    pub(crate) socket_inflight: Option<SocketInflightToken>,
 }
 
 impl OverlappedEntry {
@@ -89,6 +92,7 @@ impl OverlappedEntry {
             in_flight: false,
             blocking_completion: None,
             resolved_handle: None,
+            socket_inflight: None,
         }
     }
 }

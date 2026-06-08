@@ -7,12 +7,12 @@ use crate::config::{BorrowedRawHandle, IoFd, SocketKey};
 use crate::error::{IocpError, iocp_report_to_event_res};
 use crate::op::submit::SubmissionResult;
 use crate::rio::RioEnv;
-use crate::rio::RioState;
 use crate::rio::core::registry::{
     RioAddrReservation, RioBufferLeaseToken, RioPreparedBuffer, RioSubmissionKind,
 };
 use crate::rio::core::submit_ops::{RioKernel, RioRq};
 use crate::rio::error::{RioError, RioResult};
+use crate::rio::{RioState, SocketInflightToken};
 use diagweave::prelude::*;
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -71,16 +71,22 @@ impl RioRequestDiagnostics {
     }
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct RioOpRequestInit {
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
-    pub(crate) socket_key: SocketKey,
+    pub(crate) socket_inflight: SocketInflightToken,
     pub(crate) op_kind: RioOpKind,
     pub(crate) request_id: u64,
     pub(crate) addr_slot: Option<usize>,
     pub(crate) buffer_lease: Option<RioBufferLeaseToken>,
     pub(crate) diagnostics: RioRequestDiagnostics,
+}
+
+impl RioOpRequestInit {
+    #[inline]
+    pub(crate) fn socket_key(&self) -> SocketKey {
+        self.socket_inflight.socket_key()
+    }
 }
 
 pub(crate) enum RioCompletionKind {
@@ -92,7 +98,7 @@ pub(crate) enum RioCompletionKind {
 
 #[repr(C)]
 pub(crate) struct RioOpRequestContext {
-    pub(crate) init: RioOpRequestInit,
+    pub(crate) init: Option<RioOpRequestInit>,
 }
 
 #[repr(transparent)]
@@ -137,6 +143,13 @@ impl RioRequestContextHandle {
     }
 
     #[inline]
+    fn as_mut(&mut self) -> &mut RioOpRequestContext {
+        // SAFETY: the typed owner has unique access while extracting the init
+        // before freeing the request context.
+        unsafe { self.0.as_mut() }
+    }
+
+    #[inline]
     fn free(self) {
         // SAFETY: the typed owner calling this method is responsible for owning
         // the allocation represented by the handle.
@@ -148,7 +161,7 @@ impl RioPreparedRequestContext {
     #[inline]
     pub(crate) fn new(init: RioOpRequestInit) -> Self {
         Self {
-            handle: RioRequestContextHandle::new(RioOpRequestContext { init }),
+            handle: RioRequestContextHandle::new(RioOpRequestContext { init: Some(init) }),
         }
     }
 
@@ -164,10 +177,24 @@ impl RioPreparedRequestContext {
             handle: this.handle,
         }
     }
+
+    #[inline]
+    fn init(&self) -> Option<&RioOpRequestInit> {
+        self.handle.as_ref().init.as_ref()
+    }
+
+    #[inline]
+    fn take_init(&mut self) -> Option<RioOpRequestInit> {
+        self.handle.as_mut().init.take()
+    }
 }
 
 impl Drop for RioPreparedRequestContext {
     fn drop(&mut self) {
+        debug_assert!(
+            self.handle.as_ref().init.is_none(),
+            "dropping prepared RIO request context without releasing socket inflight token"
+        );
         self.handle.free();
     }
 }
@@ -186,8 +213,8 @@ impl RioCompletedRequestContext {
     }
 
     #[inline]
-    fn init(&self) -> RioOpRequestInit {
-        self.handle.as_ref().init
+    fn take_init(&mut self) -> Option<RioOpRequestInit> {
+        self.handle.as_mut().init.take()
     }
 }
 
@@ -200,7 +227,7 @@ impl Drop for RioCompletedRequestContext {
 pub(crate) struct RioSubmissionSpec {
     pub(crate) user_data: usize,
     pub(crate) generation: u32,
-    pub(crate) socket_key: SocketKey,
+    pub(crate) socket_inflight: SocketInflightToken,
     pub(crate) op_kind: RioOpKind,
     pub(crate) rq: RioRq,
     pub(crate) data_buf: RioPreparedBuffer,
@@ -208,7 +235,6 @@ pub(crate) struct RioSubmissionSpec {
 }
 
 pub(crate) struct RioPreparedRequest {
-    pub(crate) socket_key: SocketKey,
     pub(crate) op_kind: RioOpKind,
     pub(crate) request_id: u64,
     pub(crate) rq: RioRq,
@@ -266,6 +292,26 @@ pub(crate) struct RioSubmissionLease<'a> {
 
 impl RioPreparedRequest {
     #[inline]
+    fn init(&self) -> &RioOpRequestInit {
+        self.context
+            .as_ref()
+            .and_then(RioPreparedRequestContext::init)
+            .expect("RIO prepared request init missing")
+    }
+
+    #[inline]
+    fn take_init(&mut self) -> Option<RioOpRequestInit> {
+        self.context
+            .as_mut()
+            .and_then(RioPreparedRequestContext::take_init)
+    }
+
+    #[inline]
+    pub(crate) fn socket_key(&self) -> SocketKey {
+        self.init().socket_key()
+    }
+
+    #[inline]
     pub(crate) fn as_request_context(&self) -> *const c_void {
         self.context
             .as_ref()
@@ -287,12 +333,13 @@ impl RioPreparedRequest {
         ctx: RioSubmitErrorContext<'_>,
     ) -> Report<RioError> {
         let diagnostics = self.diagnostics;
+        let socket_key = self.socket_key();
         error
             .push_ctx("scope", ctx.scope)
             .with_ctx("fd_fixed_index", ctx.fd.fixed_index())
             .with_ctx("fd_generation", ctx.fd.generation())
             .with_ctx("handle_raw", ctx.handle.raw().as_handle() as usize)
-            .with_ctx("socket_raw", self.socket_key.as_handle() as usize)
+            .with_ctx("socket_raw", socket_key.as_handle() as usize)
             .with_ctx("user_data", ctx.user_data)
             .with_ctx("generation", ctx.generation)
             .with_ctx("rio_op_kind", self.op_kind.as_str())
@@ -347,8 +394,6 @@ impl<'a> RioSubmissionLease<'a> {
             .registry
             .commit_buffer_lease(self.request.data_buf.lease);
         self.state.outstanding_count += 1;
-        self.state
-            .acquire_socket_kernel_inflight(self.request.socket_key);
         self.submitted = true;
     }
 }
@@ -361,6 +406,14 @@ impl Drop for RioSubmissionLease<'_> {
         self.state
             .registry
             .free_addr_slot(self.request.addr.map(|addr| addr.slot));
+        let socket_inflight = self.request.take_init().map(|init| init.socket_inflight);
+        debug_assert!(
+            socket_inflight.is_some(),
+            "unsubmitted RIO request missing socket inflight token"
+        );
+        if let Some(socket_inflight) = socket_inflight {
+            self.state.release_socket_inflight_token(socket_inflight);
+        }
     }
 }
 
@@ -420,11 +473,28 @@ impl RioState {
                 .prepare_submission(plan.buffer, plan.buffer_offset, buf_len, env)?;
         let addr = self.prepare_submit_address(plan.address, env)?;
         let socket_key = plan.handle.raw().actor_key();
+        let socket_inflight = match self.try_acquire_socket_inflight_token(socket_key) {
+            Ok(token) => token,
+            Err(error) => {
+                self.registry.free_addr_slot(addr.map(|addr| addr.slot));
+                return Err(error
+                    .push_ctx("scope", "rio.core.submit_plan.acquire_socket_inflight")
+                    .with_ctx("fd_fixed_index", plan.fd.fixed_index())
+                    .with_ctx("fd_generation", plan.fd.generation())
+                    .with_ctx("handle_raw", plan.handle.raw().as_handle() as usize)
+                    .with_ctx("socket_raw", socket_key.as_handle() as usize)
+                    .with_ctx("user_data", plan.user_data)
+                    .with_ctx("generation", plan.generation)
+                    .with_ctx("rio_op_kind", plan.op_kind.as_str())
+                    .with_ctx("rio_operation", plan.operation)
+                    .attach_note("failed to acquire socket inflight slot for RIO submission"));
+            }
+        };
         let error_context = plan.submit_error_context();
         self.prepare_submission_lease(RioSubmissionSpec {
             user_data: plan.user_data,
             generation: plan.generation,
-            socket_key,
+            socket_inflight,
             op_kind: plan.op_kind,
             rq,
             data_buf,
@@ -470,7 +540,7 @@ impl RioState {
         let context = Self::encode_req_ctx(RioOpRequestInit {
             user_data: spec.user_data,
             generation: spec.generation,
-            socket_key: spec.socket_key,
+            socket_inflight: spec.socket_inflight,
             op_kind: spec.op_kind,
             request_id,
             addr_slot: spec.addr.map(|addr| addr.slot),
@@ -478,7 +548,6 @@ impl RioState {
             diagnostics,
         });
         let request = RioPreparedRequest {
-            socket_key: spec.socket_key,
             op_kind: spec.op_kind,
             request_id,
             rq: spec.rq,
@@ -497,11 +566,9 @@ impl RioState {
 
     #[inline]
     pub(crate) fn decode_req_ctx(ctx: u64) -> Option<RioCompletionKind> {
-        let context = RioCompletedRequestContext::from_request_context(ctx)?;
-        Some(RioCompletionKind::Op {
-            init: context.init(),
-            context,
-        })
+        let mut context = RioCompletedRequestContext::from_request_context(ctx)?;
+        let init = context.take_init()?;
+        Some(RioCompletionKind::Op { init, context })
     }
 
     #[inline]
@@ -541,10 +608,11 @@ mod tests {
     use crate::config::IocpHandle;
 
     fn test_req_init(addr_slot: Option<usize>) -> RioOpRequestInit {
+        let socket_key = IocpHandle::for_socket(std::ptr::null_mut());
         RioOpRequestInit {
             user_data: 11,
             generation: 17,
-            socket_key: IocpHandle::for_socket(std::ptr::null_mut()),
+            socket_inflight: SocketInflightToken::new(socket_key),
             op_kind: RioOpKind::Recv,
             request_id: 23,
             addr_slot,

@@ -9,6 +9,7 @@ use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::control_flow::RioSocketActor;
+use crate::rio::runtime::release_socket_inflight_token_from;
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
@@ -88,7 +89,7 @@ impl RioState {
             Some(RioCompletionKind::Op {
                 init:
                     RioOpRequestInit {
-                        socket_key,
+                        socket_inflight,
                         addr_slot,
                         buffer_lease,
                         ..
@@ -97,7 +98,7 @@ impl RioState {
             }) => {
                 self.registry.free_addr_slot(addr_slot);
                 self.registry.release_buffer_lease_deferred(buffer_lease);
-                self.release_socket_inflight(socket_key);
+                release_socket_inflight_token_from(&mut self.socket_runtime, socket_inflight);
             }
             None => {}
         }

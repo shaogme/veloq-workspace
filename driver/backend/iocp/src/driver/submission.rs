@@ -76,6 +76,7 @@ impl<'a> IocpDriver<'a> {
             sidecar.blocking_completion = None;
             sidecar.in_flight = false;
             sidecar.resolved_handle = None;
+            sidecar.socket_inflight = None;
         });
 
         guard
@@ -84,6 +85,7 @@ impl<'a> IocpDriver<'a> {
                 op_ref.header.generation = generation;
                 op_ref.header.blocking_completion = None;
                 op_ref.header.resolved_handle = None;
+                op_ref.header.socket_inflight = None;
             })
             .ok_or(IocpError::InvalidState)
             .attach_note("Op missing in prep_op_slot")?;
@@ -284,27 +286,26 @@ impl<'a> IocpDriver<'a> {
         .push_ctx("scope", "iocp/driver")
         .attach_note("op submit failed");
 
-        let pending_socket_key = if matches!(result, Ok(submit::SubmissionResult::Pending)) {
-            sub_guard
+        let socket_pending_without_inflight_token = match &result {
+            Ok(submit::SubmissionResult::Pending) => sub_guard
                 .slot
                 .as_mut()
                 .and_then(|slot| {
                     slot.with_op_mut(|op| {
-                        if Self::is_rio_op(op) {
-                            return None;
-                        }
-                        op.header
-                            .in_flight
-                            .then_some(op.header.resolved_handle)
-                            .flatten()
+                        !Self::is_rio_op(op)
+                            && op.header.in_flight
+                            && op.header.resolved_handle.is_some_and(|h| h.is_socket())
+                            && op.header.socket_inflight.is_none()
                     })
                 })
-                .flatten()
-                .filter(|h| h.is_socket())
-                .map(|h| h.actor_key())
-        } else {
-            None
+                .unwrap_or(false),
+            _ => false,
         };
+
+        debug_assert!(
+            !socket_pending_without_inflight_token,
+            "kernel-pending socket op missing pre-acquired socket inflight token"
+        );
 
         let mut sub_guard_opt = Some(sub_guard);
         if result.is_ok() {
@@ -314,10 +315,6 @@ impl<'a> IocpDriver<'a> {
             let _ = guard.persist();
         }
         drop(sub_guard_opt);
-
-        if let Some(socket_key) = pending_socket_key {
-            self.track_socket_submit_pending(socket_key);
-        }
 
         Ok(result)
     }

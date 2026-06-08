@@ -54,6 +54,29 @@ impl Default for SocketRuntimeState {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SocketInflightToken {
+    socket_key: SocketKey,
+}
+
+impl SocketInflightToken {
+    #[inline]
+    pub(crate) const fn new(socket_key: SocketKey) -> Self {
+        Self { socket_key }
+    }
+
+    #[inline]
+    pub(crate) const fn socket_key(&self) -> SocketKey {
+        self.socket_key
+    }
+}
+
+#[must_use = "dropping a SocketInflightGuard releases the acquired socket inflight slot"]
+pub(crate) struct SocketInflightGuard<'a> {
+    pub(crate) state: &'a mut RioState,
+    pub(crate) token: Option<SocketInflightToken>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RioEnv<'a> {
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,

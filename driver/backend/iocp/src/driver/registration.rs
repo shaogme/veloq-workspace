@@ -315,28 +315,29 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    pub(super) fn track_socket_submit_pending(&mut self, key: SocketKey) {
-        let _ = self.rio.state_mut().try_acquire_socket_inflight(key);
-    }
-
     pub(super) fn release_socket_inflight_for_op(&mut self, user_data: usize) {
-        let socket_key = self
+        let socket_inflight = self
             .ops
             .get_slot_entry_op_storage_and_entry_mut(user_data)
             .and_then(|(_, _, op_opt, _)| {
                 let op = op_opt.as_mut()?;
-                if !op.header.in_flight {
-                    return None;
+                let was_in_flight = op.header.in_flight;
+                if was_in_flight {
+                    op.header.in_flight = false;
                 }
-                op.header.in_flight = false;
-                op.header
-                    .resolved_handle
-                    .filter(|h| h.is_socket())
-                    .map(|h| h.actor_key())
+                let socket_inflight = op.header.socket_inflight.take();
+                debug_assert!(
+                    socket_inflight.is_some()
+                        || !was_in_flight
+                        || op.header.resolved_handle.is_none_or(|h| !h.is_socket())
+                        || Self::is_rio_op(op),
+                    "kernel-pending socket op completed without socket inflight token"
+                );
+                socket_inflight
             });
 
-        if let Some(key) = socket_key {
-            self.rio.state_mut().release_socket_inflight(key);
+        if let Some(token) = socket_inflight {
+            self.rio.state_mut().release_socket_inflight_token(token);
             self.drain_deferred_socket_cleanup();
         }
     }
