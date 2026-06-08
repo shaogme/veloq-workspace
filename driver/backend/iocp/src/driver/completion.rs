@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use diagweave::prelude::*;
 use tracing::{debug, error};
-use veloq_driver_core::driver::{OpToken, RecordCompletionOutcome};
+use veloq_driver_core::driver::{CompletionCleanupGuard, OpToken, RecordCompletionOutcome};
 use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, io_result_to_event_res, push_completion_shared};
@@ -96,6 +96,7 @@ impl<'a> IocpDriver<'a> {
             flags: 0,
             payload: payload_erased,
             detail,
+            cleanup: CompletionCleanupGuard::default(),
         });
         true
     }
@@ -140,9 +141,12 @@ impl<'a> IocpDriver<'a> {
                         std::io::Error::from_raw_os_error(error_code.unwrap_or(0) as i32),
                     ))
                 };
-                if let Some(op) = completed.op.as_mut() {
-                    op.orphan_cleanup(&io_result, &self.extensions);
-                }
+                let cleanup = completed
+                    .op
+                    .as_mut()
+                    .map(|op| op.completion_cleanup(&io_result))
+                    .unwrap_or_default();
+                drop(cleanup);
                 let _ = completed.take_op();
                 let _ = completed.take_completion_data();
                 self.ops
@@ -283,6 +287,11 @@ impl<'a> IocpDriver<'a> {
                 let _data = std::mem::take(guard.platform_mut());
                 should_free = true;
             } else {
+                let cleanup = guard
+                    .op
+                    .as_mut()
+                    .map(|op| op.completion_cleanup(io_detail.as_ref().expect("io result present")))
+                    .unwrap_or_default();
                 if let Some(op) = guard.op.as_mut() {
                     op.unbind_user_payload();
                 }
@@ -293,6 +302,7 @@ impl<'a> IocpDriver<'a> {
                     flags: 0,
                     payload,
                     detail: detail.or_else(|| io_detail.take()),
+                    cleanup,
                 });
                 let _ = guard.take_op();
                 let _data = std::mem::take(guard.platform_mut());

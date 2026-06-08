@@ -475,15 +475,17 @@ mod tests {
             let _in_flight = slot.start_submission_with(None).persist();
         }
 
-        registry.shared.record_completion_with_data(
-            CompletionEvent {
-                token: completion_token,
-                res: 0,
-                flags: 0,
-            },
-            Some(()),
-            None,
-        );
+        registry
+            .shared
+            .record_completion(crate::driver::CompletionPacket::new(
+                CompletionEvent {
+                    token: completion_token,
+                    res: 0,
+                    flags: 0,
+                },
+                Some(()),
+                None,
+            ));
 
         assert!(matches!(
             registry.checked_slot_view(token),
@@ -491,6 +493,9 @@ mod tests {
         ));
         let record = match registry.shared.try_take_record(completion_token) {
             crate::driver::PollRecordResult::Ready(record) => record,
+            crate::driver::PollRecordResult::ReadyLost(anomaly) => {
+                panic!("completion should not be lost: {anomaly:?}")
+            }
             crate::driver::PollRecordResult::Pending => panic!("completion should be ready"),
             crate::driver::PollRecordResult::Stale(anomaly) => {
                 panic!("completion should not be stale: {anomaly:?}")

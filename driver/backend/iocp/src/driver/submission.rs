@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::{DiagnosticResult, ResultReportExt};
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
-    CompletionToken, DriverSubmitResult, OpToken, SharedCompletionQueue, SharedCompletionTable,
-    SubmitStatus,
+    CompletionCleanupGuard, CompletionToken, DriverSubmitResult, OpToken, SharedCompletionQueue,
+    SharedCompletionTable, SubmitStatus,
 };
 use veloq_driver_core::slot::{CheckedSlotView, Reserved, SlotRegistryExt, SlotView};
 
@@ -132,6 +132,7 @@ impl<'a> IocpDriver<'a> {
                     flags: 0,
                     payload,
                     detail,
+                    cleanup: CompletionCleanupGuard::default(),
                 };
                 push_completion_shared(
                     ctx.completion_events,

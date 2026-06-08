@@ -1,6 +1,7 @@
 use tracing::{debug, warn};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, OpToken, RecordCompletionOutcome,
+    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionCleanupGuard, OpToken,
+    RecordCompletionOutcome,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
@@ -262,6 +263,7 @@ impl<'a> IocpDriver<'a> {
                     flags: 0,
                     payload,
                     detail,
+                    cleanup: CompletionCleanupGuard::default(),
                 }),
             ))
         } else {

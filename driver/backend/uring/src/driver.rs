@@ -18,8 +18,7 @@ use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
     CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome, Driver,
     DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteWaker,
-    SharedCompletionQueue,
-    SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+    SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
 

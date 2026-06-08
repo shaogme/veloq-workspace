@@ -1,8 +1,8 @@
 //! Actor coordination and completion routing for the RIO runtime.
 
 use crate::IoFd;
-use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::common::push_completion_shared;
+use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::driver::IocpOpRegistry;
 use crate::error::IocpError;
 use crate::rio::core::registry::RioRegistry;
@@ -19,7 +19,7 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionRecord, CompletionToken, DriverCompletionDiagnostics, OpToken,
+    CompletionEvent, CompletionPacket, CompletionToken, DriverCompletionDiagnostics, OpToken,
     SharedCompletionQueue, SharedCompletionTable,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
@@ -108,11 +108,7 @@ impl<'a> RioCompletionRouter<'a> {
                     let outcome = push_completion_shared(
                         self.comp.events,
                         self.comp.table,
-                        CompletionRecord {
-                            event,
-                            payload,
-                            detail: detail.or(Some(completion)),
-                        },
+                        CompletionPacket::new(event, payload, detail.or(Some(completion))),
                     );
                     self.comp.diagnostics.record_completion_outcome(&outcome);
                     let _ = ops.remove_token(op_token);
@@ -185,11 +181,7 @@ impl<'a> RioCompletionRouter<'a> {
                         let outcome = push_completion_shared(
                             self.comp.events,
                             self.comp.table,
-                            CompletionRecord {
-                                event,
-                                payload,
-                                detail: detail.or(Some(completion)),
-                            },
+                            CompletionPacket::new(event, payload, detail.or(Some(completion))),
                         );
                         self.comp.diagnostics.record_completion_outcome(&outcome);
                     }
@@ -219,9 +211,12 @@ impl<'a> RioCompletionRouter<'a> {
                             .set_error_code(res.Status)
                             .attach_note("orphaned RIO completion returned os error")
                     };
-                    if let Some(op) = guard.op.as_mut() {
-                        op.orphan_cleanup(&orphan_result, self.comp.ext);
-                    }
+                    let cleanup = guard
+                        .op
+                        .as_mut()
+                        .map(|op| op.completion_cleanup(&orphan_result))
+                        .unwrap_or_default();
+                    drop(cleanup);
                     let _ = guard.take_op();
                     let _ = guard.take_completion_data();
                     let _ = std::mem::take(guard.platform_mut());

@@ -170,7 +170,7 @@ where
 
 #[inline]
 pub(crate) fn completion_record_to_result<T, O, UP, E, C>(
-    record: CompletionRecord<UP, E, C>,
+    mut record: CompletionRecord<UP, E, C>,
 ) -> Poll<OpResult<T::Output, E, T::Completion>>
 where
     UP: Send,
@@ -179,14 +179,13 @@ where
     E: DriverError,
     C: crate::driver::CompletionValue,
 {
-    let CompletionRecord {
-        event,
-        payload: payload_erased,
-        detail,
-    } = record;
+    let event = record.event;
+    let payload_erased = record.payload.take();
+    let detail = record.detail.take();
     let Some(payload_erased) = payload_erased else {
         return Poll::Ready(OpResult::ResourceLost(payload_missing_error()));
     };
+    record.disarm_cleanup();
     let payload = T::payload_from_erased(payload_erased);
     let res = detail.unwrap_or_else(|| event_res_to_result::<C, E>(event.res));
     let completion = T::complete(payload, res);
@@ -207,6 +206,11 @@ where
 {
     match table.try_take_record(token) {
         PollRecordResult::Ready(record) => completion_record_to_result::<T, O, UP, E, C>(record),
+        PollRecordResult::ReadyLost(anomaly) => {
+            Poll::Ready(OpResult::<T::Output, E, T::Completion>::ResourceLost(
+                completion_anomaly_error(anomaly),
+            ))
+        }
         PollRecordResult::Stale(anomaly) => {
             Poll::Ready(OpResult::<T::Output, E, T::Completion>::ResourceLost(
                 completion_anomaly_error(anomaly),

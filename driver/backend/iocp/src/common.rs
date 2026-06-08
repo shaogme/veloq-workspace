@@ -8,9 +8,8 @@ use tracing::error;
 use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
-use veloq_driver_core::RawHandleMeta;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionRecord, CompletionSidecar, CompletionToken, RecordCompletionOutcome,
+    CompletionPacket, CompletionSidecar, CompletionToken, RecordCompletionOutcome,
     RecordCompletionResult, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
 };
 
@@ -75,34 +74,22 @@ pub(crate) fn io_result_to_event_res(res: &IocpResult<usize>) -> i32 {
 #[inline]
 pub(crate) fn completion_record(
     sidecar: CompletionSidecar<IocpUserPayload, IocpError>,
-) -> CompletionRecord<IocpUserPayload, IocpError> {
-    CompletionRecord {
-        event: CompletionEvent {
-            token: CompletionToken::user(sidecar.token),
-            res: sidecar.res,
-            flags: sidecar.flags,
-        },
-        payload: sidecar.payload,
-        detail: sidecar.detail,
-    }
+) -> CompletionPacket<IocpUserPayload, IocpError> {
+    CompletionPacket::from(sidecar)
 }
 
 #[inline]
 pub(crate) fn push_completion_shared(
     queue: &SharedCompletionQueue,
     table: &SharedCompletionTable<IocpUserPayload, IocpError>,
-    record: CompletionRecord<IocpUserPayload, IocpError>,
+    packet: CompletionPacket<IocpUserPayload, IocpError>,
 ) -> RecordCompletionOutcome {
-    let event = record.event;
-    let result = table.record_completion_with_data(record.event, record.payload, record.detail);
+    let event = packet.event;
+    let result = table.record_completion(packet);
     let outcome = match result {
         RecordCompletionResult::Recorded => RecordCompletionOutcome::Recorded,
-        RecordCompletionResult::Rejected {
-            outcome,
-            payload,
-            detail,
-        } => {
-            cleanup_rejected_completion(event, payload, detail);
+        RecordCompletionResult::Rejected { outcome, packet } => {
+            drop(packet);
             outcome
         }
     };
@@ -120,31 +107,6 @@ pub(crate) fn push_completion_shared(
     }
     queue.push(event);
     outcome
-}
-
-fn cleanup_rejected_completion(
-    event: CompletionEvent,
-    payload: Option<IocpUserPayload>,
-    detail: Option<crate::error::IocpDriverResult<usize>>,
-) {
-    let raw = detail
-        .as_ref()
-        .and_then(|result| result.as_ref().ok().copied())
-        .or_else(|| (event.res >= 0).then_some(event.res as usize));
-
-    match payload {
-        Some(IocpUserPayload::Open(_)) => {
-            if let Some(raw) = raw {
-                crate::config::IocpHandle::for_file(raw as _).close();
-            }
-        }
-        Some(IocpUserPayload::Accept(_)) => {
-            if let Some(raw) = raw {
-                crate::config::IocpHandle::for_socket(raw as _).close();
-            }
-        }
-        _ => {}
-    }
 }
 
 // ============================================================================

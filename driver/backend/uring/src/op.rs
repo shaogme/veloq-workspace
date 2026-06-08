@@ -6,6 +6,7 @@ use crate::error::{UringDriverResult as DriverResult, UringError};
 use crate::{OwnedRawHandle, RawHandle};
 use io_uring::squeue;
 use std::time::Duration;
+use veloq_driver_core::driver::CompletionCleanupGuard;
 use veloq_driver_core::driver::PlatformOp;
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion, OpKind};
 
@@ -34,8 +35,8 @@ pub(crate) type OnCompleteFn = unsafe fn(
     payload: &mut UringUserPayload,
     result: i32,
 ) -> DriverResult<usize>;
-pub(crate) type OrphanCleanupFn =
-    unsafe fn(op: &mut UringKernelOp, payload: &mut UringUserPayload, result: i32);
+pub(crate) type CompletionCleanupFn =
+    unsafe fn(op: &mut UringKernelOp, result: i32) -> CompletionCleanupGuard;
 pub(crate) type DropFn = unsafe fn(op: &mut UringKernelOp);
 pub(crate) type GetTimeoutFn =
     unsafe fn(op: &UringKernelOp, payload: &UringUserPayload) -> Option<Duration>;
@@ -58,7 +59,7 @@ pub(crate) enum SubmissionStrategy {
 pub(crate) struct OpVTable {
     pub(crate) make_sqe: MakeSqeFn,
     pub(crate) on_complete: OnCompleteFn,
-    pub(crate) orphan_cleanup: OrphanCleanupFn,
+    pub(crate) completion_cleanup: CompletionCleanupFn,
     pub(crate) drop: DropFn,
     pub(crate) strategy: SubmissionStrategy,
     pub(crate) get_timeout: GetTimeoutFn,
@@ -101,7 +102,7 @@ macro_rules! define_uring_ops {
                 kind: $kind:expr,
                 make_sqe: $make_sqe:path,
                 $(on_complete: $complete:path,)?
-                $(orphan_cleanup: $orphan_cleanup:path,)?
+                $(completion_cleanup: $completion_cleanup:path,)?
                 $(completion: $completion:ty,)?
                 $(map_completion: $map_completion:expr,)?
                 drop: $drop:path,
@@ -133,7 +134,7 @@ macro_rules! define_uring_ops {
                     static TABLE: OpVTable = OpVTable {
                         make_sqe: $make_sqe,
                         on_complete: define_uring_ops!(@on_complete $($complete)?),
-                        orphan_cleanup: define_uring_ops!(@orphan_cleanup $($orphan_cleanup)?),
+                        completion_cleanup: define_uring_ops!(@completion_cleanup $($completion_cleanup)?),
                         drop: $drop,
                         strategy: define_uring_ops!(@strategy $($strategy)?),
                         get_timeout: define_uring_ops!(@get_timeout $($get_timeout)?),
@@ -193,8 +194,8 @@ macro_rules! define_uring_ops {
     (@on_complete ) => { crate::op::submit::on_complete_default };
     (@on_complete $func:path) => { $func };
 
-    (@orphan_cleanup ) => { crate::op::submit::orphan_cleanup_noop };
-    (@orphan_cleanup $func:path) => { $func };
+    (@completion_cleanup ) => { crate::op::submit::completion_cleanup_noop };
+    (@completion_cleanup $func:path) => { $func };
 
     (@completion_type ) => { usize };
     (@completion_type $ty:ty) => { $ty };
@@ -338,7 +339,7 @@ define_uring_ops! {
         kind: OpKind::Accept,
         make_sqe: submit::make_sqe_accept,
         on_complete: submit::on_complete_accept,
-        orphan_cleanup: submit::orphan_cleanup_close_raw_fd,
+        completion_cleanup: submit::completion_cleanup_close_raw_fd,
         completion: OwnedRawHandle,
         map_completion: |_op: &Accept, res: DriverResult<usize>| {
             res.map(|raw| unsafe {
@@ -391,7 +392,7 @@ define_uring_ops! {
         payload: payload::OpenPayload,
         kind: OpKind::Open,
         make_sqe: submit::make_sqe_open,
-        orphan_cleanup: submit::orphan_cleanup_close_raw_fd,
+        completion_cleanup: submit::completion_cleanup_close_raw_fd,
         completion: OwnedRawHandle,
         map_completion: |_op: &Open, res: DriverResult<usize>| {
             res.map(|raw| unsafe {

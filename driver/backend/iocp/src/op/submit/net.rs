@@ -16,11 +16,14 @@ use crate::op::submit::common::{
     iocp_submit_connect_ex, mark_header_in_flight, resolve_fd_handle, unpack_kernel_ref,
 };
 use crate::op::{
-    ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv,
-    SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvFromPayload, UdpSend,
+    ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, IocpKernelOp, KernelRef, OpSend,
+    OverlappedEntry, Recv, SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvFromPayload,
+    UdpSend,
 };
 use crate::rio::{RioTarget, RioUdpRecvFromArgs, SocketInflightGuard};
 use crate::win32::SafeSocket;
+use veloq_driver_core::RawHandleMeta;
+use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard};
 
 // ============================================================================
 // Network Operations
@@ -533,6 +536,18 @@ pub(crate) unsafe fn on_complete_accept(
     // Transfer ownership to upper layer completion; payload must not close this socket again.
     let accepted_raw = accept_socket.into_raw();
     Ok(accepted_raw.raw().as_handle() as usize)
+}
+
+pub(crate) unsafe fn completion_cleanup_close_socket(
+    _op: &mut IocpKernelOp,
+    result: &IocpResult<usize>,
+) -> CompletionCleanupGuard {
+    let Ok(raw) = result.as_ref().copied() else {
+        return CompletionCleanupGuard::default();
+    };
+    CompletionCleanupGuard::new(CompletionCleanup::new(move || {
+        crate::config::IocpHandle::for_socket(raw as _).close();
+    }))
 }
 
 pub(crate) fn submit_send_to(

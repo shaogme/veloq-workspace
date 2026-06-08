@@ -321,105 +321,6 @@ impl DriverCompletionDiagnostics {
     }
 }
 
-pub struct CompletionSidecar<UP, E, R = usize> {
-    pub token: OpToken,
-    pub res: i32,
-    pub flags: u32,
-    pub payload: Option<UP>,
-    pub detail: Option<DriverResult<R, E>>,
-}
-
-pub struct CompletionPacket<UP, E, R = usize> {
-    pub event: CompletionEvent,
-    pub payload: Option<UP>,
-    pub detail: Option<DriverResult<R, E>>,
-}
-
-impl<UP, E, R> CompletionPacket<UP, E, R> {
-    #[inline]
-    pub fn new(
-        event: CompletionEvent,
-        payload: Option<UP>,
-        detail: Option<DriverResult<R, E>>,
-    ) -> Self {
-        Self {
-            event,
-            payload,
-            detail,
-        }
-    }
-
-    #[inline]
-    pub fn user(
-        token: OpToken,
-        res: i32,
-        flags: u32,
-        payload: Option<UP>,
-        detail: Option<DriverResult<R, E>>,
-    ) -> Self {
-        Self::new(
-            CompletionEvent {
-                token: CompletionToken::user(token),
-                res,
-                flags,
-            },
-            payload,
-            detail,
-        )
-    }
-}
-
-impl<UP, E, R> From<CompletionSidecar<UP, E, R>> for CompletionPacket<UP, E, R> {
-    #[inline]
-    fn from(sidecar: CompletionSidecar<UP, E, R>) -> Self {
-        Self::user(
-            sidecar.token,
-            sidecar.res,
-            sidecar.flags,
-            sidecar.payload,
-            sidecar.detail,
-        )
-    }
-}
-
-/// Unified completion event produced by platform drivers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompletionEvent {
-    /// Completion token (generation + slot index, or backend control token).
-    pub token: CompletionToken,
-    /// Completion result code. Non-negative for success, negative for error.
-    pub res: i32,
-    /// Platform-specific completion flags.
-    pub flags: u32,
-}
-
-impl CompletionEvent {
-    #[inline]
-    pub const fn raw_token(self) -> u64 {
-        self.token.raw()
-    }
-}
-
-pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
-pub type SharedCompletionTable<UP, E, R = usize> = Arc<dyn CompletionAccess<UP, E, R>>;
-
-pub struct CompletionRecord<UP, E, R = usize> {
-    pub event: CompletionEvent,
-    pub payload: Option<UP>,
-    pub detail: Option<DriverResult<R, E>>,
-}
-
-impl<UP, E, R> From<CompletionPacket<UP, E, R>> for CompletionRecord<UP, E, R> {
-    #[inline]
-    fn from(packet: CompletionPacket<UP, E, R>) -> Self {
-        Self {
-            event: packet.event,
-            payload: packet.payload,
-            detail: packet.detail,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionAnomalyReason {
     UnknownSlot,
@@ -517,6 +418,249 @@ impl CompletionAnomaly {
     }
 }
 
+pub struct CompletionCleanup {
+    action: Box<dyn FnOnce() + Send + 'static>,
+}
+
+impl CompletionCleanup {
+    #[inline]
+    pub fn new(action: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            action: Box::new(action),
+        }
+    }
+
+    #[inline]
+    fn run(self) {
+        (self.action)();
+    }
+}
+
+impl std::fmt::Debug for CompletionCleanup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletionCleanup").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CompletionCleanupGuard {
+    cleanup: Option<CompletionCleanup>,
+}
+
+impl CompletionCleanupGuard {
+    #[inline]
+    pub fn new(cleanup: CompletionCleanup) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+
+    #[inline]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn is_armed(&self) -> bool {
+        self.cleanup.is_some()
+    }
+
+    #[inline]
+    pub fn disarm(&mut self) -> bool {
+        self.cleanup.take().is_some()
+    }
+}
+
+impl Drop for CompletionCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.run();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionRecordKind {
+    User,
+    Lost(CompletionAnomaly),
+}
+
+impl Default for CompletionRecordKind {
+    #[inline]
+    fn default() -> Self {
+        Self::User
+    }
+}
+
+pub struct CompletionSidecar<UP, E, R = usize> {
+    pub token: OpToken,
+    pub res: i32,
+    pub flags: u32,
+    pub payload: Option<UP>,
+    pub detail: Option<DriverResult<R, E>>,
+    pub cleanup: CompletionCleanupGuard,
+}
+
+pub struct CompletionPacket<UP, E, R = usize> {
+    pub event: CompletionEvent,
+    pub payload: Option<UP>,
+    pub detail: Option<DriverResult<R, E>>,
+    pub cleanup: CompletionCleanupGuard,
+    pub record_kind: CompletionRecordKind,
+}
+
+impl<UP, E, R> CompletionPacket<UP, E, R> {
+    #[inline]
+    pub fn new(
+        event: CompletionEvent,
+        payload: Option<UP>,
+        detail: Option<DriverResult<R, E>>,
+    ) -> Self {
+        Self::with_cleanup(
+            event,
+            payload,
+            detail,
+            CompletionCleanupGuard::default(),
+            CompletionRecordKind::User,
+        )
+    }
+
+    #[inline]
+    pub fn with_cleanup(
+        event: CompletionEvent,
+        payload: Option<UP>,
+        detail: Option<DriverResult<R, E>>,
+        cleanup: CompletionCleanupGuard,
+        record_kind: CompletionRecordKind,
+    ) -> Self {
+        Self {
+            event,
+            payload,
+            detail,
+            cleanup,
+            record_kind,
+        }
+    }
+
+    #[inline]
+    pub fn user(
+        token: OpToken,
+        res: i32,
+        flags: u32,
+        payload: Option<UP>,
+        detail: Option<DriverResult<R, E>>,
+    ) -> Self {
+        Self::user_with_cleanup(
+            token,
+            res,
+            flags,
+            payload,
+            detail,
+            CompletionCleanupGuard::default(),
+        )
+    }
+
+    #[inline]
+    pub fn user_with_cleanup(
+        token: OpToken,
+        res: i32,
+        flags: u32,
+        payload: Option<UP>,
+        detail: Option<DriverResult<R, E>>,
+        cleanup: CompletionCleanupGuard,
+    ) -> Self {
+        Self::with_cleanup(
+            CompletionEvent {
+                token: CompletionToken::user(token),
+                res,
+                flags,
+            },
+            payload,
+            detail,
+            cleanup,
+            CompletionRecordKind::User,
+        )
+    }
+
+    #[inline]
+    pub fn lost(
+        event: CompletionEvent,
+        anomaly: CompletionAnomaly,
+        cleanup: CompletionCleanupGuard,
+    ) -> Self {
+        Self::with_cleanup(
+            event,
+            None,
+            None,
+            cleanup,
+            CompletionRecordKind::Lost(anomaly),
+        )
+    }
+}
+
+impl<UP, E, R> From<CompletionSidecar<UP, E, R>> for CompletionPacket<UP, E, R> {
+    #[inline]
+    fn from(sidecar: CompletionSidecar<UP, E, R>) -> Self {
+        Self::user_with_cleanup(
+            sidecar.token,
+            sidecar.res,
+            sidecar.flags,
+            sidecar.payload,
+            sidecar.detail,
+            sidecar.cleanup,
+        )
+    }
+}
+
+/// Unified completion event produced by platform drivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionEvent {
+    /// Completion token (generation + slot index, or backend control token).
+    pub token: CompletionToken,
+    /// Completion result code. Non-negative for success, negative for error.
+    pub res: i32,
+    /// Platform-specific completion flags.
+    pub flags: u32,
+}
+
+impl CompletionEvent {
+    #[inline]
+    pub const fn raw_token(self) -> u64 {
+        self.token.raw()
+    }
+}
+
+pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
+pub type SharedCompletionTable<UP, E, R = usize> = Arc<dyn CompletionAccess<UP, E, R>>;
+
+pub struct CompletionRecord<UP, E, R = usize> {
+    pub event: CompletionEvent,
+    pub payload: Option<UP>,
+    pub detail: Option<DriverResult<R, E>>,
+    pub cleanup: CompletionCleanupGuard,
+    pub record_kind: CompletionRecordKind,
+}
+
+impl<UP, E, R> CompletionRecord<UP, E, R> {
+    #[inline]
+    pub fn disarm_cleanup(&mut self) -> bool {
+        self.cleanup.disarm()
+    }
+}
+
+impl<UP, E, R> From<CompletionPacket<UP, E, R>> for CompletionRecord<UP, E, R> {
+    #[inline]
+    fn from(packet: CompletionPacket<UP, E, R>) -> Self {
+        Self {
+            event: packet.event,
+            payload: packet.payload,
+            detail: packet.detail,
+            cleanup: packet.cleanup,
+            record_kind: packet.record_kind,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordCompletionOutcome {
     Recorded,
@@ -531,8 +675,7 @@ pub enum RecordCompletionResult<UP, E, R = usize> {
     Recorded,
     Rejected {
         outcome: RecordCompletionOutcome,
-        payload: Option<UP>,
-        detail: Option<DriverResult<R, E>>,
+        packet: CompletionPacket<UP, E, R>,
     },
 }
 
@@ -583,20 +726,17 @@ impl DriverCompletionDiagnostics {
 #[inline]
 fn rejected_completion<UP, E, R>(
     outcome: RecordCompletionOutcome,
-    payload: Option<UP>,
-    detail: Option<DriverResult<R, E>>,
+    packet: CompletionPacket<UP, E, R>,
 ) -> RecordCompletionResult<UP, E, R> {
-    RecordCompletionResult::Rejected {
-        outcome,
-        payload,
-        detail,
-    }
+    RecordCompletionResult::Rejected { outcome, packet }
 }
 
 /// Result of a completion poll, enabling detection of recycled slots.
 pub enum PollRecordResult<UP, E, R = usize> {
     /// Operation completed successfully or with an error.
     Ready(CompletionRecord<UP, E, R>),
+    /// Operation was explicitly marked lost and the waiter was woken.
+    ReadyLost(CompletionAnomaly),
     /// Operation is still in flight.
     Pending,
     /// Operation lost because the slot has been recycled for a newer generation.
@@ -606,12 +746,19 @@ pub enum PollRecordResult<UP, E, R = usize> {
 }
 
 pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
-    fn record_completion_with_data(
+    fn record_completion(
+        &self,
+        packet: CompletionPacket<UP, E, R>,
+    ) -> RecordCompletionResult<UP, E, R>;
+
+    fn record_lost_completion(
         &self,
         event: CompletionEvent,
-        payload: Option<UP>,
-        detail: Option<DriverResult<R, E>>,
-    ) -> RecordCompletionResult<UP, E, R>;
+        anomaly: CompletionAnomaly,
+        cleanup: CompletionCleanupGuard,
+    ) -> RecordCompletionResult<UP, E, R> {
+        self.record_completion(CompletionPacket::lost(event, anomaly, cleanup))
+    }
 
     fn try_take_record(&self, token: CompletionToken) -> PollRecordResult<UP, E, R>;
 
@@ -655,18 +802,15 @@ where
     Spec: slot::SlotSpec<UserPayload = UP, Error = E, Completion = R>,
 {
     #[inline]
-    fn record_completion_with_data(
+    fn record_completion(
         &self,
-        event: CompletionEvent,
-        mut payload: Option<UP>,
-        mut detail: Option<DriverResult<R, E>>,
+        mut packet: CompletionPacket<UP, E, R>,
     ) -> RecordCompletionResult<UP, E, R> {
-        let token = event.token;
+        let token = packet.event.token;
         let Some(op_token) = token.op_token() else {
             return rejected_completion(
                 RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_control(token)),
-                payload,
-                detail,
+                packet,
             );
         };
         let (idx, generation) = op_token.parts();
@@ -675,8 +819,7 @@ where
                 RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_slot(
                     token, idx, generation,
                 )),
-                payload,
-                detail,
+                packet,
             );
         }
         let cell = &self.slots[idx];
@@ -692,8 +835,7 @@ where
                     RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
                         token, idx, generation, cell_gen, state,
                     )),
-                    payload,
-                    detail,
+                    packet,
                 );
             }
             if generation > cell_gen && state != slot::SlotState::Idle {
@@ -701,13 +843,18 @@ where
                     RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
                         token, idx, generation, cell_gen, state,
                     )),
-                    payload,
-                    detail,
+                    packet,
                 );
             }
 
             match state {
                 slot::SlotState::Idle if generation > cell_gen => {
+                    should_note_ready = true;
+                    break current;
+                }
+                slot::SlotState::Reserved
+                    if matches!(packet.record_kind, CompletionRecordKind::Lost(_)) =>
+                {
                     should_note_ready = true;
                     break current;
                 }
@@ -723,8 +870,7 @@ where
                         RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
                             token, idx, generation, state,
                         )),
-                        payload,
-                        detail,
+                        packet,
                     );
                 }
                 slot::SlotState::InFlightOrphaned => {
@@ -743,8 +889,7 @@ where
                         {
                             return rejected_completion(
                                 RecordCompletionOutcome::OrphanedDropped,
-                                payload,
-                                detail,
+                                packet,
                             );
                         }
                     } else {
@@ -752,8 +897,7 @@ where
                             RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
                                 token, idx, generation, cell_gen, state,
                             )),
-                            payload,
-                            detail,
+                            packet,
                         );
                     }
                 }
@@ -764,12 +908,16 @@ where
         if should_note_ready {
             self.note_ready_completion();
         }
-        cell.completion_with_data(|payload_cell, detail_cell| {
-            *payload_cell = payload.take();
-            *detail_cell = detail.take();
+        cell.completion_with_record_data(|payload_cell, detail_cell, cleanup_cell, kind_cell| {
+            *payload_cell = packet.payload.take();
+            *detail_cell = packet.detail.take();
+            *cleanup_cell = std::mem::take(&mut packet.cleanup);
+            *kind_cell = packet.record_kind;
         });
-        cell.completion_res.store(event.res, Ordering::Release);
-        cell.completion_flags.store(event.flags, Ordering::Release);
+        cell.completion_res
+            .store(packet.event.res, Ordering::Release);
+        cell.completion_flags
+            .store(packet.event.flags, Ordering::Release);
 
         match cell.core_state.compare_exchange(
             ready_from,
@@ -803,12 +951,21 @@ where
                 // If we reached here, someone else either:
                 // 1. already set it to InFlightReady (which is fine, we just discard our duplicate data)
                 // 2. recycled the slot (generation mismatch)
-                let (stored_payload, stored_detail) =
-                    cell.completion_with_data(|payload_cell, detail_cell| {
-                        (payload_cell.take(), detail_cell.take())
-                    });
-                payload = stored_payload;
-                detail = stored_detail;
+                let (stored_payload, stored_detail, stored_cleanup, stored_kind) = cell
+                    .completion_with_record_data(
+                        |payload_cell, detail_cell, cleanup_cell, kind_cell| {
+                            (
+                                payload_cell.take(),
+                                detail_cell.take(),
+                                std::mem::take(cleanup_cell),
+                                *kind_cell,
+                            )
+                        },
+                    );
+                packet.payload = stored_payload;
+                packet.detail = stored_detail;
+                packet.cleanup = stored_cleanup;
+                packet.record_kind = stored_kind;
 
                 let cur = cell.load_core_state(Ordering::Acquire);
                 if cur.generation() == generation
@@ -824,11 +981,7 @@ where
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     );
-                    return rejected_completion(
-                        RecordCompletionOutcome::OrphanedDropped,
-                        payload,
-                        detail,
-                    );
+                    return rejected_completion(RecordCompletionOutcome::OrphanedDropped, packet);
                 } else if should_note_ready {
                     self.clear_ready_completion();
                 }
@@ -842,8 +995,7 @@ where
                             cur.generation(),
                             cur.state(),
                         )),
-                        payload,
-                        detail,
+                        packet,
                     );
                 }
                 return rejected_completion(
@@ -853,8 +1005,7 @@ where
                         generation,
                         cur.state(),
                     )),
-                    payload,
-                    detail,
+                    packet,
                 );
             }
         }
@@ -919,9 +1070,24 @@ where
         }
 
         self.clear_ready_completion();
-        let (payload, detail) = cell.completion_with_data(|payload_cell, detail_cell| {
-            (payload_cell.take(), detail_cell.take())
-        });
+        let (payload, detail, cleanup, record_kind) = cell.completion_with_record_data(
+            |payload_cell, detail_cell, cleanup_cell, kind_cell| {
+                let kind = *kind_cell;
+                *kind_cell = CompletionRecordKind::User;
+                (
+                    payload_cell.take(),
+                    detail_cell.take(),
+                    std::mem::take(cleanup_cell),
+                    kind,
+                )
+            },
+        );
+        if let CompletionRecordKind::Lost(anomaly) = record_kind {
+            drop(payload);
+            drop(detail);
+            drop(cleanup);
+            return PollRecordResult::ReadyLost(anomaly);
+        }
         PollRecordResult::Ready(CompletionRecord {
             event: CompletionEvent {
                 token,
@@ -930,6 +1096,8 @@ where
             },
             payload,
             detail,
+            cleanup,
+            record_kind,
         })
     }
 
@@ -1121,10 +1289,7 @@ where
                         .is_ok()
                     {
                         self.clear_ready_completion();
-                        cell.completion_with_data(|payload_cell, detail_cell| {
-                            let _ = payload_cell.take();
-                            let _ = detail_cell.take();
-                        });
+                        cell.clear_completion_record_data();
                         return;
                     }
                 }

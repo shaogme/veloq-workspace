@@ -44,7 +44,7 @@ where
 }
 
 pub(crate) fn complete_from_record<T>(
-    record: CompletionRecord<IocpUserPayload, IocpError>,
+    mut record: CompletionRecord<IocpUserPayload, IocpError>,
 ) -> OpCompletion<T::Output, IocpError, T::Completion>
 where
     T: IntoPlatformOp<
@@ -54,11 +54,13 @@ where
             Error = IocpError,
         >,
 {
-    let payload_erased = record.payload.expect("completion payload missing");
+    let payload_erased = record.payload.take().expect("completion payload missing");
     let payload = T::payload_from_erased(payload_erased);
     let res = record
         .detail
+        .take()
         .unwrap_or_else(|| event_res_to_result::<usize, IocpError>(record.event.res));
+    record.disarm_cleanup();
     T::complete(payload, res)
 }
 
@@ -82,6 +84,12 @@ pub(crate) fn wait_completion_record(
         let completion_table = driver.completion_table();
         match completion_table.try_take_record(token) {
             PollRecordResult::Ready(record) => return Ok(record),
+            PollRecordResult::ReadyLost(anomaly) => {
+                return IocpError::CompletionWait
+                    .with_ctx("completion_token", anomaly.token.raw())
+                    .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason))
+                    .attach_note("lost completion record");
+            }
             PollRecordResult::Stale(anomaly) => {
                 return IocpError::CompletionWait
                     .with_ctx("completion_token", anomaly.token.raw())

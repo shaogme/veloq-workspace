@@ -3,7 +3,8 @@ use crate::error::{UringDriverResult, UringError};
 use io_uring::opcode;
 use tracing::{debug, error, trace};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionSidecar, CompletionToken, OpToken,
+    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionCleanupGuard, CompletionSidecar,
+    CompletionToken, OpToken,
 };
 
 use crate::op::{
@@ -90,6 +91,7 @@ impl<'a> UringDriver<'a> {
                         flags: 0,
                         payload,
                         detail,
+                        cleanup: CompletionCleanupGuard::default(),
                     };
                     self.wheel.cancel(tid);
                     self.push_completion_event(sidecar);
@@ -266,6 +268,7 @@ fn cancel_slot_immediate<'a, S: SlotState>(
         flags: 0,
         payload,
         detail,
+        cleanup: CompletionCleanupGuard::default(),
     }
 }
 

@@ -11,8 +11,9 @@ use crate::op::{
     slot::{CheckedSlotView, SlotSnapshot, SlotView, UringOpRegistryExt},
 };
 use veloq_driver_core::driver::{
-    CompletionControlKind, CompletionEvent, CompletionSidecar, CompletionToken,
-    CompletionTokenClass, OpToken, RecordCompletionResult, drain_cancel_requests,
+    CompletionCleanupGuard, CompletionControlKind, CompletionEvent, CompletionPacket,
+    CompletionSidecar, CompletionToken, CompletionTokenClass, OpToken, RecordCompletionResult,
+    drain_cancel_requests,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +94,7 @@ impl<'a> UringDriver<'a> {
                             flags: 0,
                             payload,
                             detail,
+                            cleanup: CompletionCleanupGuard::default(),
                         })
                     }
                     _ => None,
@@ -331,10 +333,14 @@ impl<'a> UringDriver<'a> {
                 (payload.take(), result.take())
             })
             .unwrap_or((None, None));
+        let mut cleanup = CompletionCleanupGuard::default();
         if let Some((_, _, op, _)) = self
             .ops
             .get_slot_entry_op_storage_and_entry_mut(snapshot.index)
         {
+            if let Some(op_ref) = op.as_mut() {
+                cleanup = unsafe { (op_ref.vtable.completion_cleanup)(op_ref, raw_res) };
+            }
             let _ = op.take();
         }
 
@@ -349,33 +355,38 @@ impl<'a> UringDriver<'a> {
                 .with_ctx("has_payload", snapshot.has_payload)
                 .attach_note(note)))
         });
-        self.push_completion_event(CompletionSidecar::<UringUserPayload, UringError> {
-            token: OpToken::new(snapshot.index, snapshot.generation),
+        drop(payload);
+        drop(detail);
+
+        let token = OpToken::new(snapshot.index, snapshot.generation);
+        let event = CompletionEvent {
+            token: CompletionToken::user(token),
             res: -libc::EIO,
             flags,
-            payload,
-            detail,
-        });
-        let _ = self.ops.recycle_token(
-            OpToken::new(snapshot.index, snapshot.generation),
-            snapshot.generation.wrapping_add(1),
+        };
+        let anomaly = veloq_driver_core::driver::CompletionAnomaly::corrupt(
+            event.token,
+            snapshot.index,
+            snapshot.generation,
+            snapshot.state,
         );
+        let outcome = self
+            .completion_table
+            .record_lost_completion(event, anomaly, cleanup);
+        self.completion_diagnostics
+            .record_completion_result(&outcome);
+        self.cleanup_rejected_completion(event, outcome);
+        self.completion_events.push(event);
+        let _ = self.ops.remove_token(token);
     }
 
     pub(crate) fn push_completion_event(
         &mut self,
         sidecar: CompletionSidecar<UringUserPayload, UringError>,
     ) {
-        let event = CompletionEvent {
-            token: CompletionToken::user(sidecar.token),
-            res: sidecar.res,
-            flags: sidecar.flags,
-        };
-        let outcome = self.completion_table.record_completion_with_data(
-            event,
-            sidecar.payload,
-            sidecar.detail,
-        );
+        let packet = CompletionPacket::from(sidecar);
+        let event = packet.event;
+        let outcome = self.completion_table.record_completion(packet);
         self.completion_diagnostics
             .record_completion_result(&outcome);
         self.cleanup_rejected_completion(event, outcome);
@@ -387,12 +398,7 @@ impl<'a> UringDriver<'a> {
         event: CompletionEvent,
         outcome: RecordCompletionResult<UringUserPayload, UringError>,
     ) {
-        let RecordCompletionResult::Rejected {
-            outcome,
-            payload,
-            detail: _,
-        } = outcome
-        else {
+        let RecordCompletionResult::Rejected { outcome, packet } = outcome else {
             return;
         };
 
@@ -403,26 +409,7 @@ impl<'a> UringDriver<'a> {
             outcome = ?outcome,
             "uring completion table rejected completion"
         );
-
-        if event.res < 0 {
-            return;
-        }
-
-        match payload {
-            Some(UringUserPayload::Open(_)) | Some(UringUserPayload::Accept(_)) => {
-                let fd = event.res;
-                let close_res = unsafe { libc::close(fd) };
-                if close_res != 0 {
-                    self.completion_diagnostics.inc_orphan_cleanup_error();
-                    warn!(
-                        fd,
-                        errno = std::io::Error::last_os_error().raw_os_error(),
-                        "failed to close rejected uring completion fd"
-                    );
-                }
-            }
-            _ => {}
-        }
+        drop(packet);
     }
 }
 
@@ -454,6 +441,11 @@ fn complete_waiting_slot(
     let has_op = slot.op.is_some();
     let has_payload = slot.storage.payload.is_some();
     if !has_op || !has_payload {
+        let cleanup = slot
+            .op
+            .as_mut()
+            .map(|op| unsafe { (op.vtable.completion_cleanup)(op, cqe_res) })
+            .unwrap_or_default();
         let (payload, detail) = slot
             .storage
             .with_mut(|result, payload, _sidecar| (payload.take(), result.take()));
@@ -475,17 +467,20 @@ fn complete_waiting_slot(
                         "in-flight uring completion missing op or payload",
                     )))
             }),
+            cleanup,
         };
     }
 
-    let final_res = {
+    let (final_res, cleanup) = {
         let Some(payload) = slot.storage.payload.as_mut() else {
             unreachable!("payload presence checked above");
         };
         let Some(op) = slot.op.as_mut() else {
             unreachable!("op presence checked above");
         };
-        unsafe { (op.vtable.on_complete)(op, payload, cqe_res) }
+        let final_res = unsafe { (op.vtable.on_complete)(op, payload, cqe_res) };
+        let cleanup = unsafe { (op.vtable.completion_cleanup)(op, cqe_res) };
+        (final_res, cleanup)
     };
 
     let mut completed = slot.complete();
@@ -505,6 +500,7 @@ fn complete_waiting_slot(
         flags: cqe_flags,
         payload,
         detail,
+        cleanup,
     }
 }
 
@@ -516,9 +512,11 @@ fn complete_orphaned_slot(
 ) -> CompletionSidecar<UringUserPayload, UringError> {
     let mut completed = slot.complete();
     let generation = completed.entry.generation(Ordering::Acquire);
-    if let (Some(op), Some(payload)) = (completed.op.as_mut(), completed.storage.payload.as_mut()) {
-        unsafe { (op.vtable.orphan_cleanup)(op, payload, cqe_res) };
-    }
+    let cleanup = completed
+        .op
+        .as_mut()
+        .map(|op| unsafe { (op.vtable.completion_cleanup)(op, cqe_res) })
+        .unwrap_or_default();
     let (payload, detail) = completed.take_completion_data();
     let _ = completed.take_op();
 
@@ -528,6 +526,7 @@ fn complete_orphaned_slot(
         flags: cqe_flags,
         payload,
         detail,
+        cleanup,
     }
 }
 

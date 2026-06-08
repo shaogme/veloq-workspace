@@ -15,6 +15,8 @@ use crate::error::{UringDriverResult as DriverResult, UringError};
 use crate::op::{UringOp, UringOpPayload, UringUserPayload};
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
+use tracing::warn;
+use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard};
 use veloq_driver_core::op::BufIoRangeError;
 
 #[inline]
@@ -96,22 +98,31 @@ pub(crate) unsafe fn on_complete_default(
     }
 }
 
-pub(crate) unsafe fn orphan_cleanup_noop(
+pub(crate) unsafe fn completion_cleanup_noop(
     _op: &mut UringOp,
-    _payload: &mut UringUserPayload,
     _result: i32,
-) {
+) -> CompletionCleanupGuard {
+    CompletionCleanupGuard::default()
 }
 
-pub(crate) unsafe fn orphan_cleanup_close_raw_fd(
+pub(crate) unsafe fn completion_cleanup_close_raw_fd(
     _op: &mut UringOp,
-    _payload: &mut UringUserPayload,
     result: i32,
-) {
-    if result >= 0 {
-        // SAFETY: successful open/accept CQEs transfer a fresh raw fd that no user future owns.
-        let _ = unsafe { libc::close(result) };
+) -> CompletionCleanupGuard {
+    if result < 0 {
+        return CompletionCleanupGuard::default();
     }
+    CompletionCleanupGuard::new(CompletionCleanup::new(move || {
+        // SAFETY: successful open/accept CQEs transfer a fresh raw fd that no user future owns yet.
+        let close_res = unsafe { libc::close(result) };
+        if close_res != 0 {
+            warn!(
+                fd = result,
+                errno = std::io::Error::last_os_error().raw_os_error(),
+                "failed to close unconsumed uring completion fd"
+            );
+        }
+    }))
 }
 
 pub(crate) unsafe fn make_sqe_timeout(

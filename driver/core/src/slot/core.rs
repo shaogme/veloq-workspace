@@ -1,5 +1,6 @@
 use super::{SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
 use crate::DriverResult;
+use crate::driver::{CompletionCleanupGuard, CompletionRecordKind};
 use bilge::prelude::*;
 use std::marker::PhantomData;
 use veloq_atomic_waker::AtomicWaker;
@@ -146,6 +147,8 @@ pub struct SlotData<Spec: SlotSpec> {
 pub(crate) struct CompletionData<UP, E, R = usize> {
     pub payload: Option<UP>,
     pub detail: Option<DriverResult<R, E>>,
+    pub cleanup: CompletionCleanupGuard,
+    pub record_kind: CompletionRecordKind,
 }
 
 impl<UP, E, R> Default for CompletionData<UP, E, R> {
@@ -153,6 +156,8 @@ impl<UP, E, R> Default for CompletionData<UP, E, R> {
         Self {
             payload: None,
             detail: None,
+            cleanup: CompletionCleanupGuard::default(),
+            record_kind: CompletionRecordKind::User,
         }
     }
 }
@@ -240,16 +245,33 @@ impl<Spec: SlotSpec> SlotData<Spec> {
     }
 
     #[inline]
-    pub(crate) fn completion_with_data<F, X>(&self, f: F) -> X
+    pub(crate) fn completion_with_record_data<F, X>(&self, f: F) -> X
     where
         F: FnOnce(
             &mut Option<SlotPayload<Spec>>,
             &mut Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+            &mut CompletionCleanupGuard,
+            &mut CompletionRecordKind,
         ) -> X,
     {
         let mut data = self.completion_data.lock();
-        let CompletionData { payload, detail } = &mut *data;
-        f(payload, detail)
+        let CompletionData {
+            payload,
+            detail,
+            cleanup,
+            record_kind,
+        } = &mut *data;
+        f(payload, detail, cleanup, record_kind)
+    }
+
+    #[inline]
+    pub(crate) fn clear_completion_record_data(&self) {
+        self.completion_with_record_data(|payload, detail, cleanup, record_kind| {
+            let _ = payload.take();
+            let _ = detail.take();
+            *cleanup = CompletionCleanupGuard::default();
+            *record_kind = CompletionRecordKind::User;
+        });
     }
 }
 
