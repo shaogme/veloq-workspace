@@ -7,10 +7,7 @@ use veloq_driver_core::driver::{
     CompletionSidecar, CompletionToken, OpToken, record_completion_anomaly, run_completion_cleanup,
 };
 
-use crate::op::{
-    UringUserPayload,
-    slot::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt},
-};
+use crate::op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt, UringUserPayload};
 
 #[derive(Clone, Default)]
 pub struct UringOpState {

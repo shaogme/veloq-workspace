@@ -31,7 +31,7 @@ pub(crate) use registration::{
     MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,
 };
 
-use crate::op::slot::{UringOpRegistry, UringSlotSpec};
+use crate::op::{UringOpRegistry, UringSlotSpec};
 
 type DriverResult<T> = CoreDriverResult<T, UringError>;
 pub(crate) struct EventFd {

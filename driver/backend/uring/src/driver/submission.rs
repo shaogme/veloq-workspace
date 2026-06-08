@@ -6,7 +6,7 @@ use crate::config::{RawHandle, UringRawHandle};
 use crate::driver::UringDriver;
 use crate::driver::lifecycle::UringOpState;
 use crate::error::{UringError, UringResult};
-use crate::op::slot::{CheckedSlotView, Slot, SlotView, UringOpRegistryExt};
+use crate::op::{CheckedSlotView, Slot, SlotView, UringOpRegistryExt};
 use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 
 use veloq_driver_core::driver::registry::{AllocResult, OpHandle};
@@ -34,7 +34,7 @@ impl<'a> UringDriver<'a> {
     pub(crate) unsafe fn submit_from_slot_raw(
         driver: *mut UringDriver,
         token: OpToken,
-        slot: Slot<'_, crate::op::slot::Reserved>,
+        slot: Slot<'_, crate::op::Reserved>,
     ) -> UringResult<bool> {
         let driver = unsafe { &mut *driver };
         let user_data = token.index();

@@ -6,10 +6,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::driver::UringDriver;
 use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_event_res};
-use crate::op::{
-    UringUserPayload,
-    slot::{CheckedSlotView, SlotView, UringOpRegistryExt},
-};
+use crate::op::{CheckedSlotView, Slot, SlotView, UringOpRegistryExt, UringUserPayload};
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionDispatch,
     CompletionEvent, CompletionPacket, CompletionSidecar, CompletionToken, OpToken, RawCompletion,
@@ -435,7 +432,7 @@ impl<'a> UringDriver<'a> {
 }
 
 fn complete_waiting_slot(
-    slot: crate::op::slot::Slot<'_, veloq_driver_core::slot::InFlightWaiting>,
+    slot: Slot<'_, veloq_driver_core::slot::InFlightWaiting>,
     token: OpToken,
     cqe_res: i32,
     cqe_flags: u32,
@@ -509,7 +506,7 @@ fn complete_waiting_slot(
 }
 
 fn cleanup_orphaned_slot(
-    slot: crate::op::slot::Slot<'_, veloq_driver_core::slot::InFlightOrphaned>,
+    slot: Slot<'_, veloq_driver_core::slot::InFlightOrphaned>,
     cqe_res: i32,
 ) -> CompletionCleanupGuard {
     let mut completed = slot.complete();

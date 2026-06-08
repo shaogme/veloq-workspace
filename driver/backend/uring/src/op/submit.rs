@@ -1,8 +1,8 @@
 mod file;
 mod net;
 
-pub(crate) use file::*;
-pub(crate) use net::*;
+pub(super) use file::*;
+pub(super) use net::*;
 
 use crate::config::{IoFd, RawHandleKind};
 use crate::driver::{RegisteredFileEntry, UringDriver, resolve_registered_fixed_fd};
