@@ -20,5 +20,5 @@ pub(crate) type Slot<'a, State> = CoreSlot<'a, State, UringSlotSpec>;
 
 pub(crate) use veloq_driver_core::slot::{
     CheckedSlotView, Reserved, SlotMarker as SlotState, SlotRegistryExt as UringOpRegistryExt,
-    SlotSnapshot, SlotView,
+    SlotView,
 };

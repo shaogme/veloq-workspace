@@ -21,7 +21,7 @@ use veloq_driver_core::driver::{
     DriveOutcome, Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
     RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
-use veloq_driver_core::slot::DetachedCancelTable;
+use veloq_driver_core::slot::RemoteCancelQueue;
 
 use diagweave::prelude::*;
 
@@ -44,7 +44,7 @@ pub struct IocpDriver<'a> {
     extensions: crate::ext::Extensions,
     timer: polling::TimerEngine,
     handles: registration::HandleRegistry,
-    detached_cancel_table: Arc<DetachedCancelTable>,
+    remote_cancel_queue: Arc<RemoteCancelQueue>,
     completion_diagnostics: DriverCompletionDiagnostics,
 
     // RIO Support (required)
@@ -138,8 +138,8 @@ impl<'a> Driver for IocpDriver<'a> {
         self.ops.shared.clone()
     }
 
-    fn detached_cancel_table(&self) -> Arc<DetachedCancelTable> {
-        self.detached_cancel_table.clone()
+    fn remote_cancel_queue(&self) -> Arc<RemoteCancelQueue> {
+        self.remote_cancel_queue.clone()
     }
 
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP) {
@@ -207,7 +207,6 @@ impl<'a> Driver for IocpDriver<'a> {
         let ctx = submission::SubmitContextInternal::new(
             completion.port_arc(),
             timer.wheel_mut(),
-            completion.events(),
             completion.table(),
             diagnostics,
         );

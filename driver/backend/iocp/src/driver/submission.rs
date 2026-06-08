@@ -6,7 +6,7 @@ use diagweave::prelude::*;
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
     CompletionCleanupGuard, CompletionToken, DriverCompletionDiagnostics, DriverSubmitResult,
-    OpToken, SharedCompletionQueue, SharedCompletionTable, SubmitStatus,
+    OpToken, SharedCompletionTable, SubmitStatus,
 };
 use veloq_driver_core::slot::{
     CheckedSlotView, Reserved, SlotAccessError, SlotRegistryExt, SlotView,
@@ -23,7 +23,6 @@ use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload, SubmitContext, submit};
 pub(crate) struct SubmitContextInternal<'a> {
     port: Arc<crate::win32::IoCompletionPort>,
     wheel: &'a mut veloq_wheel::Wheel<OpToken>,
-    completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
     diagnostics: &'a mut DriverCompletionDiagnostics,
 }
@@ -32,14 +31,12 @@ impl<'a> SubmitContextInternal<'a> {
     pub(crate) fn new(
         port: Arc<crate::win32::IoCompletionPort>,
         wheel: &'a mut veloq_wheel::Wheel<OpToken>,
-        completion_events: &'a SharedCompletionQueue,
         completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
         diagnostics: &'a mut DriverCompletionDiagnostics,
     ) -> Self {
         Self {
             port,
             wheel,
-            completion_events,
             completion_table,
             diagnostics,
         }
@@ -148,7 +145,6 @@ impl<'a> IocpDriver<'a> {
                     cleanup: CompletionCleanupGuard::default(),
                 };
                 push_completion_shared(
-                    ctx.completion_events,
                     ctx.completion_table,
                     ctx.diagnostics,
                     completion_record(sidecar),

@@ -21,7 +21,47 @@ pub struct DriverCompletionDiagnostics {
     orphan_cleanup_error: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DriverCompletionDiagnosticsSnapshot {
+    pub user_completed: u64,
+    pub user_orphan_completed: u64,
+    pub unknown_completion: u64,
+    pub stale_completion: u64,
+    pub slot_corruption: u64,
+    pub cancel_submitted: u64,
+    pub cancel_ack_ok: u64,
+    pub cancel_ack_not_found: u64,
+    pub cancel_ack_error: u64,
+    pub waker_ok: u64,
+    pub waker_error: u64,
+    pub waker_rebuild: u64,
+    pub completion_rejected: u64,
+    pub internal_unknown: u64,
+    pub orphan_cleanup_error: u64,
+}
+
 impl DriverCompletionDiagnostics {
+    #[inline]
+    pub fn snapshot(&self) -> DriverCompletionDiagnosticsSnapshot {
+        DriverCompletionDiagnosticsSnapshot {
+            user_completed: self.user_completed,
+            user_orphan_completed: self.user_orphan_completed,
+            unknown_completion: self.unknown_completion,
+            stale_completion: self.stale_completion,
+            slot_corruption: self.slot_corruption,
+            cancel_submitted: self.cancel_submitted,
+            cancel_ack_ok: self.cancel_ack_ok,
+            cancel_ack_not_found: self.cancel_ack_not_found,
+            cancel_ack_error: self.cancel_ack_error,
+            waker_ok: self.waker_ok,
+            waker_error: self.waker_error,
+            waker_rebuild: self.waker_rebuild,
+            completion_rejected: self.completion_rejected,
+            internal_unknown: self.internal_unknown,
+            orphan_cleanup_error: self.orphan_cleanup_error,
+        }
+    }
+
     #[inline]
     pub fn inc_user_completed(&mut self) {
         self.user_completed = self.user_completed.saturating_add(1);

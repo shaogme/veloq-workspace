@@ -1,5 +1,4 @@
 use crate::slot;
-use crossbeam_queue::SegQueue;
 use std::sync::Arc;
 use std::task::Waker;
 use veloq_shim::atomic::Ordering;
@@ -10,7 +9,6 @@ use super::{
     decode_completion_token,
 };
 
-pub type SharedCompletionQueue = Arc<SegQueue<CompletionEvent>>;
 pub type SharedCompletionTable<UP, E, R = usize> = Arc<dyn CompletionAccess<UP, E, R>>;
 
 /// Result of a completion poll, enabling detection of recycled slots.
@@ -151,23 +149,10 @@ where
                 }
                 slot::SlotState::InFlightOrphaned => {
                     if cell_gen == generation {
-                        if cell
-                            .core_state
-                            .compare_exchange(
-                                current,
-                                current
-                                    .with_state(slot::SlotState::Idle)
-                                    .with_generation(generation.wrapping_add(1)),
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            return rejected_completion(
-                                RecordCompletionOutcome::OrphanedDropped,
-                                packet,
-                            );
-                        }
+                        return rejected_completion(
+                            RecordCompletionOutcome::OrphanedDropped,
+                            packet,
+                        );
                     } else {
                         return rejected_completion(
                             RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
@@ -250,13 +235,6 @@ where
                     if should_note_ready {
                         self.clear_ready_completion();
                     }
-                    let _ = cell.core_state.compare_exchange(
-                        cur,
-                        cur.with_state(slot::SlotState::Idle)
-                            .with_generation(generation.wrapping_add(1)),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
                     return rejected_completion(RecordCompletionOutcome::OrphanedDropped, packet);
                 } else if should_note_ready {
                     self.clear_ready_completion();

@@ -4,7 +4,7 @@ use io_uring::opcode;
 use tracing::{debug, error, trace};
 use veloq_driver_core::driver::{
     CancelMode, CancelRequest, CancelSubmitOutcome, CompletionCleanupGuard, CompletionSidecar,
-    CompletionToken, OpToken,
+    CompletionToken, OpToken, run_completion_cleanup,
 };
 
 use crate::op::{
@@ -72,8 +72,11 @@ impl<'a> UringDriver<'a> {
                 let sidecar = cancel_slot_immediate(slot, token);
                 if request.mode == CancelMode::UserVisible {
                     self.push_completion_event(sidecar);
+                } else {
+                    let mut cleanup = sidecar.cleanup;
+                    let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
                 }
-                let _ = self.ops.remove_token(token);
+                let _ = self.ops.finalize_orphaned_completion(token);
                 CancelSubmitOutcome::AlreadyComplete
             }
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
@@ -94,8 +97,14 @@ impl<'a> UringDriver<'a> {
                         cleanup: CompletionCleanupGuard::default(),
                     };
                     self.wheel.cancel(tid);
-                    self.push_completion_event(sidecar);
-                    let _ = self.ops.remove_token(token);
+                    if request.mode == CancelMode::UserVisible {
+                        self.push_completion_event(sidecar);
+                    } else {
+                        let mut cleanup = sidecar.cleanup;
+                        let _ =
+                            run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                    }
+                    let _ = self.ops.finalize_orphaned_completion(token);
                     return CancelSubmitOutcome::AlreadyComplete;
                 }
 
@@ -110,8 +119,9 @@ impl<'a> UringDriver<'a> {
                 if let Some(tid) = slot.platform_mut().timer_id {
                     let sidecar = cancel_slot_immediate(slot, token);
                     self.wheel.cancel(tid);
-                    self.push_completion_event(sidecar);
-                    let _ = self.ops.remove_token(token);
+                    let mut cleanup = sidecar.cleanup;
+                    let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                    let _ = self.ops.finalize_orphaned_completion(token);
                     return CancelSubmitOutcome::AlreadyComplete;
                 }
 
@@ -149,10 +159,7 @@ impl<'a> UringDriver<'a> {
                     has_payload = snapshot.has_payload,
                     "cancel request found corrupt slot; recycling"
                 );
-                let _ = self.ops.recycle_token(
-                    OpToken::new(user_data, snapshot.generation),
-                    snapshot.generation.wrapping_add(1),
-                );
+                let _ = self.ops.finalize_corrupt_slot(snapshot);
                 CancelSubmitOutcome::NotFound
             }
         }

@@ -1,6 +1,5 @@
 use crate::slot;
 use crate::slot::SlotSpec as CoreSlotSpec;
-use crate::slot::is_runnable_state;
 use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
 use crate::{DriverError, DriverReport, DriverResult};
 
@@ -99,8 +98,8 @@ impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
     }
 
     #[inline]
-    pub fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable> {
-        self.driver.detached_cancel_table()
+    pub fn remote_cancel_queue(&self) -> Arc<slot::RemoteCancelQueue> {
+        self.driver.remote_cancel_queue()
     }
 
     #[inline]
@@ -169,7 +168,7 @@ pub trait Driver {
 
     fn slot_table(&self) -> SharedDriverSlotTable<Self>;
 
-    fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable>;
+    fn remote_cancel_queue(&self) -> Arc<slot::RemoteCancelQueue>;
 
     #[doc(hidden)]
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP);
@@ -258,8 +257,8 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 
     #[inline]
-    fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable> {
-        self.provider.with_driver_ref(|d| d.detached_cancel_table())
+    fn remote_cancel_queue(&self) -> Arc<slot::RemoteCancelQueue> {
+        self.provider.with_driver_ref(|d| d.remote_cancel_queue())
     }
 
     #[inline]
@@ -340,26 +339,9 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
 
 #[inline]
 pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
-    let shared = driver.slot_table();
-    let cancel_table = driver.detached_cancel_table();
-    let word_count = cancel_table.cancel_word_count();
-    for word_idx in 0..word_count {
-        let mut bits = cancel_table.take_cancel_word(word_idx);
-        while bits != 0 {
-            let bit_idx = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-
-            let user_data = word_idx * 64 + bit_idx;
-            let Some((generation, state)) = shared.slot_snapshot(user_data) else {
-                continue;
-            };
-            if cancel_table.cancel_generation(user_data) == generation as u64
-                && is_runnable_state(state)
-            {
-                let _ =
-                    driver.cancel_op(CancelRequest::abandon(OpToken::new(user_data, generation)));
-            }
-        }
+    let cancel_queue = driver.remote_cancel_queue();
+    while let Some(request) = cancel_queue.pop_cancel() {
+        let _ = driver.cancel_op(request);
     }
 }
 

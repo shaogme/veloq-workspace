@@ -338,6 +338,30 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         true
     }
 
+    #[inline]
+    pub fn finalize_waiting_completion(
+        &mut self,
+        token: OpToken,
+    ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
+        self.remove_token(token)
+    }
+
+    #[inline]
+    pub fn finalize_orphaned_completion(
+        &mut self,
+        token: OpToken,
+    ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
+        self.remove_token(token)
+    }
+
+    #[inline]
+    pub fn finalize_corrupt_slot(
+        &mut self,
+        snapshot: crate::slot::SlotSnapshot,
+    ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
+        self.remove_token(OpToken::new(snapshot.index, snapshot.generation))
+    }
+
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
         if page_idx == 0 {
             let ptr = self.local.as_ptr() as *const u8;
@@ -351,6 +375,11 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     #[inline]
     pub fn has_active_ops(&self) -> bool {
         self.active_count > 0
+    }
+
+    #[inline]
+    pub fn active_count(&self) -> usize {
+        self.active_count
     }
 }
 

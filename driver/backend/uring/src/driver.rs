@@ -18,9 +18,9 @@ use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
     CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome, Driver,
     DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+    SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
-use veloq_driver_core::slot::DetachedCancelTable;
+use veloq_driver_core::slot::RemoteCancelQueue;
 
 mod completion;
 mod lifecycle;
@@ -97,9 +97,8 @@ pub struct UringDriver<'a> {
     pub(crate) pending_cancel_cqes: HashMap<u16, PendingCancel>,
     pub(crate) next_cancel_id: u16,
     pub(crate) completion_diagnostics: DriverCompletionDiagnostics,
-    pub(crate) completion_events: SharedCompletionQueue,
     pub(crate) completion_table: SharedCompletionTable<UringUserPayload, UringError>,
-    pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
+    pub(crate) remote_cancel_queue: Arc<RemoteCancelQueue>,
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_registered_fd: Option<IoFd>,
@@ -172,9 +171,8 @@ impl<'a> UringDriver<'a> {
             pending_cancel_cqes: HashMap::new(),
             next_cancel_id: 1,
             completion_diagnostics: DriverCompletionDiagnostics::default(),
-            completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
             completion_table,
-            detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
+            remote_cancel_queue: Arc::new(RemoteCancelQueue::new(entries as usize)),
             waker_fd: Arc::new(EventFd {
                 // SAFETY: `eventfd` returns a freshly created fd owned by this driver.
                 fd: unsafe {
@@ -263,8 +261,8 @@ impl<'a> Driver for UringDriver<'a> {
         self.ops.shared.clone()
     }
 
-    fn detached_cancel_table(&self) -> std::sync::Arc<DetachedCancelTable> {
-        self.detached_cancel_table.clone()
+    fn remote_cancel_queue(&self) -> std::sync::Arc<RemoteCancelQueue> {
+        self.remote_cancel_queue.clone()
     }
 
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: UringUserPayload) {

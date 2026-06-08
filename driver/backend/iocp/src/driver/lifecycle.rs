@@ -8,7 +8,7 @@ use veloq_buf::BufferRegistrar;
 use veloq_driver_core::driver::{
     CancelRequest, DriverCompletionDiagnostics, OpToken, SharedCompletionTable,
 };
-use veloq_driver_core::slot::{CheckedSlotView, DetachedCancelTable, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{CheckedSlotView, RemoteCancelQueue, SlotRegistryExt, SlotView};
 
 use crate::config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle};
 use crate::error::{IocpError, IocpResult};
@@ -132,7 +132,7 @@ impl<'a> IocpDriver<'a> {
             extensions,
             timer: TimerEngine::new(),
             handles: HandleRegistry::new(),
-            detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
+            remote_cancel_queue: Arc::new(RemoteCancelQueue::new(entries as usize)),
             completion_diagnostics: DriverCompletionDiagnostics::default(),
             rio,
             shutting_down: false,
@@ -298,7 +298,6 @@ impl<'a> IocpDriver<'a> {
                 .push_ctx("scope", "iocp/driver")
                 .attach_note("drain pending iocp timed out")?;
             {
-                let completion_events = self.completion.events();
                 let completion_table = self.completion.table();
                 let (rio_state, registrar) = self.rio.state_and_registrar_mut();
                 rio_state
@@ -307,7 +306,6 @@ impl<'a> IocpDriver<'a> {
                         &mut self.ops,
                         &self.extensions,
                         registrar,
-                        completion_events,
                         completion_table,
                         &mut self.completion_diagnostics,
                     )

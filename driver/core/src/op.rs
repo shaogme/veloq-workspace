@@ -122,7 +122,7 @@ impl<T> Op<T> {
                 let (kernel_op, payload) = data.into_kernel_and_payload();
                 let mut op_platform = Some(kernel_op);
                 let completion_table = slot.completion_table();
-                let cancel_signal = slot.detached_cancel_table();
+                let cancel_signal = slot.remote_cancel_queue();
                 let cancel_waker = slot.create_waker();
                 slot.set_payload(T::payload_into_erased(payload));
 

@@ -10,7 +10,7 @@ use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
 use veloq_driver_core::driver::{
     CompletionPacket, CompletionSidecar, CompletionToken, RecordCompletionOutcome, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, record_user_completion,
+    SharedCompletionTable, record_user_completion,
 };
 
 // ============================================================================
@@ -80,13 +80,12 @@ pub(crate) fn completion_record(
 
 #[inline]
 pub(crate) fn push_completion_shared(
-    queue: &SharedCompletionQueue,
     table: &SharedCompletionTable<IocpUserPayload, IocpError>,
     diagnostics: &mut veloq_driver_core::driver::DriverCompletionDiagnostics,
     packet: CompletionPacket<IocpUserPayload, IocpError>,
 ) -> RecordCompletionOutcome {
     let event = packet.event;
-    let outcome = record_user_completion(queue, table, diagnostics, packet);
+    let outcome = record_user_completion(table, diagnostics, packet);
     match &outcome {
         RecordCompletionOutcome::Recorded | RecordCompletionOutcome::OrphanedDropped => {}
         anomaly => {

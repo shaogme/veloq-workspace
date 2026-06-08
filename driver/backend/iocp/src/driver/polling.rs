@@ -2,13 +2,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_queue::SegQueue;
 use diagweave::prelude::*;
 use tracing::{debug, error, warn};
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionBackend, CompletionDispatch, CompletionToken, OpToken,
-    RawCompletion, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
-    dispatch_raw_completion, drain_cancel_requests, record_completion_anomaly,
+    RawCompletion, RemoteWaker, SharedCompletionTable, dispatch_raw_completion,
+    drain_cancel_requests, record_completion_anomaly,
 };
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
@@ -35,7 +34,6 @@ pub(super) struct CompletionProgress {
 pub(super) struct CompletionPump {
     port: Arc<crate::win32::IoCompletionPort>,
     is_notified: Arc<AtomicBool>,
-    events: SharedCompletionQueue,
     table: SharedCompletionTable<IocpUserPayload, IocpError>,
 }
 
@@ -47,7 +45,6 @@ impl CompletionPump {
         Self {
             port: Arc::new(port),
             is_notified: Arc::new(AtomicBool::new(false)),
-            events: Arc::new(SegQueue::new()),
             table,
         }
     }
@@ -58,10 +55,6 @@ impl CompletionPump {
 
     pub(super) fn port_arc(&self) -> Arc<crate::win32::IoCompletionPort> {
         self.port.clone()
-    }
-
-    pub(super) fn events(&self) -> &SharedCompletionQueue {
-        &self.events
     }
 
     pub(super) fn table(&self) -> &SharedCompletionTable<IocpUserPayload, IocpError> {
@@ -210,7 +203,6 @@ impl<'a> IocpDriver<'a> {
                         &mut self.ops,
                         &self.extensions,
                         registrar,
-                        self.completion.events(),
                         self.completion.table(),
                         &mut self.completion_diagnostics,
                     )

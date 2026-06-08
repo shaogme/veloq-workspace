@@ -33,7 +33,6 @@ impl<'a> IocpDriver<'a> {
         let (user_data, generation) = token.parts();
 
         let emit_ctx = EmitContext {
-            completion_events: self.completion.events(),
             completion_table: self.completion.table(),
         };
 
@@ -260,7 +259,6 @@ impl<'a> IocpDriver<'a> {
 
         let outcome = if emit_completion {
             Some(push_completion_shared(
-                ctx.completion_events,
                 ctx.completion_table,
                 diagnostics,
                 completion_record(CompletionSidecar {

@@ -15,7 +15,7 @@ use veloq_driver_core::driver::{
     CompletionEvent, CompletionPacket, CompletionSidecar, CompletionToken, OpToken, RawCompletion,
     RoutedSlotCompletion, dispatch_raw_completion, drain_cancel_requests,
     record_completion_anomaly, record_lost_completion, record_user_completion,
-    route_checked_slot_completion,
+    route_checked_slot_completion, run_completion_cleanup,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +169,7 @@ impl<'a> UringDriver<'a> {
 
             if let Some(sidecar) = sidecar {
                 self.push_completion_event(sidecar);
-                let _ = self.ops.remove_token(token);
+                let _ = self.ops.finalize_waiting_completion(token);
             }
         }
     }
@@ -247,13 +247,13 @@ impl<'a> UringDriver<'a> {
             RoutedSlotCompletion::Waiting(slot) => {
                 let sidecar = complete_waiting_slot(slot, token, raw.res, raw.flags);
                 self.push_completion_event(sidecar);
-                let _ = self.ops.remove_token(token);
+                let _ = self.ops.finalize_waiting_completion(token);
                 1
             }
             RoutedSlotCompletion::Orphaned(slot) => {
-                let sidecar = complete_orphaned_slot(slot, token, raw.res, raw.flags);
-                self.push_completion_event(sidecar);
-                let _ = self.ops.remove_token(token);
+                let mut cleanup = cleanup_orphaned_slot(slot, raw.res);
+                let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                let _ = self.ops.finalize_orphaned_completion(token);
                 1
             }
             RoutedSlotCompletion::Corrupt(anomaly) => {
@@ -412,16 +412,13 @@ impl<'a> UringDriver<'a> {
             flags,
         };
         let _ = record_lost_completion(
-            &self.completion_events,
             &self.completion_table,
             &mut self.completion_diagnostics,
             event,
             anomaly,
             cleanup,
         );
-        if let Some(token) = event.token.op_token() {
-            let _ = self.ops.remove_token(token);
-        }
+        let _ = self.ops.finalize_corrupt_slot(snapshot);
     }
 
     pub(crate) fn push_completion_event(
@@ -430,7 +427,6 @@ impl<'a> UringDriver<'a> {
     ) {
         let packet = CompletionPacket::from(sidecar);
         let _ = record_user_completion(
-            &self.completion_events,
             &self.completion_table,
             &mut self.completion_diagnostics,
             packet,
@@ -512,14 +508,11 @@ fn complete_waiting_slot(
     }
 }
 
-fn complete_orphaned_slot(
+fn cleanup_orphaned_slot(
     slot: crate::op::slot::Slot<'_, veloq_driver_core::slot::InFlightOrphaned>,
-    token: OpToken,
     cqe_res: i32,
-    cqe_flags: u32,
-) -> CompletionSidecar<UringUserPayload, UringError> {
+) -> CompletionCleanupGuard {
     let mut completed = slot.complete();
-    let generation = completed.entry.generation(Ordering::Acquire);
     let cleanup = completed
         .op
         .as_mut()
@@ -527,15 +520,9 @@ fn complete_orphaned_slot(
         .unwrap_or_default();
     let (payload, detail) = completed.take_completion_data();
     let _ = completed.take_op();
-
-    CompletionSidecar::<UringUserPayload, UringError> {
-        token: OpToken::new(token.index(), generation),
-        res: cqe_res,
-        flags: cqe_flags,
-        payload,
-        detail,
-        cleanup,
-    }
+    drop(payload);
+    drop(detail);
+    cleanup
 }
 
 #[inline]

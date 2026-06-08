@@ -20,9 +20,9 @@ use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionBackend, CompletionEvent, CompletionPacket, CompletionToken,
-    DriverCompletionDiagnostics, RawCompletion, RoutedSlotCompletion, SharedCompletionQueue,
-    SharedCompletionTable, record_completion_anomaly, record_lost_completion,
-    route_checked_slot_completion,
+    DriverCompletionDiagnostics, RawCompletion, RoutedSlotCompletion, SharedCompletionTable,
+    record_completion_anomaly, record_lost_completion, route_checked_slot_completion,
+    run_completion_cleanup,
 };
 use veloq_driver_core::slot::SlotRegistryExt;
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -122,14 +122,13 @@ impl<'a> RioCompletionRouter<'a> {
                     let _ = guard.take_completion_data();
                     drop(guard);
                     let _ = record_lost_completion(
-                        self.comp.events,
                         self.comp.table,
                         self.comp.diagnostics,
                         raw.event(),
                         anomaly,
                         cleanup,
                     );
-                    let _ = ops.remove_token(op_token);
+                    let _ = ops.finalize_corrupt_slot(snapshot);
                 } else {
                     let cancelled = slot.platform().rio_cancel_requested;
                     let mut completion = if cancelled {
@@ -197,14 +196,13 @@ impl<'a> RioCompletionRouter<'a> {
                         };
 
                         let outcome = push_completion_shared(
-                            self.comp.events,
                             self.comp.table,
                             self.comp.diagnostics,
                             CompletionPacket::new(event, payload, detail.or(Some(completion))),
                         );
                         let _ = outcome;
                     }
-                    let _ = ops.remove_token(op_token);
+                    let _ = ops.finalize_waiting_completion(op_token);
                 }
             }
             RoutedSlotCompletion::Orphaned(mut slot) => {
@@ -241,15 +239,9 @@ impl<'a> RioCompletionRouter<'a> {
                     let _ = guard.take_completion_data();
                     let _ = std::mem::take(guard.platform_mut());
                     drop(guard);
-                    let _ = record_lost_completion(
-                        self.comp.events,
-                        self.comp.table,
-                        self.comp.diagnostics,
-                        raw.event(),
-                        anomaly,
-                        cleanup,
-                    );
-                    let _ = ops.recycle_token(op_token, generation.wrapping_add(1));
+                    let mut cleanup = cleanup;
+                    let _ = run_completion_cleanup(self.comp.diagnostics, &mut cleanup);
+                    let _ = ops.finalize_orphaned_completion(op_token);
                 } else {
                     let mut guard = slot.complete();
                     let orphan_result = if res.Status == 0 {
@@ -272,22 +264,9 @@ impl<'a> RioCompletionRouter<'a> {
                     let _ = guard.take_completion_data();
                     let _ = std::mem::take(guard.platform_mut());
                     drop(guard);
-                    let anomaly = CompletionAnomaly::non_active(
-                        completion_token,
-                        user_data,
-                        generation,
-                        veloq_driver_core::slot::SlotState::InFlightOrphaned,
-                    )
-                    .with_raw_completion(raw);
-                    let _ = record_lost_completion(
-                        self.comp.events,
-                        self.comp.table,
-                        self.comp.diagnostics,
-                        raw.event(),
-                        anomaly,
-                        cleanup,
-                    );
-                    let _ = ops.recycle_token(op_token, generation.wrapping_add(1));
+                    let mut cleanup = cleanup;
+                    let _ = run_completion_cleanup(self.comp.diagnostics, &mut cleanup);
+                    let _ = ops.finalize_orphaned_completion(op_token);
                 }
             }
             RoutedSlotCompletion::Corrupt(anomaly) => {
@@ -296,7 +275,9 @@ impl<'a> RioCompletionRouter<'a> {
                     user_data,
                     generation, "RIO completion found corrupt or reserved slot"
                 );
-                let _ = ops.recycle_token(op_token, generation.wrapping_add(1));
+                if let Some(snapshot) = anomaly.slot_snapshot {
+                    let _ = ops.finalize_corrupt_slot(snapshot);
+                }
             }
             RoutedSlotCompletion::Missing(anomaly) => {
                 record_completion_anomaly(self.comp.diagnostics, &anomaly);
@@ -467,18 +448,10 @@ impl RioState {
         ops: &mut IocpOpRegistry,
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
         diagnostics: &mut DriverCompletionDiagnostics,
     ) -> RioResult<usize> {
-        self.process_completions_internal(
-            ops,
-            ext,
-            registrar,
-            completion_events,
-            completion_table,
-            diagnostics,
-        )
+        self.process_completions_internal(ops, ext, registrar, completion_table, diagnostics)
     }
 
     fn process_completions_internal(
@@ -486,7 +459,6 @@ impl RioState {
         ops: &mut IocpOpRegistry,
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
         diagnostics: &mut DriverCompletionDiagnostics,
     ) -> RioResult<usize> {
@@ -501,7 +473,6 @@ impl RioState {
             RioCompletionContext {
                 ops,
                 ext,
-                events: completion_events,
                 table: completion_table,
                 diagnostics,
             },
@@ -540,7 +511,6 @@ impl RioState {
         ops: &mut IocpOpRegistry,
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        completion_events: &SharedCompletionQueue,
         completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
         diagnostics: &mut DriverCompletionDiagnostics,
     ) -> RioResult<()> {
@@ -562,14 +532,8 @@ impl RioState {
                     .attach_note("strict close timed out while draining RIO outstanding requests");
             }
 
-            let processed = self.process_completions(
-                ops,
-                ext,
-                registrar,
-                completion_events,
-                completion_table,
-                diagnostics,
-            )?;
+            let processed =
+                self.process_completions(ops, ext, registrar, completion_table, diagnostics)?;
             if processed == 0 {
                 std::thread::yield_now();
             }

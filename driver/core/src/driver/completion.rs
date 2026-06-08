@@ -8,12 +8,12 @@ mod types;
 use crate::slot::{self, CheckedSlotView, SlotView};
 pub use table::{
     CELL_STATE_BUSY, CELL_STATE_IDLE, CELL_STATE_ORPHANED, CELL_STATE_READY, CELL_STATE_WAITING,
-    CompletionAccess, PollRecordResult, SharedCompletionQueue, SharedCompletionTable,
+    CompletionAccess, PollRecordResult, SharedCompletionTable,
 };
 pub use types::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanup,
-    CompletionCleanupGuard, DriverCompletionDiagnostics, RecordCompletionOutcome,
-    RecordCompletionResult,
+    CompletionCleanupGuard, DriverCompletionDiagnostics, DriverCompletionDiagnosticsSnapshot,
+    RecordCompletionOutcome, RecordCompletionResult,
 };
 
 pub trait CompletionValue: Send {
@@ -121,16 +121,6 @@ pub enum CompletionDispatch {
     Cancel { id: u16, raw: RawCompletion },
     RioWake { id: u16, raw: RawCompletion },
     Unknown { raw: RawCompletion },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionRoute {
-    Waiting,
-    Orphaned,
-    Missing(CompletionAnomaly),
-    Empty(CompletionAnomaly),
-    Stale(CompletionAnomaly),
-    Corrupt(CompletionAnomaly),
 }
 
 pub enum RoutedSlotCompletion<'a, Spec: slot::SlotSpec> {
@@ -653,7 +643,6 @@ pub fn record_completion_anomaly(
 
 #[inline]
 pub fn record_user_completion<UP, E, R>(
-    queue: &SharedCompletionQueue,
     table: &SharedCompletionTable<UP, E, R>,
     diagnostics: &mut DriverCompletionDiagnostics,
     packet: CompletionPacket<UP, E, R>,
@@ -663,18 +652,15 @@ where
     E: Send,
     R: Send,
 {
-    let event = packet.event;
     match table.record_completion(packet) {
         RecordCompletionResult::Recorded => {
             let outcome = RecordCompletionOutcome::Recorded;
             diagnostics.record_completion_outcome(&outcome);
-            queue.push(event);
             outcome
         }
         RecordCompletionResult::Rejected { outcome, packet } => {
             diagnostics.record_completion_outcome(&outcome);
             run_rejected_cleanup(diagnostics, packet);
-            queue.push(event);
             outcome
         }
     }
@@ -682,7 +668,6 @@ where
 
 #[inline]
 pub fn record_lost_completion<UP, E, R>(
-    queue: &SharedCompletionQueue,
     table: &SharedCompletionTable<UP, E, R>,
     diagnostics: &mut DriverCompletionDiagnostics,
     event: CompletionEvent,
@@ -695,7 +680,6 @@ where
     R: Send,
 {
     record_user_completion(
-        queue,
         table,
         diagnostics,
         CompletionPacket::lost(event, anomaly, cleanup),

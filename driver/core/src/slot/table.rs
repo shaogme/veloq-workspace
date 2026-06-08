@@ -1,75 +1,32 @@
-use crate::slot::core::{SlotData, SlotState};
+use crate::driver::CancelRequest;
+use crate::slot::core::SlotData;
 use crate::slot::{SlotCompletion, SlotError, SlotSpec};
+use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
-use veloq_shim::atomic::{AtomicU64, AtomicUsize, Ordering};
+use veloq_shim::atomic::{AtomicUsize, Ordering};
 
 pub type SlotEntry<Spec> = CachePadded<SlotData<Spec>>;
 pub type SlotEntries<Spec> = Box<[SlotEntry<Spec>]>;
 
-pub struct DetachedCancelTable {
-    slot_count: usize,
-    cancel_words: Box<[CachePadded<AtomicU64>]>,
-    cancel_generations: Box<[CachePadded<AtomicU64>]>,
+pub struct RemoteCancelQueue {
+    requests: SegQueue<CancelRequest>,
 }
 
-impl DetachedCancelTable {
-    pub fn new(capacity: usize) -> Self {
-        let word_count = capacity.div_ceil(64);
-        let mut cancel_words = Vec::with_capacity(word_count);
-        for _ in 0..word_count {
-            cancel_words.push(CachePadded::new(AtomicU64::new(0)));
-        }
-        let mut cancel_generations = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            cancel_generations.push(CachePadded::new(AtomicU64::new(0)));
-        }
+impl RemoteCancelQueue {
+    pub fn new(_capacity: usize) -> Self {
         Self {
-            slot_count: capacity,
-            cancel_words: cancel_words.into_boxed_slice(),
-            cancel_generations: cancel_generations.into_boxed_slice(),
+            requests: SegQueue::new(),
         }
     }
 
     #[inline]
-    pub fn request_cancel(&self, token: crate::driver::OpToken) {
-        let (idx, generation) = token.parts();
-        if idx >= self.slot_count {
-            return;
-        }
-
-        let generation = generation as u64;
-        let cell = &self.cancel_generations[idx];
-        let mut current = cell.load(Ordering::Acquire);
-        while generation > current {
-            match cell.compare_exchange_weak(
-                current,
-                generation,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(next) => current = next,
-            }
-        }
-
-        let word_idx = idx / 64;
-        let bit_idx = idx % 64;
-        self.cancel_words[word_idx].fetch_or(1u64 << bit_idx, Ordering::Release);
+    pub fn request_cancel(&self, request: CancelRequest) {
+        self.requests.push(request);
     }
 
     #[inline]
-    pub fn cancel_word_count(&self) -> usize {
-        self.cancel_words.len()
-    }
-
-    #[inline]
-    pub fn take_cancel_word(&self, word_idx: usize) -> u64 {
-        self.cancel_words[word_idx].fetch_and(0, Ordering::AcqRel)
-    }
-
-    #[inline]
-    pub(crate) fn cancel_generation(&self, idx: usize) -> u64 {
-        self.cancel_generations[idx].load(Ordering::Acquire)
+    pub fn pop_cancel(&self) -> Option<CancelRequest> {
+        self.requests.pop()
     }
 }
 
@@ -122,14 +79,6 @@ impl<Spec: SlotSpec> SlotTable<Spec> {
     pub fn pop_all(&self) -> usize {
         self.remote_free_head
             .swap(Self::NULL_INDEX, Ordering::Acquire)
-    }
-
-    #[inline]
-    pub(crate) fn slot_snapshot(&self, idx: usize) -> Option<(u32, SlotState)> {
-        self.slots.get(idx).map(|slot| {
-            let core = slot.load_core_state(Ordering::Acquire);
-            (core.generation(), core.state())
-        })
     }
 
     /// 检查是否存在已完成但尚未被消费的完成项。

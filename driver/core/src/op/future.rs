@@ -13,7 +13,7 @@ use crate::driver::{
     SharedCompletionTable, SubmitStatus, event_res_to_result,
 };
 use crate::op::{IntoPlatformOp, Op};
-use crate::slot::DetachedCancelTable;
+use crate::slot::RemoteCancelQueue;
 use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
 
 use diagweave::prelude::*;
@@ -267,7 +267,7 @@ where
     T: IntoPlatformOp<O, DriverCompletion = C, Error = E>,
 {
     pub(crate) completion_table: Option<SharedCompletionTable<T::ErasedPayload, E, C>>,
-    pub(crate) cancel_signal: Option<Arc<DetachedCancelTable>>,
+    pub(crate) cancel_signal: Option<Arc<RemoteCancelQueue>>,
     pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<E>>>,
     pub(crate) token: Option<OpToken>,
     pub(crate) immediate_failure: Option<(DriverReport<E>, T::UserPayload)>,
@@ -297,7 +297,7 @@ where
                 table.mark_orphaned(CompletionToken::user(token));
             }
             if let Some(cancel_signal) = self.cancel_signal.as_ref() {
-                cancel_signal.request_cancel(token);
+                cancel_signal.request_cancel(CancelRequest::abandon(token));
             }
         }
         if let Some(cancel_waker) = self.cancel_waker.as_ref()
