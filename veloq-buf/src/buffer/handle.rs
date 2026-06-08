@@ -8,6 +8,7 @@ use bilge::prelude::*;
 
 use super::common::{PoolKind, RegionInfo};
 use super::error::{BufError, BufResult};
+use crate::heap::ChunkId;
 use diagweave::prelude::*;
 
 #[bitsize(64)]
@@ -291,7 +292,7 @@ pub(crate) fn heap_resolve_region_info(buf: &FixedBuf) -> RegionInfo {
 
     RegionInfo {
         pool_kind: PoolKind::Heap,
-        id: 0,
+        id: ChunkId::ZERO,
         offset: ptr.saturating_sub(base),
         cookie: buf.context_raw(),
     }

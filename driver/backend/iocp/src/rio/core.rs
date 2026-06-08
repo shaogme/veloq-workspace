@@ -288,6 +288,7 @@ pub(crate) struct RioSubmissionLease<'a> {
     state: &'a mut RioState,
     request: RioPreparedRequest,
     submitted: bool,
+    buffer_ref_acquired: bool,
 }
 
 impl RioPreparedRequest {
@@ -379,9 +380,34 @@ impl<'a> RioSubmissionLease<'a> {
         mut self,
         submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
     ) -> RioResult<SubmissionResult> {
+        self.acquire_buffer_ref()?;
         submit(&self.state.kernel, &self.request)?;
         self.commit_submitted();
         Ok(SubmissionResult::Pending)
+    }
+
+    fn acquire_buffer_ref(&mut self) -> RioResult<()> {
+        if self.buffer_ref_acquired {
+            return Ok(());
+        }
+        self.state
+            .registry
+            .acquire_buffer_lease(self.request.data_buf.lease)
+            .push_ctx("scope", "rio.core.submission.acquire_buffer_lease")
+            .with_ctx("rio_op_kind", self.request.op_kind.as_str())
+            .with_ctx("rio_request_id", self.request.request_id)
+            .with_ctx("data_buffer_id", self.request.diagnostics.data_buffer_id)
+            .with_ctx(
+                "data_buffer_offset",
+                self.request.diagnostics.data_buffer_offset,
+            )
+            .with_ctx(
+                "data_buffer_length",
+                self.request.diagnostics.data_buffer_length,
+            )
+            .attach_note("failed to acquire RIO buffer lease before kernel submit")?;
+        self.buffer_ref_acquired = true;
+        Ok(())
     }
 
     fn commit_submitted(&mut self) {
@@ -390,11 +416,42 @@ impl<'a> RioSubmissionLease<'a> {
         }
         let submitted_context = self.request.mark_submitted();
         debug_assert!(!submitted_context.as_request_context().is_null());
-        self.state
-            .registry
-            .commit_buffer_lease(self.request.data_buf.lease);
         self.state.outstanding_count += 1;
         self.submitted = true;
+    }
+
+    fn rollback_buffer_ref(&mut self) {
+        if !self.buffer_ref_acquired {
+            return;
+        }
+
+        let release = if let Some(env) = self
+            .state
+            .kernel
+            .env(&veloq_buf::NoopRegistrar, self.state.registration_mode)
+        {
+            self.state
+                .registry
+                .release_buffer_lease(self.request.data_buf.lease, env)
+        } else {
+            self.state
+                .registry
+                .release_buffer_lease_deferred(self.request.data_buf.lease)
+        };
+
+        match release {
+            Ok(()) => {
+                self.buffer_ref_acquired = false;
+            }
+            Err(error) => {
+                tracing::error!(
+                    report = ?error,
+                    rio_op_kind = self.request.op_kind.as_str(),
+                    rio_request_id = self.request.request_id,
+                    "failed to roll back unsubmitted RIO buffer lease"
+                );
+            }
+        }
     }
 }
 
@@ -403,6 +460,7 @@ impl Drop for RioSubmissionLease<'_> {
         if self.submitted {
             return;
         }
+        self.rollback_buffer_ref();
         self.state
             .registry
             .free_addr_slot(self.request.addr.map(|addr| addr.slot));
@@ -561,6 +619,7 @@ impl RioState {
             state: self,
             request,
             submitted: false,
+            buffer_ref_acquired: false,
         }
     }
 

@@ -17,29 +17,17 @@ pub struct Config {
     queue_capacity: NonZeroUsize,
 }
 
+#[cfg(not(windows))]
 impl AsRef<UringConfig> for Config {
     fn as_ref(&self) -> &UringConfig {
-        #[cfg(not(windows))]
-        {
-            &self.uring
-        }
-        #[cfg(windows)]
-        {
-            unreachable!("this function should only be called on non-windows platforms");
-        }
+        &self.uring
     }
 }
 
+#[cfg(windows)]
 impl AsRef<IocpConfig> for Config {
     fn as_ref(&self) -> &IocpConfig {
-        #[cfg(windows)]
-        {
-            &self.iocp
-        }
-        #[cfg(not(windows))]
-        {
-            unreachable!("this function should only be called on windows");
-        }
+        &self.iocp
     }
 }
 

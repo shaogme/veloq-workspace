@@ -9,7 +9,7 @@ use super::any::AnyBufPool;
 use super::common::{
     AllocResult, BackingPool, BufPool, BufferRegion, BufferRegistrar, PoolKind, RegionInfo,
 };
-use super::error::BufResult;
+use super::error::{BufError, BufResult};
 use super::handle::{FixedBuf, PackedContext};
 
 /// 定义 Runtime 所有工作线程的缓冲池拓扑结构
@@ -40,8 +40,8 @@ pub trait PoolTopology: Clone + Send + Sync {
         &self,
         state: &Self::State,
         worker_idx: usize,
-        registrar: Box<dyn BufferRegistrar + '_>,
-    ) -> AnyBufPool;
+        registrar: &dyn BufferRegistrar,
+    ) -> BufResult<AnyBufPool>;
 
     /// Connect a listener to the shared state to receive notifications about new memory chunks.
     /// Used for dynamic expansion.
@@ -91,20 +91,24 @@ impl PoolTopology for UniformSlot {
         &self,
         pool: &Self::State,
         worker_idx: usize,
-        registrar: Box<dyn BufferRegistrar + '_>,
-    ) -> AnyBufPool {
+        registrar: &dyn BufferRegistrar,
+    ) -> BufResult<AnyBufPool> {
         // 在 Slot 架构中，所有线程共享一个大的连续区域
-        // Phase 1: For now, we only register the initial chunk (Chunk 0).
-        let global_info = pool.chunk_info(0).expect("Chunk 0 missing");
-        let region = BufferRegion::new(global_info.ptr, global_info.len);
+        let regions = pool
+            .chunk_infos()
+            .into_iter()
+            .map(|info| {
+                BufferRegion::from_chunk_info(info).ok_or(BufError::PageUnaligned {
+                    size: info.len.get(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // 注册内存区域
-        let _ids = registrar
-            .register(&[region])
-            .expect("Failed to register global buffer region (check 'ulimit -l' / RLIMIT_MEMLOCK)");
+        let _ids = registrar.register(&regions)?;
 
         let slot_pool = SlotBasedPool::with_seed(pool.clone(), worker_idx);
-        AnyBufPool::new(slot_pool)
+        Ok(AnyBufPool::new(slot_pool))
     }
 
     fn connect_listener(
@@ -216,9 +220,9 @@ impl BackingPool for SlotBasedPool {
         if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order, self.seed) {
             let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
             let context_data = PackedContext::new(
-                slot_idx.0 as u32,
+                slot_idx.get() as u32,
                 order as u8,
-                chunk_id,
+                chunk_id.get(),
                 PoolKind::SlotBased,
             );
             let context = u64::from(context_data);
@@ -342,7 +346,7 @@ pub(crate) unsafe fn slot_based_resolve_region_info(
 
     // 2. Unpack ChunkID
     let ctx = PackedContext::from(buf.context_raw());
-    let chunk_id = ctx.chunk_id();
+    let chunk_id = crate::heap::ChunkId::from(ctx.chunk_id());
 
     // 3. Get base address from ChunkInfo
     let chunk_info = pool

@@ -76,6 +76,14 @@ impl IdleDecision {
     pub fn is_continue(self) -> bool {
         matches!(self, Self::Continue)
     }
+
+    #[inline]
+    pub(crate) fn into_wait_strategy(self) -> Option<IdleWaitStrategy> {
+        match self {
+            Self::Continue => None,
+            Self::Wait(strategy) => Some(strategy),
+        }
+    }
 }
 
 pub struct RuntimeContext {
@@ -439,11 +447,9 @@ mod tests {
     #[test]
     fn idle_decision_wait_wraps_strategy() {
         let decision = IdleDecision::wait(IdleWaitStrategy::timeout(Duration::from_millis(5)));
-        match decision {
-            IdleDecision::Wait(IdleWaitStrategy::Timeout(duration)) => {
-                assert_eq!(duration, Duration::from_millis(5));
-            }
-            _ => panic!("unexpected idle decision"),
-        }
+        assert_eq!(
+            decision.into_wait_strategy(),
+            Some(IdleWaitStrategy::Timeout(Duration::from_millis(5)))
+        );
     }
 }

@@ -355,10 +355,10 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             .idle_hook
             .map(|h| h(self.shared))
             .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block));
-        if idle_decision.is_continue() {
+        let Some(wait_strategy) = idle_decision.into_wait_strategy() else {
             std::thread::yield_now();
             return;
-        }
+        };
 
         let base = &self.shared.base;
         let group_idx = base.topo.worker_to_group[self.worker_id];
@@ -379,7 +379,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             return;
         }
 
-        self.park(idle_decision, completion);
+        self.park(wait_strategy, completion);
         self.leave_idle(group_idx);
     }
 
@@ -397,23 +397,22 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
 
     fn park<S: Storage, O: Ownership>(
         &self,
-        idle_decision: IdleDecision,
+        wait_strategy: IdleWaitStrategy,
         completion: Option<&GenericScopeCompletion<S, O>>,
     ) {
         let base = &self.shared.base;
         let parker = Parker::from_inner(base.registry.parker_inners[self.worker_id].clone());
-        match idle_decision {
-            IdleDecision::Wait(IdleWaitStrategy::Timeout(duration)) => {
+        match wait_strategy {
+            IdleWaitStrategy::Timeout(duration) => {
                 let _ = parker.park_timeout(duration);
             }
-            IdleDecision::Wait(IdleWaitStrategy::Block) => {
+            IdleWaitStrategy::Block => {
                 if completion.is_some() {
                     let _ = parker.park_timeout(Duration::from_millis(1));
                 } else {
                     parker.park();
                 }
             }
-            IdleDecision::Continue => unreachable!(),
         }
     }
 

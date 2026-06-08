@@ -169,7 +169,9 @@ impl<T: PoolTopology> Runtime<T> {
                         state: &registrar_state,
                         registration_mode,
                     };
-                    topology.build(&state, worker_id, Box::new(borrowed_registrar))
+                    topology
+                        .build(&state, worker_id, &borrowed_registrar)
+                        .expect("failed to build worker buffer pool")
                 };
 
                 WorkerState {

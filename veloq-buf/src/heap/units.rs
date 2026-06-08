@@ -6,7 +6,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 2MB minimum memory per thread (Huge Page aligned)
-pub const MIN_THREAD_MEMORY: NonZeroUsize = crate::nz!(2 * 1024 * 1024);
+pub(crate) const MIN_THREAD_MEMORY: NonZeroUsize = crate::nz!(2 * 1024 * 1024);
 
 /// Multiplier for thread memory scaling.
 /// Each unit represents `MIN_THREAD_MEMORY` (2MB).
@@ -20,10 +20,60 @@ pub struct GlobalAllocatorConfig {
     pub total_memory: usize,
 }
 
+/// Chunk identifier within a [`GlobalSlotPool`](crate::heap::GlobalSlotPool).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct ChunkId(pub(crate) u16);
+
+impl ChunkId {
+    pub(crate) const ZERO: Self = Self(0);
+
+    #[inline]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+
+    #[inline]
+    pub(crate) fn from_index(index: usize) -> Option<Self> {
+        u16::try_from(index).ok().map(Self)
+    }
+}
+
+impl From<u16> for ChunkId {
+    #[inline]
+    fn from(value: u16) -> Self {
+        Self(value)
+    }
+}
+
+impl PartialEq<u16> for ChunkId {
+    #[inline]
+    fn eq(&self, other: &u16) -> bool {
+        self.0 == *other
+    }
+}
+
+impl fmt::Debug for ChunkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Chunk(#{})", self.0)
+    }
+}
+
+impl fmt::Display for ChunkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Information about a memory chunk (God View)
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkInfo {
-    pub id: u16,
+    pub id: ChunkId,
     pub ptr: NonNull<u8>,
     pub len: NonZeroUsize,
 }
@@ -36,12 +86,106 @@ unsafe impl Sync for ChunkInfo {}
 
 /// Standard Slot Size: 4KB
 /// Aligned with the physical page size of most architectures (x86_64/AArch64)
-pub const SLOT_SIZE: usize = 4096;
+pub(crate) const SLOT_SIZE: usize = 4096;
 
-/// Calculate the number of slots required for a given size
-#[inline]
-pub const fn slots_needed(size: usize) -> usize {
-    size.div_ceil(SLOT_SIZE)
+/// A non-zero byte count that is aligned to the slot/page size.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct PageAlignedBytes(NonZeroUsize);
+
+impl PageAlignedBytes {
+    #[inline]
+    pub(crate) const fn new(size: NonZeroUsize) -> Option<Self> {
+        if size.get().is_multiple_of(SLOT_SIZE) {
+            Some(Self(size))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_usize(size: usize) -> Option<Self> {
+        NonZeroUsize::new(size).and_then(Self::new)
+    }
+
+    #[inline]
+    pub(crate) const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    #[inline]
+    pub(crate) const fn as_non_zero(self) -> NonZeroUsize {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) const fn slot_count(self) -> SlotCount {
+        SlotCount(self.get() / SLOT_SIZE)
+    }
+}
+
+impl fmt::Debug for PageAlignedBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}B", self.get())
+    }
+}
+
+/// Number of slots.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct SlotCount(usize);
+
+impl SlotCount {
+
+    #[inline]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) const fn bytes(self) -> usize {
+        self.0 * SLOT_SIZE
+    }
+
+    #[inline]
+    pub(crate) const fn superblock_count(self) -> usize {
+        self.0 / SUPERBLOCK_SIZE
+    }
+
+    #[inline]
+    pub(crate) const fn per_shard(self, shard_count: usize) -> Self {
+        Self(self.0 / shard_count)
+    }
+}
+
+impl fmt::Debug for SlotCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} slots", self.0)
+    }
+}
+
+/// Shard index inside a chunk.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub(crate) struct ShardIndex(usize);
+
+impl ShardIndex {
+    #[inline]
+    pub(crate) const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+
+}
+
+impl fmt::Debug for ShardIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Shard(#{})", self.0)
+    }
 }
 
 /// Slot Index
@@ -50,7 +194,7 @@ pub const fn slots_needed(size: usize) -> usize {
 /// Range: [0, total_slots)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct SlotIndex(pub usize);
+pub(crate) struct SlotIndex(pub usize);
 
 impl fmt::Debug for SlotIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -59,23 +203,90 @@ impl fmt::Debug for SlotIndex {
 }
 
 impl SlotIndex {
+    #[inline]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+
     /// Calculate the memory offset (byte offset) corresponding to the Slot
-    pub fn offset(&self) -> usize {
+    #[inline]
+    pub(crate) fn offset(&self) -> usize {
         self.0 * SLOT_SIZE
     }
 
     /// Convert from byte offset to Slot Index
-    pub fn from_offset(offset: usize) -> Self {
+    #[inline]
+    pub(crate) fn from_offset(offset: usize) -> Self {
         Self(offset / SLOT_SIZE)
+    }
+
+    #[inline]
+    pub(crate) const fn from_shard_local(
+        shard: ShardIndex,
+        slots_per_shard: SlotCount,
+        local: Self,
+    ) -> Self {
+        Self(shard.get() * slots_per_shard.get() + local.get())
+    }
+
+    #[inline]
+    pub(crate) const fn shard_local(self, slots_per_shard: SlotCount) -> (ShardIndex, Self) {
+        (
+            ShardIndex(self.0 / slots_per_shard.get()),
+            Self(self.0 % slots_per_shard.get()),
+        )
+    }
+
+    #[inline]
+    pub(crate) const fn superblock_index(self) -> SuperblockIndex {
+        SuperblockIndex(self.0 / SUPERBLOCK_SIZE)
+    }
+
+    #[inline]
+    pub(crate) const fn superblock_offset(self) -> u16 {
+        (self.0 % SUPERBLOCK_SIZE) as u16
+    }
+
+    #[inline]
+    pub(crate) const fn from_superblock_offset(sb_idx: SuperblockIndex, offset: u16) -> Self {
+        Self(sb_idx.get() * SUPERBLOCK_SIZE + offset as usize)
     }
 }
 
 // --- From superblock.rs ---
 
 /// Order of the Superblock (64 Slots = 2^6)
-pub const SUPERBLOCK_ORDER: usize = 6;
+pub(crate) const SUPERBLOCK_ORDER: usize = 6;
 /// Number of slots in a Superblock
-pub const SUPERBLOCK_SIZE: usize = 1 << SUPERBLOCK_ORDER;
+pub(crate) const SUPERBLOCK_SIZE: usize = 1 << SUPERBLOCK_ORDER;
+
+/// Superblock index inside a chunk.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub(crate) struct SuperblockIndex(usize);
+
+impl SuperblockIndex {
+    #[inline]
+    pub(crate) const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) const fn base_slot(self) -> SlotIndex {
+        SlotIndex(self.0 * SUPERBLOCK_SIZE)
+    }
+}
+
+impl fmt::Debug for SuperblockIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Superblock(#{})", self.0)
+    }
+}
 
 /// State of a Superblock
 ///
@@ -100,7 +311,7 @@ impl Default for SuperblockState {
 }
 
 impl SuperblockState {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             // Initialize to 0 (All Used).
             // This is "safe" because the superblock is Inactive.
@@ -112,13 +323,13 @@ impl SuperblockState {
     }
 
     /// Reset state for reuse (Called when acquiring from Buddy)
-    pub fn init(&self) {
+    pub(crate) fn init(&self) {
         self.free_mask.store(u64::MAX, Ordering::Release);
         self.is_active.store(true, Ordering::Release);
     }
 
     /// Try to allocate one slot `(0..63)`.
-    pub fn alloc_one(&self) -> Option<u16> {
+    pub(crate) fn alloc_one(&self) -> Option<u16> {
         let mut old = self.free_mask.load(Ordering::Relaxed);
         loop {
             if old == 0 {
@@ -141,7 +352,7 @@ impl SuperblockState {
     /// Mark a slot as free.
     /// Returns `true` if the superblock is NOW eligible for return to Buddy System.
     /// (i.e., it is Empty AND Not Active).
-    pub fn free_one(&self, idx: u16) -> bool {
+    pub(crate) fn free_one(&self, idx: u16) -> bool {
         let mask = 1u64 << idx;
 
         // SeqCst is required here to synchronize with `set_inactive`.
@@ -161,7 +372,7 @@ impl SuperblockState {
 
     /// Mark the superblock as inactive (Thread gave up on it).
     /// Returns `true` if the superblock is Empty and should be returned to Buddy System.
-    pub fn set_inactive(&self) -> bool {
+    pub(crate) fn set_inactive(&self) -> bool {
         // SeqCst required.
         self.is_active.store(false, Ordering::SeqCst);
 

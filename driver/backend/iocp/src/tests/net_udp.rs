@@ -35,7 +35,7 @@ fn register_buf_chunk(
         .chunk_info(region.id)
         .unwrap_or_else(|| panic!("{label} chunk not found"));
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_chunk(region.id.get(), chunk.ptr.as_ptr(), chunk.len.get())
         .unwrap_or_else(|_| panic!("register {label} chunk failed"));
 }
 
@@ -63,7 +63,9 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     let mut send_buf = reg_pool
         .alloc(std::num::NonZeroUsize::new(8192).unwrap())
@@ -138,7 +140,9 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     let mut send_buf = reg_pool
         .alloc(std::num::NonZeroUsize::new(8192).unwrap())
@@ -199,7 +203,9 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     let recv_buf = reg_pool
         .alloc(std::num::NonZeroUsize::new(8192).unwrap())

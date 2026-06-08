@@ -47,14 +47,14 @@ macro_rules! make_rw_fixed {
             let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
                 driver
                     .registered_chunks
-                    .get(region_info.id as usize)
+                    .get(region_info.id.as_usize())
                     .unwrap_or(false)
             } else {
                 false
             };
 
             if is_registered {
-                let fixed_idx = region_info.id;
+                let fixed_idx = region_info.id.get();
                 Ok($type_fixed(fixed_fd, ptr, len, fixed_idx)
                     .offset(offset)
                     .build())
@@ -100,14 +100,14 @@ macro_rules! make_rw_fixed {
             let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
                 driver
                     .registered_chunks
-                    .get(region_info.id as usize)
+                    .get(region_info.id.as_usize())
                     .unwrap_or(false)
             } else {
                 false
             };
 
             if is_registered {
-                let fixed_idx = region_info.id;
+                let fixed_idx = region_info.id.get();
                 Ok($type_fixed(fixed_fd, ptr, len, fixed_idx)
                     .offset(offset)
                     .build())
@@ -150,14 +150,14 @@ macro_rules! make_rw_raw {
             let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
                 driver
                     .registered_chunks
-                    .get(region_info.id as usize)
+                    .get(region_info.id.as_usize())
                     .unwrap_or(false)
             } else {
                 false
             };
 
             if is_registered {
-                let fixed_idx = region_info.id;
+                let fixed_idx = region_info.id.get();
                 Ok(opcode::WriteFixed::new(types::Fd(fd), ptr, len, fixed_idx)
                     .offset(rw_op.offset)
                     .build())
@@ -199,14 +199,14 @@ macro_rules! make_rw_raw {
             let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
                 driver
                     .registered_chunks
-                    .get(region_info.id as usize)
+                    .get(region_info.id.as_usize())
                     .unwrap_or(false)
             } else {
                 false
             };
 
             if is_registered {
-                let fixed_idx = region_info.id;
+                let fixed_idx = region_info.id.get();
                 Ok(opcode::ReadFixed::new(types::Fd(fd), ptr, len, fixed_idx)
                     .offset(rw_op.offset)
                     .build())
@@ -531,7 +531,7 @@ pub(crate) unsafe fn resolve_chunks_read_fixed(
     };
     let info = rw_op.buf.resolve_region_info();
     if info.pool_kind == PoolKind::SlotBased {
-        chunks[0] = info.id;
+        chunks[0] = info.id.get();
         1
     } else {
         0
@@ -557,7 +557,7 @@ pub(crate) unsafe fn resolve_chunks_write_fixed(
     };
     let info = rw_op.buf.resolve_region_info();
     if info.pool_kind == PoolKind::SlotBased {
-        chunks[0] = info.id;
+        chunks[0] = info.id.get();
         1
     } else {
         0

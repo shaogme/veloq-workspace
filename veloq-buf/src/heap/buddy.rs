@@ -179,7 +179,7 @@ impl BuddyAllocator {
     }
 
     /// Allocation: Request 2^order slots
-    pub fn alloc(&mut self, order: usize) -> Option<SlotIndex> {
+    pub(crate) fn alloc(&mut self, order: usize) -> Option<SlotIndex> {
         if order > MAX_ORDER {
             return None;
         }
@@ -235,7 +235,7 @@ impl BuddyAllocator {
     /// # Safety
     /// index must be a valid allocated block start.
     /// order must match allocation order.
-    pub unsafe fn dealloc(&mut self, index: SlotIndex, order: usize) -> Result<(), BuddyError> {
+    pub(crate) unsafe fn dealloc(&mut self, index: SlotIndex, order: usize) -> Result<(), BuddyError> {
         let mut curr_idx = index;
         let mut curr_order = order;
 
@@ -304,7 +304,7 @@ impl BuddyAllocator {
         Ok(())
     }
 
-    pub fn ptr_of(&self, index: SlotIndex) -> NonNull<u8> {
+    pub(crate) fn ptr_of(&self, index: SlotIndex) -> NonNull<u8> {
         self.ptr_from_index(index)
     }
 

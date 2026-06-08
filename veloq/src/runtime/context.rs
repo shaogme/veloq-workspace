@@ -76,7 +76,10 @@ impl<'a, 'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'a, 'ctx> {
         self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
     }
 
-    fn resolve_chunk_info(&self, chunk_id: u16) -> Option<veloq_buf::heap::ChunkInfo> {
+    fn resolve_chunk_info(
+        &self,
+        chunk_id: veloq_buf::heap::ChunkId,
+    ) -> Option<veloq_buf::heap::ChunkInfo> {
         self.extra(|extra| {
             resolve_chunk_info_internal(
                 &extra.driver,
@@ -99,7 +102,10 @@ impl<'a, 'ctx> veloq_buf::BufferRegistrar for BorrowedRegistrar<'a, 'ctx> {
         register_internal(self.driver, self.state, regions)
     }
 
-    fn resolve_chunk_info(&self, chunk_id: u16) -> Option<veloq_buf::heap::ChunkInfo> {
+    fn resolve_chunk_info(
+        &self,
+        chunk_id: veloq_buf::heap::ChunkId,
+    ) -> Option<veloq_buf::heap::ChunkInfo> {
         resolve_chunk_info_internal(self.driver, self.state, self.registration_mode, chunk_id)
     }
 }
@@ -114,19 +120,19 @@ fn register_internal(
 
     {
         let mut driver = driver.borrow_mut();
-        for (idx, region) in regions.iter().enumerate() {
-            let chunk_idx = idx as u16;
+        for region in regions {
+            let chunk_id = region.id();
             driver
-                .register_chunk(chunk_idx, region.as_ptr(), region.len())
+                .register_chunk(chunk_id.get(), region.as_ptr(), region.len())
                 .map_err(|err| std::io::Error::other(format!("{err:#}")))
                 .trans()?;
 
             new_chunks.push(veloq_buf::heap::ChunkInfo {
-                id: chunk_idx,
+                id: chunk_id,
                 ptr: unsafe { std::ptr::NonNull::new_unchecked(region.as_ptr() as *mut u8) },
                 len: unsafe { std::num::NonZeroUsize::new_unchecked(region.len()) },
             });
-            indices.push(idx);
+            indices.push(chunk_id.as_usize());
         }
     }
 
@@ -140,7 +146,7 @@ fn resolve_chunk_info_internal(
     driver: &RefCell<PlatformDriver<'_>>,
     state: &RefCell<WorkerRegistrarState>,
     registration_mode: BufferRegistrationMode,
-    chunk_id: u16,
+    chunk_id: veloq_buf::heap::ChunkId,
 ) -> Option<veloq_buf::heap::ChunkInfo> {
     // 首先在本地快照中查找
     let found = {
@@ -182,7 +188,7 @@ fn sync_to_driver_internal(
 
     if matches!(registration_mode, BufferRegistrationMode::Compatible) {
         for chunk in &new_chunks {
-            let _ = driver.register_chunk(chunk.id, chunk.ptr.as_ptr(), chunk.len.get());
+            let _ = driver.register_chunk(chunk.id.get(), chunk.ptr.as_ptr(), chunk.len.get());
         }
     }
 

@@ -84,7 +84,8 @@ fn reaper_sender() -> Option<&'static std::sync::mpsc::Sender<DeferredRioCleanup
 }
 
 impl RioState {
-    fn handle_drain_result(&mut self, res: &RIORESULT) {
+    fn handle_drain_result(&mut self, res: &RIORESULT) -> RioResult<()> {
+        let mut release_result = Ok(());
         match Self::decode_req_ctx(res.RequestContext) {
             Some(RioCompletionKind::Op {
                 init:
@@ -97,7 +98,7 @@ impl RioState {
                 context: _completed_context,
             }) => {
                 self.registry.free_addr_slot(addr_slot);
-                self.registry.release_buffer_lease_deferred(buffer_lease);
+                release_result = self.registry.release_buffer_lease_deferred(buffer_lease);
                 release_socket_inflight_token_from(&mut self.socket_runtime, socket_inflight);
             }
             None => {}
@@ -105,12 +106,14 @@ impl RioState {
         if self.outstanding_count > 0 {
             self.outstanding_count -= 1;
         }
+        release_result
     }
 
-    fn drain_batch(&mut self, results: &[RIORESULT], count: usize) {
+    fn drain_batch(&mut self, results: &[RIORESULT], count: usize) -> RioResult<()> {
         for res in results.iter().take(count) {
-            self.handle_drain_result(res);
+            self.handle_drain_result(res)?;
         }
+        Ok(())
     }
 
     pub(crate) fn drain_outstanding(&mut self, timeout: std::time::Duration) -> RioResult<()> {
@@ -138,7 +141,7 @@ impl RioState {
                 continue;
             }
 
-            self.drain_batch(&results, count as usize);
+            self.drain_batch(&results, count as usize)?;
         }
 
         Ok(())

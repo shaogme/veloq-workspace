@@ -80,10 +80,12 @@ impl<'a> UringDriver<'a> {
                     })?;
 
                     if !is_registered
-                        && let Some(info) = driver.registrar.resolve_chunk_info(chunk_id)
+                        && let Some(info) = driver
+                            .registrar
+                            .resolve_chunk_info(veloq_buf::heap::ChunkId::from(chunk_id))
                     {
                         if let Err(e) = driver.register_chunk_internal(
-                            info.id,
+                            info.id.get(),
                             info.ptr.as_ptr(),
                             info.len.get(),
                         ) {

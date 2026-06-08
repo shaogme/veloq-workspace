@@ -17,6 +17,9 @@ set! {
         #[display("Chunk memory size too small for sharding")]
         ChunkTooSmall,
 
+        #[display("Chunk memory size must be page aligned: {size}")]
+        PageUnaligned { size: usize },
+
         #[display("Chunk {chunk_id} missing")]
         ChunkMissing { chunk_id: u16 },
 

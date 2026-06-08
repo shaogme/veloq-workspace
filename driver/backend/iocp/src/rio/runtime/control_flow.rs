@@ -168,13 +168,13 @@ impl<'a> RioCompletionRouter<'a> {
         }
 
         self.registry.free_addr_slot(addr_slot);
-        self.registry.release_buffer_lease(buffer_lease, self.env);
+        let release_result = self.registry.release_buffer_lease(buffer_lease, self.env);
         self.release_socket_inflight(socket_inflight);
         if *self.outstanding_count > 0 {
             *self.outstanding_count -= 1;
         }
         self.completed_count += 1;
-        Ok(())
+        release_result
     }
 
     fn handle_one(&mut self, res: &RIORESULT) -> RioResult<()> {

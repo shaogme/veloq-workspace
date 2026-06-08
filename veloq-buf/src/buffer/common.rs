@@ -5,6 +5,8 @@ use std::ptr::NonNull;
 
 use bilge::prelude::*;
 
+use crate::heap::{ChunkId, PageAlignedBytes};
+
 #[bitsize(1)]
 #[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolKind {
@@ -55,7 +57,7 @@ impl<const S: u16> std::fmt::Debug for NotU16<S> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionInfo {
     pub pool_kind: PoolKind,
-    pub id: u16,
+    pub id: ChunkId,
     pub offset: usize,
     /// A unique cookie used to distinguish different allocations for the same pointer (e.g. heap reuse).
     pub cookie: u64,
@@ -90,14 +92,28 @@ impl AllocResult {
 
 #[derive(Debug, Clone, Copy)]
 pub struct BufferRegion {
+    pub(crate) id: ChunkId,
     pub(crate) ptr: NonNull<u8>,
-    pub(crate) len: NonZeroUsize,
+    pub(crate) len: PageAlignedBytes,
 }
 
 impl BufferRegion {
-    pub fn new(ptr: NonNull<u8>, len: NonZeroUsize) -> Self {
-        Self { ptr, len }
+    pub fn new(id: ChunkId, ptr: NonNull<u8>, len: PageAlignedBytes) -> Self {
+        Self { id, ptr, len }
     }
+
+    pub fn from_chunk_info(info: crate::heap::ChunkInfo) -> Option<Self> {
+        PageAlignedBytes::new(info.len).map(|len| Self {
+            id: info.id,
+            ptr: info.ptr,
+            len,
+        })
+    }
+
+    pub fn id(&self) -> ChunkId {
+        self.id
+    }
+
     pub fn ptr(&self) -> NonNull<u8> {
         self.ptr
     }
@@ -113,10 +129,6 @@ impl BufferRegion {
     pub fn len(&self) -> usize {
         self.len.get()
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 unsafe impl Send for BufferRegion {}
@@ -131,7 +143,7 @@ pub trait BufferRegistrar {
 
     /// Resolve chunk info for a given chunk_id.
     /// Used for lazy registration.
-    fn resolve_chunk_info(&self, chunk_id: u16) -> Option<crate::heap::ChunkInfo>;
+    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<crate::heap::ChunkInfo>;
 }
 
 /// A no-op registrar that does nothing.
@@ -142,7 +154,7 @@ impl BufferRegistrar for NoopRegistrar {
         Ok(Vec::new())
     }
 
-    fn resolve_chunk_info(&self, _chunk_id: u16) -> Option<crate::heap::ChunkInfo> {
+    fn resolve_chunk_info(&self, _chunk_id: ChunkId) -> Option<crate::heap::ChunkInfo> {
         None
     }
 }

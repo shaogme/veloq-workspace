@@ -122,7 +122,9 @@ fn test_iocp_recv_with_buffer_pool() {
     let global_pool = topology.create_pool(1).expect("Create pool failed");
 
     // Build pool with noop registrar; chunk registration is explicitly controlled below.
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     // Setup server listener
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -155,7 +157,7 @@ fn test_iocp_recv_with_buffer_pool() {
         .chunk_info(region.id)
         .expect("Chunk info for buffer not found");
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_chunk(region.id.get(), chunk.ptr.as_ptr(), chunk.len.get())
         .expect("register chunk failed");
 
     // Poll connect completion before issuing recv.
@@ -207,7 +209,9 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -244,7 +248,7 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
         .chunk_info(region.id)
         .expect("Chunk info for buffer not found");
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_chunk(region.id.get(), chunk.ptr.as_ptr(), chunk.len.get())
         .expect("register chunk failed");
 
     let recv_op = Recv {
@@ -279,7 +283,9 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -321,7 +327,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         .chunk_info(region.id)
         .expect("Chunk info for buffer not found");
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_chunk(region.id.get(), chunk.ptr.as_ptr(), chunk.len.get())
         .expect("register chunk failed");
 
     let recv_op = Recv {
@@ -354,7 +360,9 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -396,7 +404,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         .chunk_info(region.id)
         .expect("Chunk info for buffer not found");
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_chunk(region.id.get(), chunk.ptr.as_ptr(), chunk.len.get())
         .expect("register chunk failed");
 
     let recv_op = Recv {

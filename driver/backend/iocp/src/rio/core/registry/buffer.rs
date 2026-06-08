@@ -52,12 +52,37 @@ impl RioBufferRegistration {
             retired: false,
         }
     }
+
+    fn acquire_ref(&mut self) -> RioResult<()> {
+        self.active_refs = self.active_refs.checked_add(1).ok_or_else(|| {
+            RioError::ResourceExhaustion
+                .to_report()
+                .with_ctx("rio_buffer_id", self.id.0 as usize)
+                .with_ctx("active_refs", self.active_refs)
+                .attach_note("RIO buffer registration active refcount overflow")
+        })?;
+        Ok(())
+    }
+
+    fn release_ref(&mut self) -> bool {
+        if self.active_refs == 0 {
+            return false;
+        }
+        self.active_refs -= 1;
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RioChunkRegistration {
     pub(crate) generation: u64,
     pub(crate) registration: RioBufferRegistration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RioChunkRegistrationLocation {
+    Current,
+    Retired,
 }
 
 impl RioRegistry {
@@ -72,33 +97,27 @@ impl RioRegistry {
             return self.resolve_heap_id(buf, info.offset, env);
         }
 
-        let mut lease = self.current_chunk_lease(info.id);
+        let mut lease = self.current_chunk_lease(info.id.get());
 
         if lease.is_none()
             && let Some(chunk_info) = env.registrar.resolve_chunk_info(info.id)
         {
             self.register_chunk(
-                info.id,
+                info.id.get(),
                 (chunk_info.ptr.as_ptr(), chunk_info.len.get()),
                 env,
             )?;
-            lease = self.current_chunk_lease(info.id);
+            lease = self.current_chunk_lease(info.id.get());
         }
 
         match lease {
-            Some(RioBufferLeaseToken::Chunk(lease)) => Ok((
+            Some(lease) => Ok((
                 lease.id,
                 info.offset,
                 Some(RioBufferLeaseToken::Chunk(lease)),
             )),
-            Some(RioBufferLeaseToken::Heap(_)) => {
-                debug_assert!(false, "resolved heap lease from chunk registry");
-                RioError::Internal
-                    .with_ctx("chunk_id", info.id as usize)
-                    .attach_note("RIO chunk registration resolved to heap lease")
-            }
             None => RioError::Internal
-                .with_ctx("chunk_id", info.id as usize)
+                .with_ctx("chunk_id", info.id.as_usize())
                 .attach_note("RIO chunk not registered"),
         }
     }
@@ -178,15 +197,15 @@ impl RioRegistry {
         self.next_registration_generation
     }
 
-    pub(crate) fn current_chunk_lease(&self, id: u16) -> Option<RioBufferLeaseToken> {
+    pub(crate) fn current_chunk_lease(&self, id: u16) -> Option<RioChunkLeaseToken> {
         let entry = self.chunk_registry.get(id as usize)?.as_ref()?;
-        Some(RioBufferLeaseToken::Chunk(RioChunkLeaseToken {
+        Some(RioChunkLeaseToken {
             key: RioChunkRegistrationKey {
                 id,
                 generation: entry.generation,
             },
             id: entry.registration.id,
-        }))
+        })
     }
 
     pub(crate) fn retire_chunk_registration(
@@ -283,70 +302,57 @@ impl RioRegistry {
         Ok(id)
     }
 
-    pub(crate) fn commit_buffer_lease(&mut self, lease: Option<RioBufferLeaseToken>) {
+    pub(crate) fn acquire_buffer_lease(
+        &mut self,
+        lease: Option<RioBufferLeaseToken>,
+    ) -> RioResult<()> {
         let Some(lease) = lease else {
-            return;
+            return Ok(());
         };
         match lease {
-            RioBufferLeaseToken::Chunk(lease) => self.commit_chunk_lease(lease),
-            RioBufferLeaseToken::Heap(lease) => self.commit_heap_lease(lease),
+            RioBufferLeaseToken::Chunk(lease) => self.acquire_chunk_lease(lease),
+            RioBufferLeaseToken::Heap(lease) => self.acquire_heap_lease(lease),
         }
     }
 
-    pub(crate) fn commit_chunk_lease(&mut self, lease: RioChunkLeaseToken) {
-        if let Some(entry) = self.current_chunk_registration_mut(lease.key) {
-            if entry.id != lease.id {
-                debug_assert!(false, "committed stale RIO chunk lease");
-                return;
-            }
-            entry.active_refs = entry.active_refs.saturating_add(1);
-            return;
-        }
-
-        let Some(entry) = self.retired_chunk_registrations.get_mut(&lease.key) else {
-            debug_assert!(false, "committed unknown RIO chunk lease");
-            return;
-        };
-        if entry.id != lease.id {
-            debug_assert!(false, "committed stale RIO chunk lease");
-            return;
-        }
-        entry.active_refs = entry.active_refs.saturating_add(1);
+    pub(crate) fn acquire_chunk_lease(&mut self, lease: RioChunkLeaseToken) -> RioResult<()> {
+        let (_location, entry) = self.chunk_registration_for_lease_mut(lease, "acquire")?;
+        entry.acquire_ref()
     }
 
-    pub(crate) fn commit_heap_lease(&mut self, lease: RioHeapLeaseToken) {
-        let Some(entry) = self.heap_rio_bufs.get_mut(&lease.key) else {
-            debug_assert!(false, "committed unknown RIO heap lease");
-            return;
-        };
-        if entry.id != lease.id {
-            debug_assert!(false, "committed stale RIO heap lease");
-            return;
-        }
-        entry.active_refs = entry.active_refs.saturating_add(1);
+    pub(crate) fn acquire_heap_lease(&mut self, lease: RioHeapLeaseToken) -> RioResult<()> {
+        let entry = self.heap_registration_for_lease_mut(lease, "acquire")?;
+        entry.acquire_ref()
     }
 
     pub(crate) fn release_buffer_lease(
         &mut self,
         lease: Option<RioBufferLeaseToken>,
         env: RioEnv<'_>,
-    ) {
-        if let Some(id) = self.release_buffer_lease_inner(lease) {
+    ) -> RioResult<()> {
+        if let Some(id) = self.release_buffer_lease_inner(lease)? {
             env.dispatch.deregister_buffer(id);
         }
+        Ok(())
     }
 
-    pub(crate) fn release_buffer_lease_deferred(&mut self, lease: Option<RioBufferLeaseToken>) {
-        if let Some(id) = self.release_buffer_lease_inner(lease) {
+    pub(crate) fn release_buffer_lease_deferred(
+        &mut self,
+        lease: Option<RioBufferLeaseToken>,
+    ) -> RioResult<()> {
+        if let Some(id) = self.release_buffer_lease_inner(lease)? {
             self.pending_deregistrations.push(id);
         }
+        Ok(())
     }
 
     pub(crate) fn release_buffer_lease_inner(
         &mut self,
         lease: Option<RioBufferLeaseToken>,
-    ) -> Option<RioBufferId> {
-        let lease = lease?;
+    ) -> RioResult<Option<RioBufferId>> {
+        let Some(lease) = lease else {
+            return Ok(None);
+        };
         match lease {
             RioBufferLeaseToken::Chunk(lease) => self.release_chunk_lease_inner(lease),
             RioBufferLeaseToken::Heap(lease) => self.release_heap_lease_inner(lease),
@@ -356,70 +362,57 @@ impl RioRegistry {
     pub(crate) fn release_chunk_lease_inner(
         &mut self,
         lease: RioChunkLeaseToken,
-    ) -> Option<RioBufferId> {
-        let remove_current;
-        if let Some(entry) = self.current_chunk_registration_mut(lease.key) {
-            if entry.id != lease.id {
-                debug_assert!(false, "released stale RIO chunk lease");
-                return None;
+    ) -> RioResult<Option<RioBufferId>> {
+        let (location, remove) = {
+            let (location, entry) = self.chunk_registration_for_lease_mut(lease, "release")?;
+            if !entry.release_ref() {
+                return Err(Self::chunk_lease_error(
+                    "release",
+                    lease,
+                    "RIO chunk lease release found no active refs",
+                ));
             }
-            debug_assert!(entry.active_refs > 0, "released inactive RIO chunk lease");
-            if entry.active_refs > 0 {
-                entry.active_refs -= 1;
-            }
-            remove_current = entry.active_refs == 0 && entry.retired;
-        } else if let Some(entry) = self.retired_chunk_registrations.get_mut(&lease.key) {
-            if entry.id != lease.id {
-                debug_assert!(false, "released stale RIO chunk lease");
-                return None;
-            }
-            debug_assert!(entry.active_refs > 0, "released inactive RIO chunk lease");
-            if entry.active_refs > 0 {
-                entry.active_refs -= 1;
-            }
-            if entry.active_refs == 0 && entry.retired {
-                return self
-                    .retired_chunk_registrations
-                    .remove(&lease.key)
-                    .map(|entry| entry.id);
-            }
-            return None;
-        } else {
-            debug_assert!(false, "released unknown RIO chunk lease");
-            return None;
+            (location, entry.active_refs == 0 && entry.retired)
+        };
+
+        if !remove {
+            return Ok(None);
         }
 
-        if remove_current {
-            return self
+        let deregister = match location {
+            RioChunkRegistrationLocation::Current => self
                 .chunk_registry
                 .get_mut(lease.key.id as usize)
                 .and_then(Option::take)
-                .map(|entry| entry.registration.id);
-        }
-        None
+                .map(|entry| entry.registration.id),
+            RioChunkRegistrationLocation::Retired => self
+                .retired_chunk_registrations
+                .remove(&lease.key)
+                .map(|entry| entry.id),
+        };
+        Ok(deregister)
     }
 
     pub(crate) fn release_heap_lease_inner(
         &mut self,
         lease: RioHeapLeaseToken,
-    ) -> Option<RioBufferId> {
-        let mut remove = false;
-        if let Some(entry) = self.heap_rio_bufs.get_mut(&lease.key) {
-            if entry.id != lease.id {
-                debug_assert!(false, "released stale RIO heap lease");
-                return None;
+    ) -> RioResult<Option<RioBufferId>> {
+        let remove = {
+            let entry = self.heap_registration_for_lease_mut(lease, "release")?;
+            if !entry.release_ref() {
+                return Err(Self::heap_lease_error(
+                    "release",
+                    lease,
+                    "RIO heap lease release found no active refs",
+                ));
             }
-            debug_assert!(entry.active_refs > 0, "released inactive RIO heap lease");
-            if entry.active_refs > 0 {
-                entry.active_refs -= 1;
-            }
-            remove = entry.active_refs == 0 && entry.retired;
-        }
+            entry.active_refs == 0 && entry.retired
+        };
 
         if remove {
-            return self.heap_rio_bufs.remove(&lease.key).map(|entry| entry.id);
+            return Ok(self.heap_rio_bufs.remove(&lease.key).map(|entry| entry.id));
         }
-        None
+        Ok(None)
     }
 
     pub(crate) fn current_chunk_registration_mut(
@@ -431,6 +424,130 @@ impl RioRegistry {
             .as_mut()
             .filter(|entry| entry.generation == key.generation)
             .map(|entry| &mut entry.registration)
+    }
+
+    fn chunk_registration_for_lease_mut(
+        &mut self,
+        lease: RioChunkLeaseToken,
+        action: &'static str,
+    ) -> RioResult<(RioChunkRegistrationLocation, &mut RioBufferRegistration)> {
+        let location = self.locate_chunk_lease(lease, action)?;
+        match location {
+            RioChunkRegistrationLocation::Current => {
+                let entry = self
+                    .current_chunk_registration_mut(lease.key)
+                    .ok_or_else(|| {
+                        Self::chunk_lease_error(
+                            action,
+                            lease,
+                            "current RIO chunk registration disappeared after lease lookup",
+                        )
+                    })?;
+                Ok((location, entry))
+            }
+            RioChunkRegistrationLocation::Retired => {
+                let entry = self
+                    .retired_chunk_registrations
+                    .get_mut(&lease.key)
+                    .ok_or_else(|| {
+                        Self::chunk_lease_error(
+                            action,
+                            lease,
+                            "retired RIO chunk registration disappeared after lease lookup",
+                        )
+                    })?;
+                Ok((location, entry))
+            }
+        }
+    }
+
+    fn locate_chunk_lease(
+        &self,
+        lease: RioChunkLeaseToken,
+        action: &'static str,
+    ) -> RioResult<RioChunkRegistrationLocation> {
+        if let Some(entry) = self
+            .chunk_registry
+            .get(lease.key.id as usize)
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.generation == lease.key.generation)
+        {
+            if entry.registration.id != lease.id {
+                return Err(Self::chunk_lease_error(
+                    action,
+                    lease,
+                    "RIO chunk lease buffer id is stale",
+                ));
+            }
+            return Ok(RioChunkRegistrationLocation::Current);
+        }
+
+        let Some(entry) = self.retired_chunk_registrations.get(&lease.key) else {
+            return Err(Self::chunk_lease_error(
+                action,
+                lease,
+                "RIO chunk lease registration is unknown",
+            ));
+        };
+        if entry.id != lease.id {
+            return Err(Self::chunk_lease_error(
+                action,
+                lease,
+                "retired RIO chunk lease buffer id is stale",
+            ));
+        }
+        Ok(RioChunkRegistrationLocation::Retired)
+    }
+
+    fn heap_registration_for_lease_mut(
+        &mut self,
+        lease: RioHeapLeaseToken,
+        action: &'static str,
+    ) -> RioResult<&mut RioBufferRegistration> {
+        let Some(entry) = self.heap_rio_bufs.get_mut(&lease.key) else {
+            return Err(Self::heap_lease_error(
+                action,
+                lease,
+                "RIO heap lease registration is unknown",
+            ));
+        };
+        if entry.id != lease.id {
+            return Err(Self::heap_lease_error(
+                action,
+                lease,
+                "RIO heap lease buffer id is stale",
+            ));
+        }
+        Ok(entry)
+    }
+
+    fn chunk_lease_error(
+        action: &'static str,
+        lease: RioChunkLeaseToken,
+        note: &'static str,
+    ) -> Report<RioError> {
+        RioError::Internal
+            .to_report()
+            .with_ctx("rio_buffer_lease_action", action)
+            .with_ctx("chunk_id", lease.key.id as usize)
+            .with_ctx("chunk_generation", lease.key.generation)
+            .with_ctx("rio_buffer_id", lease.id.0 as usize)
+            .attach_note(note)
+    }
+
+    fn heap_lease_error(
+        action: &'static str,
+        lease: RioHeapLeaseToken,
+        note: &'static str,
+    ) -> Report<RioError> {
+        RioError::Internal
+            .to_report()
+            .with_ctx("rio_buffer_lease_action", action)
+            .with_ctx("buffer_ptr", lease.key.ptr)
+            .with_ctx("buffer_capacity", lease.key.cap)
+            .with_ctx("buffer_cookie", lease.key.cookie)
+            .with_ctx("rio_buffer_id", lease.id.0 as usize)
+            .attach_note(note)
     }
 
     pub(crate) fn retire_heap_cache_for_insert(&mut self, env: RioEnv<'_>) {
@@ -478,9 +595,13 @@ mod tests {
             generation: key.generation,
             registration: RioBufferRegistration::new(RioBufferId(41 as _)),
         });
-        let lease = registry.current_chunk_lease(chunk_id);
+        let lease = registry
+            .current_chunk_lease(chunk_id)
+            .map(RioBufferLeaseToken::Chunk);
 
-        registry.commit_buffer_lease(lease);
+        registry
+            .acquire_buffer_lease(lease)
+            .expect("chunk lease acquire should succeed");
         let previous = registry.chunk_registry[chunk_id as usize]
             .take()
             .expect("chunk registration");
@@ -489,7 +610,9 @@ mod tests {
         assert!(deregistered_ids().is_empty());
         assert!(registry.retired_chunk_registrations.contains_key(&key));
 
-        registry.release_buffer_lease(lease, env);
+        registry
+            .release_buffer_lease(lease, env)
+            .expect("chunk lease release should succeed");
 
         assert_eq!(deregistered_ids(), vec![41]);
         assert!(!registry.retired_chunk_registrations.contains_key(&key));
@@ -515,13 +638,17 @@ mod tests {
             .heap_rio_bufs
             .insert(key, RioBufferRegistration::new(RioBufferId(77 as _)));
 
-        registry.commit_buffer_lease(lease);
+        registry
+            .acquire_buffer_lease(lease)
+            .expect("heap lease acquire should succeed");
         registry
             .heap_rio_bufs
             .get_mut(&key)
             .expect("heap registration")
             .retired = true;
-        registry.release_buffer_lease(lease, env);
+        registry
+            .release_buffer_lease(lease, env)
+            .expect("heap lease release should succeed");
 
         assert_eq!(deregistered_ids(), vec![77]);
         assert!(!registry.heap_rio_bufs.contains_key(&key));
