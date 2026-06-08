@@ -207,7 +207,7 @@ impl<'a> IocpDriver<'a> {
             in_flight.push(token);
         }
         for token in in_flight {
-            self.cancel_op_internal(CancelRequest::abandon(token));
+            let _ = self.cancel_op_internal(CancelRequest::abandon(token));
         }
         pending
     }

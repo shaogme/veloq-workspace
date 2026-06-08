@@ -3,7 +3,7 @@ use crate::error::{UringDriverResult, UringError};
 use io_uring::opcode;
 use tracing::{debug, error, trace};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CompletionSidecar, CompletionToken, OpToken,
+    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionSidecar, CompletionToken, OpToken,
 };
 
 use crate::op::{
@@ -36,7 +36,7 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    fn submit_cancel_request(&mut self, request: PendingCancel) {
+    fn submit_cancel_request(&mut self, request: PendingCancel) -> CancelSubmitOutcome {
         let (user_data, generation) = request.user_parts();
 
         let cancel_id = self.next_cancel_completion_id();
@@ -46,6 +46,7 @@ impl<'a> UringDriver<'a> {
 
         if !self.push_entry(cancel_sqe) {
             self.pending_cancellations.push_back(request);
+            CancelSubmitOutcome::Queued
         } else {
             self.pending_cancel_cqes.insert(cancel_id, request);
             self.completion_diagnostics.inc_cancel_submitted();
@@ -56,10 +57,11 @@ impl<'a> UringDriver<'a> {
                 mode = ?request.mode,
                 "submitted async cancel"
             );
+            CancelSubmitOutcome::Submitted
         }
     }
 
-    pub(crate) fn cancel_op_internal(&mut self, request: CancelRequest) {
+    pub(crate) fn cancel_op_internal(&mut self, request: CancelRequest) -> CancelSubmitOutcome {
         let request = PendingCancel::new(request);
         let (user_data, generation) = request.user_parts();
         let token = request.target;
@@ -71,6 +73,7 @@ impl<'a> UringDriver<'a> {
                     self.push_completion_event(sidecar);
                 }
                 let _ = self.ops.remove_token(token);
+                CancelSubmitOutcome::AlreadyComplete
             }
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                 if let Some(tid) = slot.platform_mut().timer_id {
@@ -91,13 +94,13 @@ impl<'a> UringDriver<'a> {
                     self.wheel.cancel(tid);
                     self.push_completion_event(sidecar);
                     let _ = self.ops.remove_token(token);
-                    return;
+                    return CancelSubmitOutcome::AlreadyComplete;
                 }
 
                 if request.mode == CancelMode::Abandon {
                     let _ = slot.cancel();
                 }
-                self.submit_cancel_request(request);
+                self.submit_cancel_request(request)
 
                 // Cancellation is async, we wait for CQE to clean up.
             }
@@ -107,10 +110,10 @@ impl<'a> UringDriver<'a> {
                     self.wheel.cancel(tid);
                     self.push_completion_event(sidecar);
                     let _ = self.ops.remove_token(token);
-                    return;
+                    return CancelSubmitOutcome::AlreadyComplete;
                 }
 
-                self.submit_cancel_request(request);
+                self.submit_cancel_request(request)
             }
             CheckedSlotView::Missing { .. } | CheckedSlotView::Empty(_) => {
                 self.completion_diagnostics.inc_unknown_completion();
@@ -120,6 +123,7 @@ impl<'a> UringDriver<'a> {
                     token = CompletionToken::user(request.target).raw(),
                     "cancel request did not match an active slot"
                 );
+                CancelSubmitOutcome::NotFound
             }
             CheckedSlotView::Stale(snapshot) => {
                 self.completion_diagnostics.inc_stale_completion();
@@ -130,6 +134,7 @@ impl<'a> UringDriver<'a> {
                     state = ?snapshot.state,
                     "cancel request is stale"
                 );
+                CancelSubmitOutcome::NotFound
             }
             CheckedSlotView::Corrupt(snapshot) => {
                 self.completion_diagnostics.inc_slot_corruption();
@@ -146,6 +151,7 @@ impl<'a> UringDriver<'a> {
                     OpToken::new(user_data, snapshot.generation),
                     snapshot.generation.wrapping_add(1),
                 );
+                CancelSubmitOutcome::NotFound
             }
         }
     }
@@ -212,7 +218,7 @@ impl<'a> UringDriver<'a> {
             match action {
                 BacklogAction::Cancel => {
                     self.pop_backlog();
-                    self.cancel_op_internal(CancelRequest::abandon(token));
+                    let _ = self.cancel_op_internal(CancelRequest::abandon(token));
                 }
                 BacklogAction::Drop => {
                     self.pop_backlog();

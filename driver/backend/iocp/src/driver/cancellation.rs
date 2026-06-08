@@ -1,5 +1,7 @@
 use tracing::{debug, warn};
-use veloq_driver_core::driver::{CancelMode, CancelRequest, OpToken, RecordCompletionOutcome};
+use veloq_driver_core::driver::{
+    CancelMode, CancelRequest, CancelSubmitOutcome, OpToken, RecordCompletionOutcome,
+};
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
@@ -22,7 +24,10 @@ enum CancelPerformStatus {
 }
 
 impl<'a> IocpDriver<'a> {
-    pub(super) fn cancel_op_internal(&mut self, request: CancelRequest) {
+    pub(super) fn cancel_op_internal(
+        &mut self,
+        request: CancelRequest,
+    ) -> IocpResult<CancelSubmitOutcome> {
         let token = request.target;
         let (user_data, generation) = token.parts();
 
@@ -47,7 +52,7 @@ impl<'a> IocpDriver<'a> {
                     .record_completion_outcome(&outcome);
             }
             self.completion_diagnostics.inc_cancel_submitted();
-            return;
+            return Ok(CancelSubmitOutcome::AlreadyComplete);
         }
 
         let state = self.ops.checked_slot_view(token);
@@ -58,7 +63,7 @@ impl<'a> IocpDriver<'a> {
                     registered_slots: self.handles.registered_slots(),
                 };
                 let status = Self::perform_cancel(ctx, token, &mut self.ops);
-                self.record_cancel_status(status);
+                self.record_cancel_status(status)
             }
             CheckedSlotView::Valid(SlotView::Reserved(_)) => {
                 if let Some(outcome) = Self::abort_slot_inner(
@@ -71,6 +76,7 @@ impl<'a> IocpDriver<'a> {
                         .record_completion_outcome(&outcome);
                 }
                 self.completion_diagnostics.inc_cancel_submitted();
+                Ok(CancelSubmitOutcome::AlreadyComplete)
             }
             CheckedSlotView::Missing { .. } | CheckedSlotView::Empty(_) => {
                 self.completion_diagnostics.inc_unknown_completion();
@@ -78,6 +84,7 @@ impl<'a> IocpDriver<'a> {
                     user_data,
                     generation, "IOCP cancel request found non-active slot"
                 );
+                Ok(CancelSubmitOutcome::NotFound)
             }
             CheckedSlotView::Stale(snapshot) => {
                 self.completion_diagnostics.inc_stale_completion();
@@ -88,6 +95,7 @@ impl<'a> IocpDriver<'a> {
                     state = ?snapshot.state,
                     "IOCP cancel request is stale"
                 );
+                Ok(CancelSubmitOutcome::NotFound)
             }
             CheckedSlotView::Corrupt(snapshot) => {
                 self.completion_diagnostics.inc_slot_corruption();
@@ -98,25 +106,33 @@ impl<'a> IocpDriver<'a> {
                     state = ?snapshot.state,
                     "IOCP cancel request found corrupt slot"
                 );
+                Ok(CancelSubmitOutcome::NotFound)
             }
         }
     }
 
-    fn record_cancel_status(&mut self, status: IocpResult<CancelPerformStatus>) {
+    fn record_cancel_status(
+        &mut self,
+        status: IocpResult<CancelPerformStatus>,
+    ) -> IocpResult<CancelSubmitOutcome> {
         match status {
             Ok(CancelPerformStatus::Submitted) | Ok(CancelPerformStatus::RioRequested) => {
                 self.completion_diagnostics.inc_cancel_submitted();
+                Ok(CancelSubmitOutcome::Submitted)
             }
             Ok(CancelPerformStatus::NotFound) => {
                 self.completion_diagnostics.inc_cancel_cqe_enoent();
                 debug!("CancelIoEx target was already complete or absent");
+                Ok(CancelSubmitOutcome::NotFound)
             }
             Ok(CancelPerformStatus::NoHandle) | Ok(CancelPerformStatus::NonActive) => {
                 self.completion_diagnostics.inc_unknown_completion();
+                Ok(CancelSubmitOutcome::NoHandle)
             }
             Err(report) => {
                 self.completion_diagnostics.inc_cancel_cqe_error();
                 warn!(report = ?report, "CancelIoEx failed");
+                Err(report)
             }
         }
     }

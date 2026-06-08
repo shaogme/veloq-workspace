@@ -2,6 +2,7 @@
 
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
+use crate::common::push_completion_shared;
 use crate::driver::IocpOpRegistry;
 use crate::error::IocpError;
 use crate::rio::core::registry::RioRegistry;
@@ -18,8 +19,8 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionToken, DriverCompletionDiagnostics, OpToken, SharedCompletionQueue,
-    SharedCompletionTable,
+    CompletionEvent, CompletionRecord, CompletionToken, DriverCompletionDiagnostics, OpToken,
+    SharedCompletionQueue, SharedCompletionTable,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -104,13 +105,16 @@ impl<'a> RioCompletionRouter<'a> {
                         flags: 0,
                     };
                     drop(guard);
-                    let outcome = self.comp.table.record_completion_with_data(
-                        event,
-                        payload,
-                        detail.or(Some(completion)),
+                    let outcome = push_completion_shared(
+                        self.comp.events,
+                        self.comp.table,
+                        CompletionRecord {
+                            event,
+                            payload,
+                            detail: detail.or(Some(completion)),
+                        },
                     );
                     self.comp.diagnostics.record_completion_outcome(&outcome);
-                    self.comp.events.push(event);
                     let _ = ops.remove_token(op_token);
                 } else {
                     let cancelled = slot.platform().rio_cancel_requested;
@@ -178,13 +182,16 @@ impl<'a> RioCompletionRouter<'a> {
                             flags: 0,
                         };
 
-                        let outcome = self.comp.table.record_completion_with_data(
-                            event,
-                            payload,
-                            detail.or(Some(completion)),
+                        let outcome = push_completion_shared(
+                            self.comp.events,
+                            self.comp.table,
+                            CompletionRecord {
+                                event,
+                                payload,
+                                detail: detail.or(Some(completion)),
+                            },
                         );
                         self.comp.diagnostics.record_completion_outcome(&outcome);
-                        self.comp.events.push(event);
                     }
                     let _ = ops.remove_token(op_token);
                 }

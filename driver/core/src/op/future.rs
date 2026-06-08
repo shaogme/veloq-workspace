@@ -547,7 +547,7 @@ where
                     driver
                         .completion_table()
                         .mark_orphaned(CompletionToken::user(token));
-                    driver.cancel_op(CancelRequest::abandon(token));
+                    let _ = driver.cancel_op(CancelRequest::abandon(token));
                 });
             }
         }

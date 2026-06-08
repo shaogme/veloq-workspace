@@ -8,9 +8,10 @@ use tracing::error;
 use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
+use veloq_driver_core::RawHandleMeta;
 use veloq_driver_core::driver::{
     CompletionEvent, CompletionRecord, CompletionSidecar, CompletionToken, RecordCompletionOutcome,
-    RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
+    RecordCompletionResult, RemoteWaker, SharedCompletionQueue, SharedCompletionTable,
 };
 
 // ============================================================================
@@ -93,7 +94,18 @@ pub(crate) fn push_completion_shared(
     record: CompletionRecord<IocpUserPayload, IocpError>,
 ) -> RecordCompletionOutcome {
     let event = record.event;
-    let outcome = table.record_completion_with_data(record.event, record.payload, record.detail);
+    let result = table.record_completion_with_data(record.event, record.payload, record.detail);
+    let outcome = match result {
+        RecordCompletionResult::Recorded => RecordCompletionOutcome::Recorded,
+        RecordCompletionResult::Rejected {
+            outcome,
+            payload,
+            detail,
+        } => {
+            cleanup_rejected_completion(event, payload, detail);
+            outcome
+        }
+    };
     match &outcome {
         RecordCompletionOutcome::Recorded | RecordCompletionOutcome::OrphanedDropped => {}
         anomaly => {
@@ -108,6 +120,31 @@ pub(crate) fn push_completion_shared(
     }
     queue.push(event);
     outcome
+}
+
+fn cleanup_rejected_completion(
+    event: CompletionEvent,
+    payload: Option<IocpUserPayload>,
+    detail: Option<crate::error::IocpDriverResult<usize>>,
+) {
+    let raw = detail
+        .as_ref()
+        .and_then(|result| result.as_ref().ok().copied())
+        .or_else(|| (event.res >= 0).then_some(event.res as usize));
+
+    match payload {
+        Some(IocpUserPayload::Open(_)) => {
+            if let Some(raw) = raw {
+                crate::config::IocpHandle::for_file(raw as _).close();
+            }
+        }
+        Some(IocpUserPayload::Accept(_)) => {
+            if let Some(raw) = raw {
+                crate::config::IocpHandle::for_socket(raw as _).close();
+            }
+        }
+        _ => {}
+    }
 }
 
 // ============================================================================

@@ -195,7 +195,10 @@ pub trait Driver {
         self.completion_table().register_waker(token, waker);
     }
 
-    fn cancel_op(&mut self, request: CancelRequest);
+    fn cancel_op(
+        &mut self,
+        request: CancelRequest,
+    ) -> DriverResult<CancelSubmitOutcome, Self::Error>;
 
     fn register_chunk(
         &mut self,
@@ -298,7 +301,10 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 
     #[inline]
-    fn cancel_op(&mut self, request: CancelRequest) {
+    fn cancel_op(
+        &mut self,
+        request: CancelRequest,
+    ) -> DriverResult<CancelSubmitOutcome, Self::Error> {
         self.provider.with_driver_mut(|d| d.cancel_op(request))
     }
 
@@ -350,7 +356,8 @@ pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
             if cancel_table.cancel_generation(user_data) == generation as u64
                 && is_runnable_state(state)
             {
-                driver.cancel_op(CancelRequest::abandon(OpToken::new(user_data, generation)));
+                let _ =
+                    driver.cancel_op(CancelRequest::abandon(OpToken::new(user_data, generation)));
             }
         }
     }

@@ -16,8 +16,9 @@ use crate::op::{UringOp, UringUserPayload};
 use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, DriveMode, DriveOutcome, Driver, DriverCompletionDiagnostics,
-    DriverSubmitResult, OpToken, RegisterFd, RemoteWaker, SharedCompletionQueue,
+    CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome, Driver,
+    DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteWaker,
+    SharedCompletionQueue,
     SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
@@ -368,8 +369,8 @@ impl<'a> Driver for UringDriver<'a> {
         self.completion_table.clone()
     }
 
-    fn cancel_op(&mut self, request: CancelRequest) {
-        self.cancel_op_internal(request);
+    fn cancel_op(&mut self, request: CancelRequest) -> DriverResult<CancelSubmitOutcome> {
+        Ok(self.cancel_op_internal(request))
     }
 
     fn register_chunk(

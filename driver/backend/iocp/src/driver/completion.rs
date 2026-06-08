@@ -274,7 +274,7 @@ impl<'a> IocpDriver<'a> {
         let mut sidecar_to_push = None;
         let handled = Self::with_inflight_slot(ops, token, |guard| {
             let completion_res = io_result_to_event_res(&io_result);
-            let mut io_detail = io_result.err().map(Err);
+            let mut io_detail = Some(io_result);
             let mut guard = guard.complete();
 
             if guard.platform_mut().is_background {

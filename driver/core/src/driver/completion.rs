@@ -216,6 +216,15 @@ impl CancelRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelSubmitOutcome {
+    Submitted,
+    Queued,
+    NotFound,
+    NoHandle,
+    AlreadyComplete,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DriverCompletionDiagnostics {
     pub user_completed: u64,
@@ -230,6 +239,9 @@ pub struct DriverCompletionDiagnostics {
     pub waker_ok: u64,
     pub waker_error: u64,
     pub waker_rebuild: u64,
+    pub completion_rejected: u64,
+    pub internal_unknown: u64,
+    pub orphan_cleanup_error: u64,
 }
 
 impl DriverCompletionDiagnostics {
@@ -291,6 +303,21 @@ impl DriverCompletionDiagnostics {
     #[inline]
     pub fn inc_waker_rebuild(&mut self) {
         self.waker_rebuild = self.waker_rebuild.saturating_add(1);
+    }
+
+    #[inline]
+    pub fn inc_completion_rejected(&mut self) {
+        self.completion_rejected = self.completion_rejected.saturating_add(1);
+    }
+
+    #[inline]
+    pub fn inc_internal_unknown(&mut self) {
+        self.internal_unknown = self.internal_unknown.saturating_add(1);
+    }
+
+    #[inline]
+    pub fn inc_orphan_cleanup_error(&mut self) {
+        self.orphan_cleanup_error = self.orphan_cleanup_error.saturating_add(1);
     }
 }
 
@@ -500,9 +527,39 @@ pub enum RecordCompletionOutcome {
     Corrupt(CompletionAnomaly),
 }
 
+pub enum RecordCompletionResult<UP, E, R = usize> {
+    Recorded,
+    Rejected {
+        outcome: RecordCompletionOutcome,
+        payload: Option<UP>,
+        detail: Option<DriverResult<R, E>>,
+    },
+}
+
+impl<UP, E, R> RecordCompletionResult<UP, E, R> {
+    #[inline]
+    pub fn outcome(&self) -> &RecordCompletionOutcome {
+        match self {
+            Self::Recorded => &RecordCompletionOutcome::Recorded,
+            Self::Rejected { outcome, .. } => outcome,
+        }
+    }
+
+    #[inline]
+    pub fn into_outcome(self) -> RecordCompletionOutcome {
+        match self {
+            Self::Recorded => RecordCompletionOutcome::Recorded,
+            Self::Rejected { outcome, .. } => outcome,
+        }
+    }
+}
+
 impl DriverCompletionDiagnostics {
     #[inline]
     pub fn record_completion_outcome(&mut self, outcome: &RecordCompletionOutcome) {
+        if !matches!(outcome, RecordCompletionOutcome::Recorded) {
+            self.inc_completion_rejected();
+        }
         match outcome {
             RecordCompletionOutcome::Recorded => self.inc_user_completed(),
             RecordCompletionOutcome::OrphanedDropped => self.inc_user_orphan_completed(),
@@ -512,6 +569,27 @@ impl DriverCompletionDiagnostics {
             RecordCompletionOutcome::Stale(_) => self.inc_stale_completion(),
             RecordCompletionOutcome::Corrupt(_) => self.inc_slot_corruption(),
         }
+    }
+
+    #[inline]
+    pub fn record_completion_result<UP, E, R>(
+        &mut self,
+        result: &RecordCompletionResult<UP, E, R>,
+    ) {
+        self.record_completion_outcome(result.outcome());
+    }
+}
+
+#[inline]
+fn rejected_completion<UP, E, R>(
+    outcome: RecordCompletionOutcome,
+    payload: Option<UP>,
+    detail: Option<DriverResult<R, E>>,
+) -> RecordCompletionResult<UP, E, R> {
+    RecordCompletionResult::Rejected {
+        outcome,
+        payload,
+        detail,
     }
 }
 
@@ -533,7 +611,7 @@ pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
         event: CompletionEvent,
         payload: Option<UP>,
         detail: Option<DriverResult<R, E>>,
-    ) -> RecordCompletionOutcome;
+    ) -> RecordCompletionResult<UP, E, R>;
 
     fn try_take_record(&self, token: CompletionToken) -> PollRecordResult<UP, E, R>;
 
@@ -582,16 +660,24 @@ where
         event: CompletionEvent,
         mut payload: Option<UP>,
         mut detail: Option<DriverResult<R, E>>,
-    ) -> RecordCompletionOutcome {
+    ) -> RecordCompletionResult<UP, E, R> {
         let token = event.token;
         let Some(op_token) = token.op_token() else {
-            return RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_control(token));
+            return rejected_completion(
+                RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_control(token)),
+                payload,
+                detail,
+            );
         };
         let (idx, generation) = op_token.parts();
         if idx >= self.slots.len() {
-            return RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_slot(
-                token, idx, generation,
-            ));
+            return rejected_completion(
+                RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_slot(
+                    token, idx, generation,
+                )),
+                payload,
+                detail,
+            );
         }
         let cell = &self.slots[idx];
         let should_note_ready;
@@ -602,14 +688,22 @@ where
             let cell_gen = current.generation();
 
             if generation < cell_gen {
-                return RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
-                    token, idx, generation, cell_gen, state,
-                ));
+                return rejected_completion(
+                    RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
+                        token, idx, generation, cell_gen, state,
+                    )),
+                    payload,
+                    detail,
+                );
             }
             if generation > cell_gen && state != slot::SlotState::Idle {
-                return RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
-                    token, idx, generation, cell_gen, state,
-                ));
+                return rejected_completion(
+                    RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
+                        token, idx, generation, cell_gen, state,
+                    )),
+                    payload,
+                    detail,
+                );
             }
 
             match state {
@@ -625,9 +719,13 @@ where
                 | slot::SlotState::Reserved
                 | slot::SlotState::InFlightReady
                 | slot::SlotState::ReservedValue => {
-                    return RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
-                        token, idx, generation, state,
-                    ));
+                    return rejected_completion(
+                        RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
+                            token, idx, generation, state,
+                        )),
+                        payload,
+                        detail,
+                    );
                 }
                 slot::SlotState::InFlightOrphaned => {
                     if cell_gen == generation {
@@ -643,15 +741,20 @@ where
                             )
                             .is_ok()
                         {
-                            // Abandoned by consumer, drop incoming data
-                            let _ = payload.take();
-                            let _ = detail.take();
-                            return RecordCompletionOutcome::OrphanedDropped;
+                            return rejected_completion(
+                                RecordCompletionOutcome::OrphanedDropped,
+                                payload,
+                                detail,
+                            );
                         }
                     } else {
-                        return RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
-                            token, idx, generation, cell_gen, state,
-                        ));
+                        return rejected_completion(
+                            RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
+                                token, idx, generation, cell_gen, state,
+                            )),
+                            payload,
+                            detail,
+                        );
                     }
                 }
                 slot::SlotState::Finalizing => continue,
@@ -694,16 +797,18 @@ where
                         .is_ok()
                 {
                     cell.completion_waker.wake();
-                    return RecordCompletionOutcome::Recorded;
+                    return RecordCompletionResult::Recorded;
                 }
 
                 // If we reached here, someone else either:
                 // 1. already set it to InFlightReady (which is fine, we just discard our duplicate data)
                 // 2. recycled the slot (generation mismatch)
-                cell.completion_with_data(|payload_cell, detail_cell| {
-                    let _ = payload_cell.take();
-                    let _ = detail_cell.take();
-                });
+                let (stored_payload, stored_detail) =
+                    cell.completion_with_data(|payload_cell, detail_cell| {
+                        (payload_cell.take(), detail_cell.take())
+                    });
+                payload = stored_payload;
+                detail = stored_detail;
 
                 let cur = cell.load_core_state(Ordering::Acquire);
                 if cur.generation() == generation
@@ -719,31 +824,43 @@ where
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     );
-                    return RecordCompletionOutcome::OrphanedDropped;
+                    return rejected_completion(
+                        RecordCompletionOutcome::OrphanedDropped,
+                        payload,
+                        detail,
+                    );
                 } else if should_note_ready {
                     self.clear_ready_completion();
                 }
                 let cur = cell.load_core_state(Ordering::Acquire);
                 if cur.generation() != generation {
-                    return RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
+                    return rejected_completion(
+                        RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
+                            token,
+                            idx,
+                            generation,
+                            cur.generation(),
+                            cur.state(),
+                        )),
+                        payload,
+                        detail,
+                    );
+                }
+                return rejected_completion(
+                    RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
                         token,
                         idx,
                         generation,
-                        cur.generation(),
                         cur.state(),
-                    ));
-                }
-                return RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
-                    token,
-                    idx,
-                    generation,
-                    cur.state(),
-                ));
+                    )),
+                    payload,
+                    detail,
+                );
             }
         }
 
         cell.completion_waker.wake();
-        RecordCompletionOutcome::Recorded
+        RecordCompletionResult::Recorded
     }
 
     #[inline]

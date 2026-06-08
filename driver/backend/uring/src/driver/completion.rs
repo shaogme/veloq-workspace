@@ -12,7 +12,7 @@ use crate::op::{
 };
 use veloq_driver_core::driver::{
     CompletionControlKind, CompletionEvent, CompletionSidecar, CompletionToken,
-    CompletionTokenClass, OpToken, drain_cancel_requests,
+    CompletionTokenClass, OpToken, RecordCompletionResult, drain_cancel_requests,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -377,8 +377,52 @@ impl<'a> UringDriver<'a> {
             sidecar.detail,
         );
         self.completion_diagnostics
-            .record_completion_outcome(&outcome);
+            .record_completion_result(&outcome);
+        self.cleanup_rejected_completion(event, outcome);
         self.completion_events.push(event);
+    }
+
+    fn cleanup_rejected_completion(
+        &mut self,
+        event: CompletionEvent,
+        outcome: RecordCompletionResult<UringUserPayload, UringError>,
+    ) {
+        let RecordCompletionResult::Rejected {
+            outcome,
+            payload,
+            detail: _,
+        } = outcome
+        else {
+            return;
+        };
+
+        debug!(
+            token = event.token.raw(),
+            res = event.res,
+            flags = event.flags,
+            outcome = ?outcome,
+            "uring completion table rejected completion"
+        );
+
+        if event.res < 0 {
+            return;
+        }
+
+        match payload {
+            Some(UringUserPayload::Open(_)) | Some(UringUserPayload::Accept(_)) => {
+                let fd = event.res;
+                let close_res = unsafe { libc::close(fd) };
+                if close_res != 0 {
+                    self.completion_diagnostics.inc_orphan_cleanup_error();
+                    warn!(
+                        fd,
+                        errno = std::io::Error::last_os_error().raw_os_error(),
+                        "failed to close rejected uring completion fd"
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 }
 
