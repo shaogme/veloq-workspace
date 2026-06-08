@@ -58,12 +58,7 @@ pub struct SubmittedOpSlot {
 
 impl SubmittedOpSlot {
     #[inline]
-    pub fn token(self) -> u64 {
-        encode_completion_token(self.user_data, self.generation)
-    }
-
-    #[inline]
-    pub fn completion_token(self) -> CompletionToken {
+    pub fn token(self) -> CompletionToken {
         CompletionToken::user(self.user_data, self.generation)
     }
 }
@@ -97,12 +92,7 @@ impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
     }
 
     #[inline]
-    pub fn token(&self) -> u64 {
-        encode_completion_token(self.user_data, self.generation)
-    }
-
-    #[inline]
-    pub fn completion_token(&self) -> CompletionToken {
+    pub fn token(&self) -> CompletionToken {
         CompletionToken::user(self.user_data, self.generation)
     }
 
@@ -205,15 +195,9 @@ pub trait Driver {
 
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error>;
 
-    fn completion_queue(&self) -> SharedCompletionQueue;
-
     fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion>;
 
-    fn try_pop_completion(&mut self) -> Option<CompletionEvent> {
-        self.completion_queue().pop()
-    }
-
-    fn register_completion_waker(&mut self, token: u64, waker: &Waker) {
+    fn register_completion_waker(&mut self, token: CompletionToken, waker: &Waker) {
         self.completion_table().register_waker(token, waker);
     }
 
@@ -312,11 +296,6 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     #[inline]
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error> {
         self.provider.with_driver_mut(|d| d.drive(mode))
-    }
-
-    #[inline]
-    fn completion_queue(&self) -> SharedCompletionQueue {
-        self.provider.with_driver_ref(|d| d.completion_queue())
     }
 
     #[inline]

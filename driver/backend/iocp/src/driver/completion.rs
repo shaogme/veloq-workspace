@@ -55,8 +55,11 @@ impl<'a> IocpDriver<'a> {
                 }
             }
         }
+        let mut finished_timers = Vec::new();
         for user_data in expired {
-            Self::finish_timer_op(&mut self.ops, user_data, &mut pending_events);
+            if Self::finish_timer_op(&mut self.ops, user_data, &mut pending_events) {
+                finished_timers.push(user_data);
+            }
         }
 
         for completion in pending_events {
@@ -66,6 +69,9 @@ impl<'a> IocpDriver<'a> {
                 completion_record(completion),
             );
         }
+        for user_data in finished_timers {
+            self.ops.remove(user_data);
+        }
         self.timer.restore_cleared_buffer(timer_buffer);
     }
 
@@ -73,10 +79,10 @@ impl<'a> IocpDriver<'a> {
         ops: &mut IocpOpRegistry,
         user_data: usize,
         pending_events: &mut Vec<CompletionSidecar>,
-    ) {
+    ) -> bool {
         let mut guard = match ops.slot_view(user_data) {
             Some(SlotView::InFlightWaiting(slot)) => slot.complete(),
-            _ => return,
+            _ => return false,
         };
 
         let generation = guard.entry.generation(Ordering::Acquire);
@@ -90,7 +96,7 @@ impl<'a> IocpDriver<'a> {
             payload: payload_erased,
             detail,
         });
-        ops.remove(user_data);
+        true
     }
 
     pub(super) fn process_completion(
@@ -293,8 +299,6 @@ impl<'a> IocpDriver<'a> {
 
         if handled.is_none() {
             debug!(user_data, "Received completion for non-active slot");
-        } else if should_free {
-            ops.remove(user_data);
         }
 
         if let Some(sidecar) = sidecar_to_push {
@@ -303,6 +307,10 @@ impl<'a> IocpDriver<'a> {
                 ctx.completion_table,
                 completion_record(sidecar),
             );
+        }
+
+        if handled.is_some() && should_free {
+            ops.remove(user_data);
         }
     }
 }

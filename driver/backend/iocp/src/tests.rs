@@ -6,8 +6,8 @@ pub(crate) mod net_udp;
 use core::convert::TryFrom;
 use diagweave::prelude::*;
 use veloq_driver_core::driver::{
-    CompletionRecord, DriveMode, Driver, DriverSubmitResult, PollRecordResult,
-    encode_completion_token, event_res_to_result,
+    CompletionRecord, CompletionToken, DriveMode, Driver, DriverSubmitResult, PollRecordResult,
+    event_res_to_result,
 };
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
 
@@ -69,7 +69,7 @@ pub(crate) fn wait_completion_record(
     timeout: std::time::Duration,
 ) -> IocpResult<CompletionRecord<IocpUserPayload, IocpError>> {
     let start = std::time::Instant::now();
-    let token = encode_completion_token(user_data, generation);
+    let token = CompletionToken::user(user_data, generation);
     loop {
         if start.elapsed() > timeout {
             return IocpError::CompletionWait
@@ -82,8 +82,9 @@ pub(crate) fn wait_completion_record(
         let completion_table = driver.completion_table();
         match completion_table.try_take_record(token) {
             PollRecordResult::Ready(record) => return Ok(record),
-            PollRecordResult::Stale => {
+            PollRecordResult::Stale(anomaly) => {
                 return IocpError::CompletionWait
+                    .with_ctx("completion_token", anomaly.token.raw())
                     .attach_note("stale completion record (generation mismatch)");
             }
             PollRecordResult::Lost(anomaly) => {

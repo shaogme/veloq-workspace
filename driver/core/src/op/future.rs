@@ -133,22 +133,6 @@ where
 }
 
 #[inline]
-pub(crate) fn generation_mismatch_error<E>() -> OpError<E>
-where
-    E: DriverError,
-{
-    OpError::new(
-        LostReason::GenerationMismatch,
-        E::from_core_report(
-            DriverCoreError::Internal
-                .to_report()
-                .push_ctx("scope", "driver-core/op")
-                .attach_note("operation lost: slot recycled (generation mismatch)"),
-        ),
-    )
-}
-
-#[inline]
 pub(crate) fn completion_anomaly_error<E>(anomaly: CompletionAnomaly) -> OpError<E>
 where
     E: DriverError,
@@ -212,7 +196,7 @@ where
 #[inline]
 pub(crate) fn poll_completion_table_once<T, O, UP, E, C>(
     table: &dyn crate::driver::CompletionAccess<UP, E, C>,
-    token: u64,
+    token: CompletionToken,
 ) -> Poll<OpResult<T::Output, E, T::Completion>>
 where
     UP: Send,
@@ -223,9 +207,11 @@ where
 {
     match table.try_take_record(token) {
         PollRecordResult::Ready(record) => completion_record_to_result::<T, O, UP, E, C>(record),
-        PollRecordResult::Stale => Poll::Ready(
-            OpResult::<T::Output, E, T::Completion>::ResourceLost(generation_mismatch_error()),
-        ),
+        PollRecordResult::Stale(anomaly) => {
+            Poll::Ready(OpResult::<T::Output, E, T::Completion>::ResourceLost(
+                completion_anomaly_error(anomaly),
+            ))
+        }
         PollRecordResult::Lost(anomaly) => {
             Poll::Ready(OpResult::<T::Output, E, T::Completion>::ResourceLost(
                 completion_anomaly_error(anomaly),
@@ -248,7 +234,7 @@ where
     pub(crate) completion_table: Option<SharedCompletionTable<T::ErasedPayload, E, C>>,
     pub(crate) cancel_signal: Option<Arc<DetachedCancelTable>>,
     pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<E>>>,
-    pub(crate) token: u64,
+    pub(crate) token: Option<CompletionToken>,
     pub(crate) immediate_failure: Option<(DriverReport<E>, T::UserPayload)>,
     pub(crate) _phantom: std::marker::PhantomData<DetachedOpMarker<T, T::ErasedPayload, E, C, O>>,
 }
@@ -270,11 +256,13 @@ where
     T: IntoPlatformOp<O, DriverCompletion = C, Error = E>,
 {
     fn drop(&mut self) {
-        if let Some(table) = self.completion_table.as_ref() {
-            table.mark_orphaned(self.token);
-        }
-        if let Some(cancel_signal) = self.cancel_signal.as_ref() {
-            cancel_signal.request_cancel(self.token);
+        if let Some(token) = self.token {
+            if let Some(table) = self.completion_table.as_ref() {
+                table.mark_orphaned(token);
+            }
+            if let Some(cancel_signal) = self.cancel_signal.as_ref() {
+                cancel_signal.request_cancel(token);
+            }
         }
         if let Some(cancel_waker) = self.cancel_waker.as_ref()
             && let Err(e) = cancel_waker.wake()
@@ -305,14 +293,17 @@ where
             .completion_table
             .as_ref()
             .expect("DetachedOp missing completion_table but no immediate_failure");
+        let token = this
+            .token
+            .expect("DetachedOp missing completion token but no immediate_failure");
         if let Poll::Ready(result) =
-            poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, this.token)
+            poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, token)
         {
             return Poll::Ready(result);
         }
 
-        table.register_waker(this.token, cx.waker());
-        poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, this.token)
+        table.register_waker(token, cx.waker());
+        poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, token)
     }
 }
 
@@ -338,7 +329,7 @@ where
     pub(crate) data: Option<T>,
     pub(crate) provider: P,
     pub(crate) user_data: usize,
-    pub(crate) token: u64,
+    pub(crate) token: Option<CompletionToken>,
     pub(crate) marker: std::marker::PhantomData<&'a ()>,
 }
 
@@ -358,7 +349,7 @@ where
             data: Some(data),
             provider,
             user_data: 0,
-            token: 0,
+            token: None,
             marker: std::marker::PhantomData,
         }
     }
@@ -430,14 +421,14 @@ where
                 }
                 Ok((user_data, token, result, fallback_payload)) => {
                     op.user_data = user_data;
-                    op.token = token;
+                    op.token = Some(token);
                     match result {
                         DriverSubmitResult::Submitted(_) => {
                             op.state = LocalState::Submitted;
                             trace!(
                                 op = %std::any::type_name::<T>(),
                                 user_data = op.user_data,
-                                token = op.token,
+                                token = token.raw(),
                                 "LocalOp::poll: submitted"
                             );
                         }
@@ -463,7 +454,7 @@ where
                                 trace!(
                                     op = %std::any::type_name::<T>(),
                                     user_data = op.user_data,
-                                    token = op.token,
+                                    token = token.raw(),
                                     status = ?status,
                                     "LocalOp::poll: submitted in flight"
                                 );
@@ -475,7 +466,9 @@ where
         }
 
         if let LocalState::Submitted = op.state {
-            let token = op.token;
+            let token = op
+                .token
+                .expect("LocalOp submitted state missing completion token");
             let res =
                 op.provider.with_driver(|mut driver| {
                     let mut is_ready = false;
@@ -515,7 +508,7 @@ where
                 trace!(
                     op = %std::any::type_name::<T>(),
                     user_data = op.user_data,
-                    token = op.token,
+                    token = token.raw(),
                     "LocalOp::poll: completion ready"
                 );
                 Poll::Ready(res.1.unwrap())
@@ -523,7 +516,7 @@ where
                 trace!(
                     op = %std::any::type_name::<T>(),
                     user_data = op.user_data,
-                    token = op.token,
+                    token = token.raw(),
                     "LocalOp::poll: completion pending"
                 );
                 Poll::Pending
@@ -546,11 +539,12 @@ where
 {
     fn drop(&mut self) {
         if let LocalState::Submitted = self.state {
-            let token = self.token;
-            self.provider.with_driver(|mut driver| {
-                driver.completion_table().mark_orphaned(token);
-                driver.cancel_op(CancelRequest::abandon(CompletionToken::from_raw(token)));
-            });
+            if let Some(token) = self.token {
+                self.provider.with_driver(|mut driver| {
+                    driver.completion_table().mark_orphaned(token);
+                    driver.cancel_op(CancelRequest::abandon(token));
+                });
+            }
         }
     }
 }

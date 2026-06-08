@@ -114,7 +114,7 @@ impl<T> Op<T> {
                             completion_table: Some(completion_table),
                             cancel_signal: Some(cancel_signal),
                             cancel_waker: Some(cancel_waker),
-                            token,
+                            token: Some(token),
                             immediate_failure: None,
                             _phantom: std::marker::PhantomData,
                         }
@@ -142,7 +142,7 @@ impl<T> Op<T> {
                                     completion_table: None,
                                     cancel_signal: None,
                                     cancel_waker: None,
-                                    token: 0,
+                                    token: None,
                                     immediate_failure: Some((report, payload)),
                                     _phantom: std::marker::PhantomData,
                                 }
@@ -154,7 +154,7 @@ impl<T> Op<T> {
                                     completion_table: Some(completion_table),
                                     cancel_signal: Some(cancel_signal),
                                     cancel_waker: Some(cancel_waker),
-                                    token,
+                                    token: Some(token),
                                     immediate_failure: None,
                                     _phantom: std::marker::PhantomData,
                                 }
@@ -170,7 +170,7 @@ impl<T> Op<T> {
                     completion_table: None,
                     cancel_signal: None,
                     cancel_waker: None,
-                    token: 0,
+                    token: None,
                     immediate_failure: Some((e, payload)),
                     _phantom: std::marker::PhantomData,
                 }

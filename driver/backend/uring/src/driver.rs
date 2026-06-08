@@ -365,10 +365,6 @@ impl<'a> Driver for UringDriver<'a> {
         })
     }
 
-    fn completion_queue(&self) -> SharedCompletionQueue {
-        self.completion_events.clone()
-    }
-
     fn completion_table(&self) -> SharedCompletionTable<UringUserPayload, UringError> {
         self.completion_table.clone()
     }

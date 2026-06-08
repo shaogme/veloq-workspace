@@ -23,14 +23,14 @@ impl SlotSpec for DummySlotSpec {
 fn test_completion_table_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = encode_completion_token(0, 1);
+        let token = CompletionToken::user(0, 1);
 
         let table_cloned = table.clone();
         let producer = thread::spawn(move || {
             // Mock driver producing a completion
             table_cloned.record_completion_with_data(
                 CompletionEvent {
-                    user_data: token,
+                    token,
                     res: 0,
                     flags: 0,
                 },
@@ -44,10 +44,10 @@ fn test_completion_table_loom() {
             // Mock consumer: mark waiting, then either poll or drop
             table_cloned2.mark_waiting(token);
             match table_cloned2.try_take_record(token) {
-                PollRecordResult::Ready(record) => assert_eq!(record.event.user_data, token),
-                PollRecordResult::Pending | PollRecordResult::Stale | PollRecordResult::Lost(_) => {
-                    table_cloned2.mark_orphaned(token);
-                }
+                PollRecordResult::Ready(record) => assert_eq!(record.event.token, token),
+                PollRecordResult::Pending
+                | PollRecordResult::Stale(_)
+                | PollRecordResult::Lost(_) => table_cloned2.mark_orphaned(token),
             }
         });
 
@@ -60,13 +60,13 @@ fn test_completion_table_loom() {
 fn test_detached_drop_race_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = encode_completion_token(0, 1);
+        let token = CompletionToken::user(0, 1);
 
         let table_cloned = table.clone();
         let producer = thread::spawn(move || {
             table_cloned.record_completion_with_data(
                 CompletionEvent {
-                    user_data: token,
+                    token,
                     res: 42,
                     flags: 0,
                 },
@@ -94,11 +94,11 @@ fn test_detached_drop_race_loom() {
 fn test_fast_completion_then_waiting_take_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = encode_completion_token(0, 1);
+        let token = CompletionToken::user(0, 1);
 
         table.record_completion_with_data(
             CompletionEvent {
-                user_data: token,
+                token,
                 res: 7,
                 flags: 0,
             },
@@ -109,11 +109,13 @@ fn test_fast_completion_then_waiting_take_loom() {
         table.mark_waiting(token);
         match table.try_take_record(token) {
             PollRecordResult::Ready(record) => {
-                assert_eq!(record.event.user_data, token);
+                assert_eq!(record.event.token, token);
                 assert_eq!(record.event.res, 7);
             }
             PollRecordResult::Pending => panic!("expected ready after fast completion"),
-            PollRecordResult::Stale => panic!("unexpected stale in same generation"),
+            PollRecordResult::Stale(anomaly) => {
+                panic!("unexpected stale in same generation: {anomaly:?}")
+            }
             PollRecordResult::Lost(anomaly) => panic!("unexpected lost completion: {anomaly:?}"),
         }
 
@@ -125,12 +127,12 @@ fn test_fast_completion_then_waiting_take_loom() {
 fn test_stale_after_generation_advance_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token_g1 = encode_completion_token(0, 1);
-        let token_g2 = encode_completion_token(0, 2);
+        let token_g1 = CompletionToken::user(0, 1);
+        let token_g2 = CompletionToken::user(0, 2);
 
         table.record_completion_with_data(
             CompletionEvent {
-                user_data: token_g1,
+                token: token_g1,
                 res: 1,
                 flags: 0,
             },
@@ -144,7 +146,7 @@ fn test_stale_after_generation_advance_loom() {
         table.mark_waiting(token_g2);
 
         match table.try_take_record(token_g1) {
-            PollRecordResult::Stale => {}
+            PollRecordResult::Stale(_) => {}
             PollRecordResult::Ready(_) => panic!("old generation must not become ready"),
             PollRecordResult::Pending => panic!("old generation must be stale"),
             PollRecordResult::Lost(anomaly) => {
@@ -158,11 +160,11 @@ fn test_stale_after_generation_advance_loom() {
 fn test_ready_race_with_mark_orphaned_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = encode_completion_token(0, 1);
+        let token = CompletionToken::user(0, 1);
 
         table.record_completion_with_data(
             CompletionEvent {
-                user_data: token,
+                token,
                 res: 3,
                 flags: 0,
             },
@@ -193,12 +195,12 @@ fn test_two_consumers_at_most_one_ready_loom() {
         use loom::sync::atomic::{AtomicUsize, Ordering};
 
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = encode_completion_token(0, 1);
+        let token = CompletionToken::user(0, 1);
         let ready_count = Arc::new(AtomicUsize::new(0));
 
         table.record_completion_with_data(
             CompletionEvent {
-                user_data: token,
+                token,
                 res: 9,
                 flags: 0,
             },

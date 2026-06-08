@@ -18,7 +18,7 @@ use veloq_driver_core::driver::registry::OpEntry;
 use veloq_driver_core::driver::{
     CancelRequest, CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver,
     DriverCompletionDiagnostics, DriverSubmitResult, RegisterFd, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+    SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
 
@@ -246,10 +246,6 @@ impl<'a> Driver for IocpDriver<'a> {
             next_timeout_hint: self.timer.next_timeout(),
             pending_progress,
         })
-    }
-
-    fn completion_queue(&self) -> SharedCompletionQueue {
-        self.completion.completion_queue()
     }
 
     fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion> {

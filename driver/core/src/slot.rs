@@ -493,7 +493,7 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{CompletionAccess, CompletionEvent, PlatformOp, encode_completion_token};
+    use crate::driver::{CompletionAccess, CompletionEvent, CompletionToken, PlatformOp};
 
     struct DummyPlatformOp;
 
@@ -514,7 +514,7 @@ mod tests {
     fn ready_slots_are_owned_by_completion_table_not_slot_view() {
         let mut registry = OpRegistry::<DummySlotSpec>::new(1);
         let handle = registry.alloc(()).expect("slot allocation failed").handle;
-        let token = encode_completion_token(handle.index, handle.generation);
+        let token = CompletionToken::user(handle.index, handle.generation);
 
         {
             let slot = registry
@@ -525,7 +525,7 @@ mod tests {
 
         registry.shared.record_completion_with_data(
             CompletionEvent {
-                user_data: token,
+                token,
                 res: 0,
                 flags: 0,
             },
@@ -537,12 +537,14 @@ mod tests {
         let record = match registry.shared.try_take_record(token) {
             crate::driver::PollRecordResult::Ready(record) => record,
             crate::driver::PollRecordResult::Pending => panic!("completion should be ready"),
-            crate::driver::PollRecordResult::Stale => panic!("completion should not be stale"),
+            crate::driver::PollRecordResult::Stale(anomaly) => {
+                panic!("completion should not be stale: {anomaly:?}")
+            }
             crate::driver::PollRecordResult::Lost(anomaly) => {
                 panic!("completion should not be lost: {anomaly:?}")
             }
         };
-        assert_eq!(record.event.user_data, token);
+        assert_eq!(record.event.token, token);
         assert_eq!(record.payload, Some(()));
     }
 }

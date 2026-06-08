@@ -276,8 +276,8 @@ pub struct CompletionSidecar<UP, E, R = usize> {
 /// Unified completion event produced by platform drivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompletionEvent {
-    /// Encoded completion token (generation + slot index).
-    pub user_data: u64,
+    /// Completion token (generation + slot index, or backend control token).
+    pub token: CompletionToken,
     /// Completion result code. Non-negative for success, negative for error.
     pub res: i32,
     /// Platform-specific completion flags.
@@ -286,8 +286,8 @@ pub struct CompletionEvent {
 
 impl CompletionEvent {
     #[inline]
-    pub const fn token(self) -> CompletionToken {
-        CompletionToken::from_raw(self.user_data)
+    pub const fn user_data(self) -> u64 {
+        self.token.raw()
     }
 }
 
@@ -319,6 +319,77 @@ pub struct CompletionAnomaly {
     pub reason: CompletionAnomalyReason,
 }
 
+impl CompletionAnomaly {
+    #[inline]
+    pub fn unknown_control(token: CompletionToken) -> Self {
+        Self {
+            token,
+            index: None,
+            expected_generation: None,
+            actual_generation: None,
+            state: None,
+            reason: CompletionAnomalyReason::UnknownControlToken,
+        }
+    }
+
+    #[inline]
+    pub fn unknown_slot(token: CompletionToken, index: usize, generation: u32) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: None,
+            state: None,
+            reason: CompletionAnomalyReason::UnknownSlot,
+        }
+    }
+
+    #[inline]
+    pub fn stale(
+        token: CompletionToken,
+        index: usize,
+        expected_generation: u32,
+        actual_generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(expected_generation),
+            actual_generation: Some(actual_generation),
+            state: Some(state),
+            reason: CompletionAnomalyReason::StaleGeneration,
+        }
+    }
+
+    #[inline]
+    pub fn non_active(
+        token: CompletionToken,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: Some(generation),
+            state: Some(state),
+            reason: CompletionAnomalyReason::NonActiveSlot,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCompletionOutcome {
+    Recorded,
+    OrphanedDropped,
+    Missing(CompletionAnomaly),
+    Stale(CompletionAnomaly),
+    NonActive(CompletionAnomaly),
+    Corrupt(CompletionAnomaly),
+}
+
 /// Result of a completion poll, enabling detection of recycled slots.
 pub enum PollRecordResult<UP, E, R = usize> {
     /// Operation completed successfully or with an error.
@@ -326,7 +397,7 @@ pub enum PollRecordResult<UP, E, R = usize> {
     /// Operation is still in flight.
     Pending,
     /// Operation lost because the slot has been recycled for a newer generation.
-    Stale,
+    Stale(CompletionAnomaly),
     /// Operation lost or could not be associated with a valid active slot.
     Lost(CompletionAnomaly),
 }
@@ -337,35 +408,28 @@ pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
         event: CompletionEvent,
         payload: Option<UP>,
         detail: Option<DriverResult<R, E>>,
-    );
+    ) -> RecordCompletionOutcome;
 
-    fn try_take_record(&self, token: u64) -> PollRecordResult<UP, E, R>;
+    fn try_take_record(&self, token: CompletionToken) -> PollRecordResult<UP, E, R>;
 
     #[inline]
-    fn try_take(&self, token: u64) -> PollRecordResult<UP, E, R> {
+    fn try_take(&self, token: CompletionToken) -> PollRecordResult<UP, E, R> {
         self.try_take_record(token)
     }
 
-    fn register_waker(&self, token: u64, waker: &Waker);
+    fn register_waker(&self, token: CompletionToken, waker: &Waker);
 
-    fn mark_waiting(&self, token: u64);
+    fn mark_waiting(&self, token: CompletionToken);
 
-    fn mark_orphaned(&self, token: u64);
+    fn mark_orphaned(&self, token: CompletionToken);
 
     #[cfg(any(test, feature = "loom"))]
     fn debug_get_state(&self, idx: usize) -> u8;
 }
 
 #[inline]
-pub fn encode_completion_token(index: usize, generation: u32) -> u64 {
-    CompletionToken::user(index, generation).raw()
-}
-
-#[inline]
-pub fn decode_completion_token(token: u64) -> (usize, u32) {
-    CompletionToken::from_raw(token)
-        .user_parts()
-        .unwrap_or((CONTROL_TOKEN_INDEX as usize, 0))
+pub(crate) fn decode_completion_token(token: CompletionToken) -> Option<(usize, u32)> {
+    token.user_parts()
 }
 
 #[inline]
@@ -393,12 +457,15 @@ where
         event: CompletionEvent,
         mut payload: Option<UP>,
         mut detail: Option<DriverResult<R, E>>,
-    ) {
-        let Some((idx, generation)) = event.token().user_parts() else {
-            return;
+    ) -> RecordCompletionOutcome {
+        let token = event.token;
+        let Some((idx, generation)) = token.user_parts() else {
+            return RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_control(token));
         };
         if idx >= self.slots.len() {
-            return;
+            return RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_slot(
+                token, idx, generation,
+            ));
         }
         let cell = &self.slots[idx];
         let should_note_ready;
@@ -409,20 +476,32 @@ where
             let cell_gen = current.generation();
 
             if generation < cell_gen {
-                return;
+                return RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
+                    token, idx, generation, cell_gen, state,
+                ));
             }
             if generation > cell_gen && state != slot::SlotState::Idle {
-                return;
+                return RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
+                    token, idx, generation, cell_gen, state,
+                ));
             }
 
             match state {
+                slot::SlotState::Idle if generation > cell_gen => {
+                    should_note_ready = true;
+                    break current;
+                }
+                slot::SlotState::InFlightWaiting => {
+                    should_note_ready = true;
+                    break current;
+                }
                 slot::SlotState::Idle
                 | slot::SlotState::Reserved
                 | slot::SlotState::InFlightReady
-                | slot::SlotState::InFlightWaiting
                 | slot::SlotState::ReservedValue => {
-                    should_note_ready = state != slot::SlotState::InFlightReady;
-                    break current;
+                    return RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
+                        token, idx, generation, state,
+                    ));
                 }
                 slot::SlotState::InFlightOrphaned => {
                     if cell_gen == generation {
@@ -441,10 +520,12 @@ where
                             // Abandoned by consumer, drop incoming data
                             let _ = payload.take();
                             let _ = detail.take();
-                            return;
+                            return RecordCompletionOutcome::OrphanedDropped;
                         }
                     } else {
-                        return;
+                        return RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
+                            token, idx, generation, cell_gen, state,
+                        ));
                     }
                 }
                 slot::SlotState::Finalizing => continue,
@@ -487,7 +568,7 @@ where
                         .is_ok()
                 {
                     cell.completion_waker.wake();
-                    return;
+                    return RecordCompletionOutcome::Recorded;
                 }
 
                 // If we reached here, someone else either:
@@ -512,38 +593,40 @@ where
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     );
+                    return RecordCompletionOutcome::OrphanedDropped;
                 } else if should_note_ready {
                     self.clear_ready_completion();
                 }
-                return;
+                let cur = cell.load_core_state(Ordering::Acquire);
+                if cur.generation() != generation {
+                    return RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
+                        token,
+                        idx,
+                        generation,
+                        cur.generation(),
+                        cur.state(),
+                    ));
+                }
+                return RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
+                    token,
+                    idx,
+                    generation,
+                    cur.state(),
+                ));
             }
         }
 
         cell.completion_waker.wake();
+        RecordCompletionOutcome::Recorded
     }
 
     #[inline]
-    fn try_take_record(&self, token: u64) -> PollRecordResult<UP, E, R> {
-        let token = CompletionToken::from_raw(token);
+    fn try_take_record(&self, token: CompletionToken) -> PollRecordResult<UP, E, R> {
         let Some((idx, generation)) = token.user_parts() else {
-            return PollRecordResult::Lost(CompletionAnomaly {
-                token,
-                index: None,
-                expected_generation: None,
-                actual_generation: None,
-                state: None,
-                reason: CompletionAnomalyReason::UnknownControlToken,
-            });
+            return PollRecordResult::Lost(CompletionAnomaly::unknown_control(token));
         };
         if idx >= self.slots.len() {
-            return PollRecordResult::Lost(CompletionAnomaly {
-                token,
-                index: Some(idx),
-                expected_generation: Some(generation),
-                actual_generation: None,
-                state: None,
-                reason: CompletionAnomalyReason::UnknownSlot,
-            });
+            return PollRecordResult::Lost(CompletionAnomaly::unknown_slot(token, idx, generation));
         }
         let cell = &self.slots[idx];
 
@@ -553,11 +636,27 @@ where
 
         // If the cell's generation is strictly greater than ours, we are stale.
         if cell_gen > generation {
-            return PollRecordResult::Stale;
+            return PollRecordResult::Stale(CompletionAnomaly::stale(
+                token, idx, generation, cell_gen, state,
+            ));
         }
 
-        if state != slot::SlotState::InFlightReady || cell_gen != generation {
+        if cell_gen != generation {
             return PollRecordResult::Pending;
+        }
+
+        if state != slot::SlotState::InFlightReady {
+            return match state {
+                slot::SlotState::InFlightWaiting => PollRecordResult::Pending,
+                slot::SlotState::Idle
+                | slot::SlotState::Reserved
+                | slot::SlotState::InFlightOrphaned
+                | slot::SlotState::Finalizing
+                | slot::SlotState::ReservedValue => PollRecordResult::Lost(
+                    CompletionAnomaly::non_active(token, idx, generation, state),
+                ),
+                slot::SlotState::InFlightReady => unreachable!(),
+            };
         }
 
         if cell
@@ -581,7 +680,7 @@ where
         });
         PollRecordResult::Ready(CompletionRecord {
             event: CompletionEvent {
-                user_data: token.raw(),
+                token,
                 res: cell.completion_res.load(Ordering::Acquire),
                 flags: cell.completion_flags.load(Ordering::Acquire),
             },
@@ -591,8 +690,10 @@ where
     }
 
     #[inline]
-    fn register_waker(&self, token: u64, waker: &Waker) {
-        let (idx, generation) = decode_completion_token(token);
+    fn register_waker(&self, token: CompletionToken, waker: &Waker) {
+        let Some((idx, generation)) = decode_completion_token(token) else {
+            return;
+        };
         if idx >= self.slots.len() {
             return;
         }
@@ -652,8 +753,10 @@ where
     }
 
     #[inline]
-    fn mark_waiting(&self, token: u64) {
-        let (idx, generation) = decode_completion_token(token);
+    fn mark_waiting(&self, token: CompletionToken) {
+        let Some((idx, generation)) = decode_completion_token(token) else {
+            return;
+        };
         if idx >= self.slots.len() {
             return;
         }
@@ -726,8 +829,10 @@ where
     }
 
     #[inline]
-    fn mark_orphaned(&self, token: u64) {
-        let (idx, generation) = decode_completion_token(token);
+    fn mark_orphaned(&self, token: CompletionToken) {
+        let Some((idx, generation)) = decode_completion_token(token) else {
+            return;
+        };
         if idx >= self.slots.len() {
             return;
         }

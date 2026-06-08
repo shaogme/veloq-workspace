@@ -18,7 +18,7 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionEvent, SharedCompletionQueue, SharedCompletionTable, encode_completion_token,
+    CompletionEvent, CompletionToken, SharedCompletionQueue, SharedCompletionTable,
 };
 use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -143,12 +143,12 @@ impl<'a> RioCompletionRouter<'a> {
                         let _ = guard.take_op();
                         let (payload, detail) = guard.take_completion_data();
                         let event = CompletionEvent {
-                            user_data: encode_completion_token(user_data, generation),
+                            token: CompletionToken::user(user_data, generation),
                             res: res_code,
                             flags: 0,
                         };
 
-                        self.comp.table.record_completion_with_data(
+                        let _ = self.comp.table.record_completion_with_data(
                             event,
                             payload,
                             detail.or(Some(completion)),

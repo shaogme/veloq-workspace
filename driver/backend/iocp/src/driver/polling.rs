@@ -62,10 +62,6 @@ impl CompletionPump {
         &self.events
     }
 
-    pub(super) fn completion_queue(&self) -> SharedCompletionQueue {
-        self.events.clone()
-    }
-
     pub(super) fn table(&self) -> &SharedCompletionTable<IocpUserPayload, IocpError> {
         &self.table
     }

@@ -12,7 +12,7 @@ use crate::op::{
 };
 use veloq_driver_core::driver::{
     CompletionControlKind, CompletionEvent, CompletionSidecar, CompletionToken,
-    CompletionTokenClass, drain_cancel_requests, encode_completion_token,
+    CompletionTokenClass, drain_cancel_requests,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -362,14 +362,17 @@ impl<'a> UringDriver<'a> {
         &mut self,
         sidecar: CompletionSidecar<UringUserPayload, UringError>,
     ) {
-        let token = encode_completion_token(sidecar.user_data, sidecar.generation);
+        let token = CompletionToken::user(sidecar.user_data, sidecar.generation);
         let event = CompletionEvent {
-            user_data: token,
+            token,
             res: sidecar.res,
             flags: sidecar.flags,
         };
-        self.completion_table
-            .record_completion_with_data(event, sidecar.payload, sidecar.detail);
+        let _ = self.completion_table.record_completion_with_data(
+            event,
+            sidecar.payload,
+            sidecar.detail,
+        );
         self.completion_events.push(event);
     }
 }

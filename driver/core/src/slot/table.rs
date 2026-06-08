@@ -31,8 +31,10 @@ impl DetachedCancelTable {
     }
 
     #[inline]
-    pub fn request_cancel(&self, token: u64) {
-        let (idx, generation) = crate::driver::decode_completion_token(token);
+    pub fn request_cancel(&self, token: crate::driver::CompletionToken) {
+        let Some((idx, generation)) = token.user_parts() else {
+            return;
+        };
         if idx >= self.slot_count {
             return;
         }
