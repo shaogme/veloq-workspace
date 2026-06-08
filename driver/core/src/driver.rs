@@ -52,48 +52,45 @@ impl<E> DriverSubmitResult<E> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubmittedOpSlot {
-    pub user_data: usize,
-    pub generation: u32,
+    token: OpToken,
 }
 
 impl SubmittedOpSlot {
     #[inline]
-    pub fn token(self) -> CompletionToken {
-        CompletionToken::user(self.user_data, self.generation)
+    pub fn token(self) -> OpToken {
+        self.token
+    }
+
+    #[inline]
+    pub fn completion_token(self) -> CompletionToken {
+        CompletionToken::user(self.token)
     }
 }
 
 pub struct ReservedOpSlot<'a, D: Driver + ?Sized> {
     driver: &'a mut D,
-    user_data: usize,
-    generation: u32,
+    token: OpToken,
     release_on_drop: bool,
 }
 
 impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
     #[inline]
-    fn new(driver: &'a mut D, user_data: usize, generation: u32) -> Self {
+    fn new(driver: &'a mut D, token: OpToken) -> Self {
         Self {
             driver,
-            user_data,
-            generation,
+            token,
             release_on_drop: true,
         }
     }
 
     #[inline]
-    pub fn user_data(&self) -> usize {
-        self.user_data
+    pub fn token(&self) -> OpToken {
+        self.token
     }
 
     #[inline]
-    pub fn generation(&self) -> u32 {
-        self.generation
-    }
-
-    #[inline]
-    pub fn token(&self) -> CompletionToken {
-        CompletionToken::user(self.user_data, self.generation)
+    pub fn completion_token(&self) -> CompletionToken {
+        CompletionToken::user(self.token)
     }
 
     #[inline]
@@ -113,27 +110,24 @@ impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
 
     #[inline]
     pub fn set_payload(&mut self, payload: D::UP) {
-        self.driver.slot_set_payload_raw(self.user_data, payload);
+        self.driver.slot_set_payload_raw(self.token, payload);
     }
 
     #[inline]
     pub fn submit(&mut self, op_in: &mut Option<D::Op>) -> DriverSubmitResult<D::Error> {
-        self.driver.submit_op_raw(self.user_data, op_in)
+        self.driver.submit_op_raw(self.token, op_in)
     }
 
     #[inline]
     pub fn persist(mut self) -> SubmittedOpSlot {
         self.release_on_drop = false;
-        SubmittedOpSlot {
-            user_data: self.user_data,
-            generation: self.generation,
-        }
+        SubmittedOpSlot { token: self.token }
     }
 
     #[inline]
     pub fn recover_payload(mut self) -> Option<D::UP> {
-        let payload = self.driver.slot_take_payload_raw(self.user_data);
-        self.driver.release_op_slot_raw(self.user_data);
+        let payload = self.driver.slot_take_payload_raw(self.token);
+        self.driver.release_op_slot_raw(self.token);
         self.release_on_drop = false;
         payload
     }
@@ -142,7 +136,7 @@ impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
 impl<D: Driver + ?Sized> Drop for ReservedOpSlot<'_, D> {
     fn drop(&mut self) {
         if self.release_on_drop {
-            self.driver.release_op_slot_raw(self.user_data);
+            self.driver.release_op_slot_raw(self.token);
         }
     }
 }
@@ -163,14 +157,14 @@ pub trait Driver {
         >;
 
     #[doc(hidden)]
-    fn reserve_op_raw(&mut self) -> DriverResult<(usize, u32), Self::Error>;
+    fn reserve_op_raw(&mut self) -> DriverResult<OpToken, Self::Error>;
 
     fn reserve_op(&mut self) -> DriverResult<ReservedOpSlot<'_, Self>, Self::Error>
     where
         Self: Sized,
     {
-        let (user_data, generation) = self.reserve_op_raw()?;
-        Ok(ReservedOpSlot::new(self, user_data, generation))
+        let token = self.reserve_op_raw()?;
+        Ok(ReservedOpSlot::new(self, token))
     }
 
     fn slot_table(&self) -> SharedDriverSlotTable<Self>;
@@ -178,18 +172,18 @@ pub trait Driver {
     fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable>;
 
     #[doc(hidden)]
-    fn slot_set_payload_raw(&mut self, user_data: usize, payload: Self::UP);
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP);
 
     #[doc(hidden)]
-    fn slot_take_payload_raw(&mut self, user_data: usize) -> Option<Self::UP>;
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP>;
 
     #[doc(hidden)]
-    fn release_op_slot_raw(&mut self, user_data: usize);
+    fn release_op_slot_raw(&mut self, token: OpToken);
 
     #[doc(hidden)]
     fn submit_op_raw(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         op_in: &mut Option<Self::Op>,
     ) -> DriverSubmitResult<Self::Error>;
 
@@ -251,7 +245,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     type SlotSpec = D::SlotSpec;
 
     #[inline]
-    fn reserve_op_raw(&mut self) -> DriverResult<(usize, u32), Self::Error> {
+    fn reserve_op_raw(&mut self) -> DriverResult<OpToken, Self::Error> {
         self.provider.with_driver_mut(|d| d.reserve_op_raw())
     }
 
@@ -266,31 +260,31 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 
     #[inline]
-    fn slot_set_payload_raw(&mut self, user_data: usize, payload: Self::UP) {
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP) {
         self.provider
-            .with_driver_mut(|d| d.slot_set_payload_raw(user_data, payload))
+            .with_driver_mut(|d| d.slot_set_payload_raw(token, payload))
     }
 
     #[inline]
-    fn slot_take_payload_raw(&mut self, user_data: usize) -> Option<Self::UP> {
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP> {
         self.provider
-            .with_driver_mut(|d| d.slot_take_payload_raw(user_data))
+            .with_driver_mut(|d| d.slot_take_payload_raw(token))
     }
 
     #[inline]
-    fn release_op_slot_raw(&mut self, user_data: usize) {
+    fn release_op_slot_raw(&mut self, token: OpToken) {
         self.provider
-            .with_driver_mut(|d| d.release_op_slot_raw(user_data))
+            .with_driver_mut(|d| d.release_op_slot_raw(token))
     }
 
     #[inline]
     fn submit_op_raw(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         op_in: &mut Option<Self::Op>,
     ) -> DriverSubmitResult<Self::Error> {
         self.provider
-            .with_driver_mut(|d| d.submit_op_raw(user_data, op_in))
+            .with_driver_mut(|d| d.submit_op_raw(token, op_in))
     }
 
     #[inline]
@@ -356,9 +350,7 @@ pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
             if cancel_table.cancel_generation(user_data) == generation as u64
                 && is_runnable_state(state)
             {
-                driver.cancel_op(CancelRequest::abandon(CompletionToken::user(
-                    user_data, generation,
-                )));
+                driver.cancel_op(CancelRequest::abandon(OpToken::new(user_data, generation)));
             }
         }
     }

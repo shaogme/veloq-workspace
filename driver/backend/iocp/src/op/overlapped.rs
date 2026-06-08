@@ -4,6 +4,7 @@ use crate::rio::SocketInflightToken;
 use crate::win32::{IoCompletionPort, Overlapped};
 use std::io;
 use std::sync::{Arc, Mutex};
+use veloq_driver_core::driver::OpToken;
 
 pub(crate) type BlockingSuccessCleanup = fn(usize);
 
@@ -68,10 +69,8 @@ impl Drop for BlockingCompletion {
 pub struct OverlappedEntry {
     /// The underlying Windows Overlapped structure.
     pub(crate) inner: Overlapped,
-    /// User-defined data associated with the operation.
-    pub(crate) user_data: usize,
-    /// Generation count for slot validation.
-    pub(crate) generation: u32,
+    /// Token associated with the operation.
+    pub(crate) token: OpToken,
     /// Whether the operation is currently in-flight in the kernel.
     pub(crate) in_flight: bool,
     /// Result of an offloaded blocking operation.
@@ -87,8 +86,7 @@ impl OverlappedEntry {
     pub(crate) fn new(user_data: usize) -> Self {
         Self {
             inner: Overlapped::zeroed(),
-            user_data,
-            generation: 0,
+            token: OpToken::new(user_data, 0),
             in_flight: false,
             blocking_completion: None,
             resolved_handle: None,

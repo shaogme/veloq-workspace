@@ -1,6 +1,6 @@
 use tracing::trace;
 
-use crate::driver::{Driver, DriverSubmitResult, PlatformOp, SubmitStatus};
+use crate::driver::{CompletionToken, Driver, DriverSubmitResult, PlatformOp, SubmitStatus};
 use crate::{DriverError, DriverResult};
 
 pub trait DriverProvider: Clone + Unpin {
@@ -108,7 +108,7 @@ impl<T> Op<T> {
                 match slot.submit(&mut op_platform) {
                     DriverSubmitResult::Submitted(_) => {
                         let token = slot.persist().token();
-                        completion_table.mark_waiting(token);
+                        completion_table.mark_waiting(CompletionToken::user(token));
                         DetachedOp {
                             completion_table: Some(completion_table),
                             cancel_signal: Some(cancel_signal),
@@ -159,7 +159,7 @@ impl<T> Op<T> {
                             }
                             SubmitStatus::InFlight => {
                                 let token = slot.persist().token();
-                                completion_table.mark_waiting(token);
+                                completion_table.mark_waiting(CompletionToken::user(token));
                                 DetachedOp {
                                     completion_table: Some(completion_table),
                                     cancel_signal: Some(cancel_signal),

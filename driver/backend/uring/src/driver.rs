@@ -16,9 +16,9 @@ use crate::op::{UringOp, UringUserPayload};
 use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CompletionToken, DriveMode, DriveOutcome, Driver,
-    DriverCompletionDiagnostics, DriverSubmitResult, RegisterFd, RemoteWaker,
-    SharedCompletionQueue, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+    CancelMode, CancelRequest, DriveMode, DriveOutcome, Driver, DriverCompletionDiagnostics,
+    DriverSubmitResult, OpToken, RegisterFd, RemoteWaker, SharedCompletionQueue,
+    SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
 
@@ -41,7 +41,7 @@ pub(crate) struct EventFd {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingCancel {
-    pub(crate) token: CompletionToken,
+    pub(crate) target: OpToken,
     pub(crate) mode: CancelMode,
 }
 
@@ -49,14 +49,14 @@ impl PendingCancel {
     #[inline]
     pub(crate) const fn new(request: CancelRequest) -> Self {
         Self {
-            token: request.token,
+            target: request.target,
             mode: request.mode,
         }
     }
 
     #[inline]
-    pub(crate) fn user_parts(self) -> Option<(usize, u32)> {
-        self.token.user_parts()
+    pub(crate) const fn user_parts(self) -> (usize, u32) {
+        self.target.parts()
     }
 }
 
@@ -92,7 +92,7 @@ impl RemoteWaker<UringError> for UringWaker {
 pub struct UringDriver<'a> {
     pub(crate) ring: IoUring,
     pub(crate) ops: UringOpRegistry,
-    pub(crate) backlog: VecDeque<usize>,
+    pub(crate) backlog: VecDeque<OpToken>,
     pub(crate) pending_cancellations: VecDeque<PendingCancel>,
     pub(crate) pending_cancel_cqes: HashMap<u16, PendingCancel>,
     pub(crate) next_cancel_id: u16,
@@ -103,12 +103,12 @@ pub struct UringDriver<'a> {
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_registered_fd: Option<IoFd>,
-    pub(crate) waker_token: Option<usize>,
+    pub(crate) waker_token: Option<OpToken>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
-    pub(crate) wheel: veloq_wheel::Wheel<usize>,
-    pub(crate) timer_buffer: Vec<usize>,
+    pub(crate) wheel: veloq_wheel::Wheel<OpToken>,
+    pub(crate) timer_buffer: Vec<OpToken>,
     pub(crate) last_timer_poll: Instant,
     pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
     pub(crate) registration_stats: UringRegistrationStats,
@@ -244,7 +244,7 @@ impl<'a> Driver for UringDriver<'a> {
     type Error = UringError;
     type SlotSpec = UringSlotSpec;
 
-    fn reserve_op_raw(&mut self) -> DriverResult<(usize, u32)> {
+    fn reserve_op_raw(&mut self) -> DriverResult<OpToken> {
         match self.ops.insert(OpEntry::new(UringOpState::new())) {
             Ok(OpHandle {
                 index: id,
@@ -252,7 +252,7 @@ impl<'a> Driver for UringDriver<'a> {
             }) => {
                 trace!(id, generation, "Reserved op slot");
                 self.ops.slot_reserve(id);
-                Ok((id, generation))
+                Ok(OpToken::new(id, generation))
             }
             Err(_) => {
                 Err(UringError::InvalidState.report("uring.driver.reserve_op", "OpRegistry full"))
@@ -268,7 +268,8 @@ impl<'a> Driver for UringDriver<'a> {
         self.detached_cancel_table.clone()
     }
 
-    fn slot_set_payload_raw(&mut self, user_data: usize, payload: UringUserPayload) {
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: UringUserPayload) {
+        let user_data = token.index();
         let _ = self
             .ops
             .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
@@ -276,7 +277,8 @@ impl<'a> Driver for UringDriver<'a> {
             });
     }
 
-    fn slot_take_payload_raw(&mut self, user_data: usize) -> Option<UringUserPayload> {
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<UringUserPayload> {
+        let user_data = token.index();
         self.ops
             .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
                 payload_cell.take()
@@ -284,13 +286,14 @@ impl<'a> Driver for UringDriver<'a> {
             .flatten()
     }
 
-    fn release_op_slot_raw(&mut self, user_data: usize) {
+    fn release_op_slot_raw(&mut self, token: OpToken) {
+        let user_data = token.index();
         let _ = self.ops.remove_if_active(user_data);
     }
 
     fn submit_op_raw(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         op_in: &mut Option<Self::Op>,
     ) -> DriverSubmitResult<Self::Error> {
         let Some(op) = op_in.take() else {
@@ -326,11 +329,9 @@ impl<'a> Driver for UringDriver<'a> {
                     .attach_note("background strategy reached normal submit path"),
                 SubmitStatus::Void,
             ),
-            crate::op::SubmissionStrategy::SubmitSqe => {
-                self.submit_sqe_internal(user_data, op, op_in)
-            }
+            crate::op::SubmissionStrategy::SubmitSqe => self.submit_sqe_internal(token, op, op_in),
             crate::op::SubmissionStrategy::SoftwareTimer => {
-                self.submit_timer_internal(user_data, op, op_in)
+                self.submit_timer_internal(token, op, op_in)
             }
         }
     }

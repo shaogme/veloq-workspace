@@ -64,8 +64,7 @@ pub(crate) fn submit_recv(
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
-    let user_data = header.user_data;
-    let generation = header.generation;
+    let (user_data, generation) = header.token.parts();
     mark_header_in_flight(
         header,
         ctx.rio
@@ -105,8 +104,7 @@ pub(crate) fn submit_udp_recv(
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
-    let user_data = header.user_data;
-    let generation = header.generation;
+    let (user_data, generation) = header.token.parts();
     mark_header_in_flight(
         header,
         ctx.rio
@@ -145,8 +143,7 @@ pub(crate) fn submit_send(
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
-    let user_data = header.user_data;
-    let generation = header.generation;
+    let (user_data, generation) = header.token.parts();
     mark_header_in_flight(
         header,
         ctx.rio
@@ -185,8 +182,7 @@ pub(crate) fn submit_udp_send(
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
-    let user_data = header.user_data;
-    let generation = header.generation;
+    let (user_data, generation) = header.token.parts();
     mark_header_in_flight(
         header,
         ctx.rio
@@ -231,8 +227,8 @@ pub(crate) fn submit_connect(
     .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
     .with_ctx("fd_generation", connect_op.fd.generation())
     .with_ctx("handle_raw", raw.as_handle() as usize)
-    .with_ctx("user_data", header.user_data)
-    .with_ctx("generation", header.generation)?;
+    .with_ctx("user_data", header.token.index())
+    .with_ctx("generation", header.token.generation())?;
     let raw_handle = crate::config::RawHandle::new(raw);
     let handle = raw_handle.borrow();
     ensure_socket_bound(handle, connect_op)?;
@@ -245,8 +241,8 @@ pub(crate) fn submit_connect(
         .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
         .with_ctx("fd_generation", connect_op.fd.generation())
         .with_ctx("handle_raw", raw.as_handle() as usize)
-        .with_ctx("user_data", header.user_data)
-        .with_ctx("generation", header.generation)
+        .with_ctx("user_data", header.token.index())
+        .with_ctx("generation", header.token.generation())
         .attach_note("failed to acquire socket inflight slot before ConnectEx")
         .trans()?;
 
@@ -426,8 +422,8 @@ pub(crate) fn submit_accept(
     ensure_iocp_association(&user.fd, raw, ctx.port.as_ref(), &mut *ctx.registered_slots)
         .push_ctx("scope", "submit_accept")
         .with_ctx("listen_handle_raw", raw.as_handle() as usize)
-        .with_ctx("user_data", header.user_data)
-        .with_ctx("generation", header.generation)?;
+        .with_ctx("user_data", header.token.index())
+        .with_ctx("generation", header.token.generation())?;
 
     let split = ACCEPT_EX_ADDR_SECTION_LEN;
     let mut bytes_received = 0;
@@ -441,8 +437,8 @@ pub(crate) fn submit_accept(
         .with_ctx("fd_generation", user.fd.generation())
         .with_ctx("listen_handle_raw", raw.as_handle() as usize)
         .with_ctx("accept_socket_raw", accept_socket_raw)
-        .with_ctx("user_data", header.user_data)
-        .with_ctx("generation", header.generation)
+        .with_ctx("user_data", header.token.index())
+        .with_ctx("generation", header.token.generation())
         .attach_note("failed to acquire socket inflight slot before AcceptEx")
         .trans()?;
     // SAFETY: iocp_submit_accept_ex is a safe wrapper for the WinSock extension.
@@ -464,8 +460,8 @@ pub(crate) fn submit_accept(
     .with_ctx("accept_socket_raw", accept_socket_raw)
     .with_ctx("accept_input_length", split)
     .with_ctx("accept_output_length", split)
-    .with_ctx("user_data", header.user_data)
-    .with_ctx("generation", header.generation)
+    .with_ctx("user_data", header.token.index())
+    .with_ctx("generation", header.token.generation())
     .attach_note("AcceptEx submit failed");
     mark_socket_header_in_flight(header, inflight, submit_res)
 }
@@ -557,8 +553,8 @@ pub(crate) fn submit_send_to(
         buf: &user.buf,
         addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
         addr_len: payload.addr_len,
-        user_data: header.user_data,
-        generation: header.generation,
+        user_data: header.token.index(),
+        generation: header.token.generation(),
         buf_offset: user.buf_offset,
     };
     mark_header_in_flight(
@@ -568,8 +564,8 @@ pub(crate) fn submit_send_to(
             .with_ctx("outer_scope", "submit_send_to")
             .with_ctx("fd_fixed_index", user.fd.fixed_index())
             .with_ctx("fd_generation", user.fd.generation())
-            .with_ctx("user_data", header.user_data)
-            .with_ctx("generation", header.generation)
+            .with_ctx("user_data", header.token.index())
+            .with_ctx("generation", header.token.generation())
             .attach_note("RIO send_to submit failed")
             .trans(),
     )
@@ -600,8 +596,8 @@ pub(crate) fn submit_udp_recv_from(
         handle,
         recv_from_op: val,
         addr_ptr: (&mut payload.addr as *mut SockAddrStorage).cast::<std::ffi::c_void>(),
-        user_data: header.user_data,
-        generation: header.generation,
+        user_data: header.token.index(),
+        generation: header.token.generation(),
     };
     mark_header_in_flight(
         header,
@@ -610,8 +606,8 @@ pub(crate) fn submit_udp_recv_from(
             .with_ctx("outer_scope", "submit_udp_recv_from")
             .with_ctx("fd_fixed_index", fd.fixed_index())
             .with_ctx("fd_generation", fd.generation())
-            .with_ctx("user_data", header.user_data)
-            .with_ctx("generation", header.generation)
+            .with_ctx("user_data", header.token.index())
+            .with_ctx("generation", header.token.generation())
             .attach_note("RIO udp_recv_from submit failed")
             .trans(),
     )

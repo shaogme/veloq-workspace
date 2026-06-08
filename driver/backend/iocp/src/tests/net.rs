@@ -338,7 +338,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let (user_data, generation) = submit_test_op(&mut driver, recv_op);
 
     driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
-        veloq_driver_core::driver::CompletionToken::user(user_data, generation),
+        veloq_driver_core::driver::OpToken::new(user_data, generation),
     ));
     let _ = tx_send.send(());
 
@@ -417,7 +417,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let (user_data, generation) = submit_test_op(&mut driver, recv_op);
 
     driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
-        veloq_driver_core::driver::CompletionToken::user(user_data, generation),
+        veloq_driver_core::driver::OpToken::new(user_data, generation),
     ));
 
     assert!(

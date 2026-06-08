@@ -18,7 +18,7 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionEvent, CompletionToken, DriverCompletionDiagnostics, SharedCompletionQueue,
+    CompletionEvent, CompletionToken, DriverCompletionDiagnostics, OpToken, SharedCompletionQueue,
     SharedCompletionTable,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
@@ -79,8 +79,9 @@ impl<'a> RioCompletionRouter<'a> {
         } = init;
         let socket_key = socket_inflight.socket_key();
         let ops = &mut self.comp.ops;
-        let token = CompletionToken::user(user_data, generation);
-        match ops.checked_slot_view(token) {
+        let op_token = OpToken::new(user_data, generation);
+        let completion_token = CompletionToken::user(op_token);
+        match ops.checked_slot_view(op_token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                 if slot.platform().generation != generation {
                     let report = IocpError::Internal
@@ -98,7 +99,7 @@ impl<'a> RioCompletionRouter<'a> {
                     let (payload, detail) = guard.take_completion_data();
                     let completion = Err(report);
                     let event = CompletionEvent {
-                        token,
+                        token: completion_token,
                         res: rio_result_to_event_res(&completion),
                         flags: 0,
                     };
@@ -172,7 +173,7 @@ impl<'a> RioCompletionRouter<'a> {
                         let _ = guard.take_op();
                         let (payload, detail) = guard.take_completion_data();
                         let event = CompletionEvent {
-                            token,
+                            token: completion_token,
                             res: res_code,
                             flags: 0,
                         };
@@ -229,7 +230,7 @@ impl<'a> RioCompletionRouter<'a> {
                 );
                 let _ = ops.recycle_if_active(user_data, generation.wrapping_add(1));
             }
-            CheckedSlotView::Missing { .. } | CheckedSlotView::NonUser { .. } => {
+            CheckedSlotView::Missing { .. } => {
                 self.comp.diagnostics.inc_unknown_completion();
                 debug!(
                     user_data,

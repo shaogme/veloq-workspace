@@ -5,7 +5,7 @@ use diagweave::prelude::*;
 use tracing::debug;
 use veloq_buf::BufferRegistrar;
 use veloq_driver_core::driver::{
-    CancelRequest, CompletionToken, DriverCompletionDiagnostics, SharedCompletionTable,
+    CancelRequest, DriverCompletionDiagnostics, OpToken, SharedCompletionTable,
 };
 use veloq_driver_core::slot::{DetachedCancelTable, SlotRegistryExt, SlotView};
 
@@ -196,9 +196,7 @@ impl<'a> IocpDriver<'a> {
         for user_data in in_flight {
             let generation =
                 self.ops.shared.slots[user_data].generation(std::sync::atomic::Ordering::Acquire);
-            self.cancel_op_internal(CancelRequest::abandon(CompletionToken::user(
-                user_data, generation,
-            )));
+            self.cancel_op_internal(CancelRequest::abandon(OpToken::new(user_data, generation)));
         }
         pending
     }

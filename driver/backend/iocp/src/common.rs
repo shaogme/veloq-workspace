@@ -77,7 +77,7 @@ pub(crate) fn completion_record(
 ) -> CompletionRecord<IocpUserPayload, IocpError> {
     CompletionRecord {
         event: CompletionEvent {
-            token: CompletionToken::user(sidecar.user_data, sidecar.generation),
+            token: CompletionToken::user(sidecar.token),
             res: sidecar.res,
             flags: sidecar.flags,
         },

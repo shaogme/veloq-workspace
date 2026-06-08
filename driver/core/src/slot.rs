@@ -1,7 +1,7 @@
 use crate::DriverResult;
 use crate::SlotSidecar;
 use crate::driver::registry::OpRegistry;
-use crate::driver::{CompletionToken, PlatformOp};
+use crate::driver::{OpToken, PlatformOp};
 use std::marker::PhantomData;
 use veloq_shim::atomic::Ordering;
 
@@ -342,9 +342,6 @@ pub struct SlotSnapshot {
 
 pub enum CheckedSlotView<'a, Spec: SlotSpec> {
     Valid(SlotView<'a, Spec>),
-    NonUser {
-        token: CompletionToken,
-    },
     Missing {
         index: usize,
         expected_generation: u32,
@@ -356,7 +353,7 @@ pub enum CheckedSlotView<'a, Spec: SlotSpec> {
 
 pub trait SlotRegistryExt<Spec: SlotSpec> {
     fn unchecked_slot_view(&mut self, index: usize) -> Option<SlotView<'_, Spec>>;
-    fn checked_slot_view(&mut self, token: CompletionToken) -> CheckedSlotView<'_, Spec>;
+    fn checked_slot_view(&mut self, token: OpToken) -> CheckedSlotView<'_, Spec>;
     fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Spec>;
 }
 
@@ -397,10 +394,8 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
     }
 
     #[inline]
-    fn checked_slot_view(&mut self, token: CompletionToken) -> CheckedSlotView<'_, Spec> {
-        let Some((index, expected_generation)) = token.user_parts() else {
-            return CheckedSlotView::NonUser { token };
-        };
+    fn checked_slot_view(&mut self, token: OpToken) -> CheckedSlotView<'_, Spec> {
+        let (index, expected_generation) = token.parts();
         let Some((entry, op_entry, op, storage)) =
             self.get_slot_entry_op_storage_and_entry_mut(index)
         else {
@@ -512,7 +507,8 @@ mod tests {
     fn ready_slots_are_owned_by_completion_table_not_slot_view() {
         let mut registry = OpRegistry::<DummySlotSpec>::new(1);
         let handle = registry.alloc(()).expect("slot allocation failed").handle;
-        let token = CompletionToken::user(handle.index, handle.generation);
+        let token = OpToken::new(handle.index, handle.generation);
+        let completion_token = CompletionToken::user(token);
 
         {
             let slot = registry
@@ -523,7 +519,7 @@ mod tests {
 
         registry.shared.record_completion_with_data(
             CompletionEvent {
-                token,
+                token: completion_token,
                 res: 0,
                 flags: 0,
             },
@@ -532,7 +528,7 @@ mod tests {
         );
 
         assert!(registry.unchecked_slot_view(handle.index).is_none());
-        let record = match registry.shared.try_take_record(token) {
+        let record = match registry.shared.try_take_record(completion_token) {
             crate::driver::PollRecordResult::Ready(record) => record,
             crate::driver::PollRecordResult::Pending => panic!("completion should be ready"),
             crate::driver::PollRecordResult::Stale(anomaly) => {
@@ -542,7 +538,7 @@ mod tests {
                 panic!("completion should not be lost: {anomaly:?}")
             }
         };
-        assert_eq!(record.event.token, token);
+        assert_eq!(record.event.token, completion_token);
         assert_eq!(record.payload, Some(()));
     }
 }

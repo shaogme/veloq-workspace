@@ -12,7 +12,7 @@ use crate::op::{
 };
 use veloq_driver_core::driver::{
     CompletionControlKind, CompletionEvent, CompletionSidecar, CompletionToken,
-    CompletionTokenClass, drain_cancel_requests,
+    CompletionTokenClass, OpToken, drain_cancel_requests,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub(crate) struct CompletionProgress {
 }
 
 enum UringCompletionKind {
-    User { index: usize, generation: u32 },
+    User { token: OpToken },
     Waker,
     Cancel { id: u16 },
     Unknown { token: CompletionToken },
@@ -77,22 +77,19 @@ impl<'a> UringDriver<'a> {
         self.wheel.advance(elapsed, &mut self.timer_buffer);
 
         let timer_buffer = std::mem::take(&mut self.timer_buffer);
-        for user_data in timer_buffer {
-            let sidecar = self
-                .ops
-                .unchecked_slot_view(user_data)
-                .and_then(|slot| match slot {
+        for token in timer_buffer {
+            let user_data = token.index();
+            let sidecar = match self.ops.checked_slot_view(token) {
+                CheckedSlotView::Valid(slot) => match slot {
                     SlotView::InFlightWaiting(mut slot) => {
                         slot.platform_mut().timer_id = None;
                         let mut completed = slot.complete();
 
-                        let generation = completed.entry.generation(Ordering::Acquire);
                         let _ = completed.take_op();
                         let (payload, detail) = completed.take_completion_data();
 
                         Some(CompletionSidecar::<UringUserPayload, UringError> {
-                            user_data,
-                            generation,
+                            token,
                             res: 0,
                             flags: 0,
                             payload,
@@ -100,7 +97,20 @@ impl<'a> UringDriver<'a> {
                         })
                     }
                     _ => None,
-                });
+                },
+                CheckedSlotView::Missing { .. } | CheckedSlotView::Empty(_) => {
+                    self.completion_diagnostics.inc_unknown_completion();
+                    None
+                }
+                CheckedSlotView::Stale(_) => {
+                    self.completion_diagnostics.inc_stale_completion();
+                    None
+                }
+                CheckedSlotView::Corrupt(snapshot) => {
+                    self.emit_corrupt_completion(snapshot, 0, 0, "timer found corrupt slot");
+                    None
+                }
+            };
 
             if let Some(sidecar) = sidecar {
                 self.push_completion_event(sidecar);
@@ -148,9 +158,8 @@ impl<'a> UringDriver<'a> {
         let mut progress = CompletionProgress::default();
         for (raw_token, cqe_res, cqe_flags) in cqes {
             match classify_completion(raw_token) {
-                UringCompletionKind::User { index, generation } => {
-                    progress.user +=
-                        self.handle_user_completion(index, generation, cqe_res, cqe_flags);
+                UringCompletionKind::User { token } => {
+                    progress.user += self.handle_user_completion(token, cqe_res, cqe_flags);
                 }
                 UringCompletionKind::Waker => {
                     progress.internal += 1;
@@ -175,23 +184,17 @@ impl<'a> UringDriver<'a> {
         Ok(progress)
     }
 
-    fn handle_user_completion(
-        &mut self,
-        user_data: usize,
-        generation: u32,
-        cqe_res: i32,
-        cqe_flags: u32,
-    ) -> usize {
-        let token = CompletionToken::user(user_data, generation);
+    fn handle_user_completion(&mut self, token: OpToken, cqe_res: i32, cqe_flags: u32) -> usize {
+        let (user_data, generation) = token.parts();
         match self.ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
-                let sidecar = complete_waiting_slot(slot, user_data, cqe_res, cqe_flags);
+                let sidecar = complete_waiting_slot(slot, token, cqe_res, cqe_flags);
                 self.push_completion_event(sidecar);
                 self.ops.remove(user_data);
                 1
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
-                let sidecar = complete_orphaned_slot(slot, user_data, cqe_res, cqe_flags);
+                let sidecar = complete_orphaned_slot(slot, token, cqe_res, cqe_flags);
                 self.push_completion_event(sidecar);
                 self.ops.remove(user_data);
                 1
@@ -208,7 +211,7 @@ impl<'a> UringDriver<'a> {
                 self.emit_corrupt_completion(snapshot, cqe_res, cqe_flags, "reserved slot");
                 0
             }
-            CheckedSlotView::NonUser { .. } | CheckedSlotView::Missing { .. } => {
+            CheckedSlotView::Missing { .. } => {
                 self.completion_diagnostics.inc_unknown_completion();
                 debug!(user_data, generation, "completion for missing slot");
                 0
@@ -291,7 +294,7 @@ impl<'a> UringDriver<'a> {
 
         self.is_waked.store(false, Ordering::Release);
         if let Some(token) = self.waker_token.take() {
-            self.ops.remove(token);
+            self.ops.remove(token.index());
         }
         if let Err(e) = self.submit_waker() {
             self.completion_diagnostics.inc_waker_rebuild();
@@ -348,8 +351,7 @@ impl<'a> UringDriver<'a> {
                 .attach_note(note)))
         });
         self.push_completion_event(CompletionSidecar::<UringUserPayload, UringError> {
-            user_data: snapshot.index,
-            generation: snapshot.generation,
+            token: OpToken::new(snapshot.index, snapshot.generation),
             res: -libc::EIO,
             flags,
             payload,
@@ -364,9 +366,8 @@ impl<'a> UringDriver<'a> {
         &mut self,
         sidecar: CompletionSidecar<UringUserPayload, UringError>,
     ) {
-        let token = CompletionToken::user(sidecar.user_data, sidecar.generation);
         let event = CompletionEvent {
-            token,
+            token: CompletionToken::user(sidecar.token),
             res: sidecar.res,
             flags: sidecar.flags,
         };
@@ -384,9 +385,7 @@ impl<'a> UringDriver<'a> {
 fn classify_completion(raw: u64) -> UringCompletionKind {
     let token = CompletionToken::from_raw(raw);
     match token.classify() {
-        CompletionTokenClass::User { index, generation } => {
-            UringCompletionKind::User { index, generation }
-        }
+        CompletionTokenClass::User(token) => UringCompletionKind::User { token },
         CompletionTokenClass::Control {
             kind: CompletionControlKind::Waker,
             ..
@@ -401,11 +400,12 @@ fn classify_completion(raw: u64) -> UringCompletionKind {
 }
 
 fn complete_waiting_slot(
-    mut slot: crate::op::slot::Slot<'_, veloq_driver_core::slot::InFlightWaiting>,
-    user_data: usize,
+    slot: crate::op::slot::Slot<'_, veloq_driver_core::slot::InFlightWaiting>,
+    token: OpToken,
     cqe_res: i32,
     cqe_flags: u32,
 ) -> CompletionSidecar<UringUserPayload, UringError> {
+    let user_data = token.index();
     let generation = slot.entry.generation(Ordering::Acquire);
     let has_op = slot.op.is_some();
     let has_payload = slot.storage.payload.is_some();
@@ -415,8 +415,7 @@ fn complete_waiting_slot(
             .with_mut(|result, payload, _sidecar| (payload.take(), result.take()));
         let _ = slot.op.take();
         return CompletionSidecar::<UringUserPayload, UringError> {
-            user_data,
-            generation,
+            token,
             res: -libc::EIO,
             flags: cqe_flags,
             payload,
@@ -457,8 +456,7 @@ fn complete_waiting_slot(
     let _ = completed.take_op();
 
     CompletionSidecar::<UringUserPayload, UringError> {
-        user_data,
-        generation,
+        token,
         res: res_code,
         flags: cqe_flags,
         payload,
@@ -468,7 +466,7 @@ fn complete_waiting_slot(
 
 fn complete_orphaned_slot(
     slot: crate::op::slot::Slot<'_, veloq_driver_core::slot::InFlightOrphaned>,
-    user_data: usize,
+    token: OpToken,
     cqe_res: i32,
     cqe_flags: u32,
 ) -> CompletionSidecar<UringUserPayload, UringError> {
@@ -481,8 +479,7 @@ fn complete_orphaned_slot(
     let _ = completed.take_op();
 
     CompletionSidecar::<UringUserPayload, UringError> {
-        user_data,
-        generation,
+        token: OpToken::new(token.index(), generation),
         res: cqe_res,
         flags: cqe_flags,
         payload,

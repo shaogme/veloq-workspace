@@ -18,7 +18,7 @@ use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::OpEntry;
 use veloq_driver_core::driver::{
     CancelRequest, CompletionSidecar as CoreCompletionSidecar, DriveMode, DriveOutcome, Driver,
-    DriverCompletionDiagnostics, DriverSubmitResult, RegisterFd, RemoteWaker,
+    DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteWaker,
     SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 use veloq_driver_core::slot::DetachedCancelTable;
@@ -123,7 +123,7 @@ impl<'a> Driver for IocpDriver<'a> {
     type Error = IocpError;
     type SlotSpec = IocpSlotSpec;
 
-    fn reserve_op_raw(&mut self) -> IocpDriverResult<(usize, u32)> {
+    fn reserve_op_raw(&mut self) -> IocpDriverResult<OpToken> {
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::default())) {
             Ok(handle) => (handle.index, handle.generation),
             Err(_) => {
@@ -131,7 +131,7 @@ impl<'a> Driver for IocpDriver<'a> {
             }
         };
         trace!(user_data, generation, "Reserved op slot");
-        Ok((user_data, generation))
+        Ok(OpToken::new(user_data, generation))
     }
 
     fn slot_table(&self) -> SharedDriverSlotTable<Self> {
@@ -142,7 +142,8 @@ impl<'a> Driver for IocpDriver<'a> {
         self.detached_cancel_table.clone()
     }
 
-    fn slot_set_payload_raw(&mut self, user_data: usize, payload: Self::UP) {
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP) {
+        let user_data = token.index();
         let _ = self
             .ops
             .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
@@ -150,7 +151,8 @@ impl<'a> Driver for IocpDriver<'a> {
             });
     }
 
-    fn slot_take_payload_raw(&mut self, user_data: usize) -> Option<Self::UP> {
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP> {
+        let user_data = token.index();
         self.ops
             .with_slot_storage_mut(user_data, |_result, payload_cell, _sidecar| {
                 payload_cell.take()
@@ -158,9 +160,10 @@ impl<'a> Driver for IocpDriver<'a> {
             .flatten()
     }
 
-    fn release_op_slot_raw(&mut self, user_data: usize) {
+    fn release_op_slot_raw(&mut self, token: OpToken) {
         use std::sync::atomic::Ordering;
 
+        let user_data = token.index();
         let Some(slot) = self.ops.shared.slots.get(user_data) else {
             return;
         };
@@ -172,7 +175,7 @@ impl<'a> Driver for IocpDriver<'a> {
 
     fn submit_op_raw(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         op_in: &mut Option<Self::Op>,
     ) -> DriverSubmitResult<Self::Error> {
         if self.shutting_down {
@@ -196,7 +199,7 @@ impl<'a> Driver for IocpDriver<'a> {
             }
         };
 
-        let result = match self.call_op_submit(user_data, op) {
+        let result = match self.call_op_submit(token, op) {
             Ok(res) => res,
             Err(e) => {
                 return DriverSubmitResult::failed(
@@ -216,7 +219,7 @@ impl<'a> Driver for IocpDriver<'a> {
             completion.table(),
         );
 
-        Self::on_submit_res(&mut self.ops, ctx, result, user_data, op_in)
+        Self::on_submit_res(&mut self.ops, ctx, result, token, op_in)
     }
 
     fn drive(&mut self, mode: DriveMode) -> IocpDriverResult<DriveOutcome> {

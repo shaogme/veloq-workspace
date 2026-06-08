@@ -6,7 +6,7 @@ use crossbeam_queue::SegQueue;
 use diagweave::prelude::*;
 use tracing::{debug, error, warn};
 use veloq_driver_core::driver::{
-    CompletionControlKind, CompletionToken, CompletionTokenClass, RemoteWaker,
+    CompletionControlKind, CompletionToken, CompletionTokenClass, OpToken, RemoteWaker,
     SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
 };
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
@@ -20,7 +20,7 @@ use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY};
 
 enum IocpCompletionKind {
     Waker,
-    User { index: usize, generation: u32 },
+    User { token: OpToken },
     Unknown { token: CompletionToken },
 }
 
@@ -83,8 +83,8 @@ impl CompletionPump {
 }
 
 pub(super) struct TimerEngine {
-    wheel: Wheel<usize>,
-    buffer: Vec<usize>,
+    wheel: Wheel<OpToken>,
+    buffer: Vec<OpToken>,
     last_poll: Instant,
 }
 
@@ -97,7 +97,7 @@ impl TimerEngine {
         }
     }
 
-    pub(super) fn wheel_mut(&mut self) -> &mut Wheel<usize> {
+    pub(super) fn wheel_mut(&mut self) -> &mut Wheel<OpToken> {
         &mut self.wheel
     }
 
@@ -105,8 +105,8 @@ impl TimerEngine {
         self.wheel.next_timeout()
     }
 
-    pub(super) fn insert(&mut self, user_data: usize, duration: Duration) -> TaskId {
-        self.wheel.insert(user_data, duration)
+    pub(super) fn insert(&mut self, token: OpToken, duration: Duration) -> TaskId {
+        self.wheel.insert(token, duration)
     }
 
     pub(super) fn cancel(&mut self, id: TaskId) {
@@ -119,11 +119,11 @@ impl TimerEngine {
         self.last_poll = now;
     }
 
-    pub(super) fn take_buffer(&mut self) -> Vec<usize> {
+    pub(super) fn take_buffer(&mut self) -> Vec<OpToken> {
         std::mem::take(&mut self.buffer)
     }
 
-    pub(super) fn restore_cleared_buffer(&mut self, mut buffer: Vec<usize>) {
+    pub(super) fn restore_cleared_buffer(&mut self, mut buffer: Vec<OpToken>) {
         buffer.clear();
         self.buffer = buffer;
     }
@@ -229,8 +229,8 @@ impl<'a> IocpDriver<'a> {
                 self.handle_waker_completion(success, error_code);
                 Ok(CompletionProgress::default())
             }
-            IocpCompletionKind::User { index, generation } => {
-                self.process_completion(index, generation, success, error_code, bytes);
+            IocpCompletionKind::User { token } => {
+                self.process_completion(token, success, error_code, bytes);
                 Ok(CompletionProgress { iocp: 1, rio: 0 })
             }
             IocpCompletionKind::Unknown { token } => {
@@ -268,7 +268,7 @@ impl<'a> IocpDriver<'a> {
         if !overlapped.is_null() {
             // SAFETY: overlapped is non-null and corresponds to a valid OverlappedEntry.
             let entry = unsafe { &*(overlapped as *const crate::op::OverlappedEntry) };
-            let idx = entry.user_data;
+            let idx = entry.token.index();
             if idx >= self.ops.local.len() {
                 error!(
                     idx,
@@ -281,10 +281,7 @@ impl<'a> IocpDriver<'a> {
                     .with_ctx("slot_count", self.ops.local.len())
                     .attach_note("completed index out of bounds");
             }
-            return Ok(IocpCompletionKind::User {
-                index: idx,
-                generation: entry.generation,
-            });
+            return Ok(IocpCompletionKind::User { token: entry.token });
         }
 
         if completion_key == WAKEUP_USER_DATA {
@@ -315,9 +312,7 @@ impl<'a> IocpDriver<'a> {
 
         let token = CompletionToken::from_raw(completion_key as u64);
         match token.classify() {
-            CompletionTokenClass::User { index, generation } => {
-                Ok(IocpCompletionKind::User { index, generation })
-            }
+            CompletionTokenClass::User(token) => Ok(IocpCompletionKind::User { token }),
             CompletionTokenClass::Control {
                 kind: CompletionControlKind::Waker,
                 ..

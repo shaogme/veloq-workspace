@@ -80,8 +80,8 @@ macro_rules! submit_io_op {
                 .with_ctx("fd_fixed_index", val.fd.fixed_index())
                 .with_ctx("fd_generation", val.fd.generation())
                 .with_ctx("handle_raw", raw.as_handle() as usize)
-                .with_ctx("user_data", header.user_data)
-                .with_ctx("generation", header.generation)
+                .with_ctx("user_data", header.token.index())
+                .with_ctx("generation", header.token.generation())
                 .with_ctx("offset", val.offset)
                 .with_ctx("buffer_length", val.buf.len())
                 .with_ctx("buffer_capacity", val.buf.capacity())?;
@@ -96,8 +96,8 @@ macro_rules! submit_io_op {
                 .with_ctx("fd_fixed_index", val.fd.fixed_index())
                 .with_ctx("fd_generation", val.fd.generation())
                 .with_ctx("handle_raw", raw.as_handle() as usize)
-                .with_ctx("user_data", header.user_data)
-                .with_ctx("generation", header.generation)
+                .with_ctx("user_data", header.token.index())
+                .with_ctx("generation", header.token.generation())
                 .with_ctx("offset", val.offset)
                 .with_ctx("buffer_offset", val.buf_offset)
                 .with_ctx("buffer_length", len)
@@ -127,8 +127,8 @@ macro_rules! submit_raw_io_op {
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
                 .with_ctx("handle_raw", raw.as_handle() as usize)
-                .with_ctx("user_data", header.user_data)
-                .with_ctx("generation", header.generation)
+                .with_ctx("user_data", header.token.index())
+                .with_ctx("generation", header.token.generation())
                 .with_ctx("offset", val.offset)
                 .with_ctx("buffer_length", val.buf.len())
                 .with_ctx("buffer_capacity", val.buf.capacity())?;
@@ -139,8 +139,8 @@ macro_rules! submit_raw_io_op {
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
                 .push_ctx("scope", stringify!($fn_name))
                 .with_ctx("handle_raw", raw.as_handle() as usize)
-                .with_ctx("user_data", header.user_data)
-                .with_ctx("generation", header.generation)
+                .with_ctx("user_data", header.token.index())
+                .with_ctx("generation", header.token.generation())
                 .with_ctx("offset", val.offset)
                 .with_ctx("buffer_offset", val.buf_offset)
                 .with_ctx("buffer_length", len)
@@ -194,7 +194,7 @@ fn make_blocking_completion(
     ctx: &SubmitContext<'_>,
     cleanup_success: Option<BlockingSuccessCleanup>,
 ) -> Arc<BlockingCompletion> {
-    let completion_key = CompletionToken::user(header.user_data, header.generation).raw() as usize;
+    let completion_key = CompletionToken::user(header.token).raw() as usize;
     let completion = BlockingCompletion::new(ctx.port.clone(), completion_key, cleanup_success);
     header.blocking_completion = Some(completion.clone());
     completion

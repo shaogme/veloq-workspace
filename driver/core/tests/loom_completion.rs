@@ -23,7 +23,7 @@ impl SlotSpec for DummySlotSpec {
 fn test_completion_table_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = CompletionToken::user(0, 1);
+        let token = CompletionToken::user(OpToken::new(0, 1));
 
         let table_cloned = table.clone();
         let producer = thread::spawn(move || {
@@ -60,7 +60,7 @@ fn test_completion_table_loom() {
 fn test_detached_drop_race_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = CompletionToken::user(0, 1);
+        let token = CompletionToken::user(OpToken::new(0, 1));
 
         let table_cloned = table.clone();
         let producer = thread::spawn(move || {
@@ -94,7 +94,7 @@ fn test_detached_drop_race_loom() {
 fn test_fast_completion_then_waiting_take_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = CompletionToken::user(0, 1);
+        let token = CompletionToken::user(OpToken::new(0, 1));
 
         table.record_completion_with_data(
             CompletionEvent {
@@ -127,8 +127,8 @@ fn test_fast_completion_then_waiting_take_loom() {
 fn test_stale_after_generation_advance_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token_g1 = CompletionToken::user(0, 1);
-        let token_g2 = CompletionToken::user(0, 2);
+        let token_g1 = CompletionToken::user(OpToken::new(0, 1));
+        let token_g2 = CompletionToken::user(OpToken::new(0, 2));
 
         table.record_completion_with_data(
             CompletionEvent {
@@ -160,7 +160,7 @@ fn test_stale_after_generation_advance_loom() {
 fn test_ready_race_with_mark_orphaned_loom() {
     loom::model(|| {
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = CompletionToken::user(0, 1);
+        let token = CompletionToken::user(OpToken::new(0, 1));
 
         table.record_completion_with_data(
             CompletionEvent {
@@ -195,7 +195,7 @@ fn test_two_consumers_at_most_one_ready_loom() {
         use loom::sync::atomic::{AtomicUsize, Ordering};
 
         let table: SharedCompletionTable<(), ()> = Arc::new(SlotTable::<DummySlotSpec>::new(1));
-        let token = CompletionToken::user(0, 1);
+        let token = CompletionToken::user(OpToken::new(0, 1));
         let ready_count = Arc::new(AtomicUsize::new(0));
 
         table.record_completion_with_data(

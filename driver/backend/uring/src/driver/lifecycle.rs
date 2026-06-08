@@ -1,9 +1,10 @@
 use crate::driver::{PendingCancel, UringDriver};
 use crate::error::{UringDriverResult, UringError};
 use io_uring::opcode;
-use std::sync::atomic::Ordering;
 use tracing::{debug, error, trace};
-use veloq_driver_core::driver::{CancelMode, CancelRequest, CompletionSidecar, CompletionToken};
+use veloq_driver_core::driver::{
+    CancelMode, CancelRequest, CompletionSidecar, CompletionToken, OpToken,
+};
 
 use crate::op::{
     UringUserPayload,
@@ -36,18 +37,10 @@ impl<'a> UringDriver<'a> {
     }
 
     fn submit_cancel_request(&mut self, request: PendingCancel) {
-        let Some((user_data, generation)) = request.user_parts() else {
-            self.completion_diagnostics.inc_unknown_completion();
-            debug!(
-                token = request.token.raw(),
-                mode = ?request.mode,
-                "skipping cancel request for non-user token"
-            );
-            return;
-        };
+        let (user_data, generation) = request.user_parts();
 
         let cancel_id = self.next_cancel_completion_id();
-        let cancel_sqe = opcode::AsyncCancel::new(request.token.raw())
+        let cancel_sqe = opcode::AsyncCancel::new(CompletionToken::user(request.target).raw())
             .build()
             .user_data(CompletionToken::cancel(cancel_id).raw());
 
@@ -68,19 +61,12 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn cancel_op_internal(&mut self, request: CancelRequest) {
         let request = PendingCancel::new(request);
-        let Some((user_data, generation)) = request.user_parts() else {
-            self.completion_diagnostics.inc_unknown_completion();
-            debug!(
-                token = request.token.raw(),
-                "cancel request token is not a user op"
-            );
-            return;
-        };
+        let (user_data, generation) = request.user_parts();
+        let token = request.target;
 
-        let token = CompletionToken::user(user_data, generation);
         match self.ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
-                let sidecar = cancel_slot_immediate(slot, user_data);
+                let sidecar = cancel_slot_immediate(slot, token);
                 if request.mode == CancelMode::UserVisible {
                     self.push_completion_event(sidecar);
                 }
@@ -93,12 +79,10 @@ impl<'a> UringDriver<'a> {
                     } else {
                         slot.complete()
                     };
-                    let generation = completed.entry.generation(Ordering::Acquire);
                     let _ = completed.take_op();
                     let (payload, detail) = completed.take_completion_data();
                     let sidecar = CompletionSidecar::<UringUserPayload, UringError> {
-                        user_data,
-                        generation,
+                        token,
                         res: -libc::ECANCELED,
                         flags: 0,
                         payload,
@@ -119,7 +103,7 @@ impl<'a> UringDriver<'a> {
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
                 if let Some(tid) = slot.platform_mut().timer_id {
-                    let sidecar = cancel_slot_immediate(slot, user_data);
+                    let sidecar = cancel_slot_immediate(slot, token);
                     self.wheel.cancel(tid);
                     self.push_completion_event(sidecar);
                     self.ops.remove(user_data);
@@ -128,14 +112,12 @@ impl<'a> UringDriver<'a> {
 
                 self.submit_cancel_request(request);
             }
-            CheckedSlotView::NonUser { .. }
-            | CheckedSlotView::Missing { .. }
-            | CheckedSlotView::Empty(_) => {
+            CheckedSlotView::Missing { .. } | CheckedSlotView::Empty(_) => {
                 self.completion_diagnostics.inc_unknown_completion();
                 debug!(
                     user_data,
                     generation,
-                    token = request.token.raw(),
+                    token = CompletionToken::user(request.target).raw(),
                     "cancel request did not match an active slot"
                 );
             }
@@ -173,15 +155,8 @@ impl<'a> UringDriver<'a> {
 
         while submitted_count < limit {
             if let Some(request) = self.pending_cancellations.front().copied() {
-                let Some((user_data, generation)) = request.user_parts() else {
-                    self.pending_cancellations.pop_front();
-                    self.completion_diagnostics.inc_unknown_completion();
-                    continue;
-                };
-
                 let stale_or_missing = !matches!(
-                    self.ops
-                        .checked_slot_view(CompletionToken::user(user_data, generation)),
+                    self.ops.checked_slot_view(request.target),
                     CheckedSlotView::Valid(_)
                 );
                 if stale_or_missing {
@@ -191,9 +166,10 @@ impl<'a> UringDriver<'a> {
                 }
 
                 let cancel_id = self.next_cancel_completion_id();
-                let cancel_sqe = opcode::AsyncCancel::new(request.token.raw())
-                    .build()
-                    .user_data(CompletionToken::cancel(cancel_id).raw());
+                let cancel_sqe =
+                    opcode::AsyncCancel::new(CompletionToken::user(request.target).raw())
+                        .build()
+                        .user_data(CompletionToken::cancel(cancel_id).raw());
 
                 if self.push_entry(cancel_sqe) {
                     self.pending_cancel_cqes.insert(cancel_id, request);
@@ -216,31 +192,31 @@ impl<'a> UringDriver<'a> {
             Drop,
         }
 
-        while let Some(&user_data) = self.backlog.front() {
-            let action = match self.ops.unchecked_slot_view(user_data) {
-                Some(SlotView::InFlightOrphaned(_)) => BacklogAction::Cancel,
-                Some(SlotView::Reserved(slot)) => {
-                    if slot_has_op(slot) {
-                        BacklogAction::Submit
-                    } else {
-                        BacklogAction::Drop
+        while let Some(&token) = self.backlog.front() {
+            let action = match self.ops.checked_slot_view(token) {
+                CheckedSlotView::Valid(slot) => match slot {
+                    SlotView::InFlightOrphaned(_) => BacklogAction::Cancel,
+                    SlotView::Reserved(slot) => {
+                        if slot_has_op(slot) {
+                            BacklogAction::Submit
+                        } else {
+                            BacklogAction::Drop
+                        }
                     }
-                }
+                    SlotView::InFlightWaiting(_) => BacklogAction::Drop,
+                },
                 _ => BacklogAction::Drop,
             };
 
             match action {
                 BacklogAction::Cancel => {
                     self.pop_backlog();
-                    let generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
-                    self.cancel_op_internal(CancelRequest::abandon(CompletionToken::user(
-                        user_data, generation,
-                    )));
+                    self.cancel_op_internal(CancelRequest::abandon(token));
                 }
                 BacklogAction::Drop => {
                     self.pop_backlog();
                 }
-                BacklogAction::Submit => match self.submit_from_slot_index(user_data) {
+                BacklogAction::Submit => match self.submit_from_slot_token(token) {
                     Ok(true) => {
                         self.pop_backlog();
                     }
@@ -257,20 +233,19 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    pub(crate) fn push_backlog(&mut self, user_data: usize) {
-        self.backlog.push_back(user_data);
+    pub(crate) fn push_backlog(&mut self, token: OpToken) {
+        self.backlog.push_back(token);
     }
 
-    pub(crate) fn pop_backlog(&mut self) -> Option<usize> {
+    pub(crate) fn pop_backlog(&mut self) -> Option<OpToken> {
         self.backlog.pop_front()
     }
 }
 
 fn cancel_slot_immediate<'a, S: SlotState>(
     slot: Slot<'a, S>,
-    user_data: usize,
+    token: OpToken,
 ) -> CompletionSidecar<UringUserPayload, UringError> {
-    let generation = slot.entry.generation(Ordering::Acquire);
     let (payload, detail) = slot.storage.with_mut(
         |result: &mut Option<UringDriverResult<usize>>,
          payload: &mut Option<UringUserPayload>,
@@ -279,8 +254,7 @@ fn cancel_slot_immediate<'a, S: SlotState>(
     let _ = slot.op.take();
 
     CompletionSidecar::<UringUserPayload, UringError> {
-        user_data,
-        generation,
+        token,
         res: -libc::ECANCELED,
         flags: 0,
         payload,

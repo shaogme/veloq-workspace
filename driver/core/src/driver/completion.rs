@@ -60,10 +60,7 @@ impl CompletionControlKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionTokenClass {
-    User {
-        index: usize,
-        generation: u32,
-    },
+    User(OpToken),
     Control {
         kind: CompletionControlKind,
         id: u16,
@@ -75,15 +72,44 @@ pub enum CompletionTokenClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CompletionToken(u64);
+pub struct OpToken {
+    index: usize,
+    generation: u32,
+}
 
-impl CompletionToken {
+impl OpToken {
     #[inline]
-    pub fn user(index: usize, generation: u32) -> Self {
+    pub fn new(index: usize, generation: u32) -> Self {
         assert!(
             index < CONTROL_TOKEN_INDEX as usize,
             "completion slot index exceeds encodable user token range"
         );
+        Self { index, generation }
+    }
+
+    #[inline]
+    pub const fn index(self) -> usize {
+        self.index
+    }
+
+    #[inline]
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+
+    #[inline]
+    pub const fn parts(self) -> (usize, u32) {
+        (self.index, self.generation)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompletionToken(u64);
+
+impl CompletionToken {
+    #[inline]
+    pub fn user(token: OpToken) -> Self {
+        let (index, generation) = token.parts();
         Self(((generation as u64) << 32) | (index as u32 as u64))
     }
 
@@ -125,10 +151,7 @@ impl CompletionToken {
     pub fn classify(self) -> CompletionTokenClass {
         let index = (self.0 & 0xffff_ffff) as u32;
         if index != CONTROL_TOKEN_INDEX {
-            return CompletionTokenClass::User {
-                index: index as usize,
-                generation: (self.0 >> 32) as u32,
-            };
+            return CompletionTokenClass::User(OpToken::new(index as usize, (self.0 >> 32) as u32));
         }
 
         let kind = (self.0 >> CONTROL_TOKEN_KIND_SHIFT) as u16;
@@ -140,9 +163,9 @@ impl CompletionToken {
     }
 
     #[inline]
-    pub fn user_parts(self) -> Option<(usize, u32)> {
+    pub fn op_token(self) -> Option<OpToken> {
         match self.classify() {
-            CompletionTokenClass::User { index, generation } => Some((index, generation)),
+            CompletionTokenClass::User(token) => Some(token),
             CompletionTokenClass::Control { .. } | CompletionTokenClass::UnknownControl { .. } => {
                 None
             }
@@ -172,24 +195,24 @@ pub enum CancelMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelRequest {
-    pub token: CompletionToken,
+    pub target: OpToken,
     pub mode: CancelMode,
 }
 
 impl CancelRequest {
     #[inline]
-    pub const fn new(token: CompletionToken, mode: CancelMode) -> Self {
-        Self { token, mode }
+    pub const fn new(target: OpToken, mode: CancelMode) -> Self {
+        Self { target, mode }
     }
 
     #[inline]
-    pub const fn user_visible(token: CompletionToken) -> Self {
-        Self::new(token, CancelMode::UserVisible)
+    pub const fn user_visible(target: OpToken) -> Self {
+        Self::new(target, CancelMode::UserVisible)
     }
 
     #[inline]
-    pub const fn abandon(token: CompletionToken) -> Self {
-        Self::new(token, CancelMode::Abandon)
+    pub const fn abandon(target: OpToken) -> Self {
+        Self::new(target, CancelMode::Abandon)
     }
 }
 
@@ -272,8 +295,7 @@ impl DriverCompletionDiagnostics {
 }
 
 pub struct CompletionSidecar<UP, E, R = usize> {
-    pub user_data: usize,
-    pub generation: u32,
+    pub token: OpToken,
     pub res: i32,
     pub flags: u32,
     pub payload: Option<UP>,
@@ -302,8 +324,7 @@ impl<UP, E, R> CompletionPacket<UP, E, R> {
 
     #[inline]
     pub fn user(
-        index: usize,
-        generation: u32,
+        token: OpToken,
         res: i32,
         flags: u32,
         payload: Option<UP>,
@@ -311,7 +332,7 @@ impl<UP, E, R> CompletionPacket<UP, E, R> {
     ) -> Self {
         Self::new(
             CompletionEvent {
-                token: CompletionToken::user(index, generation),
+                token: CompletionToken::user(token),
                 res,
                 flags,
             },
@@ -325,8 +346,7 @@ impl<UP, E, R> From<CompletionSidecar<UP, E, R>> for CompletionPacket<UP, E, R> 
     #[inline]
     fn from(sidecar: CompletionSidecar<UP, E, R>) -> Self {
         Self::user(
-            sidecar.user_data,
-            sidecar.generation,
+            sidecar.token,
             sidecar.res,
             sidecar.flags,
             sidecar.payload,
@@ -348,7 +368,7 @@ pub struct CompletionEvent {
 
 impl CompletionEvent {
     #[inline]
-    pub const fn user_data(self) -> u64 {
+    pub const fn raw_token(self) -> u64 {
         self.token.raw()
     }
 }
@@ -534,7 +554,7 @@ pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
 
 #[inline]
 pub(crate) fn decode_completion_token(token: CompletionToken) -> Option<(usize, u32)> {
-    token.user_parts()
+    token.op_token().map(OpToken::parts)
 }
 
 #[inline]
@@ -564,9 +584,10 @@ where
         mut detail: Option<DriverResult<R, E>>,
     ) -> RecordCompletionOutcome {
         let token = event.token;
-        let Some((idx, generation)) = token.user_parts() else {
+        let Some(op_token) = token.op_token() else {
             return RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_control(token));
         };
+        let (idx, generation) = op_token.parts();
         if idx >= self.slots.len() {
             return RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_slot(
                 token, idx, generation,
@@ -727,9 +748,10 @@ where
 
     #[inline]
     fn try_take_record(&self, token: CompletionToken) -> PollRecordResult<UP, E, R> {
-        let Some((idx, generation)) = token.user_parts() else {
+        let Some(op_token) = token.op_token() else {
             return PollRecordResult::Lost(CompletionAnomaly::unknown_control(token));
         };
+        let (idx, generation) = op_token.parts();
         if idx >= self.slots.len() {
             return PollRecordResult::Lost(CompletionAnomaly::unknown_slot(token, idx, generation));
         }

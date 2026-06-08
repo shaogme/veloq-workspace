@@ -1,8 +1,6 @@
-use std::sync::atomic::Ordering;
-
 use tracing::{debug, warn};
-use veloq_driver_core::driver::{CancelMode, CancelRequest, RecordCompletionOutcome};
-use veloq_driver_core::slot::{SlotRegistryExt, SlotView};
+use veloq_driver_core::driver::{CancelMode, CancelRequest, OpToken, RecordCompletionOutcome};
+use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::driver::completion::EmitContext;
@@ -25,28 +23,8 @@ enum CancelPerformStatus {
 
 impl<'a> IocpDriver<'a> {
     pub(super) fn cancel_op_internal(&mut self, request: CancelRequest) {
-        let Some((user_data, generation)) = request.token.user_parts() else {
-            self.completion_diagnostics.inc_unknown_completion();
-            debug!(
-                token = request.token.raw(),
-                "IOCP cancel request token is not user op"
-            );
-            return;
-        };
-
-        if !self.ops.contains(user_data) {
-            self.completion_diagnostics.inc_unknown_completion();
-            return;
-        }
-        let current_generation = self.ops.shared.slots[user_data].generation(Ordering::Acquire);
-        if current_generation != generation {
-            self.completion_diagnostics.inc_stale_completion();
-            debug!(
-                user_data,
-                generation, current_generation, "ignoring stale IOCP cancel request"
-            );
-            return;
-        }
+        let token = request.target;
+        let (user_data, generation) = token.parts();
 
         let emit_ctx = EmitContext {
             completion_events: self.completion.events(),
@@ -64,6 +42,7 @@ impl<'a> IocpDriver<'a> {
                 user_data,
                 &mut self.ops,
                 request.mode == CancelMode::UserVisible,
+                token,
             ) {
                 self.completion_diagnostics
                     .record_completion_outcome(&outcome);
@@ -72,26 +51,55 @@ impl<'a> IocpDriver<'a> {
             return;
         }
 
-        let state = self.ops.unchecked_slot_view(user_data);
+        let state = self.ops.checked_slot_view(token);
         match state {
-            Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) => {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(_))
+            | CheckedSlotView::Valid(SlotView::InFlightOrphaned(_)) => {
                 let ctx = CancelContext {
                     registered_slots: self.handles.registered_slots(),
                 };
                 let status = Self::perform_cancel(ctx, user_data, &mut self.ops);
                 self.record_cancel_status(status);
             }
-            _ => {
+            CheckedSlotView::Valid(SlotView::Reserved(_)) => {
                 if let Some(outcome) = Self::abort_slot_inner(
                     emit_ctx,
                     user_data,
                     &mut self.ops,
                     request.mode == CancelMode::UserVisible,
+                    token,
                 ) {
                     self.completion_diagnostics
                         .record_completion_outcome(&outcome);
                 }
                 self.completion_diagnostics.inc_cancel_submitted();
+            }
+            CheckedSlotView::Missing { .. } | CheckedSlotView::Empty(_) => {
+                self.completion_diagnostics.inc_unknown_completion();
+                debug!(
+                    user_data,
+                    generation, "IOCP cancel request found non-active slot"
+                );
+            }
+            CheckedSlotView::Stale(snapshot) => {
+                self.completion_diagnostics.inc_stale_completion();
+                debug!(
+                    user_data,
+                    generation,
+                    actual_generation = snapshot.generation,
+                    state = ?snapshot.state,
+                    "IOCP cancel request is stale"
+                );
+            }
+            CheckedSlotView::Corrupt(snapshot) => {
+                self.completion_diagnostics.inc_slot_corruption();
+                debug!(
+                    user_data,
+                    generation,
+                    actual_generation = snapshot.generation,
+                    state = ?snapshot.state,
+                    "IOCP cancel request found corrupt slot"
+                );
             }
         }
     }
@@ -204,8 +212,8 @@ impl<'a> IocpDriver<'a> {
         user_data: usize,
         ops: &mut IocpOpRegistry,
         emit_completion: bool,
+        token: OpToken,
     ) -> Option<RecordCompletionOutcome> {
-        let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
         let inflight = match ops.unchecked_slot_view(user_data) {
             Some(SlotView::InFlightWaiting(guard)) => {
                 let mut guard = guard.complete();
@@ -234,8 +242,7 @@ impl<'a> IocpDriver<'a> {
                 ctx.completion_events,
                 ctx.completion_table,
                 completion_record(CompletionSidecar {
-                    user_data,
-                    generation,
+                    token,
                     res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
                     flags: 0,
                     payload,

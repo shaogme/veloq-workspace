@@ -1,5 +1,4 @@
 use diagweave::prelude::*;
-use std::sync::atomic::Ordering;
 use std::task::Poll;
 use tracing::{debug, trace};
 
@@ -11,16 +10,19 @@ use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
 use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 
 use veloq_driver_core::driver::registry::{AllocResult, OpHandle};
-use veloq_driver_core::driver::{CompletionToken, Driver, DriverSubmitResult, SubmitStatus};
+use veloq_driver_core::driver::{
+    CompletionToken, Driver, DriverSubmitResult, OpToken, SubmitStatus,
+};
 use veloq_driver_core::op::{IntoPlatformOp, Wakeup};
 
 impl<'a> UringDriver<'a> {
     pub(crate) unsafe fn submit_from_slot_raw(
         driver: *mut UringDriver,
-        user_data: usize,
+        token: OpToken,
         slot: Slot<'_, crate::op::slot::Reserved>,
     ) -> UringResult<bool> {
         let driver = unsafe { &mut *driver };
+        let user_data = token.index();
         let mut sub_guard = slot.start_submission_with(None);
         let strategy = sub_guard
             .slot
@@ -53,22 +55,23 @@ impl<'a> UringDriver<'a> {
                         )
                     })?;
 
-                    let op = slot
-                        .op
-                        .as_mut()
-                        .expect("slot in InFlight state must contain an op");
+                    let op = slot.op.as_mut().ok_or_else(|| {
+                        UringError::InvalidState.report(
+                            "driver.submit_from_slot_raw",
+                            "slot in submission state missing op",
+                        )
+                    })?;
                     let vtable = op.vtable;
                     let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
-                    let token = if Some(user_data) == driver.waker_token {
+                    let completion_token = if Some(token) == driver.waker_token {
                         CompletionToken::waker(0)
                     } else {
-                        let generation = slot.entry.generation(Ordering::Acquire);
-                        CompletionToken::user(user_data, generation)
+                        CompletionToken::user(token)
                     };
                     let sqe = unsafe {
                         (vtable.make_sqe)(op, &mut *driver_ptr, user_data)
                             .attach_note("driver.submit_from_slot_raw.make_sqe")?
-                            .user_data(token.raw())
+                            .user_data(completion_token.raw())
                     };
                     (count, sqe)
                 };
@@ -147,12 +150,15 @@ impl<'a> UringDriver<'a> {
                             "submission guard payload missing",
                         )
                     })?;
-                    let op = slot.op.as_mut().expect("timer op missing");
+                    let op = slot.op.as_mut().ok_or_else(|| {
+                        UringError::InvalidState
+                            .report("driver.submit_from_slot_raw.timer", "timer slot missing op")
+                    })?;
                     let vtable = op.vtable;
                     unsafe { (vtable.get_timeout)(op, payload) }
                 };
                 if let Some(duration) = duration_opt {
-                    let task_id = driver.wheel.insert(user_data, duration);
+                    let task_id = driver.wheel.insert(token, duration);
                     if let Some(entry) = driver.ops.get_mut(user_data) {
                         entry.platform_data.timer_id = Some(task_id);
                     }
@@ -173,16 +179,16 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    pub(crate) fn submit_from_slot_index(&mut self, user_data: usize) -> UringResult<bool> {
+    pub(crate) fn submit_from_slot_token(&mut self, token: OpToken) -> UringResult<bool> {
         let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.unchecked_slot_view(user_data) {
-            Some(SlotView::Reserved(slot)) => slot,
+        let slot = match self.ops.checked_slot_view(token) {
+            veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot,
             _ => {
                 return Err(UringError::InvalidState
                     .report("driver.submit_from_slot_index", "op missing in slot"));
             }
         };
-        unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) }
+        unsafe { Self::submit_from_slot_raw(driver_ptr, token, slot) }
     }
 
     pub(crate) fn submit_waker(&mut self) -> UringResult<()> {
@@ -212,22 +218,25 @@ impl<'a> UringDriver<'a> {
         let result = self.ops.alloc(UringOpState::new());
 
         if let Ok(AllocResult {
-            handle: OpHandle {
-                index: user_data, ..
-            },
+            handle:
+                OpHandle {
+                    index: user_data,
+                    generation,
+                },
         }) = result
         {
-            self.waker_token = Some(user_data);
-            self.slot_set_payload_raw(user_data, UringUserPayload::Wakeup(payload));
+            let token = OpToken::new(user_data, generation);
+            self.waker_token = Some(token);
+            self.slot_set_payload_raw(token, UringUserPayload::Wakeup(payload));
 
             let driver_ptr = self as *mut UringDriver;
             let slot = self
                 .ops
                 .slot_reserve(user_data)
                 .init_op_with(uring_op, |_| {});
-            match unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) } {
+            match unsafe { Self::submit_from_slot_raw(driver_ptr, token, slot) } {
                 Ok(true) => {}
-                Ok(false) => self.push_backlog(user_data),
+                Ok(false) => self.push_backlog(token),
                 Err(e) => return Err(e),
             }
             Ok(())
@@ -289,13 +298,14 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn submit_sqe_internal(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         op: UringOp,
         op_in: &mut Option<UringOp>,
     ) -> DriverSubmitResult<UringError> {
+        let user_data = token.index();
         let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.unchecked_slot_view(user_data) {
-            Some(SlotView::Reserved(slot)) => {
+        let slot = match self.ops.checked_slot_view(token) {
+            veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 if slot.has_op() {
                     let mut slot = slot;
                     *slot.op_mut() = op;
@@ -304,7 +314,7 @@ impl<'a> UringDriver<'a> {
                     slot.init_op_with(op, |_| {})
                 }
             }
-            Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
+            _ => {
                 return DriverSubmitResult::failed(
                     UringError::InvalidState.report(
                         "uring.driver.submit_sqe_internal",
@@ -315,11 +325,11 @@ impl<'a> UringDriver<'a> {
             }
         };
 
-        match unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) } {
+        match unsafe { Self::submit_from_slot_raw(driver_ptr, token, slot) } {
             Ok(true) => DriverSubmitResult::submitted(Poll::Ready(())),
             Ok(false) => {
                 debug!(user_data, "SQ full, pushing to backlog");
-                self.push_backlog(user_data);
+                self.push_backlog(token);
                 DriverSubmitResult::submitted(Poll::Pending)
             }
             Err(e) => {
@@ -341,13 +351,14 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn submit_timer_internal(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         op: UringOp,
         op_in: &mut Option<UringOp>,
     ) -> DriverSubmitResult<UringError> {
+        let user_data = token.index();
         let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.unchecked_slot_view(user_data) {
-            Some(SlotView::Reserved(slot)) => {
+        let slot = match self.ops.checked_slot_view(token) {
+            veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 if slot.has_op() {
                     let mut slot = slot;
                     *slot.op_mut() = op;
@@ -356,7 +367,7 @@ impl<'a> UringDriver<'a> {
                     slot.init_op_with(op, |_| {})
                 }
             }
-            Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_)) | None => {
+            _ => {
                 return DriverSubmitResult::failed(
                     UringError::InvalidState.report(
                         "uring.driver.submit_timer_internal",
@@ -367,14 +378,14 @@ impl<'a> UringDriver<'a> {
             }
         };
 
-        match unsafe { Self::submit_from_slot_raw(driver_ptr, user_data, slot) } {
+        match unsafe { Self::submit_from_slot_raw(driver_ptr, token, slot) } {
             Ok(true) => DriverSubmitResult::submitted(Poll::Ready(())),
             Ok(false) => {
                 debug!(
                     user_data,
                     "SQ full (unexpected for timer), pushing to backlog"
                 );
-                self.push_backlog(user_data);
+                self.push_backlog(token);
                 DriverSubmitResult::submitted(Poll::Pending)
             }
             Err(e) => {

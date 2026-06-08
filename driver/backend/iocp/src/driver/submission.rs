@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::{DiagnosticResult, ResultReportExt};
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
-    CompletionToken, DriverSubmitResult, SharedCompletionQueue, SharedCompletionTable, SubmitStatus,
+    CompletionToken, DriverSubmitResult, OpToken, SharedCompletionQueue, SharedCompletionTable,
+    SubmitStatus,
 };
 use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
 
@@ -20,7 +21,7 @@ use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload, SubmitContext, submit};
 
 pub(crate) struct SubmitContextInternal<'a> {
     port: Arc<crate::win32::IoCompletionPort>,
-    wheel: &'a mut veloq_wheel::Wheel<usize>,
+    wheel: &'a mut veloq_wheel::Wheel<OpToken>,
     completion_events: &'a SharedCompletionQueue,
     completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
 }
@@ -28,7 +29,7 @@ pub(crate) struct SubmitContextInternal<'a> {
 impl<'a> SubmitContextInternal<'a> {
     pub(crate) fn new(
         port: Arc<crate::win32::IoCompletionPort>,
-        wheel: &'a mut veloq_wheel::Wheel<usize>,
+        wheel: &'a mut veloq_wheel::Wheel<OpToken>,
         completion_events: &'a SharedCompletionQueue,
         completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
     ) -> Self {
@@ -63,16 +64,16 @@ impl<'a> IocpDriver<'a> {
     #[inline]
     pub(crate) fn prep_op_slot(
         ops: &mut IocpOpRegistry,
-        user_data: usize,
+        token: OpToken,
         op: IocpOp,
     ) -> IocpResult<Slot<'_, Reserved>> {
+        let user_data = token.index();
+        let generation = token.generation();
         let mut guard = ops.slot_reserve(user_data);
-        let generation = guard.entry.generation(Ordering::Acquire);
         guard.platform_mut().generation = generation;
         guard.platform_mut().rio_cancel_requested = false;
         let mut guard = guard.init_op_with(op, |sidecar| {
-            sidecar.user_data = user_data;
-            sidecar.generation = generation;
+            sidecar.token = token;
             sidecar.blocking_completion = None;
             sidecar.in_flight = false;
             sidecar.resolved_handle = None;
@@ -81,8 +82,7 @@ impl<'a> IocpDriver<'a> {
 
         guard
             .with_op_mut(|op_ref| {
-                op_ref.header.user_data = user_data;
-                op_ref.header.generation = generation;
+                op_ref.header.token = token;
                 op_ref.header.blocking_completion = None;
                 op_ref.header.resolved_handle = None;
                 op_ref.header.socket_inflight = None;
@@ -109,17 +109,17 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn handle_offload(
         ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
-        user_data: usize,
+        token: OpToken,
         task: BlockingTask,
     ) -> IocpDriverResult<Poll<()>> {
+        let user_data = token.index();
         if !BlockingBridge::submit(task) {
             if let Some(SlotView::InFlightWaiting(slot)) = ops.unchecked_slot_view(user_data) {
                 let mut guard = slot.complete();
                 let _ = guard.take_op();
                 let (payload, detail) = guard.take_completion_data();
                 let sidecar = CompletionSidecar {
-                    user_data,
-                    generation: guard.entry.generation(Ordering::Acquire),
+                    token,
                     res: iocp_fallback_event_res(IocpError::Submission),
                     flags: 0,
                     payload,
@@ -142,16 +142,17 @@ impl<'a> IocpDriver<'a> {
         ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
         result: IocpDriverResult<submit::SubmissionResult>,
-        user_data: usize,
+        token: OpToken,
         op_in: &mut Option<IocpOp>,
     ) -> DriverSubmitResult<IocpError> {
+        let user_data = token.index();
         match result {
             Ok(submit::SubmissionResult::Pending) => DriverSubmitResult::submitted(Poll::Pending),
             Ok(submit::SubmissionResult::PostToQueue) => {
-                Self::handle_post_to_queue(ops, ctx, user_data, op_in)
+                Self::handle_post_to_queue(ops, ctx, token, op_in)
             }
             Ok(submit::SubmissionResult::Offload(task)) => {
-                match Self::handle_offload(ops, ctx, user_data, task) {
+                match Self::handle_offload(ops, ctx, token, task) {
                     Ok(poll) => DriverSubmitResult::submitted(poll),
                     Err(_) => DriverSubmitResult::failed(
                         IocpError::Submission
@@ -161,7 +162,7 @@ impl<'a> IocpDriver<'a> {
                 }
             }
             Ok(submit::SubmissionResult::Timer(duration)) => {
-                Self::handle_timer_sub(ops, ctx, user_data, duration)
+                Self::handle_timer_sub(ops, ctx, token, duration)
             }
             Err(e) => {
                 if let Some(SlotView::InFlightWaiting(slot)) = ops.unchecked_slot_view(user_data) {
@@ -179,11 +180,11 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn handle_post_to_queue(
         ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
-        user_data: usize,
+        token: OpToken,
         op_in: &mut Option<IocpOp>,
     ) -> DriverSubmitResult<IocpError> {
-        let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
-        let completion_key = CompletionToken::user(user_data, generation).raw() as usize;
+        let user_data = token.index();
+        let completion_key = CompletionToken::user(token).raw() as usize;
         if let Err(err) = ctx.port.notify(completion_key) {
             if let Some(SlotView::InFlightWaiting(slot)) = ops.unchecked_slot_view(user_data) {
                 let mut guard = slot.complete();
@@ -203,10 +204,11 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn handle_timer_sub(
         ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
-        user_data: usize,
+        token: OpToken,
         duration: Duration,
     ) -> DriverSubmitResult<IocpError> {
-        let timeout = ctx.wheel.insert(user_data, duration);
+        let user_data = token.index();
+        let timeout = ctx.wheel.insert(token, duration);
         if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
             op_entry.platform_data.timer_id = Some(timeout);
             op_entry.platform_data.timer_deadline = Some(Instant::now() + duration);
@@ -216,10 +218,10 @@ impl<'a> IocpDriver<'a> {
 
     pub(crate) fn call_op_submit(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         op: IocpOp,
     ) -> IocpDriverResult<IocpDriverResult<submit::SubmissionResult>> {
-        let guard = Self::prep_op_slot(&mut self.ops, user_data, op)
+        let guard = Self::prep_op_slot(&mut self.ops, token, op)
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
 
@@ -245,12 +247,7 @@ impl<'a> IocpDriver<'a> {
             );
 
             close_result.and_then(|(raw_handle, io_result)| {
-                let generation = sub_guard
-                    .slot
-                    .as_ref()
-                    .map(|slot| slot.entry.generation(Ordering::Acquire))
-                    .unwrap_or(0);
-                let completion_key = CompletionToken::user(user_data, generation).raw() as usize;
+                let completion_key = CompletionToken::user(token).raw() as usize;
                 let completion =
                     BlockingCompletion::new(self.completion.port_arc(), completion_key, None);
                 completion.store_result(io_result);

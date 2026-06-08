@@ -6,8 +6,8 @@ pub(crate) mod net_udp;
 use core::convert::TryFrom;
 use diagweave::prelude::*;
 use veloq_driver_core::driver::{
-    CompletionRecord, CompletionToken, DriveMode, Driver, DriverSubmitResult, PollRecordResult,
-    event_res_to_result,
+    CompletionRecord, CompletionToken, DriveMode, Driver, DriverSubmitResult, OpToken,
+    PollRecordResult, event_res_to_result,
 };
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
 
@@ -34,8 +34,8 @@ where
     slot.set_payload(T::payload_into_erased(payload));
     match slot.submit(&mut iocp_op) {
         DriverSubmitResult::Submitted(_) => {
-            let submitted = slot.persist();
-            (submitted.user_data, submitted.generation)
+            let submitted = slot.persist().token();
+            submitted.parts()
         }
         DriverSubmitResult::Failed { report, status } => {
             panic!("submit op failed: status={status:?}, error={report}")
@@ -69,7 +69,7 @@ pub(crate) fn wait_completion_record(
     timeout: std::time::Duration,
 ) -> IocpResult<CompletionRecord<IocpUserPayload, IocpError>> {
     let start = std::time::Instant::now();
-    let token = CompletionToken::user(user_data, generation);
+    let token = CompletionToken::user(OpToken::new(user_data, generation));
     loop {
         if start.elapsed() > timeout {
             return IocpError::CompletionWait
