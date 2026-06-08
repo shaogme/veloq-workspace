@@ -102,7 +102,8 @@ pub struct UringDriver<'a> {
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_registered_fd: Option<IoFd>,
-    pub(crate) waker_token: Option<OpToken>,
+    pub(crate) waker_armed: bool,
+    pub(crate) waker_buf: Box<[u8; 8]>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
@@ -184,7 +185,8 @@ impl<'a> UringDriver<'a> {
                 },
             }),
             waker_registered_fd: None,
-            waker_token: None,
+            waker_armed: false,
+            waker_buf: Box::new([0; 8]),
             registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
             is_waked,
 

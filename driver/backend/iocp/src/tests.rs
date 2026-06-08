@@ -44,7 +44,7 @@ where
 }
 
 pub(crate) fn complete_from_record<T>(
-    mut record: CompletionRecord<IocpUserPayload, IocpError>,
+    record: CompletionRecord<IocpUserPayload, IocpError>,
 ) -> OpCompletion<T::Output, IocpError, T::Completion>
 where
     T: IntoPlatformOp<
@@ -54,13 +54,18 @@ where
             Error = IocpError,
         >,
 {
-    let payload_erased = record.payload.take().expect("completion payload missing");
+    let CompletionRecord {
+        event,
+        payload: payload_erased,
+        mut detail,
+        mut cleanup,
+        record_kind: _,
+    } = record;
     let payload = T::try_payload_from_erased(payload_erased).expect("completion payload type");
-    let res = record
-        .detail
+    let res = detail
         .take()
-        .unwrap_or_else(|| event_res_to_result::<usize, IocpError>(record.event.res));
-    record.disarm_cleanup();
+        .unwrap_or_else(|| event_res_to_result::<usize, IocpError>(event.res));
+    cleanup.disarm();
     T::complete(payload, res)
 }
 

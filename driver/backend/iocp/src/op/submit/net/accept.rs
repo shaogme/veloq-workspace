@@ -38,7 +38,7 @@ pub(crate) fn submit_accept(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
-    let user = unsafe { payload.user.as_mut() };
+    let user = unsafe { payload.user.as_mut()? };
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
@@ -121,7 +121,7 @@ pub(crate) unsafe fn on_complete_accept(
     ext: &Extensions,
 ) -> IocpResult<usize> {
     // SAFETY: The caller guarantees that payload is valid.
-    let user = unsafe { payload.user.as_mut() };
+    let user = unsafe { payload.user.as_mut()? };
     let accept_socket = payload
         .accept_socket
         .take()

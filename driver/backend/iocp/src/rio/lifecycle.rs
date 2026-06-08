@@ -5,6 +5,7 @@ use crate::rio::ActorKey;
 use crate::rio::RioState;
 use crate::rio::core::RioCompletionKind;
 use crate::rio::core::RioOpRequestInit;
+use crate::rio::core::RioRequestContextDecode;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::submit_ops::RioKernel;
 use crate::rio::error::{RioError, RioResult};
@@ -88,8 +89,8 @@ fn reaper_sender() -> Option<&'static std::sync::mpsc::Sender<DeferredRioCleanup
 impl RioState {
     fn handle_drain_result(&mut self, res: &RIORESULT) -> RioResult<()> {
         let mut release_result = Ok(());
-        match self.decode_req_ctx(res.RequestContext) {
-            Some(RioCompletionKind::Op {
+        match self.decode_req_ctx_checked(res.RequestContext) {
+            RioRequestContextDecode::Valid(RioCompletionKind::Op {
                 init:
                     RioOpRequestInit {
                         socket_inflight,
@@ -104,7 +105,9 @@ impl RioState {
                 let _ =
                     release_socket_inflight_token_from(&mut self.socket_runtime, socket_inflight);
             }
-            None => {}
+            RioRequestContextDecode::Malformed { .. }
+            | RioRequestContextDecode::Missing { .. }
+            | RioRequestContextDecode::Stale { .. } => {}
         }
         if self.outstanding_count > 0 {
             self.outstanding_count -= 1;

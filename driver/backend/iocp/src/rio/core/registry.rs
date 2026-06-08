@@ -25,7 +25,7 @@ use crate::rio::RioEnv;
 use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
 use crate::rio::core::{
     RioCompletedRequestContext, RioCompletionKind, RioOpRequestInit, RioPreparedRequestContext,
-    RioRequestContextId,
+    RioRequestContextDecode, RioRequestContextId,
 };
 use crate::rio::error::{RioError, RioResult};
 use diagweave::prelude::*;
@@ -196,10 +196,40 @@ impl RioRegistry {
         self.take_request_context_init(context.id())
     }
 
+    #[cfg(test)]
     pub(crate) fn decode_request_context(&mut self, raw: u64) -> Option<RioCompletionKind> {
-        let id = RioRequestContextId::from_raw(raw)?;
-        let init = self.take_request_context_init(id)?;
-        Some(RioCompletionKind::Op {
+        match self.decode_request_context_checked(raw) {
+            RioRequestContextDecode::Valid(kind) => Some(kind),
+            RioRequestContextDecode::Malformed { .. }
+            | RioRequestContextDecode::Missing { .. }
+            | RioRequestContextDecode::Stale { .. } => None,
+        }
+    }
+
+    pub(crate) fn decode_request_context_checked(&mut self, raw: u64) -> RioRequestContextDecode {
+        let Some(id) = RioRequestContextId::from_raw(raw) else {
+            return RioRequestContextDecode::Malformed { raw };
+        };
+        let Some(slot) = self.request_contexts.get_mut(id.index()) else {
+            return RioRequestContextDecode::Missing { id };
+        };
+        if !slot.in_use {
+            return RioRequestContextDecode::Missing { id };
+        }
+        if slot.generation != id.generation() {
+            return RioRequestContextDecode::Stale {
+                id,
+                actual_generation: slot.generation,
+            };
+        }
+        let Some(init) = slot.init.take() else {
+            slot.in_use = false;
+            self.request_context_free.push(id.index());
+            return RioRequestContextDecode::Missing { id };
+        };
+        slot.in_use = false;
+        self.request_context_free.push(id.index());
+        RioRequestContextDecode::Valid(RioCompletionKind::Op {
             init,
             context: RioCompletedRequestContext::new(id),
         })

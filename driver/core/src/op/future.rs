@@ -149,6 +149,7 @@ where
 {
     let reason = match anomaly.reason {
         CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
+        CompletionAnomalyReason::PayloadMissing => LostReason::PayloadMissing,
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::UnknownControlToken
         | CompletionAnomalyReason::NonActiveSlot
@@ -194,7 +195,7 @@ where
 
 #[inline]
 pub(crate) fn completion_record_to_result<T, O, UP, E, C>(
-    mut record: CompletionRecord<UP, E, C>,
+    record: CompletionRecord<UP, E, C>,
 ) -> Poll<OpResult<T::Output, E, T::Completion>>
 where
     UP: Send,
@@ -203,20 +204,21 @@ where
     E: DriverError,
     C: crate::driver::CompletionValue,
 {
-    let event = record.event;
-    let payload_erased = record.payload.take();
-    let detail = record.detail.take();
-    let Some(payload_erased) = payload_erased else {
-        return Poll::Ready(OpResult::ResourceLost(payload_missing_error()));
-    };
+    let CompletionRecord {
+        event,
+        payload: payload_erased,
+        detail,
+        mut cleanup,
+        record_kind: _,
+    } = record;
     let payload = match T::try_payload_from_erased(payload_erased) {
         Ok(payload) => payload,
         Err(report) => {
-            let _ = record.cleanup.run();
+            let _ = cleanup.run();
             return Poll::Ready(OpResult::ResourceLost(payload_projection_error(report)));
         }
     };
-    record.disarm_cleanup();
+    cleanup.disarm();
     let res = detail.unwrap_or_else(|| event_res_to_result::<C, E>(event.res));
     let completion = T::complete(payload, res);
     Poll::Ready(OpResult::Completed(completion.result, completion.output))

@@ -200,7 +200,7 @@ pub(crate) fn submit_open(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
-    let user = unsafe { payload.user.as_ref() };
+    let user = unsafe { payload.user.as_ref()? };
     let path = owned_wide_path(user.path.as_slice())?;
     let flags = user.flags;
     let mode = user.mode;
@@ -230,7 +230,7 @@ pub(crate) fn submit_fsync(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
-    let user = unsafe { payload.user.as_ref() };
+    let user = unsafe { payload.user.as_ref()? };
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
 
@@ -246,7 +246,7 @@ pub(crate) fn submit_fsync_raw(
     payload: &mut KernelRef<FsyncRaw>,
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
-    let user = unsafe { payload.user.as_ref() };
+    let user = unsafe { payload.user.as_ref()? };
     header.resolved_handle = Some(user.fd);
     let raw_handle = crate::config::RawHandle::new(user.fd);
     let handle = raw_handle.borrow();
@@ -267,7 +267,7 @@ pub(crate) fn submit_sync_range(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
-    let user = unsafe { payload.user.as_ref() };
+    let user = unsafe { payload.user.as_ref()? };
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
 
@@ -283,7 +283,7 @@ pub(crate) fn submit_sync_range_raw(
     payload: &mut KernelRef<SyncFileRangeRaw>,
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
-    let user = unsafe { payload.user.as_ref() };
+    let user = unsafe { payload.user.as_ref()? };
     header.resolved_handle = Some(user.fd);
     let raw_handle = crate::config::RawHandle::new(user.fd);
     let handle = raw_handle.borrow();
@@ -304,7 +304,7 @@ pub(crate) fn submit_fallocate(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
-    let user = unsafe { payload.user.as_ref() };
+    let user = unsafe { payload.user.as_ref()? };
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
 
@@ -325,7 +325,7 @@ pub(crate) fn submit_fallocate_raw(
     payload: &mut KernelRef<FallocateRaw>,
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
-    let user = unsafe { payload.user.as_ref() };
+    let user = unsafe { payload.user.as_ref()? };
     header.resolved_handle = Some(user.fd);
     let raw_handle = crate::config::RawHandle::new(user.fd);
     let handle = raw_handle.borrow();

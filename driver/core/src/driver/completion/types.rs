@@ -9,6 +9,7 @@ pub struct DriverCompletionDiagnostics {
     unknown_completion: u64,
     stale_completion: u64,
     slot_corruption: u64,
+    payload_missing: u64,
     cancel_submitted: u64,
     cancel_ack_ok: u64,
     cancel_ack_not_found: u64,
@@ -18,6 +19,9 @@ pub struct DriverCompletionDiagnostics {
     waker_rebuild: u64,
     completion_rejected: u64,
     internal_unknown: u64,
+    rio_malformed_context: u64,
+    rio_missing_context: u64,
+    rio_stale_context: u64,
     orphan_cleanup_error: u64,
 }
 
@@ -28,6 +32,7 @@ pub struct DriverCompletionDiagnosticsSnapshot {
     pub unknown_completion: u64,
     pub stale_completion: u64,
     pub slot_corruption: u64,
+    pub payload_missing: u64,
     pub cancel_submitted: u64,
     pub cancel_ack_ok: u64,
     pub cancel_ack_not_found: u64,
@@ -37,6 +42,9 @@ pub struct DriverCompletionDiagnosticsSnapshot {
     pub waker_rebuild: u64,
     pub completion_rejected: u64,
     pub internal_unknown: u64,
+    pub rio_malformed_context: u64,
+    pub rio_missing_context: u64,
+    pub rio_stale_context: u64,
     pub orphan_cleanup_error: u64,
 }
 
@@ -49,6 +57,7 @@ impl DriverCompletionDiagnostics {
             unknown_completion: self.unknown_completion,
             stale_completion: self.stale_completion,
             slot_corruption: self.slot_corruption,
+            payload_missing: self.payload_missing,
             cancel_submitted: self.cancel_submitted,
             cancel_ack_ok: self.cancel_ack_ok,
             cancel_ack_not_found: self.cancel_ack_not_found,
@@ -58,6 +67,9 @@ impl DriverCompletionDiagnostics {
             waker_rebuild: self.waker_rebuild,
             completion_rejected: self.completion_rejected,
             internal_unknown: self.internal_unknown,
+            rio_malformed_context: self.rio_malformed_context,
+            rio_missing_context: self.rio_missing_context,
+            rio_stale_context: self.rio_stale_context,
             orphan_cleanup_error: self.orphan_cleanup_error,
         }
     }
@@ -85,6 +97,11 @@ impl DriverCompletionDiagnostics {
     #[inline]
     pub fn inc_slot_corruption(&mut self) {
         self.slot_corruption = self.slot_corruption.saturating_add(1);
+    }
+
+    #[inline]
+    pub fn inc_payload_missing(&mut self) {
+        self.payload_missing = self.payload_missing.saturating_add(1);
     }
 
     #[inline]
@@ -133,6 +150,21 @@ impl DriverCompletionDiagnostics {
     }
 
     #[inline]
+    pub fn inc_rio_malformed_context(&mut self) {
+        self.rio_malformed_context = self.rio_malformed_context.saturating_add(1);
+    }
+
+    #[inline]
+    pub fn inc_rio_missing_context(&mut self) {
+        self.rio_missing_context = self.rio_missing_context.saturating_add(1);
+    }
+
+    #[inline]
+    pub fn inc_rio_stale_context(&mut self) {
+        self.rio_stale_context = self.rio_stale_context.saturating_add(1);
+    }
+
+    #[inline]
     pub fn inc_orphan_cleanup_error(&mut self) {
         self.orphan_cleanup_error = self.orphan_cleanup_error.saturating_add(1);
     }
@@ -145,6 +177,7 @@ pub enum CompletionAnomalyReason {
     StaleGeneration,
     NonActiveSlot,
     SlotCorruption,
+    PayloadMissing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +296,22 @@ impl CompletionAnomaly {
             flags: None,
             slot_snapshot: None,
             reason: CompletionAnomalyReason::SlotCorruption,
+        }
+    }
+
+    #[inline]
+    pub fn payload_missing(token: CompletionToken, index: usize, generation: u32) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: Some(generation),
+            state: None,
+            backend: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::PayloadMissing,
         }
     }
 

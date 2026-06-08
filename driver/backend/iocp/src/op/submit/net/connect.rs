@@ -24,7 +24,7 @@ pub(crate) fn submit_connect(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-    let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
     let raw = resolve_fd_handle(&connect_op.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
     ensure_iocp_association(
@@ -155,7 +155,7 @@ pub(crate) fn submit_udp_connect(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-    let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
     let raw = resolve_fd_handle(&connect_op.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
     with_borrowed_socket(raw.as_socket(), |socket| {

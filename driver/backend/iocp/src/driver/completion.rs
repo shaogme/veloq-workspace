@@ -21,6 +21,11 @@ pub(super) struct EmitContext<'a> {
         &'a veloq_driver_core::driver::SharedCompletionTable<IocpUserPayload, IocpError>,
 }
 
+enum TimerFinish {
+    WaitingCompleted,
+    OrphanedDropped,
+}
+
 impl<'a> IocpDriver<'a> {
     pub(super) fn process_timers(&mut self) {
         let timer_buffer = self.timer.take_buffer();
@@ -53,8 +58,8 @@ impl<'a> IocpDriver<'a> {
         }
         let mut finished_timers = Vec::new();
         for token in expired {
-            if Self::finish_timer_op(&mut self.ops, token, &mut pending_events) {
-                finished_timers.push(token);
+            if let Some(finish) = Self::finish_timer_op(&mut self.ops, token, &mut pending_events) {
+                finished_timers.push((token, finish));
             }
         }
 
@@ -66,8 +71,15 @@ impl<'a> IocpDriver<'a> {
             );
             let _ = outcome;
         }
-        for token in finished_timers {
-            let _ = self.ops.finalize_waiting_completion(token);
+        for (token, finish) in finished_timers {
+            match finish {
+                TimerFinish::WaitingCompleted => {
+                    let _ = self.ops.finalize_waiting_completion(token);
+                }
+                TimerFinish::OrphanedDropped => {
+                    let _ = self.ops.finalize_orphaned_completion(token);
+                }
+            }
         }
         self.timer.restore_cleared_buffer(timer_buffer);
     }
@@ -76,23 +88,32 @@ impl<'a> IocpDriver<'a> {
         ops: &mut IocpOpRegistry,
         token: OpToken,
         pending_events: &mut Vec<CompletionSidecar>,
-    ) -> bool {
-        let mut guard = match ops.checked_slot_view(token) {
-            CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => slot.complete(),
-            _ => return false,
-        };
-
-        let _ = guard.take_op();
-        let (payload_erased, detail) = guard.take_completion_data();
-        pending_events.push(CompletionSidecar {
-            token,
-            res: 0,
-            flags: 0,
-            payload: payload_erased,
-            detail,
-            cleanup: CompletionCleanupGuard::default(),
-        });
-        true
+    ) -> Option<TimerFinish> {
+        match ops.checked_slot_view(token) {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
+                let mut guard = slot.complete();
+                let _ = guard.take_op();
+                let (payload_erased, detail) = guard.take_completion_data();
+                pending_events.push(CompletionSidecar {
+                    token,
+                    res: 0,
+                    flags: 0,
+                    payload: payload_erased,
+                    detail,
+                    cleanup: CompletionCleanupGuard::default(),
+                });
+                Some(TimerFinish::WaitingCompleted)
+            }
+            CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
+                let mut guard = slot.complete();
+                let _ = guard.take_op();
+                let (payload_erased, detail) = guard.take_completion_data();
+                drop(payload_erased);
+                drop(detail);
+                Some(TimerFinish::OrphanedDropped)
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn process_completion(
@@ -258,11 +279,10 @@ impl<'a> IocpDriver<'a> {
                 let _ = guard.take_completion_data();
                 let _data = std::mem::take(guard.platform_mut());
             } else {
-                let cleanup = guard
-                    .op
-                    .as_mut()
-                    .map(|op| op.completion_cleanup(io_detail.as_ref().expect("io result present")))
-                    .unwrap_or_default();
+                let cleanup = match (guard.op.as_mut(), io_detail.as_ref()) {
+                    (Some(op), Some(io_result)) => op.completion_cleanup(io_result),
+                    _ => CompletionCleanupGuard::default(),
+                };
                 if let Some(op) = guard.op.as_mut() {
                     op.unbind_user_payload();
                 }

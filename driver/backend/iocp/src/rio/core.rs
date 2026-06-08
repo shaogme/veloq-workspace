@@ -88,6 +88,20 @@ pub(crate) enum RioCompletionKind {
     },
 }
 
+pub(crate) enum RioRequestContextDecode {
+    Valid(RioCompletionKind),
+    Malformed {
+        raw: u64,
+    },
+    Missing {
+        id: RioRequestContextId,
+    },
+    Stale {
+        id: RioRequestContextId,
+        actual_generation: u32,
+    },
+}
+
 const RIO_REQUEST_CONTEXT_MAGIC: u64 = 0xA7;
 const RIO_REQUEST_CONTEXT_MAGIC_SHIFT: u32 = 56;
 const RIO_REQUEST_CONTEXT_INDEX_SHIFT: u32 = 32;
@@ -579,8 +593,8 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn decode_req_ctx(&mut self, ctx: u64) -> Option<RioCompletionKind> {
-        self.registry.decode_request_context(ctx)
+    pub(crate) fn decode_req_ctx_checked(&mut self, ctx: u64) -> RioRequestContextDecode {
+        self.registry.decode_request_context_checked(ctx)
     }
 
     #[inline]

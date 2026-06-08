@@ -57,7 +57,7 @@ pub(crate) fn submit_recv(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
     overlapped.set_offset(0);
 
     let fd = val.fd;
@@ -97,7 +97,7 @@ pub(crate) fn submit_udp_recv(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
     overlapped.set_offset(0);
 
     let fd = val.fd;
@@ -137,7 +137,7 @@ pub(crate) fn submit_send(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
     overlapped.set_offset(0);
 
     let raw = resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
@@ -176,7 +176,7 @@ pub(crate) fn submit_udp_send(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+    let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
     overlapped.set_offset(0);
 
     let raw = resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
@@ -215,7 +215,7 @@ pub(crate) fn submit_send_to(
     ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: The caller guarantees that payload is valid.
-    let user = unsafe { payload.user.as_ref() };
+    let user = unsafe { payload.user.as_ref()? };
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
     let raw_handle = crate::config::RawHandle::new(raw);
@@ -255,7 +255,7 @@ pub(crate) fn submit_udp_recv_from(
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: payload.user and overlapped come from the in-flight slot.
     let (val, overlapped) = unsafe {
-        let user = payload.user.as_mut();
+        let user = payload.user.as_mut()?;
         (user, &mut *ctx.overlapped)
     };
     overlapped.set_offset(0);
@@ -295,7 +295,7 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
     _ext: &Extensions,
 ) -> IocpResult<usize> {
     // SAFETY: The caller guarantees that payload is valid.
-    let val = unsafe { payload.user.as_mut() };
+    let val = unsafe { payload.user.as_mut()? };
     let addr_bytes = unsafe {
         std::slice::from_raw_parts(
             (&payload.addr as *const SockAddrStorage).cast::<u8>(),

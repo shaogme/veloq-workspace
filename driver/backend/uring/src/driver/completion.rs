@@ -89,6 +89,17 @@ impl<'a> UringDriver<'a> {
                             cleanup: CompletionCleanupGuard::default(),
                         })
                     }
+                    SlotView::InFlightOrphaned(mut slot) => {
+                        slot.platform_mut().timer_id = None;
+                        let mut completed = slot.complete();
+                        let _ = completed.take_op();
+                        let (payload, detail) = completed.take_completion_data();
+                        drop(payload);
+                        drop(detail);
+                        drop(completed);
+                        let _ = self.ops.finalize_orphaned_completion(token);
+                        None
+                    }
                     _ => None,
                 },
                 CheckedSlotView::Missing {
@@ -335,9 +346,7 @@ impl<'a> UringDriver<'a> {
         }
 
         self.is_waked.store(false, Ordering::Release);
-        if let Some(token) = self.waker_token.take() {
-            let _ = self.ops.remove_token(token);
-        }
+        self.waker_armed = false;
         if let Err(e) = self.submit_waker() {
             self.completion_diagnostics.inc_waker_rebuild();
             error!(report = ?e, "failed to resubmit waker");

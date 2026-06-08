@@ -551,6 +551,6 @@ mod tests {
             }
         };
         assert_eq!(record.event.token, completion_token);
-        assert_eq!(record.payload, Some(()));
+        assert_eq!(record.payload, ());
     }
 }

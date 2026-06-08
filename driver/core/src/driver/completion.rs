@@ -575,7 +575,7 @@ impl CompletionEvent {
 
 pub struct CompletionRecord<UP, E, R = usize> {
     pub event: CompletionEvent,
-    pub payload: Option<UP>,
+    pub payload: UP,
     pub detail: Option<DriverResult<R, E>>,
     pub cleanup: CompletionCleanupGuard,
     pub record_kind: CompletionRecordKind,
@@ -585,19 +585,6 @@ impl<UP, E, R> CompletionRecord<UP, E, R> {
     #[inline]
     pub fn disarm_cleanup(&mut self) -> bool {
         self.cleanup.disarm()
-    }
-}
-
-impl<UP, E, R> From<CompletionPacket<UP, E, R>> for CompletionRecord<UP, E, R> {
-    #[inline]
-    fn from(packet: CompletionPacket<UP, E, R>) -> Self {
-        Self {
-            event: packet.event,
-            payload: packet.payload,
-            detail: packet.detail,
-            cleanup: packet.cleanup,
-            record_kind: packet.record_kind,
-        }
     }
 }
 
@@ -635,6 +622,7 @@ pub fn record_completion_anomaly(
         | CompletionAnomalyReason::NonActiveSlot => diagnostics.inc_unknown_completion(),
         CompletionAnomalyReason::StaleGeneration => diagnostics.inc_stale_completion(),
         CompletionAnomalyReason::SlotCorruption => diagnostics.inc_slot_corruption(),
+        CompletionAnomalyReason::PayloadMissing => diagnostics.inc_payload_missing(),
     }
 }
 
@@ -642,13 +630,24 @@ pub fn record_completion_anomaly(
 pub fn record_user_completion<UP, E, R>(
     table: &SharedCompletionTable<UP, E, R>,
     diagnostics: &mut DriverCompletionDiagnostics,
-    packet: CompletionPacket<UP, E, R>,
+    mut packet: CompletionPacket<UP, E, R>,
 ) -> RecordCompletionOutcome
 where
     UP: Send,
     E: Send,
     R: Send,
 {
+    if packet.payload.is_none()
+        && matches!(packet.record_kind, CompletionRecordKind::User)
+        && let Some(op_token) = packet.event.token.op_token()
+    {
+        let (index, generation) = op_token.parts();
+        let anomaly = CompletionAnomaly::payload_missing(packet.event.token, index, generation)
+            .with_event(packet.event);
+        record_completion_anomaly(diagnostics, &anomaly);
+        packet.record_kind = CompletionRecordKind::Lost(anomaly);
+    }
+
     match table.record_completion(packet) {
         RecordCompletionResult::Recorded => {
             let outcome = RecordCompletionOutcome::Recorded;

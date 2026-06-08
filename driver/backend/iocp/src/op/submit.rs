@@ -257,12 +257,12 @@ pub(crate) fn resolve_registered_raw_file(
 pub(crate) unsafe fn unpack_kernel_ref<T>(
     payload: &mut KernelRef<T>,
     overlapped: *mut Overlapped,
-) -> (&mut T, &mut Overlapped) {
+) -> IocpResult<(&mut T, &mut Overlapped)> {
     // SAFETY: guaranteed by the caller.
-    let val = unsafe { payload.user.as_mut() };
+    let val = unsafe { payload.user.as_mut()? };
     // SAFETY: guaranteed by the caller.
     let overlapped = unsafe { &mut *overlapped };
-    (val, overlapped)
+    Ok((val, overlapped))
 }
 
 /// Associates a handle with an IOCP.
@@ -349,8 +349,7 @@ macro_rules! impl_get_fd {
     ($fn_name:ident, $payload:ty, direct_fd) => {
         pub(crate) unsafe fn $fn_name(payload: &$payload) -> Option<crate::config::IoFd> {
             // SAFETY: the caller guarantees the payload pointer is valid.
-            let user = unsafe { payload.user.as_ref() };
-            Some(user.fd)
+            unsafe { payload.user.as_ref().ok().map(|user| user.fd) }
         }
     };
     ($fn_name:ident, $payload:ty, no_fd) => {
@@ -409,6 +408,6 @@ pub(crate) fn submit_timeout(
     _ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
     // SAFETY: Dereferencing the user pointer in KernelRef.
-    let u = unsafe { payload.user.as_ref() };
+    let u = unsafe { payload.user.as_ref()? };
     Ok(SubmissionResult::Timer(u.duration))
 }

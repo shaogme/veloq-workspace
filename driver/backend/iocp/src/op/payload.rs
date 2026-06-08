@@ -3,6 +3,7 @@ use std::ptr::NonNull;
 use windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE;
 
 use crate::config::OwnedRawHandle;
+use crate::error::{IocpError, IocpResult};
 use crate::net::addr::SockAddrStorage;
 use crate::op::spec::PayloadBinding;
 use crate::op::{
@@ -10,6 +11,8 @@ use crate::op::{
     ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
     UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw,
 };
+
+use diagweave::prelude::*;
 
 pub enum IocpUserPayload {
     ReadFixed(ReadFixed),
@@ -87,17 +90,27 @@ impl<T> PayloadRef<T> {
     }
 
     #[inline]
-    pub(crate) unsafe fn as_ref(&self) -> &T {
-        let user = self.user.expect("IOCP user payload used before binding");
+    pub(crate) unsafe fn as_ref(&self) -> IocpResult<&T> {
+        let user = self.user.ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("payload_type", std::any::type_name::<T>())
+                .attach_note("IOCP user payload used before binding")
+        })?;
         // SAFETY: the payload is bound to the live slot payload before submission.
-        unsafe { user.as_ref() }
+        Ok(unsafe { user.as_ref() })
     }
 
     #[inline]
-    pub(crate) unsafe fn as_mut(&mut self) -> &mut T {
-        let mut user = self.user.expect("IOCP user payload used before binding");
+    pub(crate) unsafe fn as_mut(&mut self) -> IocpResult<&mut T> {
+        let mut user = self.user.ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("payload_type", std::any::type_name::<T>())
+                .attach_note("IOCP user payload used before binding")
+        })?;
         // SAFETY: the payload is bound to the live slot payload before submission.
-        unsafe { user.as_mut() }
+        Ok(unsafe { user.as_mut() })
     }
 }
 

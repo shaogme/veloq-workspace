@@ -12,18 +12,11 @@ use veloq_driver_core::driver::{
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
-use crate::common::{IOCP_WAKEUP_COMPLETION_KEY, IocpErrorContext, IocpWaker, iocp_msg};
+use crate::common::{IocpErrorContext, IocpWaker, iocp_msg};
 use crate::error::{IocpError, IocpResult};
 use crate::op::IocpUserPayload;
 
 use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY};
-
-enum IocpCompletionKind {
-    Waker,
-    RioWake,
-    User { token: OpToken },
-    Unknown { raw: RawCompletion },
-}
 
 #[derive(Default)]
 pub(super) struct CompletionProgress {
@@ -196,7 +189,7 @@ impl<'a> IocpDriver<'a> {
         error_code: Option<u32>,
     ) -> IocpDriverResult<CompletionProgress> {
         match self.resolve_completion_kind(bytes, overlapped, success, key, error_code)? {
-            IocpCompletionKind::RioWake => {
+            CompletionDispatch::RioWake { .. } => {
                 let processed = {
                     let (rio_state, registrar) = self.rio.state_and_registrar_mut();
                     rio_state.process_completions(
@@ -218,15 +211,15 @@ impl<'a> IocpDriver<'a> {
                     rio: processed,
                 })
             }
-            IocpCompletionKind::Waker => {
+            CompletionDispatch::Waker { .. } => {
                 self.handle_waker_completion(success, error_code);
                 Ok(CompletionProgress::default())
             }
-            IocpCompletionKind::User { token } => {
+            CompletionDispatch::User { token, .. } => {
                 self.process_completion(token, success, error_code, bytes);
                 Ok(CompletionProgress { iocp: 1, rio: 0 })
             }
-            IocpCompletionKind::Unknown { raw } => {
+            CompletionDispatch::Cancel { raw, .. } | CompletionDispatch::Unknown { raw } => {
                 let anomaly =
                     CompletionAnomaly::unknown_control(raw.token).with_raw_completion(raw);
                 record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
@@ -260,9 +253,15 @@ impl<'a> IocpDriver<'a> {
         success: bool,
         completion_key: usize,
         error_code: Option<u32>,
-    ) -> IocpResult<IocpCompletionKind> {
+    ) -> IocpResult<CompletionDispatch> {
         if completion_key == RIO_EVENT_KEY {
-            return Ok(IocpCompletionKind::RioWake);
+            let raw = RawCompletion::new(
+                CompletionBackend::Iocp,
+                CompletionToken::rio_wake(0),
+                iocp_status_res(success, error_code, bytes),
+                0,
+            );
+            return Ok(CompletionDispatch::RioWake { id: 0, raw });
         }
 
         if !overlapped.is_null() {
@@ -281,17 +280,28 @@ impl<'a> IocpDriver<'a> {
                     .with_ctx("slot_count", self.ops.local.len())
                     .attach_note("completed index out of bounds");
             }
-            return Ok(IocpCompletionKind::User { token: entry.token });
-        }
-
-        if completion_key == IOCP_WAKEUP_COMPLETION_KEY {
-            return Ok(IocpCompletionKind::Waker);
+            let raw = RawCompletion::new(
+                CompletionBackend::Iocp,
+                CompletionToken::user(entry.token),
+                iocp_status_res(success, error_code, bytes),
+                0,
+            );
+            return Ok(CompletionDispatch::User {
+                token: entry.token,
+                raw,
+            });
         }
 
         if !success {
             let err = error_code.unwrap_or(0);
             if err == WAIT_TIMEOUT {
-                return Ok(IocpCompletionKind::Waker);
+                let raw = RawCompletion::new(
+                    CompletionBackend::Iocp,
+                    CompletionToken::waker(0),
+                    iocp_status_res(success, error_code, bytes),
+                    0,
+                );
+                return Ok(CompletionDispatch::Waker { id: 0, raw });
             }
             if completion_key == 0 {
                 let _ = iocp_msg(
@@ -301,7 +311,7 @@ impl<'a> IocpDriver<'a> {
                 .with_ctx("os_error_code", err)
                 .with_ctx("completion_key", completion_key)
                 .with_ctx("overlapped_is_null", true);
-                return Ok(IocpCompletionKind::Unknown {
+                return Ok(CompletionDispatch::Unknown {
                     raw: RawCompletion::new(
                         CompletionBackend::Iocp,
                         CompletionToken::from_raw(completion_key as u64),
@@ -318,20 +328,13 @@ impl<'a> IocpDriver<'a> {
             "resolved null-overlapped completion from key"
         );
 
-        let raw = dispatch_raw_completion(
+        let dispatch = dispatch_raw_completion(
             CompletionBackend::Iocp,
             completion_key as u64,
             iocp_status_res(success, error_code, bytes),
             0,
         );
-        match raw {
-            CompletionDispatch::User { token, .. } => Ok(IocpCompletionKind::User { token }),
-            CompletionDispatch::Waker { .. } => Ok(IocpCompletionKind::Waker),
-            CompletionDispatch::RioWake { .. } => Ok(IocpCompletionKind::RioWake),
-            CompletionDispatch::Cancel { raw, .. } | CompletionDispatch::Unknown { raw } => {
-                Ok(IocpCompletionKind::Unknown { raw })
-            }
-        }
+        Ok(dispatch)
     }
 }
 

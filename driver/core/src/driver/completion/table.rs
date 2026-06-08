@@ -342,6 +342,19 @@ where
             drop(cleanup);
             return PollRecordResult::ReadyLost(anomaly);
         }
+        let Some(payload) = payload else {
+            drop(detail);
+            drop(cleanup);
+            return PollRecordResult::ReadyLost(
+                CompletionAnomaly::payload_missing(token, idx, generation).with_event(
+                    CompletionEvent {
+                        token,
+                        res: cell.completion_res.load(Ordering::Acquire),
+                        flags: cell.completion_flags.load(Ordering::Acquire),
+                    },
+                ),
+            );
+        };
         PollRecordResult::Ready(CompletionRecord {
             event: CompletionEvent {
                 token,

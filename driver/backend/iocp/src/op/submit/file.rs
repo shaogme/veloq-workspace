@@ -60,7 +60,7 @@ macro_rules! submit_io_op {
             ctx: &mut SubmitContext,
         ) -> IocpResult<SubmissionResult> {
             // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-            let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+            let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
 
             overlapped.set_offset(val.offset);
 
@@ -107,7 +107,7 @@ macro_rules! submit_raw_io_op {
             ctx: &mut SubmitContext,
         ) -> IocpResult<SubmissionResult> {
             // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-            let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) };
+            let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
 
             overlapped.set_offset(val.offset);
 

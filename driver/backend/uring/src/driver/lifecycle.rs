@@ -1,5 +1,6 @@
 use crate::driver::{PendingCancel, UringDriver};
-use crate::error::{UringDriverResult, UringError};
+use crate::error::{UringDriverResult, UringError, uring_report_to_event_res};
+use diagweave::prelude::*;
 use io_uring::opcode;
 use tracing::{debug, error, trace};
 use veloq_driver_core::driver::{
@@ -9,9 +10,19 @@ use veloq_driver_core::driver::{
 
 use crate::op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt, UringUserPayload};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UringSubmissionState {
+    #[default]
+    Idle,
+    Queued,
+    KernelSubmitted,
+    Timer,
+}
+
 #[derive(Clone, Default)]
 pub struct UringOpState {
     pub(crate) timer_id: Option<veloq_wheel::TaskId>,
+    pub(crate) submission_state: UringSubmissionState,
 }
 
 impl UringOpState {
@@ -77,6 +88,20 @@ impl<'a> UringDriver<'a> {
                 CancelSubmitOutcome::AlreadyComplete
             }
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+                if slot.platform().submission_state == UringSubmissionState::Queued {
+                    let sidecar = cancel_slot_immediate(slot, token);
+                    self.remove_backlog_token(token);
+                    if request.mode == CancelMode::UserVisible {
+                        self.push_completion_event(sidecar);
+                    } else {
+                        let mut cleanup = sidecar.cleanup;
+                        let _ =
+                            run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                    }
+                    let _ = self.ops.finalize_waiting_completion(token);
+                    return CancelSubmitOutcome::AlreadyComplete;
+                }
+
                 if let Some(tid) = slot.platform_mut().timer_id {
                     let mut completed = if request.mode == CancelMode::Abandon {
                         slot.cancel().complete()
@@ -113,6 +138,15 @@ impl<'a> UringDriver<'a> {
                 // Cancellation is async, we wait for CQE to clean up.
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+                if slot.platform().submission_state == UringSubmissionState::Queued {
+                    let sidecar = cancel_slot_immediate(slot, token);
+                    self.remove_backlog_token(token);
+                    let mut cleanup = sidecar.cleanup;
+                    let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                    let _ = self.ops.finalize_orphaned_completion(token);
+                    return CancelSubmitOutcome::AlreadyComplete;
+                }
+
                 if let Some(tid) = slot.platform_mut().timer_id {
                     let sidecar = cancel_slot_immediate(slot, token);
                     self.wheel.cancel(tid);
@@ -245,36 +279,62 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn flush_backlog(&mut self) {
         enum BacklogAction {
-            Submit,
-            Cancel,
+            SubmitReserved,
+            SubmitQueued,
+            CancelQueued,
+            CancelKernel,
             Drop,
         }
 
         while let Some(&token) = self.backlog.front() {
             let action = match self.ops.checked_slot_view(token) {
                 CheckedSlotView::Valid(slot) => match slot {
-                    SlotView::InFlightOrphaned(_) => BacklogAction::Cancel,
+                    SlotView::InFlightOrphaned(slot) => {
+                        if slot.platform().submission_state == UringSubmissionState::Queued {
+                            BacklogAction::CancelQueued
+                        } else {
+                            BacklogAction::CancelKernel
+                        }
+                    }
                     SlotView::Reserved(slot) => {
                         if slot_has_op(slot) {
-                            BacklogAction::Submit
+                            BacklogAction::SubmitReserved
                         } else {
                             BacklogAction::Drop
                         }
                     }
-                    SlotView::InFlightWaiting(_) => BacklogAction::Drop,
+                    SlotView::InFlightWaiting(slot) => {
+                        if slot.platform().submission_state == UringSubmissionState::Queued {
+                            BacklogAction::SubmitQueued
+                        } else {
+                            BacklogAction::Drop
+                        }
+                    }
                 },
                 _ => BacklogAction::Drop,
             };
 
             match action {
-                BacklogAction::Cancel => {
+                BacklogAction::CancelQueued => {
+                    self.pop_backlog();
+                    if let CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) =
+                        self.ops.checked_slot_view(token)
+                    {
+                        let sidecar = cancel_slot_immediate(slot, token);
+                        let mut cleanup = sidecar.cleanup;
+                        let _ =
+                            run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                        let _ = self.ops.finalize_orphaned_completion(token);
+                    }
+                }
+                BacklogAction::CancelKernel => {
                     self.pop_backlog();
                     let _ = self.cancel_op_internal(CancelRequest::abandon(token));
                 }
                 BacklogAction::Drop => {
                     self.pop_backlog();
                 }
-                BacklogAction::Submit => match self.submit_from_slot_token(token) {
+                BacklogAction::SubmitReserved => match self.submit_from_slot_token(token) {
                     Ok(true) => {
                         self.pop_backlog();
                     }
@@ -287,6 +347,25 @@ impl<'a> UringDriver<'a> {
                         self.pop_backlog();
                     }
                 },
+                BacklogAction::SubmitQueued => {
+                    let driver_ptr = self as *mut UringDriver;
+                    let result = match self.ops.checked_slot_view(token) {
+                        CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => unsafe {
+                            Self::submit_queued_from_slot_raw(driver_ptr, token, slot)
+                        },
+                        _ => Ok(true),
+                    };
+                    match result {
+                        Ok(true) => {
+                            self.pop_backlog();
+                        }
+                        Ok(false) => break,
+                        Err(report) => {
+                            self.pop_backlog();
+                            self.complete_queued_submission_error(token, report);
+                        }
+                    }
+                }
             }
         }
     }
@@ -297,6 +376,35 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn pop_backlog(&mut self) -> Option<OpToken> {
         self.backlog.pop_front()
+    }
+
+    pub(crate) fn remove_backlog_token(&mut self, token: OpToken) -> bool {
+        let Some(pos) = self.backlog.iter().position(|queued| *queued == token) else {
+            return false;
+        };
+        self.backlog.remove(pos);
+        true
+    }
+
+    fn complete_queued_submission_error(&mut self, token: OpToken, report: Report<UringError>) {
+        let event_res = uring_report_to_event_res(&report);
+        if let CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) =
+            self.ops.checked_slot_view(token)
+        {
+            let mut completed = slot.complete();
+            let _ = completed.take_op();
+            let (payload, detail) = completed.take_completion_data();
+            let sidecar = CompletionSidecar::<UringUserPayload, UringError> {
+                token,
+                res: event_res,
+                flags: 0,
+                payload,
+                detail: detail.or(Some(Err(report))),
+                cleanup: CompletionCleanupGuard::default(),
+            };
+            self.push_completion_event(sidecar);
+            let _ = self.ops.finalize_waiting_completion(token);
+        }
     }
 }
 

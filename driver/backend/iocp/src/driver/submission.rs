@@ -52,13 +52,13 @@ impl BlockingBridge {
     }
 }
 
-fn close_fd_from_op(op: &IocpOp) -> Option<IoFd> {
+fn close_fd_from_op(op: &mut IocpOp) -> IocpResult<Option<IoFd>> {
     match &op.payload {
         IocpOpPayload::Close(payload) => {
             // SAFETY: the slot payload is bound before submission starts.
-            Some(unsafe { payload.user.as_ref() }.fd)
+            Ok(Some(unsafe { payload.user.as_ref()? }.fd))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -254,11 +254,12 @@ impl<'a> IocpDriver<'a> {
                     .with_mut(|_result, _payload, sidecar| sidecar.in_flight = false);
             }))
             .map_err(|err| slot_access_report("iocp.driver.call_op_submit.start", err))?;
-        let close_fd = sub_guard
-            .slot
-            .as_mut()
-            .and_then(|slot| slot.with_op_mut(|op| close_fd_from_op(op)).ok())
-            .flatten();
+        let close_fd = if let Some(slot) = sub_guard.slot.as_mut() {
+            slot.with_op_mut(close_fd_from_op)
+                .map_err(|err| slot_access_report("iocp.driver.call_op_submit.close_fd", err))??
+        } else {
+            None
+        };
 
         let result = if let Some(fd) = close_fd {
             let close_result = super::registration::close_registered_owned_fd(
