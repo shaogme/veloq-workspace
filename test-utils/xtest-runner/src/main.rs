@@ -29,6 +29,12 @@ union! {
                 code: Option<i32>,
             },
 
+            #[display("{step} 失败（退出码: {code:?}）")]
+            PrebuildFailed {
+                step: String,
+                code: Option<i32>,
+            },
+
             #[display("{task}-{target} 第 {round}/{total} 次执行失败（退出码: {code:?}）")]
             RoundFailed {
                 task: &'static str,
@@ -271,10 +277,9 @@ impl Runner {
     }
 
     fn run(&self) -> Result<(), Report<RunnerError>> {
-        let command = self.round_command();
-
         if !matches!(self.mode, RunMode::Native) {
             // 在非原生环境下，我们直接运行一次 xtest-runner，由内部的 xtest-runner 负责循环
+            let command = self.round_command();
             let status = command_status(&command, &self.workspace_root)
                 .with_ctx("command", command.display())?;
             if status.success() {
@@ -285,6 +290,9 @@ impl Runner {
             }
         }
 
+        self.prebuild_tests()?;
+
+        let command = self.round_command();
         for round in 1..=self.config.count {
             self.run_round(&command, round)?;
         }
@@ -297,6 +305,71 @@ impl Runner {
         );
 
         Ok(())
+    }
+
+    fn prebuild_tests(&self) -> Result<(), Report<RunnerError>> {
+        if self.config.task != Task::Test {
+            return Ok(());
+        }
+
+        let steps = [
+            ("预构建 nextest 测试二进制", self.nextest_prebuild_command()),
+            ("预热 trybuild 编译测试", trybuild_warmup_command()),
+        ];
+
+        for (step, command) in steps {
+            self.run_prebuild_step(step, command)?;
+        }
+
+        Ok(())
+    }
+
+    fn nextest_prebuild_command(&self) -> CommandSpec {
+        let mut command = match self.config.target {
+            Target::Linux => linux_native_command(Task::Test, self.config.features.as_deref()),
+            Target::Windows => windows_native_command(
+                Task::Test,
+                self.config.features.as_deref(),
+                self.windows_target.as_deref(),
+            ),
+        };
+        command.args.push("--no-run".into());
+        command
+    }
+
+    fn run_prebuild_step(
+        &self,
+        step: &str,
+        command: CommandSpec,
+    ) -> Result<(), Report<RunnerError>> {
+        if !self.config.quiet {
+            eprintln!("[xtest-runner] {step}: {}", command.display());
+            let status = command_status(&command, &self.workspace_root)
+                .with_ctx("step", step.to_string())?;
+            if status.success() {
+                return Ok(());
+            }
+
+            return RunnerError::PrebuildFailed {
+                step: step.to_string(),
+                code: status.code(),
+            }
+            .with_ctx("command", command.display());
+        }
+
+        let output =
+            command_output(&command, &self.workspace_root).with_ctx("step", step.to_string())?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        eprintln!("{step} 失败（退出码: {:?}）", output.status.code());
+        print_output(&output);
+        RunnerError::PrebuildFailed {
+            step: step.to_string(),
+            code: output.status.code(),
+        }
+        .with_ctx("command", command.display())
     }
 
     fn run_round(&self, command: &CommandSpec, round: usize) -> Result<(), Report<RunnerError>> {
@@ -524,6 +597,22 @@ fn windows_native_command(task: Task, features: Option<&str>, target: Option<&st
     }
 
     CommandSpec::new("cargo", args)
+}
+
+fn trybuild_warmup_command() -> CommandSpec {
+    CommandSpec::new(
+        "cargo",
+        vec![
+            "test".into(),
+            "-p".into(),
+            "veloq-runtime".into(),
+            "--test".into(),
+            "compile_tests".into(),
+            "compile_tests".into(),
+            "--".into(),
+            "--exact".into(),
+        ],
+    )
 }
 
 fn parse_count(input: &str) -> Result<usize, RunnerError> {
