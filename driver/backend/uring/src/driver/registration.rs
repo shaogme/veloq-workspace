@@ -179,6 +179,51 @@ impl<'a> UringDriver<'a> {
         Ok(())
     }
 
+    fn unregister_file_slot(
+        &mut self,
+        idx: u32,
+        advance_generation: bool,
+        scope: &'static str,
+    ) -> UringResult<()> {
+        let index = idx as usize;
+        if index >= self.registered_files.len() {
+            return Ok(());
+        }
+
+        let Some(entry) = self.registered_files[index].take() else {
+            return Ok(());
+        };
+
+        if let Err(e) = self.ring.submitter().register_files_update(idx, &[-1]) {
+            self.registered_files[index] = Some(entry);
+            return Err(UringError::Registration.io_report(scope, e));
+        }
+
+        self.free_file_slots.push(idx);
+        if advance_generation {
+            Self::advance_file_generation(&mut self.file_generations[index]);
+        }
+        Ok(())
+    }
+
+    fn rollback_file_slots(&mut self, registered: &mut Vec<u32>) -> UringResult<()> {
+        let mut first_error = None;
+        while let Some(idx) = registered.pop() {
+            if let Err(report) =
+                self.unregister_file_slot(idx, false, "driver.register_files_internal.rollback")
+                && first_error.is_none()
+            {
+                first_error = Some(report);
+            }
+        }
+
+        if let Some(report) = first_error {
+            Err(report.attach_note("registered file rollback failed"))
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn unregister_fixed_fd(&mut self, fd: IoFd) -> UringResult<()> {
         if !self.file_table_initialized {
             return Ok(());
@@ -189,15 +234,7 @@ impl<'a> UringDriver<'a> {
             if self.file_generations.get(index).copied() != Some(fd.generation()) {
                 return Ok(());
             }
-            let Some(_entry) = self.registered_files[index].take() else {
-                return Ok(());
-            };
-            self.ring
-                .submitter()
-                .register_files_update(idx, &[-1])
-                .map_err(|e| UringError::Registration.io_report("driver.unregister_fixed_fd", e))?;
-            self.free_file_slots.push(idx);
-            Self::advance_file_generation(&mut self.file_generations[index]);
+            self.unregister_file_slot(idx, true, "driver.unregister_fixed_fd")?;
         }
         Ok(())
     }
@@ -226,7 +263,19 @@ impl<'a> UringDriver<'a> {
     ) -> UringResult<Vec<IoFd>> {
         self.ensure_file_table_initialized()?;
 
+        let requested = files.len();
+        let available = self.free_file_slots.len();
+        if requested > available {
+            return Err(UringError::InvalidState
+                .to_report()
+                .push_ctx("scope", "driver.register_files_internal")
+                .with_ctx("requested_files", requested)
+                .with_ctx("free_file_slots", available)
+                .attach_note("io_uring registered file table exhausted"));
+        }
+
         let mut fixed_fds = Vec::with_capacity(files.len());
+        let mut registered_slots = Vec::with_capacity(files.len());
         for file in files {
             let entry = match file {
                 RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd {
@@ -236,20 +285,21 @@ impl<'a> UringDriver<'a> {
                 RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
             };
             let fd = entry.fd();
-            let idx = self.free_file_slots.pop().ok_or_else(|| {
-                UringError::InvalidState.report(
-                    "driver.register_files_internal",
-                    "io_uring registered file table exhausted",
-                )
-            })?;
-            self.ring
-                .submitter()
-                .register_files_update(idx, &[fd])
-                .map_err(|e| {
-                    UringError::Registration
-                        .io_report("driver.register_files_internal.register_files_update", e)
-                })?;
+            let idx = self.free_file_slots.pop().expect(
+                "register_files_internal capacity precheck guarantees enough free file slots",
+            );
+            if let Err(e) = self.ring.submitter().register_files_update(idx, &[fd]) {
+                self.free_file_slots.push(idx);
+                let report = UringError::Registration
+                    .io_report("driver.register_files_internal.register_files_update", e);
+                if let Err(rollback_report) = self.rollback_file_slots(&mut registered_slots) {
+                    return Err(rollback_report
+                        .attach_note("rollback failed after registered file update failure"));
+                }
+                return Err(report);
+            }
             self.registered_files[idx as usize] = Some(entry);
+            registered_slots.push(idx);
             let generation = self.file_generations[idx as usize];
             fixed_fds.push(IoFd::fixed_with_generation(idx, generation));
         }
