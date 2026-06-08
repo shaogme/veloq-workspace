@@ -10,8 +10,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_NORMAL, FILE_END_OF_FILE_INFO,
-    FILE_FLAG_OVERLAPPED, FileAllocationInfo, FileEndOfFileInfo, FlushFileBuffers,
-    SetFileInformationByHandle,
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAllocationInfo,
+    FileEndOfFileInfo, FlushFileBuffers, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -264,7 +264,7 @@ fn open_file(path: Vec<u16>, flags: i32, mode: u32) -> io::Result<usize> {
         CreateFileW(
             path.as_ptr(),
             flags as u32,
-            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null(),
             real_disposition,
             flags_and_attributes,

@@ -2,17 +2,19 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use veloq::fs::{File, LocalFile};
 use veloq::io::{AsyncBufRead, AsyncBufWrite};
 use veloq::runtime::Runtime;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
+static TEMP_FILE_ID: AtomicUsize = AtomicUsize::new(0);
+
 struct CleanupGuard(PathBuf);
 
 impl CleanupGuard {
-    fn new(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
+    fn new(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref().to_path_buf();
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
@@ -35,12 +37,17 @@ fn create_runtime() -> Runtime<UniformSlot> {
         .expect("failed to build runtime")
 }
 
+fn temp_file_path(label: &str) -> PathBuf {
+    let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("veloq-{label}-{}-{id}.tmp", std::process::id()))
+}
+
 #[test]
 fn test_file_integrity() {
     for size in [nz!(8192), nz!(16384), nz!(65536)] {
         let runtime = create_runtime();
         runtime.block_on(async |ctx| {
-            let file_path = format!("test_file_integrity_{:?}.tmp", size);
+            let file_path = temp_file_path(&format!("file-integrity-{}", size.get()));
             let _guard = CleanupGuard::new(&file_path);
 
             {
@@ -72,6 +79,26 @@ fn test_file_integrity() {
 }
 
 #[test]
+fn test_file_can_be_reopened_while_existing_handle_is_alive() {
+    let runtime = create_runtime();
+
+    runtime.block_on(async |ctx| {
+        let path = temp_file_path("fs-shared-open");
+        let _guard = CleanupGuard::new(&path);
+
+        let writer = LocalFile::create(ctx, &path)
+            .await
+            .expect("Failed to create file");
+        let reader = LocalFile::open(ctx, &path)
+            .await
+            .expect("Failed to reopen file while writer is alive");
+
+        drop(reader);
+        drop(writer);
+    });
+}
+
+#[test]
 fn test_multithread_file_ops() {
     let completion_count = Arc::new(AtomicUsize::new(0));
     const NUM_TASKS: usize = 10;
@@ -83,7 +110,7 @@ fn test_multithread_file_ops() {
             for i in 0..NUM_TASKS {
                 let counter = completion_count_for_runtime.clone();
                 s.spawn_boxed(async move {
-                    let file_name = format!("test_mt_fs_{}.tmp", i);
+                    let file_name = temp_file_path(&format!("mt-fs-{i}"));
                     let _guard = CleanupGuard::new(&file_name);
 
                     let content = format!("Task {} content", i);
@@ -126,10 +153,10 @@ fn test_fs_read_exact_write_all() {
     let runtime = create_runtime();
 
     runtime.block_on(async |ctx| {
-        let path = "test_fs_exact.tmp";
-        let _guard = CleanupGuard::new(path);
+        let path = temp_file_path("fs-exact");
+        let _guard = CleanupGuard::new(&path);
 
-        let file = LocalFile::create(ctx, path)
+        let file = LocalFile::create(ctx, &path)
             .await
             .expect("Failed to create file");
 
@@ -142,7 +169,7 @@ fn test_fs_read_exact_write_all() {
         file.sync_all().await.expect("Sync failed");
         drop(file);
 
-        let file = LocalFile::open(ctx, path)
+        let file = LocalFile::open(ctx, &path)
             .await
             .expect("Failed to open file");
         let mut read_buf = ctx.alloc(nz!(DATA.len()));
