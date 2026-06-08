@@ -23,9 +23,8 @@ use crate::op::submit::common::{
     mark_header_in_flight, resolve_fd_handle, resolve_registered_raw_file, unpack_kernel_ref,
 };
 use crate::op::{
-    Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, IocpKernelOp, KernelRef, OpenPayload,
-    OverlappedEntry, ReadFixed, ReadRaw, SubmitContext, SyncFileRange, SyncFileRangeRaw,
-    WriteFixed, WriteRaw,
+    Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, KernelRef, OpenPayload, OverlappedEntry,
+    ReadFixed, ReadRaw, SubmitContext, SyncFileRange, SyncFileRangeRaw, WriteFixed, WriteRaw,
 };
 use veloq_driver_core::RawHandleMeta;
 use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard};
@@ -226,10 +225,7 @@ fn close_unconsumed_file_handle(raw: usize) {
     }
 }
 
-pub(crate) unsafe fn completion_cleanup_close_file(
-    _op: &mut IocpKernelOp,
-    result: &IocpResult<usize>,
-) -> CompletionCleanupGuard {
+pub(crate) fn completion_cleanup_close_file(result: &IocpResult<usize>) -> CompletionCleanupGuard {
     let Ok(raw) = result.as_ref().copied() else {
         return CompletionCleanupGuard::default();
     };

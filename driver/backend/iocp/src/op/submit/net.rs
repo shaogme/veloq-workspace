@@ -16,9 +16,8 @@ use crate::op::submit::common::{
     iocp_submit_connect_ex, mark_header_in_flight, resolve_fd_handle, unpack_kernel_ref,
 };
 use crate::op::{
-    ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, IocpKernelOp, KernelRef, OpSend,
-    OverlappedEntry, Recv, SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvFromPayload,
-    UdpSend,
+    ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, Connect, KernelRef, OpSend, OverlappedEntry, Recv,
+    SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvFromPayload, UdpSend,
 };
 use crate::rio::{RioTarget, RioUdpRecvFromArgs, SocketInflightGuard};
 use crate::win32::SafeSocket;
@@ -538,8 +537,7 @@ pub(crate) unsafe fn on_complete_accept(
     Ok(accepted_raw.raw().as_handle() as usize)
 }
 
-pub(crate) unsafe fn completion_cleanup_close_socket(
-    _op: &mut IocpKernelOp,
+pub(crate) fn completion_cleanup_close_socket(
     result: &IocpResult<usize>,
 ) -> CompletionCleanupGuard {
     let Ok(raw) = result.as_ref().copied() else {

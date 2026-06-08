@@ -1,37 +1,20 @@
 use crate::driver::UringDriver;
 use crate::error::{UringDriverResult as DriverResult, UringError};
-use crate::op::{UringOp, UringOpPayload, UringUserPayload};
+use crate::op::{Accept, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend};
 use io_uring::{opcode, squeue};
 use veloq_driver_core::driver::SubmitTokenContext;
 use veloq_driver_core::op::{checked_read_buf_range, checked_write_buf_range};
 
-use super::{invalid_buf_io_range, payload_variant_mismatch, resolve_socket_fd};
+use super::{invalid_buf_io_range, resolve_socket_fd};
 
 macro_rules! make_buf_op {
     ($fn_name:ident, $OpType:ident, $opcode:path, recv_args) => {
         pub(crate) unsafe fn $fn_name(
-            _op: &mut UringOp,
+            _kernel: &mut crate::op::payload::KernelRef<$OpType>,
+            val: &mut $OpType,
             driver: &mut UringDriver,
-            token: SubmitTokenContext,
+            _token: SubmitTokenContext,
         ) -> DriverResult<squeue::Entry> {
-            let storage = driver
-                .ops
-                .slot_storage_mut_token(token.op_token)
-                .ok_or_else(|| {
-                    payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-                })?;
-            let payload = storage.payload.as_mut().ok_or_else(|| {
-                payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-            })?;
-            let val = match payload {
-                crate::op::UringUserPayload::$OpType(p) => p,
-                _ => {
-                    return Err(payload_variant_mismatch(concat!(
-                        "uring.op.submit.",
-                        stringify!($fn_name)
-                    )));
-                }
-            };
             let (ptr, len) =
                 checked_read_buf_range(&mut val.buf, val.buf_offset).map_err(|err| {
                     invalid_buf_io_range(concat!("uring.op.submit.", stringify!($fn_name)), err)
@@ -47,28 +30,11 @@ macro_rules! make_buf_op {
     };
     ($fn_name:ident, $OpType:ident, $opcode:path, send_args) => {
         pub(crate) unsafe fn $fn_name(
-            _op: &mut UringOp,
+            _kernel: &mut crate::op::payload::KernelRef<$OpType>,
+            val: &mut $OpType,
             driver: &mut UringDriver,
-            token: SubmitTokenContext,
+            _token: SubmitTokenContext,
         ) -> DriverResult<squeue::Entry> {
-            let storage = driver
-                .ops
-                .slot_storage_mut_token(token.op_token)
-                .ok_or_else(|| {
-                    payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-                })?;
-            let payload = storage.payload.as_mut().ok_or_else(|| {
-                payload_variant_mismatch(concat!("uring.op.submit.", stringify!($fn_name)))
-            })?;
-            let val = match payload {
-                crate::op::UringUserPayload::$OpType(p) => p,
-                _ => {
-                    return Err(payload_variant_mismatch(concat!(
-                        "uring.op.submit.",
-                        stringify!($fn_name)
-                    )));
-                }
-            };
             let (ptr, len) = checked_write_buf_range(&val.buf, val.buf_offset).map_err(|err| {
                 invalid_buf_io_range(concat!("uring.op.submit.", stringify!($fn_name)), err)
             })?;
@@ -84,38 +50,19 @@ macro_rules! make_buf_op {
 }
 
 make_buf_op!(make_sqe_recv, Recv, opcode::Recv::new, recv_args);
-impl_default_completion!(on_complete_recv);
-impl_lifecycle!(drop_recv, Recv, direct_fd);
 
 make_buf_op!(make_sqe_send, OpSend, opcode::Send::new, send_args);
-impl_default_completion!(on_complete_send);
-impl_lifecycle!(drop_send, Send, direct_fd);
 
 make_buf_op!(make_sqe_udp_recv, UdpRecv, opcode::Recv::new, recv_args);
-impl_default_completion!(on_complete_udp_recv);
-impl_lifecycle!(drop_udp_recv, UdpRecv, direct_fd);
 
 make_buf_op!(make_sqe_udp_send, UdpSend, opcode::Send::new, send_args);
-impl_default_completion!(on_complete_udp_send);
-impl_lifecycle!(drop_udp_send, UdpSend, direct_fd);
 
 pub(crate) unsafe fn make_sqe_connect(
-    _op: &mut UringOp,
+    _kernel: &mut crate::op::payload::KernelRef<Connect>,
+    val: &mut Connect,
     driver: &mut UringDriver,
-    token: SubmitTokenContext,
+    _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let storage = driver
-        .ops
-        .slot_storage_mut_token(token.op_token)
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_connect"))?;
-    let payload = storage
-        .payload
-        .as_mut()
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_connect"))?;
-    let val = match payload {
-        crate::op::UringUserPayload::Connect(p) => p,
-        _ => return Err(payload_variant_mismatch("uring.op.submit.make_sqe_connect")),
-    };
     let fixed_fd = resolve_socket_fd(
         &driver.registered_files,
         &driver.file_generations,
@@ -124,30 +71,13 @@ pub(crate) unsafe fn make_sqe_connect(
     )?;
     Ok(opcode::Connect::new(fixed_fd, &val.addr.0 as *const _ as *const _, val.addr_len).build())
 }
-impl_default_completion!(on_complete_connect);
-impl_lifecycle!(drop_connect, Connect, direct_fd);
 
 pub(crate) unsafe fn make_sqe_udp_connect(
-    _op: &mut UringOp,
+    _kernel: &mut crate::op::payload::KernelRef<UdpConnect>,
+    val: &mut UdpConnect,
     driver: &mut UringDriver,
-    token: SubmitTokenContext,
+    _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let storage = driver
-        .ops
-        .slot_storage_mut_token(token.op_token)
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_connect"))?;
-    let payload = storage
-        .payload
-        .as_mut()
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_connect"))?;
-    let val = match payload {
-        crate::op::UringUserPayload::UdpConnect(p) => p,
-        _ => {
-            return Err(payload_variant_mismatch(
-                "uring.op.submit.make_sqe_udp_connect",
-            ));
-        }
-    };
     let fixed_fd = resolve_socket_fd(
         &driver.registered_files,
         &driver.file_generations,
@@ -156,26 +86,13 @@ pub(crate) unsafe fn make_sqe_udp_connect(
     )?;
     Ok(opcode::Connect::new(fixed_fd, &val.addr.0 as *const _ as *const _, val.addr_len).build())
 }
-impl_default_completion!(on_complete_udp_connect);
-impl_lifecycle!(drop_udp_connect, UdpConnect, direct_fd);
 
 pub(crate) unsafe fn make_sqe_accept(
-    _op: &mut UringOp,
+    _kernel: &mut crate::op::payload::AcceptPayload,
+    val: &mut Accept,
     driver: &mut UringDriver,
-    token: SubmitTokenContext,
+    _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let storage = driver
-        .ops
-        .slot_storage_mut_token(token.op_token)
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_accept"))?;
-    let payload = storage
-        .payload
-        .as_mut()
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_accept"))?;
-    let val = match payload {
-        crate::op::UringUserPayload::Accept(p) => p,
-        _ => return Err(payload_variant_mismatch("uring.op.submit.make_sqe_accept")),
-    };
     let fixed_fd = resolve_socket_fd(
         &driver.registered_files,
         &driver.file_generations,
@@ -191,8 +108,8 @@ pub(crate) unsafe fn make_sqe_accept(
 }
 
 pub(crate) unsafe fn on_complete_accept(
-    _op: &mut UringOp,
-    payload: &mut UringUserPayload,
+    _kernel: &mut crate::op::payload::AcceptPayload,
+    accept_op: &mut Accept,
     result: i32,
 ) -> DriverResult<usize> {
     if result < 0 {
@@ -203,16 +120,6 @@ pub(crate) unsafe fn on_complete_accept(
             )
             .set_error_code(-result));
     }
-
-    let accept_op = match payload {
-        crate::op::UringUserPayload::Accept(p) => p,
-        _ => {
-            return Err(UringError::InvalidState.report(
-                "uring.op.submit.on_complete_accept",
-                "payload variant mismatch for accept",
-            ));
-        }
-    };
 
     let addr_bytes = unsafe {
         std::slice::from_raw_parts(
@@ -226,31 +133,12 @@ pub(crate) unsafe fn on_complete_accept(
     Ok(result as usize)
 }
 
-impl_lifecycle!(drop_accept, Accept, nested_fd);
-
 pub(crate) unsafe fn make_sqe_send_to(
-    op: &mut UringOp,
+    kernel: &mut crate::op::payload::SendToPayload,
+    user: &mut SendTo,
     driver: &mut UringDriver,
-    token: SubmitTokenContext,
+    _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let storage = driver
-        .ops
-        .slot_storage_mut_token(token.op_token)
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_send_to"))?;
-    let payload = storage
-        .payload
-        .as_mut()
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_send_to"))?;
-    let user = match payload {
-        crate::op::UringUserPayload::SendTo(p) => p,
-        _ => return Err(payload_variant_mismatch("uring.op.submit.make_sqe_send_to")),
-    };
-
-    let kernel = match &mut op.payload {
-        UringOpPayload::SendTo(p) => p,
-        _ => return Err(payload_variant_mismatch("uring.op.submit.make_sqe_send_to")),
-    };
-
     let (ptr, len) = checked_write_buf_range(&user.buf, user.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send_to", err))?;
     kernel.iovec[0].iov_base = ptr as *mut _;
@@ -274,40 +162,12 @@ pub(crate) unsafe fn make_sqe_send_to(
     Ok(opcode::SendMsg::new(fixed_fd, &kernel.msghdr as *const _).build())
 }
 
-impl_default_completion!(on_complete_send_to);
-impl_lifecycle!(drop_send_to, SendTo, nested_fd);
-
 pub(crate) unsafe fn make_sqe_udp_recv_from(
-    op: &mut UringOp,
+    kernel: &mut crate::op::payload::UdpRecvFromPayload,
+    user: &mut UdpRecvFrom,
     driver: &mut UringDriver,
-    token: SubmitTokenContext,
+    _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let storage = driver
-        .ops
-        .slot_storage_mut_token(token.op_token)
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_recv_from"))?;
-    let payload = storage
-        .payload
-        .as_mut()
-        .ok_or_else(|| payload_variant_mismatch("uring.op.submit.make_sqe_udp_recv_from"))?;
-    let user = match payload {
-        crate::op::UringUserPayload::UdpRecvFrom(p) => p,
-        _ => {
-            return Err(payload_variant_mismatch(
-                "uring.op.submit.make_sqe_udp_recv_from",
-            ));
-        }
-    };
-
-    let kernel = match &mut op.payload {
-        UringOpPayload::UdpRecvFrom(p) => p,
-        _ => {
-            return Err(payload_variant_mismatch(
-                "uring.op.submit.make_sqe_udp_recv_from",
-            ));
-        }
-    };
-
     let fd = user.fd;
     let recv_buf = &mut user.buf;
 
@@ -331,8 +191,8 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
 }
 
 pub(crate) unsafe fn on_complete_udp_recv_from(
-    op: &mut UringOp,
-    payload: &mut UringUserPayload,
+    kernel: &mut crate::op::payload::UdpRecvFromPayload,
+    user: &mut UdpRecvFrom,
     result: i32,
 ) -> DriverResult<usize> {
     if result < 0 {
@@ -344,21 +204,6 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
             .set_error_code(-result));
     }
 
-    let user = match payload {
-        crate::op::UringUserPayload::UdpRecvFrom(p) => p,
-        _ => {
-            return Err(UringError::InvalidState.report(
-                "uring.op.submit.on_complete_udp_recv_from",
-                "payload variant mismatch for udp_recv_from",
-            ));
-        }
-    };
-
-    let kernel = match &mut op.payload {
-        UringOpPayload::UdpRecvFrom(p) => p,
-        _ => return Err(payload_variant_mismatch("on_complete_udp_recv_from")),
-    };
-
     let len = kernel.msghdr.msg_namelen as usize;
     let addr_bytes =
         unsafe { std::slice::from_raw_parts(&kernel.msg_name as *const _ as *const u8, len) };
@@ -367,5 +212,3 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
     }
     Ok(result as usize)
 }
-
-impl_lifecycle!(drop_udp_recv_from, UdpRecvFrom, direct_fd);

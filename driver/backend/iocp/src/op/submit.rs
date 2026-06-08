@@ -4,9 +4,9 @@ pub(crate) mod net;
 
 use crate::error::IocpResult;
 use crate::op::{
-    AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend, OpenPayload, Recv,
-    SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecv, UdpRecvFromPayload,
-    UdpSend, Wakeup,
+    AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend, Recv, SendToPayload,
+    SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecv, UdpRecvFromPayload, UdpSend,
+    Wakeup,
 };
 
 pub(crate) use common::SubmissionResult;
@@ -34,13 +34,11 @@ impl_get_fd!(
     KernelRef<crate::op::ReadFixed>,
     direct_fd
 );
-impl_get_fd!(get_fd_read_raw, KernelRef<crate::op::ReadRaw>, no_fd);
 impl_get_fd!(
     get_fd_write_fixed,
     KernelRef<crate::op::WriteFixed>,
     direct_fd
 );
-impl_get_fd!(get_fd_write_raw, KernelRef<crate::op::WriteRaw>, no_fd);
 impl_get_fd!(get_fd_recv, KernelRef<Recv>, direct_fd);
 impl_get_fd!(get_fd_send, KernelRef<OpSend>, direct_fd);
 impl_get_fd!(get_fd_udp_recv, KernelRef<UdpRecv>, direct_fd);
@@ -49,26 +47,12 @@ impl_get_fd!(get_fd_connect, KernelRef<Connect>, direct_fd);
 impl_get_fd!(get_fd_udp_connect, KernelRef<UdpConnect>, direct_fd);
 impl_get_fd!(get_fd_accept, AcceptPayload, direct_fd);
 impl_get_fd!(get_fd_send_to, SendToPayload, direct_fd);
-impl_get_fd!(get_fd_open, OpenPayload, no_fd); // Open does not have a direct fd in payload
 impl_get_fd!(get_fd_udp_recv_from, UdpRecvFromPayload, direct_fd);
 
 impl_get_fd!(get_fd_close, KernelRef<Close>, direct_fd);
 impl_get_fd!(get_fd_fsync, KernelRef<Fsync>, direct_fd);
-impl_get_fd!(get_fd_fsync_raw, KernelRef<crate::op::FsyncRaw>, no_fd);
 impl_get_fd!(get_fd_sync_range, KernelRef<SyncFileRange>, direct_fd);
-impl_get_fd!(
-    get_fd_sync_range_raw,
-    KernelRef<crate::op::SyncFileRangeRaw>,
-    no_fd
-);
 impl_get_fd!(get_fd_fallocate, KernelRef<Fallocate>, direct_fd);
-impl_get_fd!(
-    get_fd_fallocate_raw,
-    KernelRef<crate::op::FallocateRaw>,
-    no_fd
-);
-impl_get_fd!(get_fd_timeout, KernelRef<Timeout>, no_fd);
-impl_get_fd!(get_fd_wakeup, KernelRef<Wakeup>, no_fd);
 
 // ============================================================================
 // Other Operations

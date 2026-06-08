@@ -89,6 +89,7 @@ impl<'a> UringDriver<'a> {
                     let sqe = unsafe {
                         (vtable.make_sqe)(
                             op,
+                            payload,
                             &mut *driver_ptr,
                             SubmitTokenContext::new(token, completion_token),
                         )

@@ -7,9 +7,11 @@
 
 pub(crate) mod overlapped;
 pub(crate) mod slot;
+mod spec;
 pub(crate) mod submit;
 
 pub use overlapped::OverlappedEntry;
+use spec::{IocpOpErasure, IocpOpSpec, PayloadBinding};
 pub(crate) use submit::SubmissionResult;
 
 use std::ptr::NonNull;
@@ -20,8 +22,6 @@ use crate::error::{IocpDriverResult as DriverResult, IocpError, IocpResult};
 use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioState;
-
-use diagweave::prelude::*;
 
 use veloq_driver_core::driver::{CompletionToken, OpToken, PlatformOp};
 use veloq_driver_core::op::{
@@ -83,216 +83,204 @@ pub(crate) struct SubmitContext<'a> {
 }
 
 // ============================================================================
-// Macro Definition
+// Type-Erased Payloads & VTable
 // ============================================================================
 
-macro_rules! define_iocp_ops {
-    (
-        $(
-            $OpType:ident {
-                variant: $Variant:ident,
-                $(payload: $Payload:ty,)?
-                kind: $kind:expr,
-                submit: $submit:path,
-                $(on_complete: $complete:path,)?
-                $(completion_cleanup: $completion_cleanup:path,)?
-                $(completion: $completion:ty,)?
-                $(map_completion: $map_completion:expr,)?
-                get_fd: $get_fd:path,
-                $(construct: $construct:expr,)?
-                $(destruct: $destruct:expr,)?
-            }
-        ),+ $(,)?
-    ) => {
-        pub enum IocpUserPayload {
-            $(
-                $OpType($OpType),
-            )+
-        }
-
-        unsafe impl Send for IocpUserPayload {}
-
-        /// Type-safe payload enum for IOCP operations.
-        pub(crate) enum IocpOpPayload {
-            $(
-                $Variant( define_iocp_ops!(@payload_type $OpType $(, $Payload)?) ),
-            )+
-        }
-
-        /// Virtual table for dynamic dispatch of IOCP operations.
-            pub(crate) struct OpVTable {
-                pub(crate) submit: fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult>,
-                pub(crate) on_complete: Option<unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> IocpResult<usize>>,
-                pub(crate) completion_cleanup: unsafe fn(op: &mut IocpKernelOp, result: &IocpResult<usize>) -> CompletionCleanupGuard,
-                pub(crate) get_fd: unsafe fn(op: &IocpKernelOp) -> Option<IoFd>,
-            }
-
-        /// A type-erased IOCP kernel operation.
-        pub struct IocpKernelOp {
-            /// Virtual Table for dynamic dispatch
-            pub(crate) vtable: NonNull<OpVTable>,
-            /// Public header accessible directly by Driver
-            pub(crate) header: OverlappedEntry,
-            /// Type-safe payload enum
-            pub(crate) payload: IocpOpPayload,
-        }
-
-        impl PlatformOp for IocpKernelOp {}
-
-        impl IocpKernelOp {
-            pub(crate) fn bind_user_payload(&mut self, erased: &mut IocpUserPayload) -> IocpResult<()> {
-                match (&mut self.payload, erased) {
-                    $(
-                        (IocpOpPayload::$Variant(payload), IocpUserPayload::$OpType(user)) => {
-                            payload.user.bind(NonNull::from(user));
-                            Ok(())
-                        },
-                    )+
-                    _ => IocpError::InvalidState.attach_note(
-                        "variant mismatch while binding IOCP user payload",
-                    ),
-                }
-            }
-
-            pub(crate) fn unbind_user_payload(&mut self) {
-                match &mut self.payload {
-                    $(
-                        IocpOpPayload::$Variant(payload) => payload.user.clear(),
-                    )+
-                }
-            }
-
-            pub(crate) fn get_fd(&self) -> Option<IoFd> {
-                unsafe { (self.vtable.as_ref().get_fd)(self) }
-            }
-            pub(crate) fn submit(&mut self, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult> {
-                // SAFETY: vtable is initialized from a static TABLE and always non-null.
-                let table = unsafe { self.vtable.as_ref() };
-                (table.submit)(self, ctx)
-            }
-            pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> IocpResult<usize> {
-                if let Some(on_complete) = unsafe { self.vtable.as_ref().on_complete } {
-                    unsafe { (on_complete)(self, result, ext) }
-                } else {
-                    Ok(result)
-                }
-            }
-            pub(crate) fn completion_cleanup(&mut self, result: &IocpResult<usize>) -> CompletionCleanupGuard {
-                unsafe { (self.vtable.as_ref().completion_cleanup)(self, result) }
-            }
-        }
-
-        $(
-            impl IntoPlatformOp<IocpOp> for $OpType {
-                type UserPayload = $OpType;
-                type ErasedPayload = IocpUserPayload;
-                type Output = $OpType;
-                type Completion = define_iocp_ops!(@completion_type $($completion)?);
-                type DriverCompletion = usize;
-                type Error = IocpError;
-                const PAYLOAD_KIND: OpKind = $kind;
-
-                fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
-                    static TABLE: OpVTable = OpVTable {
-                        submit: |op, ctx| {
-                            if let IocpOpPayload::$Variant(ref mut p) = op.payload {
-                                $submit(&mut op.header, p, ctx)
-                            } else {
-                                IocpError::InvalidState
-                                    .with_ctx("op_type", stringify!($OpType))
-                                    .attach_note("variant mismatch in IocpKernelOp dispatch")
-                            }
-                        },
-                        on_complete: define_iocp_ops!(@optional_complete_shim $OpType, $Variant, $($complete)?),
-                        completion_cleanup: define_iocp_ops!(@completion_cleanup $($completion_cleanup)?),
-                        get_fd: |op| unsafe {
-                            if let IocpOpPayload::$Variant(ref p) = op.payload {
-                                $get_fd(p)
-                            } else {
-                                None
-                            }
-                        },
-                    };
-
-                    let payload = define_iocp_ops!(@construct &self, $($construct)?, $OpType $(, $Payload)?);
-
-                    let op = IocpKernelOp {
-                        // SAFETY: TABLE is a static and its address is guaranteed to be non-null.
-                        vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
-                        header: OverlappedEntry::new(OpToken::new(0, 0)),
-                        payload: IocpOpPayload::$Variant(payload),
-                    };
-                    (op, self)
-                }
-
-                fn payload_into_erased(payload: Self::UserPayload) -> IocpUserPayload {
-                    IocpUserPayload::$OpType(payload)
-                }
-
-                fn try_payload_from_erased(erased: IocpUserPayload) -> DriverResult<Self::UserPayload> {
-                    match erased {
-                        IocpUserPayload::$OpType(p) => Ok(p),
-                        #[allow(unreachable_patterns)]
-                        _ => Err(veloq_driver_core::op::payload_projection_mismatch_report::<IocpError>(
-                            stringify!($OpType),
-                            "IocpUserPayload",
-                        )),
-                    }
-                }
-
-                fn complete(
-                    payload: Self::UserPayload,
-                    res: DriverResult<usize>,
-                ) -> OpCompletion<Self::Output, IocpError, Self::Completion> {
-                    let completion = define_iocp_ops!(@map_completion &payload, res, $($map_completion)?);
-                    let output = define_iocp_ops!(@destruct payload, $($destruct)?);
-                    OpCompletion::new(completion, output)
-                }
-            }
-        )+
-    };
-
-    (@payload_type $OpType:ty) => { KernelRef<$OpType> };
-    (@payload_type $OpType:ty, $Payload:ty) => { $Payload };
-
-    (@optional_complete_shim $OpType:ident, $Variant:ident,) => { None };
-    (@optional_complete_shim $OpType:ident, $Variant:ident, $fn:path) => {
-        Some(|op, result, ext| unsafe {
-            if let IocpOpPayload::$Variant(ref mut p) = op.payload {
-                $fn(&mut op.header, p, result, ext)
-            } else {
-                IocpError::InvalidState
-                    .with_ctx("op_type", stringify!($OpType))
-                    .attach_note("variant mismatch in IocpKernelOp on_complete")
-            }
-        })
-    };
-
-    (@completion_cleanup ) => { completion_cleanup_noop };
-    (@completion_cleanup $func:path) => { $func };
-
-    // Default construct: keep only a pointer to user payload
-    (@construct $user:expr, , $OpType:ty) => { KernelRef { user: PayloadRef::unbound() } };
-    // Custom construct
-    (@construct $user:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user) };
-
-    // Default destruct: return user payload
-    (@destruct $user_payload:expr, ) => { $user_payload };
-    // Custom destruct
-    (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
-
-    (@completion_type ) => { usize };
-    (@completion_type $ty:ty) => { $ty };
-
-    (@map_completion $this:expr, $res:expr, ) => { $res };
-    (@map_completion $this:expr, $res:expr, $expr:expr) => { ($expr)($this, $res) };
+pub enum IocpUserPayload {
+    ReadFixed(ReadFixed),
+    ReadRaw(ReadRaw),
+    WriteFixed(WriteFixed),
+    WriteRaw(WriteRaw),
+    Recv(Recv),
+    OpSend(OpSend),
+    UdpRecv(UdpRecv),
+    UdpSend(UdpSend),
+    Close(Close),
+    Fsync(Fsync),
+    FsyncRaw(FsyncRaw),
+    SyncFileRange(SyncFileRange),
+    SyncFileRangeRaw(SyncFileRangeRaw),
+    Fallocate(Fallocate),
+    FallocateRaw(FallocateRaw),
+    Timeout(Timeout),
+    Connect(Connect),
+    UdpConnect(UdpConnect),
+    Accept(Accept),
+    SendTo(SendTo),
+    UdpRecvFrom(UdpRecvFrom),
+    Open(Open),
+    Wakeup(Wakeup),
 }
 
-unsafe fn completion_cleanup_noop(
-    _op: &mut IocpKernelOp,
-    _result: &IocpResult<usize>,
-) -> CompletionCleanupGuard {
-    CompletionCleanupGuard::default()
+unsafe impl Send for IocpUserPayload {}
+
+pub(crate) enum IocpOpPayload {
+    Read(KernelRef<ReadFixed>),
+    ReadRaw(KernelRef<ReadRaw>),
+    Write(KernelRef<WriteFixed>),
+    WriteRaw(KernelRef<WriteRaw>),
+    Recv(KernelRef<Recv>),
+    Send(KernelRef<OpSend>),
+    UdpRecv(KernelRef<UdpRecv>),
+    UdpSend(KernelRef<UdpSend>),
+    Close(KernelRef<Close>),
+    Fsync(KernelRef<Fsync>),
+    FsyncRaw(KernelRef<FsyncRaw>),
+    SyncRange(KernelRef<SyncFileRange>),
+    SyncRangeRaw(KernelRef<SyncFileRangeRaw>),
+    Fallocate(KernelRef<Fallocate>),
+    FallocateRaw(KernelRef<FallocateRaw>),
+    Timeout(KernelRef<Timeout>),
+    Connect(KernelRef<Connect>),
+    UdpConnect(KernelRef<UdpConnect>),
+    Accept(AcceptPayload),
+    SendTo(SendToPayload),
+    UdpRecvFrom(UdpRecvFromPayload),
+    Open(OpenPayload),
+    Wakeup(KernelRef<Wakeup>),
+}
+
+pub(crate) struct OpVTable {
+    pub(crate) submit: fn(&mut IocpKernelOp, &mut SubmitContext) -> IocpResult<SubmissionResult>,
+    pub(crate) on_complete:
+        unsafe fn(&mut IocpKernelOp, result: usize, ext: &Extensions) -> IocpResult<usize>,
+    pub(crate) completion_cleanup:
+        unsafe fn(&mut IocpKernelOp, result: &IocpResult<usize>) -> CompletionCleanupGuard,
+    pub(crate) get_fd: unsafe fn(&IocpKernelOp) -> Option<IoFd>,
+    pub(crate) bind_user_payload: fn(&mut IocpKernelOp, &mut IocpUserPayload) -> IocpResult<()>,
+    pub(crate) unbind_user_payload: fn(&mut IocpKernelOp),
+}
+
+pub struct IocpKernelOp {
+    pub(crate) vtable: &'static OpVTable,
+    pub(crate) header: OverlappedEntry,
+    pub(crate) payload: IocpOpPayload,
+}
+
+impl PlatformOp for IocpKernelOp {}
+
+impl IocpKernelOp {
+    pub(crate) fn bind_user_payload(&mut self, erased: &mut IocpUserPayload) -> IocpResult<()> {
+        (self.vtable.bind_user_payload)(self, erased)
+    }
+
+    pub(crate) fn unbind_user_payload(&mut self) {
+        (self.vtable.unbind_user_payload)(self);
+    }
+
+    pub(crate) fn get_fd(&self) -> Option<IoFd> {
+        unsafe { (self.vtable.get_fd)(self) }
+    }
+
+    pub(crate) fn submit(&mut self, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult> {
+        (self.vtable.submit)(self, ctx)
+    }
+
+    pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> IocpResult<usize> {
+        unsafe { (self.vtable.on_complete)(self, result, ext) }
+    }
+
+    pub(crate) fn completion_cleanup(
+        &mut self,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard {
+        unsafe { (self.vtable.completion_cleanup)(self, result) }
+    }
+}
+
+macro_rules! impl_iocp_op_erasure {
+    ($OpType:ty, $user_variant:ident, $kernel_variant:ident, $completion:ty) => {
+        impl IocpOpErasure for $OpType {
+            fn erase_kernel_payload(payload: Self::KernelPayload) -> IocpOpPayload {
+                IocpOpPayload::$kernel_variant(payload)
+            }
+
+            fn kernel_payload_ref(payload: &IocpOpPayload) -> Option<&Self::KernelPayload> {
+                match payload {
+                    IocpOpPayload::$kernel_variant(payload) => Some(payload),
+                    _ => None,
+                }
+            }
+
+            fn kernel_payload_mut(payload: &mut IocpOpPayload) -> Option<&mut Self::KernelPayload> {
+                match payload {
+                    IocpOpPayload::$kernel_variant(payload) => Some(payload),
+                    _ => None,
+                }
+            }
+
+            fn erase_user_payload(payload: Self) -> IocpUserPayload {
+                IocpUserPayload::$user_variant(payload)
+            }
+
+            fn try_user_payload(payload: IocpUserPayload) -> DriverResult<Self> {
+                match payload {
+                    IocpUserPayload::$user_variant(payload) => Ok(payload),
+                    _ => Err(veloq_driver_core::op::payload_projection_mismatch_report::<
+                        IocpError,
+                    >(stringify!($OpType), "IocpUserPayload")),
+                }
+            }
+
+            fn user_payload_mut(payload: &mut IocpUserPayload) -> Option<&mut Self> {
+                match payload {
+                    IocpUserPayload::$user_variant(payload) => Some(payload),
+                    _ => None,
+                }
+            }
+
+            fn vtable() -> &'static OpVTable {
+                static TABLE: OpVTable = OpVTable {
+                    submit: spec::submit_shim::<$OpType>,
+                    on_complete: spec::on_complete_shim::<$OpType>,
+                    completion_cleanup: spec::completion_cleanup_shim::<$OpType>,
+                    get_fd: spec::get_fd_shim::<$OpType>,
+                    bind_user_payload: spec::bind_user_payload_shim::<$OpType>,
+                    unbind_user_payload: spec::unbind_user_payload_shim::<$OpType>,
+                };
+                &TABLE
+            }
+        }
+
+        impl IntoPlatformOp<IocpOp> for $OpType {
+            type UserPayload = $OpType;
+            type ErasedPayload = IocpUserPayload;
+            type Output = $OpType;
+            type Completion = $completion;
+            type DriverCompletion = usize;
+            type Error = IocpError;
+
+            const PAYLOAD_KIND: OpKind = <$OpType as IocpOpSpec>::PAYLOAD_KIND;
+
+            fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
+                let kernel_payload = <$OpType as IocpOpSpec>::new_kernel_payload(&self);
+                let op = IocpKernelOp {
+                    vtable: <$OpType as IocpOpErasure>::vtable(),
+                    header: OverlappedEntry::new(OpToken::new(0, 0)),
+                    payload: <$OpType as IocpOpErasure>::erase_kernel_payload(kernel_payload),
+                };
+                (op, self)
+            }
+
+            fn payload_into_erased(payload: Self::UserPayload) -> IocpUserPayload {
+                <$OpType as IocpOpErasure>::erase_user_payload(payload)
+            }
+
+            fn try_payload_from_erased(
+                payload: IocpUserPayload,
+            ) -> DriverResult<Self::UserPayload> {
+                <$OpType as IocpOpErasure>::try_user_payload(payload)
+            }
+
+            fn complete(
+                payload: Self::UserPayload,
+                res: DriverResult<usize>,
+            ) -> OpCompletion<Self::Output, IocpError, Self::Completion> {
+                let completion = <$OpType as IocpOpSpec>::map_completion(&payload, res);
+                OpCompletion::new(completion, payload)
+            }
+        }
+    };
 }
 
 // ============================================================================
@@ -367,6 +355,62 @@ pub(crate) struct OpenPayload {
     pub(crate) user: PayloadRef<Open>,
 }
 
+fn kernel_ref<T>(_user: &T) -> KernelRef<T> {
+    KernelRef {
+        user: PayloadRef::unbound(),
+    }
+}
+
+impl<T> PayloadBinding<T> for KernelRef<T> {
+    fn bind(&mut self, user: NonNull<T>) {
+        self.user.bind(user);
+    }
+
+    fn clear(&mut self) {
+        self.user.clear();
+    }
+}
+
+impl PayloadBinding<Accept> for AcceptPayload {
+    fn bind(&mut self, user: NonNull<Accept>) {
+        self.user.bind(user);
+    }
+
+    fn clear(&mut self) {
+        self.user.clear();
+    }
+}
+
+impl PayloadBinding<SendTo> for SendToPayload {
+    fn bind(&mut self, user: NonNull<SendTo>) {
+        self.user.bind(user);
+    }
+
+    fn clear(&mut self) {
+        self.user.clear();
+    }
+}
+
+impl PayloadBinding<UdpRecvFrom> for UdpRecvFromPayload {
+    fn bind(&mut self, user: NonNull<UdpRecvFrom>) {
+        self.user.bind(user);
+    }
+
+    fn clear(&mut self) {
+        self.user.clear();
+    }
+}
+
+impl PayloadBinding<Open> for OpenPayload {
+    fn bind(&mut self, user: NonNull<Open>) {
+        self.user.bind(user);
+    }
+
+    fn clear(&mut self) {
+        self.user.clear();
+    }
+}
+
 /// Alias for the platform-specific IOCP kernel operation.
 pub type IocpOp = IocpKernelOp;
 
@@ -374,193 +418,687 @@ pub type IocpOp = IocpKernelOp;
 // Op Definitions
 // ============================================================================
 
-define_iocp_ops! {
-    ReadFixed {
-        variant: Read,
-        kind: OpKind::ReadFixed,
-        submit: submit::submit_read_fixed,
-        get_fd: submit::get_fd_read_fixed,
-    },
-    ReadRaw {
-        variant: ReadRaw,
-        kind: OpKind::ReadFixed,
-        submit: submit::submit_read_raw,
-        get_fd: submit::get_fd_read_raw,
-    },
-    WriteFixed {
-        variant: Write,
-        kind: OpKind::WriteFixed,
-        submit: submit::submit_write_fixed,
-        get_fd: submit::get_fd_write_fixed,
-    },
-    WriteRaw {
-        variant: WriteRaw,
-        kind: OpKind::WriteFixed,
-        submit: submit::submit_write_raw,
-        get_fd: submit::get_fd_write_raw,
-    },
-    Recv {
-        variant: Recv,
-        kind: OpKind::Recv,
-        submit: submit::submit_recv,
-        get_fd: submit::get_fd_recv,
-    },
-    OpSend {
-        variant: Send,
-        kind: OpKind::Send,
-        submit: submit::submit_send,
-        get_fd: submit::get_fd_send,
-    },
-    UdpRecv {
-        variant: UdpRecv,
-        kind: OpKind::UdpRecv,
-        submit: submit::submit_udp_recv,
-        get_fd: submit::get_fd_udp_recv,
-    },
-    UdpSend {
-        variant: UdpSend,
-        kind: OpKind::UdpSend,
-        submit: submit::submit_udp_send,
-        get_fd: submit::get_fd_udp_send,
-    },
-    Close {
-        variant: Close,
-        kind: OpKind::Close,
-        submit: submit::submit_close,
-        get_fd: submit::get_fd_close,
-    },
-    Fsync {
-        variant: Fsync,
-        kind: OpKind::Fsync,
-        submit: submit::submit_fsync,
-        get_fd: submit::get_fd_fsync,
-    },
-    FsyncRaw {
-        variant: FsyncRaw,
-        kind: OpKind::Fsync,
-        submit: submit::submit_fsync_raw,
-        get_fd: submit::get_fd_fsync_raw,
-    },
-    SyncFileRange {
-        variant: SyncRange,
-        kind: OpKind::SyncFileRange,
-        submit: submit::submit_sync_range,
-        get_fd: submit::get_fd_sync_range,
-    },
-    SyncFileRangeRaw {
-        variant: SyncRangeRaw,
-        kind: OpKind::SyncFileRange,
-        submit: submit::submit_sync_range_raw,
-        get_fd: submit::get_fd_sync_range_raw,
-    },
-    Fallocate {
-        variant: Fallocate,
-        kind: OpKind::Fallocate,
-        submit: submit::submit_fallocate,
-        get_fd: submit::get_fd_fallocate,
-    },
-    FallocateRaw {
-        variant: FallocateRaw,
-        kind: OpKind::Fallocate,
-        submit: submit::submit_fallocate_raw,
-        get_fd: submit::get_fd_fallocate_raw,
-    },
-    Timeout {
-        variant: Timeout,
-        kind: OpKind::Timeout,
-        submit: submit::submit_timeout,
-        get_fd: submit::get_fd_timeout,
-    },
-    Connect {
-        variant: Connect,
-        kind: OpKind::Connect,
-        submit: submit::submit_connect,
-        on_complete: submit::on_complete_connect,
-        get_fd: submit::get_fd_connect,
-    },
-    UdpConnect {
-        variant: UdpConnect,
-        kind: OpKind::UdpConnect,
-        submit: submit::submit_udp_connect,
-        on_complete: submit::on_complete_udp_connect,
-        get_fd: submit::get_fd_udp_connect,
-    },
-    Accept {
-        variant: Accept,
-        payload: AcceptPayload,
-        kind: OpKind::Accept,
-        submit: submit::submit_accept,
-        on_complete: submit::on_complete_accept,
-        completion_cleanup: submit::completion_cleanup_close_socket,
-        completion: OwnedRawHandle,
-        map_completion: |_op: &Accept, res: DriverResult<usize>| {
-            res.map(|raw| unsafe {
-                OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_socket(raw as _)))
-            })
-        },
-        get_fd: submit::get_fd_accept,
-        construct: |_user: &Accept| {
-            AcceptPayload {
-                user: PayloadRef::unbound(),
-                accept_buffer: [0; ACCEPT_EX_OUTPUT_BUFFER_LEN],
-                accept_socket: None,
-            }
-        },
-    },
-    SendTo {
-        variant: SendTo,
-        payload: SendToPayload,
-        kind: OpKind::SendTo,
-        submit: submit::submit_send_to,
-        get_fd: submit::get_fd_send_to,
-        construct: |user: &SendTo| {
-            let (addr, _raw_addr_len) = crate::net::addr::socket_addr_to_storage(user.addr);
-            let addr_len = match user.addr {
-                std::net::SocketAddr::V4(_) => std::mem::size_of::<SOCKADDR_IN>() as i32,
-                std::net::SocketAddr::V6(_) => std::mem::size_of::<SOCKADDR_IN6>() as i32,
-            };
-            SendToPayload {
-                user: PayloadRef::unbound(),
-                addr,
-                addr_len,
-            }
-        },
-    },
-    UdpRecvFrom {
-        variant: UdpRecvFrom,
-        payload: UdpRecvFromPayload,
-        kind: OpKind::UdpRecvFrom,
-        submit: submit::submit_udp_recv_from,
-        on_complete: submit::on_complete_udp_recv_from,
-        get_fd: submit::get_fd_udp_recv_from,
-        construct: |_user: &UdpRecvFrom| {
-            UdpRecvFromPayload {
-                user: PayloadRef::unbound(),
-                addr: SockAddrStorage::default(),
-            }
-        },
-    },
-    Open {
-        variant: Open,
-        payload: OpenPayload,
-        kind: OpKind::Open,
-        submit: submit::submit_open,
-        completion_cleanup: submit::completion_cleanup_close_file,
-        completion: OwnedRawHandle,
-        map_completion: |_op: &Open, res: DriverResult<usize>| {
-            res.map(|raw| unsafe {
-                OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_file(raw as _)))
-            })
-        },
-        get_fd: submit::get_fd_open,
-        construct: |_user: &Open| OpenPayload {
-            user: PayloadRef::unbound(),
-        },
-    },
-    Wakeup {
-        variant: Wakeup,
-        kind: OpKind::Wakeup,
-        submit: submit::submit_wakeup,
-        get_fd: submit::get_fd_wakeup,
-    },
+impl IocpOpSpec for ReadFixed {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::ReadFixed;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_read_fixed(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_read_fixed(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
 }
+
+impl IocpOpSpec for ReadRaw {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::ReadFixed;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_read_raw(header, payload, ctx)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for WriteFixed {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::WriteFixed;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_write_fixed(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_write_fixed(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for WriteRaw {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::WriteFixed;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_write_raw(header, payload, ctx)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for Recv {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Recv;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_recv(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_recv(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for OpSend {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Send;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_send(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_send(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for UdpRecv {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::UdpRecv;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_udp_recv(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_udp_recv(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for UdpSend {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::UdpSend;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_udp_send(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_udp_send(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for Close {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Close;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_close(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_close(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for Fsync {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Fsync;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_fsync(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_fsync(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for FsyncRaw {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Fsync;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_fsync_raw(header, payload, ctx)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for SyncFileRange {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::SyncFileRange;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_sync_range(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_sync_range(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for SyncFileRangeRaw {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::SyncFileRange;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_sync_range_raw(header, payload, ctx)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for Fallocate {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Fallocate;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_fallocate(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_fallocate(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for FallocateRaw {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Fallocate;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_fallocate_raw(header, payload, ctx)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for Timeout {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Timeout;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_timeout(header, payload, ctx)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for Connect {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Connect;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_connect(header, payload, ctx)
+    }
+
+    unsafe fn on_complete(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        result: usize,
+        ext: &Extensions,
+    ) -> IocpResult<usize> {
+        unsafe { submit::on_complete_connect(header, payload, result, ext) }
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_connect(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for UdpConnect {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::UdpConnect;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_udp_connect(header, payload, ctx)
+    }
+
+    unsafe fn on_complete(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        result: usize,
+        ext: &Extensions,
+    ) -> IocpResult<usize> {
+        unsafe { submit::on_complete_udp_connect(header, payload, result, ext) }
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_udp_connect(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for Accept {
+    type KernelPayload = AcceptPayload;
+    type Completion = OwnedRawHandle;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Accept;
+
+    fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
+        AcceptPayload {
+            user: PayloadRef::unbound(),
+            accept_buffer: [0; ACCEPT_EX_OUTPUT_BUFFER_LEN],
+            accept_socket: None,
+        }
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_accept(header, payload, ctx)
+    }
+
+    unsafe fn on_complete(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        result: usize,
+        ext: &Extensions,
+    ) -> IocpResult<usize> {
+        unsafe { submit::on_complete_accept(header, payload, result, ext) }
+    }
+
+    fn completion_cleanup(
+        _payload: &mut Self::KernelPayload,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard {
+        submit::completion_cleanup_close_socket(result)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_accept(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res.map(|raw| unsafe {
+            OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_socket(raw as _)))
+        })
+    }
+}
+
+impl IocpOpSpec for SendTo {
+    type KernelPayload = SendToPayload;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::SendTo;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        let (addr, _raw_addr_len) = crate::net::addr::socket_addr_to_storage(user.addr);
+        let addr_len = match user.addr {
+            std::net::SocketAddr::V4(_) => std::mem::size_of::<SOCKADDR_IN>() as i32,
+            std::net::SocketAddr::V6(_) => std::mem::size_of::<SOCKADDR_IN6>() as i32,
+        };
+        SendToPayload {
+            user: PayloadRef::unbound(),
+            addr,
+            addr_len,
+        }
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_send_to(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_send_to(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for UdpRecvFrom {
+    type KernelPayload = UdpRecvFromPayload;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::UdpRecvFrom;
+
+    fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
+        UdpRecvFromPayload {
+            user: PayloadRef::unbound(),
+            addr: SockAddrStorage::default(),
+        }
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_udp_recv_from(header, payload, ctx)
+    }
+
+    unsafe fn on_complete(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        result: usize,
+        ext: &Extensions,
+    ) -> IocpResult<usize> {
+        unsafe { submit::on_complete_udp_recv_from(header, payload, result, ext) }
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_udp_recv_from(payload) }
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpOpSpec for Open {
+    type KernelPayload = OpenPayload;
+    type Completion = OwnedRawHandle;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Open;
+
+    fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
+        OpenPayload {
+            user: PayloadRef::unbound(),
+        }
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_open(header, payload, ctx)
+    }
+
+    fn completion_cleanup(
+        _payload: &mut Self::KernelPayload,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard {
+        submit::completion_cleanup_close_file(result)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res.map(|raw| unsafe {
+            OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_file(raw as _)))
+        })
+    }
+}
+
+impl IocpOpSpec for Wakeup {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Wakeup;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_wakeup(header, payload, ctx)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl_iocp_op_erasure!(ReadFixed, ReadFixed, Read, usize);
+impl_iocp_op_erasure!(ReadRaw, ReadRaw, ReadRaw, usize);
+impl_iocp_op_erasure!(WriteFixed, WriteFixed, Write, usize);
+impl_iocp_op_erasure!(WriteRaw, WriteRaw, WriteRaw, usize);
+impl_iocp_op_erasure!(Recv, Recv, Recv, usize);
+impl_iocp_op_erasure!(OpSend, OpSend, Send, usize);
+impl_iocp_op_erasure!(UdpRecv, UdpRecv, UdpRecv, usize);
+impl_iocp_op_erasure!(UdpSend, UdpSend, UdpSend, usize);
+impl_iocp_op_erasure!(Close, Close, Close, usize);
+impl_iocp_op_erasure!(Fsync, Fsync, Fsync, usize);
+impl_iocp_op_erasure!(FsyncRaw, FsyncRaw, FsyncRaw, usize);
+impl_iocp_op_erasure!(SyncFileRange, SyncFileRange, SyncRange, usize);
+impl_iocp_op_erasure!(SyncFileRangeRaw, SyncFileRangeRaw, SyncRangeRaw, usize);
+impl_iocp_op_erasure!(Fallocate, Fallocate, Fallocate, usize);
+impl_iocp_op_erasure!(FallocateRaw, FallocateRaw, FallocateRaw, usize);
+impl_iocp_op_erasure!(Timeout, Timeout, Timeout, usize);
+impl_iocp_op_erasure!(Connect, Connect, Connect, usize);
+impl_iocp_op_erasure!(UdpConnect, UdpConnect, UdpConnect, usize);
+impl_iocp_op_erasure!(Accept, Accept, Accept, OwnedRawHandle);
+impl_iocp_op_erasure!(SendTo, SendTo, SendTo, usize);
+impl_iocp_op_erasure!(UdpRecvFrom, UdpRecvFrom, UdpRecvFrom, usize);
+impl_iocp_op_erasure!(Open, Open, Open, OwnedRawHandle);
+impl_iocp_op_erasure!(Wakeup, Wakeup, Wakeup, usize);
