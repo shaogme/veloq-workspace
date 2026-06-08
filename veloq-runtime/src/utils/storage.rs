@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::task::Waker;
 
-use crossbeam_queue::SegQueue;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StrategyType {
     Local,
@@ -100,7 +98,7 @@ pub trait StateLock<T>: Send + Sync {
 
 pub trait StateWakerQueue: Send + Sync + 'static {
     fn new() -> Self;
-    fn push(&self, waker: Waker);
+    fn register(&self, waker: &Waker);
     fn take_all(&self) -> Vec<Waker>;
 }
 
@@ -162,22 +160,21 @@ impl<T> StateLock<T> for AtomicLock<T> {
 unsafe impl<T> Send for AtomicLock<T> {}
 unsafe impl<T> Sync for AtomicLock<T> {}
 
-pub struct AtomicWakerQueue(SegQueue<Waker>);
+pub struct AtomicWakerQueue(parking_lot::Mutex<Vec<Waker>>);
 impl StateWakerQueue for AtomicWakerQueue {
     fn new() -> Self {
-        Self(SegQueue::new())
+        Self(parking_lot::Mutex::new(Vec::new()))
     }
 
-    fn push(&self, waker: Waker) {
-        self.0.push(waker);
+    fn register(&self, waker: &Waker) {
+        let mut wakers = self.0.lock();
+        if !wakers.iter().any(|registered| registered.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
     }
 
     fn take_all(&self) -> Vec<Waker> {
-        let mut wakers = Vec::new();
-        while let Some(waker) = self.0.pop() {
-            wakers.push(waker);
-        }
-        wakers
+        std::mem::take(&mut *self.0.lock())
     }
 }
 unsafe impl Send for AtomicWakerQueue {}
@@ -260,8 +257,11 @@ impl StateWakerQueue for LocalWakerQueue {
         Self(RefCell::new(Vec::new()))
     }
 
-    fn push(&self, waker: Waker) {
-        self.0.borrow_mut().push(waker);
+    fn register(&self, waker: &Waker) {
+        let mut wakers = self.0.borrow_mut();
+        if !wakers.iter().any(|registered| registered.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
     }
 
     fn take_all(&self) -> Vec<Waker> {

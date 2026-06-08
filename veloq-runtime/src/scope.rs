@@ -16,6 +16,7 @@ mod completion;
 mod join;
 mod router;
 
+pub(crate) use completion::ScopeCompletionRegistration;
 pub use completion::{GenericScopeCompletion, LocalScopeCompletion, ScopeCompletion};
 pub use join::{JoinHandle, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle};
 

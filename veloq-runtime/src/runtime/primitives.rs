@@ -502,7 +502,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
             waker.wake_by_ref();
             return;
         }
-        self.inner.wakers.push(waker.clone());
+        self.inner.wakers.register(waker);
         if let Some(ref parent) = self.inner.cross_parent {
             parent.register_cancel_waker(waker);
         }

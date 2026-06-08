@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 
 use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
 use crate::runtime::primitives::{self, Unparker};
-use crate::scope::GenericScopeCompletion;
+use crate::scope::{GenericScopeCompletion, ScopeCompletionRegistration};
 use crate::task::{LocalTaskRef, SendTaskRef, TaskHandleRef};
 use crate::utils::FastRand;
 use crate::utils::ownership::Ownership;
@@ -433,6 +433,8 @@ impl<T> RuntimeShared<T> {
             let waker =
                 primitives::create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
             let mut init_cx = Context::from_waker(&waker);
+            let mut completion_registration =
+                completion.map(|c| ScopeCompletionRegistration::new(&**c, &waker));
 
             let mut tick = 0u32;
             const INJECTOR_CHECK_INTERVAL: u32 = 61;
@@ -526,8 +528,8 @@ impl<T> RuntimeShared<T> {
                     continue;
                 }
 
-                if let Some(c) = completion {
-                    c.register(&waker);
+                if let Some(registration) = completion_registration.as_mut() {
+                    registration.register(&waker);
                 }
                 RuntimeProgressCoordinator::new(self, worker_id).run(completion.map(|c| &**c));
             }

@@ -2,22 +2,65 @@ use crate::runtime::primitives::GenericCancellationToken;
 use crate::task::AnyScopeRef;
 use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
 use crate::utils::storage::{
-    AtomicStorage, LocalStorage, StateInt, StateOptionBox, StateOptionPtr, Storage, StrategyType,
+    AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, Storage, StrategyType,
 };
 use std::any::Any;
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::task::Waker;
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
-pub(crate) struct WakerNode {
+pub(crate) struct ScopeWakerNode<S: Storage> {
     pub(crate) waker: Waker,
-    pub(crate) next: Option<NonNull<WakerNode>>,
+    pub(crate) link: Link,
+    marker: PhantomData<S>,
+}
+
+intrusive_adapter!(pub(crate) ScopeWakerAdapter<S> = ScopeWakerNode<S> { link: Link } where S: Storage);
+
+impl<S: Storage> ScopeWakerNode<S> {
+    fn new(waker: &Waker) -> Self {
+        Self {
+            waker: waker.clone(),
+            link: Link::new(),
+            marker: PhantomData,
+        }
+    }
+}
+
+pub(crate) struct ScopeCompletionRegistration<'a, S: Storage, O: Ownership> {
+    completion: &'a GenericScopeCompletion<S, O>,
+    node: Pin<Box<ScopeWakerNode<S>>>,
+}
+
+impl<'a, S: Storage, O: Ownership> ScopeCompletionRegistration<'a, S, O> {
+    pub(crate) fn new(completion: &'a GenericScopeCompletion<S, O>, waker: &Waker) -> Self {
+        Self {
+            completion,
+            node: Box::pin(ScopeWakerNode::new(waker)),
+        }
+    }
+
+    pub(crate) fn register(&mut self, waker: &Waker) {
+        self.completion.register(self.node.as_mut(), waker);
+    }
+}
+
+impl<S: Storage, O: Ownership> Drop for ScopeCompletionRegistration<'_, S, O> {
+    fn drop(&mut self) {
+        let node = unsafe { NonNull::from(self.node.as_mut().get_unchecked_mut()) };
+        unsafe {
+            self.completion.remove_waiter(node);
+        }
+    }
 }
 
 /// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
 pub struct GenericScopeCompletion<S: Storage, O: Ownership> {
     remaining: S::Usize,
-    wakers: S::OptionPtr<WakerNode>,
+    wakers: S::Lock<LinkedList<ScopeWakerAdapter<S>>>,
     cancel_token: GenericCancellationToken<S, O>,
     panic_info: S::OptionBox<dyn Any + Send + 'static>,
     parent: Option<AnyScopeRef>,
@@ -40,7 +83,7 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
 
         O::new(Self {
             remaining: S::Usize::new(0),
-            wakers: S::OptionPtr::new(None),
+            wakers: S::Lock::new(LinkedList::new(ScopeWakerAdapter::<S>::new())),
             cancel_token: GenericCancellationToken::<S, O>::new_with_parent(cross_parent),
             panic_info: S::OptionBox::new(None),
             parent,
@@ -48,13 +91,16 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
     }
 
     fn drain_wakers(&self) {
-        let mut current = self.wakers.swap(None, Ordering::AcqRel);
-        while let Some(node_ptr) = current {
-            unsafe {
-                let node = Box::from_raw(node_ptr.as_ptr());
-                node.waker.wake();
-                current = node.next;
+        let mut ready = Vec::new();
+        {
+            let mut wakers = self.wakers.lock();
+            while let Some(node) = wakers.pop_front() {
+                ready.push(node.as_ref().get_ref().waker.clone());
             }
+        }
+
+        for waker in ready {
+            waker.wake();
         }
     }
 
@@ -90,36 +136,40 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
         }
     }
 
-    pub fn register(&self, waker: &Waker) {
-        if self.remaining.load(Ordering::Acquire) == 0 {
+    pub(crate) fn register(&self, mut node: Pin<&mut ScopeWakerNode<S>>, waker: &Waker) {
+        if self.remaining.load(Ordering::Acquire) == 0 || self.is_cancelled() {
             waker.wake_by_ref();
             return;
         }
 
-        let mut node = Box::new(WakerNode {
-            waker: waker.clone(),
-            next: None,
-        });
-        let mut current = self.wakers.load(Ordering::Acquire);
-        loop {
-            node.next = current;
-            let node_ptr = unsafe { NonNull::new_unchecked(Box::into_raw(node)) };
-            match self.wakers.compare_exchange_weak(
-                current,
-                Some(node_ptr),
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => {
-                    node = unsafe { Box::from_raw(node_ptr.as_ptr()) };
-                    current = actual;
-                }
-            }
+        let mut wakers = self.wakers.lock();
+        if self.remaining.load(Ordering::Acquire) == 0 || self.is_cancelled() {
+            drop(wakers);
+            waker.wake_by_ref();
+            return;
         }
 
-        if self.remaining.load(Ordering::Acquire) == 0 {
-            self.drain_wakers();
+        unsafe {
+            let node_ref = node.as_mut().get_unchecked_mut();
+            if !node_ref.waker.will_wake(waker) {
+                node_ref.waker = waker.clone();
+            }
+            if !node_ref.link.is_linked() {
+                wakers.push_back(node);
+            }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `node` 必须指向先前通过 `register` 注册到该 completion 的同一个节点。
+    pub(crate) unsafe fn remove_waiter(&self, node: NonNull<ScopeWakerNode<S>>) {
+        let mut wakers = self.wakers.lock();
+        if unsafe { node.as_ref().link.is_linked() } {
+            unsafe {
+                let mut cursor = wakers.cursor_mut_from_ptr(node);
+                cursor.remove();
+            }
         }
     }
 
@@ -144,12 +194,9 @@ impl<S: Storage, O: Ownership> GenericScopeCompletion<S, O> {
 
 impl<S: Storage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     fn drop(&mut self) {
-        let mut current = self.wakers.swap(None, Ordering::Relaxed);
-        while let Some(node_ptr) = current {
-            unsafe {
-                let node = Box::from_raw(node_ptr.as_ptr());
-                current = node.next;
-            }
+        {
+            let mut wakers = self.wakers.lock();
+            while wakers.pop_front().is_some() {}
         }
 
         if let Some(panic_info) = self.take_panic()
