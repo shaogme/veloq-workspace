@@ -15,10 +15,23 @@ use crate::error::{UringDriverResult as DriverResult, UringError};
 use crate::op::{UringOp, UringOpPayload, UringUserPayload};
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
+use veloq_driver_core::op::BufIoRangeError;
 
 #[inline]
 fn payload_variant_mismatch(scope: &'static str) -> Report<UringError> {
     UringError::InvalidState.report(scope, "UringOpPayload variant mismatch")
+}
+
+#[inline]
+fn invalid_buf_io_range(scope: &'static str, err: BufIoRangeError) -> Report<UringError> {
+    UringError::InvalidInput
+        .report(scope, err.note())
+        .with_ctx("buffer_offset", err.buffer_offset())
+        .with_ctx("buffer_length", err.buffer_length())
+        .with_ctx("buffer_capacity", err.buffer_capacity())
+        .with_ctx("buffer_bound", err.buffer_bound())
+        .with_ctx("buffer_bound_kind", err.buffer_bound_kind().name())
+        .with_ctx("submission_length", err.submission_length())
 }
 
 #[inline]

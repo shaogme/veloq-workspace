@@ -4,8 +4,9 @@ use crate::op::{UringOp, UringUserPayload};
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use veloq_buf::PoolKind;
+use veloq_driver_core::op::{checked_read_buf_range, checked_write_buf_range};
 
-use super::{payload_variant_mismatch, resolve_any_fd, resolve_file_fd};
+use super::{invalid_buf_io_range, payload_variant_mismatch, resolve_any_fd, resolve_file_fd};
 
 macro_rules! make_rw_fixed {
     ($fn_name:ident, $variant:ident, $type_raw:path, $type_fixed:path) => {
@@ -31,8 +32,10 @@ macro_rules! make_rw_fixed {
             };
 
             let region_info = rw_op.buf.resolve_region_info();
-            let ptr = unsafe { rw_op.buf.as_mut_ptr().add(rw_op.buf_offset) };
-            let len = (rw_op.buf.capacity() - rw_op.buf_offset) as u32;
+            let (ptr, len) =
+                checked_read_buf_range(&mut rw_op.buf, rw_op.buf_offset).map_err(|err| {
+                    invalid_buf_io_range(concat!("uring.op.submit.", stringify!($fn_name)), err)
+                })?;
             let offset = rw_op.offset;
             let fixed_fd = resolve_file_fd(
                 &driver.registered_files,
@@ -82,8 +85,10 @@ macro_rules! make_rw_fixed {
                 }
             };
             let region_info = rw_op.buf.resolve_region_info();
-            let ptr = unsafe { rw_op.buf.as_slice().as_ptr().add(rw_op.buf_offset) };
-            let len = (rw_op.buf.len() - rw_op.buf_offset) as u32;
+            let (ptr, len) =
+                checked_write_buf_range(&rw_op.buf, rw_op.buf_offset).map_err(|err| {
+                    invalid_buf_io_range(concat!("uring.op.submit.", stringify!($fn_name)), err)
+                })?;
             let offset = rw_op.offset;
             let fixed_fd = resolve_file_fd(
                 &driver.registered_files,
@@ -136,8 +141,10 @@ macro_rules! make_rw_raw {
                 }
             };
             let region_info = rw_op.buf.resolve_region_info();
-            let ptr = unsafe { rw_op.buf.as_slice().as_ptr().add(rw_op.buf_offset) };
-            let len = (rw_op.buf.len() - rw_op.buf_offset) as u32;
+            let (ptr, len) =
+                checked_write_buf_range(&rw_op.buf, rw_op.buf_offset).map_err(|err| {
+                    invalid_buf_io_range(concat!("uring.op.submit.", stringify!($fn_name)), err)
+                })?;
             let fd = rw_op.fd.as_fd();
 
             let is_registered = if region_info.pool_kind == PoolKind::SlotBased {
@@ -183,8 +190,10 @@ macro_rules! make_rw_raw {
                 }
             };
             let region_info = rw_op.buf.resolve_region_info();
-            let ptr = unsafe { rw_op.buf.as_mut_ptr().add(rw_op.buf_offset) };
-            let len = (rw_op.buf.capacity() - rw_op.buf_offset) as u32;
+            let (ptr, len) =
+                checked_read_buf_range(&mut rw_op.buf, rw_op.buf_offset).map_err(|err| {
+                    invalid_buf_io_range(concat!("uring.op.submit.", stringify!($fn_name)), err)
+                })?;
             let fd = rw_op.fd.as_fd();
 
             let is_registered = if region_info.pool_kind == PoolKind::SlotBased {

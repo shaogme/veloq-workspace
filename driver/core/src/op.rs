@@ -20,9 +20,11 @@ pub trait DriverProvider: Clone + Unpin {
     fn with_driver<'a, R>(&'a self, f: impl FnOnce(Self::Driver<'a>) -> R) -> R;
 }
 
+mod buffer_range;
 mod future;
 mod types;
 
+pub use buffer_range::*;
 pub use future::*;
 pub use types::*;
 

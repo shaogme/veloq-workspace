@@ -2,8 +2,9 @@ use crate::driver::UringDriver;
 use crate::error::{UringDriverResult as DriverResult, UringError};
 use crate::op::{UringOp, UringOpPayload, UringUserPayload};
 use io_uring::{opcode, squeue};
+use veloq_driver_core::op::{checked_read_buf_range, checked_write_buf_range};
 
-use super::{payload_variant_mismatch, resolve_socket_fd};
+use super::{invalid_buf_io_range, payload_variant_mismatch, resolve_socket_fd};
 
 macro_rules! make_buf_op {
     ($fn_name:ident, $OpType:ident, $opcode:path, recv_args) => {
@@ -27,8 +28,10 @@ macro_rules! make_buf_op {
                     )));
                 }
             };
-            let ptr = unsafe { val.buf.as_mut_ptr().add(val.buf_offset) };
-            let len = (val.buf.capacity() - val.buf_offset) as u32;
+            let (ptr, len) =
+                checked_read_buf_range(&mut val.buf, val.buf_offset).map_err(|err| {
+                    invalid_buf_io_range(concat!("uring.op.submit.", stringify!($fn_name)), err)
+                })?;
             let fixed_fd = resolve_socket_fd(
                 &driver.registered_files,
                 &driver.file_generations,
@@ -59,8 +62,9 @@ macro_rules! make_buf_op {
                     )));
                 }
             };
-            let ptr = unsafe { val.buf.as_slice().as_ptr().add(val.buf_offset) };
-            let len = (val.buf.len() - val.buf_offset) as u32;
+            let (ptr, len) = checked_write_buf_range(&val.buf, val.buf_offset).map_err(|err| {
+                invalid_buf_io_range(concat!("uring.op.submit.", stringify!($fn_name)), err)
+            })?;
             let fixed_fd = resolve_socket_fd(
                 &driver.registered_files,
                 &driver.file_generations,
@@ -240,9 +244,10 @@ pub(crate) unsafe fn make_sqe_send_to(
         _ => return Err(payload_variant_mismatch("uring.op.submit.make_sqe_send_to")),
     };
 
-    kernel.iovec[0].iov_base =
-        unsafe { user.buf.as_slice().as_ptr().add(user.buf_offset) } as *mut _;
-    kernel.iovec[0].iov_len = user.buf.len() - user.buf_offset;
+    let (ptr, len) = checked_write_buf_range(&user.buf, user.buf_offset)
+        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send_to", err))?;
+    kernel.iovec[0].iov_base = ptr as *mut _;
+    kernel.iovec[0].iov_len = len as usize;
 
     let (msg_name, msg_namelen) = crate::net::socket_addr_to_storage(user.addr);
     kernel.msg_name = msg_name.0;
@@ -299,8 +304,10 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
     let fd = user.fd;
     let recv_buf = &mut user.buf;
 
-    kernel.iovec[0].iov_base = unsafe { recv_buf.as_mut_ptr().add(user.buf_offset) } as *mut _;
-    kernel.iovec[0].iov_len = recv_buf.capacity().saturating_sub(user.buf_offset);
+    let (ptr, len) = checked_read_buf_range(recv_buf, user.buf_offset)
+        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv_from", err))?;
+    kernel.iovec[0].iov_base = ptr as *mut _;
+    kernel.iovec[0].iov_len = len as usize;
 
     kernel.msghdr.msg_name = &mut kernel.msg_name as *mut _ as *mut libc::c_void;
     kernel.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;

@@ -1,5 +1,6 @@
 use veloq_blocking::BlockingTask;
 use veloq_buf::FixedBuf;
+use veloq_driver_core::op::{BufIoRangeError, checked_read_buf_range, checked_write_buf_range};
 
 use diagweave::prelude::*;
 use std::io;
@@ -30,8 +31,37 @@ use crate::op::{
 // Macros
 // ============================================================================
 
+fn invalid_buf_io_range(scope: &'static str, err: BufIoRangeError) -> Report<IocpError> {
+    IocpError::InvalidInput
+        .report(scope, err.note())
+        .with_ctx("buffer_offset", err.buffer_offset())
+        .with_ctx("buffer_length", err.buffer_length())
+        .with_ctx("buffer_capacity", err.buffer_capacity())
+        .with_ctx("buffer_bound", err.buffer_bound())
+        .with_ctx("buffer_bound_kind", err.buffer_bound_kind().name())
+        .with_ctx("submission_length", err.submission_length())
+}
+
+fn checked_file_read_range(
+    buf: &mut FixedBuf,
+    buf_offset: usize,
+    scope: &'static str,
+) -> IocpResult<(*mut u8, u32)> {
+    checked_read_buf_range(buf, buf_offset).map_err(|err| invalid_buf_io_range(scope, err))
+}
+
+fn checked_file_write_range(
+    buf: &mut FixedBuf,
+    buf_offset: usize,
+    scope: &'static str,
+) -> IocpResult<(*mut u8, u32)> {
+    checked_write_buf_range(buf, buf_offset)
+        .map(|(ptr, len)| (ptr as *mut u8, len))
+        .map_err(|err| invalid_buf_io_range(scope, err))
+}
+
 macro_rules! submit_io_op {
-    ($fn_name:ident, $field_type:ty, $wrapper_fn:ident, offset, $ptr_fn:expr) => {
+    ($fn_name:ident, $field_type:ty, $wrapper_fn:ident, offset, $range_fn:ident) => {
         pub(crate) fn $fn_name(
             header: &mut OverlappedEntry,
             payload: &mut KernelRef<$field_type>,
@@ -52,20 +82,11 @@ macro_rules! submit_io_op {
                 .with_ctx("user_data", header.user_data)
                 .with_ctx("generation", header.generation)
                 .with_ctx("offset", val.offset)
-                .with_ctx("buffer_length", val.buf.len())?;
+                .with_ctx("buffer_length", val.buf.len())
+                .with_ctx("buffer_capacity", val.buf.capacity())?;
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
-            if val.buf_offset > val.buf.len() {
-                return IocpError::InvalidInput
-                    .push_ctx("scope", stringify!($fn_name))
-                    .with_ctx("buffer_offset", val.buf_offset)
-                    .with_ctx("buffer_length", val.buf.len())
-                    .attach_note("buffer offset exceeds buffer length");
-            }
-            let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
-            // SAFETY: buf_offset <= buf.len() is verified above.
-            let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
-            let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
+            let (ptr, len) = $range_fn(&mut val.buf, val.buf_offset, stringify!($fn_name))?;
             let raw_handle = crate::config::RawHandle::new(raw);
             let handle = raw_handle.borrow();
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
@@ -79,6 +100,7 @@ macro_rules! submit_io_op {
                 .with_ctx("offset", val.offset)
                 .with_ctx("buffer_offset", val.buf_offset)
                 .with_ctx("buffer_length", len)
+                .with_ctx("buffer_capacity", val.buf.capacity())
                 .attach_note("file syscall submit failed");
             mark_header_in_flight(header, submit_res)
         }
@@ -86,7 +108,7 @@ macro_rules! submit_io_op {
 }
 
 macro_rules! submit_raw_io_op {
-    ($fn_name:ident, $field_type:ty, $wrapper_fn:ident, offset, $ptr_fn:expr) => {
+    ($fn_name:ident, $field_type:ty, $wrapper_fn:ident, offset, $range_fn:ident) => {
         pub(crate) fn $fn_name(
             header: &mut OverlappedEntry,
             payload: &mut KernelRef<$field_type>,
@@ -107,18 +129,10 @@ macro_rules! submit_raw_io_op {
                 .with_ctx("user_data", header.user_data)
                 .with_ctx("generation", header.generation)
                 .with_ctx("offset", val.offset)
-                .with_ctx("buffer_length", val.buf.len())?;
+                .with_ctx("buffer_length", val.buf.len())
+                .with_ctx("buffer_capacity", val.buf.capacity())?;
 
-            if val.buf_offset > val.buf.len() {
-                return IocpError::InvalidInput
-                    .push_ctx("scope", stringify!($fn_name))
-                    .with_ctx("buffer_offset", val.buf_offset)
-                    .with_ctx("buffer_length", val.buf.len())
-                    .attach_note("buffer offset exceeds buffer length");
-            }
-            let get_ptr: fn(&mut _) -> *mut u8 = $ptr_fn;
-            let ptr = unsafe { get_ptr(&mut val.buf).add(val.buf_offset) };
-            let len = (val.buf.len().saturating_sub(val.buf_offset)) as u32;
+            let (ptr, len) = $range_fn(&mut val.buf, val.buf_offset, stringify!($fn_name))?;
             let raw_handle = crate::config::RawHandle::new(raw);
             let handle = raw_handle.borrow();
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
@@ -129,6 +143,7 @@ macro_rules! submit_raw_io_op {
                 .with_ctx("offset", val.offset)
                 .with_ctx("buffer_offset", val.buf_offset)
                 .with_ctx("buffer_length", len)
+                .with_ctx("buffer_capacity", val.buf.capacity())
                 .attach_note("file syscall submit failed");
             mark_header_in_flight(header, submit_res)
         }
@@ -144,14 +159,14 @@ submit_io_op!(
     ReadFixed,
     iocp_submit_read,
     offset,
-    |b: &mut FixedBuf| b.as_mut_ptr()
+    checked_file_read_range
 );
 submit_raw_io_op!(
     submit_read_raw,
     ReadRaw,
     iocp_submit_read,
     offset,
-    |b: &mut FixedBuf| b.as_mut_ptr()
+    checked_file_read_range
 );
 
 submit_io_op!(
@@ -159,14 +174,14 @@ submit_io_op!(
     WriteFixed,
     iocp_submit_write,
     offset,
-    |b: &mut FixedBuf| b.as_slice().as_ptr() as *mut u8
+    checked_file_write_range
 );
 submit_raw_io_op!(
     submit_write_raw,
     WriteRaw,
     iocp_submit_write,
     offset,
-    |b: &mut FixedBuf| b.as_slice().as_ptr() as *mut u8
+    checked_file_write_range
 );
 
 // ============================================================================
