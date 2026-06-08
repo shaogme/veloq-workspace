@@ -14,7 +14,7 @@ pub(crate) use dispatch::*;
 use crate::BufferRegistrationMode;
 use crate::config::BorrowedRawHandle;
 use crate::ext::Extensions;
-use crate::op::submit::SubmissionResult;
+use crate::op::SubmissionResult;
 use crate::rio::core::registry::{RioRegistry, RioSubmissionKind};
 use crate::rio::core::{RioAddressPolicy, RioOpKind, RioSubmitPlan};
 use crate::rio::error::{RioError, RioResult};

@@ -13,8 +13,7 @@ use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt,
 use crate::common::{completion_record, io_result_to_event_res, push_completion_shared};
 use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
 use crate::error::{IocpError, IocpResult};
-use crate::op::slot::Slot;
-use crate::op::{IocpOp, IocpUserPayload};
+use crate::op::{IocpOp, IocpUserPayload, Slot};
 use crate::rio::SocketInflightToken;
 
 pub(super) struct EmitContext<'a> {

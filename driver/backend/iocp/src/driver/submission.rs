@@ -16,9 +16,10 @@ use crate::common::{completion_record, push_completion_shared};
 use crate::config::IoFd;
 use crate::driver::{CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry};
 use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
-use crate::op::overlapped::BlockingCompletion;
-use crate::op::slot::Slot;
-use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload, SubmitContext, submit};
+use crate::op::{
+    BlockingCompletion, IocpOp, IocpOpPayload, IocpUserPayload, Slot, SubmissionResult,
+    SubmitContext,
+};
 
 pub(crate) struct SubmitContextInternal<'a> {
     port: Arc<crate::win32::IoCompletionPort>,
@@ -159,16 +160,14 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn on_submit_res(
         ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
-        result: IocpDriverResult<submit::SubmissionResult>,
+        result: IocpDriverResult<SubmissionResult>,
         token: OpToken,
         op_in: &mut Option<IocpOp>,
     ) -> DriverSubmitResult<IocpError> {
         match result {
-            Ok(submit::SubmissionResult::Pending) => DriverSubmitResult::submitted(Poll::Pending),
-            Ok(submit::SubmissionResult::PostToQueue) => {
-                Self::handle_post_to_queue(ops, ctx, token, op_in)
-            }
-            Ok(submit::SubmissionResult::Offload(task)) => {
+            Ok(SubmissionResult::Pending) => DriverSubmitResult::submitted(Poll::Pending),
+            Ok(SubmissionResult::PostToQueue) => Self::handle_post_to_queue(ops, ctx, token, op_in),
+            Ok(SubmissionResult::Offload(task)) => {
                 match Self::handle_offload(ops, ctx, token, task) {
                     Ok(poll) => DriverSubmitResult::submitted(poll),
                     Err(_) => DriverSubmitResult::failed(
@@ -178,7 +177,7 @@ impl<'a> IocpDriver<'a> {
                     ),
                 }
             }
-            Ok(submit::SubmissionResult::Timer(duration)) => {
+            Ok(SubmissionResult::Timer(duration)) => {
                 Self::handle_timer_sub(ops, ctx, token, duration)
             }
             Err(e) => {
@@ -240,7 +239,7 @@ impl<'a> IocpDriver<'a> {
         &mut self,
         token: OpToken,
         op: IocpOp,
-    ) -> IocpDriverResult<IocpDriverResult<submit::SubmissionResult>> {
+    ) -> IocpDriverResult<IocpDriverResult<SubmissionResult>> {
         let guard = Self::prep_op_slot(&mut self.ops, token, op)
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
@@ -284,7 +283,7 @@ impl<'a> IocpDriver<'a> {
                 })
                 .map_err(|err| slot_access_report("iocp.driver.call_op_submit.close_op", err))?;
 
-                Ok(submit::SubmissionResult::PostToQueue)
+                Ok(SubmissionResult::PostToQueue)
             })
         } else {
             let (rio, registrar) = self.rio.state_and_registrar_mut();
@@ -313,7 +312,7 @@ impl<'a> IocpDriver<'a> {
         .attach_note("op submit failed");
 
         let socket_pending_without_inflight_token = match &result {
-            Ok(submit::SubmissionResult::Pending) => sub_guard
+            Ok(SubmissionResult::Pending) => sub_guard
                 .slot
                 .as_mut()
                 .and_then(|slot| {

@@ -26,11 +26,10 @@ use diagweave::prelude::*;
 
 use crate::config::{IoFd, IocpHandle};
 use crate::error::IocpError;
-use crate::op::{IocpOp, IocpOpPayload, IocpUserPayload};
+use crate::op::{IocpOp, IocpOpPayload, IocpOpRegistry, IocpSlotSpec, IocpUserPayload};
 
 pub(crate) type IocpDriverResult<T> = CoreDriverResult<T, IocpError>;
-pub use crate::op::slot::IocpOpState;
-pub(crate) use crate::op::slot::{IocpOpRegistry, IocpSlotSpec};
+pub use crate::op::IocpOpState;
 
 // ============================================================================
 // State & Lifecycle Types
@@ -104,7 +103,7 @@ impl<'a> IocpDriver<'a> {
         use veloq_driver_core::slot::SlotTable;
 
         let mut cur = self.ops.shared.remote_free_head.load(Ordering::Acquire);
-        while cur != SlotTable::<crate::op::slot::IocpSlotSpec>::NULL_INDEX {
+        while cur != SlotTable::<crate::op::IocpSlotSpec>::NULL_INDEX {
             if cur == needle {
                 return true;
             }

@@ -3,8 +3,8 @@
 use crate::IoFd;
 use crate::common::push_completion_shared;
 use crate::config::{BorrowedRawHandle, SocketKey};
-use crate::driver::IocpOpRegistry;
 use crate::error::IocpError;
+use crate::op::IocpOpRegistry;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;

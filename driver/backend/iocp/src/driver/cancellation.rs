@@ -9,7 +9,7 @@ use crate::common::{completion_record, push_completion_shared};
 use crate::driver::completion::EmitContext;
 use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
 use crate::error::IocpResult;
-use crate::op::submit;
+use crate::op;
 use crate::win32::CancelRequestResult;
 
 struct CancelContext<'a> {
@@ -162,7 +162,7 @@ impl<'a> IocpDriver<'a> {
                                 .with_op_mut(|iocp_op| iocp_op.get_fd())
                                 .ok()
                                 .flatten()?;
-                            submit::resolve_fd_handle(&fd, ctx.registered_slots).ok()
+                            op::resolve_fd_handle(&fd, ctx.registered_slots).ok()
                         });
 
                     if let Some(raw_handle) = raw_handle {
@@ -197,7 +197,7 @@ impl<'a> IocpDriver<'a> {
                         .and_then(|iocp_op| iocp_op.header.resolved_handle)
                         .or_else(|| {
                             let fd = guard.op.as_mut().and_then(|iocp_op| iocp_op.get_fd())?;
-                            submit::resolve_fd_handle(&fd, ctx.registered_slots).ok()
+                            op::resolve_fd_handle(&fd, ctx.registered_slots).ok()
                         });
 
                     if let Some(raw_handle) = raw_handle {

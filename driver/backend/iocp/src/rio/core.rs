@@ -5,7 +5,7 @@ pub(crate) mod submit_ops;
 
 use crate::config::{BorrowedRawHandle, IoFd, SocketKey};
 use crate::error::{IocpError, iocp_report_to_event_res};
-use crate::op::submit::SubmissionResult;
+use crate::op::SubmissionResult;
 use crate::rio::RioEnv;
 use crate::rio::core::registry::{
     RioAddrReservation, RioBufferLeaseToken, RioPreparedBuffer, RioRegistry, RioSubmissionKind,

@@ -15,8 +15,8 @@ pub(crate) mod runtime;
 
 use crate::BufferRegistrationMode;
 use crate::config::SocketKey;
-use crate::driver::IocpOpRegistry;
 use crate::error::IocpError;
+use crate::op::IocpOpRegistry;
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
 use veloq_driver_core::driver::{DriverCompletionDiagnostics, SharedCompletionTable};

@@ -3,9 +3,9 @@ use std::ptr::NonNull;
 use crate::config::IoFd;
 use crate::error::{IocpDriverResult as DriverResult, IocpError, IocpResult};
 use crate::ext::Extensions;
-use crate::op::submit::SubmissionResult;
 use crate::op::{
-    IocpKernelOp, IocpOpPayload, IocpUserPayload, OpVTable, OverlappedEntry, SubmitContext,
+    IocpKernelOp, IocpOpPayload, IocpUserPayload, OpVTable, OverlappedEntry, SubmissionResult,
+    SubmitContext,
 };
 use diagweave::prelude::*;
 use veloq_driver_core::driver::CompletionCleanupGuard;
