@@ -9,7 +9,7 @@ pub(crate) const RIO_EVENT_KEY: usize =
     veloq_driver_core::driver::CompletionToken::rio_wake(0).raw() as usize;
 pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use tracing::trace;
@@ -19,9 +19,8 @@ use veloq_driver_core::driver::registry::OpEntry;
 use veloq_driver_core::driver::{
     CancelRequest, CancelSubmitOutcome, CompletionSidecar as CoreCompletionSidecar, DriveMode,
     DriveOutcome, Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
-    RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
-use veloq_driver_core::slot::RemoteCancelQueue;
 
 use diagweave::prelude::*;
 
@@ -44,7 +43,8 @@ pub struct IocpDriver<'a> {
     extensions: crate::ext::Extensions,
     timer: polling::TimerEngine,
     handles: registration::HandleRegistry,
-    remote_cancel_queue: Arc<RemoteCancelQueue>,
+    remote_cancel_sender: RemoteCancelSender,
+    remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
     completion_diagnostics: DriverCompletionDiagnostics,
 
     // RIO Support (required)
@@ -138,8 +138,12 @@ impl<'a> Driver for IocpDriver<'a> {
         self.ops.shared.clone()
     }
 
-    fn remote_cancel_queue(&self) -> Arc<RemoteCancelQueue> {
-        self.remote_cancel_queue.clone()
+    fn remote_cancel_sender(&self) -> RemoteCancelSender {
+        self.remote_cancel_sender.clone()
+    }
+
+    fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest> {
+        self.remote_cancel_receiver.try_recv().ok()
     }
 
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP) {

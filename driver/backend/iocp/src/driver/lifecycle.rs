@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -8,7 +7,7 @@ use veloq_buf::BufferRegistrar;
 use veloq_driver_core::driver::{
     CancelRequest, DriverCompletionDiagnostics, OpToken, SharedCompletionTable,
 };
-use veloq_driver_core::slot::{CheckedSlotView, RemoteCancelQueue, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
 use crate::config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle};
 use crate::error::{IocpError, IocpResult};
@@ -126,13 +125,15 @@ impl<'a> IocpDriver<'a> {
         let ops = IocpOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<IocpUserPayload, IocpError> =
             ops.shared.clone();
+        let (remote_cancel_sender, remote_cancel_receiver) = std::sync::mpsc::channel();
         Ok(Self {
             completion: CompletionPump::new(port_val, completion_table),
             ops,
             extensions,
             timer: TimerEngine::new(),
             handles: HandleRegistry::new(),
-            remote_cancel_queue: Arc::new(RemoteCancelQueue::new(entries as usize)),
+            remote_cancel_sender,
+            remote_cancel_receiver,
             completion_diagnostics: DriverCompletionDiagnostics::default(),
             rio,
             shutting_down: false,

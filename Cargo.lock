@@ -1419,7 +1419,6 @@ name = "veloq-driver-core"
 version = "0.1.0"
 dependencies = [
  "bilge",
- "crossbeam-queue",
  "crossbeam-utils",
  "diagweave",
  "libc",

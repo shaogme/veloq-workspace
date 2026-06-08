@@ -3,7 +3,7 @@ use crate::slot::SlotSpec as CoreSlotSpec;
 use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
 use crate::{DriverError, DriverReport, DriverResult};
 
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
@@ -27,6 +27,7 @@ pub enum DriverControlCommand {
 
 pub type SharedSlotTable<Spec> = Arc<slot::SlotTable<Spec>>;
 pub type SharedDriverSlotTable<D> = SharedSlotTable<<D as Driver>::SlotSpec>;
+pub type RemoteCancelSender = mpsc::Sender<CancelRequest>;
 
 #[must_use]
 pub enum DriverSubmitResult<E> {
@@ -98,8 +99,8 @@ impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
     }
 
     #[inline]
-    pub fn remote_cancel_queue(&self) -> Arc<slot::RemoteCancelQueue> {
-        self.driver.remote_cancel_queue()
+    pub fn remote_cancel_sender(&self) -> RemoteCancelSender {
+        self.driver.remote_cancel_sender()
     }
 
     #[inline]
@@ -168,7 +169,10 @@ pub trait Driver {
 
     fn slot_table(&self) -> SharedDriverSlotTable<Self>;
 
-    fn remote_cancel_queue(&self) -> Arc<slot::RemoteCancelQueue>;
+    fn remote_cancel_sender(&self) -> RemoteCancelSender;
+
+    #[doc(hidden)]
+    fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest>;
 
     #[doc(hidden)]
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP);
@@ -257,8 +261,14 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 
     #[inline]
-    fn remote_cancel_queue(&self) -> Arc<slot::RemoteCancelQueue> {
-        self.provider.with_driver_ref(|d| d.remote_cancel_queue())
+    fn remote_cancel_sender(&self) -> RemoteCancelSender {
+        self.provider.with_driver_ref(|d| d.remote_cancel_sender())
+    }
+
+    #[inline]
+    fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest> {
+        self.provider
+            .with_driver_mut(|d| d.try_recv_remote_cancel_request())
     }
 
     #[inline]
@@ -339,8 +349,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
 
 #[inline]
 pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
-    let cancel_queue = driver.remote_cancel_queue();
-    while let Some(request) = cancel_queue.pop_cancel() {
+    while let Some(request) = driver.try_recv_remote_cancel_request() {
         let _ = driver.cancel_op(request);
     }
 }

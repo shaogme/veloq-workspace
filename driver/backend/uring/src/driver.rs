@@ -2,8 +2,8 @@ use diagweave::prelude::*;
 use io_uring::IoUring;
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use tracing::{debug, trace};
@@ -17,10 +17,9 @@ use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
     CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome, Driver,
-    DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteWaker,
-    SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+    DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
+    RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
-use veloq_driver_core::slot::RemoteCancelQueue;
 
 mod completion;
 mod lifecycle;
@@ -98,7 +97,8 @@ pub struct UringDriver<'a> {
     pub(crate) next_cancel_id: u16,
     pub(crate) completion_diagnostics: DriverCompletionDiagnostics,
     pub(crate) completion_table: SharedCompletionTable<UringUserPayload, UringError>,
-    pub(crate) remote_cancel_queue: Arc<RemoteCancelQueue>,
+    pub(crate) remote_cancel_sender: RemoteCancelSender,
+    pub(crate) remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
 
     pub(crate) waker_fd: Arc<EventFd>,
     pub(crate) waker_registered_fd: Option<IoFd>,
@@ -162,6 +162,7 @@ impl<'a> UringDriver<'a> {
         debug!("Initalized UringDriver with {} entries", entries);
 
         let is_waked = Arc::new(AtomicBool::new(false));
+        let (remote_cancel_sender, remote_cancel_receiver) = mpsc::channel();
 
         let mut driver = Self {
             ring,
@@ -172,7 +173,8 @@ impl<'a> UringDriver<'a> {
             next_cancel_id: 1,
             completion_diagnostics: DriverCompletionDiagnostics::default(),
             completion_table,
-            remote_cancel_queue: Arc::new(RemoteCancelQueue::new(entries as usize)),
+            remote_cancel_sender,
+            remote_cancel_receiver,
             waker_fd: Arc::new(EventFd {
                 // SAFETY: `eventfd` returns a freshly created fd owned by this driver.
                 fd: unsafe {
@@ -261,8 +263,12 @@ impl<'a> Driver for UringDriver<'a> {
         self.ops.shared.clone()
     }
 
-    fn remote_cancel_queue(&self) -> std::sync::Arc<RemoteCancelQueue> {
-        self.remote_cancel_queue.clone()
+    fn remote_cancel_sender(&self) -> RemoteCancelSender {
+        self.remote_cancel_sender.clone()
+    }
+
+    fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest> {
+        self.remote_cancel_receiver.try_recv().ok()
     }
 
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: UringUserPayload) {

@@ -122,7 +122,7 @@ impl<T> Op<T> {
                 let (kernel_op, payload) = data.into_kernel_and_payload();
                 let mut op_platform = Some(kernel_op);
                 let completion_table = slot.completion_table();
-                let cancel_signal = slot.remote_cancel_queue();
+                let cancel_sender = slot.remote_cancel_sender();
                 let cancel_waker = slot.create_waker();
                 slot.set_payload(T::payload_into_erased(payload));
 
@@ -132,7 +132,7 @@ impl<T> Op<T> {
                         completion_table.mark_waiting(CompletionToken::user(token));
                         DetachedOp {
                             completion_table: Some(completion_table),
-                            cancel_signal: Some(cancel_signal),
+                            cancel_sender: Some(cancel_sender),
                             cancel_waker: Some(cancel_waker),
                             token: Some(token),
                             immediate_failure: None,
@@ -153,7 +153,7 @@ impl<T> Op<T> {
                                     }
                                     return DetachedOp {
                                         completion_table: None,
-                                        cancel_signal: None,
+                                        cancel_sender: None,
                                         cancel_waker: None,
                                         token: None,
                                         immediate_failure: None,
@@ -172,7 +172,7 @@ impl<T> Op<T> {
                                         }
                                         return DetachedOp {
                                             completion_table: None,
-                                            cancel_signal: None,
+                                            cancel_sender: None,
                                             cancel_waker: None,
                                             token: None,
                                             immediate_failure: None,
@@ -188,7 +188,7 @@ impl<T> Op<T> {
                                 }
                                 DetachedOp {
                                     completion_table: None,
-                                    cancel_signal: None,
+                                    cancel_sender: None,
                                     cancel_waker: None,
                                     token: None,
                                     immediate_failure: Some((report, payload)),
@@ -201,7 +201,7 @@ impl<T> Op<T> {
                                 completion_table.mark_waiting(CompletionToken::user(token));
                                 DetachedOp {
                                     completion_table: Some(completion_table),
-                                    cancel_signal: Some(cancel_signal),
+                                    cancel_sender: Some(cancel_sender),
                                     cancel_waker: Some(cancel_waker),
                                     token: Some(token),
                                     immediate_failure: None,
@@ -218,7 +218,7 @@ impl<T> Op<T> {
                 drop(kernel_op);
                 DetachedOp {
                     completion_table: None,
-                    cancel_signal: None,
+                    cancel_sender: None,
                     cancel_waker: None,
                     token: None,
                     immediate_failure: Some((e, payload)),

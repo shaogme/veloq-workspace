@@ -22,7 +22,6 @@ veloq-atomic-waker.workspace = true
 veloq-buf.workspace = true
 
 crossbeam-utils.workspace = true
-crossbeam-queue.workspace = true
 tracing.workspace = true
 veloq-shim.workspace = true
 diagweave.workspace = true

@@ -1,34 +1,10 @@
-use crate::driver::CancelRequest;
 use crate::slot::core::SlotData;
 use crate::slot::{SlotCompletion, SlotError, SlotSpec};
-use crossbeam_queue::SegQueue;
 use crossbeam_utils::CachePadded;
 use veloq_shim::atomic::{AtomicUsize, Ordering};
 
 pub type SlotEntry<Spec> = CachePadded<SlotData<Spec>>;
 pub type SlotEntries<Spec> = Box<[SlotEntry<Spec>]>;
-
-pub struct RemoteCancelQueue {
-    requests: SegQueue<CancelRequest>,
-}
-
-impl RemoteCancelQueue {
-    pub fn new(_capacity: usize) -> Self {
-        Self {
-            requests: SegQueue::new(),
-        }
-    }
-
-    #[inline]
-    pub fn request_cancel(&self, request: CancelRequest) {
-        self.requests.push(request);
-    }
-
-    #[inline]
-    pub fn pop_cancel(&self) -> Option<CancelRequest> {
-        self.requests.pop()
-    }
-}
 
 pub struct SlotTable<Spec: SlotSpec> {
     pub slots: SlotEntries<Spec>,

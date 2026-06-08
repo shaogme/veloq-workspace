@@ -9,11 +9,10 @@ use tracing::trace;
 
 use crate::driver::{
     CancelRequest, CompletionAnomaly, CompletionAnomalyReason, CompletionRecord, CompletionToken,
-    Driver, DriverSubmitResult, OpToken, PlatformOp, PollRecordResult, RemoteWaker,
-    SharedCompletionTable, SubmitStatus, event_res_to_result,
+    Driver, DriverSubmitResult, OpToken, PlatformOp, PollRecordResult, RemoteCancelSender,
+    RemoteWaker, SharedCompletionTable, SubmitStatus, event_res_to_result,
 };
 use crate::op::{IntoPlatformOp, Op};
-use crate::slot::RemoteCancelQueue;
 use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
 
 use diagweave::prelude::*;
@@ -267,7 +266,7 @@ where
     T: IntoPlatformOp<O, DriverCompletion = C, Error = E>,
 {
     pub(crate) completion_table: Option<SharedCompletionTable<T::ErasedPayload, E, C>>,
-    pub(crate) cancel_signal: Option<Arc<RemoteCancelQueue>>,
+    pub(crate) cancel_sender: Option<RemoteCancelSender>,
     pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<E>>>,
     pub(crate) token: Option<OpToken>,
     pub(crate) immediate_failure: Option<(DriverReport<E>, T::UserPayload)>,
@@ -296,8 +295,8 @@ where
             if let Some(table) = self.completion_table.as_ref() {
                 table.mark_orphaned(CompletionToken::user(token));
             }
-            if let Some(cancel_signal) = self.cancel_signal.as_ref() {
-                cancel_signal.request_cancel(CancelRequest::abandon(token));
+            if let Some(cancel_sender) = self.cancel_sender.as_ref() {
+                let _ = cancel_sender.send(CancelRequest::abandon(token));
             }
         }
         if let Some(cancel_waker) = self.cancel_waker.as_ref()
