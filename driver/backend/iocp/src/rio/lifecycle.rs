@@ -22,6 +22,7 @@ pub(crate) struct DeferredRioCleanup {
     kernel: RioKernel,
     registry: RioRegistry,
     registration_mode: crate::BufferRegistrationMode,
+    submissions_closed: bool,
     actors: SlotMap<ActorKey, RioSocketActor>,
     actor_by_handle: FxHashMap<SocketKey, ActorKey>,
     socket_runtime: FxHashMap<SocketKey, crate::rio::SocketRuntimeState>,
@@ -39,6 +40,7 @@ impl DeferredRioCleanup {
             kernel: self.kernel,
             registry: self.registry,
             registration_mode: self.registration_mode,
+            submissions_closed: self.submissions_closed,
             actors: self.actors,
             actor_by_handle: self.actor_by_handle,
             socket_runtime: self.socket_runtime,
@@ -46,7 +48,7 @@ impl DeferredRioCleanup {
             next_request_id: self.next_request_id,
             deferred_payloads: self.deferred_payloads,
         };
-        state.begin_shutdown();
+        state.stop_accepting_new_submissions();
         if let Err(e) = state.drain_outstanding(RIO_REAPER_DRAIN_TIMEOUT) {
             tracing::warn!(error = ?e, "RioReaper: background drain timed out");
             if state.outstanding_count > 0 {
@@ -99,7 +101,8 @@ impl RioState {
             }) => {
                 self.registry.free_addr_slot(addr_slot);
                 release_result = self.registry.release_buffer_lease_deferred(buffer_lease);
-                release_socket_inflight_token_from(&mut self.socket_runtime, socket_inflight);
+                let _ =
+                    release_socket_inflight_token_from(&mut self.socket_runtime, socket_inflight);
             }
             None => {}
         }
@@ -148,7 +151,15 @@ impl RioState {
     }
 
     fn finalize_cleanup(&mut self) {
-        self.shutdown_rio_actors();
+        self.stop_accepting_new_submissions();
+        if self.outstanding_count == 0 {
+            self.forget_runtime_after_drain();
+        } else {
+            tracing::warn!(
+                outstanding_count = self.outstanding_count,
+                "finalizing RIO state before outstanding requests drained"
+            );
+        }
         if let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)
@@ -168,6 +179,7 @@ impl RioState {
             kernel,
             registry,
             registration_mode: self.registration_mode,
+            submissions_closed: self.submissions_closed,
             actors: std::mem::take(&mut self.actors),
             actor_by_handle: std::mem::take(&mut self.actor_by_handle),
             socket_runtime: std::mem::take(&mut self.socket_runtime),
@@ -184,7 +196,7 @@ impl RioState {
 
 impl Drop for RioState {
     fn drop(&mut self) {
-        self.begin_shutdown();
+        self.stop_accepting_new_submissions();
         if self.outstanding_count == 0 {
             self.finalize_cleanup();
             return;

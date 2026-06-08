@@ -150,7 +150,7 @@ impl<'a> IocpDriver<'a> {
             return ShutdownPending::default();
         }
         self.shutting_down = true;
-        self.rio.state_mut().begin_shutdown();
+        self.rio.state_mut().stop_accepting_new_submissions();
 
         let mut in_flight = Vec::new();
         let mut pending = ShutdownPending::default();
@@ -295,6 +295,8 @@ impl<'a> IocpDriver<'a> {
                     .attach_note("failed to drain RIO outstanding requests")
                     .trans()?;
             }
+            self.drain_deferred_socket_cleanup();
+            self.rio.state_mut().forget_runtime_after_drain();
             self.rio.state_mut().kernel.close();
         } else if pending.rio_pending > 0 || self.rio.state().outstanding_count > 0 {
             self.preserve_rio_payloads_for_fast_close();

@@ -96,6 +96,7 @@ pub(crate) struct RioState {
     pub(crate) kernel: RioKernel,
     pub(crate) registry: RioRegistry,
     pub(crate) registration_mode: BufferRegistrationMode,
+    pub(crate) submissions_closed: bool,
     pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
     pub(crate) actor_by_handle: FxHashMap<SocketKey, ActorKey>,
     pub(crate) socket_runtime: FxHashMap<SocketKey, SocketRuntimeState>,

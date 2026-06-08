@@ -10,7 +10,10 @@ use crate::rio::core::submit_ops::RioRq;
 use crate::rio::core::{RioCompletionKind, RioOpRequestInit};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::release_socket_inflight_token_from;
-use crate::rio::{RioCompletionContext, RioEnv, RioState, SocketInflightToken, SocketRuntimeState};
+use crate::rio::{
+    RioCompletionContext, RioEnv, RioState, SocketInflightToken, SocketLifecycleState,
+    SocketRuntimeState,
+};
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use veloq_driver_core::driver::{
@@ -58,7 +61,7 @@ impl<'a> RioCompletionRouter<'a> {
     }
 
     fn release_socket_inflight(&mut self, socket_inflight: SocketInflightToken) {
-        release_socket_inflight_token_from(self.socket_runtime, socket_inflight);
+        let _ = release_socket_inflight_token_from(self.socket_runtime, socket_inflight);
     }
 
     fn handle_op_completion(&mut self, init: RioOpRequestInit, res: &RIORESULT) -> RioResult<()> {
@@ -198,6 +201,13 @@ impl RioState {
     ) -> RioResult<&mut RioSocketActor> {
         let (fd, handle) = target;
         let socket_key = handle.raw().actor_key();
+        if self.submissions_closed {
+            return RioError::InvalidInput
+                .with_ctx("socket_raw", socket_key.as_handle() as usize)
+                .with_ctx("outstanding_count", self.outstanding_count)
+                .attach_note("RIO runtime is shutting down; rejecting actor creation");
+        }
+
         if let Some(key) = self.actor_by_handle.get(&socket_key).copied() {
             return self
                 .actors
@@ -245,13 +255,25 @@ impl RioState {
         let _ = self.actors.remove(key);
     }
 
-    pub(crate) fn begin_shutdown(&mut self) {
+    pub(crate) fn stop_accepting_new_submissions(&mut self) {
+        self.submissions_closed = true;
         self.actor_by_handle.clear();
-        self.socket_runtime.clear();
-        self.actors.clear();
+        for state in self.socket_runtime.values_mut() {
+            state.lifecycle = SocketLifecycleState::Closing;
+        }
     }
 
-    pub(crate) fn shutdown_rio_actors(&mut self) {
+    pub(crate) fn forget_runtime_after_drain(&mut self) {
+        debug_assert_eq!(
+            self.outstanding_count, 0,
+            "forgetting RIO runtime before outstanding completions drained"
+        );
+        debug_assert!(
+            self.socket_runtime
+                .values()
+                .all(|state| state.inflight == 0),
+            "forgetting socket runtime before socket inflight counters drained"
+        );
         self.actors.clear();
         self.actor_by_handle.clear();
         self.socket_runtime.clear();

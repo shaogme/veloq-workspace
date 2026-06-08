@@ -37,6 +37,7 @@ impl RioState {
             kernel,
             registry: RioRegistry::new(rq_depth, entries as usize),
             registration_mode,
+            submissions_closed: false,
             actors: slotmap::SlotMap::with_key(),
             actor_by_handle: rustc_hash::FxHashMap::default(),
             socket_runtime: rustc_hash::FxHashMap::default(),
