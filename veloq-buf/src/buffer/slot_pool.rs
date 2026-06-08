@@ -219,10 +219,10 @@ impl BackingPool for SlotBasedPool {
 
         if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order, self.seed) {
             let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
-            let context_data = PackedContext::new(
+            let context_data = PackedContext::from_slot_parts(
                 slot_idx.get() as u32,
                 order as u8,
-                chunk_id.get(),
+                chunk_id,
                 PoolKind::SlotBased,
             );
             let context = u64::from(context_data);
@@ -305,7 +305,7 @@ pub(crate) unsafe fn slot_based_dealloc(pool_data: NonNull<()>, context: u64) {
     let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
 
     let ctx = PackedContext::from(context);
-    let chunk_id = ctx.chunk_id();
+    let chunk_id = ctx.slot_chunk_id();
     let order = ctx.order() as usize;
     let slot_idx = crate::heap::SlotIndex(ctx.slot_idx() as usize);
 
@@ -346,7 +346,7 @@ pub(crate) unsafe fn slot_based_resolve_region_info(
 
     // 2. Unpack ChunkID
     let ctx = PackedContext::from(buf.context_raw());
-    let chunk_id = crate::heap::ChunkId::from(ctx.chunk_id());
+    let chunk_id = ctx.slot_chunk_id();
 
     // 3. Get base address from ChunkInfo
     let chunk_info = pool

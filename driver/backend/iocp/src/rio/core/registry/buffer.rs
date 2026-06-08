@@ -4,6 +4,7 @@ use crate::rio::core::submit_ops::{RioBufferId, RioProvider};
 use crate::rio::error::{RioError, RioResult};
 use diagweave::prelude::*;
 use std::time::Instant;
+use veloq_buf::heap::ChunkId;
 use veloq_buf::{FixedBuf, PoolKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -21,7 +22,7 @@ pub(crate) struct RioHeapLeaseToken {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RioChunkRegistrationKey {
-    pub(crate) id: u16,
+    pub(crate) id: ChunkId,
     pub(crate) generation: u64,
 }
 
@@ -97,17 +98,17 @@ impl RioRegistry {
             return self.resolve_heap_id(buf, info.offset, env);
         }
 
-        let mut lease = self.current_chunk_lease(info.id.get());
+        let mut lease = self.current_chunk_lease(info.id);
 
         if lease.is_none()
             && let Some(chunk_info) = env.registrar.resolve_chunk_info(info.id)
         {
             self.register_chunk(
-                info.id.get(),
+                info.id,
                 (chunk_info.ptr.as_ptr(), chunk_info.len.get()),
                 env,
             )?;
-            lease = self.current_chunk_lease(info.id.get());
+            lease = self.current_chunk_lease(info.id);
         }
 
         match lease {
@@ -117,14 +118,14 @@ impl RioRegistry {
                 Some(RioBufferLeaseToken::Chunk(lease)),
             )),
             None => RioError::Internal
-                .with_ctx("chunk_id", info.id.as_usize())
+                .with_ctx("chunk_id", info.id.raw())
                 .attach_note("RIO chunk not registered"),
         }
     }
 
     pub(crate) fn register_chunk(
         &mut self,
-        id: u16,
+        id: ChunkId,
         mem: (*const u8, usize),
         env: RioEnv<'_>,
     ) -> RioResult<()> {
@@ -137,12 +138,12 @@ impl RioRegistry {
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
             return RioError::ResourceExhaustion
-                .with_ctx("chunk_id", id as usize)
+                .with_ctx("chunk_id", id.raw())
                 .attach_note("RIO chunk registration skipped due to recent failure");
         }
 
         let (ptr, len) = mem;
-        let id_idx = id as usize;
+        let id_idx = id.as_usize();
 
         if id_idx >= self.chunk_registry.len() {
             self.chunk_registry.resize(id_idx + 1, None);
@@ -163,7 +164,7 @@ impl RioRegistry {
                 self.chunk_register_failures_recent
                     .insert(id, Instant::now());
                 return Err(e)
-                    .with_ctx("chunk_id", id as usize)
+                    .with_ctx("chunk_id", id.raw())
                     .with_ctx("buffer_length", len)
                     .attach_note("RIORegisterBuffer failed for chunk");
             }
@@ -197,8 +198,8 @@ impl RioRegistry {
         self.next_registration_generation
     }
 
-    pub(crate) fn current_chunk_lease(&self, id: u16) -> Option<RioChunkLeaseToken> {
-        let entry = self.chunk_registry.get(id as usize)?.as_ref()?;
+    pub(crate) fn current_chunk_lease(&self, id: ChunkId) -> Option<RioChunkLeaseToken> {
+        let entry = self.chunk_registry.get(id.as_usize())?.as_ref()?;
         Some(RioChunkLeaseToken {
             key: RioChunkRegistrationKey {
                 id,
@@ -382,7 +383,7 @@ impl RioRegistry {
         let deregister = match location {
             RioChunkRegistrationLocation::Current => self
                 .chunk_registry
-                .get_mut(lease.key.id as usize)
+                .get_mut(lease.key.id.as_usize())
                 .and_then(Option::take)
                 .map(|entry| entry.registration.id),
             RioChunkRegistrationLocation::Retired => self
@@ -420,7 +421,7 @@ impl RioRegistry {
         key: RioChunkRegistrationKey,
     ) -> Option<&mut RioBufferRegistration> {
         self.chunk_registry
-            .get_mut(key.id as usize)?
+            .get_mut(key.id.as_usize())?
             .as_mut()
             .filter(|entry| entry.generation == key.generation)
             .map(|entry| &mut entry.registration)
@@ -468,7 +469,7 @@ impl RioRegistry {
     ) -> RioResult<RioChunkRegistrationLocation> {
         if let Some(entry) = self
             .chunk_registry
-            .get(lease.key.id as usize)
+            .get(lease.key.id.as_usize())
             .and_then(Option::as_ref)
             .filter(|entry| entry.generation == lease.key.generation)
         {
@@ -529,7 +530,7 @@ impl RioRegistry {
         RioError::Internal
             .to_report()
             .with_ctx("rio_buffer_lease_action", action)
-            .with_ctx("chunk_id", lease.key.id as usize)
+            .with_ctx("chunk_id", lease.key.id.as_usize())
             .with_ctx("chunk_generation", lease.key.generation)
             .with_ctx("rio_buffer_id", lease.id.0 as usize)
             .attach_note(note)
@@ -585,13 +586,14 @@ mod tests {
         let dispatch = test_dispatch();
         let env = test_env(&dispatch);
         let mut registry = RioRegistry::new(32, 1);
-        let chunk_id = 3;
+        let chunk_id = ChunkId::from_raw(3);
+        let chunk_index = chunk_id.as_usize();
         let key = RioChunkRegistrationKey {
             id: chunk_id,
             generation: 1,
         };
-        registry.chunk_registry.resize(chunk_id as usize + 1, None);
-        registry.chunk_registry[chunk_id as usize] = Some(RioChunkRegistration {
+        registry.chunk_registry.resize(chunk_index + 1, None);
+        registry.chunk_registry[chunk_index] = Some(RioChunkRegistration {
             generation: key.generation,
             registration: RioBufferRegistration::new(RioBufferId(41 as _)),
         });
@@ -602,7 +604,7 @@ mod tests {
         registry
             .acquire_buffer_lease(lease)
             .expect("chunk lease acquire should succeed");
-        let previous = registry.chunk_registry[chunk_id as usize]
+        let previous = registry.chunk_registry[chunk_index]
             .take()
             .expect("chunk registration");
         registry.retire_chunk_registration(key, previous.registration, env);
@@ -661,9 +663,10 @@ mod tests {
         let dispatch = test_dispatch();
         let env = test_env(&dispatch);
         let mut registry = RioRegistry::new(32, 1);
-        let chunk_id = 2;
-        registry.chunk_registry.resize(chunk_id as usize + 1, None);
-        registry.chunk_registry[chunk_id as usize] = Some(RioChunkRegistration {
+        let chunk_id = ChunkId::from_raw(2);
+        let chunk_index = chunk_id.as_usize();
+        registry.chunk_registry.resize(chunk_index + 1, None);
+        registry.chunk_registry[chunk_index] = Some(RioChunkRegistration {
             generation: 1,
             registration: RioBufferRegistration::new(RioBufferId(55 as _)),
         });
@@ -674,7 +677,7 @@ mod tests {
             .register_chunk(chunk_id, (&byte as *const u8, 1), env)
             .expect_err("failed registration should be reported");
 
-        let current = registry.chunk_registry[chunk_id as usize]
+        let current = registry.chunk_registry[chunk_index]
             .expect("existing chunk registration should remain current");
         assert_eq!(current.registration.id, RioBufferId(55 as _));
         assert!(registry.pending_deregistrations.is_empty());

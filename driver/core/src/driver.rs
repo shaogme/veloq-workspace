@@ -211,7 +211,7 @@ pub trait Driver {
 
     fn register_chunk(
         &mut self,
-        id: u16,
+        id: veloq_buf::heap::ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> DriverResult<(), Self::Error>;
@@ -322,7 +322,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     #[inline]
     fn register_chunk(
         &mut self,
-        id: u16,
+        id: veloq_buf::heap::ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> DriverResult<(), Self::Error> {

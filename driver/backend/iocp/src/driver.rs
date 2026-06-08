@@ -259,7 +259,12 @@ impl<'a> Driver for IocpDriver<'a> {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> IocpDriverResult<()> {
+    fn register_chunk(
+        &mut self,
+        id: veloq_buf::heap::ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> IocpDriverResult<()> {
         IocpDriver::register_chunk(self, id, ptr, len)
             .push_ctx("scope", "iocp/driver")
             .attach_note("register chunk failed")

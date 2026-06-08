@@ -37,8 +37,11 @@ pub(crate) type OnCompleteFn = unsafe fn(
 pub(crate) type DropFn = unsafe fn(op: &mut UringKernelOp);
 pub(crate) type GetTimeoutFn =
     unsafe fn(op: &UringKernelOp, payload: &UringUserPayload) -> Option<Duration>;
-pub(crate) type ResolveChunksFn =
-    unsafe fn(op: &UringKernelOp, payload: &UringUserPayload, chunks: &mut [u16]) -> usize;
+pub(crate) type ResolveChunksFn = unsafe fn(
+    op: &UringKernelOp,
+    payload: &UringUserPayload,
+    chunks: &mut [veloq_buf::heap::ChunkId],
+) -> usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionStrategy {

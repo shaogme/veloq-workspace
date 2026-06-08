@@ -88,7 +88,7 @@ pub struct UringDriver<'a> {
     pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
-    pub(crate) chunk_register_failures_recent: HashMap<u16, Instant>,
+    pub(crate) chunk_register_failures_recent: HashMap<veloq_buf::heap::ChunkId, Instant>,
     pub(crate) registered_files: Vec<Option<RegisteredFileEntry>>,
     pub(crate) file_generations: Vec<u64>,
     pub(crate) free_file_slots: Vec<u32>,
@@ -349,7 +349,12 @@ impl<'a> Driver for UringDriver<'a> {
         self.cancel_op_internal(user_data);
     }
 
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
+    fn register_chunk(
+        &mut self,
+        id: veloq_buf::heap::ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> DriverResult<()> {
         self.register_chunk_internal(id, ptr, len)
             .push_ctx("scope", "uring.driver.register_chunk")
             .with_ctx("driver_error_kind", UringError::Registration.to_string())

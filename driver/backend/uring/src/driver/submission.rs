@@ -38,7 +38,7 @@ impl<'a> UringDriver<'a> {
 
         match strategy {
             SubmissionStrategy::SubmitSqe => {
-                let mut chunks = [0u16; 4];
+                let mut chunks = [veloq_buf::heap::ChunkId::ZERO; 4];
                 let (count, sqe) = {
                     let driver_ptr = driver as *mut UringDriver;
                     let slot = sub_guard.slot.as_mut().ok_or_else(|| {
@@ -69,7 +69,7 @@ impl<'a> UringDriver<'a> {
                 };
 
                 for &chunk_id in chunks.iter().take(count) {
-                    let index = chunk_id as usize;
+                    let index = chunk_id.as_usize();
                     let is_registered = driver.registered_chunks.get(index).map_err(|e| {
                         UringError::InvalidState
                             .to_report()
@@ -80,18 +80,16 @@ impl<'a> UringDriver<'a> {
                     })?;
 
                     if !is_registered
-                        && let Some(info) = driver
-                            .registrar
-                            .resolve_chunk_info(veloq_buf::heap::ChunkId::from(chunk_id))
+                        && let Some(info) = driver.registrar.resolve_chunk_info(chunk_id)
                     {
                         if let Err(e) = driver.register_chunk_internal(
-                            info.id.get(),
+                            info.id,
                             info.ptr.as_ptr(),
                             info.len.get(),
                         ) {
                             if driver.registration_mode.is_strict() {
                                 return Err(e
-                                    .with_ctx("chunk_id", chunk_id as usize)
+                                    .with_ctx("chunk_id", chunk_id.raw())
                                     .with_ctx("user_data", user_data)
                                     .attach_note("strict mode lazy register failed"));
                             }
@@ -106,7 +104,7 @@ impl<'a> UringDriver<'a> {
                             return Err(UringError::InvalidState
                                 .to_report()
                                 .push_ctx("scope", "driver.submit_from_slot_raw.missing_chunk_info")
-                                .with_ctx("chunk_id", chunk_id as usize)
+                                .with_ctx("chunk_id", chunk_id.raw())
                                 .with_ctx("user_data", user_data)
                                 .attach_note(
                                     "strict mode missing chunk info for lazy registration",
@@ -115,7 +113,7 @@ impl<'a> UringDriver<'a> {
                         return Err(UringError::InvalidInput
                             .to_report()
                             .push_ctx("scope", "driver.submit_from_slot_raw.missing_chunk_info")
-                            .with_ctx("chunk_id", chunk_id as usize)
+                            .with_ctx("chunk_id", chunk_id.raw())
                             .with_ctx("user_data", user_data)
                             .attach_note("missing chunk info for lazy registration"));
                     }

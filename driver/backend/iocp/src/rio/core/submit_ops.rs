@@ -46,7 +46,12 @@ impl RioState {
         })
     }
 
-    pub(crate) fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> RioResult<()> {
+    pub(crate) fn register_chunk(
+        &mut self,
+        id: veloq_buf::heap::ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> RioResult<()> {
         let Some(env) = self
             .kernel
             .env(&veloq_buf::NoopRegistrar, self.registration_mode)

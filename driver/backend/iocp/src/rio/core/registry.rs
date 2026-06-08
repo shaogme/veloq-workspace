@@ -64,7 +64,7 @@ pub(crate) struct RioRegistry {
     pub(crate) pending_deregistrations: Vec<RioBufferId>,
     pub(crate) rq_depth: u32,
     pub(crate) registration_stats: RioRegistrationStats,
-    pub(crate) chunk_register_failures_recent: FxHashMap<u16, Instant>,
+    pub(crate) chunk_register_failures_recent: FxHashMap<veloq_buf::heap::ChunkId, Instant>,
     pub(crate) heap_register_failures_recent: FxHashMap<RioHeapBufferKey, Instant>,
     pub(crate) next_registration_generation: u64,
 }

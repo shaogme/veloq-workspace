@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::mpsc;
 
+use veloq_buf::heap::ChunkId;
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver_native::driver::{
     ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver,
@@ -72,7 +73,7 @@ impl<'a, 'ctx> DriverRegistrar<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'a, 'ctx> {
-    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> veloq_buf::BufResult<Vec<usize>> {
+    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> veloq_buf::BufResult<Vec<ChunkId>> {
         self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
     }
 
@@ -98,7 +99,7 @@ pub(crate) struct BorrowedRegistrar<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> veloq_buf::BufferRegistrar for BorrowedRegistrar<'a, 'ctx> {
-    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> veloq_buf::BufResult<Vec<usize>> {
+    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> veloq_buf::BufResult<Vec<ChunkId>> {
         register_internal(self.driver, self.state, regions)
     }
 
@@ -114,7 +115,7 @@ fn register_internal(
     driver: &RefCell<PlatformDriver<'_>>,
     state: &RefCell<WorkerRegistrarState>,
     regions: &[veloq_buf::BufferRegion],
-) -> veloq_buf::BufResult<Vec<usize>> {
+) -> veloq_buf::BufResult<Vec<ChunkId>> {
     let mut indices = Vec::with_capacity(regions.len());
     let mut new_chunks = Vec::with_capacity(regions.len());
 
@@ -123,7 +124,7 @@ fn register_internal(
         for region in regions {
             let chunk_id = region.id();
             driver
-                .register_chunk(chunk_id.get(), region.as_ptr(), region.len())
+                .register_chunk(chunk_id, region.as_ptr(), region.len())
                 .map_err(|err| std::io::Error::other(format!("{err:#}")))
                 .trans()?;
 
@@ -132,7 +133,7 @@ fn register_internal(
                 ptr: unsafe { std::ptr::NonNull::new_unchecked(region.as_ptr() as *mut u8) },
                 len: unsafe { std::num::NonZeroUsize::new_unchecked(region.len()) },
             });
-            indices.push(chunk_id.as_usize());
+            indices.push(chunk_id);
         }
     }
 
@@ -188,7 +189,7 @@ fn sync_to_driver_internal(
 
     if matches!(registration_mode, BufferRegistrationMode::Compatible) {
         for chunk in &new_chunks {
-            let _ = driver.register_chunk(chunk.id.get(), chunk.ptr.as_ptr(), chunk.len.get());
+            let _ = driver.register_chunk(chunk.id, chunk.ptr.as_ptr(), chunk.len.get());
         }
     }
 

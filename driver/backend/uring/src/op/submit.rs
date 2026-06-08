@@ -184,7 +184,7 @@ pub(crate) unsafe fn get_timeout_none(
 pub(crate) unsafe fn resolve_chunks_none(
     _op: &UringOp,
     _payload: &UringUserPayload,
-    _chunks: &mut [u16],
+    _chunks: &mut [veloq_buf::heap::ChunkId],
 ) -> usize {
     0
 }

@@ -544,15 +544,9 @@ impl GlobalSlotPool {
     ///
     /// # Safety
     /// - `chunk_id`, `index`, and `order` must match a previous allocation.
-    pub(crate) unsafe fn dealloc_slots(
-        &self,
-        chunk_id: impl Into<ChunkId>,
-        index: SlotIndex,
-        order: usize,
-    ) {
-        let chunk_id = chunk_id.into();
+    pub(crate) unsafe fn dealloc_slots(&self, chunk_id: ChunkId, index: SlotIndex, order: usize) {
         let chunks = self.chunks.read();
-        if let Some(chunk) = chunks.get(chunk_id.as_usize()) {
+        if let Some(chunk) = chunks.get(chunk_id.0 as usize) {
             // Verify ID just in case
             debug_assert_eq!(chunk.id, chunk_id);
             unsafe {
@@ -565,10 +559,9 @@ impl GlobalSlotPool {
     }
 
     /// Get Memory Info for a Chunk
-    pub fn chunk_info(&self, chunk_id: impl Into<ChunkId>) -> Option<ChunkInfo> {
-        let chunk_id = chunk_id.into();
+    pub fn chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
         let chunks = self.chunks.read();
-        chunks.get(chunk_id.as_usize()).map(|c| ChunkInfo {
+        chunks.get(chunk_id.0 as usize).map(|c| ChunkInfo {
             id: c.id,
             ptr: c.memory.ptr,
             len: c.memory.size,

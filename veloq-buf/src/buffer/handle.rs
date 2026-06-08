@@ -13,7 +13,7 @@ use diagweave::prelude::*;
 
 #[bitsize(64)]
 #[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
-pub struct PackedContext {
+pub(crate) struct PackedContext {
     pub slot_idx: u32,
     pub order: u8,
     pub chunk_id: u16,
@@ -27,8 +27,21 @@ pub(crate) struct HeapControlBlock {
 }
 
 impl PackedContext {
-    pub fn raw_payload(&self) -> u64 {
+    pub(crate) fn raw_payload(&self) -> u64 {
         u64::from(*self) & 0x00FFFFFFFFFFFFFF
+    }
+
+    pub(crate) fn from_slot_parts(
+        slot_idx: u32,
+        order: u8,
+        chunk_id: ChunkId,
+        pool_kind: PoolKind,
+    ) -> Self {
+        Self::new(slot_idx, order, chunk_id.0, pool_kind)
+    }
+
+    pub(crate) fn slot_chunk_id(&self) -> ChunkId {
+        ChunkId::from_raw(self.chunk_id())
     }
 }
 

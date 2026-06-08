@@ -139,7 +139,7 @@ pub trait BufferRegistrar {
     /// Register memory regions with the kernel.
     /// Returns a list of handles (tokens) corresponding to the regions.
     /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
-    fn register(&self, regions: &[BufferRegion]) -> super::error::BufResult<Vec<usize>>;
+    fn register(&self, regions: &[BufferRegion]) -> super::error::BufResult<Vec<ChunkId>>;
 
     /// Resolve chunk info for a given chunk_id.
     /// Used for lazy registration.
@@ -150,7 +150,7 @@ pub trait BufferRegistrar {
 pub struct NoopRegistrar;
 
 impl BufferRegistrar for NoopRegistrar {
-    fn register(&self, _regions: &[BufferRegion]) -> super::error::BufResult<Vec<usize>> {
+    fn register(&self, _regions: &[BufferRegion]) -> super::error::BufResult<Vec<ChunkId>> {
         Ok(Vec::new())
     }
 

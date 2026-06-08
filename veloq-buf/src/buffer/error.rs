@@ -21,7 +21,7 @@ set! {
         PageUnaligned { size: usize },
 
         #[display("Chunk {chunk_id} missing")]
-        ChunkMissing { chunk_id: u16 },
+        ChunkMissing { chunk_id: crate::heap::ChunkId },
 
         #[display("FixedBuf has invalid ChunkID")]
         InvalidChunkId,

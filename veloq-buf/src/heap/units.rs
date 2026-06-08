@@ -26,35 +26,31 @@ pub struct GlobalAllocatorConfig {
 pub struct ChunkId(pub(crate) u16);
 
 impl ChunkId {
-    pub(crate) const ZERO: Self = Self(0);
+    pub const ZERO: Self = Self(0);
 
-    #[inline]
-    pub const fn get(self) -> u16 {
-        self.0
-    }
-
-    #[inline]
-    pub const fn as_usize(self) -> usize {
-        self.0 as usize
+    #[cfg(not(debug_assertions))]
+    pub(crate) const fn from_raw(value: u16) -> Self {
+        Self(value)
     }
 
     #[inline]
     pub(crate) fn from_index(index: usize) -> Option<Self> {
-        u16::try_from(index).ok().map(Self)
+        u16::try_from(index).map(Self).ok()
     }
-}
 
-impl From<u16> for ChunkId {
-    #[inline]
-    fn from(value: u16) -> Self {
-        Self(value)
+    #[cfg(debug_assertions)]
+    pub const fn from_raw(raw: u16) -> Self {
+        Self(raw)
     }
-}
 
-impl PartialEq<u16> for ChunkId {
     #[inline]
-    fn eq(&self, other: &u16) -> bool {
-        self.0 == *other
+    pub fn raw(&self) -> u16 {
+        self.0
+    }
+
+    #[inline]
+    pub fn as_usize(&self) -> usize {
+        self.0 as usize
     }
 }
 
@@ -136,7 +132,6 @@ impl fmt::Debug for PageAlignedBytes {
 pub struct SlotCount(usize);
 
 impl SlotCount {
-
     #[inline]
     pub(crate) const fn get(self) -> usize {
         self.0
@@ -179,7 +174,6 @@ impl ShardIndex {
     pub(crate) const fn get(self) -> usize {
         self.0
     }
-
 }
 
 impl fmt::Debug for ShardIndex {

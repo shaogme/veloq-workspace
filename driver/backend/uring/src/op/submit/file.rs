@@ -4,6 +4,7 @@ use crate::op::{UringOp, UringUserPayload};
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use veloq_buf::PoolKind;
+use veloq_buf::heap::ChunkId;
 use veloq_driver_core::op::{checked_read_buf_range, checked_write_buf_range};
 
 use super::{invalid_buf_io_range, payload_variant_mismatch, resolve_any_fd, resolve_file_fd};
@@ -54,7 +55,7 @@ macro_rules! make_rw_fixed {
             };
 
             if is_registered {
-                let fixed_idx = region_info.id.get();
+                let fixed_idx = region_info.id.raw();
                 Ok($type_fixed(fixed_fd, ptr, len, fixed_idx)
                     .offset(offset)
                     .build())
@@ -107,7 +108,7 @@ macro_rules! make_rw_fixed {
             };
 
             if is_registered {
-                let fixed_idx = region_info.id.get();
+                let fixed_idx = region_info.id.raw();
                 Ok($type_fixed(fixed_fd, ptr, len, fixed_idx)
                     .offset(offset)
                     .build())
@@ -157,7 +158,7 @@ macro_rules! make_rw_raw {
             };
 
             if is_registered {
-                let fixed_idx = region_info.id.get();
+                let fixed_idx = region_info.id.raw();
                 Ok(opcode::WriteFixed::new(types::Fd(fd), ptr, len, fixed_idx)
                     .offset(rw_op.offset)
                     .build())
@@ -206,7 +207,7 @@ macro_rules! make_rw_raw {
             };
 
             if is_registered {
-                let fixed_idx = region_info.id.get();
+                let fixed_idx = region_info.id.raw();
                 Ok(opcode::ReadFixed::new(types::Fd(fd), ptr, len, fixed_idx)
                     .offset(rw_op.offset)
                     .build())
@@ -523,7 +524,7 @@ impl_lifecycle!(drop_open, Open, no_fd);
 pub(crate) unsafe fn resolve_chunks_read_fixed(
     _op: &UringOp,
     payload: &UringUserPayload,
-    chunks: &mut [u16],
+    chunks: &mut [ChunkId],
 ) -> usize {
     let rw_op = match payload {
         crate::op::UringUserPayload::ReadFixed(p) => p,
@@ -531,7 +532,7 @@ pub(crate) unsafe fn resolve_chunks_read_fixed(
     };
     let info = rw_op.buf.resolve_region_info();
     if info.pool_kind == PoolKind::SlotBased {
-        chunks[0] = info.id.get();
+        chunks[0] = info.id;
         1
     } else {
         0
@@ -541,7 +542,7 @@ pub(crate) unsafe fn resolve_chunks_read_fixed(
 pub(crate) unsafe fn resolve_chunks_read_raw(
     op: &UringOp,
     payload: &UringUserPayload,
-    chunks: &mut [u16],
+    chunks: &mut [ChunkId],
 ) -> usize {
     unsafe { resolve_chunks_read_fixed(op, payload, chunks) }
 }
@@ -549,7 +550,7 @@ pub(crate) unsafe fn resolve_chunks_read_raw(
 pub(crate) unsafe fn resolve_chunks_write_fixed(
     _op: &UringOp,
     payload: &UringUserPayload,
-    chunks: &mut [u16],
+    chunks: &mut [ChunkId],
 ) -> usize {
     let rw_op = match payload {
         crate::op::UringUserPayload::WriteFixed(p) => p,
@@ -557,7 +558,7 @@ pub(crate) unsafe fn resolve_chunks_write_fixed(
     };
     let info = rw_op.buf.resolve_region_info();
     if info.pool_kind == PoolKind::SlotBased {
-        chunks[0] = info.id.get();
+        chunks[0] = info.id;
         1
     } else {
         0
@@ -567,7 +568,7 @@ pub(crate) unsafe fn resolve_chunks_write_fixed(
 pub(crate) unsafe fn resolve_chunks_write_raw(
     op: &UringOp,
     payload: &UringUserPayload,
-    chunks: &mut [u16],
+    chunks: &mut [ChunkId],
 ) -> usize {
     unsafe { resolve_chunks_write_fixed(op, payload, chunks) }
 }

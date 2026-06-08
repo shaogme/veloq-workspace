@@ -4,7 +4,9 @@ use veloq::config::BufferRegistrationMode;
 use veloq::runtime::Runtime;
 #[cfg(feature = "test-hooks")]
 use veloq::runtime::context::RuntimeContext;
-use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq_buf::{
+    BufPool, PoolKind, RegionInfo, UniformSlot, heap::ChunkId, heap::ThreadMemoryMultiplier, nz,
+};
 
 #[cfg(feature = "test-hooks")]
 use veloq_driver_native::driver::test_hooks::DriverTestHooks;
@@ -15,6 +17,10 @@ fn build_runtime(worker_threads: usize, mode: BufferRegistrationMode) -> Runtime
         .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
         .build()
         .expect("failed to build runtime")
+}
+
+fn assert_slot_based(info: RegionInfo, message: &str) {
+    assert_eq!(info.pool_kind, PoolKind::SlotBased, "{message}");
 }
 
 #[cfg(feature = "test-hooks")]
@@ -38,12 +44,8 @@ fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
                 .alloc(alloc_size)
                 .unwrap_or_else(|| panic!("allocation failed before expansion validation, i={i}"));
             let info = buf.resolve_region_info();
-            assert_ne!(
-                info.id,
-                u16::MAX,
-                "auto expansion should not fallback to heap buffer"
-            );
-            if info.id != 0 {
+            assert_slot_based(info, "auto expansion should not fallback to heap buffer");
+            if info.id != ChunkId::ZERO {
                 expanded_chunk_id = Some(info.id);
             }
             bufs.push(buf);
@@ -89,8 +91,8 @@ fn run_expansion_immediate_registration_check(
                 .alloc(alloc_size)
                 .unwrap_or_else(|| panic!("allocation failed while triggering expansion, i={i}"));
             let info = buf.resolve_region_info();
-            assert_ne!(info.id, u16::MAX, "expansion should not fallback to heap");
-            if info.id != 0 {
+            assert_slot_based(info, "expansion should not fallback to heap");
+            if info.id != ChunkId::ZERO {
                 expanded = true;
             }
             bufs.push(buf);
@@ -136,12 +138,8 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
                 .alloc(alloc_size)
                 .unwrap_or_else(|| panic!("worker0 allocation failed, i={i}"));
             let info = buf.resolve_region_info();
-            assert_ne!(
-                info.id,
-                u16::MAX,
-                "expansion path should not fallback to heap"
-            );
-            if info.id != 0 {
+            assert_slot_based(info, "expansion path should not fallback to heap");
+            if info.id != ChunkId::ZERO {
                 expanded_chunk_id = Some(info.id);
                 holding.push(buf);
                 break;
@@ -157,14 +155,15 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
                     ctx.yield_now().await;
                     let pool = ctx.buf_pool();
                     let buf = pool.alloc(alloc_size).expect("worker allocation failed");
-                    buf.resolve_region_info().id
+                    buf.resolve_region_info()
                 }));
             }
 
             for h in handles {
-                let chunk_id = h.await.expect("task failed");
-                assert_ne!(chunk_id, u16::MAX, "worker should not fallback to heap");
-                assert_ne!(chunk_id, 0, "worker should see expanded chunk");
+                let info = h.await.expect("task failed");
+                assert_slot_based(info, "worker should not fallback to heap");
+                let chunk_id = info.id;
+                assert_ne!(chunk_id, ChunkId::ZERO, "worker should see expanded chunk");
                 assert!(
                     chunk_id >= expanded_id,
                     "worker chunk_id should be on or after expanded chunk"

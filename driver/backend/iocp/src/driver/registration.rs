@@ -366,7 +366,7 @@ impl<'a> IocpDriver<'a> {
     /// Registers a chunk of memory for RIO operations.
     pub(crate) fn register_chunk(
         &mut self,
-        id: u16,
+        id: veloq_buf::heap::ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> IocpDriverResult<()> {

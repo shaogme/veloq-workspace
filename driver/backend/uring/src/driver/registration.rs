@@ -113,7 +113,7 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn register_chunk_internal(
         &mut self,
-        id: u16,
+        id: veloq_buf::heap::ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> UringResult<()> {
@@ -128,16 +128,16 @@ impl<'a> UringDriver<'a> {
             return Err(UringError::Registration
                 .to_report()
                 .push_ctx("scope", "driver.register_chunk_internal")
-                .with_ctx("chunk_id", id as usize)
+                .with_ctx("chunk_id", id.raw())
                 .attach_note("recent chunk registration failure cooldown"));
         }
 
-        let index = id as usize;
+        let index = id.as_usize();
         if index >= MAX_CHUNKS {
             return Err(UringError::InvalidInput
                 .to_report()
                 .push_ctx("scope", "driver.register_chunk_internal")
-                .with_ctx("chunk_id", id as usize)
+                .with_ctx("chunk_id", index)
                 .with_ctx("max_chunks", MAX_CHUNKS)
                 .attach_note("chunk id exceeds maximum registered chunk count"));
         }

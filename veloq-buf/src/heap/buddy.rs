@@ -235,7 +235,11 @@ impl BuddyAllocator {
     /// # Safety
     /// index must be a valid allocated block start.
     /// order must match allocation order.
-    pub(crate) unsafe fn dealloc(&mut self, index: SlotIndex, order: usize) -> Result<(), BuddyError> {
+    pub(crate) unsafe fn dealloc(
+        &mut self,
+        index: SlotIndex,
+        order: usize,
+    ) -> Result<(), BuddyError> {
         let mut curr_idx = index;
         let mut curr_order = order;
 
