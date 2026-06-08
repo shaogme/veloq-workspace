@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use diagweave::prelude::*;
@@ -7,7 +8,7 @@ use veloq_buf::BufferRegistrar;
 use veloq_driver_core::driver::{
     CancelRequest, DriverCompletionDiagnostics, OpToken, SharedCompletionTable,
 };
-use veloq_driver_core::slot::{DetachedCancelTable, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{CheckedSlotView, DetachedCancelTable, SlotRegistryExt, SlotView};
 
 use crate::config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle};
 use crate::error::{IocpError, IocpResult};
@@ -30,6 +31,15 @@ enum ShutdownOpKind {
     Iocp,
     Rio,
     Immediate,
+}
+
+fn current_token(ops: &IocpOpRegistry, user_data: usize) -> Option<OpToken> {
+    let generation = ops
+        .shared
+        .slots
+        .get(user_data)?
+        .generation(Ordering::Acquire);
+    Some(OpToken::new(user_data, generation))
 }
 
 pub(super) struct IocpRioRuntime<'a> {
@@ -158,8 +168,11 @@ impl<'a> IocpDriver<'a> {
         let mut in_flight = Vec::new();
         let mut pending = ShutdownPending::default();
         for user_data in 0..self.ops.local.len() {
-            let kind = match self.ops.unchecked_slot_view(user_data) {
-                Some(SlotView::InFlightWaiting(mut slot)) => {
+            let Some(token) = current_token(&self.ops, user_data) else {
+                continue;
+            };
+            let kind = match self.ops.checked_slot_view(token) {
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                     if slot.platform().timer_id.is_some() {
                         Some(ShutdownOpKind::Immediate)
                     } else if slot
@@ -171,7 +184,7 @@ impl<'a> IocpDriver<'a> {
                         Some(ShutdownOpKind::Iocp)
                     }
                 }
-                Some(SlotView::InFlightOrphaned(slot)) => {
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
                     if slot.platform().timer_id.is_some() {
                         Some(ShutdownOpKind::Immediate)
                     } else if slot.op.as_ref().map(Self::is_rio_op).unwrap_or(false) {
@@ -191,12 +204,10 @@ impl<'a> IocpDriver<'a> {
                 ShutdownOpKind::Rio => pending.rio_pending += 1,
                 ShutdownOpKind::Immediate => {}
             }
-            in_flight.push(user_data);
+            in_flight.push(token);
         }
-        for user_data in in_flight {
-            let generation =
-                self.ops.shared.slots[user_data].generation(std::sync::atomic::Ordering::Acquire);
-            self.cancel_op_internal(CancelRequest::abandon(OpToken::new(user_data, generation)));
+        for token in in_flight {
+            self.cancel_op_internal(CancelRequest::abandon(token));
         }
         pending
     }
@@ -232,28 +243,31 @@ impl<'a> IocpDriver<'a> {
     fn preserve_rio_payloads_for_fast_close(&mut self) {
         let mut rio_slots = Vec::new();
         for user_data in 0..self.ops.local.len() {
-            let is_rio = match self.ops.unchecked_slot_view(user_data) {
-                Some(SlotView::InFlightWaiting(mut slot)) => slot
+            let Some(token) = current_token(&self.ops, user_data) else {
+                continue;
+            };
+            let is_rio = match self.ops.checked_slot_view(token) {
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => slot
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                     .unwrap_or(false),
-                Some(SlotView::InFlightOrphaned(slot)) => {
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
                     slot.op.as_ref().map(Self::is_rio_op).unwrap_or(false)
                 }
                 _ => false,
             };
             if is_rio {
-                rio_slots.push(user_data);
+                rio_slots.push(token);
             }
         }
 
         let mut payloads = Vec::new();
-        for user_data in rio_slots {
-            match self.ops.unchecked_slot_view(user_data) {
-                Some(SlotView::InFlightWaiting(mut slot)) => {
+        for token in rio_slots {
+            match self.ops.checked_slot_view(token) {
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                     slot.platform_mut().rio_cancel_requested = true;
                     let _ = slot.with_op_mut(|iocp_op| iocp_op.unbind_user_payload());
                 }
-                Some(SlotView::InFlightOrphaned(mut slot)) => {
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
                     slot.platform_mut().rio_cancel_requested = true;
                     if let Some(iocp_op) = slot.op.as_mut() {
                         iocp_op.unbind_user_payload();
@@ -264,7 +278,7 @@ impl<'a> IocpDriver<'a> {
 
             if let Some(payload) = self
                 .ops
-                .with_slot_storage_mut(user_data, |_result, payload, _sidecar| payload.take())
+                .with_slot_storage_mut(token.index(), |_result, payload, _sidecar| payload.take())
                 .flatten()
             {
                 payloads.push(payload);

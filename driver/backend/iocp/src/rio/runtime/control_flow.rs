@@ -111,7 +111,7 @@ impl<'a> RioCompletionRouter<'a> {
                     );
                     self.comp.diagnostics.record_completion_outcome(&outcome);
                     self.comp.events.push(event);
-                    let _ = ops.remove(user_data);
+                    let _ = ops.remove_token(op_token);
                 } else {
                     let cancelled = slot.platform().rio_cancel_requested;
                     let mut completion = if cancelled {
@@ -186,7 +186,7 @@ impl<'a> RioCompletionRouter<'a> {
                         self.comp.diagnostics.record_completion_outcome(&outcome);
                         self.comp.events.push(event);
                     }
-                    let _ = ops.remove(user_data);
+                    let _ = ops.remove_token(op_token);
                 }
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
@@ -219,7 +219,7 @@ impl<'a> RioCompletionRouter<'a> {
                     let _ = guard.take_completion_data();
                     let _ = std::mem::take(guard.platform_mut());
                     drop(guard);
-                    ops.recycle(user_data, generation.wrapping_add(1));
+                    let _ = ops.recycle_token(op_token, generation.wrapping_add(1));
                 }
             }
             CheckedSlotView::Valid(SlotView::Reserved(_)) | CheckedSlotView::Corrupt(_) => {
@@ -228,7 +228,7 @@ impl<'a> RioCompletionRouter<'a> {
                     user_data,
                     generation, "RIO completion found corrupt or reserved slot"
                 );
-                let _ = ops.recycle_if_active(user_data, generation.wrapping_add(1));
+                let _ = ops.recycle_token(op_token, generation.wrapping_add(1));
             }
             CheckedSlotView::Missing { .. } => {
                 self.comp.diagnostics.inc_unknown_completion();

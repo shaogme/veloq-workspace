@@ -70,7 +70,7 @@ impl<'a> UringDriver<'a> {
                 if request.mode == CancelMode::UserVisible {
                     self.push_completion_event(sidecar);
                 }
-                self.ops.remove(user_data);
+                let _ = self.ops.remove_token(token);
             }
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                 if let Some(tid) = slot.platform_mut().timer_id {
@@ -90,7 +90,7 @@ impl<'a> UringDriver<'a> {
                     };
                     self.wheel.cancel(tid);
                     self.push_completion_event(sidecar);
-                    self.ops.remove(user_data);
+                    let _ = self.ops.remove_token(token);
                     return;
                 }
 
@@ -106,7 +106,7 @@ impl<'a> UringDriver<'a> {
                     let sidecar = cancel_slot_immediate(slot, token);
                     self.wheel.cancel(tid);
                     self.push_completion_event(sidecar);
-                    self.ops.remove(user_data);
+                    let _ = self.ops.remove_token(token);
                     return;
                 }
 
@@ -142,9 +142,10 @@ impl<'a> UringDriver<'a> {
                     has_payload = snapshot.has_payload,
                     "cancel request found corrupt slot; recycling"
                 );
-                let _ = self
-                    .ops
-                    .recycle_if_active(user_data, snapshot.generation.wrapping_add(1));
+                let _ = self.ops.recycle_token(
+                    OpToken::new(user_data, snapshot.generation),
+                    snapshot.generation.wrapping_add(1),
+                );
             }
         }
     }

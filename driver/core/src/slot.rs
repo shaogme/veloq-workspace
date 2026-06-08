@@ -352,47 +352,10 @@ pub enum CheckedSlotView<'a, Spec: SlotSpec> {
 }
 
 pub trait SlotRegistryExt<Spec: SlotSpec> {
-    fn unchecked_slot_view(&mut self, index: usize) -> Option<SlotView<'_, Spec>>;
     fn checked_slot_view(&mut self, token: OpToken) -> CheckedSlotView<'_, Spec>;
-    fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Spec>;
 }
 
 impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
-    #[inline]
-    fn unchecked_slot_view(&mut self, index: usize) -> Option<SlotView<'_, Spec>> {
-        let (entry, op_entry, op, storage) = self.get_slot_entry_op_storage_and_entry_mut(index)?;
-        match entry.state(Ordering::Acquire) {
-            SlotState::Reserved => Slot::<Reserved, Spec>::try_bind(
-                entry,
-                op,
-                storage,
-                &mut op_entry.platform_data,
-                index,
-            )
-            .map(SlotView::Reserved),
-            SlotState::InFlightWaiting => Slot::<InFlightWaiting, Spec>::try_bind(
-                entry,
-                op,
-                storage,
-                &mut op_entry.platform_data,
-                index,
-            )
-            .map(SlotView::InFlightWaiting),
-            SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Spec>::try_bind(
-                entry,
-                op,
-                storage,
-                &mut op_entry.platform_data,
-                index,
-            )
-            .map(SlotView::InFlightOrphaned),
-            SlotState::Idle
-            | SlotState::InFlightReady
-            | SlotState::Finalizing
-            | SlotState::ReservedValue => None,
-        }
-    }
-
     #[inline]
     fn checked_slot_view(&mut self, token: OpToken) -> CheckedSlotView<'_, Spec> {
         let (index, expected_generation) = token.parts();
@@ -428,11 +391,7 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
             | SlotState::InFlightReady
             | SlotState::Finalizing
             | SlotState::ReservedValue => return CheckedSlotView::Empty(snapshot),
-            SlotState::Reserved => {
-                if !snapshot.has_payload {
-                    return CheckedSlotView::Corrupt(snapshot);
-                }
-            }
+            SlotState::Reserved => {}
         }
 
         match state {
@@ -472,15 +431,6 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
             | SlotState::ReservedValue => CheckedSlotView::Empty(snapshot),
         }
     }
-
-    #[inline]
-    fn slot_reserve(&mut self, index: usize) -> Slot<'_, Reserved, Spec> {
-        let (entry, op_entry, op, storage) = self
-            .get_slot_entry_op_storage_and_entry_mut(index)
-            .expect("slot missing in registry during reserve");
-        entry.set_state(SlotState::Reserved, Ordering::Release);
-        Slot::new_internal(entry, op, storage, &mut op_entry.platform_data, index)
-    }
 }
 
 #[cfg(test)]
@@ -511,9 +461,17 @@ mod tests {
         let completion_token = CompletionToken::user(token);
 
         {
-            let slot = registry
-                .slot_reserve(handle.index)
-                .init_op_with(DummyPlatformOp, |_| {});
+            registry
+                .with_slot_storage_mut(handle.index, |_result, payload, _sidecar| {
+                    *payload = Some(());
+                })
+                .expect("slot storage should exist");
+            let slot = match registry.checked_slot_view(token) {
+                CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
+                    slot.init_op_with(DummyPlatformOp, |_| {})
+                }
+                _ => panic!("reserved slot should be available"),
+            };
             let _in_flight = slot.start_submission_with(None).persist();
         }
 
@@ -527,7 +485,10 @@ mod tests {
             None,
         );
 
-        assert!(registry.unchecked_slot_view(handle.index).is_none());
+        assert!(matches!(
+            registry.checked_slot_view(token),
+            CheckedSlotView::Empty(_)
+        ));
         let record = match registry.shared.try_take_record(completion_token) {
             crate::driver::PollRecordResult::Ready(record) => record,
             crate::driver::PollRecordResult::Pending => panic!("completion should be ready"),

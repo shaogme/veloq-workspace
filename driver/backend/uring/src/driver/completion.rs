@@ -78,7 +78,6 @@ impl<'a> UringDriver<'a> {
 
         let timer_buffer = std::mem::take(&mut self.timer_buffer);
         for token in timer_buffer {
-            let user_data = token.index();
             let sidecar = match self.ops.checked_slot_view(token) {
                 CheckedSlotView::Valid(slot) => match slot {
                     SlotView::InFlightWaiting(mut slot) => {
@@ -114,7 +113,7 @@ impl<'a> UringDriver<'a> {
 
             if let Some(sidecar) = sidecar {
                 self.push_completion_event(sidecar);
-                self.ops.remove(user_data);
+                let _ = self.ops.remove_token(token);
             }
         }
     }
@@ -190,13 +189,13 @@ impl<'a> UringDriver<'a> {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
                 let sidecar = complete_waiting_slot(slot, token, cqe_res, cqe_flags);
                 self.push_completion_event(sidecar);
-                self.ops.remove(user_data);
+                let _ = self.ops.remove_token(token);
                 1
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
                 let sidecar = complete_orphaned_slot(slot, token, cqe_res, cqe_flags);
                 self.push_completion_event(sidecar);
-                self.ops.remove(user_data);
+                let _ = self.ops.remove_token(token);
                 1
             }
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
@@ -294,7 +293,7 @@ impl<'a> UringDriver<'a> {
 
         self.is_waked.store(false, Ordering::Release);
         if let Some(token) = self.waker_token.take() {
-            self.ops.remove(token.index());
+            let _ = self.ops.remove_token(token);
         }
         if let Err(e) = self.submit_waker() {
             self.completion_diagnostics.inc_waker_rebuild();
@@ -357,9 +356,10 @@ impl<'a> UringDriver<'a> {
             payload,
             detail,
         });
-        let _ = self
-            .ops
-            .recycle_if_active(snapshot.index, snapshot.generation.wrapping_add(1));
+        let _ = self.ops.recycle_token(
+            OpToken::new(snapshot.index, snapshot.generation),
+            snapshot.generation.wrapping_add(1),
+        );
     }
 
     pub(crate) fn push_completion_event(

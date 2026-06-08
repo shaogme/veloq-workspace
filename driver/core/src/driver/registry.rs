@@ -1,4 +1,5 @@
 use crate::DriverResult;
+use crate::driver::OpToken;
 use crate::slot::{
     SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData, SlotSidecarData,
     SlotSpec, SlotState, SlotStorage, SlotTable,
@@ -223,39 +224,32 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         user_data < self.local.len()
     }
 
-    pub fn remove(&mut self, user_data: usize) -> OpEntry<RegistryPlatformData<Spec>> {
-        assert!(user_data < self.local.len(), "Invalid user_data for remove");
-
+    fn remove_index(&mut self, user_data: usize) -> OpEntry<RegistryPlatformData<Spec>> {
         let local = &mut self.local[user_data];
         let _ = local.op.take();
         let data = std::mem::take(&mut local.entry.platform_data);
         local.storage.reset();
         self.shared.slots[user_data].free();
         self.shared.push_free(user_data);
-        self.active_count -= 1;
+        self.active_count = self.active_count.saturating_sub(1);
 
         OpEntry {
             platform_data: data,
         }
     }
 
-    pub fn remove_if_active(&mut self, user_data: usize) -> bool {
-        if user_data >= self.local.len()
-            || self.shared.slots[user_data].state(Ordering::Acquire) == SlotState::Idle
-        {
-            return false;
+    pub fn remove_token(&mut self, token: OpToken) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
+        let (user_data, generation) = token.parts();
+        let slot = self.shared.slots.get(user_data)?;
+        let core = slot.load_core_state(Ordering::Acquire);
+        if core.state() == SlotState::Idle || core.generation() != generation {
+            return None;
         }
 
-        let _ = self.remove(user_data);
-        true
+        Some(self.remove_index(user_data))
     }
 
-    pub fn recycle(&mut self, user_data: usize, generation: u32) {
-        assert!(
-            user_data < self.local.len(),
-            "Invalid user_data for recycle"
-        );
-
+    fn recycle_index(&mut self, user_data: usize, generation: u32) {
         let local = &mut self.local[user_data];
         let _ = local.op.take();
         let _ = std::mem::take(&mut local.entry.platform_data);
@@ -266,17 +260,20 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         }
         self.shared.slots[user_data].reset(generation);
         self.shared.push_free(user_data);
-        self.active_count -= 1;
+        self.active_count = self.active_count.saturating_sub(1);
     }
 
-    pub fn recycle_if_active(&mut self, user_data: usize, generation: u32) -> bool {
-        if user_data >= self.local.len()
-            || self.shared.slots[user_data].state(Ordering::Acquire) == SlotState::Idle
-        {
+    pub fn recycle_token(&mut self, token: OpToken, next_generation: u32) -> bool {
+        let (user_data, generation) = token.parts();
+        let Some(slot) = self.shared.slots.get(user_data) else {
+            return false;
+        };
+        let core = slot.load_core_state(Ordering::Acquire);
+        if core.state() == SlotState::Idle || core.generation() != generation {
             return false;
         }
 
-        self.recycle(user_data, generation);
+        self.recycle_index(user_data, next_generation);
         true
     }
 

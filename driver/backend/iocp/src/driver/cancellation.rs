@@ -39,7 +39,6 @@ impl<'a> IocpDriver<'a> {
             self.timer.cancel(tid);
             if let Some(outcome) = Self::abort_slot_inner(
                 emit_ctx,
-                user_data,
                 &mut self.ops,
                 request.mode == CancelMode::UserVisible,
                 token,
@@ -58,13 +57,12 @@ impl<'a> IocpDriver<'a> {
                 let ctx = CancelContext {
                     registered_slots: self.handles.registered_slots(),
                 };
-                let status = Self::perform_cancel(ctx, user_data, &mut self.ops);
+                let status = Self::perform_cancel(ctx, token, &mut self.ops);
                 self.record_cancel_status(status);
             }
             CheckedSlotView::Valid(SlotView::Reserved(_)) => {
                 if let Some(outcome) = Self::abort_slot_inner(
                     emit_ctx,
-                    user_data,
                     &mut self.ops,
                     request.mode == CancelMode::UserVisible,
                     token,
@@ -125,11 +123,12 @@ impl<'a> IocpDriver<'a> {
 
     fn perform_cancel(
         ctx: CancelContext<'_>,
-        user_data: usize,
+        token: OpToken,
         ops: &mut IocpOpRegistry,
     ) -> IocpResult<CancelPerformStatus> {
-        let status = match ops.unchecked_slot_view(user_data) {
-            Some(SlotView::InFlightWaiting(mut guard)) => {
+        let user_data = token.index();
+        let status = match ops.checked_slot_view(token) {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(mut guard)) => {
                 let is_rio = guard
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                     .unwrap_or(false);
@@ -165,7 +164,7 @@ impl<'a> IocpDriver<'a> {
                     }
                 }
             }
-            Some(SlotView::InFlightOrphaned(mut guard)) => {
+            CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut guard)) => {
                 let is_rio = guard.op.as_ref().map(Self::is_rio_op).unwrap_or(false);
 
                 if is_rio {
@@ -209,18 +208,18 @@ impl<'a> IocpDriver<'a> {
 
     fn abort_slot_inner(
         ctx: EmitContext<'_>,
-        user_data: usize,
         ops: &mut IocpOpRegistry,
         emit_completion: bool,
         token: OpToken,
     ) -> Option<RecordCompletionOutcome> {
-        let inflight = match ops.unchecked_slot_view(user_data) {
-            Some(SlotView::InFlightWaiting(guard)) => {
+        let user_data = token.index();
+        let inflight = match ops.checked_slot_view(token) {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(guard)) => {
                 let mut guard = guard.complete();
                 let _ = guard.take_op();
                 Some(guard.take_completion_data())
             }
-            Some(SlotView::InFlightOrphaned(guard)) => {
+            CheckedSlotView::Valid(SlotView::InFlightOrphaned(guard)) => {
                 let mut guard = guard.complete();
                 let _ = guard.take_op();
                 Some(guard.take_completion_data())
@@ -255,7 +254,7 @@ impl<'a> IocpDriver<'a> {
             None
         };
 
-        ops.remove(user_data);
+        let _ = ops.remove_token(token);
         outcome
     }
 }

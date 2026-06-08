@@ -161,16 +161,9 @@ impl<'a> Driver for IocpDriver<'a> {
     }
 
     fn release_op_slot_raw(&mut self, token: OpToken) {
-        use std::sync::atomic::Ordering;
-
-        let user_data = token.index();
-        let Some(slot) = self.ops.shared.slots.get(user_data) else {
-            return;
-        };
-        let generation = slot.generation(Ordering::Acquire);
         let _ = self
             .ops
-            .recycle_if_active(user_data, generation.wrapping_add(1));
+            .recycle_token(token, token.generation().wrapping_add(1));
     }
 
     fn submit_op_raw(

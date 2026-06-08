@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -9,7 +8,7 @@ use veloq_driver_core::driver::{
     CompletionToken, DriverSubmitResult, OpToken, SharedCompletionQueue, SharedCompletionTable,
     SubmitStatus,
 };
-use veloq_driver_core::slot::{Reserved, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{CheckedSlotView, Reserved, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::config::IoFd;
@@ -69,7 +68,15 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpResult<Slot<'_, Reserved>> {
         let user_data = token.index();
         let generation = token.generation();
-        let mut guard = ops.slot_reserve(user_data);
+        let mut guard = match ops.checked_slot_view(token) {
+            CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot,
+            _ => {
+                return IocpError::InvalidState
+                    .with_ctx("user_data", user_data)
+                    .with_ctx("generation", generation)
+                    .attach_note("reserved IOCP slot missing during preparation");
+            }
+        };
         guard.platform_mut().generation = generation;
         guard.platform_mut().rio_cancel_requested = false;
         let mut guard = guard.init_op_with(op, |sidecar| {
@@ -112,9 +119,10 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         task: BlockingTask,
     ) -> IocpDriverResult<Poll<()>> {
-        let user_data = token.index();
         if !BlockingBridge::submit(task) {
-            if let Some(SlotView::InFlightWaiting(slot)) = ops.unchecked_slot_view(user_data) {
+            if let CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) =
+                ops.checked_slot_view(token)
+            {
                 let mut guard = slot.complete();
                 let _ = guard.take_op();
                 let (payload, detail) = guard.take_completion_data();
@@ -131,8 +139,7 @@ impl<'a> IocpDriver<'a> {
                     completion_record(sidecar),
                 );
             }
-            let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
-            ops.recycle(user_data, generation.wrapping_add(1));
+            let _ = ops.recycle_token(token, token.generation().wrapping_add(1));
             return Err(IocpError::Submission.report("iocp/driver", "thread pool overloaded"));
         }
         Ok(Poll::Pending)
@@ -145,7 +152,6 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         op_in: &mut Option<IocpOp>,
     ) -> DriverSubmitResult<IocpError> {
-        let user_data = token.index();
         match result {
             Ok(submit::SubmissionResult::Pending) => DriverSubmitResult::submitted(Poll::Pending),
             Ok(submit::SubmissionResult::PostToQueue) => {
@@ -165,7 +171,9 @@ impl<'a> IocpDriver<'a> {
                 Self::handle_timer_sub(ops, ctx, token, duration)
             }
             Err(e) => {
-                if let Some(SlotView::InFlightWaiting(slot)) = ops.unchecked_slot_view(user_data) {
+                if let CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) =
+                    ops.checked_slot_view(token)
+                {
                     let mut guard = slot.complete();
                     *op_in = guard.take_op();
                 }
@@ -183,10 +191,11 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         op_in: &mut Option<IocpOp>,
     ) -> DriverSubmitResult<IocpError> {
-        let user_data = token.index();
         let completion_key = CompletionToken::user(token).raw() as usize;
         if let Err(err) = ctx.port.notify(completion_key) {
-            if let Some(SlotView::InFlightWaiting(slot)) = ops.unchecked_slot_view(user_data) {
+            if let CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) =
+                ops.checked_slot_view(token)
+            {
                 let mut guard = slot.complete();
                 *op_in = guard.take_op();
             }

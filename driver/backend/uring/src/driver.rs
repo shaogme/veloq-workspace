@@ -32,7 +32,7 @@ pub(crate) use registration::{
     MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,
 };
 
-use crate::op::slot::{UringOpRegistry, UringOpRegistryExt, UringSlotSpec};
+use crate::op::slot::{UringOpRegistry, UringSlotSpec};
 
 type DriverResult<T> = CoreDriverResult<T, UringError>;
 pub(crate) struct EventFd {
@@ -251,7 +251,6 @@ impl<'a> Driver for UringDriver<'a> {
                 generation,
             }) => {
                 trace!(id, generation, "Reserved op slot");
-                self.ops.slot_reserve(id);
                 Ok(OpToken::new(id, generation))
             }
             Err(_) => {
@@ -287,8 +286,7 @@ impl<'a> Driver for UringDriver<'a> {
     }
 
     fn release_op_slot_raw(&mut self, token: OpToken) {
-        let user_data = token.index();
-        let _ = self.ops.remove_if_active(user_data);
+        let _ = self.ops.remove_token(token);
     }
 
     fn submit_op_raw(

@@ -73,7 +73,7 @@ impl<'a> IocpDriver<'a> {
                 .record_completion_outcome(&outcome);
         }
         for token in finished_timers {
-            self.ops.remove(token.index());
+            let _ = self.ops.remove_token(token);
         }
         self.timer.restore_cleared_buffer(timer_buffer);
     }
@@ -112,7 +112,7 @@ impl<'a> IocpDriver<'a> {
         match self.completion_route(token) {
             CompletionRoute::Waiting => {
                 let io_result =
-                    self.calculate_io_result(user_data, success, error_code, bytes_transferred);
+                    self.calculate_io_result(token, success, error_code, bytes_transferred);
                 self.release_socket_inflight_for_op(user_data);
                 let ctx = EmitContext {
                     completion_events: self.completion.events(),
@@ -126,8 +126,8 @@ impl<'a> IocpDriver<'a> {
             }
             CompletionRoute::Orphaned => {
                 self.release_socket_inflight_for_op(user_data);
-                let Some(SlotView::InFlightOrphaned(slot)) =
-                    self.ops.unchecked_slot_view(user_data)
+                let CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) =
+                    self.ops.checked_slot_view(token)
                 else {
                     return;
                 };
@@ -146,7 +146,7 @@ impl<'a> IocpDriver<'a> {
                 let _ = completed.take_op();
                 let _ = completed.take_completion_data();
                 self.ops
-                    .recycle(user_data, completed_generation.wrapping_add(1));
+                    .recycle_token(token, completed_generation.wrapping_add(1));
                 self.completion_diagnostics.inc_user_orphan_completed();
             }
             CompletionRoute::Missing | CompletionRoute::Empty => {
@@ -171,7 +171,7 @@ impl<'a> IocpDriver<'a> {
                 );
                 self.release_socket_inflight_for_op(user_data);
                 self.ops
-                    .recycle_if_active(user_data, completed_generation.wrapping_add(1));
+                    .recycle_token(token, completed_generation.wrapping_add(1));
             }
         }
     }
@@ -192,22 +192,23 @@ impl<'a> IocpDriver<'a> {
     #[inline]
     pub(super) fn with_inflight_slot<R>(
         ops: &mut IocpOpRegistry,
-        index: usize,
+        token: OpToken,
         f: impl FnOnce(Slot<'_, InFlightWaiting>) -> R,
     ) -> Option<R> {
-        match ops.unchecked_slot_view(index)? {
-            SlotView::InFlightWaiting(slot) => Some(f(slot)),
+        match ops.checked_slot_view(token) {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => Some(f(slot)),
             _ => None,
         }
     }
 
     fn calculate_io_result(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         success: bool,
         error_code: Option<u32>,
         bytes_transferred: u32,
     ) -> IocpResult<usize> {
+        let user_data = token.index();
         let mut io_result = if !success {
             Err(IocpError::CompletionWait.io_report(
                 "iocp.driver.calculate_io_result",
@@ -217,7 +218,7 @@ impl<'a> IocpDriver<'a> {
             Ok(bytes_transferred as usize)
         };
 
-        let processed = Self::with_inflight_slot(&mut self.ops, user_data, |mut guard| {
+        let processed = Self::with_inflight_slot(&mut self.ops, token, |mut guard| {
             let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
                 let blocking_res = iocp_op
                     .header
@@ -271,7 +272,7 @@ impl<'a> IocpDriver<'a> {
         let user_data = token.index();
         let mut should_free = false;
         let mut sidecar_to_push = None;
-        let handled = Self::with_inflight_slot(ops, user_data, |guard| {
+        let handled = Self::with_inflight_slot(ops, token, |guard| {
             let completion_res = io_result_to_event_res(&io_result);
             let mut io_detail = io_result.err().map(Err);
             let mut guard = guard.complete();
@@ -310,13 +311,13 @@ impl<'a> IocpDriver<'a> {
                 completion_record(sidecar),
             );
             if handled.is_some() && should_free {
-                ops.remove(user_data);
+                let _ = ops.remove_token(token);
             }
             return Some(outcome);
         }
 
         if handled.is_some() && should_free {
-            ops.remove(user_data);
+            let _ = ops.remove_token(token);
         }
         None
     }

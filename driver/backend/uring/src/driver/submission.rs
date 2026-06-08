@@ -6,7 +6,7 @@ use crate::config::{RawHandle, UringRawHandle};
 use crate::driver::UringDriver;
 use crate::driver::lifecycle::UringOpState;
 use crate::error::{UringError, UringResult};
-use crate::op::slot::{Slot, SlotView, UringOpRegistryExt};
+use crate::op::slot::{CheckedSlotView, Slot, SlotView, UringOpRegistryExt};
 use crate::op::{SubmissionStrategy, UringOp, UringUserPayload};
 
 use veloq_driver_core::driver::registry::{AllocResult, OpHandle};
@@ -230,10 +230,15 @@ impl<'a> UringDriver<'a> {
             self.slot_set_payload_raw(token, UringUserPayload::Wakeup(payload));
 
             let driver_ptr = self as *mut UringDriver;
-            let slot = self
-                .ops
-                .slot_reserve(user_data)
-                .init_op_with(uring_op, |_| {});
+            let slot = match self.ops.checked_slot_view(token) {
+                CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
+                    slot.init_op_with(uring_op, |_| {})
+                }
+                _ => {
+                    return Err(UringError::InvalidState
+                        .report("driver.submit_waker", "reserved waker slot disappeared"));
+                }
+            };
             match unsafe { Self::submit_from_slot_raw(driver_ptr, token, slot) } {
                 Ok(true) => {}
                 Ok(false) => self.push_backlog(token),
