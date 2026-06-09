@@ -101,6 +101,14 @@ where
     },
 }
 
+pub enum CompletionBackendIngressAction<Spec, Effect>
+where
+    Spec: slot::SlotSpec,
+{
+    RouteUser(UserCompletionEvent),
+    Finish(CompletionHookOutcome<Spec, Effect>),
+}
+
 pub trait CompletionBackendHooks<Spec>
 where
     Spec: slot::SlotSpec,
@@ -142,8 +150,8 @@ where
     fn complete_backend_ingress(
         &mut self,
         _ingress: &Self::BackendIngress,
-    ) -> Result<UserCompletionEvent, CompletionHookOutcome<Spec, Self::BackendEffect>> {
-        Err(CompletionHookOutcome::Ignore {
+    ) -> CompletionBackendIngressAction<Spec, Self::BackendEffect> {
+        CompletionBackendIngressAction::Finish(CompletionHookOutcome::Ignore {
             effect: Self::BackendEffect::default(),
         })
     }
@@ -329,14 +337,16 @@ where
                 CompletionSource::Synthetic(source),
             ),
             CompletionIngress::Backend(backend) => match hooks.complete_backend_ingress(&backend) {
-                Ok(event) => self.accept_user_event(
+                CompletionBackendIngressAction::RouteUser(event) => self.accept_user_event(
                     table,
                     diagnostics,
                     hooks,
                     event,
                     CompletionSource::Backend(&backend),
                 ),
-                Err(outcome) => finish_hook_outcome(self, table, diagnostics, hooks, outcome, None),
+                CompletionBackendIngressAction::Finish(outcome) => {
+                    finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
+                }
             },
             CompletionIngress::Anomaly(anomaly) => finish_anomaly(self, diagnostics, anomaly),
         }

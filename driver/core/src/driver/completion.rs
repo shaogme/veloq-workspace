@@ -9,9 +9,9 @@ mod types;
 use crate::driver::registry::OpRegistry;
 use crate::slot::{self, CheckedSlotView, SlotRegistryExt, SlotView};
 pub use flow::{
-    CompletionBackendHooks, CompletionControl, CompletionFlowExt, CompletionFlowOutcome,
-    CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionWritePermit,
-    SyntheticCompletionSource,
+    CompletionBackendHooks, CompletionBackendIngressAction, CompletionControl, CompletionFlowExt,
+    CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
+    CompletionWritePermit, SyntheticCompletionSource,
 };
 pub use table::{
     CELL_STATE_BUSY, CELL_STATE_IDLE, CELL_STATE_ORPHANED, CELL_STATE_READY, CELL_STATE_WAITING,

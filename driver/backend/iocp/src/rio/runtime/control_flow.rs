@@ -16,9 +16,9 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionBackendHooks, CompletionControl,
-    CompletionFlowExt, CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
-    RawCompletion, SharedCompletionTable, UserCompletionEvent,
+    CompletionAnomaly, CompletionBackend, CompletionBackendHooks, CompletionBackendIngressAction,
+    CompletionControl, CompletionFlowExt, CompletionHookOutcome, CompletionIngress,
+    CompletionSource, CompletionToken, RawCompletion, SharedCompletionTable, UserCompletionEvent,
 };
 use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -193,11 +193,8 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for RioCompletionHooks<'_> 
     fn complete_backend_ingress(
         &mut self,
         ingress: &Self::BackendIngress,
-    ) -> Result<
-        UserCompletionEvent,
-        CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect>,
-    > {
-        Ok(UserCompletionEvent::from_parts(
+    ) -> CompletionBackendIngressAction<crate::op::IocpSlotSpec, Self::BackendEffect> {
+        CompletionBackendIngressAction::RouteUser(UserCompletionEvent::from_parts(
             CompletionBackend::Rio,
             ingress.init.token,
             ingress.result.raw_res(),
