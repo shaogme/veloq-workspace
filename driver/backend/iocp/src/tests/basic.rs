@@ -184,8 +184,8 @@ fn test_close_owned_registered_file_unregisters_and_rejects_stale_fd() {
         .unwrap();
     let idx = fd.fixed_index() as usize;
 
-    let (user_data, generation) = submit_test_op(&mut driver, Close { fd });
-    let closed = wait_completion(&mut driver, user_data, generation, Duration::from_secs(5))
+    let token = submit_test_op(&mut driver, Close { fd });
+    let closed = wait_completion(&mut driver, token, Duration::from_secs(5))
         .expect("close completion failed");
     assert_eq!(closed, 0);
     assert!(

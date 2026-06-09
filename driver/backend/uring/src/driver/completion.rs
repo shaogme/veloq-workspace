@@ -11,10 +11,10 @@ use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_e
 use crate::op::{Slot, UringUserPayload};
 use veloq_driver_core::driver::{
     CancelCompletionId, CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
-    CompletionCleanupGuard, CompletionControl, CompletionFlowExt, CompletionFlowOutcome,
-    CompletionHookOutcome, CompletionIngress, CompletionSource, DriverCompletionDiagnostics,
-    OpToken, PlatformOp, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
-    drain_cancel_requests,
+    CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
+    CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
+    DriverCompletionDiagnostics, OpToken, PlatformOp, RawCompletion, SyntheticCompletionSource,
+    UserCompletionEvent, drain_cancel_requests,
 };
 use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting, SlotRegistryExt};
 
@@ -250,7 +250,7 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
                     self.synthetic.take_submission_failure(),
                 )
             }
-            CompletionSource::RawKernel | CompletionSource::User | CompletionSource::Backend(_) => {
+            CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
                 complete_kernel_waiting_slot(slot, event.token(), event.raw())
             }
         }
@@ -266,7 +266,7 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => 0,
             CompletionSource::Synthetic(SyntheticCompletionSource::Cancel) => event.res(),
             CompletionSource::Synthetic(SyntheticCompletionSource::SubmissionFailure)
-            | CompletionSource::RawKernel
+            | CompletionSource::Kernel
             | CompletionSource::User
             | CompletionSource::Backend(_) => event.raw().res,
         };
@@ -397,12 +397,12 @@ impl<'a> UringDriver<'a> {
         let mut progress = CompletionProgress::default();
         for (raw_token, cqe_res, cqe_flags) in cqes {
             let outcome = self.accept_completion_ingress(
-                CompletionIngress::RawKernel {
-                    backend: CompletionBackend::Uring,
+                CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
+                    CompletionBackend::Uring,
                     raw_token,
-                    res: cqe_res,
-                    flags: cqe_flags,
-                },
+                    cqe_res,
+                    cqe_flags,
+                )),
                 UringSyntheticCompletion::None,
             )?;
             progress.merge(outcome);
@@ -733,14 +733,17 @@ fn lost_waiting_slot_completion(
     raw: RawCompletion,
 ) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
     let (snapshot, cleanup) = slot.finish_lost(raw.res);
-    let event = UserCompletionEvent::from_parts(
-        CompletionBackend::Uring,
-        snapshot
-            .try_token()
-            .expect("corrupt active uring slot should have an encodable token"),
-        raw.res,
-        raw.flags,
-    );
+    let Some(token) = lost_completion_event_token(snapshot, raw) else {
+        let anomaly =
+            CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot).with_raw_completion(raw);
+        drop(cleanup);
+        return CompletionHookOutcome::Anomaly {
+            anomaly,
+            effect: UringBackendEffect::None,
+        };
+    };
+    let event =
+        UserCompletionEvent::from_parts(CompletionBackend::Uring, token, raw.res, raw.flags);
     CompletionHookOutcome::Lost {
         event,
         loss_reason: CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot)
@@ -757,14 +760,17 @@ fn lost_completed_slot_completion(
     cleanup: CompletionCleanupGuard,
 ) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
     let snapshot = slot.snapshot();
-    let event = UserCompletionEvent::from_parts(
-        CompletionBackend::Uring,
-        snapshot
-            .try_token()
-            .expect("corrupt active uring slot should have an encodable token"),
-        raw.res,
-        raw.flags,
-    );
+    let Some(token) = lost_completion_event_token(snapshot, raw) else {
+        let anomaly =
+            CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot).with_raw_completion(raw);
+        drop(cleanup);
+        return CompletionHookOutcome::Anomaly {
+            anomaly,
+            effect: UringBackendEffect::None,
+        };
+    };
+    let event =
+        UserCompletionEvent::from_parts(CompletionBackend::Uring, token, raw.res, raw.flags);
     let (payload, detail) = slot.take_completion_data();
     let _ = slot.take_op();
     drop(payload);
@@ -777,6 +783,14 @@ fn lost_completed_slot_completion(
         cleanup,
         effect: UringBackendEffect::None,
     }
+}
+
+#[inline]
+fn lost_completion_event_token(
+    snapshot: veloq_driver_core::slot::SlotSnapshot,
+    raw: RawCompletion,
+) -> Option<OpToken> {
+    snapshot.try_token().ok().or_else(|| raw.token.op_token())
 }
 
 trait LostWaitingSlot {

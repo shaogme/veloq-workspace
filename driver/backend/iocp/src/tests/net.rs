@@ -53,7 +53,7 @@ fn test_iocp_accept() {
         remote_addr: None,
     };
 
-    let (user_data, generation) = submit_test_op(&mut driver, accept_op);
+    let token = submit_test_op(&mut driver, accept_op);
 
     // Connect Client in background
     std::thread::spawn(move || {
@@ -61,13 +61,8 @@ fn test_iocp_accept() {
         std::net::TcpStream::connect(addr).expect("Client connect failed");
     });
 
-    let record = wait_completion_record(
-        &mut driver,
-        user_data,
-        generation,
-        std::time::Duration::from_secs(5),
-    )
-    .expect("Accept failed");
+    let record = wait_completion_record(&mut driver, token, std::time::Duration::from_secs(5))
+        .expect("Accept failed");
     let completion = complete_from_record::<Accept<SockAddrStorage>>(record);
     let (accepted, op) = completion.into_parts();
     let _accepted = accepted.expect("Accept failed");
@@ -98,14 +93,9 @@ fn test_iocp_connect() {
         addr_len: addr_len as u32,
     };
 
-    let (user_data, generation) = submit_test_op(&mut driver, connect_op);
+    let token = submit_test_op(&mut driver, connect_op);
 
-    let res = wait_completion(
-        &mut driver,
-        user_data,
-        generation,
-        std::time::Duration::from_secs(5),
-    );
+    let res = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
     assert!(res.is_ok(), "Connect failed: {:?}", res.err());
 
     driver.unregister_files(vec![client_fd]).unwrap();
@@ -139,7 +129,7 @@ fn test_iocp_recv_with_buffer_pool() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
+    let connect_token = submit_test_op(&mut driver, connect_op);
 
     let server_thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -163,8 +153,7 @@ fn test_iocp_recv_with_buffer_pool() {
     // Poll connect completion before issuing recv.
     let connect_res = wait_completion(
         &mut driver,
-        connect_user_data,
-        connect_generation,
+        connect_token,
         std::time::Duration::from_secs(5),
     );
     assert!(
@@ -180,15 +169,10 @@ fn test_iocp_recv_with_buffer_pool() {
         buf_offset: 0,
     };
 
-    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
+    let token = submit_test_op(&mut driver, recv_op);
 
-    let record = wait_completion_record(
-        &mut driver,
-        user_data,
-        generation,
-        std::time::Duration::from_secs(5),
-    )
-    .expect("recv completion missing");
+    let record = wait_completion_record(&mut driver, token, std::time::Duration::from_secs(5))
+        .expect("recv completion missing");
     let completion = complete_from_record::<Recv>(record);
     let (result, mut op) = completion.into_parts();
     let bytes_read = result.expect("Recv failed");
@@ -231,14 +215,8 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
-    wait_completion(
-        &mut driver,
-        connect_user_data,
-        connect_generation,
-        Duration::from_secs(5),
-    )
-    .expect("Connect failed");
+    let connect_token = submit_test_op(&mut driver, connect_op);
+    wait_completion(&mut driver, connect_token, Duration::from_secs(5)).expect("Connect failed");
 
     let buf = reg_pool
         .alloc(std::num::NonZeroUsize::new(8192).unwrap())
@@ -256,14 +234,14 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
         buf,
         buf_offset: 0,
     };
-    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
+    let token = submit_test_op(&mut driver, recv_op);
 
     driver
         .unregister_files(vec![client_fd])
         .expect("unregister while recv in flight should defer cleanup");
 
     let _ = tx_send.send(());
-    let record = wait_completion_record(&mut driver, user_data, generation, Duration::from_secs(5))
+    let record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
         .expect("recv completion missing");
     let completion = complete_from_record::<Recv>(record);
     let (result, mut op) = completion.into_parts();
@@ -305,14 +283,9 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
+    let connect_token = submit_test_op(&mut driver, connect_op);
 
-    let connect_res = wait_completion(
-        &mut driver,
-        connect_user_data,
-        connect_generation,
-        Duration::from_secs(5),
-    );
+    let connect_res = wait_completion(&mut driver, connect_token, Duration::from_secs(5));
     assert!(
         connect_res.is_ok(),
         "Connect failed: {:?}",
@@ -335,15 +308,14 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         buf,
         buf_offset: 0,
     };
-    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
+    let token = submit_test_op(&mut driver, recv_op);
 
     let _ = driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
-        veloq_driver_core::driver::OpToken::from_registry_parts(user_data, generation)
-            .expect("test token should be encodable"),
+        token,
     ));
     let _ = tx_send.send(());
 
-    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(5));
+    let res = wait_completion(&mut driver, token, Duration::from_secs(5));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
         completion_os_error_code(&err),
@@ -385,14 +357,9 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
+    let connect_token = submit_test_op(&mut driver, connect_op);
 
-    let connect_res = wait_completion(
-        &mut driver,
-        connect_user_data,
-        connect_generation,
-        Duration::from_secs(5),
-    );
+    let connect_res = wait_completion(&mut driver, connect_token, Duration::from_secs(5));
     assert!(
         connect_res.is_ok(),
         "Connect failed: {:?}",
@@ -415,21 +382,20 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         buf,
         buf_offset: 0,
     };
-    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
+    let token = submit_test_op(&mut driver, recv_op);
 
     let _ = driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
-        veloq_driver_core::driver::OpToken::from_registry_parts(user_data, generation)
-            .expect("test token should be encodable"),
+        token,
     ));
 
     assert!(
-        !remote_free_contains(&driver, user_data),
+        !remote_free_contains(&driver, token.index()),
         "取消后真实 RIO completion 到来前不应回收槽位"
     );
 
     let _ = tx_send.send(());
 
-    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(5));
+    let res = wait_completion(&mut driver, token, Duration::from_secs(5));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
         completion_os_error_code(&err),
@@ -439,14 +405,14 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let drain_start = std::time::Instant::now();
     while drain_start.elapsed() < Duration::from_secs(2) {
         let _ = driver.drive(DriveMode::Poll);
-        if remote_free_contains(&driver, user_data) {
+        if remote_free_contains(&driver, token.index()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
 
     assert!(
-        remote_free_contains(&driver, user_data),
+        remote_free_contains(&driver, token.index()),
         "晚到 RIO completion 到来后槽位仍应保持可复用"
     );
 

@@ -4,10 +4,10 @@ use crate::slot::{self, SlotRegistryExt};
 
 use super::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanupGuard,
-    CompletionDispatch, CompletionPacket, DriverCompletionDiagnostics,
+    CompletionDispatch, CompletionEnvelope, CompletionPacket, DriverCompletionDiagnostics,
     DriverCompletionDiagnosticsBackend, RawCompletion, RecordCompletionOutcome,
     RecordCompletionResult, RoutedSlotCompletion, SharedCompletionTable, UserCompletionEvent,
-    dispatch_raw_completion, finalize_corrupt_checked, finalize_orphaned_checked,
+    dispatch_envelope, finalize_corrupt_checked, finalize_orphaned_checked,
     finalize_waiting_checked, record_completion_anomaly, route_user_completion,
     run_completion_cleanup, run_rejected_cleanup, unknown_completion_anomaly,
 };
@@ -33,12 +33,7 @@ pub enum SyntheticCompletionSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionIngress<BackendIngress = ()> {
-    RawKernel {
-        backend: CompletionBackend,
-        raw_token: u64,
-        res: i32,
-        flags: u32,
-    },
+    Kernel(CompletionEnvelope),
     User(UserCompletionEvent),
     Synthetic {
         event: UserCompletionEvent,
@@ -50,7 +45,7 @@ pub enum CompletionIngress<BackendIngress = ()> {
 
 #[derive(Debug, Clone, Copy)]
 pub enum CompletionSource<'a, BackendIngress> {
-    RawKernel,
+    Kernel,
     User,
     Synthetic(SyntheticCompletionSource),
     Backend(&'a BackendIngress),
@@ -297,18 +292,13 @@ where
         Hooks: CompletionBackendHooks<Spec>,
     {
         match ingress {
-            CompletionIngress::RawKernel {
-                backend,
-                raw_token,
-                res,
-                flags,
-            } => match dispatch_raw_completion(backend, raw_token, res, flags) {
+            CompletionIngress::Kernel(envelope) => match dispatch_envelope(envelope) {
                 CompletionDispatch::User { event } => self.accept_user_event(
                     table,
                     diagnostics,
                     hooks,
                     event,
-                    CompletionSource::RawKernel,
+                    CompletionSource::Kernel,
                 ),
                 CompletionDispatch::Waker { id, raw } => {
                     let outcome = hooks.handle_control(CompletionControl::Waker { id, raw });

@@ -78,8 +78,8 @@ fn submit_registered_write(driver: &mut IocpDriver<'_>, fd: IoFd, offset: u64, b
         offset,
         buf_offset: 0,
     };
-    let (user_data, generation) = submit_test_op(driver, op);
-    let written = wait_completion(driver, user_data, generation, Duration::from_secs(5))
+    let token = submit_test_op(driver, op);
+    let written = wait_completion(driver, token, Duration::from_secs(5))
         .expect("registered write completion failed");
     assert_eq!(written, bytes.len());
 }
@@ -91,8 +91,8 @@ fn read_registered(driver: &mut IocpDriver<'_>, fd: IoFd, offset: u64, len: usiz
         offset,
         buf_offset: 0,
     };
-    let (user_data, generation) = submit_test_op(driver, op);
-    let record = wait_completion_record(driver, user_data, generation, Duration::from_secs(5))
+    let token = submit_test_op(driver, op);
+    let record = wait_completion_record(driver, token, Duration::from_secs(5))
         .expect("registered read completion missing");
     let completion = complete_from_record::<ReadFixed>(record);
     let (result, mut op) = completion.into_parts();
@@ -108,8 +108,8 @@ fn submit_raw_write(driver: &mut IocpDriver<'_>, handle: IocpHandle, offset: u64
         offset,
         buf_offset: 0,
     };
-    let (user_data, generation) = submit_test_op(driver, op);
-    let written = wait_completion(driver, user_data, generation, Duration::from_secs(5))
+    let token = submit_test_op(driver, op);
+    let written = wait_completion(driver, token, Duration::from_secs(5))
         .expect("raw write completion failed");
     assert_eq!(written, bytes.len());
 }
@@ -142,8 +142,8 @@ fn read_raw(driver: &mut IocpDriver<'_>, handle: IocpHandle, offset: u64, len: u
         offset,
         buf_offset: 0,
     };
-    let (user_data, generation) = submit_test_op(driver, op);
-    let record = wait_completion_record(driver, user_data, generation, Duration::from_secs(5))
+    let token = submit_test_op(driver, op);
+    let record = wait_completion_record(driver, token, Duration::from_secs(5))
         .expect("raw read completion missing");
     let completion = complete_from_record::<ReadRaw<IocpHandle>>(record);
     let (result, mut op) = completion.into_parts();
@@ -160,15 +160,10 @@ fn test_iocp_timeout() {
         duration: std::time::Duration::from_millis(100),
     };
 
-    let (user_data, generation) = submit_test_op(&mut driver, timeout_op);
+    let token = submit_test_op(&mut driver, timeout_op);
 
     let start = std::time::Instant::now();
-    let res = wait_completion(
-        &mut driver,
-        user_data,
-        generation,
-        std::time::Duration::from_secs(1),
-    );
+    let res = wait_completion(&mut driver, token, std::time::Duration::from_secs(1));
     assert!(res.is_ok(), "Timeout should succeed");
     let elapsed = start.elapsed();
     assert!(

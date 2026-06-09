@@ -1,7 +1,7 @@
 use tracing::{debug, warn};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionBackend, CompletionToken, OpToken,
-    SyntheticCompletionSource, UserCompletionEvent,
+    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionAnomaly, CompletionBackend,
+    CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
@@ -57,7 +57,7 @@ impl<'a> IocpDriver<'a> {
                     registered_slots: self.handles.registered_slots(),
                 };
                 let status = Self::perform_cancel(ctx, token, &mut self.ops);
-                self.record_cancel_status(status)
+                self.record_cancel_status(token, status)
             }
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 let prepared = if slot.has_op() {
@@ -132,6 +132,7 @@ impl<'a> IocpDriver<'a> {
 
     fn record_cancel_status(
         &mut self,
+        token: OpToken,
         status: IocpResult<CancelPerformStatus>,
     ) -> IocpResult<CancelSubmitOutcome> {
         match status {
@@ -141,10 +142,18 @@ impl<'a> IocpDriver<'a> {
             }
             Ok(CancelPerformStatus::NotFound) => {
                 self.completion_diagnostics.backend().inc_cancel_not_found();
+                self.record_cancel_not_found_if_target_active(token)?;
                 debug!("CancelIoEx target was already complete or absent");
                 Ok(CancelSubmitOutcome::TargetMissing)
             }
-            Ok(CancelPerformStatus::NoHandle) | Ok(CancelPerformStatus::NonActive) => {
+            Ok(CancelPerformStatus::NoHandle) => {
+                self.completion_diagnostics.backend().inc_cancel_no_handle();
+                Ok(CancelSubmitOutcome::NoBackendHandle)
+            }
+            Ok(CancelPerformStatus::NonActive) => {
+                self.completion_diagnostics
+                    .backend()
+                    .inc_cancel_non_active();
                 Ok(CancelSubmitOutcome::NoBackendHandle)
             }
             Err(report) => {
@@ -153,6 +162,44 @@ impl<'a> IocpDriver<'a> {
                 Err(report)
             }
         }
+    }
+
+    fn record_cancel_not_found_if_target_active(&mut self, token: OpToken) -> IocpResult<()> {
+        let active_target = match self.ops.checked_slot_view(token) {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => Some(slot.snapshot()),
+            CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => Some(slot.snapshot()),
+            _ => None,
+        };
+
+        let Some(snapshot) = active_target else {
+            return Ok(());
+        };
+
+        self.completion_diagnostics
+            .backend()
+            .inc_cancel_not_found_active();
+        let raw = veloq_driver_core::driver::RawCompletion::new(
+            CompletionBackend::Iocp,
+            CompletionToken::user(token),
+            -(windows_sys::Win32::Foundation::ERROR_NOT_FOUND as i32),
+            0,
+        );
+        let anomaly = CompletionAnomaly::cancel_ack_target_still_active(
+            raw.token,
+            snapshot.index,
+            snapshot.generation,
+            snapshot.state,
+        )
+        .with_slot_snapshot(snapshot)
+        .with_raw_completion(raw);
+        let _ = self.accept_completion_anomaly(anomaly)?;
+        debug!(
+            user_data = snapshot.index,
+            generation = snapshot.generation,
+            state = ?snapshot.state,
+            "CancelIoEx returned ERROR_NOT_FOUND while target is still active"
+        );
+        Ok(())
     }
 
     fn perform_cancel(

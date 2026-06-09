@@ -231,7 +231,7 @@ where
         }
     };
     cleanup.disarm();
-    let res = detail.unwrap_or_else(|| C::from_event_res::<E>(event.res));
+    let res = detail.unwrap_or_else(|| C::from_event_res::<E>(event.res()));
     let completion = T::complete(payload, res);
     Poll::Ready(OpResult::Completed(completion.result, completion.output))
 }

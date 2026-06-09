@@ -183,9 +183,9 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for RioCompletionHooks<'_> 
     ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
         let effect = match source {
             CompletionSource::Backend(ingress) => RioBackendEffect::from_init(&ingress.init),
-            CompletionSource::RawKernel
-            | CompletionSource::User
-            | CompletionSource::Synthetic(_) => RioBackendEffect::default(),
+            CompletionSource::Kernel | CompletionSource::User | CompletionSource::Synthetic(_) => {
+                RioBackendEffect::default()
+            }
         };
         CompletionHookOutcome::Anomaly { anomaly, effect }
     }

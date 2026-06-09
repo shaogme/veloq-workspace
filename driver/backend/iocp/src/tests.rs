@@ -19,7 +19,7 @@ pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     driver.debug_remote_free_contains(needle)
 }
 
-pub(crate) fn submit_test_op<T>(driver: &mut IocpDriver, data: T) -> (usize, u32)
+pub(crate) fn submit_test_op<T>(driver: &mut IocpDriver, data: T) -> OpToken
 where
     T: IntoPlatformOp<
             IocpOp,
@@ -35,7 +35,7 @@ where
     match slot.submit(&mut iocp_op) {
         DriverSubmitResult::Submitted(_) => {
             let submitted = slot.persist().token();
-            submitted.parts()
+            submitted
         }
         DriverSubmitResult::Failed { report, status } => {
             panic!("submit op failed: status={status:?}, error={report}")
@@ -63,25 +63,22 @@ where
     let payload = T::try_payload_from_erased(payload_erased).expect("completion payload type");
     let res = detail
         .take()
-        .unwrap_or_else(|| usize::from_event_res::<IocpError>(event.res));
+        .unwrap_or_else(|| usize::from_event_res::<IocpError>(event.res()));
     cleanup.disarm();
     T::complete(payload, res)
 }
 
 pub(crate) fn wait_completion_record(
     driver: &mut IocpDriver,
-    user_data: usize,
-    generation: u32,
+    token: OpToken,
     timeout: std::time::Duration,
 ) -> IocpResult<CompletionRecord<IocpUserPayload, IocpError>> {
     let start = std::time::Instant::now();
-    let token = OpToken::from_registry_parts(user_data, generation)
-        .expect("test token should be encodable");
     loop {
         if start.elapsed() > timeout {
             return IocpError::CompletionWait
-                .with_ctx("user_data", user_data)
-                .with_ctx("generation", generation)
+                .with_ctx("user_data", token.index())
+                .with_ctx("generation", token.generation())
                 .with_ctx("timeout_ms", timeout.as_millis() as u64)
                 .attach_note("wait completion timed out");
         }
@@ -103,12 +100,11 @@ pub(crate) fn wait_completion_record(
 
 pub(crate) fn wait_completion(
     driver: &mut IocpDriver,
-    user_data: usize,
-    generation: u32,
+    token: OpToken,
     timeout: std::time::Duration,
 ) -> IocpResult<usize> {
-    let record = wait_completion_record(driver, user_data, generation, timeout)?;
-    usize::from_event_res::<IocpError>(record.event.res).map_err(|e| {
+    let record = wait_completion_record(driver, token, timeout)?;
+    usize::from_event_res::<IocpError>(record.event.res()).map_err(|e| {
         let code = iocp_report_to_event_res(&e);
         let io_error = std::io::Error::from_raw_os_error(-code);
         IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error)

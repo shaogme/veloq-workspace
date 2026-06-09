@@ -5,8 +5,8 @@ use veloq_shim::atomic::Ordering;
 
 use super::types::CompletionMutationOutcome;
 use super::{
-    CompletionAnomaly, CompletionCleanupGuard, CompletionEvent, CompletionInput, CompletionPacket,
-    CompletionRecord, CompletionToken, CompletionWritePermit, OpToken, RecordCompletionOutcome,
+    CompletionAnomaly, CompletionCleanupGuard, CompletionInput, CompletionPacket, CompletionRecord,
+    CompletionToken, CompletionWritePermit, OpToken, RecordCompletionOutcome,
     RecordCompletionResult, UserCompletionEvent, run_completion_cleanup,
 };
 
@@ -40,11 +40,6 @@ pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
     }
 
     fn try_take_record(&self, token: OpToken) -> PollRecordResult<UP, E, R>;
-
-    #[inline]
-    fn try_take(&self, token: OpToken) -> PollRecordResult<UP, E, R> {
-        self.try_take_record(token)
-    }
 
     fn register_waker(&self, token: OpToken, waker: &Waker) -> CompletionMutationOutcome;
 
@@ -173,6 +168,7 @@ fn run_discarded_record_cleanup<B, UP, E, R>(
 ) {
     match record_data {
         slot::CompletionData::User {
+            event: _,
             payload,
             detail,
             mut cleanup,
@@ -202,8 +198,8 @@ where
         packet: CompletionPacket<UP, E, R>,
     ) -> RecordCompletionResult<UP, E, R> {
         let op_token = packet.token();
-        let event = packet.completion_event();
-        let token = event.token;
+        let event = packet.event;
+        let token = event.completion_token();
         let (idx, generation) = op_token.parts();
         let success_outcome = recorded_outcome(&packet.input);
         if idx >= self.slots.len() {
@@ -301,6 +297,7 @@ where
         cell.completion_with_record_data(|record| {
             *record = match input {
                 CompletionInput::User(completion) => slot::CompletionData::User {
+                    event,
                     payload: completion.payload,
                     detail: completion.detail,
                     cleanup: completion.cleanup,
@@ -311,8 +308,9 @@ where
                 },
             };
         });
-        cell.completion_res.store(event.res, Ordering::Release);
-        cell.completion_flags.store(event.flags, Ordering::Release);
+        cell.completion_res.store(event.res(), Ordering::Release);
+        cell.completion_flags
+            .store(event.flags(), Ordering::Release);
         self.note_ready_completion();
         cell.core_state.store(
             finalizing
@@ -348,8 +346,10 @@ where
             return PollRecordResult::Unavailable(anomaly);
         }
 
-        if cell_gen != generation {
-            return PollRecordResult::Pending;
+        if cell_gen < generation {
+            let anomaly = CompletionAnomaly::non_active(completion_token, idx, generation, state);
+            self.diagnostics.record_anomaly(&anomaly);
+            return PollRecordResult::Unavailable(anomaly);
         }
 
         if state != slot::SlotState::InFlightReady {
@@ -387,14 +387,10 @@ where
 
         self.clear_ready_completion();
         let record_data = cell.completion_with_record_data(std::mem::take);
-        let event = CompletionEvent {
-            token: completion_token,
-            res: cell.completion_res.load(Ordering::Acquire),
-            flags: cell.completion_flags.load(Ordering::Acquire),
-        };
 
         match record_data {
             slot::CompletionData::User {
+                event,
                 payload,
                 detail,
                 cleanup,
@@ -411,7 +407,8 @@ where
             }
             slot::CompletionData::Empty => {
                 let anomaly = CompletionAnomaly::payload_missing(completion_token, idx, generation)
-                    .with_event(event);
+                    .with_raw_result(cell.completion_res.load(Ordering::Acquire))
+                    .with_flags(cell.completion_flags.load(Ordering::Acquire));
                 self.diagnostics.record_anomaly(&anomaly);
                 self.diagnostics.inc_user_lost();
                 PollRecordResult::Unavailable(anomaly)
@@ -652,8 +649,8 @@ mod tests {
     use crate::driver::registry::OpRegistry;
     use crate::driver::{
         CompletionAnomalyReason, CompletionBackend, CompletionBackendHooks, CompletionCleanup,
-        CompletionControl, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
-        CompletionIngress, CompletionSource,
+        CompletionControl, CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome,
+        CompletionHookOutcome, CompletionIngress, CompletionSource,
     };
     use crate::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
     use diagweave::prelude::*;
@@ -848,6 +845,47 @@ mod tests {
     }
 
     #[test]
+    fn try_take_record_reports_future_generation_unavailable() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        let token = test_token(0, 1);
+
+        match table.try_take_record(token) {
+            PollRecordResult::Unavailable(anomaly) => {
+                assert_eq!(anomaly.reason, CompletionAnomalyReason::NonActiveSlot);
+                assert_eq!(anomaly.index, Some(0));
+                assert_eq!(anomaly.expected_generation, Some(1));
+            }
+            PollRecordResult::Pending => panic!("future generation token must not stay pending"),
+            PollRecordResult::Ready(_) => panic!("future generation token must not become ready"),
+        }
+    }
+
+    #[test]
+    fn raw_unknown_control_is_recorded_as_anomaly() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let diagnostics = registry.shared.completion_diagnostics();
+        let table: SharedCompletionTable<(), ()> = registry.shared.clone();
+        let mut hooks = TestHooks::default();
+        let raw_unknown_control = (99u64 << 48) | (7u64 << 32) | u64::from(u32::MAX);
+
+        let outcome = registry.accept_completion(
+            &table,
+            &diagnostics,
+            &mut hooks,
+            CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
+                CompletionBackend::Core,
+                raw_unknown_control,
+                -5,
+                0,
+            )),
+        );
+
+        assert_eq!(outcome.anomaly, 1);
+        assert_eq!(diagnostics.snapshot().unknown_completion, 1);
+        assert!(!registry.shared.has_ready_completion());
+    }
+
+    #[test]
     fn mark_waiting_does_not_activate_idle_future_generation() {
         let table = slot::SlotTable::<DummySlotSpec>::new(1);
         let token = test_token(0, 1);
@@ -1037,7 +1075,7 @@ mod tests {
                 panic!("first completion should remain available: {anomaly:?}")
             }
         };
-        assert_eq!(record.event.res, 11);
+        assert_eq!(record.event.res(), 11);
     }
 
     #[test]

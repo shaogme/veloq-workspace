@@ -1,6 +1,6 @@
 use super::{SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
 use crate::DriverResult;
-use crate::driver::{CompletionAnomaly, CompletionCleanupGuard};
+use crate::driver::{CompletionAnomaly, CompletionCleanupGuard, UserCompletionEvent};
 use bilge::prelude::*;
 use std::marker::PhantomData;
 use veloq_atomic_waker::AtomicWaker;
@@ -148,6 +148,7 @@ pub(crate) enum CompletionData<UP, E, R = usize> {
     #[default]
     Empty,
     User {
+        event: UserCompletionEvent,
         payload: UP,
         detail: Option<DriverResult<R, E>>,
         cleanup: CompletionCleanupGuard,

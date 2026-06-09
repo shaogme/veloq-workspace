@@ -243,6 +243,21 @@ pub struct CompletionEnvelope {
 
 impl CompletionEnvelope {
     #[inline]
+    pub fn from_raw_parts(
+        backend: CompletionBackend,
+        raw_token: u64,
+        res: i32,
+        flags: u32,
+    ) -> Self {
+        Self::from_raw(RawCompletion::new(
+            backend,
+            CompletionToken::from_raw(raw_token),
+            res,
+            flags,
+        ))
+    }
+
+    #[inline]
     pub fn from_raw(raw: RawCompletion) -> Self {
         let identity = match raw.token.classify() {
             CompletionTokenClass::User(token) => CompletionIdentity::User(token),
@@ -301,22 +316,6 @@ impl<'a, Spec: slot::SlotSpec> RoutedSlotCompletion<'a, Spec> {
             | Self::Stale(anomaly)
             | Self::Corrupt(anomaly) => Some(anomaly),
         }
-    }
-}
-
-pub enum SlotExtractionOutcome<T> {
-    Extracted(T),
-    Lost {
-        anomaly: CompletionAnomaly,
-        cleanup: CompletionCleanupGuard,
-        snapshot: slot::SlotSnapshot,
-    },
-}
-
-impl<T> SlotExtractionOutcome<T> {
-    #[inline]
-    pub const fn is_extracted(&self) -> bool {
-        matches!(self, Self::Extracted(_))
     }
 }
 
@@ -438,14 +437,8 @@ where
 }
 
 #[inline]
-fn dispatch_raw_completion(
-    backend: CompletionBackend,
-    raw_token: u64,
-    res: i32,
-    flags: u32,
-) -> CompletionDispatch {
-    let raw = RawCompletion::new(backend, CompletionToken::from_raw(raw_token), res, flags);
-    let envelope = CompletionEnvelope::from_raw(raw);
+fn dispatch_envelope(envelope: CompletionEnvelope) -> CompletionDispatch {
+    let raw = envelope.raw;
     match envelope.identity {
         CompletionIdentity::User(token) => CompletionDispatch::User {
             event: UserCompletionEvent::from_classified(token, raw),
@@ -577,7 +570,7 @@ impl CompletionToken {
     }
 
     #[inline]
-    pub const fn from_raw(raw: u64) -> Self {
+    const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
@@ -721,13 +714,6 @@ fn corrupt_slot_anomaly(token: CompletionToken, snapshot: slot::SlotSnapshot) ->
     }
 }
 
-impl From<u64> for CompletionToken {
-    #[inline]
-    fn from(value: u64) -> Self {
-        Self::from_raw(value)
-    }
-}
-
 impl From<CompletionToken> for u64 {
     #[inline]
     fn from(value: CompletionToken) -> Self {
@@ -772,21 +758,6 @@ pub enum CancelSubmitOutcome {
     TargetMissing,
     TargetStale,
     NoBackendHandle,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancelAck {
-    Ok,
-    NotFound,
-    Error,
-    Untracked,
-}
-
-pub struct CompletionSidecar<UP, E, R = usize> {
-    pub event: UserCompletionEvent,
-    pub payload: UP,
-    pub detail: Option<DriverResult<R, E>>,
-    pub cleanup: CompletionCleanupGuard,
 }
 
 pub struct CompletionPacket<UP, E, R = usize> {
@@ -888,28 +859,6 @@ impl<UP, E, R> CompletionPacket<UP, E, R> {
     }
 }
 
-impl<UP, E, R> CompletionSidecar<UP, E, R> {
-    #[inline]
-    pub fn new(
-        event: UserCompletionEvent,
-        payload: UP,
-        detail: Option<DriverResult<R, E>>,
-        cleanup: CompletionCleanupGuard,
-    ) -> Self {
-        Self {
-            event,
-            payload,
-            detail,
-            cleanup,
-        }
-    }
-
-    #[inline]
-    pub fn into_packet(self) -> CompletionPacket<UP, E, R> {
-        CompletionPacket::user_with_cleanup(self.event, self.payload, self.detail, self.cleanup)
-    }
-}
-
 /// Unified completion event produced by platform drivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompletionEvent {
@@ -929,7 +878,7 @@ impl CompletionEvent {
 }
 
 pub struct CompletionRecord<UP, E, R = usize> {
-    pub event: CompletionEvent,
+    pub event: UserCompletionEvent,
     pub payload: UP,
     pub detail: Option<DriverResult<R, E>>,
     pub cleanup: CompletionCleanupGuard,

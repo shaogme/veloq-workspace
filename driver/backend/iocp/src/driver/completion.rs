@@ -4,9 +4,9 @@ use diagweave::prelude::*;
 use tracing::warn;
 use veloq_driver_core::driver::{
     CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
-    CompletionCleanupGuard, CompletionControl, CompletionFlowExt, CompletionFlowOutcome,
-    CompletionHookOutcome, CompletionIngress, CompletionSource, SyntheticCompletionSource,
-    UserCompletionEvent,
+    CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
+    CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
+    SyntheticCompletionSource, UserCompletionEvent,
 };
 use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView};
 
@@ -141,7 +141,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                     self.synthetic.take_submission_failure(),
                 )
             }
-            CompletionSource::RawKernel | CompletionSource::User | CompletionSource::Backend(_) => {
+            CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
                 let io_result = calculate_io_result_from_slot(self.ext, &mut slot, event.res());
                 let socket_inflight = take_socket_inflight_from_slot(&mut slot);
                 complete_iocp_waiting_slot(slot, event, io_result, socket_inflight)
@@ -224,13 +224,7 @@ impl<'a> IocpDriver<'a> {
         self.timer.restore_cleared_buffer(timer_buffer);
     }
 
-    pub(super) fn process_completion(
-        &mut self,
-        event: UserCompletionEvent,
-        _success: bool,
-        _error_code: Option<u32>,
-        _bytes_transferred: u32,
-    ) -> CompletionProgress {
+    pub(super) fn process_completion(&mut self, event: UserCompletionEvent) -> CompletionProgress {
         let outcome = self
             .accept_completion_ingress(
                 CompletionIngress::User(event),
@@ -266,12 +260,12 @@ impl<'a> IocpDriver<'a> {
         flags: u32,
     ) -> IocpResult<CompletionFlowOutcome> {
         self.accept_completion_ingress(
-            CompletionIngress::RawKernel {
-                backend: CompletionBackend::Iocp,
+            CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
+                CompletionBackend::Iocp,
                 raw_token,
                 res,
                 flags,
-            },
+            )),
             IocpSyntheticCompletion::None,
         )
     }

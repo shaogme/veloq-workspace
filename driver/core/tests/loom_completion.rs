@@ -143,7 +143,10 @@ fn test_completion_table_loom() {
             table_cloned.mark_waiting(token);
             match table_cloned.try_take_record(token) {
                 PollRecordResult::Ready(record) => {
-                    assert_eq!(record.event.token, CompletionToken::user(token))
+                    assert_eq!(
+                        record.event.completion_token(),
+                        CompletionToken::user(token)
+                    )
                 }
                 PollRecordResult::Pending | PollRecordResult::Unavailable(_) => {
                     table_cloned.mark_orphaned(token);
@@ -189,8 +192,11 @@ fn test_fast_completion_then_waiting_take_loom() {
         table.mark_waiting(token);
         match table.try_take_record(token) {
             PollRecordResult::Ready(record) => {
-                assert_eq!(record.event.token, CompletionToken::user(token));
-                assert_eq!(record.event.res, 7);
+                assert_eq!(
+                    record.event.completion_token(),
+                    CompletionToken::user(token)
+                );
+                assert_eq!(record.event.res(), 7);
             }
             PollRecordResult::Pending => panic!("expected ready after fast completion"),
             PollRecordResult::Unavailable(anomaly) => {

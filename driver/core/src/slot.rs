@@ -625,7 +625,7 @@ mod tests {
                 panic!("completion should be available: {anomaly:?}")
             }
         };
-        assert_eq!(record.event.token, completion_token);
+        assert_eq!(record.event.completion_token(), completion_token);
         assert_eq!(record.payload, ());
     }
 

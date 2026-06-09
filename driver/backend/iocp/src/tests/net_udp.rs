@@ -93,14 +93,14 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         addr: server_addr,
     };
 
-    let (recv_ud, recv_gen) = submit_test_op(&mut driver, recv_op);
-    let (send_ud, send_gen) = submit_test_op(&mut driver, send_op);
+    let recv_token = submit_test_op(&mut driver, recv_op);
+    let send_token = submit_test_op(&mut driver, send_op);
 
-    let sent = wait_completion(&mut driver, send_ud, send_gen, Duration::from_secs(5))
+    let sent = wait_completion(&mut driver, send_token, Duration::from_secs(5))
         .expect("send_to completion failed");
     assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
     let recv_completion = complete_from_record::<UdpRecvFrom>(
-        wait_completion_record(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
+        wait_completion_record(&mut driver, recv_token, Duration::from_secs(5))
             .expect("udp_recv_from completion missing"),
     );
     let (recv_result, recv_out) = recv_completion.into_parts();
@@ -170,14 +170,14 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         addr: server_addr,
     };
 
-    let (recv_ud, recv_gen) = submit_test_op(&mut driver, recv_op);
-    let (send_ud, send_gen) = submit_test_op(&mut driver, send_op);
+    let recv_token = submit_test_op(&mut driver, recv_op);
+    let send_token = submit_test_op(&mut driver, send_op);
 
-    let sent = wait_completion(&mut driver, send_ud, send_gen, Duration::from_secs(5))
+    let sent = wait_completion(&mut driver, send_token, Duration::from_secs(5))
         .expect("send_to completion failed");
     assert_eq!(sent, test_data.len(), "send_to bytes mismatch");
     let recv_completion = complete_from_record::<UdpRecvFrom>(
-        wait_completion_record(&mut driver, recv_ud, recv_gen, Duration::from_secs(5))
+        wait_completion_record(&mut driver, recv_token, Duration::from_secs(5))
             .expect("udp_recv_from completion missing"),
     );
     let (recv_result, recv_out) = recv_completion.into_parts();
@@ -218,23 +218,17 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
         buf_offset: 0,
         addr: None,
     };
-    let (ud, generation) = submit_test_op(&mut driver, recv_op);
+    let token = submit_test_op(&mut driver, recv_op);
 
     let _ = driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
-        veloq_driver_core::driver::OpToken::from_registry_parts(ud, generation)
-            .expect("test token should be encodable"),
+        token,
     ));
     let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client bind failed");
     client
         .send_to(b"cancel-drain", server_addr)
         .expect("client send_to failed");
-    let err = wait_completion(
-        &mut driver,
-        ud,
-        generation,
-        std::time::Duration::from_secs(5),
-    )
-    .expect_err("cancelled udp_recv_from should fail");
+    let err = wait_completion(&mut driver, token, std::time::Duration::from_secs(5))
+        .expect_err("cancelled udp_recv_from should fail");
     assert_eq!(
         completion_os_error_code(&err),
         Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)

@@ -33,8 +33,8 @@ impl UringOpState {
 }
 
 impl<'a> UringDriver<'a> {
-    fn next_cancel_completion_id(&mut self) -> CancelCompletionId {
-        loop {
+    fn next_cancel_completion_id(&mut self) -> Option<CancelCompletionId> {
+        for _ in 0..u16::MAX {
             let id = self.next_cancel_id;
             self.next_cancel_id = self.next_cancel_id.wrapping_add(1);
             if self.next_cancel_id == 0 {
@@ -42,15 +42,16 @@ impl<'a> UringDriver<'a> {
             }
             let id = CancelCompletionId::new(id);
             if !self.pending_cancel_cqes.contains_key(&id) {
-                return id;
+                return Some(id);
             }
         }
+        None
     }
 
     fn try_submit_cancel_request(&mut self, request: PendingCancel) -> Option<CancelCompletionId> {
         let (user_data, generation) = request.user_parts();
 
-        let cancel_id = self.next_cancel_completion_id();
+        let cancel_id = self.next_cancel_completion_id()?;
         let cancel_sqe = opcode::AsyncCancel::new(CompletionToken::user(request.target).raw())
             .build()
             .user_data(CompletionToken::cancel(cancel_id).raw());
@@ -97,26 +98,21 @@ impl<'a> UringDriver<'a> {
 
         match self.ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
-                let prepared = if slot_has_op(slot) {
-                    match self.ops.checked_slot_view(token) {
-                        CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
-                            match slot.start_submission_with(None) {
-                                Ok(guard) => {
-                                    let _ = guard.persist();
-                                    true
-                                }
-                                Err(err) => {
-                                    debug!(
-                                        user_data,
-                                        generation,
-                                        snapshot = ?err.snapshot,
-                                        "reserved uring cancel could not prepare synthetic completion"
-                                    );
-                                    false
-                                }
-                            }
+                let prepared = if slot.has_op() {
+                    match slot.start_submission_with(None) {
+                        Ok(guard) => {
+                            let _ = guard.persist();
+                            true
                         }
-                        _ => false,
+                        Err(err) => {
+                            debug!(
+                                user_data,
+                                generation,
+                                snapshot = ?err.snapshot,
+                                "reserved uring cancel could not prepare synthetic completion"
+                            );
+                            false
+                        }
                     }
                 } else {
                     false
