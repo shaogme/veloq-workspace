@@ -16,9 +16,9 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionBackendHooks, CompletionBackendIngressAction,
-    CompletionControl, CompletionFlowExt, CompletionHookOutcome, CompletionIngress,
-    CompletionSource, CompletionToken, RawCompletion, SharedCompletionTable, UserCompletionEvent,
+    CompletionAnomaly, CompletionBackendHooks, CompletionBackendIngressAction, CompletionControl,
+    CompletionFlowExt, CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
+    RawCompletion, SharedCompletionTable, UserCompletionEvent,
 };
 use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -195,7 +195,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         ingress: &Self::BackendIngress,
     ) -> CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect> {
         CompletionBackendIngressAction::RouteUser(UserCompletionEvent::from_parts(
-            CompletionBackend::Backend("rio"),
+            crate::driver::completion::COMP_BACKEND_RIO,
             ingress.init.token,
             ingress.result.raw_res(),
             0,
@@ -236,7 +236,7 @@ fn complete_rio_waiting_slot(
     let completion_token = CompletionToken::user(token);
     let socket_key = init.socket_inflight.socket_key();
     let raw = RawCompletion::new(
-        CompletionBackend::Backend("rio"),
+        crate::driver::completion::COMP_BACKEND_RIO,
         completion_token,
         result.raw_res(),
         0,
@@ -343,8 +343,12 @@ fn complete_rio_waiting_slot(
         .unwrap_or_default();
     let _ = guard.take_op();
     let (payload, detail) = guard.take_completion_data();
-    let event =
-        UserCompletionEvent::from_parts(CompletionBackend::Backend("rio"), token, res_code, 0);
+    let event = UserCompletionEvent::from_parts(
+        crate::driver::completion::COMP_BACKEND_RIO,
+        token,
+        res_code,
+        0,
+    );
     if let Some(payload) = payload {
         CompletionHookOutcome::User {
             event,
@@ -409,10 +413,77 @@ fn complete_rio_orphaned_slot(
     CompletionHookOutcome::Cleanup { cleanup, effect }
 }
 
+pub(crate) const RIO_ANOMALY_MALFORMED: u16 = 1;
+pub(crate) const RIO_ANOMALY_MISSING: u16 = 2;
+pub(crate) const RIO_ANOMALY_STALE: u16 = 3;
+
+pub(crate) fn rio_malformed_context_anomaly(raw_context: u64) -> CompletionAnomaly {
+    CompletionAnomaly {
+        token: crate::driver::RIO_EVENT_TOKEN,
+        index: None,
+        expected_generation: None,
+        actual_generation: None,
+        state: None,
+        backend: Some(crate::driver::completion::COMP_BACKEND_RIO),
+        backend_context: Some(raw_context),
+        raw_result: None,
+        flags: None,
+        slot_snapshot: None,
+        reason: veloq_driver_core::driver::CompletionAnomalyReason::BackendSpecific(
+            RIO_ANOMALY_MALFORMED,
+        ),
+    }
+}
+
+pub(crate) fn rio_missing_context_anomaly(
+    raw_context: u64,
+    index: usize,
+    generation: u32,
+) -> CompletionAnomaly {
+    CompletionAnomaly {
+        token: crate::driver::RIO_EVENT_TOKEN,
+        index: Some(index),
+        expected_generation: Some(generation),
+        actual_generation: None,
+        state: None,
+        backend: Some(crate::driver::completion::COMP_BACKEND_RIO),
+        backend_context: Some(raw_context),
+        raw_result: None,
+        flags: None,
+        slot_snapshot: None,
+        reason: veloq_driver_core::driver::CompletionAnomalyReason::BackendSpecific(
+            RIO_ANOMALY_MISSING,
+        ),
+    }
+}
+
+pub(crate) fn rio_stale_context_anomaly(
+    raw_context: u64,
+    index: usize,
+    expected_generation: u32,
+    actual_generation: u32,
+) -> CompletionAnomaly {
+    CompletionAnomaly {
+        token: crate::driver::RIO_EVENT_TOKEN,
+        index: Some(index),
+        expected_generation: Some(expected_generation),
+        actual_generation: Some(actual_generation),
+        state: None,
+        backend: Some(crate::driver::completion::COMP_BACKEND_RIO),
+        backend_context: Some(raw_context),
+        raw_result: None,
+        flags: None,
+        slot_snapshot: None,
+        reason: veloq_driver_core::driver::CompletionAnomalyReason::BackendSpecific(
+            RIO_ANOMALY_STALE,
+        ),
+    }
+}
+
 fn anomaly_with_rio_raw(anomaly: CompletionAnomaly, res: RioResultData) -> CompletionAnomaly {
     anomaly.with_raw_completion(RawCompletion::new(
-        CompletionBackend::Backend("rio"),
-        CompletionToken::rio_wake(0),
+        crate::driver::completion::COMP_BACKEND_RIO,
+        crate::driver::RIO_EVENT_TOKEN,
         res.raw_res(),
         0,
     ))
@@ -553,10 +624,8 @@ impl RioState {
                         );
                     }
                     RioRequestContextDecode::Malformed { raw } => {
-                        let anomaly = anomaly_with_rio_raw(
-                            CompletionAnomaly::rio_malformed_context_raw(raw),
-                            result,
-                        );
+                        let anomaly =
+                            anomaly_with_rio_raw(rio_malformed_context_anomaly(raw), result);
                         let _ = ops.accept_completion(
                             completion_table,
                             diagnostics,
@@ -572,7 +641,7 @@ impl RioState {
                     }
                     RioRequestContextDecode::Missing { id } => {
                         let anomaly = anomaly_with_rio_raw(
-                            CompletionAnomaly::rio_missing_context_raw(
+                            rio_missing_context_anomaly(
                                 result.request_context,
                                 id.index(),
                                 id.generation(),
@@ -599,7 +668,7 @@ impl RioState {
                         actual_generation,
                     } => {
                         let anomaly = anomaly_with_rio_raw(
-                            CompletionAnomaly::rio_stale_context_raw(
+                            rio_stale_context_anomaly(
                                 result.request_context,
                                 id.index(),
                                 id.generation(),

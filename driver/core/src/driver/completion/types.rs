@@ -288,9 +288,7 @@ where
             | CompletionAnomalyReason::FinalizeFailed
             | CompletionAnomalyReason::CancelAckTargetStillActive
             | CompletionAnomalyReason::BackendContextUnknown
-            | CompletionAnomalyReason::RioMalformedContext
-            | CompletionAnomalyReason::RioMissingContext
-            | CompletionAnomalyReason::RioStaleContext => self.inc_internal_unknown(),
+            | CompletionAnomalyReason::BackendSpecific(_) => self.inc_internal_unknown(),
             CompletionAnomalyReason::OpMissing | CompletionAnomalyReason::SlotCorruption => {
                 self.inc_slot_corruption()
             }

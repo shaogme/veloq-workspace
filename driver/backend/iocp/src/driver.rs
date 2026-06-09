@@ -1,12 +1,17 @@
 mod cancellation;
-mod completion;
+pub(crate) mod completion;
 mod lifecycle;
 mod polling;
 mod registration;
 mod submission;
 
-pub(crate) const RIO_EVENT_KEY: usize =
-    veloq_driver_core::driver::CompletionToken::rio_wake(0).raw() as usize;
+pub(crate) const RIO_EVENT_TOKEN: veloq_driver_core::driver::CompletionToken =
+    match veloq_driver_core::driver::CompletionToken::encode_control(3, 0) {
+        Ok(t) => t,
+        Err(_) => panic!("Failed to encode RIO_EVENT_TOKEN"),
+    };
+
+pub(crate) const RIO_EVENT_KEY: usize = RIO_EVENT_TOKEN.raw() as usize;
 pub(crate) type PreInit = crate::win32::IoCompletionPort;
 
 use std::sync::{Arc, mpsc};

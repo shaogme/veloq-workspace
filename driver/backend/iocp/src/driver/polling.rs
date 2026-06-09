@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use tracing::{debug, error};
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionEnvelope, CompletionIdentity, CompletionToken,
-    OpToken, RawCompletion, RemoteWaker, SharedCompletionTable, drain_cancel_requests,
+    CompletionAnomaly, CompletionEnvelope, CompletionIdentity, OpToken, RawCompletion, RemoteWaker,
+    SharedCompletionTable, drain_cancel_requests,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
@@ -15,7 +15,7 @@ use crate::common::{IocpErrorContext, IocpWaker, iocp_msg};
 use crate::error::{IocpError, IocpResult};
 use crate::op::IocpSlotSpec;
 
-use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY};
+use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY, RIO_EVENT_TOKEN};
 
 #[derive(Default)]
 pub(super) struct CompletionProgress {
@@ -245,22 +245,20 @@ impl<'a> IocpDriver<'a> {
                 .with_ctx("completion_key", key)
                 .with_ctx("overlapped_is_null", true);
 
-                let anomaly =
-                    CompletionAnomaly::backend_context_unknown(CompletionToken::rio_wake(0))
-                        .with_backend(CompletionBackend::Backend("iocp"))
-                        .with_backend_context(key as u64)
-                        .with_raw_result(res)
-                        .with_flags(flags);
+                let anomaly = CompletionAnomaly::backend_context_unknown(RIO_EVENT_TOKEN)
+                    .with_backend(super::completion::COMP_BACKEND_IOCP)
+                    .with_backend_context(key as u64)
+                    .with_raw_result(res)
+                    .with_flags(flags);
                 let flow = self.accept_completion_anomaly(anomaly)?;
                 Ok(CompletionProgress::from_flow(flow, 1, 0))
             }
             IocpCompletionStatusKind::Unknown => {
-                let anomaly =
-                    CompletionAnomaly::backend_context_unknown(CompletionToken::rio_wake(0))
-                        .with_backend(CompletionBackend::Backend("iocp"))
-                        .with_backend_context(key as u64)
-                        .with_raw_result(res)
-                        .with_flags(flags);
+                let anomaly = CompletionAnomaly::backend_context_unknown(RIO_EVENT_TOKEN)
+                    .with_backend(super::completion::COMP_BACKEND_IOCP)
+                    .with_backend_context(key as u64)
+                    .with_raw_result(res)
+                    .with_flags(flags);
                 let flow = self.accept_completion_anomaly(anomaly)?;
                 Ok(CompletionProgress::from_flow(flow, 1, 0))
             }
@@ -287,7 +285,7 @@ impl<'a> IocpDriver<'a> {
         }
 
         let envelope = CompletionEnvelope::from_sidecar_user_token(
-            CompletionBackend::Backend("iocp"),
+            super::completion::COMP_BACKEND_IOCP,
             entry.token,
             completion_key as u64,
             res,
@@ -297,9 +295,9 @@ impl<'a> IocpDriver<'a> {
         let expected_key = raw.token.raw() as usize;
         if completion_key != 0 && completion_key != expected_key {
             let mismatch_raw = RawCompletion::new(
-                CompletionBackend::Backend("iocp"),
+                super::completion::COMP_BACKEND_IOCP,
                 CompletionEnvelope::from_raw_parts(
-                    CompletionBackend::Backend("iocp"),
+                    super::completion::COMP_BACKEND_IOCP,
                     completion_key as u64,
                     raw.res,
                     raw.flags,
@@ -357,11 +355,10 @@ fn classify_completion_status(
     } else if !success && key == 0 {
         IocpCompletionStatusKind::NullFailure
     } else if matches!(
-        CompletionEnvelope::from_raw_parts(CompletionBackend::Backend("iocp"), key as u64, 0, 0)
+        CompletionEnvelope::from_raw_parts(super::completion::COMP_BACKEND_IOCP, key as u64, 0, 0)
             .identity,
         CompletionIdentity::Waker(_)
             | CompletionIdentity::Cancel(_)
-            | CompletionIdentity::RioWake(_)
             | CompletionIdentity::UnknownControl { .. }
     ) {
         IocpCompletionStatusKind::ControlKey
@@ -449,6 +446,7 @@ fn completion_key_mismatch_anomaly(
 mod tests {
     use super::*;
     use std::ptr;
+    use veloq_driver_core::driver::CompletionToken;
 
     #[test]
     fn null_overlapped_key_zero_failure_is_not_posted_token() {

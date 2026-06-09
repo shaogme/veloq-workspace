@@ -8,7 +8,6 @@ const CONTROL_TOKEN_ID_SHIFT: u32 = 32;
 pub enum CompletionControlKind {
     Waker = 1,
     Cancel = 2,
-    RioWake = 3,
 }
 
 impl CompletionControlKind {
@@ -17,7 +16,6 @@ impl CompletionControlKind {
         match raw {
             1 => Some(Self::Waker),
             2 => Some(Self::Cancel),
-            3 => Some(Self::RioWake),
             _ => None,
         }
     }
@@ -119,9 +117,30 @@ impl CancelCompletionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompletionToken(u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionTokenError {
+    ReservedControlKind { kind: u16 },
+    ControlKindOverflow { kind: u16 },
+}
+
+impl std::fmt::Display for CompletionTokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReservedControlKind { kind } => {
+                write!(f, "Control kind {} is reserved by the driver", kind)
+            }
+            Self::ControlKindOverflow { kind } => {
+                write!(f, "Control kind {} overflows 15-bit limit", kind)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompletionTokenError {}
+
 impl CompletionToken {
     #[inline]
-    pub fn user(token: OpToken) -> Self {
+    pub const fn user(token: OpToken) -> Self {
         let (index, generation) = token.parts();
         Self(((generation as u64 & 0x7fff) << 48) | (index as u64 & 0x0000_ffff_ffff_ffff))
     }
@@ -137,7 +156,24 @@ impl CompletionToken {
     }
 
     #[inline]
-    pub const fn internal(kind: CompletionControlKind, id: u16) -> Self {
+    pub const fn encode_control(kind: u16, id: u16) -> Result<Self, CompletionTokenError> {
+        if kind > 0x7fff {
+            return Err(CompletionTokenError::ControlKindOverflow { kind });
+        }
+        if kind == CompletionControlKind::Waker as u16
+            || kind == CompletionControlKind::Cancel as u16
+        {
+            return Err(CompletionTokenError::ReservedControlKind { kind });
+        }
+        Ok(Self(
+            CONTROL_TOKEN_FLAG
+                | ((kind as u64) << CONTROL_TOKEN_KIND_SHIFT)
+                | ((id as u64) << CONTROL_TOKEN_ID_SHIFT),
+        ))
+    }
+
+    #[inline]
+    const fn internal(kind: CompletionControlKind, id: u16) -> Self {
         Self(
             CONTROL_TOKEN_FLAG
                 | ((kind as u64 & 0x7fff) << CONTROL_TOKEN_KIND_SHIFT)
@@ -153,11 +189,6 @@ impl CompletionToken {
     #[inline]
     pub const fn cancel(id: CancelCompletionId) -> Self {
         Self::internal(CompletionControlKind::Cancel, id.raw())
-    }
-
-    #[inline]
-    pub const fn rio_wake(id: u16) -> Self {
-        Self::internal(CompletionControlKind::RioWake, id)
     }
 
     #[inline]

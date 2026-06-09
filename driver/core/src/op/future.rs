@@ -153,9 +153,6 @@ where
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::UnknownControlToken
         | CompletionAnomalyReason::ControlCompletionUntracked
-        | CompletionAnomalyReason::RioMalformedContext
-        | CompletionAnomalyReason::RioMissingContext
-        | CompletionAnomalyReason::RioStaleContext
         | CompletionAnomalyReason::NonActiveSlot
         | CompletionAnomalyReason::SlotCorruption
         | CompletionAnomalyReason::OpMissing
@@ -163,7 +160,8 @@ where
         | CompletionAnomalyReason::CompletionKeyMismatch
         | CompletionAnomalyReason::FinalizeFailed
         | CompletionAnomalyReason::CancelAckTargetStillActive
-        | CompletionAnomalyReason::BackendContextUnknown => LostReason::Other,
+        | CompletionAnomalyReason::BackendContextUnknown
+        | CompletionAnomalyReason::BackendSpecific(_) => LostReason::Other,
     };
 
     let mut report = DriverCoreError::Internal

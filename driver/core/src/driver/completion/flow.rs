@@ -61,10 +61,6 @@ pub enum CompletionControl {
         id: super::CancelCompletionId,
         raw: RawCompletion,
     },
-    RioWake {
-        id: u16,
-        raw: RawCompletion,
-    },
 }
 
 pub enum CompletionHookOutcome<Spec, Effect>
@@ -313,10 +309,6 @@ where
                 }
                 CompletionDispatch::Cancel { id, raw } => {
                     let outcome = hooks.handle_control(CompletionControl::Cancel { id, raw });
-                    finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
-                }
-                CompletionDispatch::RioWake { id, raw } => {
-                    let outcome = hooks.handle_control(CompletionControl::RioWake { id, raw });
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Unknown { envelope } => {

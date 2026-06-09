@@ -1,6 +1,6 @@
 //! Runtime datapath: hot path buffer/pool state and UDP submissions.
 
-mod control_flow;
+pub(crate) mod control_flow;
 
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};

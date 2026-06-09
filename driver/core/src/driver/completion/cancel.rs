@@ -112,13 +112,11 @@ pub fn cancel_target_anomaly<'a, Spec: slot::SlotSpec>(
         | CompletionAnomalyReason::NonActiveSlot
         | CompletionAnomalyReason::UnknownControlToken
         | CompletionAnomalyReason::ControlCompletionUntracked
-        | CompletionAnomalyReason::RioMalformedContext
-        | CompletionAnomalyReason::RioMissingContext
-        | CompletionAnomalyReason::RioStaleContext
         | CompletionAnomalyReason::CompletionKeyMismatch
         | CompletionAnomalyReason::FinalizeFailed
         | CompletionAnomalyReason::CancelAckTargetStillActive
-        | CompletionAnomalyReason::BackendContextUnknown => CancelTargetGoneReason::Missing,
+        | CompletionAnomalyReason::BackendContextUnknown
+        | CompletionAnomalyReason::BackendSpecific(_) => CancelTargetGoneReason::Missing,
     };
     (reason, anomaly)
 }

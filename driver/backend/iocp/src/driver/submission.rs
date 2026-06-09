@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionBackendHooks, CompletionControl,
-    CompletionFlowExt, CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
+    CompletionAnomaly, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
+    CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
     DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus, SyntheticCompletionSource,
     UserCompletionEvent,
 };
@@ -206,7 +206,7 @@ impl<'a> IocpDriver<'a> {
             let report = IocpError::Submission.report("iocp/driver", "thread pool overloaded");
             let event_res = iocp_fallback_event_res(IocpError::Submission);
             let event = UserCompletionEvent::from_parts(
-                CompletionBackend::Backend("iocp"),
+                super::completion::COMP_BACKEND_IOCP,
                 token,
                 event_res,
                 0,

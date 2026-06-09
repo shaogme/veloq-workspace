@@ -9,12 +9,14 @@ use crate::rio::core::{
 };
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::RioSocketActor;
+use crate::rio::runtime::control_flow::{
+    rio_malformed_context_anomaly, rio_missing_context_anomaly, rio_stale_context_anomaly,
+};
 use crate::rio::runtime::release_socket_inflight_token_from;
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::sync::OnceLock;
-use veloq_driver_core::driver::CompletionAnomaly;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 const RIO_REAPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -108,26 +110,23 @@ impl RioState {
                     release_socket_inflight_token_from(&mut self.socket_runtime, socket_inflight);
             }
             RioRequestContextDecode::Malformed { raw } => {
-                let anomaly = CompletionAnomaly::rio_malformed_context_raw(raw)
+                let anomaly = rio_malformed_context_anomaly(raw)
                     .with_raw_result(rio_drain_raw_res(res))
                     .with_flags(0);
                 self.diagnostics.record_anomaly(&anomaly);
             }
             RioRequestContextDecode::Missing { id } => {
-                let anomaly = CompletionAnomaly::rio_missing_context_raw(
-                    res.RequestContext,
-                    id.index(),
-                    id.generation(),
-                )
-                .with_raw_result(rio_drain_raw_res(res))
-                .with_flags(0);
+                let anomaly =
+                    rio_missing_context_anomaly(res.RequestContext, id.index(), id.generation())
+                        .with_raw_result(rio_drain_raw_res(res))
+                        .with_flags(0);
                 self.diagnostics.record_anomaly(&anomaly);
             }
             RioRequestContextDecode::Stale {
                 id,
                 actual_generation,
             } => {
-                let anomaly = CompletionAnomaly::rio_stale_context_raw(
+                let anomaly = rio_stale_context_anomaly(
                     res.RequestContext,
                     id.index(),
                     id.generation(),

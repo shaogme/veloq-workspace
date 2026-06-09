@@ -125,10 +125,6 @@ pub enum CompletionDispatch {
         id: CancelCompletionId,
         raw: RawCompletion,
     },
-    RioWake {
-        id: u16,
-        raw: RawCompletion,
-    },
     Unknown {
         envelope: CompletionEnvelope,
     },
@@ -139,7 +135,6 @@ pub enum CompletionIdentity {
     User(OpToken),
     Waker(u16),
     Cancel(CancelCompletionId),
-    RioWake(u16),
     UnknownControl {
         kind: u16,
         id: u16,
@@ -201,13 +196,6 @@ impl CompletionEnvelope {
                 CompletionIdentity::Cancel(CancelCompletionId::new(id)),
                 CompletionIdentitySource::ControlToken,
             ),
-            CompletionTokenClass::Control {
-                kind: CompletionControlKind::RioWake,
-                id,
-            } => (
-                CompletionIdentity::RioWake(id),
-                CompletionIdentitySource::ControlToken,
-            ),
             CompletionTokenClass::UnknownControl { kind, id } => (
                 CompletionIdentity::UnknownControl { kind, id },
                 CompletionIdentitySource::ControlToken,
@@ -263,7 +251,6 @@ pub(super) fn dispatch_envelope(envelope: CompletionEnvelope) -> CompletionDispa
         },
         CompletionIdentity::Waker(id) => CompletionDispatch::Waker { id, raw },
         CompletionIdentity::Cancel(id) => CompletionDispatch::Cancel { id, raw },
-        CompletionIdentity::RioWake(id) => CompletionDispatch::RioWake { id, raw },
         CompletionIdentity::UnknownControl { .. } | CompletionIdentity::BackendContext { .. } => {
             CompletionDispatch::Unknown { envelope }
         }
@@ -290,8 +277,7 @@ pub(super) fn unknown_completion_anomaly(envelope: CompletionEnvelope) -> Comple
         CompletionIdentity::UnknownControl { .. }
         | CompletionIdentity::User(_)
         | CompletionIdentity::Waker(_)
-        | CompletionIdentity::Cancel(_)
-        | CompletionIdentity::RioWake(_) => {
+        | CompletionIdentity::Cancel(_) => {
             CompletionAnomaly::unknown_control(envelope.raw.token).with_raw_completion(envelope.raw)
         }
     }

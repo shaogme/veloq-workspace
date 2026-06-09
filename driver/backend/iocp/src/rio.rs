@@ -11,7 +11,7 @@
 mod core;
 mod error;
 mod lifecycle;
-mod runtime;
+pub(crate) mod runtime;
 
 use crate::BufferRegistrationMode;
 use crate::config::SocketKey;

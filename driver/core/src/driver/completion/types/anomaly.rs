@@ -7,9 +7,6 @@ pub enum CompletionAnomalyReason {
     UnknownSlot,
     UnknownControlToken,
     ControlCompletionUntracked,
-    RioMalformedContext,
-    RioMissingContext,
-    RioStaleContext,
     StaleGeneration,
     NonActiveSlot,
     SlotCorruption,
@@ -20,6 +17,7 @@ pub enum CompletionAnomalyReason {
     FinalizeFailed,
     CancelAckTargetStillActive,
     BackendContextUnknown,
+    BackendSpecific(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +50,7 @@ impl CompletionMutationOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionBackend {
     Core,
-    Backend(&'static str),
+    Backend(std::num::NonZeroU8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,62 +117,6 @@ impl CompletionAnomaly {
             flags: None,
             slot_snapshot: None,
             reason: CompletionAnomalyReason::UnknownSlot,
-        }
-    }
-
-    #[inline]
-    pub fn rio_malformed_context(token: CompletionToken) -> Self {
-        Self {
-            token,
-            index: None,
-            expected_generation: None,
-            actual_generation: None,
-            state: None,
-            backend: Some(CompletionBackend::Backend("rio")),
-            backend_context: None,
-            raw_result: None,
-            flags: None,
-            slot_snapshot: None,
-            reason: CompletionAnomalyReason::RioMalformedContext,
-        }
-    }
-
-    #[inline]
-    pub fn rio_missing_context(token: CompletionToken, index: usize, generation: u32) -> Self {
-        Self {
-            token,
-            index: Some(index),
-            expected_generation: Some(generation),
-            actual_generation: None,
-            state: None,
-            backend: Some(CompletionBackend::Backend("rio")),
-            backend_context: None,
-            raw_result: None,
-            flags: None,
-            slot_snapshot: None,
-            reason: CompletionAnomalyReason::RioMissingContext,
-        }
-    }
-
-    #[inline]
-    pub fn rio_stale_context(
-        token: CompletionToken,
-        index: usize,
-        expected_generation: u32,
-        actual_generation: u32,
-    ) -> Self {
-        Self {
-            token,
-            index: Some(index),
-            expected_generation: Some(expected_generation),
-            actual_generation: Some(actual_generation),
-            state: None,
-            backend: Some(CompletionBackend::Backend("rio")),
-            backend_context: None,
-            raw_result: None,
-            flags: None,
-            slot_snapshot: None,
-            reason: CompletionAnomalyReason::RioStaleContext,
         }
     }
 
@@ -435,32 +377,5 @@ impl CompletionAnomaly {
         self.state = Some(snapshot.state);
         self.slot_snapshot = Some(snapshot);
         self
-    }
-
-    #[inline]
-    pub fn rio_malformed_context_raw(raw_context: u64) -> Self {
-        Self::rio_malformed_context(CompletionToken::rio_wake(0)).with_backend_context(raw_context)
-    }
-
-    #[inline]
-    pub fn rio_missing_context_raw(raw_context: u64, index: usize, generation: u32) -> Self {
-        Self::rio_missing_context(CompletionToken::rio_wake(0), index, generation)
-            .with_backend_context(raw_context)
-    }
-
-    #[inline]
-    pub fn rio_stale_context_raw(
-        raw_context: u64,
-        index: usize,
-        expected_generation: u32,
-        actual_generation: u32,
-    ) -> Self {
-        Self::rio_stale_context(
-            CompletionToken::rio_wake(0),
-            index,
-            expected_generation,
-            actual_generation,
-        )
-        .with_backend_context(raw_context)
     }
 }
