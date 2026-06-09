@@ -880,14 +880,14 @@ pub fn cancel_target_anomaly<'a, Spec: slot::SlotSpec>(
     (reason, anomaly)
 }
 
-pub struct CompletionPacket<UP, E, R = usize> {
+pub struct CompletionPacket<Spec: slot::SlotSpec> {
     pub event: UserCompletionEvent,
-    pub input: CompletionInput<UP, E, R>,
+    pub input: CompletionInput<Spec>,
 }
 
-pub struct UserCompletion<UP, E, R = usize> {
-    pub payload: UP,
-    pub detail: Option<DriverResult<R, E>>,
+pub struct UserCompletion<Spec: slot::SlotSpec> {
+    pub payload: Spec::UserPayload,
+    pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
     pub cleanup: CompletionCleanupGuard,
 }
 
@@ -896,12 +896,12 @@ pub struct CompletionLoss {
     pub cleanup: CompletionCleanupGuard,
 }
 
-pub enum CompletionInput<UP, E, R = usize> {
-    User(UserCompletion<UP, E, R>),
+pub enum CompletionInput<Spec: slot::SlotSpec> {
+    User(UserCompletion<Spec>),
     Lost(CompletionLoss),
 }
 
-impl<UP, E, R> CompletionInput<UP, E, R> {
+impl<Spec: slot::SlotSpec> CompletionInput<Spec> {
     #[inline]
     pub fn cleanup_mut(&mut self) -> &mut CompletionCleanupGuard {
         match self {
@@ -919,12 +919,12 @@ impl<UP, E, R> CompletionInput<UP, E, R> {
     }
 }
 
-impl<UP, E, R> CompletionPacket<UP, E, R> {
+impl<Spec: slot::SlotSpec> CompletionPacket<Spec> {
     #[inline]
     pub fn user_event(
         event: UserCompletionEvent,
-        payload: UP,
-        detail: Option<DriverResult<R, E>>,
+        payload: Spec::UserPayload,
+        detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
         Self {
@@ -940,8 +940,8 @@ impl<UP, E, R> CompletionPacket<UP, E, R> {
     #[inline]
     pub fn user(
         event: UserCompletionEvent,
-        payload: UP,
-        detail: Option<DriverResult<R, E>>,
+        payload: Spec::UserPayload,
+        detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
     ) -> Self {
         Self::user_event(event, payload, detail, CompletionCleanupGuard::default())
     }
@@ -949,8 +949,8 @@ impl<UP, E, R> CompletionPacket<UP, E, R> {
     #[inline]
     pub fn user_with_cleanup(
         event: UserCompletionEvent,
-        payload: UP,
-        detail: Option<DriverResult<R, E>>,
+        payload: Spec::UserPayload,
+        detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
         Self::user_event(event, payload, detail, cleanup)
@@ -997,14 +997,14 @@ impl CompletionEvent {
     }
 }
 
-pub struct CompletionRecord<UP, E, R = usize> {
+pub struct CompletionRecord<Spec: slot::SlotSpec> {
     pub event: UserCompletionEvent,
-    pub payload: UP,
-    pub detail: Option<DriverResult<R, E>>,
+    pub payload: Spec::UserPayload,
+    pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
     pub cleanup: CompletionCleanupGuard,
 }
 
-impl<UP, E, R> CompletionRecord<UP, E, R> {
+impl<Spec: slot::SlotSpec> CompletionRecord<Spec> {
     #[inline]
     pub fn disarm_cleanup(&mut self) -> bool {
         self.cleanup.disarm()
@@ -1012,9 +1012,9 @@ impl<UP, E, R> CompletionRecord<UP, E, R> {
 }
 
 #[inline]
-fn run_rejected_cleanup<B, UP, E, R>(
-    diagnostics: &DriverCompletionDiagnostics<B>,
-    mut packet: CompletionPacket<UP, E, R>,
+fn run_rejected_cleanup<Spec: slot::SlotSpec>(
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    mut packet: CompletionPacket<Spec>,
 ) {
     run_completion_cleanup(diagnostics, packet.input.cleanup_mut());
     drop(packet);
@@ -1100,7 +1100,7 @@ mod tests {
     fn completion_packet_uses_user_completion_event_token() {
         let token = OpToken::from_registry_parts(3, 9).expect("test token");
         let event = UserCompletionEvent::from_parts(CompletionBackend::Core, token, 11, 5);
-        let packet = CompletionPacket::<(), (), usize>::user(event, (), None);
+        let packet = CompletionPacket::<DummySlotSpec>::user(event, (), None);
 
         assert_eq!(packet.token(), token);
         assert_eq!(

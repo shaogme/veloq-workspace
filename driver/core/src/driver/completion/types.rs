@@ -702,15 +702,15 @@ pub enum RecordCompletionOutcome {
     Corrupt(CompletionAnomaly),
 }
 
-pub enum RecordCompletionResult<UP, E, R = usize> {
+pub enum RecordCompletionResult<Spec: slot::SlotSpec> {
     Recorded(RecordCompletionOutcome),
     Rejected {
         outcome: RecordCompletionOutcome,
-        packet: Box<CompletionPacket<UP, E, R>>,
+        packet: Box<CompletionPacket<Spec>>,
     },
 }
 
-impl<UP, E, R> RecordCompletionResult<UP, E, R> {
+impl<Spec: slot::SlotSpec> RecordCompletionResult<Spec> {
     #[inline]
     pub fn outcome(&self) -> &RecordCompletionOutcome {
         match self {
@@ -779,7 +779,10 @@ where
     }
 
     #[inline]
-    pub fn record_completion_result<UP, E, R>(&self, result: &RecordCompletionResult<UP, E, R>) {
+    pub fn record_completion_result<Spec: slot::SlotSpec>(
+        &self,
+        result: &RecordCompletionResult<Spec>,
+    ) {
         self.record_completion_outcome(result.outcome());
     }
 }

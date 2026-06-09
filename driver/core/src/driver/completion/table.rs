@@ -10,30 +10,24 @@ use super::{
     RecordCompletionResult, UserCompletionEvent, run_completion_cleanup,
 };
 
-pub type SharedCompletionTable<Spec> = Arc<
-    dyn CompletionAccess<
-            <Spec as crate::slot::SlotSpec>::UserPayload,
-            <Spec as crate::slot::SlotSpec>::Error,
-            <Spec as crate::slot::SlotSpec>::Completion,
-        >,
->;
+pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
 
 /// Result of a completion poll, enabling detection of recycled slots.
-pub enum PollRecordResult<UP, E, R = usize> {
+pub enum PollRecordResult<Spec: slot::SlotSpec> {
     /// Operation completed successfully or with an error.
-    Ready(CompletionRecord<UP, E, R>),
+    Ready(CompletionRecord<Spec>),
     /// Operation completion became unavailable and the waiter can finish as resource-lost.
     Unavailable(CompletionAnomaly),
     /// Operation is still in flight.
     Pending,
 }
 
-pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
+pub trait CompletionAccess<Spec: slot::SlotSpec>: Send + Sync {
     fn record_completion(
         &self,
         permit: CompletionWritePermit,
-        packet: CompletionPacket<UP, E, R>,
-    ) -> RecordCompletionResult<UP, E, R>;
+        packet: CompletionPacket<Spec>,
+    ) -> RecordCompletionResult<Spec>;
 
     fn record_lost_completion(
         &self,
@@ -41,11 +35,11 @@ pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
         event: UserCompletionEvent,
         anomaly: CompletionAnomaly,
         cleanup: CompletionCleanupGuard,
-    ) -> RecordCompletionResult<UP, E, R> {
+    ) -> RecordCompletionResult<Spec> {
         self.record_completion(permit, CompletionPacket::lost(event, anomaly, cleanup))
     }
 
-    fn try_take_record(&self, token: OpToken) -> PollRecordResult<UP, E, R>;
+    fn try_take_record(&self, token: OpToken) -> PollRecordResult<Spec>;
 
     fn register_waker(&self, token: OpToken, waker: &Waker) -> CompletionMutationOutcome;
 
@@ -66,25 +60,25 @@ pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
 
 #[inline]
-fn recorded_completion<B, UP, E, R>(
-    diagnostics: &super::DriverCompletionDiagnostics<B>,
+fn recorded_completion<Spec: slot::SlotSpec>(
+    diagnostics: &super::DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     outcome: RecordCompletionOutcome,
-) -> RecordCompletionResult<UP, E, R>
+) -> RecordCompletionResult<Spec>
 where
-    B: super::DriverCompletionDiagnosticsBackend,
+    Spec::CompletionDiagnostics: super::DriverCompletionDiagnosticsBackend,
 {
     diagnostics.record_completion_outcome(&outcome);
     RecordCompletionResult::Recorded(outcome)
 }
 
 #[inline]
-fn rejected_completion<B, UP, E, R>(
-    diagnostics: &super::DriverCompletionDiagnostics<B>,
+fn rejected_completion<Spec: slot::SlotSpec>(
+    diagnostics: &super::DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     outcome: RecordCompletionOutcome,
-    packet: CompletionPacket<UP, E, R>,
-) -> RecordCompletionResult<UP, E, R>
+    packet: CompletionPacket<Spec>,
+) -> RecordCompletionResult<Spec>
 where
-    B: super::DriverCompletionDiagnosticsBackend,
+    Spec::CompletionDiagnostics: super::DriverCompletionDiagnosticsBackend,
 {
     diagnostics.record_completion_outcome(&outcome);
     RecordCompletionResult::Rejected {
@@ -94,7 +88,9 @@ where
 }
 
 #[inline]
-fn recorded_outcome<UP, E, R>(input: &CompletionInput<UP, E, R>) -> RecordCompletionOutcome {
+fn recorded_outcome<Spec: slot::SlotSpec>(
+    input: &CompletionInput<Spec>,
+) -> RecordCompletionOutcome {
     match input {
         CompletionInput::User(_) => RecordCompletionOutcome::RecordedUser,
         CompletionInput::Lost(_) => RecordCompletionOutcome::RecordedLost,
@@ -168,10 +164,12 @@ where
 }
 
 #[inline]
-fn run_discarded_record_cleanup<B, UP, E, R>(
-    diagnostics: &super::DriverCompletionDiagnostics<B>,
-    record_data: slot::CompletionData<UP, E, R>,
-) {
+fn run_discarded_record_cleanup<Spec: slot::SlotSpec>(
+    diagnostics: &super::DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    record_data: slot::CompletionData<Spec>,
+) where
+    Spec::CompletionDiagnostics: super::DriverCompletionDiagnosticsBackend,
+{
     match record_data {
         slot::CompletionData::User {
             event: _,
@@ -193,16 +191,19 @@ fn run_discarded_record_cleanup<B, UP, E, R>(
     }
 }
 
-impl<Spec, UP: Send, E: Send, R: Send> CompletionAccess<UP, E, R> for slot::SlotTable<Spec>
+impl<Spec> CompletionAccess<Spec> for slot::SlotTable<Spec>
 where
-    Spec: slot::SlotSpec<UserPayload = UP, Error = E, Completion = R>,
+    Spec: slot::SlotSpec,
+    slot::SlotPayload<Spec>: Send,
+    slot::SlotError<Spec>: Send,
+    slot::SlotCompletion<Spec>: Send,
 {
     #[inline]
     fn record_completion(
         &self,
         _permit: CompletionWritePermit,
-        packet: CompletionPacket<UP, E, R>,
-    ) -> RecordCompletionResult<UP, E, R> {
+        packet: CompletionPacket<Spec>,
+    ) -> RecordCompletionResult<Spec> {
         let op_token = packet.token();
         let event = packet.event;
         let token = event.completion_token();
@@ -330,7 +331,7 @@ where
     }
 
     #[inline]
-    fn try_take_record(&self, token: OpToken) -> PollRecordResult<UP, E, R> {
+    fn try_take_record(&self, token: OpToken) -> PollRecordResult<Spec> {
         let completion_token = CompletionToken::user(token);
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {

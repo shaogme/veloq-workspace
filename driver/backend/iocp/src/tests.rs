@@ -13,7 +13,7 @@ use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
 
 use crate::driver::IocpDriver;
 use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
-use crate::op::{IocpOp, IocpUserPayload};
+use crate::op::{IocpOp, IocpSlotSpec, IocpUserPayload};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     driver.debug_remote_free_contains(needle)
@@ -44,7 +44,7 @@ where
 }
 
 pub(crate) fn complete_from_record<T>(
-    record: CompletionRecord<IocpUserPayload, IocpError>,
+    record: CompletionRecord<IocpSlotSpec>,
 ) -> OpCompletion<T::Output, IocpError, T::Completion>
 where
     T: IntoPlatformOp<
@@ -72,7 +72,7 @@ pub(crate) fn wait_completion_record(
     driver: &mut IocpDriver,
     token: OpToken,
     timeout: std::time::Duration,
-) -> IocpResult<CompletionRecord<IocpUserPayload, IocpError>> {
+) -> IocpResult<CompletionRecord<IocpSlotSpec>> {
     let start = std::time::Instant::now();
     loop {
         if start.elapsed() > timeout {

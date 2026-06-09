@@ -459,7 +459,7 @@ where
             let record = record_user_completion::<Spec>(
                 table,
                 diagnostics,
-                CompletionPacket::user_with_cleanup(event, payload, detail, cleanup),
+                CompletionPacket::<Spec>::user_with_cleanup(event, payload, detail, cleanup),
             );
             finish_waiting_if_needed(registry, diagnostics, finalize, event);
             hooks.finish_backend_effect(effect);
@@ -514,11 +514,7 @@ where
 fn record_user_completion<Spec>(
     table: &SharedCompletionTable<Spec>,
     diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
-    packet: CompletionPacket<
-        slot::SlotPayload<Spec>,
-        slot::SlotError<Spec>,
-        slot::SlotCompletion<Spec>,
-    >,
+    packet: CompletionPacket<Spec>,
 ) -> RecordCompletionOutcome
 where
     Spec: slot::SlotSpec,
@@ -553,7 +549,7 @@ where
     record_user_completion::<Spec>(
         table,
         diagnostics,
-        CompletionPacket::lost(event, anomaly, cleanup),
+        CompletionPacket::<Spec>::lost(event, anomaly, cleanup),
     )
 }
 

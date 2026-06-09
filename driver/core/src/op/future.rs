@@ -9,8 +9,8 @@ use tracing::trace;
 
 use crate::driver::{
     CancelRequest, CompletionAnomaly, CompletionAnomalyReason, CompletionRecord, CompletionToken,
-    Driver, DriverSubmitResult, OpToken, PlatformOp, PollRecordResult, RemoteCancelSender,
-    RemoteWaker, SharedCompletionTable, SubmitStatus,
+    CompletionValue, Driver, DriverSubmitResult, OpToken, PlatformOp, PollRecordResult,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SubmitStatus,
 };
 use crate::op::{IntoPlatformOp, Op};
 use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
@@ -207,15 +207,20 @@ where
 }
 
 #[inline]
-pub(crate) fn completion_record_to_result<T, O, UP, E, C>(
-    record: CompletionRecord<UP, E, C>,
-) -> Poll<OpResult<T::Output, E, T::Completion>>
+pub(crate) fn completion_record_to_result<T, O, Spec>(
+    record: CompletionRecord<Spec>,
+) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
 where
-    UP: Send,
+    Spec: crate::slot::SlotSpec,
     O: PlatformOp,
-    T: IntoPlatformOp<O, DriverCompletion = C, ErasedPayload = UP, Error = E>,
-    E: DriverError,
-    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            O,
+            DriverCompletion = Spec::Completion,
+            ErasedPayload = Spec::UserPayload,
+            Error = Spec::Error,
+        >,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
 {
     let CompletionRecord {
         event,
@@ -231,29 +236,37 @@ where
         }
     };
     cleanup.disarm();
-    let res = detail.unwrap_or_else(|| C::from_event_res::<E>(event.res()));
+    let res =
+        detail.unwrap_or_else(|| Spec::Completion::from_event_res::<Spec::Error>(event.res()));
     let completion = T::complete(payload, res);
     Poll::Ready(OpResult::Completed(completion.result, completion.output))
 }
 
 #[inline]
-pub(crate) fn poll_completion_table_once<T, O, UP, E, C>(
-    table: &dyn crate::driver::CompletionAccess<UP, E, C>,
+pub(crate) fn poll_completion_table_once<T, O, Spec>(
+    table: &dyn crate::driver::CompletionAccess<Spec>,
     token: OpToken,
-) -> Poll<OpResult<T::Output, E, T::Completion>>
+) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
 where
-    UP: Send,
+    Spec: crate::slot::SlotSpec,
     O: PlatformOp,
-    T: IntoPlatformOp<O, DriverCompletion = C, ErasedPayload = UP, Error = E>,
-    E: DriverError,
-    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            O,
+            DriverCompletion = Spec::Completion,
+            ErasedPayload = Spec::UserPayload,
+            Error = Spec::Error,
+        >,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
 {
     match table.try_take_record(token) {
-        PollRecordResult::Ready(record) => completion_record_to_result::<T, O, UP, E, C>(record),
+        PollRecordResult::Ready(record) => completion_record_to_result::<T, O, Spec>(record),
         PollRecordResult::Unavailable(anomaly) => {
-            Poll::Ready(OpResult::<T::Output, E, T::Completion>::ResourceLost(
-                completion_anomaly_error(anomaly),
-            ))
+            Poll::Ready(
+                OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(
+                    completion_anomaly_error(anomaly),
+                ),
+            )
         }
         PollRecordResult::Pending => Poll::Pending,
     }
@@ -358,21 +371,14 @@ where
         let token = this
             .token
             .expect("DetachedOp missing completion token but no immediate_failure");
-        if let Poll::Ready(result) = poll_completion_table_once::<
-            T,
-            Spec::Op,
-            T::ErasedPayload,
-            Spec::Error,
-            Spec::Completion,
-        >(&**table, token)
+        if let Poll::Ready(result) =
+            poll_completion_table_once::<T, Spec::Op, Spec>(&**table, token)
         {
             return Poll::Ready(result);
         }
 
         table.register_waker(token, cx.waker());
-        poll_completion_table_once::<T, Spec::Op, T::ErasedPayload, Spec::Error, Spec::Completion>(
-            &**table, token,
-        )
+        poll_completion_table_once::<T, Spec::Op, Spec>(&**table, token)
     }
 }
 
@@ -542,39 +548,34 @@ where
             let token = op
                 .token
                 .expect("LocalOp submitted state missing completion token");
-            let res =
-                op.provider.with_driver(|mut driver| {
-                    let mut is_ready = false;
-                    let mut ready_val = None;
+            let res = op.provider.with_driver(|mut driver| {
+                let mut is_ready = false;
+                let mut ready_val = None;
 
-                    match poll_completion_table_once::<T, P::Op, P::UP, P::Error, P::Completion>(
-                        &*driver.completion_table(),
-                        token,
-                    ) {
-                        Poll::Ready(result) => {
-                            is_ready = true;
-                            ready_val = Some(result);
-                        }
-                        Poll::Pending => {
-                            driver.register_completion_waker(token, cx.waker());
-                            match poll_completion_table_once::<
-                                T,
-                                P::Op,
-                                P::UP,
-                                P::Error,
-                                P::Completion,
-                            >(&*driver.completion_table(), token)
-                            {
-                                Poll::Ready(result) => {
-                                    is_ready = true;
-                                    ready_val = Some(result);
-                                }
-                                Poll::Pending => {}
+                match poll_completion_table_once::<T, P::Op, P::SlotSpec>(
+                    &*driver.completion_table(),
+                    token,
+                ) {
+                    Poll::Ready(result) => {
+                        is_ready = true;
+                        ready_val = Some(result);
+                    }
+                    Poll::Pending => {
+                        driver.register_completion_waker(token, cx.waker());
+                        match poll_completion_table_once::<T, P::Op, P::SlotSpec>(
+                            &*driver.completion_table(),
+                            token,
+                        ) {
+                            Poll::Ready(result) => {
+                                is_ready = true;
+                                ready_val = Some(result);
                             }
+                            Poll::Pending => {}
                         }
                     }
-                    (is_ready, ready_val)
-                });
+                }
+                (is_ready, ready_val)
+            });
 
             if res.0 {
                 op.state = LocalState::Completed;
