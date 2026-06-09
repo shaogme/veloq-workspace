@@ -264,11 +264,7 @@ where
 {
     fn accept_completion<Hooks>(
         &mut self,
-        table: &SharedCompletionTable<
-            slot::SlotPayload<Spec>,
-            slot::SlotError<Spec>,
-            slot::SlotCompletion<Spec>,
-        >,
+        table: &SharedCompletionTable<Spec>,
         diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         ingress: CompletionIngress<Hooks::BackendIngress>,
@@ -287,11 +283,7 @@ where
 {
     fn accept_completion<Hooks>(
         &mut self,
-        table: &SharedCompletionTable<
-            slot::SlotPayload<Spec>,
-            slot::SlotError<Spec>,
-            slot::SlotCompletion<Spec>,
-        >,
+        table: &SharedCompletionTable<Spec>,
         diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         ingress: CompletionIngress<Hooks::BackendIngress>,
@@ -359,11 +351,7 @@ where
 {
     fn accept_user_event<Hooks>(
         &mut self,
-        table: &SharedCompletionTable<
-            slot::SlotPayload<Spec>,
-            slot::SlotError<Spec>,
-            slot::SlotCompletion<Spec>,
-        >,
+        table: &SharedCompletionTable<Spec>,
         diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         event: UserCompletionEvent,
@@ -383,11 +371,7 @@ where
 {
     fn accept_user_event<Hooks>(
         &mut self,
-        table: &SharedCompletionTable<
-            slot::SlotPayload<Spec>,
-            slot::SlotError<Spec>,
-            slot::SlotCompletion<Spec>,
-        >,
+        table: &SharedCompletionTable<Spec>,
         diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         event: UserCompletionEvent,
@@ -450,11 +434,7 @@ enum FinalizeAction {
 
 fn finish_hook_outcome<Spec, Hooks>(
     registry: &mut OpRegistry<Spec>,
-    table: &SharedCompletionTable<
-        slot::SlotPayload<Spec>,
-        slot::SlotError<Spec>,
-        slot::SlotCompletion<Spec>,
-    >,
+    table: &SharedCompletionTable<Spec>,
     diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
     hooks: &mut Hooks,
     outcome: CompletionHookOutcome<Spec, Hooks::BackendEffect>,
@@ -532,11 +512,7 @@ where
 }
 
 fn record_user_completion<Spec>(
-    table: &SharedCompletionTable<
-        slot::SlotPayload<Spec>,
-        slot::SlotError<Spec>,
-        slot::SlotCompletion<Spec>,
-    >,
+    table: &SharedCompletionTable<Spec>,
     diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
     packet: CompletionPacket<
         slot::SlotPayload<Spec>,
@@ -561,11 +537,7 @@ where
 }
 
 fn record_lost_completion<Spec>(
-    table: &SharedCompletionTable<
-        slot::SlotPayload<Spec>,
-        slot::SlotError<Spec>,
-        slot::SlotCompletion<Spec>,
-    >,
+    table: &SharedCompletionTable<Spec>,
     diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
     event: UserCompletionEvent,
     anomaly: CompletionAnomaly,

@@ -13,7 +13,7 @@ use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
 use crate::common::{IocpErrorContext, IocpWaker, iocp_msg};
 use crate::error::{IocpError, IocpResult};
-use crate::op::IocpUserPayload;
+use crate::op::IocpSlotSpec;
 
 use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY};
 
@@ -38,13 +38,13 @@ impl CompletionProgress {
 pub(super) struct CompletionPump {
     port: Arc<crate::win32::IoCompletionPort>,
     is_notified: Arc<AtomicBool>,
-    table: SharedCompletionTable<IocpUserPayload, IocpError>,
+    table: SharedCompletionTable<IocpSlotSpec>,
 }
 
 impl CompletionPump {
     pub(super) fn new(
         port: crate::win32::IoCompletionPort,
-        table: SharedCompletionTable<IocpUserPayload, IocpError>,
+        table: SharedCompletionTable<IocpSlotSpec>,
     ) -> Self {
         Self {
             port: Arc::new(port),
@@ -61,11 +61,11 @@ impl CompletionPump {
         self.port.clone()
     }
 
-    pub(super) fn table(&self) -> &SharedCompletionTable<IocpUserPayload, IocpError> {
+    pub(super) fn table(&self) -> &SharedCompletionTable<IocpSlotSpec> {
         &self.table
     }
 
-    pub(super) fn completion_table(&self) -> SharedCompletionTable<IocpUserPayload, IocpError> {
+    pub(super) fn completion_table(&self) -> SharedCompletionTable<IocpSlotSpec> {
         self.table.clone()
     }
 
@@ -397,7 +397,7 @@ fn completion_key_mismatch_anomaly(
     token: OpToken,
     raw: RawCompletion,
     mismatch_raw: RawCompletion,
-    view: CheckedSlotView<'_, crate::op::IocpSlotSpec>,
+    view: CheckedSlotView<'_, IocpSlotSpec>,
 ) -> CompletionAnomaly {
     match view {
         CheckedSlotView::Valid(slot) => {

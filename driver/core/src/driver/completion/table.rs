@@ -10,7 +10,13 @@ use super::{
     RecordCompletionResult, UserCompletionEvent, run_completion_cleanup,
 };
 
-pub type SharedCompletionTable<UP, E, R = usize> = Arc<dyn CompletionAccess<UP, E, R>>;
+pub type SharedCompletionTable<Spec> = Arc<
+    dyn CompletionAccess<
+            <Spec as crate::slot::SlotSpec>::UserPayload,
+            <Spec as crate::slot::SlotSpec>::Error,
+            <Spec as crate::slot::SlotSpec>::Completion,
+        >,
+>;
 
 /// Result of a completion poll, enabling detection of recycled slots.
 pub enum PollRecordResult<UP, E, R = usize> {
@@ -808,7 +814,7 @@ mod tests {
         hooks: &mut TestHooks,
     ) -> CompletionFlowOutcome {
         let diagnostics = registry.shared.completion_diagnostics();
-        let table: SharedCompletionTable<(), ()> = registry.shared.clone();
+        let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
         registry.accept_completion(&table, &diagnostics, hooks, CompletionIngress::User(event))
     }
 
@@ -864,7 +870,7 @@ mod tests {
     fn raw_unknown_control_is_recorded_as_anomaly() {
         let mut registry = OpRegistry::<DummySlotSpec>::new(1);
         let diagnostics = registry.shared.completion_diagnostics();
-        let table: SharedCompletionTable<(), ()> = registry.shared.clone();
+        let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
         let mut hooks = TestHooks::default();
         let raw_unknown_control = (99u64 << 48) | (7u64 << 32) | u64::from(u32::MAX);
 

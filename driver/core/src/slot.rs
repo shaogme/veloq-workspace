@@ -659,7 +659,7 @@ mod tests {
         }
 
         let diagnostics = registry.shared.completion_diagnostics();
-        let table: crate::driver::SharedCompletionTable<(), ()> = registry.shared.clone();
+        let table: crate::driver::SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
         let mut hooks = TestHooks;
         let _ = registry.accept_completion(
             &table,

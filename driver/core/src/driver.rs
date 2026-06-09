@@ -108,7 +108,7 @@ impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
     }
 
     #[inline]
-    pub fn completion_table(&self) -> SharedCompletionTable<D::UP, D::Error, D::Completion> {
+    pub fn completion_table(&self) -> SharedCompletionTable<D::SlotSpec> {
         self.driver.completion_table()
     }
 
@@ -206,7 +206,7 @@ pub trait Driver {
 
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error>;
 
-    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion>;
+    fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec>;
 
     fn register_completion_waker(
         &mut self,
@@ -323,7 +323,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 
     #[inline]
-    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion> {
+    fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec> {
         self.provider.with_driver_ref(|d| d.completion_table())
     }
 

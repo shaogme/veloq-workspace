@@ -9,11 +9,18 @@ pub trait DriverProvider: Clone + Unpin {
     type UP: std::marker::Send;
     type Completion: crate::driver::CompletionValue;
     type Error: DriverError;
+    type SlotSpec: crate::slot::SlotSpec<
+            Op = Self::Op,
+            UserPayload = Self::UP,
+            Completion = Self::Completion,
+            Error = Self::Error,
+        >;
     type Driver<'a>: crate::driver::Driver<
             Op = Self::Op,
             UP = Self::UP,
             Completion = Self::Completion,
             Error = Self::Error,
+            SlotSpec = Self::SlotSpec,
         >
     where
         Self: 'a;
@@ -104,7 +111,7 @@ impl<T> Op<T> {
         Self { data }
     }
 
-    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::Op, D::Error, D::Completion>
+    pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::SlotSpec>
     where
         T: IntoPlatformOp<
                 D::Op,

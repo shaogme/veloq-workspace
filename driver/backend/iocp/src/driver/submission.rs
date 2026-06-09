@@ -21,14 +21,13 @@ use crate::driver::{
 };
 use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
 use crate::op::{
-    BlockingCompletion, IocpOp, IocpOpPayload, IocpUserPayload, Slot, SubmissionResult,
-    SubmitContext,
+    BlockingCompletion, IocpOp, IocpOpPayload, IocpSlotSpec, Slot, SubmissionResult, SubmitContext,
 };
 
 pub(crate) struct SubmitContextInternal<'a> {
     port: Arc<crate::win32::IoCompletionPort>,
     wheel: &'a mut veloq_wheel::Wheel<OpToken>,
-    completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
+    completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
     diagnostics: &'a mut IocpDriverCompletionDiagnostics,
 }
 
@@ -36,7 +35,7 @@ impl<'a> SubmitContextInternal<'a> {
     pub(crate) fn new(
         port: Arc<crate::win32::IoCompletionPort>,
         wheel: &'a mut veloq_wheel::Wheel<OpToken>,
-        completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
+        completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
         diagnostics: &'a mut IocpDriverCompletionDiagnostics,
     ) -> Self {
         Self {
@@ -60,14 +59,14 @@ struct SubmissionFailureHooks {
     report: Option<Report<IocpError>>,
 }
 
-impl CompletionBackendHooks<crate::op::IocpSlotSpec> for SubmissionFailureHooks {
+impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
     type BackendIngress = ();
     type BackendEffect = ();
 
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
         CompletionHookOutcome::Ignore { effect: () }
     }
 
@@ -76,7 +75,7 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for SubmissionFailureHooks 
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
         let event_res = event.res();
         let snapshot = slot.snapshot();
         let mut guard = slot.complete();
@@ -121,7 +120,7 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for SubmissionFailureHooks 
         _event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
         let mut guard = slot.complete();
         let cleanup = guard
             .with_op_mut(|op| op.orphan_cleanup(&Err(IocpError::Submission.to_report())))

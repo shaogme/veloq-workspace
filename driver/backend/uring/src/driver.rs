@@ -126,7 +126,7 @@ pub struct UringDriver<'a> {
     pub(crate) pending_cancel_cqes: HashMap<CancelCompletionId, PendingCancel>,
     pub(crate) next_cancel_id: u16,
     pub(crate) completion_diagnostics: DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-    pub(crate) completion_table: SharedCompletionTable<UringUserPayload, UringError>,
+    pub(crate) completion_table: SharedCompletionTable<UringSlotSpec>,
     pub(crate) remote_cancel_sender: RemoteCancelSender,
     pub(crate) remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
 
@@ -180,8 +180,7 @@ impl<'a> UringDriver<'a> {
             .map_err(|e| UringError::DriverInit.io_report("driver.new.build_ring", e))?;
 
         let ops = UringOpRegistry::new(entries as usize);
-        let completion_table: SharedCompletionTable<UringUserPayload, UringError> =
-            ops.shared.clone();
+        let completion_table: SharedCompletionTable<UringSlotSpec> = ops.shared.clone();
         let completion_diagnostics = ops.shared.completion_diagnostics();
 
         let waker_fd = Self::create_event_fd("driver.new.eventfd")?;
@@ -416,7 +415,7 @@ impl<'a> Driver for UringDriver<'a> {
         })
     }
 
-    fn completion_table(&self) -> SharedCompletionTable<UringUserPayload, UringError> {
+    fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec> {
         self.completion_table.clone()
     }
 

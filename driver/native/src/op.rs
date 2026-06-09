@@ -97,7 +97,7 @@ impl<'a, P: veloq_driver_core::op::DriverProvider> OpSubmitter<'a, P> for Detach
                 ErasedPayload = P::UP,
                 Error = P::Error,
             > + std::marker::Send,
-    > = DetachedOp<T, P::Op, P::Error, P::Completion>;
+    > = DetachedOp<T, P::SlotSpec>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where

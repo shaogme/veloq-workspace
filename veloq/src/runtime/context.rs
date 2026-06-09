@@ -222,6 +222,7 @@ impl<'a, 'ctx> veloq_driver_native::op::DriverProvider for RuntimeContext<'a, 'c
     type UP = veloq_driver_native::driver::PlatformUP;
     type Completion = usize;
     type Error = <PlatformDriver<'ctx> as Driver>::Error;
+    type SlotSpec = <PlatformDriver<'ctx> as Driver>::SlotSpec;
     type Driver<'d>
         = RuntimeContextDriver<'d, PlatformDriver<'ctx>, RuntimeContext<'a, 'ctx>>
     where

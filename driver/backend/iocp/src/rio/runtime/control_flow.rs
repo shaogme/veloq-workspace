@@ -4,7 +4,7 @@ use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::driver::IocpDriverCompletionDiagnostics;
 use crate::error::IocpError;
-use crate::op::IocpOpRegistry;
+use crate::op::{IocpOpRegistry, IocpSlotSpec};
 use crate::rio::core::{
     RioBufferLeaseToken, RioCompletionKind, RioOpRequestInit, RioRegistry, RioRequestContextDecode,
     RioRq, rio_result_to_event_res,
@@ -127,14 +127,14 @@ impl<'a> RioCompletionHooks<'a> {
     }
 }
 
-impl CompletionBackendHooks<crate::op::IocpSlotSpec> for RioCompletionHooks<'_> {
+impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     type BackendIngress = RioIngress;
     type BackendEffect = RioBackendEffect;
 
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
         CompletionHookOutcome::Ignore {
             effect: RioBackendEffect::default(),
         }
@@ -145,7 +145,7 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for RioCompletionHooks<'_> 
         event: UserCompletionEvent,
         slot: crate::op::Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
         let CompletionSource::Backend(ingress) = source else {
             return CompletionHookOutcome::Anomaly {
                 anomaly: CompletionAnomaly::backend_invariant_broken(
@@ -166,7 +166,7 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for RioCompletionHooks<'_> 
         event: UserCompletionEvent,
         slot: crate::op::Slot<'_, InFlightOrphaned>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
         let CompletionSource::Backend(ingress) = source else {
             return CompletionHookOutcome::Ignore {
                 effect: RioBackendEffect::default(),
@@ -180,7 +180,7 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for RioCompletionHooks<'_> 
         _event: UserCompletionEvent,
         anomaly: CompletionAnomaly,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
         let effect = match source {
             CompletionSource::Backend(ingress) => RioBackendEffect::from_init(&ingress.init),
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Synthetic(_) => {
@@ -193,7 +193,7 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for RioCompletionHooks<'_> 
     fn complete_backend_ingress(
         &mut self,
         ingress: &Self::BackendIngress,
-    ) -> CompletionBackendIngressAction<crate::op::IocpSlotSpec, Self::BackendEffect> {
+    ) -> CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect> {
         CompletionBackendIngressAction::RouteUser(UserCompletionEvent::from_parts(
             CompletionBackend::Rio,
             ingress.init.token,
@@ -228,7 +228,7 @@ fn complete_rio_waiting_slot(
     mut slot: crate::op::Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     ingress: &RioIngress,
-) -> CompletionHookOutcome<crate::op::IocpSlotSpec, RioBackendEffect> {
+) -> CompletionHookOutcome<IocpSlotSpec, RioBackendEffect> {
     let init = &ingress.init;
     let result = ingress.result;
     let token = init.token;
@@ -372,7 +372,7 @@ fn complete_rio_orphaned_slot(
     mut slot: crate::op::Slot<'_, InFlightOrphaned>,
     _event: UserCompletionEvent,
     ingress: &RioIngress,
-) -> CompletionHookOutcome<crate::op::IocpSlotSpec, RioBackendEffect> {
+) -> CompletionHookOutcome<IocpSlotSpec, RioBackendEffect> {
     let init = &ingress.init;
     let result = ingress.result;
     let generation = init.token.generation();
@@ -508,7 +508,7 @@ impl RioState {
         ops: &mut IocpOpRegistry,
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
+        completion_table: &SharedCompletionTable<IocpSlotSpec>,
         diagnostics: &mut IocpDriverCompletionDiagnostics,
     ) -> RioResult<usize> {
         const MAX_RIO_RESULTS: usize = 128;
@@ -647,7 +647,7 @@ impl RioState {
         ops: &mut IocpOpRegistry,
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
-        completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
+        completion_table: &SharedCompletionTable<IocpSlotSpec>,
         diagnostics: &mut IocpDriverCompletionDiagnostics,
     ) -> RioResult<()> {
         let deadline = std::time::Instant::now()

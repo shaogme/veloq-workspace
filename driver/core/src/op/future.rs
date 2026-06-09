@@ -259,40 +259,55 @@ where
     }
 }
 
-type DetachedOpMarker<T, UP, E, C, O> = (T, UP, E, C, fn() -> O);
+type DetachedOpMarker<T, Spec> = (T, Spec);
 
 /// A Future representing a detached operation.
-pub struct DetachedOp<T, O, E, C>
+pub struct DetachedOp<T, Spec>
 where
-    O: PlatformOp,
-    E: DriverError,
-    C: crate::driver::CompletionValue,
-    T: IntoPlatformOp<O, DriverCompletion = C, Error = E>,
+    Spec: crate::slot::SlotSpec,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            Spec::Op,
+            DriverCompletion = Spec::Completion,
+            Error = Spec::Error,
+            ErasedPayload = Spec::UserPayload,
+        >,
 {
-    pub(crate) completion_table: Option<SharedCompletionTable<T::ErasedPayload, E, C>>,
+    pub(crate) completion_table: Option<SharedCompletionTable<Spec>>,
     pub(crate) cancel_sender: Option<RemoteCancelSender>,
-    pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<E>>>,
+    pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<Spec::Error>>>,
     pub(crate) token: Option<OpToken>,
-    pub(crate) immediate_failure: Option<(DriverReport<E>, T::UserPayload)>,
-    pub(crate) immediate_resource_lost: Option<OpError<E>>,
-    pub(crate) _phantom: std::marker::PhantomData<DetachedOpMarker<T, T::ErasedPayload, E, C, O>>,
+    pub(crate) immediate_failure: Option<(DriverReport<Spec::Error>, T::UserPayload)>,
+    pub(crate) immediate_resource_lost: Option<OpError<Spec::Error>>,
+    pub(crate) _phantom: std::marker::PhantomData<DetachedOpMarker<T, Spec>>,
 }
 
-unsafe impl<
-    T: IntoPlatformOp<O, DriverCompletion = C, Error = E> + std::marker::Send,
-    O: PlatformOp,
-    E: DriverError,
-    C: crate::driver::CompletionValue,
-> std::marker::Send for DetachedOp<T, O, E, C>
+unsafe impl<T, Spec> std::marker::Send for DetachedOp<T, Spec>
+where
+    Spec: crate::slot::SlotSpec,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            Spec::Op,
+            DriverCompletion = Spec::Completion,
+            Error = Spec::Error,
+            ErasedPayload = Spec::UserPayload,
+        > + std::marker::Send,
 {
 }
 
-impl<T, O, E, C> Drop for DetachedOp<T, O, E, C>
+impl<T, Spec> Drop for DetachedOp<T, Spec>
 where
-    O: PlatformOp,
-    E: DriverError,
-    C: crate::driver::CompletionValue,
-    T: IntoPlatformOp<O, DriverCompletion = C, Error = E>,
+    Spec: crate::slot::SlotSpec,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            Spec::Op,
+            DriverCompletion = Spec::Completion,
+            Error = Spec::Error,
+            ErasedPayload = Spec::UserPayload,
+        >,
 {
     fn drop(&mut self) {
         if let Some(token) = self.token {
@@ -311,14 +326,19 @@ where
     }
 }
 
-impl<T, O, E, C> Future for DetachedOp<T, O, E, C>
+impl<T, Spec> Future for DetachedOp<T, Spec>
 where
-    O: PlatformOp,
-    E: DriverError,
-    C: crate::driver::CompletionValue,
-    T: IntoPlatformOp<O, DriverCompletion = C, Error = E>,
+    Spec: crate::slot::SlotSpec,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            Spec::Op,
+            DriverCompletion = Spec::Completion,
+            Error = Spec::Error,
+            ErasedPayload = Spec::UserPayload,
+        >,
 {
-    type Output = OpResult<T::Output, E, T::Completion>;
+    type Output = OpResult<T::Output, Spec::Error, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -338,14 +358,21 @@ where
         let token = this
             .token
             .expect("DetachedOp missing completion token but no immediate_failure");
-        if let Poll::Ready(result) =
-            poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, token)
+        if let Poll::Ready(result) = poll_completion_table_once::<
+            T,
+            Spec::Op,
+            T::ErasedPayload,
+            Spec::Error,
+            Spec::Completion,
+        >(&**table, token)
         {
             return Poll::Ready(result);
         }
 
         table.register_waker(token, cx.waker());
-        poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, token)
+        poll_completion_table_once::<T, Spec::Op, T::ErasedPayload, Spec::Error, Spec::Completion>(
+            &**table, token,
+        )
     }
 }
 
@@ -682,7 +709,7 @@ impl<'a, P: crate::op::DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter 
                 ErasedPayload = P::UP,
                 Error = P::Error,
             > + std::marker::Send,
-    > = DetachedOp<T, P::Op, P::Error, P::Completion>;
+    > = DetachedOp<T, <P::Driver<'a> as Driver>::SlotSpec>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where

@@ -84,7 +84,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
 
 fn active_registry() -> (
     Arc<Mutex<OpRegistry<DummySlotSpec>>>,
-    SharedCompletionTable<(), ()>,
+    SharedCompletionTable<DummySlotSpec>,
     OpToken,
 ) {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
@@ -106,14 +106,14 @@ fn active_registry() -> (
         .start_submission_with(None)
         .expect("reserved slot should start submission")
         .persist();
-    let table: SharedCompletionTable<(), ()> = registry.shared.clone();
+    let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
     (Arc::new(Mutex::new(registry)), table, token)
 }
 
 fn accept_completion(registry: &Mutex<OpRegistry<DummySlotSpec>>, token: OpToken, res: i32) {
     let mut registry = registry.lock();
     let diagnostics = registry.shared.completion_diagnostics();
-    let table: SharedCompletionTable<(), ()> = registry.shared.clone();
+    let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
     let mut hooks = TestHooks;
     let _ = registry.accept_completion(
         &table,

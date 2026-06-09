@@ -104,7 +104,7 @@ impl<'a> IocpDriver<'a> {
         use veloq_driver_core::slot::SlotTable;
 
         let mut cur = self.ops.shared.remote_free_head.load(Ordering::Acquire);
-        while cur != SlotTable::<crate::op::IocpSlotSpec>::NULL_INDEX {
+        while cur != SlotTable::<IocpSlotSpec>::NULL_INDEX {
             if cur == needle {
                 return true;
             }
@@ -252,7 +252,7 @@ impl<'a> Driver for IocpDriver<'a> {
         })
     }
 
-    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion> {
+    fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec> {
         self.completion.completion_table()
     }
 
