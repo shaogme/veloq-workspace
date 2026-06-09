@@ -8,7 +8,7 @@
 //! It forms the low-level boundary between high-level runtime orchestration and
 //! Windows RIO APIs, keeping unsafe calls and pointer setup in one place.
 
-pub(crate) mod dispatch;
+mod dispatch;
 pub(crate) use dispatch::*;
 
 use crate::BufferRegistrationMode;
@@ -16,8 +16,9 @@ use crate::config::BorrowedRawHandle;
 use crate::driver::IocpDriverCompletionDiagnostics;
 use crate::ext::Extensions;
 use crate::op::SubmissionResult;
-use crate::rio::core::registry::{RioRegistry, RioSubmissionKind};
-use crate::rio::core::{RioAddressPolicy, RioOpKind, RioSubmitPlan};
+use crate::rio::core::{
+    RioAddressPolicy, RioOpKind, RioRegistry, RioSubmissionKind, RioSubmitPlan,
+};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioState, RioTarget};
 

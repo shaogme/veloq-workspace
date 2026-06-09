@@ -22,17 +22,18 @@ use crate::IoFd;
 use crate::config::BorrowedRawHandle;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioEnv;
-use crate::rio::core::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
-use crate::rio::core::{
-    RioCompletedRequestContext, RioCompletionKind, RioOpRequestInit, RioPreparedRequestContext,
-    RioRequestContextDecode, RioRequestContextId,
-};
 use crate::rio::error::{RioError, RioResult};
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 use veloq_buf::FixedBuf;
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
+
+use super::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
+use super::{
+    RioCompletedRequestContext, RioCompletionKind, RioOpRequestInit, RioPreparedRequestContext,
+    RioRequestContextDecode, RioRequestContextId,
+};
 
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
 pub(crate) const HEAP_REGISTRATION_CACHE_LIMIT: usize = 1024;
@@ -389,9 +390,9 @@ impl RioRegistry {
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
+    use super::super::submit_ops::{RioCq, RioDispatch};
     use super::*;
     use crate::BufferRegistrationMode;
-    use crate::rio::core::submit_ops::{RioCq, RioDispatch};
     use std::num::NonZeroUsize;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

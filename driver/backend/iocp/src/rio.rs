@@ -8,21 +8,21 @@
 //! - `runtime`: steady-state operation split into datapath and control-flow.
 //! - `lifecycle`: shutdown sequencing and deferred cleanup semantics.
 
-pub(crate) mod core;
-pub(crate) mod error;
-pub(crate) mod lifecycle;
-pub(crate) mod runtime;
+mod core;
+mod error;
+mod lifecycle;
+mod runtime;
 
 use crate::BufferRegistrationMode;
 use crate::config::SocketKey;
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
 
-use self::core::registry::RioRegistry;
-use self::core::submit_ops::{RioCq, RioDispatch, RioKernel};
-use self::runtime::control_flow::RioSocketActor;
+use self::core::{RioCq, RioDispatch, RioKernel, RioRegistry};
+use self::runtime::RioSocketActor;
 use crate::driver::IocpDriverCompletionDiagnostics;
 
+pub(crate) use self::error::RioError;
 pub(crate) use self::runtime::RioSendToArgs;
 pub(crate) use self::runtime::RioTarget;
 pub(crate) use self::runtime::RioUdpRecvFromArgs;

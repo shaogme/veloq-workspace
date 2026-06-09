@@ -1,5 +1,5 @@
 use crate::error::{IocpError, IocpResult};
-use crate::rio::error::RioError;
+use crate::rio::RioError;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCK_STREAM,

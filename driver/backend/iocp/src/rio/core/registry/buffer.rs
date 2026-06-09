@@ -1,6 +1,6 @@
 use super::{HEAP_REGISTRATION_CACHE_LIMIT, REGISTER_FAILURE_RETRY_COOLDOWN, RioRegistry};
 use crate::rio::RioEnv;
-use crate::rio::core::submit_ops::{RioBufferId, RioProvider};
+use crate::rio::core::{RioBufferId, RioProvider};
 use crate::rio::error::{RioError, RioResult};
 use diagweave::prelude::*;
 use std::time::Instant;
@@ -575,8 +575,8 @@ impl RioRegistry {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::*;
     use super::*;
-    use crate::rio::core::registry::test_helpers::*;
     use std::sync::atomic::Ordering;
 
     #[test]

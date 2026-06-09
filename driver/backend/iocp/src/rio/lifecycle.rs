@@ -4,13 +4,11 @@ use crate::config::SocketKey;
 use crate::driver::IocpDriverCompletionDiagnostics;
 use crate::rio::ActorKey;
 use crate::rio::RioState;
-use crate::rio::core::RioCompletionKind;
-use crate::rio::core::RioOpRequestInit;
-use crate::rio::core::RioRequestContextDecode;
-use crate::rio::core::registry::RioRegistry;
-use crate::rio::core::submit_ops::RioKernel;
+use crate::rio::core::{
+    RioCompletionKind, RioKernel, RioOpRequestInit, RioRegistry, RioRequestContextDecode,
+};
 use crate::rio::error::{RioError, RioResult};
-use crate::rio::runtime::control_flow::RioSocketActor;
+use crate::rio::runtime::RioSocketActor;
 use crate::rio::runtime::release_socket_inflight_token_from;
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;

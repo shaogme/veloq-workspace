@@ -1,7 +1,7 @@
 use super::RioRegistry;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioEnv;
-use crate::rio::core::submit_ops::{RioBufferId, RioProvider};
+use crate::rio::core::{RioBufferId, RioProvider};
 use crate::rio::error::{RioError, RioResult};
 use diagweave::prelude::*;
 use windows_sys::Win32::Networking::WinSock::{

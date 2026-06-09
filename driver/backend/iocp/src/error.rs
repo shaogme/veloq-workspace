@@ -4,7 +4,7 @@ use std::fmt::Display;
 use diagweave::prelude::*;
 use veloq_driver_core::{DriverCoreError, DriverError, DriverResult};
 
-use crate::rio::error::RioError;
+use crate::rio::RioError;
 
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]

@@ -5,10 +5,10 @@ use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::driver::IocpDriverCompletionDiagnostics;
 use crate::error::IocpError;
 use crate::op::IocpOpRegistry;
-use crate::rio::core::registry::{RioBufferLeaseToken, RioRegistry};
-use crate::rio::core::rio_result_to_event_res;
-use crate::rio::core::submit_ops::RioRq;
-use crate::rio::core::{RioCompletionKind, RioOpRequestInit, RioRequestContextDecode};
+use crate::rio::core::{
+    RioBufferLeaseToken, RioCompletionKind, RioOpRequestInit, RioRegistry, RioRequestContextDecode,
+    RioRq, rio_result_to_event_res,
+};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::release_socket_inflight_token_from;
 use crate::rio::{RioEnv, RioState, SocketInflightToken, SocketLifecycleState, SocketRuntimeState};

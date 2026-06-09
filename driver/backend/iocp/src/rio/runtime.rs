@@ -1,12 +1,11 @@
 //! Runtime datapath: hot path buffer/pool state and UDP submissions.
 
-pub(crate) mod control_flow;
+mod control_flow;
 
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::op::SubmissionResult;
-use crate::rio::core::registry::RioSubmissionKind;
-use crate::rio::core::{RioAddressPolicy, RioOpKind, RioSubmitPlan};
+use crate::rio::core::{RioAddressPolicy, RioOpKind, RioSubmissionKind, RioSubmitPlan};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{
     RioState, SocketInflightGuard, SocketInflightToken, SocketLifecycleState, SocketRuntimeState,
@@ -15,6 +14,8 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use veloq_driver_core::driver::OpToken;
 use veloq_driver_core::op::UdpRecvFrom;
+
+pub(crate) use control_flow::RioSocketActor;
 
 pub(crate) struct RioTarget<'a> {
     pub(crate) fd: IoFd,
@@ -299,9 +300,8 @@ mod tests {
     use super::*;
     use crate::BufferRegistrationMode;
     use crate::config::IocpHandle;
-    use crate::rio::core::registry::RioRegistry;
-    use crate::rio::core::submit_ops::{RioKernel, RioRq};
-    use crate::rio::runtime::control_flow::RioSocketActor;
+    use crate::rio::core::{RioKernel, RioRegistry, RioRq};
+    use crate::rio::runtime::RioSocketActor;
 
     fn test_state() -> RioState {
         RioState {
