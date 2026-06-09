@@ -231,7 +231,7 @@ impl RioRegistry {
         self.request_context_free.push(id.index());
         RioRequestContextDecode::Valid(RioCompletionKind::Op {
             init,
-            context: RioCompletedRequestContext::new(id),
+            context: RioCompletedRequestContext::new(),
         })
     }
 

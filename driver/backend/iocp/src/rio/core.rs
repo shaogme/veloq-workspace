@@ -197,7 +197,7 @@ impl RioSubmittedRequestContext {
 
 impl RioCompletedRequestContext {
     #[inline]
-    pub(crate) fn new(_id: RioRequestContextId) -> Self {
+    pub(crate) fn new() -> Self {
         Self
     }
 }
