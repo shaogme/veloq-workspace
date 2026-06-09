@@ -10,7 +10,7 @@ use tracing::trace;
 use crate::driver::{
     CancelRequest, CompletionAnomaly, CompletionAnomalyReason, CompletionRecord, CompletionToken,
     Driver, DriverSubmitResult, OpToken, PlatformOp, PollRecordResult, RemoteCancelSender,
-    RemoteWaker, SharedCompletionTable, SubmitStatus, event_res_to_result,
+    RemoteWaker, SharedCompletionTable, SubmitStatus,
 };
 use crate::op::{IntoPlatformOp, Op};
 use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
@@ -231,7 +231,7 @@ where
         }
     };
     cleanup.disarm();
-    let res = detail.unwrap_or_else(|| event_res_to_result::<C, E>(event.res));
+    let res = detail.unwrap_or_else(|| C::from_event_res::<E>(event.res));
     let completion = T::complete(payload, res);
     Poll::Ready(OpResult::Completed(completion.result, completion.output))
 }

@@ -435,6 +435,18 @@ impl CompletionAnomaly {
     }
 
     #[inline]
+    pub fn corrupt_slot_snapshot(token: CompletionToken, snapshot: slot::SlotSnapshot) -> Self {
+        let anomaly = if !snapshot.has_op {
+            Self::op_missing(token, snapshot.index, snapshot.generation)
+        } else if !snapshot.has_payload {
+            Self::payload_missing(token, snapshot.index, snapshot.generation)
+        } else {
+            Self::corrupt(token, snapshot.index, snapshot.generation, snapshot.state)
+        };
+        anomaly.with_slot_snapshot(snapshot)
+    }
+
+    #[inline]
     pub fn backend_invariant_broken(
         token: CompletionToken,
         index: usize,

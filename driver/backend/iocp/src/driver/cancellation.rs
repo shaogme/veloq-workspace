@@ -1,18 +1,12 @@
-use diagweave::prelude::*;
 use tracing::{debug, warn};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionAnomalyReason, CompletionBackend,
-    CompletionCleanupGuard, CompletionToken, OpToken, RawCompletion, RecordCompletionOutcome,
-    UserCompletionEvent, record_completion_anomaly, record_lost_completion, run_completion_cleanup,
-    slot_view_anomaly,
+    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionBackend, CompletionToken, OpToken,
+    SyntheticCompletionSource, UserCompletionEvent,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
-use crate::common::{completion_record, push_completion_shared};
-use crate::driver::completion::{EmitContext, finalize_corrupt_iocp_checked};
-use crate::driver::{
-    CompletionSidecar, IocpDriver, IocpDriverCompletionDiagnostics, IocpOpRegistry,
-};
+use crate::driver::completion::IocpSyntheticCompletion;
+use crate::driver::{IocpDriver, IocpOpRegistry};
 use crate::error::IocpResult;
 use crate::op;
 use crate::win32::CancelRequestResult;
@@ -37,10 +31,6 @@ impl<'a> IocpDriver<'a> {
         let token = request.target;
         let (user_data, generation) = token.parts();
 
-        let emit_ctx = EmitContext {
-            completion_table: self.completion.table(),
-        };
-
         let timer_id = match self.ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                 slot.platform_mut().timer_id.take()
@@ -52,15 +42,7 @@ impl<'a> IocpDriver<'a> {
         };
         if let Some(tid) = timer_id {
             self.timer.cancel(tid);
-            if let Some(outcome) = Self::abort_slot_inner(
-                emit_ctx,
-                &mut self.ops,
-                &mut self.completion_diagnostics,
-                request.mode,
-                token,
-            ) {
-                let _ = outcome;
-            }
+            self.complete_local_cancel(token, request.mode);
             self.completion_diagnostics
                 .backend()
                 .inc_cancel_completed_locally();
@@ -77,15 +59,31 @@ impl<'a> IocpDriver<'a> {
                 let status = Self::perform_cancel(ctx, token, &mut self.ops);
                 self.record_cancel_status(status)
             }
-            CheckedSlotView::Valid(SlotView::Reserved(_)) => {
-                if let Some(outcome) = Self::abort_slot_inner(
-                    emit_ctx,
-                    &mut self.ops,
-                    &mut self.completion_diagnostics,
-                    request.mode,
-                    token,
-                ) {
-                    let _ = outcome;
+            CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
+                let prepared = if slot.has_op() {
+                    let start_result = slot.start_submission_with(None);
+                    match start_result {
+                        Ok(guard) => {
+                            let _ = guard.persist();
+                            true
+                        }
+                        Err(err) => {
+                            debug!(
+                                user_data,
+                                generation,
+                                snapshot = ?err.snapshot,
+                                "reserved IOCP cancel could not prepare synthetic completion"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if prepared {
+                    self.complete_local_cancel(token, request.mode);
+                } else {
+                    let _ = self.ops.remove(token);
                 }
                 self.completion_diagnostics
                     .backend()
@@ -96,62 +94,40 @@ impl<'a> IocpDriver<'a> {
             | CheckedSlotView::Empty(_)
             | CheckedSlotView::Stale(_)
             | CheckedSlotView::Corrupt(_)) => {
-                let raw = RawCompletion::new(
-                    CompletionBackend::Iocp,
-                    CompletionToken::user(token),
-                    -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                    0,
-                );
-                let anomaly = match slot_view_anomaly(CompletionBackend::Iocp, token, raw, view) {
-                    Ok(_) => return Ok(CancelSubmitOutcome::TargetMissing),
-                    Err(anomaly) => anomaly,
-                };
-                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
-                match anomaly.reason {
-                    CompletionAnomalyReason::StaleGeneration => {
-                        debug!(
-                            user_data,
-                            generation,
-                            actual_generation = anomaly.actual_generation,
-                            state = ?anomaly.state,
-                            "IOCP cancel request is stale"
-                        );
-                        Ok(CancelSubmitOutcome::TargetStale)
-                    }
-                    CompletionAnomalyReason::OpMissing
-                    | CompletionAnomalyReason::PayloadMissing
-                    | CompletionAnomalyReason::SlotCorruption => {
-                        debug!(
-                            user_data,
-                            generation,
-                            snapshot = ?anomaly.slot_snapshot,
-                            "IOCP cancel request found corrupt slot"
-                        );
-                        if let Some(snapshot) = anomaly.slot_snapshot {
-                            self.release_socket_inflight_for_op(snapshot.index);
-                            let _ = finalize_corrupt_iocp_checked(
-                                &mut self.ops,
-                                &self.completion_diagnostics,
-                                snapshot,
-                                raw.res,
-                                "iocp.cancel_op_internal.corrupt",
-                            );
-                            self.drain_deferred_socket_cleanup();
-                        }
-                        Ok(CancelSubmitOutcome::TargetMissing)
-                    }
-                    _ => {
-                        debug!(
-                            user_data,
-                            generation,
-                            reason = ?anomaly.reason,
-                            "IOCP cancel request found non-active slot"
-                        );
-                        Ok(CancelSubmitOutcome::TargetMissing)
-                    }
+                let stale = matches!(view, CheckedSlotView::Stale(_));
+                if let CheckedSlotView::Corrupt(snapshot) = view {
+                    self.release_socket_inflight_for_op(snapshot.index);
+                    self.drain_deferred_socket_cleanup();
+                }
+                self.complete_local_cancel(token, request.mode);
+                if stale {
+                    debug!(user_data, generation, "IOCP cancel request is stale");
+                    Ok(CancelSubmitOutcome::TargetStale)
+                } else {
+                    debug!(
+                        user_data,
+                        generation,
+                        token = CompletionToken::user(token).raw(),
+                        "IOCP cancel request found non-active slot"
+                    );
+                    Ok(CancelSubmitOutcome::TargetMissing)
                 }
             }
         }
+    }
+
+    fn complete_local_cancel(&mut self, token: OpToken, mode: CancelMode) {
+        let event = UserCompletionEvent::from_parts(
+            CompletionBackend::Iocp,
+            token,
+            -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+            0,
+        );
+        let _ = self.accept_synthetic_completion(
+            event,
+            SyntheticCompletionSource::Cancel,
+            IocpSyntheticCompletion::Cancel { mode },
+        );
     }
 
     fn record_cancel_status(
@@ -209,12 +185,10 @@ impl<'a> IocpDriver<'a> {
 
                     if let Some(raw_handle) = raw_handle {
                         let handle = raw_handle.as_handle();
-                        // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
                         let overlapped_ptr =
                             guard.storage.with_mut(|_result, _payload, sidecar| {
                                 &mut sidecar.inner as *mut crate::win32::Overlapped
                             });
-                        // SAFETY: handle and overlapped_ptr are valid for this operation.
                         match unsafe {
                             crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
                         }? {
@@ -266,149 +240,5 @@ impl<'a> IocpDriver<'a> {
             debug!(user_data, "Skipping cancel for non in-flight slot");
         }
         Ok(status)
-    }
-
-    fn abort_slot_inner(
-        ctx: EmitContext<'_>,
-        ops: &mut IocpOpRegistry,
-        diagnostics: &mut IocpDriverCompletionDiagnostics,
-        mode: CancelMode,
-        token: OpToken,
-    ) -> Option<RecordCompletionOutcome> {
-        let emit_completion = mode == CancelMode::UserVisible;
-        let abort_result: IocpResult<usize> = Err(crate::error::IocpError::CompletionWait
-            .to_report()
-            .push_ctx("scope", "iocp.driver.abort_slot_inner")
-            .set_error_code(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
-            .attach_note("operation aborted locally"));
-        let mut cleanup = CompletionCleanupGuard::default();
-        let mut snapshot = None;
-        let inflight = match ops.checked_slot_view(token) {
-            CheckedSlotView::Valid(SlotView::InFlightWaiting(guard)) => {
-                snapshot = Some(guard.snapshot());
-                let mut guard = guard.complete();
-                cleanup = guard
-                    .op
-                    .as_mut()
-                    .map(|op| {
-                        if mode == CancelMode::Abandon {
-                            op.orphan_cleanup(&abort_result)
-                        } else {
-                            op.completion_cleanup(&abort_result)
-                        }
-                    })
-                    .unwrap_or_default();
-                let _ = guard.take_op();
-                Some(guard.take_completion_data())
-            }
-            CheckedSlotView::Valid(SlotView::InFlightOrphaned(guard)) => {
-                snapshot = Some(guard.snapshot());
-                let mut guard = guard.complete();
-                cleanup = guard
-                    .op
-                    .as_mut()
-                    .map(|op| op.orphan_cleanup(&abort_result))
-                    .unwrap_or_default();
-                let _ = guard.take_op();
-                Some(guard.take_completion_data())
-            }
-            CheckedSlotView::Valid(SlotView::Reserved(guard)) => {
-                snapshot = Some(guard.snapshot());
-                cleanup = guard
-                    .op
-                    .as_mut()
-                    .map(|op| {
-                        if mode == CancelMode::Abandon {
-                            op.orphan_cleanup(&abort_result)
-                        } else {
-                            op.completion_cleanup(&abort_result)
-                        }
-                    })
-                    .unwrap_or_default();
-                let _ = guard.op.take();
-                Some(
-                    guard
-                        .storage
-                        .with_mut(|result, payload, _sidecar| (payload.take(), result.take())),
-                )
-            }
-            _ => None,
-        };
-
-        let (payload, detail) = if let Some(data) = inflight {
-            data
-        } else {
-            ops.with_slot_storage_mut(token, |result, payload, _sidecar| {
-                (payload.take(), result.take())
-            })
-            .unwrap_or((None, None))
-        };
-
-        let outcome = if emit_completion {
-            if let Some(payload) = payload {
-                Some(push_completion_shared(
-                    ctx.completion_table,
-                    diagnostics,
-                    completion_record(CompletionSidecar::new(
-                        UserCompletionEvent::from_parts(
-                            CompletionBackend::Iocp,
-                            token,
-                            -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                            0,
-                        ),
-                        payload,
-                        detail,
-                        cleanup,
-                    )),
-                ))
-            } else if let Some(snapshot) = snapshot {
-                drop(detail);
-                let raw = RawCompletion::new(
-                    CompletionBackend::Iocp,
-                    CompletionToken::user(token),
-                    -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                    0,
-                );
-                let anomaly = veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
-                    .with_slot_snapshot(snapshot)
-                    .with_raw_completion(raw);
-                Some(record_lost_completion(
-                    ctx.completion_table,
-                    diagnostics,
-                    UserCompletionEvent::from_parts(
-                        CompletionBackend::Iocp,
-                        token,
-                        raw.res,
-                        raw.flags,
-                    ),
-                    anomaly,
-                    cleanup,
-                ))
-            } else {
-                drop(detail);
-                None
-            }
-        } else {
-            let payload_missing = payload.is_none();
-            drop(payload);
-            drop(detail);
-            if payload_missing && let Some(snapshot) = snapshot {
-                let raw = RawCompletion::new(
-                    CompletionBackend::Iocp,
-                    CompletionToken::user(token),
-                    -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                    0,
-                );
-                let anomaly = veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
-                    .with_slot_snapshot(snapshot)
-                    .with_raw_completion(raw);
-                record_completion_anomaly(diagnostics, &anomaly);
-            }
-            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
-            None
-        };
-
-        let _ = ops.remove(token);
-        outcome
     }
 }

@@ -6,8 +6,8 @@ pub(crate) mod net_udp;
 use core::convert::TryFrom;
 use diagweave::prelude::*;
 use veloq_driver_core::driver::{
-    CompletionRecord, DriveMode, Driver, DriverSubmitResult, OpToken, PollRecordResult,
-    event_res_to_result,
+    CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, OpToken,
+    PollRecordResult,
 };
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
 
@@ -63,7 +63,7 @@ where
     let payload = T::try_payload_from_erased(payload_erased).expect("completion payload type");
     let res = detail
         .take()
-        .unwrap_or_else(|| event_res_to_result::<usize, IocpError>(event.res));
+        .unwrap_or_else(|| usize::from_event_res::<IocpError>(event.res));
     cleanup.disarm();
     T::complete(payload, res)
 }
@@ -108,7 +108,7 @@ pub(crate) fn wait_completion(
     timeout: std::time::Duration,
 ) -> IocpResult<usize> {
     let record = wait_completion_record(driver, user_data, generation, timeout)?;
-    event_res_to_result::<usize, IocpError>(record.event.res).map_err(|e| {
+    usize::from_event_res::<IocpError>(record.event.res).map_err(|e| {
         let code = iocp_report_to_event_res(&e);
         let io_error = std::io::Error::from_raw_os_error(-code);
         IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error)

@@ -18,9 +18,9 @@ use crate::diagnostics::IocpCompletionDiagnostics;
 use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::OpEntry;
 use veloq_driver_core::driver::{
-    CancelRequest, CancelSubmitOutcome, CompletionSidecar as CoreCompletionSidecar, DriveMode,
-    DriveOutcome, Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
-    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+    CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome, Driver,
+    DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
+    RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 
 use diagweave::prelude::*;
@@ -67,8 +67,6 @@ pub enum CloseMode {
     /// Closes after a specified timeout, allowing pending operations to finish.
     Strict { timeout: Duration },
 }
-
-pub(crate) type CompletionSidecar = CoreCompletionSidecar<IocpUserPayload, IocpError>;
 
 impl<'a> IocpDriver<'a> {
     /// Checks if the provided operation is a RIO-based operation.

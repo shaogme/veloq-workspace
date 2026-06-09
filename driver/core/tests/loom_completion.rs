@@ -2,7 +2,8 @@
 use veloq_driver_core::driver::registry::OpRegistry;
 use veloq_driver_core::driver::*;
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotSpec, SlotView};
-use veloq_shim::thread;
+use veloq_shim::sync::Mutex;
+use veloq_shim::{Arc, thread};
 
 struct DummyPlatformOp;
 
@@ -22,7 +23,70 @@ impl SlotSpec for DummySlotSpec {
     type CompletionDiagnostics = ();
 }
 
-fn active_table() -> (SharedCompletionTable<(), ()>, OpToken) {
+struct TestHooks;
+
+impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
+    type BackendIngress = ();
+    type BackendEffect = ();
+
+    fn handle_control(
+        &mut self,
+        _control: CompletionControl,
+    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+        CompletionHookOutcome::Ignore { effect: () }
+    }
+
+    fn complete_waiting(
+        &mut self,
+        event: UserCompletionEvent,
+        slot: veloq_driver_core::slot::Slot<
+            '_,
+            veloq_driver_core::slot::InFlightWaiting,
+            DummySlotSpec,
+        >,
+        _source: CompletionSource<'_, Self::BackendIngress>,
+    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+        let mut completed = slot.complete();
+        let _ = completed.take_op();
+        let (payload, detail) = completed.take_completion_data();
+        CompletionHookOutcome::User {
+            event,
+            payload: payload.expect("loom test payload should exist"),
+            detail,
+            cleanup: CompletionCleanupGuard::default(),
+            effect: (),
+        }
+    }
+
+    fn complete_orphaned(
+        &mut self,
+        _event: UserCompletionEvent,
+        slot: veloq_driver_core::slot::Slot<
+            '_,
+            veloq_driver_core::slot::InFlightOrphaned,
+            DummySlotSpec,
+        >,
+        _source: CompletionSource<'_, Self::BackendIngress>,
+    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+        let mut completed = slot.complete();
+        let _ = completed.take_op();
+        let (payload, detail) = completed.take_completion_data();
+        let _ = payload;
+        drop(detail);
+        CompletionHookOutcome::Cleanup {
+            cleanup: CompletionCleanupGuard::default(),
+            effect: (),
+        }
+    }
+
+    fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
+}
+
+fn active_registry() -> (
+    Arc<Mutex<OpRegistry<DummySlotSpec>>>,
+    SharedCompletionTable<(), ()>,
+    OpToken,
+) {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
     let handle = registry.alloc(()).expect("slot allocation failed").handle;
     let token = OpToken::from_registry_parts(handle.index, handle.generation)
@@ -43,38 +107,46 @@ fn active_table() -> (SharedCompletionTable<(), ()>, OpToken) {
         .expect("reserved slot should start submission")
         .persist();
     let table: SharedCompletionTable<(), ()> = registry.shared.clone();
-    (table, token)
+    (Arc::new(Mutex::new(registry)), table, token)
 }
 
-fn completion_packet(token: OpToken, res: i32) -> CompletionPacket<(), ()> {
-    CompletionPacket::user(
-        UserCompletionEvent::from_parts(CompletionBackend::Core, token, res, 0),
-        (),
-        None,
-    )
+fn accept_completion(registry: &Mutex<OpRegistry<DummySlotSpec>>, token: OpToken, res: i32) {
+    let mut registry = registry.lock();
+    let diagnostics = registry.shared.completion_diagnostics();
+    let table: SharedCompletionTable<(), ()> = registry.shared.clone();
+    let mut hooks = TestHooks;
+    let _ = registry.accept_completion(
+        &table,
+        &diagnostics,
+        &mut hooks,
+        CompletionIngress::User(UserCompletionEvent::from_parts(
+            CompletionBackend::Core,
+            token,
+            res,
+            0,
+        )),
+    );
 }
 
 #[test]
 fn test_completion_table_loom() {
     loom::model(|| {
-        let (table, token) = active_table();
+        let (registry, table, token) = active_registry();
 
-        let table_cloned = table.clone();
+        let registry_cloned = registry.clone();
         let producer = thread::spawn(move || {
-            // Mock driver producing a completion
-            table_cloned.record_completion(completion_packet(token, 0));
+            accept_completion(&registry_cloned, token, 0);
         });
 
-        let table_cloned2 = table.clone();
+        let table_cloned = table.clone();
         let consumer = thread::spawn(move || {
-            // Mock consumer: mark waiting, then either poll or drop
-            table_cloned2.mark_waiting(token);
-            match table_cloned2.try_take_record(token) {
+            table_cloned.mark_waiting(token);
+            match table_cloned.try_take_record(token) {
                 PollRecordResult::Ready(record) => {
                     assert_eq!(record.event.token, CompletionToken::user(token))
                 }
                 PollRecordResult::Pending | PollRecordResult::Unavailable(_) => {
-                    table_cloned2.mark_orphaned(token);
+                    table_cloned.mark_orphaned(token);
                 }
             }
         });
@@ -87,34 +159,32 @@ fn test_completion_table_loom() {
 #[test]
 fn test_detached_drop_race_loom() {
     loom::model(|| {
-        let (table, token) = active_table();
+        let (registry, table, token) = active_registry();
 
-        let table_cloned = table.clone();
+        let registry_cloned = registry.clone();
         let producer = thread::spawn(move || {
-            table_cloned.record_completion(completion_packet(token, 42));
+            accept_completion(&registry_cloned, token, 42);
         });
 
-        let table_cloned2 = table.clone();
+        let table_cloned = table.clone();
         let consumer = thread::spawn(move || {
-            table_cloned2.mark_waiting(token);
-            // Simulate select! drop: don't poll, just mark orphaned
-            table_cloned2.mark_orphaned(token);
+            table_cloned.mark_waiting(token);
+            table_cloned.mark_orphaned(token);
         });
 
         producer.join().unwrap();
         consumer.join().unwrap();
 
-        let state = table.debug_get_state(0);
-        assert!(state == CELL_STATE_IDLE || state == CELL_STATE_ORPHANED);
+        assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
     });
 }
 
 #[test]
 fn test_fast_completion_then_waiting_take_loom() {
     loom::model(|| {
-        let (table, token) = active_table();
+        let (registry, table, token) = active_registry();
 
-        table.record_completion(completion_packet(token, 7));
+        accept_completion(&registry, token, 7);
 
         table.mark_waiting(token);
         match table.try_take_record(token) {
@@ -135,9 +205,9 @@ fn test_fast_completion_then_waiting_take_loom() {
 #[test]
 fn test_stale_after_generation_advance_loom() {
     loom::model(|| {
-        let (table, token_g1) = active_table();
+        let (registry, table, token_g1) = active_registry();
 
-        table.record_completion(completion_packet(token_g1, 1));
+        accept_completion(&registry, token_g1, 1);
         table.mark_waiting(token_g1);
         let _ = table.try_take_record(token_g1);
 
@@ -156,9 +226,9 @@ fn test_stale_after_generation_advance_loom() {
 #[test]
 fn test_ready_race_with_mark_orphaned_loom() {
     loom::model(|| {
-        let (table, token) = active_table();
+        let (registry, table, token) = active_registry();
 
-        table.record_completion(completion_packet(token, 3));
+        accept_completion(&registry, token, 3);
 
         let t1 = table.clone();
         let consumer_take = thread::spawn(move || {
@@ -182,10 +252,10 @@ fn test_two_consumers_at_most_one_ready_loom() {
     loom::model(|| {
         use loom::sync::atomic::{AtomicUsize, Ordering};
 
-        let (table, token) = active_table();
+        let (registry, table, token) = active_registry();
         let ready_count = Arc::new(AtomicUsize::new(0));
 
-        table.record_completion(completion_packet(token, 9));
+        accept_completion(&registry, token, 9);
 
         let c1_table = table.clone();
         let c1_ready = ready_count.clone();
@@ -209,7 +279,6 @@ fn test_two_consumers_at_most_one_ready_loom() {
         c2.join().unwrap();
 
         assert!(ready_count.load(Ordering::SeqCst) <= 1);
-        let state = table.debug_get_state(0);
-        assert!(state == CELL_STATE_IDLE || state == CELL_STATE_WAITING);
+        assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
     });
 }

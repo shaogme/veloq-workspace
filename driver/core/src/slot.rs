@@ -499,7 +499,10 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
 #[cfg(not(feature = "loom"))]
 mod tests {
     use super::*;
-    use crate::driver::{CompletionAccess, CompletionToken, PlatformOp};
+    use crate::driver::{
+        CompletionAccess, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
+        CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken, PlatformOp,
+    };
 
     struct DummyPlatformOp;
 
@@ -517,6 +520,57 @@ mod tests {
         type Error = ();
         type Completion = usize;
         type CompletionDiagnostics = ();
+    }
+
+    struct TestHooks;
+
+    impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
+        type BackendIngress = ();
+        type BackendEffect = ();
+
+        fn handle_control(
+            &mut self,
+            _control: CompletionControl,
+        ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+            CompletionHookOutcome::Ignore { effect: () }
+        }
+
+        fn complete_waiting(
+            &mut self,
+            event: crate::driver::UserCompletionEvent,
+            slot: Slot<'_, InFlightWaiting, DummySlotSpec>,
+            _source: CompletionSource<'_, Self::BackendIngress>,
+        ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+            let mut completed = slot.complete();
+            let _ = completed.take_op();
+            let (payload, detail) = completed.take_completion_data();
+            CompletionHookOutcome::User {
+                event,
+                payload: payload.expect("test slot payload should exist"),
+                detail,
+                cleanup: crate::driver::CompletionCleanupGuard::default(),
+                effect: (),
+            }
+        }
+
+        fn complete_orphaned(
+            &mut self,
+            _event: crate::driver::UserCompletionEvent,
+            slot: Slot<'_, InFlightOrphaned, DummySlotSpec>,
+            _source: CompletionSource<'_, Self::BackendIngress>,
+        ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+            let mut completed = slot.complete();
+            let _ = completed.take_op();
+            let (payload, detail) = completed.take_completion_data();
+            let _ = payload;
+            drop(detail);
+            CompletionHookOutcome::Cleanup {
+                cleanup: crate::driver::CompletionCleanupGuard::default(),
+                effect: (),
+            }
+        }
+
+        fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
     }
 
     #[test]
@@ -545,18 +599,20 @@ mod tests {
                 .persist();
         }
 
-        registry
-            .shared
-            .record_completion(crate::driver::CompletionPacket::user(
-                crate::driver::UserCompletionEvent::from_parts(
-                    crate::driver::CompletionBackend::Core,
-                    token,
-                    0,
-                    0,
-                ),
-                (),
-                None,
-            ));
+        let diagnostics = registry.shared.completion_diagnostics();
+        let table: crate::driver::SharedCompletionTable<(), ()> = registry.shared.clone();
+        let mut hooks = TestHooks;
+        let _ = registry.accept_completion(
+            &table,
+            &diagnostics,
+            &mut hooks,
+            CompletionIngress::User(crate::driver::UserCompletionEvent::from_parts(
+                crate::driver::CompletionBackend::Core,
+                token,
+                0,
+                0,
+            )),
+        );
 
         assert!(matches!(
             registry.checked_slot_view(token),

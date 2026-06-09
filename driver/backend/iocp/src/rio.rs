@@ -15,11 +15,8 @@ pub(crate) mod runtime;
 
 use crate::BufferRegistrationMode;
 use crate::config::SocketKey;
-use crate::error::IocpError;
-use crate::op::IocpOpRegistry;
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
-use veloq_driver_core::driver::SharedCompletionTable;
 
 use self::core::registry::RioRegistry;
 use self::core::submit_ops::{RioCq, RioDispatch, RioKernel};
@@ -55,7 +52,7 @@ impl Default for SocketRuntimeState {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SocketInflightToken {
     socket_key: SocketKey,
 }
@@ -84,13 +81,6 @@ pub(crate) struct RioEnv<'a> {
     pub(crate) dispatch: &'a RioDispatch,
     pub(crate) cq: RioCq,
     pub(crate) registration_mode: BufferRegistrationMode,
-}
-
-pub(crate) struct RioCompletionContext<'a> {
-    pub(crate) ops: &'a mut IocpOpRegistry,
-    pub(crate) ext: &'a crate::ext::Extensions,
-    pub(crate) table: &'a SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
-    pub(crate) diagnostics: &'a mut IocpDriverCompletionDiagnostics,
 }
 
 pub(crate) struct RioState {

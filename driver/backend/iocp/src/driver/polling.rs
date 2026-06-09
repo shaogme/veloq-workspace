@@ -3,14 +3,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use diagweave::prelude::*;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionDispatch, CompletionEnvelope, CompletionToken,
-    OpToken, RawCompletion, RemoteWaker, SharedCompletionTable, UserCompletionEvent,
-    dispatch_raw_completion, drain_cancel_requests, record_completion_anomaly, slot_view_anomaly,
-    unknown_completion_anomaly,
+    CompletionAnomaly, CompletionBackend, CompletionToken, OpToken, RawCompletion, RemoteWaker,
+    SharedCompletionTable, UserCompletionEvent, drain_cancel_requests,
 };
-use veloq_driver_core::slot::SlotRegistryExt;
+use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
 use crate::common::{IocpErrorContext, IocpWaker, iocp_msg};
@@ -201,231 +199,110 @@ impl<'a> IocpDriver<'a> {
         success: bool,
         error_code: Option<u32>,
     ) -> IocpDriverResult<CompletionProgress> {
-        match self.resolve_completion_kind(bytes, overlapped, success, key, error_code)? {
-            CompletionDispatch::RioWake { .. } => {
-                let processed = {
-                    let (rio_state, registrar) = self.rio.state_and_registrar_mut();
-                    rio_state.process_completions(
-                        &mut self.ops,
-                        &self.extensions,
-                        registrar,
-                        self.completion.table(),
-                        &mut self.completion_diagnostics,
-                    )
-                }
-                .inspect(|_| {
-                    self.drain_deferred_socket_cleanup();
-                })
-                .push_ctx("scope", "iocp/driver")
-                .attach_note("failed to process rio completions")
-                .trans()?;
-                Ok(CompletionProgress {
-                    iocp: 0,
-                    rio: processed,
-                    internal: 1,
-                    ..CompletionProgress::default()
-                })
+        if key == RIO_EVENT_KEY {
+            let processed = {
+                let (rio_state, registrar) = self.rio.state_and_registrar_mut();
+                rio_state.process_completions(
+                    &mut self.ops,
+                    &self.extensions,
+                    registrar,
+                    self.completion.table(),
+                    &mut self.completion_diagnostics,
+                )
             }
-            CompletionDispatch::Waker { .. } => {
-                self.handle_waker_completion(success, error_code);
-                Ok(CompletionProgress {
-                    internal: 1,
-                    ..CompletionProgress::default()
-                })
-            }
-            CompletionDispatch::User { event } => {
-                Ok(self.process_completion(event, success, error_code, bytes))
-            }
-            CompletionDispatch::Cancel { raw, .. } => {
-                let anomaly = CompletionAnomaly::control_completion_untracked(raw.token)
-                    .with_raw_completion(raw);
-                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
-                debug!(
-                    token = raw.token.raw(),
-                    key,
-                    success,
-                    ?error_code,
-                    "untracked IOCP control completion token"
-                );
-                Ok(CompletionProgress {
-                    anomaly: 1,
-                    ..CompletionProgress::default()
-                })
-            }
-            CompletionDispatch::Unknown { envelope } => {
-                let raw = envelope.raw;
-                let anomaly = if matches!(
-                    envelope.identity,
-                    veloq_driver_core::driver::CompletionIdentity::BackendContext { .. }
-                ) {
-                    unknown_completion_anomaly(envelope)
-                } else if let Some(token) = raw.token.op_token() {
-                    CompletionAnomaly::unknown_slot(raw.token, token.index(), token.generation())
-                        .with_raw_completion(raw)
-                } else {
-                    unknown_completion_anomaly(envelope)
-                };
-                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
-                debug!(
-                    token = raw.token.raw(),
-                    key,
-                    success,
-                    ?error_code,
-                    "unknown IOCP completion token"
-                );
-                Ok(CompletionProgress {
-                    anomaly: 1,
-                    ..CompletionProgress::default()
-                })
-            }
-        }
-    }
-
-    fn handle_waker_completion(&mut self, success: bool, error_code: Option<u32>) {
-        if success {
-            self.completion_diagnostics.backend().inc_waker_ok();
-            self.completion.clear_notification();
-        } else {
-            self.completion_diagnostics.backend().inc_waker_error();
-            warn!(?error_code, "IOCP waker completion reported an error");
-            self.completion.clear_notification();
-        }
-    }
-
-    fn resolve_completion_kind(
-        &mut self,
-        bytes: u32,
-        overlapped: *mut crate::win32::Overlapped,
-        success: bool,
-        completion_key: usize,
-        error_code: Option<u32>,
-    ) -> IocpResult<CompletionDispatch> {
-        if completion_key == RIO_EVENT_KEY {
-            let raw = RawCompletion::new(
-                CompletionBackend::Iocp,
-                CompletionToken::rio_wake(0),
-                iocp_status_res(success, error_code, bytes),
-                0,
-            );
-            return Ok(CompletionDispatch::RioWake { id: 0, raw });
-        }
-
-        if !overlapped.is_null() {
-            // SAFETY: overlapped is non-null and corresponds to a valid OverlappedEntry.
-            let entry = unsafe { &*(overlapped as *const crate::op::OverlappedEntry) };
-            let idx = entry.token.index();
-            if idx >= self.ops.capacity() {
-                error!(
-                    idx,
-                    slots = self.ops.capacity(),
-                    "completed index out of bounds"
-                );
-                return Ok(CompletionDispatch::Unknown {
-                    envelope: CompletionEnvelope::from_raw(RawCompletion::new(
-                        CompletionBackend::Iocp,
-                        CompletionToken::user(entry.token),
-                        iocp_status_res(success, error_code, bytes),
-                        0,
-                    )),
-                });
-            }
-            let raw = RawCompletion::new(
-                CompletionBackend::Iocp,
-                CompletionToken::user(entry.token),
-                iocp_status_res(success, error_code, bytes),
-                0,
-            );
-            let expected_key = raw.token.raw() as usize;
-            // Handles are associated with this IOCP using completion key 0. The overlapped
-            // sidecar is the authoritative user token; a non-zero mismatched key is diagnostic
-            // only and must not override the sidecar token.
-            if completion_key != 0 && completion_key != expected_key {
-                let mismatch_raw = RawCompletion::new(
-                    CompletionBackend::Iocp,
-                    CompletionToken::from_raw(completion_key as u64),
-                    raw.res,
-                    raw.flags,
-                );
-                let anomaly = match slot_view_anomaly(
-                    CompletionBackend::Iocp,
-                    entry.token,
-                    mismatch_raw,
-                    self.ops.checked_slot_view(entry.token),
-                ) {
-                    Ok(view) => {
-                        let snapshot = match view {
-                            veloq_driver_core::slot::SlotView::Reserved(slot) => slot.snapshot(),
-                            veloq_driver_core::slot::SlotView::InFlightWaiting(slot) => {
-                                slot.snapshot()
-                            }
-                            veloq_driver_core::slot::SlotView::InFlightOrphaned(slot) => {
-                                slot.snapshot()
-                            }
-                        };
-                        CompletionAnomaly::completion_key_mismatch(
-                            raw.token,
-                            snapshot.index,
-                            snapshot.generation,
-                            snapshot.state,
-                        )
-                        .with_slot_snapshot(snapshot)
-                        .with_raw_completion(mismatch_raw)
-                    }
-                    Err(anomaly) => anomaly,
-                };
-                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
-                debug!(
-                    expected_key,
-                    completion_key,
-                    sidecar_token = raw.token.raw(),
-                    reason = ?anomaly.reason,
-                    "IOCP completion key does not match overlapped sidecar token"
-                );
-            }
-            return Ok(CompletionDispatch::User {
-                event: UserCompletionEvent::from_parts(
-                    CompletionBackend::Iocp,
-                    entry.token,
-                    raw.res,
-                    raw.flags,
-                ),
+            .inspect(|_| {
+                self.drain_deferred_socket_cleanup();
+            })
+            .push_ctx("scope", "iocp/driver")
+            .attach_note("failed to process rio completions")
+            .trans()?;
+            return Ok(CompletionProgress {
+                iocp: 0,
+                rio: processed,
+                internal: 1,
+                ..CompletionProgress::default()
             });
         }
 
-        if !success {
-            let err = error_code.unwrap_or(0);
-            if completion_key == 0 {
-                let _ = iocp_msg(
-                    IocpErrorContext::CompletionWait,
-                    "GetQueuedCompletionStatus failed with null overlapped",
-                )
-                .with_ctx("os_error_code", err)
-                .with_ctx("completion_key", completion_key)
-                .with_ctx("overlapped_is_null", true);
-                return Ok(CompletionDispatch::Unknown {
-                    envelope: CompletionEnvelope::backend_context(
-                        CompletionBackend::Iocp,
-                        completion_key as u64,
-                        iocp_status_res(success, error_code, bytes),
-                        0,
-                    ),
-                });
-            }
+        let res = iocp_status_res(success, error_code, bytes);
+        if !overlapped.is_null() {
+            let event = self.resolve_overlapped_user_event(bytes, key, overlapped, success, res)?;
+            return Ok(self.process_completion(event, success, error_code, bytes));
         }
-        debug!(
-            completion_key,
-            success,
-            ?error_code,
-            "resolved null-overlapped completion from key"
-        );
 
-        let dispatch = dispatch_raw_completion(
+        if !success && key == 0 {
+            let _ = iocp_msg(
+                IocpErrorContext::CompletionWait,
+                "GetQueuedCompletionStatus failed with null overlapped",
+            )
+            .with_ctx("os_error_code", error_code.unwrap_or(0))
+            .with_ctx("completion_key", key)
+            .with_ctx("overlapped_is_null", true);
+        }
+
+        let flow = self.accept_raw_completion(key as u64, res, 0)?;
+        Ok(CompletionProgress::from_flow(flow, 1, 0))
+    }
+
+    fn resolve_overlapped_user_event(
+        &mut self,
+        bytes: u32,
+        completion_key: usize,
+        overlapped: *mut crate::win32::Overlapped,
+        success: bool,
+        res: i32,
+    ) -> IocpResult<UserCompletionEvent> {
+        let entry = unsafe { &*(overlapped as *const crate::op::OverlappedEntry) };
+        let idx = entry.token.index();
+        if idx >= self.ops.capacity() {
+            error!(
+                idx,
+                slots = self.ops.capacity(),
+                "completed index out of bounds"
+            );
+        }
+
+        let raw = RawCompletion::new(
             CompletionBackend::Iocp,
-            completion_key as u64,
-            iocp_status_res(success, error_code, bytes),
+            CompletionToken::user(entry.token),
+            res,
             0,
         );
-        Ok(dispatch)
+        let expected_key = raw.token.raw() as usize;
+        if completion_key != 0 && completion_key != expected_key {
+            let mismatch_raw = RawCompletion::new(
+                CompletionBackend::Iocp,
+                CompletionToken::from_raw(completion_key as u64),
+                raw.res,
+                raw.flags,
+            );
+            let anomaly = completion_key_mismatch_anomaly(
+                entry.token,
+                raw,
+                mismatch_raw,
+                self.ops.checked_slot_view(entry.token),
+            );
+            let reason = anomaly.reason;
+            let _ = self.accept_completion_anomaly(anomaly)?;
+            debug!(
+                expected_key,
+                completion_key,
+                sidecar_token = raw.token.raw(),
+                reason = ?reason,
+                "IOCP completion key does not match overlapped sidecar token"
+            );
+        }
+
+        debug!(
+            completion_key,
+            success, bytes, "resolved overlapped IOCP completion"
+        );
+        Ok(UserCompletionEvent::from_parts(
+            CompletionBackend::Iocp,
+            entry.token,
+            raw.res,
+            raw.flags,
+        ))
     }
 }
 
@@ -443,5 +320,56 @@ fn iocp_status_res(success: bool, error_code: Option<u32>, bytes: u32) -> i32 {
         bytes.min(i32::MAX as u32) as i32
     } else {
         -(error_code.unwrap_or(0).min(i32::MAX as u32) as i32)
+    }
+}
+
+fn completion_key_mismatch_anomaly(
+    token: OpToken,
+    raw: RawCompletion,
+    mismatch_raw: RawCompletion,
+    view: CheckedSlotView<'_, crate::op::IocpSlotSpec>,
+) -> CompletionAnomaly {
+    match view {
+        CheckedSlotView::Valid(slot) => {
+            let snapshot = match slot {
+                SlotView::Reserved(slot) => slot.snapshot(),
+                SlotView::InFlightWaiting(slot) => slot.snapshot(),
+                SlotView::InFlightOrphaned(slot) => slot.snapshot(),
+            };
+            CompletionAnomaly::completion_key_mismatch(
+                raw.token,
+                snapshot.index,
+                snapshot.generation,
+                snapshot.state,
+            )
+            .with_slot_snapshot(snapshot)
+            .with_raw_completion(mismatch_raw)
+        }
+        CheckedSlotView::Missing {
+            index,
+            expected_generation,
+        } => CompletionAnomaly::unknown_slot(mismatch_raw.token, index, expected_generation)
+            .with_raw_completion(mismatch_raw),
+        CheckedSlotView::Empty(snapshot) => CompletionAnomaly::non_active(
+            mismatch_raw.token,
+            snapshot.index,
+            token.generation(),
+            snapshot.state,
+        )
+        .with_slot_snapshot(snapshot)
+        .with_raw_completion(mismatch_raw),
+        CheckedSlotView::Stale(snapshot) => CompletionAnomaly::stale(
+            mismatch_raw.token,
+            snapshot.index,
+            token.generation(),
+            snapshot.generation,
+            snapshot.state,
+        )
+        .with_slot_snapshot(snapshot)
+        .with_raw_completion(mismatch_raw),
+        CheckedSlotView::Corrupt(snapshot) => {
+            CompletionAnomaly::corrupt_slot_snapshot(mismatch_raw.token, snapshot)
+                .with_raw_completion(mismatch_raw)
+        }
     }
 }

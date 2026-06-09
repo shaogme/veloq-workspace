@@ -5,20 +5,19 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
-    CompletionBackend, CompletionCleanupGuard, CompletionToken, DriverSubmitResult, OpToken,
-    RawCompletion, SharedCompletionTable, SubmitStatus, UserCompletionEvent,
-    record_lost_completion,
+    CompletionAnomaly, CompletionBackend, CompletionBackendHooks, CompletionControl,
+    CompletionFlowExt, CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
+    DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus, SyntheticCompletionSource,
+    UserCompletionEvent,
 };
 use veloq_driver_core::slot::{
-    CheckedSlotView, Reserved, SlotAccessError, SlotRegistryExt, SlotView,
+    CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError, SlotRegistryExt,
+    SlotView,
 };
 
-use crate::common::{completion_record, push_completion_shared};
 use crate::config::IoFd;
-use crate::driver::completion::{finalize_corrupt_iocp_checked, finalize_waiting_iocp_checked};
 use crate::driver::{
-    CompletionSidecar, IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult,
-    IocpOpRegistry,
+    IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
 };
 use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
 use crate::op::{
@@ -55,6 +54,91 @@ impl BlockingBridge {
     fn submit(task: BlockingTask) -> bool {
         veloq_blocking::get_blocking_pool().execute(task).is_ok()
     }
+}
+
+struct SubmissionFailureHooks {
+    report: Option<Report<IocpError>>,
+}
+
+impl CompletionBackendHooks<crate::op::IocpSlotSpec> for SubmissionFailureHooks {
+    type BackendIngress = ();
+    type BackendEffect = ();
+
+    fn handle_control(
+        &mut self,
+        _control: CompletionControl,
+    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+        CompletionHookOutcome::Ignore { effect: () }
+    }
+
+    fn complete_waiting(
+        &mut self,
+        event: UserCompletionEvent,
+        slot: Slot<'_, InFlightWaiting>,
+        _source: CompletionSource<'_, Self::BackendIngress>,
+    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+        let event_res = event.res();
+        let snapshot = slot.snapshot();
+        let mut guard = slot.complete();
+        let cleanup = guard
+            .op
+            .as_mut()
+            .map(|op| {
+                op.completion_cleanup(&Err(self.report.take().unwrap_or_else(|| {
+                    IocpError::Submission
+                        .to_report()
+                        .push_ctx("scope", "iocp.driver.handle_offload")
+                        .set_error_code((-event_res).max(1))
+                        .attach_note("offload task submission failed")
+                })))
+            })
+            .unwrap_or_default();
+        let _ = guard.take_op();
+        let (payload, detail) = guard.take_completion_data();
+        let Some(payload) = payload else {
+            drop(detail);
+            return CompletionHookOutcome::Lost {
+                event,
+                loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
+                    event.completion_token(),
+                    snapshot,
+                )
+                .with_raw_completion(event.raw()),
+                snapshot,
+                cleanup,
+                effect: (),
+            };
+        };
+        CompletionHookOutcome::User {
+            event,
+            payload,
+            detail,
+            cleanup,
+            effect: (),
+        }
+    }
+
+    fn complete_orphaned(
+        &mut self,
+        _event: UserCompletionEvent,
+        slot: Slot<'_, InFlightOrphaned>,
+        _source: CompletionSource<'_, Self::BackendIngress>,
+    ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
+        let mut guard = slot.complete();
+        let cleanup = guard
+            .op
+            .as_mut()
+            .map(|op| op.orphan_cleanup(&Err(IocpError::Submission.to_report())))
+            .unwrap_or_default();
+        let _ = guard.take_op();
+        let _ = guard.take_completion_data();
+        CompletionHookOutcome::Cleanup {
+            cleanup,
+            effect: (),
+        }
+    }
+
+    fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
 }
 
 fn close_fd_from_op(op: &mut IocpOp) -> IocpResult<Option<IoFd>> {
@@ -136,71 +220,22 @@ impl<'a> IocpDriver<'a> {
         task: BlockingTask,
     ) -> IocpDriverResult<Poll<()>> {
         if !BlockingBridge::submit(task) {
-            if let CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) =
-                ops.checked_slot_view(token)
-            {
-                let snapshot = slot.snapshot();
-                let mut guard = slot.complete();
-                let _ = guard.take_op();
-                let (payload, detail) = guard.take_completion_data();
-                let event_res = iocp_fallback_event_res(IocpError::Submission);
-                if let Some(payload) = payload {
-                    let sidecar = CompletionSidecar::new(
-                        UserCompletionEvent::from_parts(
-                            CompletionBackend::Iocp,
-                            token,
-                            event_res,
-                            0,
-                        ),
-                        payload,
-                        detail,
-                        CompletionCleanupGuard::default(),
-                    );
-                    push_completion_shared(
-                        ctx.completion_table,
-                        ctx.diagnostics,
-                        completion_record(sidecar),
-                    );
-                    let _ = finalize_waiting_iocp_checked(
-                        ops,
-                        ctx.diagnostics,
-                        token,
-                        event_res,
-                        "iocp.handle_offload.waiting",
-                    );
-                } else {
-                    drop(detail);
-                    let raw = RawCompletion::new(
-                        CompletionBackend::Iocp,
-                        CompletionToken::user(token),
-                        event_res,
-                        0,
-                    );
-                    let anomaly =
-                        veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
-                            .with_slot_snapshot(snapshot)
-                            .with_raw_completion(raw);
-                    let _ = record_lost_completion(
-                        ctx.completion_table,
-                        ctx.diagnostics,
-                        UserCompletionEvent::from_parts(
-                            CompletionBackend::Iocp,
-                            token,
-                            raw.res,
-                            raw.flags,
-                        ),
-                        anomaly,
-                        CompletionCleanupGuard::default(),
-                    );
-                    let _ = finalize_corrupt_iocp_checked(
-                        ops,
-                        ctx.diagnostics,
-                        snapshot,
-                        raw.res,
-                        "iocp.handle_offload.waiting_lost",
-                    );
-                }
-            }
+            let report = IocpError::Submission.report("iocp/driver", "thread pool overloaded");
+            let event_res = iocp_fallback_event_res(IocpError::Submission);
+            let event =
+                UserCompletionEvent::from_parts(CompletionBackend::Iocp, token, event_res, 0);
+            let mut hooks = SubmissionFailureHooks {
+                report: Some(report),
+            };
+            let _ = ops.accept_completion(
+                ctx.completion_table,
+                ctx.diagnostics,
+                &mut hooks,
+                CompletionIngress::Synthetic {
+                    event,
+                    source: SyntheticCompletionSource::SubmissionFailure,
+                },
+            );
             return Err(IocpError::Submission.report("iocp/driver", "thread pool overloaded"));
         }
         Ok(Poll::Pending)

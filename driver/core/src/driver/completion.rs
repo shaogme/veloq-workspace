@@ -2,11 +2,17 @@ use crate::{DriverCoreError, DriverError, DriverResult};
 
 use diagweave::prelude::*;
 
+mod flow;
 mod table;
 mod types;
 
 use crate::driver::registry::OpRegistry;
 use crate::slot::{self, CheckedSlotView, SlotRegistryExt, SlotView};
+pub use flow::{
+    CompletionBackendHooks, CompletionControl, CompletionFlowExt, CompletionFlowOutcome,
+    CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionWritePermit,
+    SyntheticCompletionSource,
+};
 pub use table::{
     CELL_STATE_BUSY, CELL_STATE_IDLE, CELL_STATE_ORPHANED, CELL_STATE_READY, CELL_STATE_WAITING,
     CompletionAccess, PollRecordResult, SharedCompletionTable,
@@ -321,7 +327,7 @@ pub enum FinalizeOutcome {
 }
 
 #[inline]
-pub fn finalize_waiting_checked<Spec>(
+fn finalize_waiting_checked<Spec>(
     registry: &mut OpRegistry<Spec>,
     diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     backend: CompletionBackend,
@@ -340,7 +346,7 @@ where
 }
 
 #[inline]
-pub fn finalize_orphaned_checked<Spec>(
+fn finalize_orphaned_checked<Spec>(
     registry: &mut OpRegistry<Spec>,
     diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     backend: CompletionBackend,
@@ -359,7 +365,7 @@ where
 }
 
 #[inline]
-pub fn finalize_corrupt_checked<Spec>(
+fn finalize_corrupt_checked<Spec>(
     registry: &mut OpRegistry<Spec>,
     diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     backend: CompletionBackend,
@@ -432,7 +438,7 @@ where
 }
 
 #[inline]
-pub fn dispatch_raw_completion(
+fn dispatch_raw_completion(
     backend: CompletionBackend,
     raw_token: u64,
     res: i32,
@@ -461,7 +467,7 @@ impl CompletionAnomaly {
 }
 
 #[inline]
-pub fn unknown_completion_anomaly(envelope: CompletionEnvelope) -> CompletionAnomaly {
+fn unknown_completion_anomaly(envelope: CompletionEnvelope) -> CompletionAnomaly {
     match envelope.identity {
         CompletionIdentity::BackendContext {
             backend,
@@ -633,7 +639,7 @@ impl CompletionToken {
 }
 
 #[inline]
-pub fn route_user_completion<'a, Spec: slot::SlotSpec>(
+fn route_user_completion<'a, Spec: slot::SlotSpec>(
     event: UserCompletionEvent,
     view: CheckedSlotView<'a, Spec>,
 ) -> RoutedSlotCompletion<'a, Spec> {
@@ -665,7 +671,7 @@ pub fn route_user_completion<'a, Spec: slot::SlotSpec>(
 }
 
 #[inline]
-pub fn slot_view_anomaly<'a, Spec: slot::SlotSpec>(
+fn slot_view_anomaly<'a, Spec: slot::SlotSpec>(
     backend: CompletionBackend,
     token: OpToken,
     raw: RawCompletion,
@@ -705,10 +711,7 @@ pub fn slot_view_anomaly<'a, Spec: slot::SlotSpec>(
 }
 
 #[inline]
-pub fn corrupt_slot_anomaly(
-    token: CompletionToken,
-    snapshot: slot::SlotSnapshot,
-) -> CompletionAnomaly {
+fn corrupt_slot_anomaly(token: CompletionToken, snapshot: slot::SlotSnapshot) -> CompletionAnomaly {
     if !snapshot.has_op {
         CompletionAnomaly::op_missing(token, snapshot.index, snapshot.generation)
     } else if !snapshot.has_payload {
@@ -716,28 +719,6 @@ pub fn corrupt_slot_anomaly(
     } else {
         CompletionAnomaly::corrupt(token, snapshot.index, snapshot.generation, snapshot.state)
     }
-}
-
-#[inline]
-pub fn slot_access_anomaly(raw: RawCompletion, access: slot::SlotAccessError) -> CompletionAnomaly {
-    let snapshot = access.snapshot;
-    let anomaly = match access.reason {
-        slot::SlotAccessErrorReason::MissingOp => {
-            CompletionAnomaly::op_missing(raw.token, snapshot.index, snapshot.generation)
-        }
-        slot::SlotAccessErrorReason::MissingPayload => {
-            CompletionAnomaly::payload_missing(raw.token, snapshot.index, snapshot.generation)
-        }
-        slot::SlotAccessErrorReason::UnexpectedOp => CompletionAnomaly::backend_invariant_broken(
-            raw.token,
-            snapshot.index,
-            snapshot.generation,
-            snapshot.state,
-        ),
-    };
-    anomaly
-        .with_slot_snapshot(snapshot)
-        .with_raw_completion(raw)
 }
 
 impl From<u64> for CompletionToken {
@@ -971,7 +952,7 @@ fn run_rejected_cleanup<B, UP, E, R>(
 }
 
 #[inline]
-pub fn run_completion_cleanup<B>(
+fn run_completion_cleanup<B>(
     diagnostics: &DriverCompletionDiagnostics<B>,
     cleanup: &mut CompletionCleanupGuard,
 ) -> bool {
@@ -985,67 +966,13 @@ pub fn run_completion_cleanup<B>(
 }
 
 #[inline]
-pub fn record_completion_anomaly<B>(
+fn record_completion_anomaly<B>(
     diagnostics: &DriverCompletionDiagnostics<B>,
     anomaly: &CompletionAnomaly,
 ) where
     B: DriverCompletionDiagnosticsBackend,
 {
     diagnostics.record_anomaly(anomaly);
-}
-
-#[inline]
-pub fn record_user_completion<B, UP, E, R>(
-    table: &SharedCompletionTable<UP, E, R>,
-    diagnostics: &DriverCompletionDiagnostics<B>,
-    packet: CompletionPacket<UP, E, R>,
-) -> RecordCompletionOutcome
-where
-    UP: Send,
-    E: Send,
-    R: Send,
-{
-    match table.record_completion(packet) {
-        RecordCompletionResult::Recorded(outcome) => outcome,
-        RecordCompletionResult::Rejected { outcome, packet } => {
-            run_rejected_cleanup(diagnostics, *packet);
-            outcome
-        }
-    }
-}
-
-#[inline]
-pub fn record_lost_completion<B, UP, E, R>(
-    table: &SharedCompletionTable<UP, E, R>,
-    diagnostics: &DriverCompletionDiagnostics<B>,
-    event: UserCompletionEvent,
-    anomaly: CompletionAnomaly,
-    cleanup: CompletionCleanupGuard,
-) -> RecordCompletionOutcome
-where
-    UP: Send,
-    E: Send,
-    R: Send,
-{
-    record_user_completion(
-        table,
-        diagnostics,
-        CompletionPacket::lost(event, anomaly, cleanup),
-    )
-}
-
-#[inline]
-pub fn discard_internal_completion<B>(diagnostics: &DriverCompletionDiagnostics<B>) {
-    diagnostics.inc_internal_unknown();
-}
-
-#[inline]
-pub fn event_res_to_result<R, E>(res: i32) -> DriverResult<R, E>
-where
-    R: CompletionValue,
-    E: DriverError,
-{
-    R::from_event_res(res)
 }
 
 #[cfg(test)]
@@ -1112,30 +1039,6 @@ mod tests {
         );
         assert_eq!(packet.completion_event().res, 11);
         assert_eq!(packet.completion_event().flags, 5);
-    }
-
-    #[test]
-    fn slot_access_anomaly_maps_missing_payload() {
-        let token = OpToken::from_registry_parts(4, 2).expect("test token");
-        let raw = RawCompletion::new(CompletionBackend::Core, CompletionToken::user(token), -1, 0);
-        let snapshot = slot::SlotSnapshot {
-            index: token.index(),
-            generation: token.generation(),
-            state: slot::SlotState::InFlightWaiting,
-            has_op: true,
-            has_payload: false,
-        };
-        let access = slot::SlotAccessError {
-            action: slot::SlotAccessAction::TakeCompletionData,
-            reason: slot::SlotAccessErrorReason::MissingPayload,
-            snapshot,
-        };
-
-        let anomaly = slot_access_anomaly(raw, access);
-
-        assert_eq!(anomaly.reason, CompletionAnomalyReason::PayloadMissing);
-        assert_eq!(anomaly.slot_snapshot, Some(snapshot));
-        assert_eq!(anomaly.raw_result, Some(-1));
     }
 
     #[test]

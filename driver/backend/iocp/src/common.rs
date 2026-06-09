@@ -5,14 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use diagweave::prelude::*;
 use tracing::error;
 
-use crate::driver::IocpDriverCompletionDiagnostics;
-use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
-use crate::op::IocpUserPayload;
+use crate::error::IocpError;
 use crate::win32::IoCompletionPort;
-use veloq_driver_core::driver::{
-    CompletionPacket, CompletionSidecar, CompletionToken, RecordCompletionOutcome, RemoteWaker,
-    SharedCompletionTable, record_user_completion,
-};
+use veloq_driver_core::driver::{CompletionToken, RemoteWaker};
 
 // ============================================================================
 // Error Context & Logic
@@ -58,50 +53,6 @@ pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Repo
         "IOCP error report"
     );
     report
-}
-
-// ============================================================================
-// Utilities
-// ============================================================================
-
-#[inline]
-pub(crate) fn io_result_to_event_res(res: &IocpResult<usize>) -> i32 {
-    match res {
-        Ok(v) => (*v).min(i32::MAX as usize) as i32,
-        Err(e) => iocp_report_to_event_res(e),
-    }
-}
-
-#[inline]
-pub(crate) fn completion_record(
-    sidecar: CompletionSidecar<IocpUserPayload, IocpError>,
-) -> CompletionPacket<IocpUserPayload, IocpError> {
-    sidecar.into_packet()
-}
-
-#[inline]
-pub(crate) fn push_completion_shared(
-    table: &SharedCompletionTable<IocpUserPayload, IocpError>,
-    diagnostics: &mut IocpDriverCompletionDiagnostics,
-    packet: CompletionPacket<IocpUserPayload, IocpError>,
-) -> RecordCompletionOutcome {
-    let event = packet.completion_event();
-    let outcome = record_user_completion(table, diagnostics, packet);
-    match &outcome {
-        RecordCompletionOutcome::RecordedUser
-        | RecordCompletionOutcome::RecordedLost
-        | RecordCompletionOutcome::OrphanedDropped => {}
-        anomaly => {
-            tracing::debug!(
-                token = event.token.raw(),
-                res = event.res,
-                flags = event.flags,
-                outcome = ?anomaly,
-                "IOCP completion table did not record completion normally"
-            );
-        }
-    }
-    outcome
 }
 
 // ============================================================================
