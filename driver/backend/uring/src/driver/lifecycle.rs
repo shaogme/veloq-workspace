@@ -126,7 +126,6 @@ impl<'a> UringDriver<'a> {
             }
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                 if slot.platform().submission_state == UringSubmissionState::Queued {
-                    drop(slot);
                     self.remove_backlog_token(token);
                     self.complete_local_cancel(token, request.mode);
                     return CancelSubmitOutcome::CompletedLocally;
@@ -134,7 +133,6 @@ impl<'a> UringDriver<'a> {
 
                 if let Some(tid) = slot.platform_mut().timer_id.take() {
                     self.wheel.cancel(tid);
-                    drop(slot);
                     self.complete_local_cancel(token, request.mode);
                     return CancelSubmitOutcome::CompletedLocally;
                 }
@@ -146,7 +144,6 @@ impl<'a> UringDriver<'a> {
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
                 if slot.platform().submission_state == UringSubmissionState::Queued {
-                    drop(slot);
                     self.remove_backlog_token(token);
                     self.complete_local_cancel(token, CancelMode::Abandon);
                     return CancelSubmitOutcome::CompletedLocally;
@@ -154,7 +151,6 @@ impl<'a> UringDriver<'a> {
 
                 if let Some(tid) = slot.platform_mut().timer_id.take() {
                     self.wheel.cancel(tid);
-                    drop(slot);
                     self.complete_local_cancel(token, CancelMode::Abandon);
                     return CancelSubmitOutcome::CompletedLocally;
                 }
