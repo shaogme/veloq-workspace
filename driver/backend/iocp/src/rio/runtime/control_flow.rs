@@ -113,16 +113,18 @@ impl<'a> RioCompletionRouter<'a> {
                         .with_ctx("rio_op_kind", op_kind.as_str())
                         .with_ctx("rio_request_id", request_id)
                         .attach_note("RIO slot platform generation mismatch");
-                    let mut guard = slot.complete();
-                    let completion = Err(report);
-                    let cleanup = guard
-                        .op
-                        .as_mut()
-                        .map(|op| op.completion_cleanup(&completion))
-                        .unwrap_or_default();
-                    let _ = guard.take_op();
-                    let _ = guard.take_completion_data();
-                    drop(guard);
+                    let cleanup = {
+                        let mut guard = slot.complete();
+                        let completion = Err(report);
+                        let cleanup = guard
+                            .op
+                            .as_mut()
+                            .map(|op| op.completion_cleanup(&completion))
+                            .unwrap_or_default();
+                        let _ = guard.take_op();
+                        let _ = guard.take_completion_data();
+                        cleanup
+                    };
                     let _ = record_lost_completion(
                         self.comp.table,
                         self.comp.diagnostics,
@@ -231,42 +233,44 @@ impl<'a> RioCompletionRouter<'a> {
                         .with_ctx("rio_op_kind", op_kind.as_str())
                         .with_ctx("rio_request_id", request_id)
                         .attach_note("orphaned RIO completion had platform generation mismatch");
-                    let mut guard = slot.complete();
-                    let cleanup = guard
-                        .op
-                        .as_mut()
-                        .map(|op| op.completion_cleanup(&orphan_result))
-                        .unwrap_or_default();
-                    let _ = guard.take_op();
-                    let _ = guard.take_completion_data();
-                    let _ = std::mem::take(guard.platform_mut());
-                    drop(guard);
-                    let mut cleanup = cleanup;
+                    let mut cleanup = {
+                        let mut guard = slot.complete();
+                        let cleanup = guard
+                            .op
+                            .as_mut()
+                            .map(|op| op.completion_cleanup(&orphan_result))
+                            .unwrap_or_default();
+                        let _ = guard.take_op();
+                        let _ = guard.take_completion_data();
+                        let _ = std::mem::take(guard.platform_mut());
+                        cleanup
+                    };
                     let _ = run_completion_cleanup(self.comp.diagnostics, &mut cleanup);
                     let _ = ops.finalize_orphaned_completion(op_token);
                 } else {
-                    let mut guard = slot.complete();
-                    let orphan_result = if res.Status == 0 {
-                        Ok(res.BytesTransferred as usize)
-                    } else {
-                        IocpError::CompletionWait
-                            .push_ctx("scope", "rio.runtime.control_flow.orphan_cleanup")
-                            .with_ctx("socket_raw", socket_key.as_handle() as usize)
-                            .with_ctx("rio_op_kind", op_kind.as_str())
-                            .with_ctx("rio_request_id", request_id)
-                            .set_error_code(res.Status)
-                            .attach_note("orphaned RIO completion returned os error")
+                    let mut cleanup = {
+                        let mut guard = slot.complete();
+                        let orphan_result = if res.Status == 0 {
+                            Ok(res.BytesTransferred as usize)
+                        } else {
+                            IocpError::CompletionWait
+                                .push_ctx("scope", "rio.runtime.control_flow.orphan_cleanup")
+                                .with_ctx("socket_raw", socket_key.as_handle() as usize)
+                                .with_ctx("rio_op_kind", op_kind.as_str())
+                                .with_ctx("rio_request_id", request_id)
+                                .set_error_code(res.Status)
+                                .attach_note("orphaned RIO completion returned os error")
+                        };
+                        let cleanup = guard
+                            .op
+                            .as_mut()
+                            .map(|op| op.completion_cleanup(&orphan_result))
+                            .unwrap_or_default();
+                        let _ = guard.take_op();
+                        let _ = guard.take_completion_data();
+                        let _ = std::mem::take(guard.platform_mut());
+                        cleanup
                     };
-                    let cleanup = guard
-                        .op
-                        .as_mut()
-                        .map(|op| op.completion_cleanup(&orphan_result))
-                        .unwrap_or_default();
-                    let _ = guard.take_op();
-                    let _ = guard.take_completion_data();
-                    let _ = std::mem::take(guard.platform_mut());
-                    drop(guard);
-                    let mut cleanup = cleanup;
                     let _ = run_completion_cleanup(self.comp.diagnostics, &mut cleanup);
                     let _ = ops.finalize_orphaned_completion(op_token);
                 }
@@ -292,13 +296,13 @@ impl<'a> RioCompletionRouter<'a> {
                         .attach_note("RIO completion found corrupt slot"));
                     let cleanup = ops
                         .active_slot_bundle_mut(op_token)
-                        .and_then(|(_, _, op, _)| {
+                        .map(|(_, _, op, _)| {
                             let cleanup = op
                                 .as_mut()
                                 .map(|op| op.completion_cleanup(&lost_result))
                                 .unwrap_or_default();
                             let _ = op.take();
-                            Some(cleanup)
+                            cleanup
                         })
                         .unwrap_or_default();
                     let _ = ops.with_slot_storage_mut(op_token, |result, payload, _sidecar| {

@@ -69,7 +69,10 @@ fn rejected_completion<UP, E, R>(
     outcome: RecordCompletionOutcome,
     packet: CompletionPacket<UP, E, R>,
 ) -> RecordCompletionResult<UP, E, R> {
-    RecordCompletionResult::Rejected { outcome, packet }
+    RecordCompletionResult::Rejected {
+        outcome,
+        packet: Box::new(packet),
+    }
 }
 
 #[inline]
@@ -434,33 +437,31 @@ where
         }
         let cell = &self.slots[idx];
 
-        loop {
-            let current = cell.load_core_state(Ordering::Acquire);
-            let state = current.state();
-            let cell_gen = current.generation();
+        let current = cell.load_core_state(Ordering::Acquire);
+        let state = current.state();
+        let cell_gen = current.generation();
 
-            if cell_gen != generation {
-                return mutation_generation_mismatch(token, idx, generation, cell_gen, state);
+        if cell_gen != generation {
+            return mutation_generation_mismatch(token, idx, generation, cell_gen, state);
+        }
+
+        // Register waker. AtomicWaker handles races with concurrent wake().
+        cell.completion_waker.register(waker);
+
+        // cell_gen == generation
+        let current_after = cell.load_core_state(Ordering::Acquire);
+        if current_after.state() == slot::SlotState::InFlightReady
+            && current_after.generation() == generation
+        {
+            waker.wake_by_ref();
+            return CompletionMutationOutcome::Applied;
+        }
+
+        match current_after.state() {
+            slot::SlotState::InFlightWaiting | slot::SlotState::InFlightReady => {
+                CompletionMutationOutcome::Applied
             }
-
-            // Register waker. AtomicWaker handles races with concurrent wake().
-            cell.completion_waker.register(waker);
-
-            // cell_gen == generation
-            let current_after = cell.load_core_state(Ordering::Acquire);
-            if current_after.state() == slot::SlotState::InFlightReady
-                && current_after.generation() == generation
-            {
-                waker.wake_by_ref();
-                return CompletionMutationOutcome::Applied;
-            }
-
-            return match current_after.state() {
-                slot::SlotState::InFlightWaiting | slot::SlotState::InFlightReady => {
-                    CompletionMutationOutcome::Applied
-                }
-                state => mutation_non_active(token, idx, generation, state),
-            };
+            state => mutation_non_active(token, idx, generation, state),
         }
     }
 

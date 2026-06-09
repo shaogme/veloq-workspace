@@ -716,7 +716,7 @@ where
         }
         RecordCompletionResult::Rejected { outcome, packet } => {
             diagnostics.record_completion_outcome(&outcome);
-            run_rejected_cleanup(diagnostics, packet);
+            run_rejected_cleanup(diagnostics, *packet);
             outcome
         }
     }

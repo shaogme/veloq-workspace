@@ -590,15 +590,15 @@ where
         >,
 {
     fn drop(&mut self) {
-        if let LocalState::Submitted = self.state {
-            if let Some(token) = self.token {
-                self.provider.with_driver(|mut driver| {
-                    driver
-                        .completion_table()
-                        .mark_orphaned(CompletionToken::user(token));
-                    let _ = driver.cancel_op(CancelRequest::abandon(token));
-                });
-            }
+        if let LocalState::Submitted = self.state
+            && let Some(token) = self.token
+        {
+            self.provider.with_driver(|mut driver| {
+                driver
+                    .completion_table()
+                    .mark_orphaned(CompletionToken::user(token));
+                let _ = driver.cancel_op(CancelRequest::abandon(token));
+            });
         }
     }
 }

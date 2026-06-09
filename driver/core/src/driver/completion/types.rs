@@ -564,7 +564,7 @@ pub enum RecordCompletionResult<UP, E, R = usize> {
     Recorded,
     Rejected {
         outcome: RecordCompletionOutcome,
-        packet: CompletionPacket<UP, E, R>,
+        packet: Box<CompletionPacket<UP, E, R>>,
     },
 }
 

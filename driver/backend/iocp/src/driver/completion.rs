@@ -226,25 +226,27 @@ impl<'a> IocpDriver<'a> {
                 let _ = self.ops.finalize_waiting_completion(token);
             }
             RoutedSlotCompletion::Orphaned(slot) => {
-                let mut completed = slot.complete();
-                let io_result = if success {
-                    Ok(bytes_transferred as usize)
-                } else {
-                    Err(IocpError::CompletionWait.io_report(
-                        "iocp.driver.process_completion.orphaned",
-                        std::io::Error::from_raw_os_error(error_code.unwrap_or(0) as i32),
-                    ))
+                let (mut cleanup, socket_inflight) = {
+                    let mut completed = slot.complete();
+                    let io_result = if success {
+                        Ok(bytes_transferred as usize)
+                    } else {
+                        Err(IocpError::CompletionWait.io_report(
+                            "iocp.driver.process_completion.orphaned",
+                            std::io::Error::from_raw_os_error(error_code.unwrap_or(0) as i32),
+                        ))
+                    };
+                    let cleanup = completed
+                        .op
+                        .as_mut()
+                        .map(|op| op.completion_cleanup(&io_result))
+                        .unwrap_or_default();
+                    let socket_inflight =
+                        completed.op.as_mut().and_then(take_socket_inflight_from_op);
+                    let _ = completed.take_op();
+                    let _ = completed.take_completion_data();
+                    (cleanup, socket_inflight)
                 };
-                let cleanup = completed
-                    .op
-                    .as_mut()
-                    .map(|op| op.completion_cleanup(&io_result))
-                    .unwrap_or_default();
-                let socket_inflight = completed.op.as_mut().and_then(take_socket_inflight_from_op);
-                let _ = completed.take_op();
-                let _ = completed.take_completion_data();
-                drop(completed);
-                let mut cleanup = cleanup;
                 let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
                 if let Some(socket_inflight) = socket_inflight {
                     self.rio
@@ -414,13 +416,13 @@ impl<'a> IocpDriver<'a> {
         let cleanup = self
             .ops
             .active_slot_bundle_mut(token)
-            .and_then(|(_, _, op, _)| {
+            .map(|(_, _, op, _)| {
                 let cleanup = op
                     .as_mut()
                     .map(|op| op.completion_cleanup(&lost_result))
                     .unwrap_or_default();
                 let _ = op.take();
-                Some(cleanup)
+                cleanup
             })
             .unwrap_or_default();
 

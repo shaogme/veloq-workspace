@@ -129,6 +129,10 @@ impl BufferRegion {
     pub fn len(&self) -> usize {
         self.len.get()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 unsafe impl Send for BufferRegion {}
