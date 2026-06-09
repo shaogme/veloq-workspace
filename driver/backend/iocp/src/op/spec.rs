@@ -46,6 +46,13 @@ pub(crate) trait IocpOpSpec: Sized + Send + 'static {
         CompletionCleanupGuard::default()
     }
 
+    fn orphan_cleanup(
+        payload: &mut Self::KernelPayload,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard {
+        Self::completion_cleanup(payload, result)
+    }
+
     unsafe fn get_fd(_payload: &Self::KernelPayload) -> Option<IoFd> {
         None
     }
@@ -109,6 +116,19 @@ where
         return CompletionCleanupGuard::default();
     };
     S::completion_cleanup(payload, result)
+}
+
+pub(crate) unsafe fn orphan_cleanup_shim<S>(
+    op: &mut IocpKernelOp,
+    result: &IocpResult<usize>,
+) -> CompletionCleanupGuard
+where
+    S: IocpOpErasure,
+{
+    let Some(payload) = S::kernel_payload_mut(&mut op.payload) else {
+        return CompletionCleanupGuard::default();
+    };
+    S::orphan_cleanup(payload, result)
 }
 
 pub(crate) unsafe fn get_fd_shim<S>(op: &IocpKernelOp) -> Option<IoFd>

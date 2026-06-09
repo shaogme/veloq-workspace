@@ -37,6 +37,8 @@ pub(crate) type OnCompleteFn = unsafe fn(
 ) -> DriverResult<usize>;
 pub(crate) type CompletionCleanupFn =
     unsafe fn(op: &mut UringKernelOp, result: i32) -> CompletionCleanupGuard;
+pub(crate) type OrphanCleanupFn =
+    unsafe fn(op: &mut UringKernelOp, result: i32) -> CompletionCleanupGuard;
 pub(crate) type GetTimeoutFn =
     unsafe fn(op: &UringKernelOp, payload: &UringUserPayload) -> Option<Duration>;
 pub(crate) type ResolveChunksFn = unsafe fn(
@@ -59,6 +61,7 @@ pub(crate) struct OpVTable {
     pub(crate) make_sqe: MakeSqeFn,
     pub(crate) on_complete: OnCompleteFn,
     pub(crate) completion_cleanup: CompletionCleanupFn,
+    pub(crate) orphan_cleanup: OrphanCleanupFn,
     pub(crate) strategy: SubmissionStrategy,
     pub(crate) get_timeout: GetTimeoutFn,
     pub(crate) resolve_chunks: ResolveChunksFn,

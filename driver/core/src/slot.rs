@@ -498,7 +498,8 @@ mod tests {
     fn ready_slots_are_owned_by_completion_table_not_slot_view() {
         let mut registry = OpRegistry::<DummySlotSpec>::new(1);
         let handle = registry.alloc(()).expect("slot allocation failed").handle;
-        let token = OpToken::new(handle.index, handle.generation);
+        let token = OpToken::from_registry_parts(handle.index, handle.generation)
+            .expect("test handle should be encodable");
         let completion_token = CompletionToken::user(token);
 
         {
@@ -556,7 +557,8 @@ mod tests {
     fn checked_slot_view_reports_stale_generation() {
         let mut registry = OpRegistry::<DummySlotSpec>::new(1);
         let handle = registry.alloc(()).expect("slot allocation failed").handle;
-        let stale_token = OpToken::new(handle.index, handle.generation);
+        let stale_token = OpToken::from_registry_parts(handle.index, handle.generation)
+            .expect("test handle should be encodable");
         let _ = registry.remove(stale_token);
         let fresh = registry
             .alloc(())
@@ -577,7 +579,8 @@ mod tests {
     fn checked_slot_view_reports_idle_as_empty() {
         let mut registry = OpRegistry::<DummySlotSpec>::new(1);
         let handle = registry.alloc(()).expect("slot allocation failed").handle;
-        let token = OpToken::new(handle.index, handle.generation);
+        let token = OpToken::from_registry_parts(handle.index, handle.generation)
+            .expect("test handle should be encodable");
 
         let _ = registry.remove(token);
 
@@ -594,7 +597,8 @@ mod tests {
     fn checked_slot_view_reports_missing_inflight_payload_as_corrupt() {
         let mut registry = OpRegistry::<DummySlotSpec>::new(1);
         let handle = registry.alloc(()).expect("slot allocation failed").handle;
-        let token = OpToken::new(handle.index, handle.generation);
+        let token = OpToken::from_registry_parts(handle.index, handle.generation)
+            .expect("test handle should be encodable");
 
         let slot = match registry.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot

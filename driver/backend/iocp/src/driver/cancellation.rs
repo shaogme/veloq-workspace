@@ -269,7 +269,13 @@ impl<'a> IocpDriver<'a> {
                 cleanup = guard
                     .op
                     .as_mut()
-                    .map(|op| op.completion_cleanup(&abort_result))
+                    .map(|op| {
+                        if emit_completion {
+                            op.completion_cleanup(&abort_result)
+                        } else {
+                            op.orphan_cleanup(&abort_result)
+                        }
+                    })
                     .unwrap_or_default();
                 let _ = guard.take_op();
                 Some(guard.take_completion_data())
@@ -279,7 +285,7 @@ impl<'a> IocpDriver<'a> {
                 cleanup = guard
                     .op
                     .as_mut()
-                    .map(|op| op.completion_cleanup(&abort_result))
+                    .map(|op| op.orphan_cleanup(&abort_result))
                     .unwrap_or_default();
                 let _ = guard.take_op();
                 Some(guard.take_completion_data())

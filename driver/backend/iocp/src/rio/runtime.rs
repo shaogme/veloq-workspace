@@ -315,6 +315,7 @@ mod tests {
             outstanding_count: 0,
             next_request_id: 0,
             deferred_payloads: Vec::new(),
+            diagnostics: veloq_driver_core::driver::DriverCompletionDiagnostics::default(),
         }
     }
 

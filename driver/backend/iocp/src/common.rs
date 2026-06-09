@@ -87,7 +87,9 @@ pub(crate) fn push_completion_shared(
     let event = packet.event;
     let outcome = record_user_completion(table, diagnostics, packet);
     match &outcome {
-        RecordCompletionOutcome::Recorded | RecordCompletionOutcome::OrphanedDropped => {}
+        RecordCompletionOutcome::RecordedUser
+        | RecordCompletionOutcome::RecordedLost
+        | RecordCompletionOutcome::OrphanedDropped => {}
         anomaly => {
             tracing::debug!(
                 token = event.token.raw(),

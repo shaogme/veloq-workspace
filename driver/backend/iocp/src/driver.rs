@@ -130,7 +130,15 @@ impl<'a> Driver for IocpDriver<'a> {
             }
         };
         trace!(user_data, generation, "Reserved op slot");
-        Ok(OpToken::new(user_data, generation))
+        OpToken::from_registry_parts(user_data, generation).map_err(|err| {
+            IocpError::Registration
+                .to_report()
+                .push_ctx("scope", "iocp/driver.reserve_op")
+                .with_ctx("slot_index", user_data)
+                .with_ctx("generation", generation)
+                .with_ctx("op_token_error", format!("{err:?}"))
+                .attach_note("reserved op slot cannot be encoded as completion token")
+        })
     }
 
     fn slot_table(&self) -> SharedDriverSlotTable<Self> {

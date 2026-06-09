@@ -23,6 +23,18 @@ use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY};
 pub(super) struct CompletionProgress {
     pub(super) iocp: usize,
     pub(super) rio: usize,
+    pub(super) user_completed: usize,
+    pub(super) user_lost: usize,
+    pub(super) orphan_cleaned: usize,
+    pub(super) internal: usize,
+    pub(super) anomaly: usize,
+}
+
+impl CompletionProgress {
+    #[inline]
+    pub(super) fn semantic_count(&self) -> usize {
+        self.user_completed + self.user_lost + self.orphan_cleaned + self.internal + self.anomaly
+    }
 }
 
 pub(super) struct CompletionPump {
@@ -210,15 +222,19 @@ impl<'a> IocpDriver<'a> {
                 Ok(CompletionProgress {
                     iocp: 0,
                     rio: processed,
+                    internal: 1,
+                    ..CompletionProgress::default()
                 })
             }
             CompletionDispatch::Waker { .. } => {
                 self.handle_waker_completion(success, error_code);
-                Ok(CompletionProgress::default())
+                Ok(CompletionProgress {
+                    internal: 1,
+                    ..CompletionProgress::default()
+                })
             }
             CompletionDispatch::User { token, .. } => {
-                self.process_completion(token, success, error_code, bytes);
-                Ok(CompletionProgress { iocp: 1, rio: 0 })
+                Ok(self.process_completion(token, success, error_code, bytes))
             }
             CompletionDispatch::Cancel { raw, .. } => {
                 let anomaly = CompletionAnomaly::control_completion_untracked(raw.token)
@@ -231,7 +247,10 @@ impl<'a> IocpDriver<'a> {
                     ?error_code,
                     "untracked IOCP control completion token"
                 );
-                Ok(CompletionProgress::default())
+                Ok(CompletionProgress {
+                    anomaly: 1,
+                    ..CompletionProgress::default()
+                })
             }
             CompletionDispatch::Unknown { raw } => {
                 let anomaly = if let Some(token) = raw.token.op_token() {
@@ -248,7 +267,10 @@ impl<'a> IocpDriver<'a> {
                     ?error_code,
                     "unknown IOCP completion token"
                 );
-                Ok(CompletionProgress::default())
+                Ok(CompletionProgress {
+                    anomaly: 1,
+                    ..CompletionProgress::default()
+                })
             }
         }
     }

@@ -184,6 +184,9 @@ where
     if let Some(backend) = anomaly.backend {
         report = report.with_ctx("completion_backend", format!("{backend:?}"));
     }
+    if let Some(backend_context) = anomaly.backend_context {
+        report = report.with_ctx("completion_backend_context", backend_context);
+    }
     if let Some(raw_result) = anomaly.raw_result {
         report = report.with_ctx("raw_result", raw_result);
     }

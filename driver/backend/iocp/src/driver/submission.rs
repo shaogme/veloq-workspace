@@ -150,8 +150,8 @@ impl<'a> IocpDriver<'a> {
                     ctx.diagnostics,
                     completion_record(sidecar),
                 );
+                let _ = ops.finalize_waiting_completion(token);
             }
-            let _ = ops.recycle(token, token.generation().wrapping_add(1));
             return Err(IocpError::Submission.report("iocp/driver", "thread pool overloaded"));
         }
         Ok(Poll::Pending)

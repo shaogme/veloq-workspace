@@ -181,6 +181,7 @@ impl<'a> UringDriver<'a> {
         let ops = UringOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<UringUserPayload, UringError> =
             ops.shared.clone();
+        let completion_diagnostics = ops.shared.completion_diagnostics();
 
         let waker_fd = Self::create_event_fd("driver.new.eventfd")?;
 
@@ -196,7 +197,7 @@ impl<'a> UringDriver<'a> {
             pending_cancellations: VecDeque::new(),
             pending_cancel_cqes: HashMap::new(),
             next_cancel_id: 1,
-            completion_diagnostics: DriverCompletionDiagnostics::default(),
+            completion_diagnostics,
             completion_table,
             remote_cancel_sender,
             remote_cancel_receiver,
@@ -293,7 +294,15 @@ impl<'a> Driver for UringDriver<'a> {
                 generation,
             }) => {
                 trace!(id, generation, "Reserved op slot");
-                Ok(OpToken::new(id, generation))
+                OpToken::from_registry_parts(id, generation).map_err(|err| {
+                    UringError::InvalidState
+                        .to_report()
+                        .push_ctx("scope", "uring.driver.reserve_op")
+                        .with_ctx("slot_index", id)
+                        .with_ctx("generation", generation)
+                        .with_ctx("op_token_error", format!("{err:?}"))
+                        .attach_note("reserved op slot cannot be encoded as completion token")
+                })
             }
             Err(_) => {
                 Err(UringError::InvalidState.report("uring.driver.reserve_op", "OpRegistry full"))

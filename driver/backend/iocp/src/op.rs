@@ -101,6 +101,8 @@ pub(crate) struct OpVTable {
         unsafe fn(&mut IocpKernelOp, result: usize, ext: &Extensions) -> IocpResult<usize>,
     pub(crate) completion_cleanup:
         unsafe fn(&mut IocpKernelOp, result: &IocpResult<usize>) -> CompletionCleanupGuard,
+    pub(crate) orphan_cleanup:
+        unsafe fn(&mut IocpKernelOp, result: &IocpResult<usize>) -> CompletionCleanupGuard,
     pub(crate) get_fd: unsafe fn(&IocpKernelOp) -> Option<IoFd>,
     pub(crate) bind_user_payload: fn(&mut IocpKernelOp, &mut IocpUserPayload) -> IocpResult<()>,
     pub(crate) unbind_user_payload: fn(&mut IocpKernelOp),
@@ -140,6 +142,10 @@ impl IocpKernelOp {
         result: &IocpResult<usize>,
     ) -> CompletionCleanupGuard {
         unsafe { (self.vtable.completion_cleanup)(self, result) }
+    }
+
+    pub(crate) fn orphan_cleanup(&mut self, result: &IocpResult<usize>) -> CompletionCleanupGuard {
+        unsafe { (self.vtable.orphan_cleanup)(self, result) }
     }
 }
 
@@ -189,6 +195,7 @@ macro_rules! impl_iocp_op_erasure {
                     submit: spec::submit_shim::<$OpType>,
                     on_complete: spec::on_complete_shim::<$OpType>,
                     completion_cleanup: spec::completion_cleanup_shim::<$OpType>,
+                    orphan_cleanup: spec::orphan_cleanup_shim::<$OpType>,
                     get_fd: spec::get_fd_shim::<$OpType>,
                     bind_user_payload: spec::bind_user_payload_shim::<$OpType>,
                     unbind_user_payload: spec::unbind_user_payload_shim::<$OpType>,
@@ -211,7 +218,9 @@ macro_rules! impl_iocp_op_erasure {
                 let kernel_payload = <$OpType as IocpOpSpec>::new_kernel_payload(&self);
                 let op = IocpKernelOp {
                     vtable: <$OpType as IocpOpErasure>::vtable(),
-                    header: OverlappedEntry::new(OpToken::new(0, 0)),
+                    header: OverlappedEntry::new(
+                        OpToken::from_registry_parts(0, 0).expect("zero token should be encodable"),
+                    ),
                     payload: <$OpType as IocpOpErasure>::erase_kernel_payload(kernel_payload),
                 };
                 (op, self)

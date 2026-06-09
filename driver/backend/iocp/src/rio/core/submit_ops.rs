@@ -19,6 +19,7 @@ use crate::rio::core::registry::{RioRegistry, RioSubmissionKind};
 use crate::rio::core::{RioAddressPolicy, RioOpKind, RioSubmitPlan};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioState, RioTarget};
+use veloq_driver_core::driver::DriverCompletionDiagnostics;
 
 impl RioState {
     pub(crate) fn new(
@@ -26,6 +27,7 @@ impl RioState {
         entries: u32,
         ext: &Extensions,
         registration_mode: BufferRegistrationMode,
+        diagnostics: DriverCompletionDiagnostics,
     ) -> RioResult<Self> {
         let kernel = RioKernel::from_extensions(port, entries, ext)?;
 
@@ -44,6 +46,7 @@ impl RioState {
             outstanding_count: 0,
             next_request_id: 0,
             deferred_payloads: Vec::new(),
+            diagnostics,
         })
     }
 

@@ -137,6 +137,69 @@ pub enum CompletionDispatch {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionIdentity {
+    User(OpToken),
+    Waker(u16),
+    Cancel(CancelCompletionId),
+    RioWake(u16),
+    UnknownControl {
+        kind: u16,
+        id: u16,
+    },
+    BackendContext {
+        backend: CompletionBackend,
+        raw_context: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionEnvelope {
+    pub raw: RawCompletion,
+    pub identity: CompletionIdentity,
+}
+
+impl CompletionEnvelope {
+    #[inline]
+    pub fn from_raw(raw: RawCompletion) -> Self {
+        let identity = match raw.token.classify() {
+            CompletionTokenClass::User(token) => CompletionIdentity::User(token),
+            CompletionTokenClass::Control {
+                kind: CompletionControlKind::Waker,
+                id,
+            } => CompletionIdentity::Waker(id),
+            CompletionTokenClass::Control {
+                kind: CompletionControlKind::Cancel,
+                id,
+            } => CompletionIdentity::Cancel(CancelCompletionId::new(id)),
+            CompletionTokenClass::Control {
+                kind: CompletionControlKind::RioWake,
+                id,
+            } => CompletionIdentity::RioWake(id),
+            CompletionTokenClass::UnknownControl { kind, id } => {
+                CompletionIdentity::UnknownControl { kind, id }
+            }
+        };
+        Self { raw, identity }
+    }
+
+    #[inline]
+    pub const fn backend_context(
+        backend: CompletionBackend,
+        raw_context: u64,
+        res: i32,
+        flags: u32,
+    ) -> Self {
+        Self {
+            raw: RawCompletion::new(backend, CompletionToken::rio_wake(0), res, flags),
+            identity: CompletionIdentity::BackendContext {
+                backend,
+                raw_context,
+            },
+        }
+    }
+}
+
 pub enum RoutedSlotCompletion<'a, Spec: slot::SlotSpec> {
     Waiting(slot::Slot<'a, slot::InFlightWaiting, Spec>),
     Orphaned(slot::Slot<'a, slot::InFlightOrphaned, Spec>),
@@ -166,26 +229,16 @@ pub fn dispatch_raw_completion(
     res: i32,
     flags: u32,
 ) -> CompletionDispatch {
-    let token = CompletionToken::from_raw(raw_token);
-    let raw = RawCompletion::new(backend, token, res, flags);
-    match token.classify() {
-        CompletionTokenClass::User(token) => CompletionDispatch::User { token, raw },
-        CompletionTokenClass::Control {
-            kind: CompletionControlKind::Waker,
-            id,
-        } => CompletionDispatch::Waker { id, raw },
-        CompletionTokenClass::Control {
-            kind: CompletionControlKind::Cancel,
-            id,
-        } => CompletionDispatch::Cancel {
-            id: CancelCompletionId::new(id),
-            raw,
-        },
-        CompletionTokenClass::Control {
-            kind: CompletionControlKind::RioWake,
-            id,
-        } => CompletionDispatch::RioWake { id, raw },
-        CompletionTokenClass::UnknownControl { .. } => CompletionDispatch::Unknown { raw },
+    let raw = RawCompletion::new(backend, CompletionToken::from_raw(raw_token), res, flags);
+    let envelope = CompletionEnvelope::from_raw(raw);
+    match envelope.identity {
+        CompletionIdentity::User(token) => CompletionDispatch::User { token, raw },
+        CompletionIdentity::Waker(id) => CompletionDispatch::Waker { id, raw },
+        CompletionIdentity::Cancel(id) => CompletionDispatch::Cancel { id, raw },
+        CompletionIdentity::RioWake(id) => CompletionDispatch::RioWake { id, raw },
+        CompletionIdentity::UnknownControl { .. } | CompletionIdentity::BackendContext { .. } => {
+            CompletionDispatch::Unknown { raw }
+        }
     }
 }
 
@@ -226,14 +279,23 @@ pub struct OpToken {
     generation: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpTokenError {
+    ReservedControlIndex { index: usize },
+}
+
 impl OpToken {
     #[inline]
-    pub fn new(index: usize, generation: u32) -> Self {
-        assert!(
-            index < CONTROL_TOKEN_INDEX as usize,
-            "completion slot index exceeds encodable user token range"
-        );
-        Self { index, generation }
+    pub const fn try_new(index: usize, generation: u32) -> Result<Self, OpTokenError> {
+        if index >= CONTROL_TOKEN_INDEX as usize {
+            return Err(OpTokenError::ReservedControlIndex { index });
+        }
+        Ok(Self { index, generation })
+    }
+
+    #[inline]
+    pub const fn from_registry_parts(index: usize, generation: u32) -> Result<Self, OpTokenError> {
+        Self::try_new(index, generation)
     }
 
     #[inline]
@@ -314,8 +376,10 @@ impl CompletionToken {
     #[inline]
     pub fn classify(self) -> CompletionTokenClass {
         let index = (self.0 & 0xffff_ffff) as u32;
-        if index != CONTROL_TOKEN_INDEX {
-            return CompletionTokenClass::User(OpToken::new(index as usize, (self.0 >> 32) as u32));
+        if index != CONTROL_TOKEN_INDEX
+            && let Ok(token) = OpToken::try_new(index as usize, (self.0 >> 32) as u32)
+        {
+            return CompletionTokenClass::User(token);
         }
 
         let kind = (self.0 >> CONTROL_TOKEN_KIND_SHIFT) as u16;
@@ -473,6 +537,14 @@ pub enum CancelSubmitOutcome {
     TargetMissing,
     TargetStale,
     NoBackendHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelAck {
+    Ok,
+    NotFound,
+    Error,
+    Untracked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -669,53 +741,23 @@ pub fn record_completion_anomaly(
     diagnostics: &mut DriverCompletionDiagnostics,
     anomaly: &CompletionAnomaly,
 ) {
-    match anomaly.reason {
-        CompletionAnomalyReason::UnknownSlot
-        | CompletionAnomalyReason::UnknownControlToken
-        | CompletionAnomalyReason::NonActiveSlot => diagnostics.inc_unknown_completion(),
-        CompletionAnomalyReason::ControlCompletionUntracked
-        | CompletionAnomalyReason::BackendInvariantBroken => diagnostics.inc_internal_unknown(),
-        CompletionAnomalyReason::RioMalformedContext => diagnostics.inc_rio_malformed_context(),
-        CompletionAnomalyReason::RioMissingContext => diagnostics.inc_rio_missing_context(),
-        CompletionAnomalyReason::RioStaleContext => diagnostics.inc_rio_stale_context(),
-        CompletionAnomalyReason::OpMissing | CompletionAnomalyReason::SlotCorruption => {
-            diagnostics.inc_slot_corruption()
-        }
-        CompletionAnomalyReason::PayloadMissing => diagnostics.inc_payload_missing(),
-        CompletionAnomalyReason::StaleGeneration => diagnostics.inc_stale_completion(),
-    }
+    diagnostics.record_anomaly(anomaly);
 }
 
 #[inline]
 pub fn record_user_completion<UP, E, R>(
     table: &SharedCompletionTable<UP, E, R>,
     diagnostics: &mut DriverCompletionDiagnostics,
-    mut packet: CompletionPacket<UP, E, R>,
+    packet: CompletionPacket<UP, E, R>,
 ) -> RecordCompletionOutcome
 where
     UP: Send,
     E: Send,
     R: Send,
 {
-    if packet.payload.is_none()
-        && matches!(packet.record_kind, CompletionRecordKind::User)
-        && let Some(op_token) = packet.event.token.op_token()
-    {
-        let (index, generation) = op_token.parts();
-        let anomaly = CompletionAnomaly::payload_missing(packet.event.token, index, generation)
-            .with_event(packet.event);
-        record_completion_anomaly(diagnostics, &anomaly);
-        packet.record_kind = CompletionRecordKind::Lost(anomaly);
-    }
-
     match table.record_completion(packet) {
-        RecordCompletionResult::Recorded => {
-            let outcome = RecordCompletionOutcome::Recorded;
-            diagnostics.record_completion_outcome(&outcome);
-            outcome
-        }
+        RecordCompletionResult::Recorded(outcome) => outcome,
         RecordCompletionResult::Rejected { outcome, packet } => {
-            diagnostics.record_completion_outcome(&outcome);
             run_rejected_cleanup(diagnostics, *packet);
             outcome
         }
@@ -759,4 +801,40 @@ where
     E: DriverError,
 {
     R::from_event_res(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op_token_try_new_rejects_control_index() {
+        let err = OpToken::try_new(CONTROL_TOKEN_INDEX as usize, 1)
+            .expect_err("control index must not be a user token");
+        assert_eq!(
+            err,
+            OpTokenError::ReservedControlIndex {
+                index: CONTROL_TOKEN_INDEX as usize
+            }
+        );
+    }
+
+    #[test]
+    fn classify_user_token_does_not_panic() {
+        let token = OpToken::from_registry_parts((CONTROL_TOKEN_INDEX - 1) as usize, 7)
+            .expect("max user index should be encodable");
+        assert_eq!(
+            CompletionToken::user(token).classify(),
+            CompletionTokenClass::User(token)
+        );
+    }
+
+    #[test]
+    fn rio_context_anomaly_keeps_backend_context_separate() {
+        let raw_context = 0xa700_0001_0000_002a;
+        let anomaly = CompletionAnomaly::rio_malformed_context_raw(raw_context);
+
+        assert_eq!(anomaly.token, CompletionToken::rio_wake(0));
+        assert_eq!(anomaly.backend_context, Some(raw_context));
+    }
 }

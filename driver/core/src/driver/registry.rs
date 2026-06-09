@@ -234,13 +234,17 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     }
 
     #[inline]
-    pub fn current_token_at_index(&self, index: usize) -> Option<OpToken> {
-        let slot = self.shared.slots.get(index)?;
-        let core = slot.load_core_state(Ordering::Acquire);
-        if core.state() == SlotState::Idle {
-            return None;
-        }
-        Some(OpToken::new(index, core.generation()))
+    pub fn active_tokens(&self) -> impl Iterator<Item = OpToken> + '_ {
+        self.shared
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let core = slot.load_core_state(Ordering::Acquire);
+                (core.state() != SlotState::Idle)
+                    .then(|| OpToken::from_registry_parts(index, core.generation()).ok())
+                    .flatten()
+            })
     }
 
     #[inline]
@@ -330,7 +334,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         &mut self,
         snapshot: crate::slot::SlotSnapshot,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
-        self.remove(OpToken::new(snapshot.index, snapshot.generation))
+        self.remove(OpToken::from_registry_parts(snapshot.index, snapshot.generation).ok()?)
     }
 
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
@@ -351,5 +355,48 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     #[inline]
     pub fn active_count(&self) -> usize {
         self.active_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::PlatformOp;
+
+    struct DummyPlatformOp;
+
+    impl PlatformOp for DummyPlatformOp {}
+
+    struct DummySlotSpec;
+
+    impl SlotSpec for DummySlotSpec {
+        type Op = DummyPlatformOp;
+        type UserPayload = ();
+        type PlatformData = ();
+        type Sidecar = ();
+        type Error = ();
+        type Completion = usize;
+    }
+
+    #[test]
+    fn active_tokens_iterates_non_idle_slots() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(3);
+        let first = registry.alloc(()).expect("first slot").handle;
+        let second = registry.alloc(()).expect("second slot").handle;
+        let first_token = OpToken::from_registry_parts(first.index, first.generation)
+            .expect("first token should be encodable");
+        let second_token = OpToken::from_registry_parts(second.index, second.generation)
+            .expect("second token should be encodable");
+
+        let tokens = registry.active_tokens().collect::<Vec<_>>();
+
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&first_token));
+        assert!(tokens.contains(&second_token));
+
+        let _ = registry.remove(first_token);
+        let tokens = registry.active_tokens().collect::<Vec<_>>();
+
+        assert_eq!(tokens, vec![second_token]);
     }
 }

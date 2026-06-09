@@ -103,4 +103,5 @@ pub(crate) struct RioState {
     pub(crate) outstanding_count: usize,
     pub(crate) next_request_id: u64,
     pub(crate) deferred_payloads: Vec<crate::op::IocpUserPayload>,
+    pub(crate) diagnostics: DriverCompletionDiagnostics,
 }

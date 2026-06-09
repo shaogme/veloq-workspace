@@ -637,7 +637,7 @@ mod tests {
     fn test_req_init(addr_slot: Option<usize>) -> RioOpRequestInit {
         let socket_key = IocpHandle::for_socket(std::ptr::null_mut());
         RioOpRequestInit {
-            token: OpToken::new(11, 17),
+            token: OpToken::from_registry_parts(11, 17).expect("test token should be encodable"),
             socket_inflight: SocketInflightToken::new(socket_key),
             op_kind: RioOpKind::Recv,
             request_id: 23,
@@ -665,7 +665,9 @@ mod tests {
                     ..
                 },
                 ..
-            }) if token == OpToken::new(11, 17)));
+            }) if token
+                == OpToken::from_registry_parts(11, 17)
+                    .expect("test token should be encodable")));
     }
 
     #[test]
@@ -686,7 +688,9 @@ mod tests {
                     ..
                 },
                 ..
-            }) if token == OpToken::new(11, 17)));
+            }) if token
+                == OpToken::from_registry_parts(11, 17)
+                    .expect("test token should be encodable")));
     }
 
     #[test]

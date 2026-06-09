@@ -221,7 +221,8 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
     let (ud, generation) = submit_test_op(&mut driver, recv_op);
 
     let _ = driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
-        veloq_driver_core::driver::OpToken::new(ud, generation),
+        veloq_driver_core::driver::OpToken::from_registry_parts(ud, generation)
+            .expect("test token should be encodable"),
     ));
     let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client bind failed");
     client

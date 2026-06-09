@@ -103,7 +103,6 @@ impl<'a> RioCompletionRouter<'a> {
                     )
                     .with_slot_snapshot(snapshot)
                     .with_raw_completion(raw);
-                    record_completion_anomaly(self.comp.diagnostics, &anomaly);
                     let report = IocpError::Internal
                         .to_report()
                         .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
@@ -238,7 +237,7 @@ impl<'a> RioCompletionRouter<'a> {
                         let cleanup = guard
                             .op
                             .as_mut()
-                            .map(|op| op.completion_cleanup(&orphan_result))
+                            .map(|op| op.orphan_cleanup(&orphan_result))
                             .unwrap_or_default();
                         let _ = guard.take_op();
                         let _ = guard.take_completion_data();
@@ -264,7 +263,7 @@ impl<'a> RioCompletionRouter<'a> {
                         let cleanup = guard
                             .op
                             .as_mut()
-                            .map(|op| op.completion_cleanup(&orphan_result))
+                            .map(|op| op.orphan_cleanup(&orphan_result))
                             .unwrap_or_default();
                         let _ = guard.take_op();
                         let _ = guard.take_completion_data();
@@ -276,7 +275,6 @@ impl<'a> RioCompletionRouter<'a> {
                 }
             }
             RoutedSlotCompletion::Corrupt(anomaly) => {
-                record_completion_anomaly(self.comp.diagnostics, &anomaly);
                 debug!(
                     user_data,
                     generation, "RIO completion found corrupt or reserved slot"
@@ -322,6 +320,8 @@ impl<'a> RioCompletionRouter<'a> {
                         cleanup,
                     );
                     let _ = ops.finalize_corrupt_slot(snapshot);
+                } else {
+                    record_completion_anomaly(self.comp.diagnostics, &anomaly);
                 }
             }
             RoutedSlotCompletion::Missing(anomaly) => {
@@ -414,11 +414,12 @@ impl<'a> RioCompletionRouter<'a> {
     fn record_malformed_request_context(&mut self, request_context: u64, res: &RIORESULT) {
         let raw = RawCompletion::new(
             CompletionBackend::Rio,
-            CompletionToken::from_raw(request_context),
+            CompletionToken::rio_wake(0),
             rio_raw_res(res),
             0,
         );
-        let anomaly = CompletionAnomaly::rio_malformed_context(raw.token).with_raw_completion(raw);
+        let anomaly =
+            CompletionAnomaly::rio_malformed_context_raw(request_context).with_raw_completion(raw);
         record_completion_anomaly(self.comp.diagnostics, &anomaly);
         debug!(
             request_context,
@@ -432,13 +433,16 @@ impl<'a> RioCompletionRouter<'a> {
     fn record_missing_request_context(&mut self, id: RioRequestContextId, res: &RIORESULT) {
         let raw = RawCompletion::new(
             CompletionBackend::Rio,
-            CompletionToken::from_raw(res.RequestContext),
+            CompletionToken::rio_wake(0),
             rio_raw_res(res),
             0,
         );
-        let anomaly =
-            CompletionAnomaly::rio_missing_context(raw.token, id.index(), id.generation())
-                .with_raw_completion(raw);
+        let anomaly = CompletionAnomaly::rio_missing_context_raw(
+            res.RequestContext,
+            id.index(),
+            id.generation(),
+        )
+        .with_raw_completion(raw);
         record_completion_anomaly(self.comp.diagnostics, &anomaly);
         debug!(
             request_context = res.RequestContext,
@@ -457,12 +461,12 @@ impl<'a> RioCompletionRouter<'a> {
     ) {
         let raw = RawCompletion::new(
             CompletionBackend::Rio,
-            CompletionToken::from_raw(res.RequestContext),
+            CompletionToken::rio_wake(0),
             rio_raw_res(res),
             0,
         );
-        let anomaly = CompletionAnomaly::rio_stale_context(
-            raw.token,
+        let anomaly = CompletionAnomaly::rio_stale_context_raw(
+            res.RequestContext,
             id.index(),
             id.generation(),
             actual_generation,

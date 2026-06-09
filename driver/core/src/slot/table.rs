@@ -1,3 +1,4 @@
+use crate::driver::DriverCompletionDiagnostics;
 use crate::slot::core::SlotData;
 use crate::slot::{SlotCompletion, SlotError, SlotSpec};
 use crossbeam_utils::CachePadded;
@@ -10,6 +11,7 @@ pub struct SlotTable<Spec: SlotSpec> {
     pub slots: SlotEntries<Spec>,
     pub remote_free_head: AtomicUsize,
     ready_completion_count: AtomicUsize,
+    pub(crate) diagnostics: DriverCompletionDiagnostics,
 }
 
 unsafe impl<Spec> Sync for SlotTable<Spec>
@@ -32,7 +34,13 @@ impl<Spec: SlotSpec> SlotTable<Spec> {
             slots: slots.into_boxed_slice(),
             remote_free_head: AtomicUsize::new(Self::NULL_INDEX),
             ready_completion_count: AtomicUsize::new(0),
+            diagnostics: DriverCompletionDiagnostics::default(),
         }
+    }
+
+    #[inline]
+    pub fn completion_diagnostics(&self) -> DriverCompletionDiagnostics {
+        self.diagnostics.clone()
     }
 
     pub fn push_free(&self, idx: usize) {

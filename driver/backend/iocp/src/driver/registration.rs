@@ -316,7 +316,11 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(super) fn release_socket_inflight_for_op(&mut self, user_data: usize) {
-        let Some(token) = self.ops.current_token_at_index(user_data) else {
+        let Some(token) = self
+            .ops
+            .active_tokens()
+            .find(|token| token.index() == user_data)
+        else {
             return;
         };
         let socket_inflight =

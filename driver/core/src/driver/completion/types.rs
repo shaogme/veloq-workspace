@@ -1,33 +1,42 @@
 use crate::driver::completion::{CompletionEvent, CompletionPacket, CompletionToken};
 use crate::slot;
 use crate::{DriverCoreError, DriverResult};
+use std::sync::Arc;
+use veloq_shim::atomic::{AtomicU64, Ordering};
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default)]
+struct DriverCompletionDiagnosticsInner {
+    user_completed: AtomicU64,
+    user_lost: AtomicU64,
+    user_orphan_completed: AtomicU64,
+    unknown_completion: AtomicU64,
+    stale_completion: AtomicU64,
+    slot_corruption: AtomicU64,
+    payload_missing: AtomicU64,
+    cancel_submitted: AtomicU64,
+    cancel_ack_ok: AtomicU64,
+    cancel_ack_not_found: AtomicU64,
+    cancel_ack_error: AtomicU64,
+    waker_ok: AtomicU64,
+    waker_error: AtomicU64,
+    waker_rebuild: AtomicU64,
+    completion_rejected: AtomicU64,
+    internal_unknown: AtomicU64,
+    rio_malformed_context: AtomicU64,
+    rio_missing_context: AtomicU64,
+    rio_stale_context: AtomicU64,
+    orphan_cleanup_error: AtomicU64,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct DriverCompletionDiagnostics {
-    user_completed: u64,
-    user_orphan_completed: u64,
-    unknown_completion: u64,
-    stale_completion: u64,
-    slot_corruption: u64,
-    payload_missing: u64,
-    cancel_submitted: u64,
-    cancel_ack_ok: u64,
-    cancel_ack_not_found: u64,
-    cancel_ack_error: u64,
-    waker_ok: u64,
-    waker_error: u64,
-    waker_rebuild: u64,
-    completion_rejected: u64,
-    internal_unknown: u64,
-    rio_malformed_context: u64,
-    rio_missing_context: u64,
-    rio_stale_context: u64,
-    orphan_cleanup_error: u64,
+    inner: Arc<DriverCompletionDiagnosticsInner>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DriverCompletionDiagnosticsSnapshot {
     pub user_completed: u64,
+    pub user_lost: u64,
     pub user_orphan_completed: u64,
     pub unknown_completion: u64,
     pub stale_completion: u64,
@@ -50,123 +59,139 @@ pub struct DriverCompletionDiagnosticsSnapshot {
 
 impl DriverCompletionDiagnostics {
     #[inline]
+    fn load(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn inc(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[inline]
     pub fn snapshot(&self) -> DriverCompletionDiagnosticsSnapshot {
         DriverCompletionDiagnosticsSnapshot {
-            user_completed: self.user_completed,
-            user_orphan_completed: self.user_orphan_completed,
-            unknown_completion: self.unknown_completion,
-            stale_completion: self.stale_completion,
-            slot_corruption: self.slot_corruption,
-            payload_missing: self.payload_missing,
-            cancel_submitted: self.cancel_submitted,
-            cancel_ack_ok: self.cancel_ack_ok,
-            cancel_ack_not_found: self.cancel_ack_not_found,
-            cancel_ack_error: self.cancel_ack_error,
-            waker_ok: self.waker_ok,
-            waker_error: self.waker_error,
-            waker_rebuild: self.waker_rebuild,
-            completion_rejected: self.completion_rejected,
-            internal_unknown: self.internal_unknown,
-            rio_malformed_context: self.rio_malformed_context,
-            rio_missing_context: self.rio_missing_context,
-            rio_stale_context: self.rio_stale_context,
-            orphan_cleanup_error: self.orphan_cleanup_error,
+            user_completed: Self::load(&self.inner.user_completed),
+            user_lost: Self::load(&self.inner.user_lost),
+            user_orphan_completed: Self::load(&self.inner.user_orphan_completed),
+            unknown_completion: Self::load(&self.inner.unknown_completion),
+            stale_completion: Self::load(&self.inner.stale_completion),
+            slot_corruption: Self::load(&self.inner.slot_corruption),
+            payload_missing: Self::load(&self.inner.payload_missing),
+            cancel_submitted: Self::load(&self.inner.cancel_submitted),
+            cancel_ack_ok: Self::load(&self.inner.cancel_ack_ok),
+            cancel_ack_not_found: Self::load(&self.inner.cancel_ack_not_found),
+            cancel_ack_error: Self::load(&self.inner.cancel_ack_error),
+            waker_ok: Self::load(&self.inner.waker_ok),
+            waker_error: Self::load(&self.inner.waker_error),
+            waker_rebuild: Self::load(&self.inner.waker_rebuild),
+            completion_rejected: Self::load(&self.inner.completion_rejected),
+            internal_unknown: Self::load(&self.inner.internal_unknown),
+            rio_malformed_context: Self::load(&self.inner.rio_malformed_context),
+            rio_missing_context: Self::load(&self.inner.rio_missing_context),
+            rio_stale_context: Self::load(&self.inner.rio_stale_context),
+            orphan_cleanup_error: Self::load(&self.inner.orphan_cleanup_error),
         }
     }
 
     #[inline]
-    pub fn inc_user_completed(&mut self) {
-        self.user_completed = self.user_completed.saturating_add(1);
+    pub fn inc_user_completed(&self) {
+        Self::inc(&self.inner.user_completed);
     }
 
     #[inline]
-    pub fn inc_user_orphan_completed(&mut self) {
-        self.user_orphan_completed = self.user_orphan_completed.saturating_add(1);
+    pub fn inc_user_lost(&self) {
+        Self::inc(&self.inner.user_lost);
     }
 
     #[inline]
-    pub fn inc_unknown_completion(&mut self) {
-        self.unknown_completion = self.unknown_completion.saturating_add(1);
+    pub fn inc_user_orphan_completed(&self) {
+        Self::inc(&self.inner.user_orphan_completed);
     }
 
     #[inline]
-    pub fn inc_stale_completion(&mut self) {
-        self.stale_completion = self.stale_completion.saturating_add(1);
+    pub fn inc_unknown_completion(&self) {
+        Self::inc(&self.inner.unknown_completion);
     }
 
     #[inline]
-    pub fn inc_slot_corruption(&mut self) {
-        self.slot_corruption = self.slot_corruption.saturating_add(1);
+    pub fn inc_stale_completion(&self) {
+        Self::inc(&self.inner.stale_completion);
     }
 
     #[inline]
-    pub fn inc_payload_missing(&mut self) {
-        self.payload_missing = self.payload_missing.saturating_add(1);
+    pub fn inc_slot_corruption(&self) {
+        Self::inc(&self.inner.slot_corruption);
     }
 
     #[inline]
-    pub fn inc_cancel_submitted(&mut self) {
-        self.cancel_submitted = self.cancel_submitted.saturating_add(1);
+    pub fn inc_payload_missing(&self) {
+        Self::inc(&self.inner.payload_missing);
     }
 
     #[inline]
-    pub fn inc_cancel_ack_ok(&mut self) {
-        self.cancel_ack_ok = self.cancel_ack_ok.saturating_add(1);
+    pub fn inc_cancel_submitted(&self) {
+        Self::inc(&self.inner.cancel_submitted);
     }
 
     #[inline]
-    pub fn inc_cancel_ack_not_found(&mut self) {
-        self.cancel_ack_not_found = self.cancel_ack_not_found.saturating_add(1);
+    pub fn inc_cancel_ack_ok(&self) {
+        Self::inc(&self.inner.cancel_ack_ok);
     }
 
     #[inline]
-    pub fn inc_cancel_ack_error(&mut self) {
-        self.cancel_ack_error = self.cancel_ack_error.saturating_add(1);
+    pub fn inc_cancel_ack_not_found(&self) {
+        Self::inc(&self.inner.cancel_ack_not_found);
     }
 
     #[inline]
-    pub fn inc_waker_ok(&mut self) {
-        self.waker_ok = self.waker_ok.saturating_add(1);
+    pub fn inc_cancel_ack_error(&self) {
+        Self::inc(&self.inner.cancel_ack_error);
     }
 
     #[inline]
-    pub fn inc_waker_error(&mut self) {
-        self.waker_error = self.waker_error.saturating_add(1);
+    pub fn inc_waker_ok(&self) {
+        Self::inc(&self.inner.waker_ok);
     }
 
     #[inline]
-    pub fn inc_waker_rebuild(&mut self) {
-        self.waker_rebuild = self.waker_rebuild.saturating_add(1);
+    pub fn inc_waker_error(&self) {
+        Self::inc(&self.inner.waker_error);
     }
 
     #[inline]
-    pub fn inc_completion_rejected(&mut self) {
-        self.completion_rejected = self.completion_rejected.saturating_add(1);
+    pub fn inc_waker_rebuild(&self) {
+        Self::inc(&self.inner.waker_rebuild);
     }
 
     #[inline]
-    pub fn inc_internal_unknown(&mut self) {
-        self.internal_unknown = self.internal_unknown.saturating_add(1);
+    pub fn inc_completion_rejected(&self) {
+        Self::inc(&self.inner.completion_rejected);
     }
 
     #[inline]
-    pub fn inc_rio_malformed_context(&mut self) {
-        self.rio_malformed_context = self.rio_malformed_context.saturating_add(1);
+    pub fn inc_internal_unknown(&self) {
+        Self::inc(&self.inner.internal_unknown);
     }
 
     #[inline]
-    pub fn inc_rio_missing_context(&mut self) {
-        self.rio_missing_context = self.rio_missing_context.saturating_add(1);
+    pub fn inc_rio_malformed_context(&self) {
+        Self::inc(&self.inner.rio_malformed_context);
     }
 
     #[inline]
-    pub fn inc_rio_stale_context(&mut self) {
-        self.rio_stale_context = self.rio_stale_context.saturating_add(1);
+    pub fn inc_rio_missing_context(&self) {
+        Self::inc(&self.inner.rio_missing_context);
     }
 
     #[inline]
-    pub fn inc_orphan_cleanup_error(&mut self) {
-        self.orphan_cleanup_error = self.orphan_cleanup_error.saturating_add(1);
+    pub fn inc_rio_stale_context(&self) {
+        Self::inc(&self.inner.rio_stale_context);
+    }
+
+    #[inline]
+    pub fn inc_orphan_cleanup_error(&self) {
+        Self::inc(&self.inner.orphan_cleanup_error);
     }
 }
 
@@ -200,6 +225,17 @@ impl CompletionMutationOutcome {
     pub const fn is_applied(self) -> bool {
         matches!(self, Self::Applied)
     }
+
+    #[inline]
+    pub const fn anomaly(&self) -> Option<&CompletionAnomaly> {
+        match self {
+            Self::Applied => None,
+            Self::Missing(anomaly)
+            | Self::Stale(anomaly)
+            | Self::NonActive(anomaly)
+            | Self::UnknownControl(anomaly) => Some(anomaly),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +254,7 @@ pub struct CompletionAnomaly {
     pub actual_generation: Option<u32>,
     pub state: Option<slot::SlotState>,
     pub backend: Option<CompletionBackend>,
+    pub backend_context: Option<u64>,
     pub raw_result: Option<i32>,
     pub flags: Option<u32>,
     pub slot_snapshot: Option<slot::SlotSnapshot>,
@@ -234,6 +271,7 @@ impl CompletionAnomaly {
             actual_generation: None,
             state: None,
             backend: None,
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -250,6 +288,7 @@ impl CompletionAnomaly {
             actual_generation: None,
             state: None,
             backend: None,
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -266,6 +305,7 @@ impl CompletionAnomaly {
             actual_generation: None,
             state: None,
             backend: None,
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -282,6 +322,7 @@ impl CompletionAnomaly {
             actual_generation: None,
             state: None,
             backend: Some(CompletionBackend::Rio),
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -298,6 +339,7 @@ impl CompletionAnomaly {
             actual_generation: None,
             state: None,
             backend: Some(CompletionBackend::Rio),
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -319,6 +361,7 @@ impl CompletionAnomaly {
             actual_generation: Some(actual_generation),
             state: None,
             backend: Some(CompletionBackend::Rio),
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -341,6 +384,7 @@ impl CompletionAnomaly {
             actual_generation: Some(actual_generation),
             state: Some(state),
             backend: None,
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -362,6 +406,7 @@ impl CompletionAnomaly {
             actual_generation: Some(generation),
             state: Some(state),
             backend: None,
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -383,6 +428,7 @@ impl CompletionAnomaly {
             actual_generation: Some(generation),
             state: Some(state),
             backend: None,
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -399,6 +445,7 @@ impl CompletionAnomaly {
             actual_generation: Some(generation),
             state: None,
             backend: None,
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -415,6 +462,7 @@ impl CompletionAnomaly {
             actual_generation: Some(generation),
             state: None,
             backend: None,
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -436,6 +484,7 @@ impl CompletionAnomaly {
             actual_generation: Some(generation),
             state: Some(state),
             backend: None,
+            backend_context: None,
             raw_result: None,
             flags: None,
             slot_snapshot: None,
@@ -446,6 +495,12 @@ impl CompletionAnomaly {
     #[inline]
     pub fn with_backend(mut self, backend: CompletionBackend) -> Self {
         self.backend = Some(backend);
+        self
+    }
+
+    #[inline]
+    pub fn with_backend_context(mut self, context: u64) -> Self {
+        self.backend_context = Some(context);
         self
     }
 
@@ -476,6 +531,33 @@ impl CompletionAnomaly {
         self.state = Some(snapshot.state);
         self.slot_snapshot = Some(snapshot);
         self
+    }
+
+    #[inline]
+    pub fn rio_malformed_context_raw(raw_context: u64) -> Self {
+        Self::rio_malformed_context(CompletionToken::rio_wake(0)).with_backend_context(raw_context)
+    }
+
+    #[inline]
+    pub fn rio_missing_context_raw(raw_context: u64, index: usize, generation: u32) -> Self {
+        Self::rio_missing_context(CompletionToken::rio_wake(0), index, generation)
+            .with_backend_context(raw_context)
+    }
+
+    #[inline]
+    pub fn rio_stale_context_raw(
+        raw_context: u64,
+        index: usize,
+        expected_generation: u32,
+        actual_generation: u32,
+    ) -> Self {
+        Self::rio_stale_context(
+            CompletionToken::rio_wake(0),
+            index,
+            expected_generation,
+            actual_generation,
+        )
+        .with_backend_context(raw_context)
     }
 }
 
@@ -552,7 +634,8 @@ impl Drop for CompletionCleanupGuard {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordCompletionOutcome {
-    Recorded,
+    RecordedUser,
+    RecordedLost,
     OrphanedDropped,
     Missing(CompletionAnomaly),
     Stale(CompletionAnomaly),
@@ -561,7 +644,7 @@ pub enum RecordCompletionOutcome {
 }
 
 pub enum RecordCompletionResult<UP, E, R = usize> {
-    Recorded,
+    Recorded(RecordCompletionOutcome),
     Rejected {
         outcome: RecordCompletionOutcome,
         packet: Box<CompletionPacket<UP, E, R>>,
@@ -572,7 +655,7 @@ impl<UP, E, R> RecordCompletionResult<UP, E, R> {
     #[inline]
     pub fn outcome(&self) -> &RecordCompletionOutcome {
         match self {
-            Self::Recorded => &RecordCompletionOutcome::Recorded,
+            Self::Recorded(outcome) => outcome,
             Self::Rejected { outcome, .. } => outcome,
         }
     }
@@ -580,7 +663,7 @@ impl<UP, E, R> RecordCompletionResult<UP, E, R> {
     #[inline]
     pub fn into_outcome(self) -> RecordCompletionOutcome {
         match self {
-            Self::Recorded => RecordCompletionOutcome::Recorded,
+            Self::Recorded(outcome) => outcome,
             Self::Rejected { outcome, .. } => outcome,
         }
     }
@@ -588,26 +671,45 @@ impl<UP, E, R> RecordCompletionResult<UP, E, R> {
 
 impl DriverCompletionDiagnostics {
     #[inline]
-    pub fn record_completion_outcome(&mut self, outcome: &RecordCompletionOutcome) {
-        if !matches!(outcome, RecordCompletionOutcome::Recorded) {
-            self.inc_completion_rejected();
-        }
-        match outcome {
-            RecordCompletionOutcome::Recorded => self.inc_user_completed(),
-            RecordCompletionOutcome::OrphanedDropped => self.inc_user_orphan_completed(),
-            RecordCompletionOutcome::Missing(_) | RecordCompletionOutcome::NonActive(_) => {
-                self.inc_unknown_completion();
+    pub fn record_anomaly(&self, anomaly: &CompletionAnomaly) {
+        match anomaly.reason {
+            CompletionAnomalyReason::UnknownSlot
+            | CompletionAnomalyReason::UnknownControlToken
+            | CompletionAnomalyReason::NonActiveSlot => self.inc_unknown_completion(),
+            CompletionAnomalyReason::ControlCompletionUntracked
+            | CompletionAnomalyReason::BackendInvariantBroken => self.inc_internal_unknown(),
+            CompletionAnomalyReason::RioMalformedContext => self.inc_rio_malformed_context(),
+            CompletionAnomalyReason::RioMissingContext => self.inc_rio_missing_context(),
+            CompletionAnomalyReason::RioStaleContext => self.inc_rio_stale_context(),
+            CompletionAnomalyReason::OpMissing | CompletionAnomalyReason::SlotCorruption => {
+                self.inc_slot_corruption()
             }
-            RecordCompletionOutcome::Stale(_) => self.inc_stale_completion(),
-            RecordCompletionOutcome::Corrupt(_) => self.inc_slot_corruption(),
+            CompletionAnomalyReason::PayloadMissing => self.inc_payload_missing(),
+            CompletionAnomalyReason::StaleGeneration => self.inc_stale_completion(),
         }
     }
 
     #[inline]
-    pub fn record_completion_result<UP, E, R>(
-        &mut self,
-        result: &RecordCompletionResult<UP, E, R>,
-    ) {
+    pub fn record_completion_outcome(&self, outcome: &RecordCompletionOutcome) {
+        if !matches!(
+            outcome,
+            RecordCompletionOutcome::RecordedUser | RecordCompletionOutcome::RecordedLost
+        ) {
+            self.inc_completion_rejected();
+        }
+        match outcome {
+            RecordCompletionOutcome::RecordedUser => self.inc_user_completed(),
+            RecordCompletionOutcome::RecordedLost => self.inc_user_lost(),
+            RecordCompletionOutcome::OrphanedDropped => self.inc_user_orphan_completed(),
+            RecordCompletionOutcome::Missing(anomaly)
+            | RecordCompletionOutcome::Stale(anomaly)
+            | RecordCompletionOutcome::NonActive(anomaly)
+            | RecordCompletionOutcome::Corrupt(anomaly) => self.record_anomaly(anomaly),
+        }
+    }
+
+    #[inline]
+    pub fn record_completion_result<UP, E, R>(&self, result: &RecordCompletionResult<UP, E, R>) {
         self.record_completion_outcome(result.outcome());
     }
 }

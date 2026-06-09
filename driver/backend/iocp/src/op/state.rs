@@ -113,7 +113,7 @@ impl OverlappedEntry {
 
 impl Default for OverlappedEntry {
     fn default() -> Self {
-        Self::new(OpToken::new(0, 0))
+        Self::new(OpToken::from_registry_parts(0, 0).expect("zero token should be encodable"))
     }
 }
 

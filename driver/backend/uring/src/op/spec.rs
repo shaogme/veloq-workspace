@@ -56,6 +56,10 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
         CompletionCleanupGuard::default()
     }
 
+    fn orphan_cleanup(kernel: &mut Self::KernelPayload, result: i32) -> CompletionCleanupGuard {
+        Self::completion_cleanup(kernel, result)
+    }
+
     fn get_timeout(_kernel: &Self::KernelPayload, _payload: &Self) -> Option<Duration> {
         None
     }
@@ -130,6 +134,19 @@ where
         return CompletionCleanupGuard::default();
     };
     S::completion_cleanup(kernel, result)
+}
+
+pub(crate) unsafe fn orphan_cleanup_shim<S>(
+    op: &mut UringKernelOp,
+    result: i32,
+) -> CompletionCleanupGuard
+where
+    S: UringOpErasure,
+{
+    let Some(kernel) = S::kernel_payload_mut(&mut op.payload) else {
+        return CompletionCleanupGuard::default();
+    };
+    S::orphan_cleanup(kernel, result)
 }
 
 pub(crate) unsafe fn get_timeout_shim<S>(
@@ -220,6 +237,7 @@ macro_rules! impl_uring_op_erasure {
                     make_sqe: crate::op::spec::make_sqe_shim::<$OpType>,
                     on_complete: crate::op::spec::on_complete_shim::<$OpType>,
                     completion_cleanup: crate::op::spec::completion_cleanup_shim::<$OpType>,
+                    orphan_cleanup: crate::op::spec::orphan_cleanup_shim::<$OpType>,
                     strategy: <$OpType as crate::op::spec::UringOpSpec>::STRATEGY,
                     get_timeout: crate::op::spec::get_timeout_shim::<$OpType>,
                     resolve_chunks: crate::op::spec::resolve_chunks_shim::<$OpType>,

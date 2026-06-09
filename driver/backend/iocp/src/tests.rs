@@ -76,7 +76,10 @@ pub(crate) fn wait_completion_record(
     timeout: std::time::Duration,
 ) -> IocpResult<CompletionRecord<IocpUserPayload, IocpError>> {
     let start = std::time::Instant::now();
-    let token = CompletionToken::user(OpToken::new(user_data, generation));
+    let token = CompletionToken::user(
+        OpToken::from_registry_parts(user_data, generation)
+            .expect("test token should be encodable"),
+    );
     loop {
         if start.elapsed() > timeout {
             return IocpError::CompletionWait

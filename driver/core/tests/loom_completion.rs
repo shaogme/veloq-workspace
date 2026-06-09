@@ -22,7 +22,8 @@ impl SlotSpec for DummySlotSpec {
 fn active_table() -> (SharedCompletionTable<(), ()>, CompletionToken) {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
     let handle = registry.alloc(()).expect("slot allocation failed").handle;
-    let token = OpToken::new(handle.index, handle.generation);
+    let token = OpToken::from_registry_parts(handle.index, handle.generation)
+        .expect("loom test handle should be encodable");
     registry
         .with_slot_storage_mut(token, |_result, payload, _sidecar| {
             *payload = Some(());

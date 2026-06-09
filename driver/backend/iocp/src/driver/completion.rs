@@ -11,6 +11,7 @@ use veloq_driver_core::driver::{
 use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, io_result_to_event_res, push_completion_shared};
+use crate::driver::polling::CompletionProgress;
 use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
 use crate::error::{IocpError, IocpResult};
 use crate::op::{IocpOp, IocpUserPayload, Slot};
@@ -169,7 +170,7 @@ impl<'a> IocpDriver<'a> {
                 let mut cleanup = guard
                     .op
                     .as_mut()
-                    .map(|op| op.completion_cleanup(&io_result))
+                    .map(|op| op.orphan_cleanup(&io_result))
                     .unwrap_or_default();
                 let _ = guard.take_op();
                 let (payload_erased, detail) = guard.take_completion_data();
@@ -188,7 +189,7 @@ impl<'a> IocpDriver<'a> {
         success: bool,
         error_code: Option<u32>,
         bytes_transferred: u32,
-    ) {
+    ) -> CompletionProgress {
         let (user_data, completed_generation) = token.parts();
         let raw = RawCompletion::new(
             CompletionBackend::Iocp,
@@ -224,6 +225,11 @@ impl<'a> IocpDriver<'a> {
                     self.drain_deferred_socket_cleanup();
                 }
                 let _ = self.ops.finalize_waiting_completion(token);
+                CompletionProgress {
+                    iocp: 1,
+                    user_completed: 1,
+                    ..CompletionProgress::default()
+                }
             }
             RoutedSlotCompletion::Orphaned(slot) => {
                 let (mut cleanup, socket_inflight) = {
@@ -239,7 +245,7 @@ impl<'a> IocpDriver<'a> {
                     let cleanup = completed
                         .op
                         .as_mut()
-                        .map(|op| op.completion_cleanup(&io_result))
+                        .map(|op| op.orphan_cleanup(&io_result))
                         .unwrap_or_default();
                     let socket_inflight =
                         completed.op.as_mut().and_then(take_socket_inflight_from_op);
@@ -255,6 +261,11 @@ impl<'a> IocpDriver<'a> {
                     self.drain_deferred_socket_cleanup();
                 }
                 let _ = self.ops.finalize_orphaned_completion(token);
+                CompletionProgress {
+                    iocp: 1,
+                    orphan_cleaned: 1,
+                    ..CompletionProgress::default()
+                }
             }
             RoutedSlotCompletion::Missing(anomaly) | RoutedSlotCompletion::Empty(anomaly) => {
                 record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
@@ -262,6 +273,11 @@ impl<'a> IocpDriver<'a> {
                     user_data,
                     completed_generation, "ignoring completion for non-active slot"
                 );
+                CompletionProgress {
+                    iocp: 1,
+                    anomaly: 1,
+                    ..CompletionProgress::default()
+                }
             }
             RoutedSlotCompletion::Stale(anomaly) => {
                 record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
@@ -269,9 +285,19 @@ impl<'a> IocpDriver<'a> {
                     user_data,
                     completed_generation, "ignoring stale IOCP completion"
                 );
+                CompletionProgress {
+                    iocp: 1,
+                    anomaly: 1,
+                    ..CompletionProgress::default()
+                }
             }
             RoutedSlotCompletion::Corrupt(anomaly) => {
                 self.emit_corrupt_completion(anomaly, "IOCP completion found corrupt slot");
+                CompletionProgress {
+                    iocp: 1,
+                    user_lost: 1,
+                    ..CompletionProgress::default()
+                }
             }
         }
     }
@@ -385,11 +411,11 @@ impl<'a> IocpDriver<'a> {
             record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
             return;
         };
-        let token = OpToken::new(snapshot.index, snapshot.generation);
+        let token = OpToken::from_registry_parts(snapshot.index, snapshot.generation)
+            .expect("slot snapshot token should be encodable");
         let raw_res = anomaly.raw_result.unwrap_or(-5);
         let flags = anomaly.flags.unwrap_or(0);
 
-        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
         error!(
             user_data = snapshot.index,
             generation = snapshot.generation,

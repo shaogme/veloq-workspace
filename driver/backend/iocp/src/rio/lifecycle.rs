@@ -15,6 +15,7 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use std::sync::OnceLock;
+use veloq_driver_core::driver::CompletionAnomaly;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 const RIO_REAPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -30,6 +31,7 @@ pub(crate) struct DeferredRioCleanup {
     outstanding_count: usize,
     next_request_id: u64,
     deferred_payloads: Vec<crate::op::IocpUserPayload>,
+    diagnostics: veloq_driver_core::driver::DriverCompletionDiagnostics,
 }
 
 // SAFETY: DeferredRioCleanup is transferred by ownership to a single reaper thread.
@@ -48,6 +50,7 @@ impl DeferredRioCleanup {
             outstanding_count: self.outstanding_count,
             next_request_id: self.next_request_id,
             deferred_payloads: self.deferred_payloads,
+            diagnostics: self.diagnostics,
         };
         state.stop_accepting_new_submissions();
         if let Err(e) = state.drain_outstanding(RIO_REAPER_DRAIN_TIMEOUT) {
@@ -105,9 +108,36 @@ impl RioState {
                 let _ =
                     release_socket_inflight_token_from(&mut self.socket_runtime, socket_inflight);
             }
-            RioRequestContextDecode::Malformed { .. }
-            | RioRequestContextDecode::Missing { .. }
-            | RioRequestContextDecode::Stale { .. } => {}
+            RioRequestContextDecode::Malformed { raw } => {
+                let anomaly = CompletionAnomaly::rio_malformed_context_raw(raw)
+                    .with_raw_result(rio_drain_raw_res(res))
+                    .with_flags(0);
+                self.diagnostics.record_anomaly(&anomaly);
+            }
+            RioRequestContextDecode::Missing { id } => {
+                let anomaly = CompletionAnomaly::rio_missing_context_raw(
+                    res.RequestContext,
+                    id.index(),
+                    id.generation(),
+                )
+                .with_raw_result(rio_drain_raw_res(res))
+                .with_flags(0);
+                self.diagnostics.record_anomaly(&anomaly);
+            }
+            RioRequestContextDecode::Stale {
+                id,
+                actual_generation,
+            } => {
+                let anomaly = CompletionAnomaly::rio_stale_context_raw(
+                    res.RequestContext,
+                    id.index(),
+                    id.generation(),
+                    actual_generation,
+                )
+                .with_raw_result(rio_drain_raw_res(res))
+                .with_flags(0);
+                self.diagnostics.record_anomaly(&anomaly);
+            }
         }
         if self.outstanding_count > 0 {
             self.outstanding_count -= 1;
@@ -189,11 +219,23 @@ impl RioState {
             outstanding_count: std::mem::take(&mut self.outstanding_count),
             next_request_id: self.next_request_id,
             deferred_payloads: std::mem::take(&mut self.deferred_payloads),
+            diagnostics: self.diagnostics.clone(),
         })
     }
 
     pub(crate) fn defer_payloads(&mut self, payloads: Vec<crate::op::IocpUserPayload>) {
         self.deferred_payloads.extend(payloads);
+    }
+}
+
+#[inline]
+fn rio_drain_raw_res(res: &RIORESULT) -> i32 {
+    if res.Status == 0 {
+        res.BytesTransferred.min(i32::MAX as u32) as i32
+    } else if res.Status > 0 {
+        -res.Status
+    } else {
+        res.Status
     }
 }
 

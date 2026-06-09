@@ -4,7 +4,7 @@ use diagweave::prelude::*;
 use tracing::debug;
 use veloq_buf::BufferRegistrar;
 use veloq_driver_core::driver::{
-    CancelRequest, DriverCompletionDiagnostics, OpToken, SharedCompletionTable,
+    CancelRequest, DriverCompletionDiagnostics, SharedCompletionTable,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
@@ -31,10 +31,6 @@ enum ShutdownOpKind {
     Immediate,
 }
 
-fn current_token(ops: &IocpOpRegistry, user_data: usize) -> Option<OpToken> {
-    ops.current_token_at_index(user_data)
-}
-
 pub(super) struct IocpRioRuntime<'a> {
     state: RioState,
     registrar: Box<dyn BufferRegistrar + 'a>,
@@ -54,8 +50,9 @@ impl<'a> IocpRioRuntime<'a> {
         ext: &Extensions,
         registration_mode: BufferRegistrationMode,
         registrar: Box<dyn BufferRegistrar + 'a>,
+        diagnostics: DriverCompletionDiagnostics,
     ) -> IocpResult<Self> {
-        let state = RioState::new(port, entries, ext, registration_mode)
+        let state = RioState::new(port, entries, ext, registration_mode, diagnostics)
             .with_ctx("entries", entries)
             .with_ctx("port_raw", port.raw().as_handle() as usize)
             .attach_note("failed to initialize RIO state")
@@ -108,17 +105,19 @@ impl<'a> IocpDriver<'a> {
         let extensions = crate::ext::Extensions::new()
             .with_ctx("port_raw", port_handle as usize)
             .attach_note("failed to load IOCP extensions")?;
+        let ops = IocpOpRegistry::new(entries as usize);
+        let completion_table: SharedCompletionTable<IocpUserPayload, IocpError> =
+            ops.shared.clone();
+        let completion_diagnostics = ops.shared.completion_diagnostics();
         let rio = IocpRioRuntime::new(
             crate::config::RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
             &extensions,
             registration_mode,
             registrar,
+            completion_diagnostics.clone(),
         )
         .attach_note("failed to initialize RIO runtime")?;
-        let ops = IocpOpRegistry::new(entries as usize);
-        let completion_table: SharedCompletionTable<IocpUserPayload, IocpError> =
-            ops.shared.clone();
         let (remote_cancel_sender, remote_cancel_receiver) = std::sync::mpsc::channel();
         Ok(Self {
             completion: CompletionPump::new(port_val, completion_table),
@@ -128,7 +127,7 @@ impl<'a> IocpDriver<'a> {
             handles: HandleRegistry::new(),
             remote_cancel_sender,
             remote_cancel_receiver,
-            completion_diagnostics: DriverCompletionDiagnostics::default(),
+            completion_diagnostics,
             rio,
             shutting_down: false,
             closed: false,
@@ -162,10 +161,7 @@ impl<'a> IocpDriver<'a> {
 
         let mut in_flight = Vec::new();
         let mut pending = ShutdownPending::default();
-        for user_data in 0..self.ops.capacity() {
-            let Some(token) = current_token(&self.ops, user_data) else {
-                continue;
-            };
+        for token in self.ops.active_tokens().collect::<Vec<_>>() {
             let kind = match self.ops.checked_slot_view(token) {
                 CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                     if slot.platform().timer_id.is_some() {
@@ -229,6 +225,7 @@ impl<'a> IocpDriver<'a> {
                 return Err(IocpError::CompletionWait.report("iocp/driver", "drain timed out"));
             }
             let progress = self.poll_completion(deadline.saturating_duration_since(now))?;
+            let _ = progress.semantic_count();
             drained += progress.iocp;
             let _rio_progress = progress.rio;
         }
@@ -237,10 +234,7 @@ impl<'a> IocpDriver<'a> {
 
     fn preserve_rio_payloads_for_fast_close(&mut self) {
         let mut rio_slots = Vec::new();
-        for user_data in 0..self.ops.capacity() {
-            let Some(token) = current_token(&self.ops, user_data) else {
-                continue;
-            };
+        for token in self.ops.active_tokens().collect::<Vec<_>>() {
             let is_rio = match self.ops.checked_slot_view(token) {
                 CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => slot
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
