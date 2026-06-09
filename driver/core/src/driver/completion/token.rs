@@ -1,4 +1,5 @@
-pub(super) const CONTROL_TOKEN_INDEX: u32 = u32::MAX;
+const INDEX_LIMIT: u64 = 1 << 48;
+const CONTROL_TOKEN_FLAG: u64 = 1 << 63;
 const CONTROL_TOKEN_KIND_SHIFT: u32 = 48;
 const CONTROL_TOKEN_ID_SHIFT: u32 = 32;
 
@@ -73,7 +74,7 @@ pub enum OpTokenError {
 impl OpToken {
     #[inline]
     pub const fn try_new(index: usize, generation: u32) -> Result<Self, OpTokenError> {
-        if index >= CONTROL_TOKEN_INDEX as usize {
+        if index as u64 >= INDEX_LIMIT {
             return Err(OpTokenError::ReservedControlIndex { index });
         }
         Ok(Self { index, generation })
@@ -122,7 +123,7 @@ impl CompletionToken {
     #[inline]
     pub fn user(token: OpToken) -> Self {
         let (index, generation) = token.parts();
-        Self(((generation as u64) << 32) | (index as u32 as u64))
+        Self(((generation as u64 & 0x7fff) << 48) | (index as u64 & 0x0000_ffff_ffff_ffff))
     }
 
     #[inline]
@@ -138,9 +139,9 @@ impl CompletionToken {
     #[inline]
     pub const fn internal(kind: CompletionControlKind, id: u16) -> Self {
         Self(
-            ((kind as u64) << CONTROL_TOKEN_KIND_SHIFT)
-                | ((id as u64) << CONTROL_TOKEN_ID_SHIFT)
-                | CONTROL_TOKEN_INDEX as u64,
+            CONTROL_TOKEN_FLAG
+                | ((kind as u64 & 0x7fff) << CONTROL_TOKEN_KIND_SHIFT)
+                | ((id as u64) << CONTROL_TOKEN_ID_SHIFT),
         )
     }
 
@@ -161,14 +162,18 @@ impl CompletionToken {
 
     #[inline]
     pub fn classify(self) -> CompletionTokenClass {
-        let index = (self.0 & 0xffff_ffff) as u32;
-        if index != CONTROL_TOKEN_INDEX
-            && let Ok(token) = OpToken::try_new(index as usize, (self.0 >> 32) as u32)
-        {
-            return CompletionTokenClass::User(token);
+        if (self.0 & CONTROL_TOKEN_FLAG) == 0 {
+            let raw_index = self.0 & 0x0000_ffff_ffff_ffff;
+            if raw_index <= usize::MAX as u64 {
+                let index = raw_index as usize;
+                let generation = ((self.0 >> 48) & 0x7fff) as u32;
+                if let Ok(token) = OpToken::try_new(index, generation) {
+                    return CompletionTokenClass::User(token);
+                }
+            }
         }
 
-        let kind = (self.0 >> CONTROL_TOKEN_KIND_SHIFT) as u16;
+        let kind = ((self.0 >> CONTROL_TOKEN_KIND_SHIFT) & 0x7fff) as u16;
         let id = ((self.0 >> CONTROL_TOKEN_ID_SHIFT) & 0xffff) as u16;
         match CompletionControlKind::from_raw(kind) {
             Some(kind) => CompletionTokenClass::Control { kind, id },
