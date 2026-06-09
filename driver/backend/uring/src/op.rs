@@ -1,7 +1,7 @@
 //! io_uring Platform-Specific Operation Definitions
 
-use crate::driver::{UringDriver, UringOpState};
 use crate::diagnostics::UringCompletionDiagnostics;
+use crate::driver::{UringDriver, UringOpState};
 use crate::error::{UringDriverResult as DriverResult, UringError};
 use io_uring::squeue;
 use std::time::Duration;
@@ -81,7 +81,19 @@ pub struct UringKernelOp {
     pub(crate) payload: UringOpPayload,
 }
 
-impl PlatformOp for UringKernelOp {}
+impl PlatformOp for UringKernelOp {
+    type CleanupContext<'a> = i32;
+
+    #[inline]
+    fn completion_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        unsafe { (self.vtable.completion_cleanup)(self, result) }
+    }
+
+    #[inline]
+    fn orphan_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        unsafe { (self.vtable.orphan_cleanup)(self, result) }
+    }
+}
 
 pub type UringOp = UringKernelOp;
 

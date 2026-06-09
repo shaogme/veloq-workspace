@@ -5,7 +5,8 @@ use diagweave::prelude::*;
 mod table;
 mod types;
 
-use crate::slot::{self, CheckedSlotView, SlotView};
+use crate::driver::registry::OpRegistry;
+use crate::slot::{self, CheckedSlotView, SlotRegistryExt, SlotView};
 pub use table::{
     CELL_STATE_BUSY, CELL_STATE_IDLE, CELL_STATE_ORPHANED, CELL_STATE_READY, CELL_STATE_WAITING,
     CompletionAccess, PollRecordResult, SharedCompletionTable,
@@ -320,6 +321,117 @@ pub enum FinalizeOutcome {
 }
 
 #[inline]
+pub fn finalize_waiting_checked<Spec>(
+    registry: &mut OpRegistry<Spec>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    backend: CompletionBackend,
+    token: OpToken,
+    raw_res: i32,
+    flags: u32,
+) -> FinalizeOutcome
+where
+    Spec: slot::SlotSpec,
+{
+    if registry.finalize_waiting_completion(token).is_some() {
+        FinalizeOutcome::Finalized
+    } else {
+        record_finalize_failure(registry, diagnostics, backend, token, raw_res, flags)
+    }
+}
+
+#[inline]
+pub fn finalize_orphaned_checked<Spec>(
+    registry: &mut OpRegistry<Spec>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    backend: CompletionBackend,
+    token: OpToken,
+    raw_res: i32,
+    flags: u32,
+) -> FinalizeOutcome
+where
+    Spec: slot::SlotSpec,
+{
+    if registry.finalize_orphaned_completion(token).is_some() {
+        FinalizeOutcome::Finalized
+    } else {
+        record_finalize_failure(registry, diagnostics, backend, token, raw_res, flags)
+    }
+}
+
+#[inline]
+pub fn finalize_corrupt_checked<Spec>(
+    registry: &mut OpRegistry<Spec>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    backend: CompletionBackend,
+    snapshot: slot::SlotSnapshot,
+    raw_res: i32,
+    flags: u32,
+) -> FinalizeOutcome
+where
+    Spec: slot::SlotSpec,
+{
+    let Ok(token) = snapshot.try_token() else {
+        let raw = RawCompletion::new(
+            backend,
+            CompletionToken::from_raw(snapshot.index as u64),
+            raw_res,
+            flags,
+        );
+        let anomaly = CompletionAnomaly::finalize_failed(
+            raw.token,
+            snapshot.index,
+            snapshot.generation,
+            snapshot.state,
+        )
+        .with_slot_snapshot(snapshot)
+        .with_raw_completion(raw);
+        record_completion_anomaly(diagnostics, &anomaly);
+        return FinalizeOutcome::Missing(anomaly);
+    };
+
+    if registry.finalize_corrupt_slot(snapshot).is_some() {
+        FinalizeOutcome::Finalized
+    } else {
+        record_finalize_failure(registry, diagnostics, backend, token, raw_res, flags)
+    }
+}
+
+#[inline]
+fn record_finalize_failure<Spec>(
+    registry: &mut OpRegistry<Spec>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    backend: CompletionBackend,
+    token: OpToken,
+    raw_res: i32,
+    flags: u32,
+) -> FinalizeOutcome
+where
+    Spec: slot::SlotSpec,
+{
+    let raw = RawCompletion::new(backend, CompletionToken::user(token), raw_res, flags);
+    let anomaly = match slot_view_anomaly(backend, token, raw, registry.checked_slot_view(token)) {
+        Ok(slot) => {
+            let snapshot = match slot {
+                SlotView::Reserved(slot) => slot.snapshot(),
+                SlotView::InFlightWaiting(slot) => slot.snapshot(),
+                SlotView::InFlightOrphaned(slot) => slot.snapshot(),
+            };
+            CompletionAnomaly::finalize_failed(
+                raw.token,
+                snapshot.index,
+                snapshot.generation,
+                snapshot.state,
+            )
+            .with_slot_snapshot(snapshot)
+            .with_raw_completion(raw)
+        }
+        Err(anomaly) => anomaly,
+    };
+    record_completion_anomaly(diagnostics, &anomaly);
+    FinalizeOutcome::Missing(anomaly)
+}
+
+#[inline]
 pub fn dispatch_raw_completion(
     backend: CompletionBackend,
     raw_token: u64,
@@ -350,20 +462,21 @@ impl CompletionAnomaly {
 
 #[inline]
 pub fn unknown_completion_anomaly(envelope: CompletionEnvelope) -> CompletionAnomaly {
-    let anomaly =
-        CompletionAnomaly::unknown_control(envelope.raw.token).with_raw_completion(envelope.raw);
     match envelope.identity {
         CompletionIdentity::BackendContext {
             backend,
             raw_context,
-        } => anomaly
+        } => CompletionAnomaly::backend_context_unknown(envelope.raw.token)
+            .with_raw_completion(envelope.raw)
             .with_backend(backend)
             .with_backend_context(raw_context),
         CompletionIdentity::UnknownControl { .. }
         | CompletionIdentity::User(_)
         | CompletionIdentity::Waker(_)
         | CompletionIdentity::Cancel(_)
-        | CompletionIdentity::RioWake(_) => anomaly,
+        | CompletionIdentity::RioWake(_) => {
+            CompletionAnomaly::unknown_control(envelope.raw.token).with_raw_completion(envelope.raw)
+        }
     }
 }
 
@@ -938,6 +1051,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::PlatformOp;
+    use crate::driver::registry::OpRegistry;
 
     #[test]
     fn op_token_try_new_rejects_control_index() {
@@ -1029,9 +1144,82 @@ mod tests {
 
         let anomaly = unknown_completion_anomaly(envelope);
 
-        assert_eq!(anomaly.reason, CompletionAnomalyReason::UnknownControlToken);
+        assert_eq!(
+            anomaly.reason,
+            CompletionAnomalyReason::BackendContextUnknown
+        );
         assert_eq!(anomaly.backend, Some(CompletionBackend::Iocp));
         assert_eq!(anomaly.backend_context, Some(0));
         assert_eq!(anomaly.raw_result, Some(-5));
+    }
+
+    struct DummyPlatformOp;
+
+    impl PlatformOp for DummyPlatformOp {
+        type CleanupContext<'a> = ();
+    }
+
+    struct DummySlotSpec;
+
+    impl slot::SlotSpec for DummySlotSpec {
+        type Op = DummyPlatformOp;
+        type UserPayload = ();
+        type PlatformData = ();
+        type Sidecar = ();
+        type Error = ();
+        type Completion = usize;
+        type CompletionDiagnostics = ();
+    }
+
+    #[test]
+    fn finalize_waiting_checked_records_missing_slot() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let diagnostics = registry.shared.completion_diagnostics();
+        let token = OpToken::from_registry_parts(4, 1).expect("test token");
+
+        let outcome = finalize_waiting_checked(
+            &mut registry,
+            &diagnostics,
+            CompletionBackend::Core,
+            token,
+            -5,
+            0,
+        );
+
+        assert!(matches!(
+            outcome,
+            FinalizeOutcome::Missing(anomaly)
+                if anomaly.reason == CompletionAnomalyReason::UnknownSlot
+        ));
+        assert_eq!(diagnostics.snapshot().unknown_completion, 1);
+    }
+
+    #[test]
+    fn finalize_corrupt_checked_records_unencodable_snapshot() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let diagnostics = registry.shared.completion_diagnostics();
+        let snapshot = slot::SlotSnapshot {
+            index: u32::MAX as usize,
+            generation: 1,
+            state: slot::SlotState::InFlightWaiting,
+            has_op: false,
+            has_payload: false,
+        };
+
+        let outcome = finalize_corrupt_checked(
+            &mut registry,
+            &diagnostics,
+            CompletionBackend::Core,
+            snapshot,
+            -5,
+            0,
+        );
+
+        assert!(matches!(
+            outcome,
+            FinalizeOutcome::Missing(anomaly)
+                if anomaly.reason == CompletionAnomalyReason::FinalizeFailed
+        ));
+        assert_eq!(diagnostics.snapshot().internal_unknown, 1);
     }
 }

@@ -13,7 +13,21 @@ pub mod registry;
 
 pub use completion::*;
 
-pub trait PlatformOp {}
+pub trait PlatformOp {
+    type CleanupContext<'a>
+    where
+        Self: 'a;
+
+    #[inline]
+    fn completion_cleanup(&mut self, _context: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        CompletionCleanupGuard::default()
+    }
+
+    #[inline]
+    fn orphan_cleanup(&mut self, context: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        self.completion_cleanup(context)
+    }
+}
 
 pub enum RegisterFd<'a, H: RawHandleMeta> {
     Borrowed(BorrowedRawHandle<'a, H>),

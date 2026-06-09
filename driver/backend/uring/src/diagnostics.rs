@@ -1,8 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use veloq_driver_core::driver::{
-    CompletionAnomaly, DriverCompletionDiagnosticsBackend,
-};
+use veloq_driver_core::driver::{CompletionAnomaly, DriverCompletionDiagnosticsBackend};
 
 #[derive(Debug, Default)]
 pub struct UringCompletionDiagnostics {

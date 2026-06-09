@@ -651,7 +651,9 @@ mod tests {
 
     struct DummyPlatformOp;
 
-    impl PlatformOp for DummyPlatformOp {}
+    impl PlatformOp for DummyPlatformOp {
+        type CleanupContext<'a> = ();
+    }
 
     struct DummySlotSpec;
 

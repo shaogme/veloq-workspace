@@ -362,7 +362,7 @@ impl<'a> IocpDriver<'a> {
                                 slot.snapshot()
                             }
                         };
-                        CompletionAnomaly::backend_invariant_broken(
+                        CompletionAnomaly::completion_key_mismatch(
                             raw.token,
                             snapshot.index,
                             snapshot.generation,

@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use diagweave::prelude::*;
 use tracing::error;
 
-use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::driver::IocpDriverCompletionDiagnostics;
+use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
 use veloq_driver_core::driver::{

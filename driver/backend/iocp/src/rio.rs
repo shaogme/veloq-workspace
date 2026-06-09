@@ -21,10 +21,10 @@ use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
 use veloq_driver_core::driver::SharedCompletionTable;
 
-use crate::driver::IocpDriverCompletionDiagnostics;
 use self::core::registry::RioRegistry;
 use self::core::submit_ops::{RioCq, RioDispatch, RioKernel};
 use self::runtime::control_flow::RioSocketActor;
+use crate::driver::IocpDriverCompletionDiagnostics;
 
 pub(crate) use self::runtime::RioSendToArgs;
 pub(crate) use self::runtime::RioTarget;

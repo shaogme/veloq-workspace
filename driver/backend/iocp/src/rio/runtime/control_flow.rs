@@ -22,8 +22,9 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionPacket, CompletionToken,
+    CompletionAnomaly, CompletionBackend, CompletionPacket, CompletionToken, FinalizeOutcome,
     RawCompletion, RoutedSlotCompletion, SharedCompletionTable, UserCompletionEvent,
+    finalize_corrupt_checked, finalize_orphaned_checked, finalize_waiting_checked,
     record_completion_anomaly, record_lost_completion, route_user_completion,
     run_completion_cleanup,
 };
@@ -48,6 +49,82 @@ struct RioCompletionRouter<'a> {
     registry: &'a mut RioRegistry,
     env: RioEnv<'a>,
     completed_count: usize,
+}
+
+fn finalize_waiting_rio_checked(
+    ops: &mut IocpOpRegistry,
+    diagnostics: &IocpDriverCompletionDiagnostics,
+    token: veloq_driver_core::driver::OpToken,
+    raw_res: i32,
+    context: &'static str,
+) -> FinalizeOutcome {
+    let outcome =
+        finalize_waiting_checked(ops, diagnostics, CompletionBackend::Rio, token, raw_res, 0);
+    if let FinalizeOutcome::Missing(anomaly) = &outcome {
+        debug_rio_finalize_failure(token, context, anomaly);
+    }
+    outcome
+}
+
+fn finalize_orphaned_rio_checked(
+    ops: &mut IocpOpRegistry,
+    diagnostics: &IocpDriverCompletionDiagnostics,
+    token: veloq_driver_core::driver::OpToken,
+    raw_res: i32,
+    context: &'static str,
+) -> FinalizeOutcome {
+    let outcome =
+        finalize_orphaned_checked(ops, diagnostics, CompletionBackend::Rio, token, raw_res, 0);
+    if let FinalizeOutcome::Missing(anomaly) = &outcome {
+        debug_rio_finalize_failure(token, context, anomaly);
+    }
+    outcome
+}
+
+fn finalize_corrupt_rio_checked(
+    ops: &mut IocpOpRegistry,
+    diagnostics: &IocpDriverCompletionDiagnostics,
+    snapshot: veloq_driver_core::slot::SlotSnapshot,
+    raw_res: i32,
+    context: &'static str,
+) -> FinalizeOutcome {
+    let token = snapshot.try_token().ok();
+    let outcome = finalize_corrupt_checked(
+        ops,
+        diagnostics,
+        CompletionBackend::Rio,
+        snapshot,
+        raw_res,
+        0,
+    );
+    if let FinalizeOutcome::Missing(anomaly) = &outcome {
+        if let Some(token) = token {
+            debug_rio_finalize_failure(token, context, anomaly);
+        } else {
+            debug!(
+                user_data = snapshot.index,
+                generation = snapshot.generation,
+                context,
+                reason = ?anomaly.reason,
+                "RIO finalize corrupt slot found unencodable snapshot token"
+            );
+        }
+    }
+    outcome
+}
+
+fn debug_rio_finalize_failure(
+    token: veloq_driver_core::driver::OpToken,
+    context: &'static str,
+    anomaly: &CompletionAnomaly,
+) {
+    debug!(
+        user_data = token.index(),
+        generation = token.generation(),
+        context,
+        reason = ?anomaly.reason,
+        "RIO finalize failed"
+    );
 }
 
 impl<'a> RioCompletionRouter<'a> {
@@ -134,7 +211,13 @@ impl<'a> RioCompletionRouter<'a> {
                         anomaly,
                         cleanup,
                     );
-                    let _ = ops.finalize_corrupt_slot(snapshot);
+                    let _ = finalize_corrupt_rio_checked(
+                        ops,
+                        self.comp.diagnostics,
+                        snapshot,
+                        raw.res,
+                        "rio.handle_op_completion.platform_generation_mismatch",
+                    );
                 } else {
                     let cancelled = slot.platform().rio_cancel_requested;
                     let mut completion = if cancelled {
@@ -242,7 +325,13 @@ impl<'a> RioCompletionRouter<'a> {
                             );
                         }
                     }
-                    let _ = ops.finalize_waiting_completion(op_token);
+                    let _ = finalize_waiting_rio_checked(
+                        ops,
+                        self.comp.diagnostics,
+                        op_token,
+                        res_code,
+                        "rio.handle_op_completion.waiting",
+                    );
                 }
             }
             RoutedSlotCompletion::Orphaned(mut slot) => {
@@ -282,7 +371,13 @@ impl<'a> RioCompletionRouter<'a> {
                         cleanup
                     };
                     let _ = run_completion_cleanup(self.comp.diagnostics, &mut cleanup);
-                    let _ = ops.finalize_orphaned_completion(op_token);
+                    let _ = finalize_orphaned_rio_checked(
+                        ops,
+                        self.comp.diagnostics,
+                        op_token,
+                        raw.res,
+                        "rio.handle_op_completion.orphaned_generation_mismatch",
+                    );
                 } else {
                     let mut cleanup = {
                         let mut guard = slot.complete();
@@ -308,7 +403,13 @@ impl<'a> RioCompletionRouter<'a> {
                         cleanup
                     };
                     let _ = run_completion_cleanup(self.comp.diagnostics, &mut cleanup);
-                    let _ = ops.finalize_orphaned_completion(op_token);
+                    let _ = finalize_orphaned_rio_checked(
+                        ops,
+                        self.comp.diagnostics,
+                        op_token,
+                        raw.res,
+                        "rio.handle_op_completion.orphaned",
+                    );
                 }
             }
             RoutedSlotCompletion::Corrupt(anomaly) => {
@@ -365,7 +466,13 @@ impl<'a> RioCompletionRouter<'a> {
                         anomaly,
                         cleanup,
                     );
-                    let _ = ops.finalize_corrupt_slot(snapshot);
+                    let _ = finalize_corrupt_rio_checked(
+                        ops,
+                        self.comp.diagnostics,
+                        snapshot,
+                        raw.res,
+                        "rio.handle_op_completion.corrupt",
+                    );
                 } else {
                     record_completion_anomaly(self.comp.diagnostics, &anomaly);
                 }

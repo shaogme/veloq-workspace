@@ -9,11 +9,12 @@ use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_e
 use crate::op::{CheckedSlotView, Slot, SlotView, UringOpRegistryExt, UringUserPayload};
 use veloq_driver_core::driver::{
     CancelAck, CancelCompletionId, CompletionAnomaly, CompletionAnomalyReason, CompletionBackend,
-    CompletionCleanupGuard, CompletionDispatch, CompletionSidecar, CompletionToken, OpToken,
-    RawCompletion, RoutedSlotCompletion, UserCompletionEvent, dispatch_raw_completion,
-    drain_cancel_requests, record_completion_anomaly, record_lost_completion,
-    record_user_completion, route_user_completion, run_completion_cleanup, slot_view_anomaly,
-    unknown_completion_anomaly,
+    CompletionCleanupGuard, CompletionDispatch, CompletionSidecar, CompletionToken,
+    FinalizeOutcome, OpToken, PlatformOp, RawCompletion, RoutedSlotCompletion, UserCompletionEvent,
+    dispatch_raw_completion, drain_cancel_requests, finalize_corrupt_checked,
+    finalize_orphaned_checked, finalize_waiting_checked, record_completion_anomaly,
+    record_lost_completion, record_user_completion, route_user_completion, run_completion_cleanup,
+    slot_view_anomaly, unknown_completion_anomaly,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +80,15 @@ impl<'a> UringDriver<'a> {
         token: OpToken,
         context: &'static str,
     ) {
-        if self.ops.finalize_waiting_completion(token).is_none() {
-            self.record_finalize_failure(token, context);
+        if let FinalizeOutcome::Missing(anomaly) = finalize_waiting_checked(
+            &mut self.ops,
+            &self.completion_diagnostics,
+            CompletionBackend::Uring,
+            token,
+            -libc::EIO,
+            0,
+        ) {
+            debug_finalize_failure(token, context, &anomaly);
         }
     }
 
@@ -89,8 +97,15 @@ impl<'a> UringDriver<'a> {
         token: OpToken,
         context: &'static str,
     ) {
-        if self.ops.finalize_orphaned_completion(token).is_none() {
-            self.record_finalize_failure(token, context);
+        if let FinalizeOutcome::Missing(anomaly) = finalize_orphaned_checked(
+            &mut self.ops,
+            &self.completion_diagnostics,
+            CompletionBackend::Uring,
+            token,
+            -libc::EIO,
+            0,
+        ) {
+            debug_finalize_failure(token, context, &anomaly);
         }
     }
 
@@ -99,68 +114,27 @@ impl<'a> UringDriver<'a> {
         snapshot: veloq_driver_core::slot::SlotSnapshot,
         context: &'static str,
     ) {
-        let Ok(token) = snapshot.try_token() else {
-            let anomaly = CompletionAnomaly::backend_invariant_broken(
-                CompletionToken::from_raw(snapshot.index as u64),
-                snapshot.index,
-                snapshot.generation,
-                snapshot.state,
-            )
-            .with_slot_snapshot(snapshot)
-            .with_backend(CompletionBackend::Uring);
-            record_completion_anomaly(&self.completion_diagnostics, &anomaly);
-            debug!(
-                user_data = snapshot.index,
-                generation = snapshot.generation,
-                context,
-                reason = ?anomaly.reason,
-                "uring finalize corrupt slot found unencodable snapshot token"
-            );
-            return;
-        };
-        if self.ops.finalize_corrupt_slot(snapshot).is_none() {
-            self.record_finalize_failure(token, context);
-        }
-    }
-
-    fn record_finalize_failure(&mut self, token: OpToken, context: &'static str) {
-        let raw = RawCompletion::new(
+        let token = snapshot.try_token().ok();
+        if let FinalizeOutcome::Missing(anomaly) = finalize_corrupt_checked(
+            &mut self.ops,
+            &self.completion_diagnostics,
             CompletionBackend::Uring,
-            CompletionToken::user(token),
+            snapshot,
             -libc::EIO,
             0,
-        );
-        let anomaly = match slot_view_anomaly(
-            CompletionBackend::Uring,
-            token,
-            raw,
-            self.ops.checked_slot_view(token),
         ) {
-            Ok(slot) => {
-                let snapshot = match slot {
-                    SlotView::Reserved(slot) => slot.snapshot(),
-                    SlotView::InFlightWaiting(slot) => slot.snapshot(),
-                    SlotView::InFlightOrphaned(slot) => slot.snapshot(),
-                };
-                CompletionAnomaly::backend_invariant_broken(
-                    raw.token,
-                    snapshot.index,
-                    snapshot.generation,
-                    snapshot.state,
-                )
-                .with_slot_snapshot(snapshot)
-                .with_raw_completion(raw)
+            if let Some(token) = token {
+                debug_finalize_failure(token, context, &anomaly);
+            } else {
+                debug!(
+                    user_data = snapshot.index,
+                    generation = snapshot.generation,
+                    context,
+                    reason = ?anomaly.reason,
+                    "uring finalize corrupt slot found unencodable snapshot token"
+                );
             }
-            Err(anomaly) => anomaly,
-        };
-        record_completion_anomaly(&self.completion_diagnostics, &anomaly);
-        debug!(
-            user_data = token.index(),
-            generation = token.generation(),
-            context,
-            reason = ?anomaly.reason,
-            "uring finalize failed"
-        );
+        }
     }
 
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
@@ -541,7 +515,7 @@ impl<'a> UringDriver<'a> {
             raw.res,
             raw.flags,
         );
-        let anomaly = CompletionAnomaly::backend_invariant_broken(
+        let anomaly = CompletionAnomaly::cancel_ack_target_still_active(
             target_raw.token,
             snapshot.index,
             snapshot.generation,
@@ -634,9 +608,9 @@ impl<'a> UringDriver<'a> {
             if let Some(op_ref) = op.as_mut() {
                 cleanup = if snapshot.state == veloq_driver_core::slot::SlotState::InFlightOrphaned
                 {
-                    unsafe { (op_ref.vtable.orphan_cleanup)(op_ref, raw_res) }
+                    op_ref.orphan_cleanup(raw_res)
                 } else {
-                    unsafe { (op_ref.vtable.completion_cleanup)(op_ref, raw_res) }
+                    op_ref.completion_cleanup(raw_res)
                 };
             }
             let _ = op.take();
@@ -678,6 +652,16 @@ impl<'a> UringDriver<'a> {
     }
 }
 
+fn debug_finalize_failure(token: OpToken, context: &'static str, anomaly: &CompletionAnomaly) {
+    debug!(
+        user_data = token.index(),
+        generation = token.generation(),
+        context,
+        reason = ?anomaly.reason,
+        "uring finalize failed"
+    );
+}
+
 enum CompleteWaitingSlotOutcome {
     User(CompletionSidecar<UringUserPayload, UringError>),
     Lost {
@@ -704,7 +688,7 @@ fn complete_waiting_slot(
             return lost_waiting_slot_completion(slot, raw);
         };
         let final_res = unsafe { (op.vtable.on_complete)(op, payload, raw.res) };
-        let cleanup = unsafe { (op.vtable.completion_cleanup)(op, raw.res) };
+        let cleanup = op.completion_cleanup(raw.res);
         (final_res, cleanup)
     };
 
@@ -788,7 +772,7 @@ impl<'a> LostWaitingSlot for Slot<'a, veloq_driver_core::slot::InFlightWaiting> 
         let cleanup = self
             .op
             .as_mut()
-            .map(|op| unsafe { (op.vtable.completion_cleanup)(op, res) })
+            .map(|op| op.completion_cleanup(res))
             .unwrap_or_default();
         let (payload, detail) = self
             .storage
@@ -808,7 +792,7 @@ fn cleanup_orphaned_slot(
     let cleanup = completed
         .op
         .as_mut()
-        .map(|op| unsafe { (op.vtable.orphan_cleanup)(op, cqe_res) })
+        .map(|op| op.orphan_cleanup(cqe_res))
         .unwrap_or_default();
     let (payload, detail) = completed.take_completion_data();
     let _ = completed.take_op();

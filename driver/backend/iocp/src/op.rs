@@ -114,7 +114,19 @@ pub struct IocpKernelOp {
     pub(crate) payload: IocpOpPayload,
 }
 
-impl PlatformOp for IocpKernelOp {}
+impl PlatformOp for IocpKernelOp {
+    type CleanupContext<'a> = &'a IocpResult<usize>;
+
+    #[inline]
+    fn completion_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        unsafe { (self.vtable.completion_cleanup)(self, result) }
+    }
+
+    #[inline]
+    fn orphan_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        unsafe { (self.vtable.orphan_cleanup)(self, result) }
+    }
+}
 
 impl IocpKernelOp {
     pub(crate) fn bind_user_payload(&mut self, erased: &mut IocpUserPayload) -> IocpResult<()> {
@@ -141,11 +153,11 @@ impl IocpKernelOp {
         &mut self,
         result: &IocpResult<usize>,
     ) -> CompletionCleanupGuard {
-        unsafe { (self.vtable.completion_cleanup)(self, result) }
+        PlatformOp::completion_cleanup(self, result)
     }
 
     pub(crate) fn orphan_cleanup(&mut self, result: &IocpResult<usize>) -> CompletionCleanupGuard {
-        unsafe { (self.vtable.orphan_cleanup)(self, result) }
+        PlatformOp::orphan_cleanup(self, result)
     }
 }
 

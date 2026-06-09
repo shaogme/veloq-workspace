@@ -159,7 +159,11 @@ where
         | CompletionAnomalyReason::NonActiveSlot
         | CompletionAnomalyReason::SlotCorruption
         | CompletionAnomalyReason::OpMissing
-        | CompletionAnomalyReason::BackendInvariantBroken => LostReason::Other,
+        | CompletionAnomalyReason::BackendInvariantBroken
+        | CompletionAnomalyReason::CompletionKeyMismatch
+        | CompletionAnomalyReason::FinalizeFailed
+        | CompletionAnomalyReason::CancelAckTargetStillActive
+        | CompletionAnomalyReason::BackendContextUnknown => LostReason::Other,
     };
 
     let mut report = DriverCoreError::Internal

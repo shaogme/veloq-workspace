@@ -15,6 +15,7 @@ use veloq_driver_core::slot::{
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::config::IoFd;
+use crate::driver::completion::{finalize_corrupt_iocp_checked, finalize_waiting_iocp_checked};
 use crate::driver::{
     CompletionSidecar, IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult,
     IocpOpRegistry,
@@ -160,7 +161,13 @@ impl<'a> IocpDriver<'a> {
                         ctx.diagnostics,
                         completion_record(sidecar),
                     );
-                    let _ = ops.finalize_waiting_completion(token);
+                    let _ = finalize_waiting_iocp_checked(
+                        ops,
+                        ctx.diagnostics,
+                        token,
+                        event_res,
+                        "iocp.handle_offload.waiting",
+                    );
                 } else {
                     drop(detail);
                     let raw = RawCompletion::new(
@@ -185,7 +192,13 @@ impl<'a> IocpDriver<'a> {
                         anomaly,
                         CompletionCleanupGuard::default(),
                     );
-                    let _ = ops.finalize_corrupt_slot(snapshot);
+                    let _ = finalize_corrupt_iocp_checked(
+                        ops,
+                        ctx.diagnostics,
+                        snapshot,
+                        raw.res,
+                        "iocp.handle_offload.waiting_lost",
+                    );
                 }
             }
             return Err(IocpError::Submission.report("iocp/driver", "thread pool overloaded"));

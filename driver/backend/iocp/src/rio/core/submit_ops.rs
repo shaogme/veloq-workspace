@@ -13,13 +13,13 @@ pub(crate) use dispatch::*;
 
 use crate::BufferRegistrationMode;
 use crate::config::BorrowedRawHandle;
+use crate::driver::IocpDriverCompletionDiagnostics;
 use crate::ext::Extensions;
 use crate::op::SubmissionResult;
 use crate::rio::core::registry::{RioRegistry, RioSubmissionKind};
 use crate::rio::core::{RioAddressPolicy, RioOpKind, RioSubmitPlan};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::{RioState, RioTarget};
-use crate::driver::IocpDriverCompletionDiagnostics;
 
 impl RioState {
     pub(crate) fn new(

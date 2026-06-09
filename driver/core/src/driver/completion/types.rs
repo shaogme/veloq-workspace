@@ -169,6 +169,10 @@ pub enum CompletionAnomalyReason {
     OpMissing,
     PayloadMissing,
     BackendInvariantBroken,
+    CompletionKeyMismatch,
+    FinalizeFailed,
+    CancelAckTargetStillActive,
+    BackendContextUnknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,6 +457,89 @@ impl CompletionAnomaly {
     }
 
     #[inline]
+    pub fn completion_key_mismatch(
+        token: CompletionToken,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: Some(generation),
+            state: Some(state),
+            backend: None,
+            backend_context: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::CompletionKeyMismatch,
+        }
+    }
+
+    #[inline]
+    pub fn finalize_failed(
+        token: CompletionToken,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: Some(generation),
+            state: Some(state),
+            backend: None,
+            backend_context: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::FinalizeFailed,
+        }
+    }
+
+    #[inline]
+    pub fn cancel_ack_target_still_active(
+        token: CompletionToken,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: Some(generation),
+            state: Some(state),
+            backend: None,
+            backend_context: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::CancelAckTargetStillActive,
+        }
+    }
+
+    #[inline]
+    pub fn backend_context_unknown(token: CompletionToken) -> Self {
+        Self {
+            token,
+            index: None,
+            expected_generation: None,
+            actual_generation: None,
+            state: None,
+            backend: None,
+            backend_context: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::BackendContextUnknown,
+        }
+    }
+
+    #[inline]
     pub fn with_backend(mut self, backend: CompletionBackend) -> Self {
         self.backend = Some(backend);
         self
@@ -645,6 +732,10 @@ where
             | CompletionAnomalyReason::NonActiveSlot => self.inc_unknown_completion(),
             CompletionAnomalyReason::ControlCompletionUntracked
             | CompletionAnomalyReason::BackendInvariantBroken
+            | CompletionAnomalyReason::CompletionKeyMismatch
+            | CompletionAnomalyReason::FinalizeFailed
+            | CompletionAnomalyReason::CancelAckTargetStillActive
+            | CompletionAnomalyReason::BackendContextUnknown
             | CompletionAnomalyReason::RioMalformedContext
             | CompletionAnomalyReason::RioMissingContext
             | CompletionAnomalyReason::RioStaleContext => self.inc_internal_unknown(),

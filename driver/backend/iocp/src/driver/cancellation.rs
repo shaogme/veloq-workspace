@@ -9,7 +9,7 @@ use veloq_driver_core::driver::{
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
-use crate::driver::completion::EmitContext;
+use crate::driver::completion::{EmitContext, finalize_corrupt_iocp_checked};
 use crate::driver::{
     CompletionSidecar, IocpDriver, IocpDriverCompletionDiagnostics, IocpOpRegistry,
 };
@@ -127,6 +127,17 @@ impl<'a> IocpDriver<'a> {
                             snapshot = ?anomaly.slot_snapshot,
                             "IOCP cancel request found corrupt slot"
                         );
+                        if let Some(snapshot) = anomaly.slot_snapshot {
+                            self.release_socket_inflight_for_op(snapshot.index);
+                            let _ = finalize_corrupt_iocp_checked(
+                                &mut self.ops,
+                                &self.completion_diagnostics,
+                                snapshot,
+                                raw.res,
+                                "iocp.cancel_op_internal.corrupt",
+                            );
+                            self.drain_deferred_socket_cleanup();
+                        }
                         Ok(CancelSubmitOutcome::TargetMissing)
                     }
                     _ => {

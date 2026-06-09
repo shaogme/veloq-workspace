@@ -467,5 +467,4 @@ impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver<'_> 
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.registration_stats.chunk_register_attempts
     }
-
 }

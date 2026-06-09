@@ -6,8 +6,8 @@ use tracing::{debug, error, trace};
 use veloq_driver_core::driver::{
     CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, CompletionAnomalyReason,
     CompletionBackend, CompletionCleanupGuard, CompletionSidecar, CompletionToken, OpToken,
-    RawCompletion, UserCompletionEvent, record_completion_anomaly, record_lost_completion,
-    run_completion_cleanup, slot_view_anomaly,
+    PlatformOp, RawCompletion, UserCompletionEvent, record_completion_anomaly,
+    record_lost_completion, run_completion_cleanup, slot_view_anomaly,
 };
 
 use crate::op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt, UringUserPayload};
@@ -183,9 +183,9 @@ impl<'a> UringDriver<'a> {
                         .as_mut()
                         .map(|op| {
                             if request.mode == CancelMode::Abandon {
-                                unsafe { (op.vtable.orphan_cleanup)(op, cancel_res) }
+                                op.orphan_cleanup(cancel_res)
                             } else {
-                                unsafe { (op.vtable.completion_cleanup)(op, cancel_res) }
+                                op.completion_cleanup(cancel_res)
                             }
                         })
                         .unwrap_or_default();
@@ -537,7 +537,7 @@ impl<'a> UringDriver<'a> {
             let cleanup = completed
                 .op
                 .as_mut()
-                .map(|op| unsafe { (op.vtable.completion_cleanup)(op, event_res) })
+                .map(|op| op.completion_cleanup(event_res))
                 .unwrap_or_default();
             let _ = completed.take_op();
             let (payload, detail) = completed.take_completion_data();
@@ -600,9 +600,9 @@ fn cancel_slot_immediate<'a, S: SlotState>(
             if mode == CancelMode::Abandon
                 || snapshot.state == veloq_driver_core::slot::SlotState::InFlightOrphaned
             {
-                unsafe { (op.vtable.orphan_cleanup)(op, -libc::ECANCELED) }
+                op.orphan_cleanup(-libc::ECANCELED)
             } else {
-                unsafe { (op.vtable.completion_cleanup)(op, -libc::ECANCELED) }
+                op.completion_cleanup(-libc::ECANCELED)
             }
         })
         .unwrap_or_default();
