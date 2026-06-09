@@ -3,7 +3,8 @@ use tracing::{debug, warn};
 use veloq_driver_core::driver::{
     CancelMode, CancelRequest, CancelSubmitOutcome, CompletionAnomalyReason, CompletionBackend,
     CompletionCleanupGuard, CompletionToken, OpToken, RawCompletion, RecordCompletionOutcome,
-    record_completion_anomaly, run_completion_cleanup, slot_view_anomaly,
+    UserCompletionEvent, record_completion_anomaly, record_lost_completion, run_completion_cleanup,
+    slot_view_anomaly,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
@@ -99,7 +100,7 @@ impl<'a> IocpDriver<'a> {
                     Ok(_) => return Ok(CancelSubmitOutcome::TargetMissing),
                     Err(anomaly) => anomaly,
                 };
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 match anomaly.reason {
                     CompletionAnomalyReason::StaleGeneration => {
                         debug!(
@@ -264,8 +265,10 @@ impl<'a> IocpDriver<'a> {
             .set_error_code(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
             .attach_note("operation aborted locally"));
         let mut cleanup = CompletionCleanupGuard::default();
+        let mut snapshot = None;
         let inflight = match ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(guard)) => {
+                snapshot = Some(guard.snapshot());
                 let mut guard = guard.complete();
                 cleanup = guard
                     .op
@@ -282,6 +285,7 @@ impl<'a> IocpDriver<'a> {
                 Some(guard.take_completion_data())
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(guard)) => {
+                snapshot = Some(guard.snapshot());
                 let mut guard = guard.complete();
                 cleanup = guard
                     .op
@@ -292,6 +296,7 @@ impl<'a> IocpDriver<'a> {
                 Some(guard.take_completion_data())
             }
             CheckedSlotView::Valid(SlotView::Reserved(guard)) => {
+                snapshot = Some(guard.snapshot());
                 cleanup = guard
                     .op
                     .as_mut()
@@ -317,22 +322,65 @@ impl<'a> IocpDriver<'a> {
         };
 
         let outcome = if emit_completion {
-            let payload = payload.expect("aborted IOCP slot payload should remain present");
-            Some(push_completion_shared(
-                ctx.completion_table,
-                diagnostics,
-                completion_record(CompletionSidecar::new(
-                    token,
+            if let Some(payload) = payload {
+                Some(push_completion_shared(
+                    ctx.completion_table,
+                    diagnostics,
+                    completion_record(CompletionSidecar::new(
+                        UserCompletionEvent::from_parts(
+                            CompletionBackend::Iocp,
+                            token,
+                            -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                            0,
+                        ),
+                        payload,
+                        detail,
+                        cleanup,
+                    )),
+                ))
+            } else if let Some(snapshot) = snapshot {
+                drop(detail);
+                let raw = RawCompletion::new(
+                    CompletionBackend::Iocp,
+                    CompletionToken::user(token),
                     -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
                     0,
-                    payload,
-                    detail,
+                );
+                let anomaly = veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                Some(record_lost_completion(
+                    ctx.completion_table,
+                    diagnostics,
+                    UserCompletionEvent::from_parts(
+                        CompletionBackend::Iocp,
+                        token,
+                        raw.res,
+                        raw.flags,
+                    ),
+                    anomaly,
                     cleanup,
-                )),
-            ))
+                ))
+            } else {
+                drop(detail);
+                None
+            }
         } else {
+            let payload_missing = payload.is_none();
             drop(payload);
             drop(detail);
+            if payload_missing && let Some(snapshot) = snapshot {
+                let raw = RawCompletion::new(
+                    CompletionBackend::Iocp,
+                    CompletionToken::user(token),
+                    -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                    0,
+                );
+                let anomaly = veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                record_completion_anomaly(diagnostics, &anomaly);
+            }
             let _ = run_completion_cleanup(diagnostics, &mut cleanup);
             None
         };

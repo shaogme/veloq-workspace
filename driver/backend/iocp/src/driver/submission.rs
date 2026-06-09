@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
-    CompletionCleanupGuard, CompletionToken, DriverCompletionDiagnostics, DriverSubmitResult,
-    OpToken, SharedCompletionTable, SubmitStatus,
+    CompletionBackend, CompletionCleanupGuard, CompletionToken, DriverCompletionDiagnostics,
+    DriverSubmitResult, OpToken, RawCompletion, SharedCompletionTable, SubmitStatus,
+    UserCompletionEvent, record_completion_anomaly,
 };
 use veloq_driver_core::slot::{
     CheckedSlotView, Reserved, SlotAccessError, SlotRegistryExt, SlotView,
@@ -134,24 +135,44 @@ impl<'a> IocpDriver<'a> {
             if let CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) =
                 ops.checked_slot_view(token)
             {
+                let snapshot = slot.snapshot();
                 let mut guard = slot.complete();
                 let _ = guard.take_op();
                 let (payload, detail) = guard.take_completion_data();
-                let payload = payload.expect("checked IOCP offload payload should remain present");
-                let sidecar = CompletionSidecar::new(
-                    token,
-                    iocp_fallback_event_res(IocpError::Submission),
-                    0,
-                    payload,
-                    detail,
-                    CompletionCleanupGuard::default(),
-                );
-                push_completion_shared(
-                    ctx.completion_table,
-                    ctx.diagnostics,
-                    completion_record(sidecar),
-                );
-                let _ = ops.finalize_waiting_completion(token);
+                let event_res = iocp_fallback_event_res(IocpError::Submission);
+                if let Some(payload) = payload {
+                    let sidecar = CompletionSidecar::new(
+                        UserCompletionEvent::from_parts(
+                            CompletionBackend::Iocp,
+                            token,
+                            event_res,
+                            0,
+                        ),
+                        payload,
+                        detail,
+                        CompletionCleanupGuard::default(),
+                    );
+                    push_completion_shared(
+                        ctx.completion_table,
+                        ctx.diagnostics,
+                        completion_record(sidecar),
+                    );
+                    let _ = ops.finalize_waiting_completion(token);
+                } else {
+                    drop(detail);
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(token),
+                        event_res,
+                        0,
+                    );
+                    let anomaly =
+                        veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
+                            .with_slot_snapshot(snapshot)
+                            .with_raw_completion(raw);
+                    record_completion_anomaly(ctx.diagnostics, &anomaly);
+                    let _ = ops.finalize_corrupt_slot(snapshot);
+                }
             }
             return Err(IocpError::Submission.report("iocp/driver", "thread pool overloaded"));
         }

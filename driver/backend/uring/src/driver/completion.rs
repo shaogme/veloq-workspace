@@ -9,10 +9,11 @@ use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_e
 use crate::op::{CheckedSlotView, Slot, SlotView, UringOpRegistryExt, UringUserPayload};
 use veloq_driver_core::driver::{
     CancelAck, CancelCompletionId, CompletionAnomaly, CompletionAnomalyReason, CompletionBackend,
-    CompletionCleanupGuard, CompletionDispatch, CompletionEvent, CompletionSidecar,
-    CompletionToken, OpToken, RawCompletion, RoutedSlotCompletion, dispatch_raw_completion,
+    CompletionCleanupGuard, CompletionDispatch, CompletionSidecar, CompletionToken, OpToken,
+    RawCompletion, RoutedSlotCompletion, UserCompletionEvent, dispatch_raw_completion,
     drain_cancel_requests, record_completion_anomaly, record_lost_completion,
     record_user_completion, route_user_completion, run_completion_cleanup, slot_view_anomaly,
+    unknown_completion_anomaly,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -98,12 +99,27 @@ impl<'a> UringDriver<'a> {
         snapshot: veloq_driver_core::slot::SlotSnapshot,
         context: &'static str,
     ) {
-        if self.ops.finalize_corrupt_slot(snapshot).is_none() {
-            self.record_finalize_failure(
-                OpToken::from_registry_parts(snapshot.index, snapshot.generation)
-                    .expect("slot snapshot token should be encodable"),
+        let Ok(token) = snapshot.try_token() else {
+            let anomaly = CompletionAnomaly::backend_invariant_broken(
+                CompletionToken::from_raw(snapshot.index as u64),
+                snapshot.index,
+                snapshot.generation,
+                snapshot.state,
+            )
+            .with_slot_snapshot(snapshot)
+            .with_backend(CompletionBackend::Uring);
+            record_completion_anomaly(&self.completion_diagnostics, &anomaly);
+            debug!(
+                user_data = snapshot.index,
+                generation = snapshot.generation,
                 context,
+                reason = ?anomaly.reason,
+                "uring finalize corrupt slot found unencodable snapshot token"
             );
+            return;
+        };
+        if self.ops.finalize_corrupt_slot(snapshot).is_none() {
+            self.record_finalize_failure(token, context);
         }
     }
 
@@ -137,7 +153,7 @@ impl<'a> UringDriver<'a> {
             }
             Err(anomaly) => anomaly,
         };
-        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+        record_completion_anomaly(&self.completion_diagnostics, &anomaly);
         debug!(
             user_data = token.index(),
             generation = token.generation(),
@@ -226,9 +242,7 @@ impl<'a> UringDriver<'a> {
                         };
 
                         Some(CompletionSidecar::<UringUserPayload, UringError>::new(
-                            token,
-                            0,
-                            0,
+                            UserCompletionEvent::from_parts(CompletionBackend::Uring, token, 0, 0),
                             payload,
                             detail,
                             CompletionCleanupGuard::default(),
@@ -237,8 +251,7 @@ impl<'a> UringDriver<'a> {
                     SlotView::InFlightOrphaned(mut slot) => {
                         slot.platform_mut().timer_id = None;
                         let mut cleanup = cleanup_orphaned_slot(slot, 0);
-                        let _ =
-                            run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                        let _ = run_completion_cleanup(&self.completion_diagnostics, &mut cleanup);
                         self.finalize_orphaned_completion_checked(
                             token,
                             "uring.advance_timers.orphaned",
@@ -270,7 +283,7 @@ impl<'a> UringDriver<'a> {
                     ) {
                         self.emit_corrupt_completion(anomaly, "timer found corrupt slot");
                     } else {
-                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                        record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                     }
                     None
                 }
@@ -323,8 +336,8 @@ impl<'a> UringDriver<'a> {
         let mut progress = CompletionProgress::default();
         for (raw_token, cqe_res, cqe_flags) in cqes {
             match dispatch_raw_completion(CompletionBackend::Uring, raw_token, cqe_res, cqe_flags) {
-                CompletionDispatch::User { token, raw } => {
-                    progress.merge(self.handle_user_completion(token, raw));
+                CompletionDispatch::User { event } => {
+                    progress.merge(self.handle_user_completion(event));
                 }
                 CompletionDispatch::Waker { raw, .. } => {
                     progress.internal += 1;
@@ -334,11 +347,23 @@ impl<'a> UringDriver<'a> {
                     progress.internal += 1;
                     self.handle_cancel_completion(id, raw);
                 }
-                CompletionDispatch::RioWake { raw, .. } | CompletionDispatch::Unknown { raw } => {
+                CompletionDispatch::RioWake { raw, .. } => {
                     progress.anomaly += 1;
                     let anomaly =
                         CompletionAnomaly::unknown_control(raw.token).with_raw_completion(raw);
-                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                    record_completion_anomaly(&self.completion_diagnostics, &anomaly);
+                    debug!(
+                        token = raw.token.raw(),
+                        res = raw.res,
+                        flags = raw.flags,
+                        "unknown uring completion token"
+                    );
+                }
+                CompletionDispatch::Unknown { envelope } => {
+                    progress.anomaly += 1;
+                    let raw = envelope.raw;
+                    let anomaly = unknown_completion_anomaly(envelope);
+                    record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                     debug!(
                         token = raw.token.raw(),
                         res = raw.res,
@@ -352,9 +377,11 @@ impl<'a> UringDriver<'a> {
         Ok(progress)
     }
 
-    fn handle_user_completion(&mut self, token: OpToken, raw: RawCompletion) -> CompletionProgress {
+    fn handle_user_completion(&mut self, event: UserCompletionEvent) -> CompletionProgress {
+        let token = event.token();
+        let raw = event.raw();
         let (user_data, generation) = token.parts();
-        match route_user_completion(token, raw, self.ops.checked_slot_view(token)) {
+        match route_user_completion(event, self.ops.checked_slot_view(token)) {
             RoutedSlotCompletion::Waiting(slot) => match complete_waiting_slot(slot, token, raw) {
                 CompleteWaitingSlotOutcome::User(sidecar) => {
                     self.push_completion_event(sidecar);
@@ -371,9 +398,8 @@ impl<'a> UringDriver<'a> {
                 } => {
                     let _ = record_lost_completion(
                         &self.completion_table,
-                        &mut self.completion_diagnostics,
-                        token,
-                        raw.event(),
+                        &self.completion_diagnostics,
+                        event,
                         anomaly,
                         cleanup,
                     );
@@ -386,7 +412,7 @@ impl<'a> UringDriver<'a> {
             },
             RoutedSlotCompletion::Orphaned(slot) => {
                 let mut cleanup = cleanup_orphaned_slot(slot, raw.res);
-                let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                let _ = run_completion_cleanup(&self.completion_diagnostics, &mut cleanup);
                 self.finalize_orphaned_completion_checked(
                     token,
                     "uring.handle_user_completion.orphaned",
@@ -398,12 +424,12 @@ impl<'a> UringDriver<'a> {
                 CompletionProgress::anomaly()
             }
             RoutedSlotCompletion::Missing(anomaly) => {
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 debug!(user_data, generation, "completion for missing slot");
                 CompletionProgress::anomaly()
             }
             RoutedSlotCompletion::Empty(anomaly) => {
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 debug!(
                     user_data,
                     generation,
@@ -413,7 +439,7 @@ impl<'a> UringDriver<'a> {
                 CompletionProgress::anomaly()
             }
             RoutedSlotCompletion::Stale(anomaly) => {
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 debug!(
                     user_data,
                     generation,
@@ -435,7 +461,7 @@ impl<'a> UringDriver<'a> {
         let Some(request) = request else {
             let anomaly =
                 CompletionAnomaly::control_completion_untracked(raw.token).with_raw_completion(raw);
-            record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+            record_completion_anomaly(&self.completion_diagnostics, &anomaly);
             debug!(
                 cancel_id = cancel_id.raw(),
                 result = raw.res,
@@ -477,7 +503,7 @@ impl<'a> UringDriver<'a> {
                     )
                     .with_slot_snapshot(snapshot)
                     .with_raw_completion(target_raw);
-                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                    record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                     debug!(
                         cancel_id = cancel_id.raw(),
                         request = ?request,
@@ -542,7 +568,11 @@ impl<'a> UringDriver<'a> {
 
     fn emit_corrupt_completion(&mut self, anomaly: CompletionAnomaly, note: &'static str) {
         let Some(snapshot) = anomaly.slot_snapshot else {
-            record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+            record_completion_anomaly(&self.completion_diagnostics, &anomaly);
+            return;
+        };
+        let Ok(token) = snapshot.try_token() else {
+            record_completion_anomaly(&self.completion_diagnostics, &anomaly);
             return;
         };
         let raw_res = anomaly.raw_result.unwrap_or(-libc::EIO);
@@ -559,17 +589,12 @@ impl<'a> UringDriver<'a> {
 
         let (payload, detail) = self
             .ops
-            .with_slot_storage_mut(
-                OpToken::from_registry_parts(snapshot.index, snapshot.generation)
-                    .expect("slot snapshot token should be encodable"),
-                |result, payload, _sidecar| (payload.take(), result.take()),
-            )
+            .with_slot_storage_mut(token, |result, payload, _sidecar| {
+                (payload.take(), result.take())
+            })
             .unwrap_or((None, None));
         let mut cleanup = CompletionCleanupGuard::default();
-        if let Some((_, _, op, _)) = self.ops.active_slot_bundle_mut(
-            OpToken::from_registry_parts(snapshot.index, snapshot.generation)
-                .expect("slot snapshot token should be encodable"),
-        ) {
+        if let Some((_, _, op, _)) = self.ops.active_slot_bundle_mut(token) {
             if let Some(op_ref) = op.as_mut() {
                 cleanup = unsafe { (op_ref.vtable.completion_cleanup)(op_ref, raw_res) };
             }
@@ -590,16 +615,11 @@ impl<'a> UringDriver<'a> {
         drop(payload);
         drop(detail);
 
-        let event = CompletionEvent {
-            token: anomaly.token,
-            res: -libc::EIO,
-            flags,
-        };
+        let event =
+            UserCompletionEvent::from_parts(CompletionBackend::Uring, token, -libc::EIO, flags);
         let _ = record_lost_completion(
             &self.completion_table,
-            &mut self.completion_diagnostics,
-            OpToken::from_registry_parts(snapshot.index, snapshot.generation)
-                .expect("slot snapshot token should be encodable"),
+            &self.completion_diagnostics,
             event,
             anomaly,
             cleanup,
@@ -612,11 +632,8 @@ impl<'a> UringDriver<'a> {
         sidecar: CompletionSidecar<UringUserPayload, UringError>,
     ) {
         let packet = sidecar.into_packet();
-        let _ = record_user_completion(
-            &self.completion_table,
-            &mut self.completion_diagnostics,
-            packet,
-        );
+        let _ =
+            record_user_completion(&self.completion_table, &self.completion_diagnostics, packet);
     }
 }
 
@@ -654,7 +671,10 @@ fn complete_waiting_slot(
     let res_code = driver_result_to_event_res(&final_res);
 
     let (payload, mut detail) = completed.take_completion_data();
-    let payload = payload.expect("checked waiting slot payload should remain present");
+    let Some(payload) = payload else {
+        drop(detail);
+        return lost_completed_slot_completion(completed, raw, cleanup);
+    };
     if detail.is_none()
         && let Err(err) = final_res
     {
@@ -663,24 +683,36 @@ fn complete_waiting_slot(
     let _ = completed.take_op();
 
     CompleteWaitingSlotOutcome::User(CompletionSidecar::<UringUserPayload, UringError>::new(
-        token, res_code, raw.flags, payload, detail, cleanup,
+        UserCompletionEvent::from_parts(CompletionBackend::Uring, token, res_code, raw.flags),
+        payload,
+        detail,
+        cleanup,
     ))
 }
 
 fn lost_waiting_slot_completion(
-    slot: Slot<'_, veloq_driver_core::slot::InFlightWaiting>,
+    slot: impl LostWaitingSlot,
     raw: RawCompletion,
 ) -> CompleteWaitingSlotOutcome {
+    let (snapshot, cleanup) = slot.finish_lost(raw.res);
+    let anomaly = veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
+        .with_slot_snapshot(snapshot)
+        .with_raw_completion(raw);
+    CompleteWaitingSlotOutcome::Lost {
+        anomaly,
+        cleanup,
+        snapshot,
+    }
+}
+
+fn lost_completed_slot_completion(
+    mut slot: Slot<'_, veloq_driver_core::slot::Completed>,
+    raw: RawCompletion,
+    cleanup: CompletionCleanupGuard,
+) -> CompleteWaitingSlotOutcome {
     let snapshot = slot.snapshot();
-    let cleanup = slot
-        .op
-        .as_mut()
-        .map(|op| unsafe { (op.vtable.completion_cleanup)(op, raw.res) })
-        .unwrap_or_default();
-    let (payload, detail) = slot
-        .storage
-        .with_mut(|result, payload, _sidecar| (payload.take(), result.take()));
-    let _ = slot.op.take();
+    let (payload, detail) = slot.take_completion_data();
+    let _ = slot.take_op();
     drop(payload);
     drop(detail);
     let anomaly = veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
@@ -690,6 +722,40 @@ fn lost_waiting_slot_completion(
         anomaly,
         cleanup,
         snapshot,
+    }
+}
+
+trait LostWaitingSlot {
+    fn finish_lost(
+        self,
+        res: i32,
+    ) -> (
+        veloq_driver_core::slot::SlotSnapshot,
+        CompletionCleanupGuard,
+    );
+}
+
+impl<'a> LostWaitingSlot for Slot<'a, veloq_driver_core::slot::InFlightWaiting> {
+    fn finish_lost(
+        self,
+        res: i32,
+    ) -> (
+        veloq_driver_core::slot::SlotSnapshot,
+        CompletionCleanupGuard,
+    ) {
+        let snapshot = self.snapshot();
+        let cleanup = self
+            .op
+            .as_mut()
+            .map(|op| unsafe { (op.vtable.completion_cleanup)(op, res) })
+            .unwrap_or_default();
+        let (payload, detail) = self
+            .storage
+            .with_mut(|result, payload, _sidecar| (payload.take(), result.take()));
+        let _ = self.op.take();
+        drop(payload);
+        drop(detail);
+        (snapshot, cleanup)
     }
 }
 

@@ -115,10 +115,84 @@ impl RawCompletion {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionDispatch {
-    User {
+pub struct UserCompletionEvent {
+    token: OpToken,
+    raw: RawCompletion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserCompletionEventMismatch {
+    pub token: OpToken,
+    pub expected: CompletionToken,
+    pub actual: CompletionToken,
+}
+
+impl UserCompletionEvent {
+    #[inline]
+    pub fn try_new(
         token: OpToken,
         raw: RawCompletion,
+    ) -> Result<Self, UserCompletionEventMismatch> {
+        let expected = CompletionToken::user(token);
+        if raw.token != expected {
+            return Err(UserCompletionEventMismatch {
+                token,
+                expected,
+                actual: raw.token,
+            });
+        }
+        Ok(Self { token, raw })
+    }
+
+    #[inline]
+    pub fn from_parts(backend: CompletionBackend, token: OpToken, res: i32, flags: u32) -> Self {
+        Self {
+            token,
+            raw: RawCompletion::new(backend, CompletionToken::user(token), res, flags),
+        }
+    }
+
+    #[inline]
+    fn from_classified(token: OpToken, raw: RawCompletion) -> Self {
+        debug_assert_eq!(raw.token, CompletionToken::user(token));
+        Self { token, raw }
+    }
+
+    #[inline]
+    pub const fn token(self) -> OpToken {
+        self.token
+    }
+
+    #[inline]
+    pub const fn raw(self) -> RawCompletion {
+        self.raw
+    }
+
+    #[inline]
+    pub const fn completion_token(self) -> CompletionToken {
+        self.raw.token
+    }
+
+    #[inline]
+    pub const fn res(self) -> i32 {
+        self.raw.res
+    }
+
+    #[inline]
+    pub const fn flags(self) -> u32 {
+        self.raw.flags
+    }
+
+    #[inline]
+    pub const fn event(self) -> CompletionEvent {
+        self.raw.event()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionDispatch {
+    User {
+        event: UserCompletionEvent,
     },
     Waker {
         id: u16,
@@ -133,7 +207,7 @@ pub enum CompletionDispatch {
         raw: RawCompletion,
     },
     Unknown {
-        raw: RawCompletion,
+        envelope: CompletionEnvelope,
     },
 }
 
@@ -222,6 +296,28 @@ impl<'a, Spec: slot::SlotSpec> RoutedSlotCompletion<'a, Spec> {
     }
 }
 
+pub enum SlotExtractionOutcome<T> {
+    Extracted(T),
+    Lost {
+        anomaly: CompletionAnomaly,
+        cleanup: CompletionCleanupGuard,
+        snapshot: slot::SlotSnapshot,
+    },
+}
+
+impl<T> SlotExtractionOutcome<T> {
+    #[inline]
+    pub const fn is_extracted(&self) -> bool {
+        matches!(self, Self::Extracted(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    Finalized,
+    Missing(CompletionAnomaly),
+}
+
 #[inline]
 pub fn dispatch_raw_completion(
     backend: CompletionBackend,
@@ -232,12 +328,14 @@ pub fn dispatch_raw_completion(
     let raw = RawCompletion::new(backend, CompletionToken::from_raw(raw_token), res, flags);
     let envelope = CompletionEnvelope::from_raw(raw);
     match envelope.identity {
-        CompletionIdentity::User(token) => CompletionDispatch::User { token, raw },
+        CompletionIdentity::User(token) => CompletionDispatch::User {
+            event: UserCompletionEvent::from_classified(token, raw),
+        },
         CompletionIdentity::Waker(id) => CompletionDispatch::Waker { id, raw },
         CompletionIdentity::Cancel(id) => CompletionDispatch::Cancel { id, raw },
         CompletionIdentity::RioWake(id) => CompletionDispatch::RioWake { id, raw },
         CompletionIdentity::UnknownControl { .. } | CompletionIdentity::BackendContext { .. } => {
-            CompletionDispatch::Unknown { raw }
+            CompletionDispatch::Unknown { envelope }
         }
     }
 }
@@ -246,6 +344,25 @@ impl CompletionAnomaly {
     #[inline]
     pub fn with_raw_completion(self, raw: RawCompletion) -> Self {
         self.with_backend(raw.backend).with_event(raw.event())
+    }
+}
+
+#[inline]
+pub fn unknown_completion_anomaly(envelope: CompletionEnvelope) -> CompletionAnomaly {
+    let anomaly =
+        CompletionAnomaly::unknown_control(envelope.raw.token).with_raw_completion(envelope.raw);
+    match envelope.identity {
+        CompletionIdentity::BackendContext {
+            backend,
+            raw_context,
+        } => anomaly
+            .with_backend(backend)
+            .with_backend_context(raw_context),
+        CompletionIdentity::UnknownControl { .. }
+        | CompletionIdentity::User(_)
+        | CompletionIdentity::Waker(_)
+        | CompletionIdentity::Cancel(_)
+        | CompletionIdentity::RioWake(_) => anomaly,
     }
 }
 
@@ -403,10 +520,11 @@ impl CompletionToken {
 
 #[inline]
 pub fn route_user_completion<'a, Spec: slot::SlotSpec>(
-    token: OpToken,
-    raw: RawCompletion,
+    event: UserCompletionEvent,
     view: CheckedSlotView<'a, Spec>,
 ) -> RoutedSlotCompletion<'a, Spec> {
+    let token = event.token();
+    let raw = event.raw();
     match slot_view_anomaly(raw.backend, token, raw, view) {
         Ok(SlotView::InFlightWaiting(slot)) => RoutedSlotCompletion::Waiting(slot),
         Ok(SlotView::InFlightOrphaned(slot)) => RoutedSlotCompletion::Orphaned(slot),
@@ -486,6 +604,28 @@ pub fn corrupt_slot_anomaly(
     }
 }
 
+#[inline]
+pub fn slot_access_anomaly(raw: RawCompletion, access: slot::SlotAccessError) -> CompletionAnomaly {
+    let snapshot = access.snapshot;
+    let anomaly = match access.reason {
+        slot::SlotAccessErrorReason::MissingOp => {
+            CompletionAnomaly::op_missing(raw.token, snapshot.index, snapshot.generation)
+        }
+        slot::SlotAccessErrorReason::MissingPayload => {
+            CompletionAnomaly::payload_missing(raw.token, snapshot.index, snapshot.generation)
+        }
+        slot::SlotAccessErrorReason::UnexpectedOp => CompletionAnomaly::backend_invariant_broken(
+            raw.token,
+            snapshot.index,
+            snapshot.generation,
+            snapshot.state,
+        ),
+    };
+    anomaly
+        .with_slot_snapshot(snapshot)
+        .with_raw_completion(raw)
+}
+
 impl From<u64> for CompletionToken {
     #[inline]
     fn from(value: u64) -> Self {
@@ -548,17 +688,14 @@ pub enum CancelAck {
 }
 
 pub struct CompletionSidecar<UP, E, R = usize> {
-    pub token: OpToken,
-    pub res: i32,
-    pub flags: u32,
+    pub event: UserCompletionEvent,
     pub payload: UP,
     pub detail: Option<DriverResult<R, E>>,
     pub cleanup: CompletionCleanupGuard,
 }
 
 pub struct CompletionPacket<UP, E, R = usize> {
-    pub token: OpToken,
-    pub event: CompletionEvent,
+    pub event: UserCompletionEvent,
     pub input: CompletionInput<UP, E, R>,
 }
 
@@ -599,14 +736,12 @@ impl<UP, E, R> CompletionInput<UP, E, R> {
 impl<UP, E, R> CompletionPacket<UP, E, R> {
     #[inline]
     pub fn user_event(
-        token: OpToken,
-        event: CompletionEvent,
+        event: UserCompletionEvent,
         payload: UP,
         detail: Option<DriverResult<R, E>>,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
         Self {
-            token,
             event,
             input: CompletionInput::User(UserCompletion {
                 payload,
@@ -618,73 +753,56 @@ impl<UP, E, R> CompletionPacket<UP, E, R> {
 
     #[inline]
     pub fn user(
-        token: OpToken,
-        res: i32,
-        flags: u32,
+        event: UserCompletionEvent,
         payload: UP,
         detail: Option<DriverResult<R, E>>,
     ) -> Self {
-        Self::user_with_cleanup(
-            token,
-            res,
-            flags,
-            payload,
-            detail,
-            CompletionCleanupGuard::default(),
-        )
+        Self::user_event(event, payload, detail, CompletionCleanupGuard::default())
     }
 
     #[inline]
     pub fn user_with_cleanup(
-        token: OpToken,
-        res: i32,
-        flags: u32,
+        event: UserCompletionEvent,
         payload: UP,
         detail: Option<DriverResult<R, E>>,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
-        Self::user_event(
-            token,
-            CompletionEvent {
-                token: CompletionToken::user(token),
-                res,
-                flags,
-            },
-            payload,
-            detail,
-            cleanup,
-        )
+        Self::user_event(event, payload, detail, cleanup)
     }
 
     #[inline]
     pub fn lost(
-        token: OpToken,
-        event: CompletionEvent,
+        event: UserCompletionEvent,
         anomaly: CompletionAnomaly,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
         Self {
-            token,
             event,
             input: CompletionInput::Lost(CompletionLoss { anomaly, cleanup }),
         }
+    }
+
+    #[inline]
+    pub const fn token(&self) -> OpToken {
+        self.event.token()
+    }
+
+    #[inline]
+    pub const fn completion_event(&self) -> CompletionEvent {
+        self.event.event()
     }
 }
 
 impl<UP, E, R> CompletionSidecar<UP, E, R> {
     #[inline]
     pub fn new(
-        token: OpToken,
-        res: i32,
-        flags: u32,
+        event: UserCompletionEvent,
         payload: UP,
         detail: Option<DriverResult<R, E>>,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
         Self {
-            token,
-            res,
-            flags,
+            event,
             payload,
             detail,
             cleanup,
@@ -693,14 +811,7 @@ impl<UP, E, R> CompletionSidecar<UP, E, R> {
 
     #[inline]
     pub fn into_packet(self) -> CompletionPacket<UP, E, R> {
-        CompletionPacket::user_with_cleanup(
-            self.token,
-            self.res,
-            self.flags,
-            self.payload,
-            self.detail,
-            self.cleanup,
-        )
+        CompletionPacket::user_with_cleanup(self.event, self.payload, self.detail, self.cleanup)
     }
 }
 
@@ -738,7 +849,7 @@ impl<UP, E, R> CompletionRecord<UP, E, R> {
 
 #[inline]
 fn run_rejected_cleanup<UP, E, R>(
-    diagnostics: &mut DriverCompletionDiagnostics,
+    diagnostics: &DriverCompletionDiagnostics,
     mut packet: CompletionPacket<UP, E, R>,
 ) {
     run_completion_cleanup(diagnostics, packet.input.cleanup_mut());
@@ -747,7 +858,7 @@ fn run_rejected_cleanup<UP, E, R>(
 
 #[inline]
 pub fn run_completion_cleanup(
-    diagnostics: &mut DriverCompletionDiagnostics,
+    diagnostics: &DriverCompletionDiagnostics,
     cleanup: &mut CompletionCleanupGuard,
 ) -> bool {
     match cleanup.run() {
@@ -761,7 +872,7 @@ pub fn run_completion_cleanup(
 
 #[inline]
 pub fn record_completion_anomaly(
-    diagnostics: &mut DriverCompletionDiagnostics,
+    diagnostics: &DriverCompletionDiagnostics,
     anomaly: &CompletionAnomaly,
 ) {
     diagnostics.record_anomaly(anomaly);
@@ -770,7 +881,7 @@ pub fn record_completion_anomaly(
 #[inline]
 pub fn record_user_completion<UP, E, R>(
     table: &SharedCompletionTable<UP, E, R>,
-    diagnostics: &mut DriverCompletionDiagnostics,
+    diagnostics: &DriverCompletionDiagnostics,
     packet: CompletionPacket<UP, E, R>,
 ) -> RecordCompletionOutcome
 where
@@ -790,9 +901,8 @@ where
 #[inline]
 pub fn record_lost_completion<UP, E, R>(
     table: &SharedCompletionTable<UP, E, R>,
-    diagnostics: &mut DriverCompletionDiagnostics,
-    token: OpToken,
-    event: CompletionEvent,
+    diagnostics: &DriverCompletionDiagnostics,
+    event: UserCompletionEvent,
     anomaly: CompletionAnomaly,
     cleanup: CompletionCleanupGuard,
 ) -> RecordCompletionOutcome
@@ -804,12 +914,12 @@ where
     record_user_completion(
         table,
         diagnostics,
-        CompletionPacket::lost(token, event, anomaly, cleanup),
+        CompletionPacket::lost(event, anomaly, cleanup),
     )
 }
 
 #[inline]
-pub fn discard_internal_completion(diagnostics: &mut DriverCompletionDiagnostics) {
+pub fn discard_internal_completion(diagnostics: &DriverCompletionDiagnostics) {
     diagnostics.inc_internal_unknown();
 }
 
@@ -855,5 +965,70 @@ mod tests {
 
         assert_eq!(anomaly.token, CompletionToken::rio_wake(0));
         assert_eq!(anomaly.backend_context, Some(raw_context));
+    }
+
+    #[test]
+    fn user_completion_event_rejects_mismatched_raw_token() {
+        let expected = OpToken::from_registry_parts(1, 7).expect("test token");
+        let actual = OpToken::from_registry_parts(2, 7).expect("test token");
+        let raw = RawCompletion::new(CompletionBackend::Core, CompletionToken::user(actual), 3, 0);
+
+        let err = UserCompletionEvent::try_new(expected, raw)
+            .expect_err("mismatched user completion must not be constructible");
+
+        assert_eq!(err.token, expected);
+        assert_eq!(err.expected, CompletionToken::user(expected));
+        assert_eq!(err.actual, CompletionToken::user(actual));
+    }
+
+    #[test]
+    fn completion_packet_uses_user_completion_event_token() {
+        let token = OpToken::from_registry_parts(3, 9).expect("test token");
+        let event = UserCompletionEvent::from_parts(CompletionBackend::Core, token, 11, 5);
+        let packet = CompletionPacket::<(), (), usize>::user(event, (), None);
+
+        assert_eq!(packet.token(), token);
+        assert_eq!(
+            packet.completion_event().token,
+            CompletionToken::user(token)
+        );
+        assert_eq!(packet.completion_event().res, 11);
+        assert_eq!(packet.completion_event().flags, 5);
+    }
+
+    #[test]
+    fn slot_access_anomaly_maps_missing_payload() {
+        let token = OpToken::from_registry_parts(4, 2).expect("test token");
+        let raw = RawCompletion::new(CompletionBackend::Core, CompletionToken::user(token), -1, 0);
+        let snapshot = slot::SlotSnapshot {
+            index: token.index(),
+            generation: token.generation(),
+            state: slot::SlotState::InFlightWaiting,
+            has_op: true,
+            has_payload: false,
+        };
+        let access = slot::SlotAccessError {
+            action: slot::SlotAccessAction::TakeCompletionData,
+            reason: slot::SlotAccessErrorReason::MissingPayload,
+            snapshot,
+        };
+
+        let anomaly = slot_access_anomaly(raw, access);
+
+        assert_eq!(anomaly.reason, CompletionAnomalyReason::PayloadMissing);
+        assert_eq!(anomaly.slot_snapshot, Some(snapshot));
+        assert_eq!(anomaly.raw_result, Some(-1));
+    }
+
+    #[test]
+    fn unknown_completion_anomaly_preserves_backend_context() {
+        let envelope = CompletionEnvelope::backend_context(CompletionBackend::Iocp, 0, -5, 0);
+
+        let anomaly = unknown_completion_anomaly(envelope);
+
+        assert_eq!(anomaly.reason, CompletionAnomalyReason::UnknownControlToken);
+        assert_eq!(anomaly.backend, Some(CompletionBackend::Iocp));
+        assert_eq!(anomaly.backend_context, Some(0));
+        assert_eq!(anomaly.raw_result, Some(-5));
     }
 }

@@ -60,12 +60,12 @@ pub struct DriverCompletionDiagnosticsSnapshot {
 impl DriverCompletionDiagnostics {
     #[inline]
     fn load(counter: &AtomicU64) -> u64 {
-        counter.load(Ordering::Acquire)
+        counter.load(Ordering::Relaxed)
     }
 
     #[inline]
     fn inc(counter: &AtomicU64) {
-        counter.fetch_add(1, Ordering::AcqRel);
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]

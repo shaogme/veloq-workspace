@@ -7,6 +7,7 @@ use super::types::CompletionMutationOutcome;
 use super::{
     CompletionAnomaly, CompletionCleanupGuard, CompletionEvent, CompletionInput, CompletionPacket,
     CompletionRecord, CompletionToken, OpToken, RecordCompletionOutcome, RecordCompletionResult,
+    UserCompletionEvent,
 };
 
 pub type SharedCompletionTable<UP, E, R = usize> = Arc<dyn CompletionAccess<UP, E, R>>;
@@ -29,12 +30,11 @@ pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
 
     fn record_lost_completion(
         &self,
-        token: OpToken,
-        event: CompletionEvent,
+        event: UserCompletionEvent,
         anomaly: CompletionAnomaly,
         cleanup: CompletionCleanupGuard,
     ) -> RecordCompletionResult<UP, E, R> {
-        self.record_completion(CompletionPacket::lost(token, event, anomaly, cleanup))
+        self.record_completion(CompletionPacket::lost(event, anomaly, cleanup))
     }
 
     fn try_take_record(&self, token: OpToken) -> PollRecordResult<UP, E, R>;
@@ -162,8 +162,9 @@ where
         &self,
         packet: CompletionPacket<UP, E, R>,
     ) -> RecordCompletionResult<UP, E, R> {
-        let op_token = packet.token;
-        let token = packet.event.token;
+        let op_token = packet.token();
+        let event = packet.completion_event();
+        let token = event.token;
         let (idx, generation) = op_token.parts();
         let success_outcome = recorded_outcome(&packet.input);
         if idx >= self.slots.len() {
@@ -257,7 +258,6 @@ where
         if let Some(anomaly) = packet.input.anomaly() {
             self.diagnostics.record_anomaly(anomaly);
         }
-        let event = packet.event;
         let input = packet.input;
         cell.completion_with_record_data(|record| {
             *record = match input {
@@ -571,9 +571,9 @@ where
 #[cfg(not(feature = "loom"))]
 mod tests {
     use super::*;
-    use crate::driver::CompletionAnomalyReason;
     use crate::driver::OpToken;
     use crate::driver::PlatformOp;
+    use crate::driver::{CompletionAnomalyReason, CompletionBackend};
 
     struct DummyPlatformOp;
 
@@ -594,12 +594,8 @@ mod tests {
         OpToken::from_registry_parts(index, generation).expect("test token should be encodable")
     }
 
-    fn test_event(token: OpToken, res: i32) -> CompletionEvent {
-        CompletionEvent {
-            token: CompletionToken::user(token),
-            res,
-            flags: 0,
-        }
+    fn test_event(token: OpToken, res: i32) -> UserCompletionEvent {
+        UserCompletionEvent::from_parts(CompletionBackend::Core, token, res, 0)
     }
 
     #[test]
@@ -608,7 +604,7 @@ mod tests {
         let token = test_token(0, 1);
 
         let outcome = table
-            .record_completion(CompletionPacket::user(token, 0, 0, (), None))
+            .record_completion(CompletionPacket::user(test_event(token, 0), (), None))
             .into_outcome();
 
         assert!(matches!(outcome, RecordCompletionOutcome::NonActive(_)));
@@ -678,7 +674,6 @@ mod tests {
 
         let outcome = table
             .record_lost_completion(
-                token,
                 test_event(token, -5),
                 anomaly,
                 CompletionCleanupGuard::default(),
@@ -711,7 +706,6 @@ mod tests {
 
         let outcome = table
             .record_lost_completion(
-                token,
                 test_event(token, -1),
                 anomaly,
                 CompletionCleanupGuard::default(),
@@ -734,7 +728,6 @@ mod tests {
 
         let outcome = table
             .record_lost_completion(
-                token,
                 test_event(token, -1),
                 anomaly,
                 CompletionCleanupGuard::default(),
@@ -754,7 +747,6 @@ mod tests {
 
         let outcome = table
             .record_lost_completion(
-                token,
                 test_event(token, -1),
                 anomaly,
                 CompletionCleanupGuard::default(),
@@ -781,7 +773,6 @@ mod tests {
 
         let outcome = table
             .record_lost_completion(
-                token,
                 test_event(token, -1),
                 anomaly,
                 CompletionCleanupGuard::default(),
@@ -806,10 +797,10 @@ mod tests {
         let token = test_token(0, 1);
 
         let first = table
-            .record_completion(CompletionPacket::user(token, 11, 0, (), None))
+            .record_completion(CompletionPacket::user(test_event(token, 11), (), None))
             .into_outcome();
         let duplicate = table
-            .record_completion(CompletionPacket::user(token, 22, 0, (), None))
+            .record_completion(CompletionPacket::user(test_event(token, 22), (), None))
             .into_outcome();
 
         assert_eq!(first, RecordCompletionOutcome::RecordedUser);
@@ -832,7 +823,7 @@ mod tests {
         let token = test_token(0, 1);
 
         let outcome = table
-            .record_completion(CompletionPacket::user(token, 0, 0, (), None))
+            .record_completion(CompletionPacket::user(test_event(token, 0), (), None))
             .into_outcome();
         assert_eq!(outcome, RecordCompletionOutcome::RecordedUser);
         assert_eq!(

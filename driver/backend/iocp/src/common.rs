@@ -84,7 +84,7 @@ pub(crate) fn push_completion_shared(
     diagnostics: &mut veloq_driver_core::driver::DriverCompletionDiagnostics,
     packet: CompletionPacket<IocpUserPayload, IocpError>,
 ) -> RecordCompletionOutcome {
-    let event = packet.event;
+    let event = packet.completion_event();
     let outcome = record_user_completion(table, diagnostics, packet);
     match &outcome {
         RecordCompletionOutcome::RecordedUser

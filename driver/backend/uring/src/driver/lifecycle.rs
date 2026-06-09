@@ -6,7 +6,8 @@ use tracing::{debug, error, trace};
 use veloq_driver_core::driver::{
     CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, CompletionAnomalyReason,
     CompletionBackend, CompletionCleanupGuard, CompletionSidecar, CompletionToken, OpToken,
-    RawCompletion, record_completion_anomaly, run_completion_cleanup, slot_view_anomaly,
+    RawCompletion, UserCompletionEvent, record_completion_anomaly, record_lost_completion,
+    run_completion_cleanup, slot_view_anomaly,
 };
 
 use crate::op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt, UringUserPayload};
@@ -30,6 +31,15 @@ impl UringOpState {
     pub(crate) fn new() -> Self {
         Self::default()
     }
+}
+
+enum ImmediateCancelOutcome {
+    User(CompletionSidecar<UringUserPayload, UringError>),
+    Lost {
+        anomaly: veloq_driver_core::driver::CompletionAnomaly,
+        cleanup: CompletionCleanupGuard,
+        snapshot: veloq_driver_core::slot::SlotSnapshot,
+    },
 }
 
 impl<'a> UringDriver<'a> {
@@ -80,6 +90,56 @@ impl<'a> UringDriver<'a> {
         }
     }
 
+    fn finish_immediate_cancel(
+        &mut self,
+        token: OpToken,
+        outcome: ImmediateCancelOutcome,
+        emit_completion: bool,
+        finalize_waiting: bool,
+        context: &'static str,
+    ) {
+        match outcome {
+            ImmediateCancelOutcome::User(sidecar) => {
+                if emit_completion {
+                    self.push_completion_event(sidecar);
+                } else {
+                    let mut cleanup = sidecar.cleanup;
+                    let _ = run_completion_cleanup(&self.completion_diagnostics, &mut cleanup);
+                }
+                if finalize_waiting {
+                    self.finalize_waiting_completion_checked(token, context);
+                } else {
+                    self.finalize_orphaned_completion_checked(token, context);
+                }
+            }
+            ImmediateCancelOutcome::Lost {
+                anomaly,
+                mut cleanup,
+                snapshot,
+            } => {
+                if emit_completion {
+                    let event = UserCompletionEvent::from_parts(
+                        CompletionBackend::Uring,
+                        token,
+                        -libc::ECANCELED,
+                        0,
+                    );
+                    let _ = record_lost_completion(
+                        &self.completion_table,
+                        &self.completion_diagnostics,
+                        event,
+                        anomaly,
+                        cleanup,
+                    );
+                } else {
+                    record_completion_anomaly(&self.completion_diagnostics, &anomaly);
+                    let _ = run_completion_cleanup(&self.completion_diagnostics, &mut cleanup);
+                }
+                self.finalize_corrupt_slot_checked(snapshot, context);
+            }
+        }
+    }
+
     pub(crate) fn cancel_op_internal(&mut self, request: CancelRequest) -> CancelSubmitOutcome {
         let request = PendingCancel::new(request);
         let (user_data, generation) = request.user_parts();
@@ -88,14 +148,11 @@ impl<'a> UringDriver<'a> {
         match self.ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 let sidecar = cancel_slot_immediate(slot, token);
-                if request.mode == CancelMode::UserVisible {
-                    self.push_completion_event(sidecar);
-                } else {
-                    let mut cleanup = sidecar.cleanup;
-                    let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
-                }
-                self.finalize_orphaned_completion_checked(
+                self.finish_immediate_cancel(
                     token,
+                    sidecar,
+                    request.mode == CancelMode::UserVisible,
+                    false,
                     "uring.cancel_op_internal.reserved",
                 );
                 CancelSubmitOutcome::CompletedLocally
@@ -104,15 +161,11 @@ impl<'a> UringDriver<'a> {
                 if slot.platform().submission_state == UringSubmissionState::Queued {
                     let sidecar = cancel_slot_immediate(slot, token);
                     self.remove_backlog_token(token);
-                    if request.mode == CancelMode::UserVisible {
-                        self.push_completion_event(sidecar);
-                    } else {
-                        let mut cleanup = sidecar.cleanup;
-                        let _ =
-                            run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
-                    }
-                    self.finalize_waiting_completion_checked(
+                    self.finish_immediate_cancel(
                         token,
+                        sidecar,
+                        request.mode == CancelMode::UserVisible,
+                        true,
                         "uring.cancel_op_internal.waiting_queued",
                     );
                     return CancelSubmitOutcome::CompletedLocally;
@@ -126,23 +179,45 @@ impl<'a> UringDriver<'a> {
                     };
                     let _ = completed.take_op();
                     let (payload, detail) = completed.take_completion_data();
-                    let payload =
-                        payload.expect("checked timer slot payload should remain present");
-                    let sidecar = CompletionSidecar::<UringUserPayload, UringError>::new(
-                        token,
-                        -libc::ECANCELED,
-                        0,
-                        payload,
-                        detail,
-                        CompletionCleanupGuard::default(),
-                    );
                     self.wheel.cancel(tid);
-                    if request.mode == CancelMode::UserVisible {
-                        self.push_completion_event(sidecar);
+                    if let Some(payload) = payload {
+                        let sidecar = CompletionSidecar::<UringUserPayload, UringError>::new(
+                            UserCompletionEvent::from_parts(
+                                CompletionBackend::Uring,
+                                token,
+                                -libc::ECANCELED,
+                                0,
+                            ),
+                            payload,
+                            detail,
+                            CompletionCleanupGuard::default(),
+                        );
+                        if request.mode == CancelMode::UserVisible {
+                            self.push_completion_event(sidecar);
+                        } else {
+                            let mut cleanup = sidecar.cleanup;
+                            let _ =
+                                run_completion_cleanup(&self.completion_diagnostics, &mut cleanup);
+                        }
                     } else {
-                        let mut cleanup = sidecar.cleanup;
-                        let _ =
-                            run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                        drop(detail);
+                        let raw = RawCompletion::new(
+                            CompletionBackend::Uring,
+                            CompletionToken::user(token),
+                            -libc::ECANCELED,
+                            0,
+                        );
+                        let snapshot = completed.snapshot();
+                        let anomaly =
+                            veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
+                                .with_slot_snapshot(snapshot)
+                                .with_raw_completion(raw);
+                        record_completion_anomaly(&self.completion_diagnostics, &anomaly);
+                        self.finalize_corrupt_slot_checked(
+                            snapshot,
+                            "uring.cancel_op_internal.waiting_timer_missing_payload",
+                        );
+                        return CancelSubmitOutcome::CompletedLocally;
                     }
                     self.finalize_orphaned_completion_checked(
                         token,
@@ -162,10 +237,11 @@ impl<'a> UringDriver<'a> {
                 if slot.platform().submission_state == UringSubmissionState::Queued {
                     let sidecar = cancel_slot_immediate(slot, token);
                     self.remove_backlog_token(token);
-                    let mut cleanup = sidecar.cleanup;
-                    let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
-                    self.finalize_orphaned_completion_checked(
+                    self.finish_immediate_cancel(
                         token,
+                        sidecar,
+                        false,
+                        false,
                         "uring.cancel_op_internal.orphaned_queued",
                     );
                     return CancelSubmitOutcome::CompletedLocally;
@@ -174,10 +250,11 @@ impl<'a> UringDriver<'a> {
                 if let Some(tid) = slot.platform_mut().timer_id {
                     let sidecar = cancel_slot_immediate(slot, token);
                     self.wheel.cancel(tid);
-                    let mut cleanup = sidecar.cleanup;
-                    let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
-                    self.finalize_orphaned_completion_checked(
+                    self.finish_immediate_cancel(
                         token,
+                        sidecar,
+                        false,
+                        false,
                         "uring.cancel_op_internal.orphaned_timer",
                     );
                     return CancelSubmitOutcome::CompletedLocally;
@@ -201,7 +278,7 @@ impl<'a> UringDriver<'a> {
                     }
                     Err(anomaly) => anomaly,
                 };
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 match anomaly.reason {
                     CompletionAnomalyReason::StaleGeneration => {
                         debug!(
@@ -273,7 +350,7 @@ impl<'a> UringDriver<'a> {
                             Ok(_) => continue,
                             Err(anomaly) => anomaly,
                         };
-                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                        record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                         if matches!(
                             anomaly.reason,
                             CompletionAnomalyReason::OpMissing
@@ -346,11 +423,11 @@ impl<'a> UringDriver<'a> {
                         self.ops.checked_slot_view(token)
                     {
                         let sidecar = cancel_slot_immediate(slot, token);
-                        let mut cleanup = sidecar.cleanup;
-                        let _ =
-                            run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
-                        self.finalize_orphaned_completion_checked(
+                        self.finish_immediate_cancel(
                             token,
+                            sidecar,
+                            false,
+                            false,
                             "uring.flush_backlog.cancel_queued",
                         );
                     }
@@ -422,16 +499,33 @@ impl<'a> UringDriver<'a> {
             let mut completed = slot.complete();
             let _ = completed.take_op();
             let (payload, detail) = completed.take_completion_data();
-            let payload = payload.expect("checked queued slot payload should remain present");
-            let sidecar = CompletionSidecar::<UringUserPayload, UringError>::new(
-                token,
-                event_res,
-                0,
-                payload,
-                detail.or(Some(Err(report))),
-                CompletionCleanupGuard::default(),
-            );
-            self.push_completion_event(sidecar);
+            if let Some(payload) = payload {
+                let sidecar = CompletionSidecar::<UringUserPayload, UringError>::new(
+                    UserCompletionEvent::from_parts(CompletionBackend::Uring, token, event_res, 0),
+                    payload,
+                    detail.or(Some(Err(report))),
+                    CompletionCleanupGuard::default(),
+                );
+                self.push_completion_event(sidecar);
+            } else {
+                drop(detail);
+                let raw = RawCompletion::new(
+                    CompletionBackend::Uring,
+                    CompletionToken::user(token),
+                    event_res,
+                    0,
+                );
+                let snapshot = completed.snapshot();
+                let anomaly = veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
+                self.finalize_corrupt_slot_checked(
+                    snapshot,
+                    "uring.complete_queued_submission_error.missing_payload",
+                );
+                return;
+            }
             self.finalize_waiting_completion_checked(
                 token,
                 "uring.complete_queued_submission_error",
@@ -443,7 +537,8 @@ impl<'a> UringDriver<'a> {
 fn cancel_slot_immediate<'a, S: SlotState>(
     slot: Slot<'a, S>,
     token: OpToken,
-) -> CompletionSidecar<UringUserPayload, UringError> {
+) -> ImmediateCancelOutcome {
+    let snapshot = slot.snapshot();
     let cleanup = slot
         .op
         .as_mut()
@@ -454,17 +549,30 @@ fn cancel_slot_immediate<'a, S: SlotState>(
          payload: &mut Option<UringUserPayload>,
          _sidecar| (payload.take(), result.take()),
     );
-    let payload = payload.expect("cancelled slot payload should remain present");
     let _ = slot.op.take();
 
-    CompletionSidecar::<UringUserPayload, UringError>::new(
-        token,
-        -libc::ECANCELED,
-        0,
-        payload,
-        detail,
-        cleanup,
-    )
+    let event =
+        UserCompletionEvent::from_parts(CompletionBackend::Uring, token, -libc::ECANCELED, 0);
+    match (snapshot.has_op, payload) {
+        (true, Some(payload)) => {
+            ImmediateCancelOutcome::User(CompletionSidecar::<UringUserPayload, UringError>::new(
+                event, payload, detail, cleanup,
+            ))
+        }
+        (_, payload) => {
+            drop(payload);
+            drop(detail);
+            let anomaly =
+                veloq_driver_core::driver::corrupt_slot_anomaly(event.completion_token(), snapshot)
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(event.raw());
+            ImmediateCancelOutcome::Lost {
+                anomaly,
+                cleanup,
+                snapshot,
+            }
+        }
+    }
 }
 
 fn slot_has_op<'a, S: SlotState>(slot: Slot<'a, S>) -> bool {

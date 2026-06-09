@@ -43,6 +43,14 @@ fn active_table() -> (SharedCompletionTable<(), ()>, OpToken) {
     (table, token)
 }
 
+fn completion_packet(token: OpToken, res: i32) -> CompletionPacket<(), ()> {
+    CompletionPacket::user(
+        UserCompletionEvent::from_parts(CompletionBackend::Core, token, res, 0),
+        (),
+        None,
+    )
+}
+
 #[test]
 fn test_completion_table_loom() {
     loom::model(|| {
@@ -51,7 +59,7 @@ fn test_completion_table_loom() {
         let table_cloned = table.clone();
         let producer = thread::spawn(move || {
             // Mock driver producing a completion
-            table_cloned.record_completion(CompletionPacket::user(token, 0, 0, (), None));
+            table_cloned.record_completion(completion_packet(token, 0));
         });
 
         let table_cloned2 = table.clone();
@@ -80,7 +88,7 @@ fn test_detached_drop_race_loom() {
 
         let table_cloned = table.clone();
         let producer = thread::spawn(move || {
-            table_cloned.record_completion(CompletionPacket::user(token, 42, 0, (), None));
+            table_cloned.record_completion(completion_packet(token, 42));
         });
 
         let table_cloned2 = table.clone();
@@ -103,7 +111,7 @@ fn test_fast_completion_then_waiting_take_loom() {
     loom::model(|| {
         let (table, token) = active_table();
 
-        table.record_completion(CompletionPacket::user(token, 7, 0, (), None));
+        table.record_completion(completion_packet(token, 7));
 
         table.mark_waiting(token);
         match table.try_take_record(token) {
@@ -126,7 +134,7 @@ fn test_stale_after_generation_advance_loom() {
     loom::model(|| {
         let (table, token_g1) = active_table();
 
-        table.record_completion(CompletionPacket::user(token_g1, 1, 0, (), None));
+        table.record_completion(completion_packet(token_g1, 1));
         table.mark_waiting(token_g1);
         let _ = table.try_take_record(token_g1);
 
@@ -147,7 +155,7 @@ fn test_ready_race_with_mark_orphaned_loom() {
     loom::model(|| {
         let (table, token) = active_table();
 
-        table.record_completion(CompletionPacket::user(token, 3, 0, (), None));
+        table.record_completion(completion_packet(token, 3));
 
         let t1 = table.clone();
         let consumer_take = thread::spawn(move || {
@@ -174,7 +182,7 @@ fn test_two_consumers_at_most_one_ready_loom() {
         let (table, token) = active_table();
         let ready_count = Arc::new(AtomicUsize::new(0));
 
-        table.record_completion(CompletionPacket::user(token, 9, 0, (), None));
+        table.record_completion(completion_packet(token, 9));
 
         let c1_table = table.clone();
         let c1_ready = ready_count.clone();

@@ -5,13 +5,13 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use tracing::{debug, error, warn};
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionDispatch, CompletionToken, OpToken,
-    RawCompletion, RemoteWaker, SharedCompletionTable, dispatch_raw_completion,
-    drain_cancel_requests, record_completion_anomaly, slot_view_anomaly,
+    CompletionAnomaly, CompletionBackend, CompletionDispatch, CompletionEnvelope, CompletionToken,
+    OpToken, RawCompletion, RemoteWaker, SharedCompletionTable, UserCompletionEvent,
+    dispatch_raw_completion, drain_cancel_requests, record_completion_anomaly, slot_view_anomaly,
+    unknown_completion_anomaly,
 };
 use veloq_driver_core::slot::SlotRegistryExt;
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
-use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
 use crate::common::{IocpErrorContext, IocpWaker, iocp_msg};
 use crate::error::{IocpError, IocpResult};
@@ -233,13 +233,13 @@ impl<'a> IocpDriver<'a> {
                     ..CompletionProgress::default()
                 })
             }
-            CompletionDispatch::User { token, .. } => {
-                Ok(self.process_completion(token, success, error_code, bytes))
+            CompletionDispatch::User { event } => {
+                Ok(self.process_completion(event, success, error_code, bytes))
             }
             CompletionDispatch::Cancel { raw, .. } => {
                 let anomaly = CompletionAnomaly::control_completion_untracked(raw.token)
                     .with_raw_completion(raw);
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 debug!(
                     token = raw.token.raw(),
                     key,
@@ -252,14 +252,20 @@ impl<'a> IocpDriver<'a> {
                     ..CompletionProgress::default()
                 })
             }
-            CompletionDispatch::Unknown { raw } => {
-                let anomaly = if let Some(token) = raw.token.op_token() {
+            CompletionDispatch::Unknown { envelope } => {
+                let raw = envelope.raw;
+                let anomaly = if matches!(
+                    envelope.identity,
+                    veloq_driver_core::driver::CompletionIdentity::BackendContext { .. }
+                ) {
+                    unknown_completion_anomaly(envelope)
+                } else if let Some(token) = raw.token.op_token() {
                     CompletionAnomaly::unknown_slot(raw.token, token.index(), token.generation())
                         .with_raw_completion(raw)
                 } else {
-                    CompletionAnomaly::unknown_control(raw.token).with_raw_completion(raw)
+                    unknown_completion_anomaly(envelope)
                 };
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 debug!(
                     token = raw.token.raw(),
                     key,
@@ -315,12 +321,12 @@ impl<'a> IocpDriver<'a> {
                     "completed index out of bounds"
                 );
                 return Ok(CompletionDispatch::Unknown {
-                    raw: RawCompletion::new(
+                    envelope: CompletionEnvelope::from_raw(RawCompletion::new(
                         CompletionBackend::Iocp,
                         CompletionToken::user(entry.token),
                         iocp_status_res(success, error_code, bytes),
                         0,
-                    ),
+                    )),
                 });
             }
             let raw = RawCompletion::new(
@@ -367,7 +373,7 @@ impl<'a> IocpDriver<'a> {
                     }
                     Err(anomaly) => anomaly,
                 };
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 debug!(
                     expected_key,
                     completion_key,
@@ -377,22 +383,17 @@ impl<'a> IocpDriver<'a> {
                 );
             }
             return Ok(CompletionDispatch::User {
-                token: entry.token,
-                raw,
+                event: UserCompletionEvent::from_parts(
+                    CompletionBackend::Iocp,
+                    entry.token,
+                    raw.res,
+                    raw.flags,
+                ),
             });
         }
 
         if !success {
             let err = error_code.unwrap_or(0);
-            if err == WAIT_TIMEOUT {
-                let raw = RawCompletion::new(
-                    CompletionBackend::Iocp,
-                    CompletionToken::waker(0),
-                    iocp_status_res(success, error_code, bytes),
-                    0,
-                );
-                return Ok(CompletionDispatch::Waker { id: 0, raw });
-            }
             if completion_key == 0 {
                 let _ = iocp_msg(
                     IocpErrorContext::CompletionWait,
@@ -402,9 +403,9 @@ impl<'a> IocpDriver<'a> {
                 .with_ctx("completion_key", completion_key)
                 .with_ctx("overlapped_is_null", true);
                 return Ok(CompletionDispatch::Unknown {
-                    raw: RawCompletion::new(
+                    envelope: CompletionEnvelope::backend_context(
                         CompletionBackend::Iocp,
-                        CompletionToken::from_raw(completion_key as u64),
+                        completion_key as u64,
                         iocp_status_res(success, error_code, bytes),
                         0,
                     ),

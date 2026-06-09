@@ -4,9 +4,9 @@ use diagweave::prelude::*;
 use tracing::{debug, error};
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanupGuard,
-    CompletionEvent, CompletionToken, DriverCompletionDiagnostics, OpToken, RawCompletion,
-    RecordCompletionOutcome, RoutedSlotCompletion, record_completion_anomaly,
-    record_lost_completion, route_user_completion, run_completion_cleanup, slot_view_anomaly,
+    CompletionToken, DriverCompletionDiagnostics, OpToken, RawCompletion, RecordCompletionOutcome,
+    RoutedSlotCompletion, UserCompletionEvent, record_completion_anomaly, record_lost_completion,
+    route_user_completion, run_completion_cleanup, slot_view_anomaly,
 };
 use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt, SlotView};
 
@@ -74,7 +74,7 @@ impl<'a> IocpDriver<'a> {
                     )
                     .with_slot_snapshot(snapshot)
                     .with_raw_completion(raw);
-                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                    record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 }
                 view @ (CheckedSlotView::Missing { .. }
                 | CheckedSlotView::Empty(_)
@@ -99,7 +99,7 @@ impl<'a> IocpDriver<'a> {
                     ) {
                         self.emit_corrupt_completion(anomaly, "IOCP timer found corrupt slot");
                     } else {
-                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                        record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                     }
                 }
             }
@@ -147,6 +147,7 @@ impl<'a> IocpDriver<'a> {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
                 let mut guard = slot.complete();
                 let io_result: IocpResult<usize> = Ok(0);
+                let snapshot = guard.snapshot();
                 let cleanup = guard
                     .op
                     .as_mut()
@@ -154,17 +155,30 @@ impl<'a> IocpDriver<'a> {
                     .unwrap_or_default();
                 let _ = guard.take_op();
                 let (payload_erased, detail) = guard.take_completion_data();
-                let payload_erased =
-                    payload_erased.expect("checked IOCP timer payload should remain present");
-                pending_events.push(CompletionSidecar::new(
-                    token,
-                    0,
-                    0,
-                    payload_erased,
-                    detail,
-                    cleanup,
-                ));
-                Some(TimerFinish::WaitingCompleted)
+                if let Some(payload_erased) = payload_erased {
+                    pending_events.push(CompletionSidecar::new(
+                        UserCompletionEvent::from_parts(CompletionBackend::Iocp, token, 0, 0),
+                        payload_erased,
+                        detail,
+                        cleanup,
+                    ));
+                    Some(TimerFinish::WaitingCompleted)
+                } else {
+                    drop(detail);
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly =
+                        veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
+                            .with_slot_snapshot(snapshot)
+                            .with_raw_completion(raw);
+                    record_completion_anomaly(diagnostics, &anomaly);
+                    let _ = ops.finalize_corrupt_slot(snapshot);
+                    None
+                }
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
                 let mut guard = slot.complete();
@@ -187,20 +201,15 @@ impl<'a> IocpDriver<'a> {
 
     pub(super) fn process_completion(
         &mut self,
-        token: OpToken,
+        event: UserCompletionEvent,
         success: bool,
         error_code: Option<u32>,
         bytes_transferred: u32,
     ) -> CompletionProgress {
+        let token = event.token();
         let (user_data, completed_generation) = token.parts();
-        let raw = RawCompletion::new(
-            CompletionBackend::Iocp,
-            veloq_driver_core::driver::CompletionToken::user(token),
-            iocp_completion_res(success, error_code, bytes_transferred),
-            0,
-        );
 
-        match route_user_completion(token, raw, self.ops.checked_slot_view(token)) {
+        match route_user_completion(event, self.ops.checked_slot_view(token)) {
             RoutedSlotCompletion::Waiting(mut slot) => {
                 let io_result = Self::calculate_io_result_from_slot(
                     &self.extensions,
@@ -255,7 +264,7 @@ impl<'a> IocpDriver<'a> {
                     let _ = completed.take_completion_data();
                     (cleanup, socket_inflight)
                 };
-                let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
+                let _ = run_completion_cleanup(&self.completion_diagnostics, &mut cleanup);
                 if let Some(socket_inflight) = socket_inflight {
                     self.rio
                         .state_mut()
@@ -270,7 +279,7 @@ impl<'a> IocpDriver<'a> {
                 }
             }
             RoutedSlotCompletion::Missing(anomaly) | RoutedSlotCompletion::Empty(anomaly) => {
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 debug!(
                     user_data,
                     completed_generation, "ignoring completion for non-active slot"
@@ -282,7 +291,7 @@ impl<'a> IocpDriver<'a> {
                 }
             }
             RoutedSlotCompletion::Stale(anomaly) => {
-                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                record_completion_anomaly(&self.completion_diagnostics, &anomaly);
                 debug!(
                     user_data,
                     completed_generation, "ignoring stale IOCP completion"
@@ -383,17 +392,37 @@ impl<'a> IocpDriver<'a> {
                     op.unbind_user_payload();
                 }
                 let (payload, detail) = guard.take_completion_data();
-                let payload = payload.expect("checked IOCP slot payload should remain present");
-                sidecar_to_push = Some(CompletionSidecar::new(
-                    token,
-                    completion_res,
-                    0,
-                    payload,
-                    detail.or_else(|| io_detail.take()),
-                    cleanup,
-                ));
-                let _ = guard.take_op();
-                let _data = std::mem::take(guard.platform_mut());
+                if let Some(payload) = payload {
+                    sidecar_to_push = Some(CompletionSidecar::new(
+                        UserCompletionEvent::from_parts(
+                            CompletionBackend::Iocp,
+                            token,
+                            completion_res,
+                            0,
+                        ),
+                        payload,
+                        detail.or_else(|| io_detail.take()),
+                        cleanup,
+                    ));
+                    let _ = guard.take_op();
+                    let _data = std::mem::take(guard.platform_mut());
+                } else {
+                    drop(detail);
+                    let snapshot = guard.snapshot();
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(token),
+                        completion_res,
+                        0,
+                    );
+                    let anomaly =
+                        veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
+                            .with_slot_snapshot(snapshot)
+                            .with_raw_completion(raw);
+                    record_completion_anomaly(diagnostics, &anomaly);
+                    let _ = guard.take_op();
+                    let _data = std::mem::take(guard.platform_mut());
+                }
             }
         }
 
@@ -411,11 +440,13 @@ impl<'a> IocpDriver<'a> {
 
     fn emit_corrupt_completion(&mut self, anomaly: CompletionAnomaly, note: &'static str) {
         let Some(snapshot) = anomaly.slot_snapshot else {
-            record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+            record_completion_anomaly(&self.completion_diagnostics, &anomaly);
             return;
         };
-        let token = OpToken::from_registry_parts(snapshot.index, snapshot.generation)
-            .expect("slot snapshot token should be encodable");
+        let Ok(token) = snapshot.try_token() else {
+            record_completion_anomaly(&self.completion_diagnostics, &anomaly);
+            return;
+        };
         let raw_res = anomaly.raw_result.unwrap_or(-5);
         let flags = anomaly.flags.unwrap_or(0);
 
@@ -462,15 +493,10 @@ impl<'a> IocpDriver<'a> {
                 let _ = payload.take();
             });
 
-        let event = CompletionEvent {
-            token: anomaly.token,
-            res: -5,
-            flags,
-        };
+        let event = UserCompletionEvent::from_parts(CompletionBackend::Iocp, token, -5, flags);
         let _ = record_lost_completion(
             self.completion.table(),
-            &mut self.completion_diagnostics,
-            token,
+            &self.completion_diagnostics,
             event,
             anomaly,
             cleanup,
@@ -493,13 +519,4 @@ fn take_socket_inflight_from_op(op: &mut IocpOp) -> Option<SocketInflightToken> 
         op.header.in_flight = false;
     }
     op.header.socket_inflight.take()
-}
-
-#[inline]
-fn iocp_completion_res(success: bool, error_code: Option<u32>, bytes_transferred: u32) -> i32 {
-    if success {
-        bytes_transferred.min(i32::MAX as u32) as i32
-    } else {
-        -(error_code.unwrap_or(0).min(i32::MAX as u32) as i32)
-    }
 }

@@ -289,6 +289,17 @@ impl<'a, Spec: SlotSpec> Slot<'a, Completed, Spec> {
         self.storage
             .with_mut(|result, payload, _sidecar| (payload.take(), result.take()))
     }
+
+    #[inline]
+    pub fn take_completion_data_checked(&mut self) -> SlotAccessOutcome<SlotCompletionData<Spec>> {
+        if self.storage.payload.is_none() {
+            return Err(self.access_error(
+                SlotAccessAction::TakeCompletionData,
+                SlotAccessErrorReason::MissingPayload,
+            ));
+        }
+        Ok(self.take_completion_data())
+    }
 }
 
 impl<'a, Spec: SlotSpec> Slot<'a, InFlightOrphaned, Spec> {
@@ -359,17 +370,26 @@ pub struct SlotSnapshot {
     pub has_payload: bool,
 }
 
+impl SlotSnapshot {
+    #[inline]
+    pub const fn try_token(self) -> Result<OpToken, crate::driver::OpTokenError> {
+        OpToken::from_registry_parts(self.index, self.generation)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotAccessAction {
     InitOp,
     StartSubmission,
     OpMut,
     TakeOp,
+    TakeCompletionData,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotAccessErrorReason {
     MissingOp,
+    MissingPayload,
     UnexpectedOp,
 }
 
@@ -522,7 +542,16 @@ mod tests {
 
         registry
             .shared
-            .record_completion(crate::driver::CompletionPacket::user(token, 0, 0, (), None));
+            .record_completion(crate::driver::CompletionPacket::user(
+                crate::driver::UserCompletionEvent::from_parts(
+                    crate::driver::CompletionBackend::Core,
+                    token,
+                    0,
+                    0,
+                ),
+                (),
+                None,
+            ));
 
         assert!(matches!(
             registry.checked_slot_view(token),
@@ -606,5 +635,23 @@ mod tests {
                     && snapshot.has_op
                     && !snapshot.has_payload
         ));
+    }
+
+    #[test]
+    fn slot_snapshot_try_token_uses_checked_user_index() {
+        let snapshot = SlotSnapshot {
+            index: 0,
+            generation: 3,
+            state: SlotState::InFlightWaiting,
+            has_op: true,
+            has_payload: true,
+        };
+
+        let token = snapshot
+            .try_token()
+            .expect("ordinary slot snapshot should encode");
+
+        assert_eq!(token.index(), 0);
+        assert_eq!(token.generation(), 3);
     }
 }

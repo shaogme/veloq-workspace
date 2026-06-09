@@ -21,9 +21,9 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionEvent,
-    CompletionPacket, CompletionToken, DriverCompletionDiagnostics, RawCompletion,
-    RoutedSlotCompletion, SharedCompletionTable, record_completion_anomaly, record_lost_completion,
+    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionPacket,
+    CompletionToken, DriverCompletionDiagnostics, RawCompletion, RoutedSlotCompletion,
+    SharedCompletionTable, UserCompletionEvent, record_completion_anomaly, record_lost_completion,
     route_user_completion, run_completion_cleanup,
 };
 use veloq_driver_core::slot::SlotRegistryExt;
@@ -91,7 +91,9 @@ impl<'a> RioCompletionRouter<'a> {
             rio_raw_res(res),
             0,
         );
-        match route_user_completion(op_token, raw, ops.checked_slot_view(op_token)) {
+        let event =
+            UserCompletionEvent::from_parts(CompletionBackend::Rio, op_token, raw.res, raw.flags);
+        match route_user_completion(event, ops.checked_slot_view(op_token)) {
             RoutedSlotCompletion::Waiting(mut slot) => {
                 if slot.platform().generation != generation {
                     let snapshot = slot.snapshot();
@@ -127,8 +129,7 @@ impl<'a> RioCompletionRouter<'a> {
                     let _ = record_lost_completion(
                         self.comp.table,
                         self.comp.diagnostics,
-                        op_token,
-                        raw.event(),
+                        event,
                         anomaly,
                         cleanup,
                     );
@@ -190,29 +191,44 @@ impl<'a> RioCompletionRouter<'a> {
                     });
                     let res_code = rio_result_to_event_res(&completion);
                     {
+                        let snapshot = slot.snapshot();
                         let mut guard = slot.complete();
                         let _ = guard.take_op();
                         let (payload, detail) = guard.take_completion_data();
-                        let payload =
-                            payload.expect("checked RIO slot payload should remain present");
-                        let event = CompletionEvent {
-                            token: completion_token,
-                            res: res_code,
-                            flags: 0,
-                        };
-
-                        let outcome = push_completion_shared(
-                            self.comp.table,
-                            self.comp.diagnostics,
-                            CompletionPacket::user_event(
+                        if let Some(payload) = payload {
+                            let event = UserCompletionEvent::from_parts(
+                                CompletionBackend::Rio,
                                 op_token,
-                                event,
-                                payload,
-                                detail.or(Some(completion)),
-                                CompletionCleanupGuard::default(),
-                            ),
-                        );
-                        let _ = outcome;
+                                res_code,
+                                0,
+                            );
+
+                            let outcome = push_completion_shared(
+                                self.comp.table,
+                                self.comp.diagnostics,
+                                CompletionPacket::user_event(
+                                    event,
+                                    payload,
+                                    detail.or(Some(completion)),
+                                    CompletionCleanupGuard::default(),
+                                ),
+                            );
+                            let _ = outcome;
+                        } else {
+                            drop(detail);
+                            let raw = RawCompletion::new(
+                                CompletionBackend::Rio,
+                                completion_token,
+                                res_code,
+                                0,
+                            );
+                            let anomaly = veloq_driver_core::driver::corrupt_slot_anomaly(
+                                raw.token, snapshot,
+                            )
+                            .with_slot_snapshot(snapshot)
+                            .with_raw_completion(raw);
+                            record_completion_anomaly(self.comp.diagnostics, &anomaly);
+                        }
                     }
                     let _ = ops.finalize_waiting_completion(op_token);
                 }
@@ -316,15 +332,15 @@ impl<'a> RioCompletionRouter<'a> {
                         let _ = result.take();
                         let _ = payload.take();
                     });
-                    let event = CompletionEvent {
-                        token: raw.token,
-                        res: -5,
-                        flags: raw.flags,
-                    };
+                    let event = UserCompletionEvent::from_parts(
+                        CompletionBackend::Rio,
+                        op_token,
+                        -5,
+                        raw.flags,
+                    );
                     let _ = record_lost_completion(
                         self.comp.table,
                         self.comp.diagnostics,
-                        op_token,
                         event,
                         anomaly,
                         cleanup,
