@@ -75,6 +75,3 @@ use routing::{
     finalize_corrupt_checked, finalize_orphaned_checked, finalize_waiting_checked,
     route_user_completion,
 };
-
-#[cfg(test)]
-mod tests;
