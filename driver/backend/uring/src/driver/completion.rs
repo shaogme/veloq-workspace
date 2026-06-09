@@ -22,8 +22,105 @@ pub(crate) struct CompletionProgress {
 }
 
 impl<'a> UringDriver<'a> {
+    pub(crate) fn finalize_waiting_completion_checked(
+        &mut self,
+        token: OpToken,
+        context: &'static str,
+    ) {
+        if self.ops.finalize_waiting_completion(token).is_none() {
+            self.record_finalize_failure(token, context);
+        }
+    }
+
+    pub(crate) fn finalize_orphaned_completion_checked(
+        &mut self,
+        token: OpToken,
+        context: &'static str,
+    ) {
+        if self.ops.finalize_orphaned_completion(token).is_none() {
+            self.record_finalize_failure(token, context);
+        }
+    }
+
+    pub(crate) fn finalize_corrupt_slot_checked(
+        &mut self,
+        snapshot: veloq_driver_core::slot::SlotSnapshot,
+        context: &'static str,
+    ) {
+        if self.ops.finalize_corrupt_slot(snapshot).is_none() {
+            self.record_finalize_failure(
+                OpToken::new(snapshot.index, snapshot.generation),
+                context,
+            );
+        }
+    }
+
+    fn record_finalize_failure(&mut self, token: OpToken, context: &'static str) {
+        let raw = RawCompletion::new(
+            CompletionBackend::Uring,
+            CompletionToken::user(token),
+            -libc::EIO,
+            0,
+        );
+        let anomaly = match self.ops.checked_slot_view(token) {
+            CheckedSlotView::Valid(slot) => {
+                let snapshot = match slot {
+                    SlotView::Reserved(slot) => slot.snapshot(),
+                    SlotView::InFlightWaiting(slot) => slot.snapshot(),
+                    SlotView::InFlightOrphaned(slot) => slot.snapshot(),
+                };
+                CompletionAnomaly::backend_invariant_broken(
+                    raw.token,
+                    snapshot.index,
+                    snapshot.generation,
+                    snapshot.state,
+                )
+                .with_slot_snapshot(snapshot)
+                .with_raw_completion(raw)
+            }
+            CheckedSlotView::Missing {
+                index,
+                expected_generation,
+            } => CompletionAnomaly::unknown_slot(raw.token, index, expected_generation)
+                .with_raw_completion(raw),
+            CheckedSlotView::Empty(snapshot) => CompletionAnomaly::non_active(
+                raw.token,
+                snapshot.index,
+                token.generation(),
+                snapshot.state,
+            )
+            .with_slot_snapshot(snapshot)
+            .with_raw_completion(raw),
+            CheckedSlotView::Stale(snapshot) => CompletionAnomaly::stale(
+                raw.token,
+                snapshot.index,
+                token.generation(),
+                snapshot.generation,
+                snapshot.state,
+            )
+            .with_slot_snapshot(snapshot)
+            .with_raw_completion(raw),
+            CheckedSlotView::Corrupt(snapshot) => CompletionAnomaly::corrupt(
+                raw.token,
+                snapshot.index,
+                snapshot.generation,
+                snapshot.state,
+            )
+            .with_slot_snapshot(snapshot)
+            .with_raw_completion(raw),
+        };
+        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+        debug!(
+            user_data = token.index(),
+            generation = token.generation(),
+            context,
+            reason = ?anomaly.reason,
+            "uring finalize failed"
+        );
+    }
+
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
-        drain_cancel_requests(self);
+        let _ = drain_cancel_requests(self)?;
         self.flush_cancellations();
         self.flush_backlog();
 
@@ -97,7 +194,10 @@ impl<'a> UringDriver<'a> {
                         drop(payload);
                         drop(detail);
                         drop(completed);
-                        let _ = self.ops.finalize_orphaned_completion(token);
+                        self.finalize_orphaned_completion_checked(
+                            token,
+                            "uring.advance_timers.orphaned",
+                        );
                         None
                     }
                     _ => None,
@@ -177,13 +277,13 @@ impl<'a> UringDriver<'a> {
 
             if let Some(sidecar) = sidecar {
                 self.push_completion_event(sidecar);
-                let _ = self.ops.finalize_waiting_completion(token);
+                self.finalize_waiting_completion_checked(token, "uring.advance_timers.waiting");
             }
         }
     }
 
     pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
-        drain_cancel_requests(self);
+        let _ = drain_cancel_requests(self)?;
         self.flush_cancellations();
         self.flush_backlog();
         self.submit_to_kernel()?;
@@ -230,7 +330,7 @@ impl<'a> UringDriver<'a> {
                 }
                 CompletionDispatch::Cancel { id, raw } => {
                     progress.internal += 1;
-                    self.handle_cancel_completion(id, raw.res);
+                    self.handle_cancel_completion(id, raw);
                 }
                 CompletionDispatch::RioWake { raw, .. } | CompletionDispatch::Unknown { raw } => {
                     let anomaly =
@@ -255,13 +355,19 @@ impl<'a> UringDriver<'a> {
             RoutedSlotCompletion::Waiting(slot) => {
                 let sidecar = complete_waiting_slot(slot, token, raw.res, raw.flags);
                 self.push_completion_event(sidecar);
-                let _ = self.ops.finalize_waiting_completion(token);
+                self.finalize_waiting_completion_checked(
+                    token,
+                    "uring.handle_user_completion.waiting",
+                );
                 1
             }
             RoutedSlotCompletion::Orphaned(slot) => {
                 let mut cleanup = cleanup_orphaned_slot(slot, raw.res);
                 let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
-                let _ = self.ops.finalize_orphaned_completion(token);
+                self.finalize_orphaned_completion_checked(
+                    token,
+                    "uring.handle_user_completion.orphaned",
+                );
                 1
             }
             RoutedSlotCompletion::Corrupt(anomaly) => {
@@ -297,14 +403,28 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    fn handle_cancel_completion(&mut self, cancel_id: u16, cqe_res: i32) {
+    fn handle_cancel_completion(&mut self, cancel_id: u16, raw: RawCompletion) {
         let request = self.pending_cancel_cqes.remove(&cancel_id);
-        match cqe_res {
+        let Some(request) = request else {
+            let anomaly =
+                CompletionAnomaly::control_completion_untracked(raw.token).with_raw_completion(raw);
+            record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+            debug!(
+                cancel_id,
+                result = raw.res,
+                flags = raw.flags,
+                token = raw.token.raw(),
+                "async cancel completion had no pending request"
+            );
+            return;
+        };
+
+        match raw.res {
             value if value >= 0 => {
                 self.completion_diagnostics.inc_cancel_ack_ok();
                 trace!(
                     cancel_id,
-                    ?request,
+                    request = ?request,
                     result = value,
                     "async cancel completed"
                 );
@@ -313,7 +433,7 @@ impl<'a> UringDriver<'a> {
                 self.completion_diagnostics.inc_cancel_ack_not_found();
                 debug!(
                     cancel_id,
-                    ?request,
+                    request = ?request,
                     "async cancel target was already complete or absent"
                 );
             }
@@ -321,7 +441,7 @@ impl<'a> UringDriver<'a> {
                 self.completion_diagnostics.inc_cancel_ack_error();
                 warn!(
                     cancel_id,
-                    ?request,
+                    request = ?request,
                     result = value,
                     errno = -value,
                     "async cancel request failed"
@@ -331,6 +451,7 @@ impl<'a> UringDriver<'a> {
     }
 
     fn handle_waker_completion(&mut self, cqe_res: i32) -> UringResult<()> {
+        let mut should_rebuild = false;
         if cqe_res >= 0 {
             self.completion_diagnostics.inc_waker_ok();
         } else {
@@ -341,19 +462,22 @@ impl<'a> UringDriver<'a> {
                 }
                 errno => {
                     warn!(res = cqe_res, errno, "eventfd waker read failed");
+                    should_rebuild = true;
                 }
             }
         }
 
-        self.is_waked.store(false, Ordering::Release);
         self.waker_armed = false;
+        if should_rebuild {
+            self.completion_diagnostics.inc_waker_rebuild();
+            self.rebuild_waker_fd()
+                .attach_note("failed to rebuild eventfd waker")?;
+        }
+        self.is_waked.store(false, Ordering::Release);
         if let Err(e) = self.submit_waker() {
             self.completion_diagnostics.inc_waker_rebuild();
             error!(report = ?e, "failed to resubmit waker");
             return Err(e);
-        }
-        if cqe_res < 0 {
-            self.completion_diagnostics.inc_waker_rebuild();
         }
         self.flush_backlog();
         Ok(())
@@ -424,7 +548,7 @@ impl<'a> UringDriver<'a> {
             anomaly,
             cleanup,
         );
-        let _ = self.ops.finalize_corrupt_slot(snapshot);
+        self.finalize_corrupt_slot_checked(snapshot, "uring.emit_corrupt_completion");
     }
 
     pub(crate) fn push_completion_event(

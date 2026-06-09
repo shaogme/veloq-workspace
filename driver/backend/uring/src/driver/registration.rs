@@ -3,7 +3,7 @@ use crate::error::{UringError, UringResult};
 use diagweave::prelude::*;
 use std::time::{Duration, Instant};
 
-use crate::config::{IoFd, OwnedRawHandle, RawHandleKind, UringRawHandle};
+use crate::config::{IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle};
 use veloq_driver_core::driver::RegisterFd;
 
 pub(crate) const MAX_CHUNKS: usize = 1024;
@@ -239,12 +239,69 @@ impl<'a> UringDriver<'a> {
         Ok(())
     }
 
+    pub(crate) fn replace_registered_fixed_fd(
+        &mut self,
+        fixed_fd: IoFd,
+        raw: RawHandle,
+    ) -> UringResult<()> {
+        if !self.file_table_initialized {
+            return Err(UringError::InvalidState
+                .to_report()
+                .push_ctx("scope", "driver.replace_registered_fixed_fd")
+                .with_ctx("fd_fixed_index", fixed_fd.fixed_index())
+                .attach_note("registered file table is not initialized"));
+        }
+
+        let idx = fixed_fd.fixed_index();
+        let index = idx as usize;
+        let Some(slot) = self.registered_files.get_mut(index) else {
+            return Err(UringError::InvalidState
+                .to_report()
+                .push_ctx("scope", "driver.replace_registered_fixed_fd")
+                .with_ctx("fd_fixed_index", idx)
+                .with_ctx("fd_generation", fixed_fd.generation())
+                .attach_note("registered file index out of bounds"));
+        };
+        if self.file_generations.get(index).copied() != Some(fixed_fd.generation()) {
+            return Err(UringError::InvalidState
+                .to_report()
+                .push_ctx("scope", "driver.replace_registered_fixed_fd")
+                .with_ctx("fd_fixed_index", idx)
+                .with_ctx("fd_generation", fixed_fd.generation())
+                .attach_note("registered file generation mismatch while replacing fd"));
+        }
+        if slot.is_none() {
+            return Err(UringError::InvalidState
+                .to_report()
+                .push_ctx("scope", "driver.replace_registered_fixed_fd")
+                .with_ctx("fd_fixed_index", idx)
+                .with_ctx("fd_generation", fixed_fd.generation())
+                .attach_note("registered file slot is empty while replacing fd"));
+        }
+
+        let fd = raw.raw().as_fd();
+        self.ring
+            .submitter()
+            .register_files_update(idx, &[fd])
+            .map_err(|e| {
+                UringError::Registration.io_report(
+                    "driver.replace_registered_fixed_fd.register_files_update",
+                    e,
+                )
+            })?;
+        *slot = Some(RegisteredFileEntry::BorrowedFd {
+            fd,
+            kind: raw.kind(),
+        });
+        Ok(())
+    }
+
     pub(crate) fn ensure_file_table_initialized(&mut self) -> UringResult<()> {
         if self.file_table_initialized {
             return Ok(());
         }
 
-        let capacity = self.ops.local.len().max(MIN_FILE_TABLE_CAPACITY);
+        let capacity = self.ops.capacity().max(MIN_FILE_TABLE_CAPACITY);
         let sparse = vec![-1; capacity];
         self.ring.submitter().register_files(&sparse).map_err(|e| {
             UringError::Registration.io_report("driver.ensure_file_table_initialized", e)

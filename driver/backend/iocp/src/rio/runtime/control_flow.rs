@@ -324,7 +324,7 @@ impl<'a> RioCompletionRouter<'a> {
                 debug!(
                     user_data,
                     generation,
-                    slots = ops.local.len(),
+                    slots = ops.capacity(),
                     "RIO completion for missing slot"
                 );
             }

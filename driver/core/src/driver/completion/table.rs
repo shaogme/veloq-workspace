@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::task::Waker;
 use veloq_shim::atomic::Ordering;
 
+use super::types::CompletionMutationOutcome;
 use super::{
     CompletionAnomaly, CompletionCleanupGuard, CompletionEvent, CompletionPacket, CompletionRecord,
     CompletionRecordKind, CompletionToken, RecordCompletionOutcome, RecordCompletionResult,
@@ -47,11 +48,11 @@ pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
         self.try_take_record(token)
     }
 
-    fn register_waker(&self, token: CompletionToken, waker: &Waker);
+    fn register_waker(&self, token: CompletionToken, waker: &Waker) -> CompletionMutationOutcome;
 
-    fn mark_waiting(&self, token: CompletionToken);
+    fn mark_waiting(&self, token: CompletionToken) -> CompletionMutationOutcome;
 
-    fn mark_orphaned(&self, token: CompletionToken);
+    fn mark_orphaned(&self, token: CompletionToken) -> CompletionMutationOutcome;
 
     #[cfg(any(test, feature = "loom"))]
     fn debug_get_state(&self, idx: usize) -> u8;
@@ -69,6 +70,59 @@ fn rejected_completion<UP, E, R>(
     packet: CompletionPacket<UP, E, R>,
 ) -> RecordCompletionResult<UP, E, R> {
     RecordCompletionResult::Rejected { outcome, packet }
+}
+
+#[inline]
+fn mutation_missing(token: CompletionToken) -> CompletionMutationOutcome {
+    match token.op_token() {
+        Some(op_token) => {
+            let (idx, generation) = op_token.parts();
+            CompletionMutationOutcome::Missing(CompletionAnomaly::unknown_slot(
+                token, idx, generation,
+            ))
+        }
+        None => {
+            CompletionMutationOutcome::UnknownControl(CompletionAnomaly::unknown_control(token))
+        }
+    }
+}
+
+#[inline]
+fn mutation_generation_mismatch(
+    token: CompletionToken,
+    idx: usize,
+    expected_generation: u32,
+    actual_generation: u32,
+    state: slot::SlotState,
+) -> CompletionMutationOutcome {
+    if actual_generation > expected_generation {
+        CompletionMutationOutcome::Stale(CompletionAnomaly::stale(
+            token,
+            idx,
+            expected_generation,
+            actual_generation,
+            state,
+        ))
+    } else {
+        CompletionMutationOutcome::NonActive(CompletionAnomaly::non_active(
+            token,
+            idx,
+            expected_generation,
+            state,
+        ))
+    }
+}
+
+#[inline]
+fn mutation_non_active(
+    token: CompletionToken,
+    idx: usize,
+    generation: u32,
+    state: slot::SlotState,
+) -> CompletionMutationOutcome {
+    CompletionMutationOutcome::NonActive(CompletionAnomaly::non_active(
+        token, idx, generation, state,
+    ))
 }
 
 impl<Spec, UP: Send, E: Send, R: Send> CompletionAccess<UP, E, R> for slot::SlotTable<Spec>
@@ -369,29 +423,28 @@ where
     }
 
     #[inline]
-    fn register_waker(&self, token: CompletionToken, waker: &Waker) {
+    fn register_waker(&self, token: CompletionToken, waker: &Waker) -> CompletionMutationOutcome {
         let Some((idx, generation)) = decode_completion_token(token) else {
-            return;
+            return CompletionMutationOutcome::UnknownControl(CompletionAnomaly::unknown_control(
+                token,
+            ));
         };
         if idx >= self.slots.len() {
-            return;
+            return mutation_missing(token);
         }
         let cell = &self.slots[idx];
 
         loop {
             let current = cell.load_core_state(Ordering::Acquire);
+            let state = current.state();
             let cell_gen = current.generation();
 
-            if cell_gen > generation {
-                return;
+            if cell_gen != generation {
+                return mutation_generation_mismatch(token, idx, generation, cell_gen, state);
             }
 
             // Register waker. AtomicWaker handles races with concurrent wake().
             cell.completion_waker.register(waker);
-
-            if cell_gen < generation {
-                return;
-            }
 
             // cell_gen == generation
             let current_after = cell.load_core_state(Ordering::Acquire);
@@ -399,18 +452,27 @@ where
                 && current_after.generation() == generation
             {
                 waker.wake_by_ref();
+                return CompletionMutationOutcome::Applied;
             }
-            return;
+
+            return match current_after.state() {
+                slot::SlotState::InFlightWaiting | slot::SlotState::InFlightReady => {
+                    CompletionMutationOutcome::Applied
+                }
+                state => mutation_non_active(token, idx, generation, state),
+            };
         }
     }
 
     #[inline]
-    fn mark_waiting(&self, token: CompletionToken) {
+    fn mark_waiting(&self, token: CompletionToken) -> CompletionMutationOutcome {
         let Some((idx, generation)) = decode_completion_token(token) else {
-            return;
+            return CompletionMutationOutcome::UnknownControl(CompletionAnomaly::unknown_control(
+                token,
+            ));
         };
         if idx >= self.slots.len() {
-            return;
+            return mutation_missing(token);
         }
         let cell = &self.slots[idx];
 
@@ -419,42 +481,45 @@ where
             let state = current.state();
             let cell_generation = current.generation();
 
-            if cell_generation > generation {
-                // Stale request, slot already repurposed for a newer op.
-                return;
+            if cell_generation != generation {
+                return mutation_generation_mismatch(
+                    token,
+                    idx,
+                    generation,
+                    cell_generation,
+                    state,
+                );
             }
 
-            if cell_generation < generation {
-                return;
-            } else {
-                // cell_generation == generation
-                if state == slot::SlotState::InFlightReady {
-                    // Fast completion happened, leave as READY.
-                    return;
-                }
+            // cell_generation == generation
+            if state == slot::SlotState::InFlightReady {
+                // Fast completion happened, leave as READY.
+                return CompletionMutationOutcome::Applied;
+            }
 
-                match state {
-                    slot::SlotState::InFlightWaiting => return,
-                    slot::SlotState::Finalizing => {
-                        return;
-                    }
-                    slot::SlotState::Idle
-                    | slot::SlotState::Reserved
-                    | slot::SlotState::InFlightOrphaned
-                    | slot::SlotState::InFlightReady
-                    | slot::SlotState::ReservedValue => return,
+            match state {
+                slot::SlotState::InFlightWaiting => return CompletionMutationOutcome::Applied,
+                slot::SlotState::Finalizing => continue,
+                slot::SlotState::Idle
+                | slot::SlotState::Reserved
+                | slot::SlotState::InFlightOrphaned
+                | slot::SlotState::InFlightReady
+                | slot::SlotState::ReservedValue => {
+                    return mutation_non_active(token, idx, generation, state);
                 }
             }
         }
     }
 
     #[inline]
-    fn mark_orphaned(&self, token: CompletionToken) {
+    fn mark_orphaned(&self, token: CompletionToken) -> CompletionMutationOutcome {
         let Some((idx, generation)) = decode_completion_token(token) else {
-            return;
+            return CompletionMutationOutcome::UnknownControl(CompletionAnomaly::unknown_control(
+                token,
+            ));
         };
         if idx >= self.slots.len() {
-            return;
+            return mutation_missing(token);
         }
         let cell = &self.slots[idx];
 
@@ -466,7 +531,9 @@ where
             match state {
                 slot::SlotState::InFlightWaiting => {
                     if cell_gen != generation {
-                        return;
+                        return mutation_generation_mismatch(
+                            token, idx, generation, cell_gen, state,
+                        );
                     }
                     if cell
                         .core_state
@@ -480,7 +547,7 @@ where
                         )
                         .is_ok()
                     {
-                        return;
+                        return CompletionMutationOutcome::Applied;
                     }
                 }
                 slot::SlotState::InFlightReady if cell_gen == generation => {
@@ -498,11 +565,14 @@ where
                     {
                         self.clear_ready_completion();
                         cell.clear_completion_record_data();
-                        return;
+                        return CompletionMutationOutcome::Applied;
                     }
                 }
                 slot::SlotState::Finalizing => continue,
-                _ => return,
+                _ if cell_gen != generation => {
+                    return mutation_generation_mismatch(token, idx, generation, cell_gen, state);
+                }
+                _ => return mutation_non_active(token, idx, generation, state),
             }
         }
     }
@@ -571,8 +641,9 @@ mod tests {
         let table = slot::SlotTable::<DummySlotSpec>::new(1);
         let token = CompletionToken::user(OpToken::new(0, 1));
 
-        table.mark_waiting(token);
+        let outcome = table.mark_waiting(token);
 
+        assert!(matches!(outcome, CompletionMutationOutcome::NonActive(_)));
         assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
     }
 
@@ -583,9 +654,36 @@ mod tests {
         table.slots[0].set_state(slot::SlotState::InFlightOrphaned, Ordering::Release);
         let token = CompletionToken::user(OpToken::new(0, 1));
 
-        table.mark_waiting(token);
+        let outcome = table.mark_waiting(token);
 
+        assert!(matches!(outcome, CompletionMutationOutcome::NonActive(_)));
         assert_eq!(table.debug_get_state(0), CELL_STATE_ORPHANED);
+    }
+
+    #[test]
+    fn mark_orphaned_reports_stale_generation() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        table.slots[0].reset(2);
+        table.slots[0].set_state(slot::SlotState::InFlightWaiting, Ordering::Release);
+        let token = CompletionToken::user(OpToken::new(0, 1));
+
+        let outcome = table.mark_orphaned(token);
+
+        assert!(matches!(outcome, CompletionMutationOutcome::Stale(_)));
+        assert_eq!(table.debug_get_state(0), CELL_STATE_WAITING);
+    }
+
+    #[test]
+    fn register_waker_reports_unknown_control_token() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        let waker = std::task::Waker::noop();
+
+        let outcome = table.register_waker(CompletionToken::waker(0), waker);
+
+        assert!(matches!(
+            outcome,
+            CompletionMutationOutcome::UnknownControl(_)
+        ));
     }
 
     #[test]

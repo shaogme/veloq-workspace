@@ -152,8 +152,11 @@ where
         CompletionAnomalyReason::PayloadMissing => LostReason::PayloadMissing,
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::UnknownControlToken
+        | CompletionAnomalyReason::ControlCompletionUntracked
         | CompletionAnomalyReason::NonActiveSlot
-        | CompletionAnomalyReason::SlotCorruption => LostReason::Other,
+        | CompletionAnomalyReason::SlotCorruption
+        | CompletionAnomalyReason::OpMissing
+        | CompletionAnomalyReason::BackendInvariantBroken => LostReason::Other,
     };
 
     let mut report = DriverCoreError::Internal

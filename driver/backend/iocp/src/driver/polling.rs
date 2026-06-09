@@ -143,7 +143,7 @@ impl<'a> IocpDriver<'a> {
 
     /// Retrieves completion events from the I/O completion port.
     pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> IocpResult<()> {
-        drain_cancel_requests(self);
+        let _ = drain_cancel_requests(self)?;
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
         let status = self.completion.port().get_status(wait_ms);
@@ -220,8 +220,12 @@ impl<'a> IocpDriver<'a> {
                 Ok(CompletionProgress { iocp: 1, rio: 0 })
             }
             CompletionDispatch::Cancel { raw, .. } | CompletionDispatch::Unknown { raw } => {
-                let anomaly =
-                    CompletionAnomaly::unknown_control(raw.token).with_raw_completion(raw);
+                let anomaly = if let Some(token) = raw.token.op_token() {
+                    CompletionAnomaly::unknown_slot(raw.token, token.index(), token.generation())
+                        .with_raw_completion(raw)
+                } else {
+                    CompletionAnomaly::unknown_control(raw.token).with_raw_completion(raw)
+                };
                 record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
                 debug!(
                     token = raw.token.raw(),
@@ -268,17 +272,20 @@ impl<'a> IocpDriver<'a> {
             // SAFETY: overlapped is non-null and corresponds to a valid OverlappedEntry.
             let entry = unsafe { &*(overlapped as *const crate::op::OverlappedEntry) };
             let idx = entry.token.index();
-            if idx >= self.ops.local.len() {
+            if idx >= self.ops.capacity() {
                 error!(
                     idx,
-                    slots = self.ops.local.len(),
+                    slots = self.ops.capacity(),
                     "completed index out of bounds"
                 );
-                return IocpError::CompletionWait
-                    .push_ctx("scope", "iocp/driver")
-                    .with_ctx("completed_index", idx)
-                    .with_ctx("slot_count", self.ops.local.len())
-                    .attach_note("completed index out of bounds");
+                return Ok(CompletionDispatch::Unknown {
+                    raw: RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(entry.token),
+                        iocp_status_res(success, error_code, bytes),
+                        0,
+                    ),
+                });
             }
             let raw = RawCompletion::new(
                 CompletionBackend::Iocp,

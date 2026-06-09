@@ -45,7 +45,7 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    fn submit_cancel_request(&mut self, request: PendingCancel) -> CancelSubmitOutcome {
+    fn try_submit_cancel_request(&mut self, request: PendingCancel) -> Option<u16> {
         let (user_data, generation) = request.user_parts();
 
         let cancel_id = self.next_cancel_completion_id();
@@ -53,10 +53,7 @@ impl<'a> UringDriver<'a> {
             .build()
             .user_data(CompletionToken::cancel(cancel_id).raw());
 
-        if !self.push_entry(cancel_sqe) {
-            self.pending_cancellations.push_back(request);
-            CancelSubmitOutcome::Queued
-        } else {
+        if self.push_entry(cancel_sqe) {
             self.pending_cancel_cqes.insert(cancel_id, request);
             self.completion_diagnostics.inc_cancel_submitted();
             trace!(
@@ -66,7 +63,18 @@ impl<'a> UringDriver<'a> {
                 mode = ?request.mode,
                 "submitted async cancel"
             );
+            Some(cancel_id)
+        } else {
+            None
+        }
+    }
+
+    fn submit_cancel_request(&mut self, request: PendingCancel) -> CancelSubmitOutcome {
+        if self.try_submit_cancel_request(request).is_some() {
             CancelSubmitOutcome::Submitted
+        } else {
+            self.pending_cancellations.push_back(request);
+            CancelSubmitOutcome::Queued
         }
     }
 
@@ -84,7 +92,10 @@ impl<'a> UringDriver<'a> {
                     let mut cleanup = sidecar.cleanup;
                     let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
                 }
-                let _ = self.ops.finalize_orphaned_completion(token);
+                self.finalize_orphaned_completion_checked(
+                    token,
+                    "uring.cancel_op_internal.reserved",
+                );
                 CancelSubmitOutcome::AlreadyComplete
             }
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
@@ -98,7 +109,10 @@ impl<'a> UringDriver<'a> {
                         let _ =
                             run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
                     }
-                    let _ = self.ops.finalize_waiting_completion(token);
+                    self.finalize_waiting_completion_checked(
+                        token,
+                        "uring.cancel_op_internal.waiting_queued",
+                    );
                     return CancelSubmitOutcome::AlreadyComplete;
                 }
 
@@ -126,7 +140,10 @@ impl<'a> UringDriver<'a> {
                         let _ =
                             run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
                     }
-                    let _ = self.ops.finalize_orphaned_completion(token);
+                    self.finalize_orphaned_completion_checked(
+                        token,
+                        "uring.cancel_op_internal.waiting_timer",
+                    );
                     return CancelSubmitOutcome::AlreadyComplete;
                 }
 
@@ -143,7 +160,10 @@ impl<'a> UringDriver<'a> {
                     self.remove_backlog_token(token);
                     let mut cleanup = sidecar.cleanup;
                     let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
-                    let _ = self.ops.finalize_orphaned_completion(token);
+                    self.finalize_orphaned_completion_checked(
+                        token,
+                        "uring.cancel_op_internal.orphaned_queued",
+                    );
                     return CancelSubmitOutcome::AlreadyComplete;
                 }
 
@@ -152,7 +172,10 @@ impl<'a> UringDriver<'a> {
                     self.wheel.cancel(tid);
                     let mut cleanup = sidecar.cleanup;
                     let _ = run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
-                    let _ = self.ops.finalize_orphaned_completion(token);
+                    self.finalize_orphaned_completion_checked(
+                        token,
+                        "uring.cancel_op_internal.orphaned_timer",
+                    );
                     return CancelSubmitOutcome::AlreadyComplete;
                 }
 
@@ -190,7 +213,7 @@ impl<'a> UringDriver<'a> {
                     has_payload = snapshot.has_payload,
                     "cancel request found corrupt slot; recycling"
                 );
-                let _ = self.ops.finalize_corrupt_slot(snapshot);
+                self.finalize_corrupt_slot_checked(snapshot, "uring.cancel_op_internal.corrupt");
                 CancelSubmitOutcome::NotFound
             }
         }
@@ -252,20 +275,15 @@ impl<'a> UringDriver<'a> {
                         )
                         .with_slot_snapshot(snapshot);
                         record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                        let _ = self.ops.finalize_corrupt_slot(snapshot);
+                        self.finalize_corrupt_slot_checked(
+                            snapshot,
+                            "uring.flush_cancellations.corrupt",
+                        );
                         continue;
                     }
                 }
 
-                let cancel_id = self.next_cancel_completion_id();
-                let cancel_sqe =
-                    opcode::AsyncCancel::new(CompletionToken::user(request.target).raw())
-                        .build()
-                        .user_data(CompletionToken::cancel(cancel_id).raw());
-
-                if self.push_entry(cancel_sqe) {
-                    self.pending_cancel_cqes.insert(cancel_id, request);
-                    self.completion_diagnostics.inc_cancel_submitted();
+                if self.try_submit_cancel_request(request).is_some() {
                     self.pending_cancellations.pop_front();
                     submitted_count += 1;
                 } else {
@@ -324,7 +342,10 @@ impl<'a> UringDriver<'a> {
                         let mut cleanup = sidecar.cleanup;
                         let _ =
                             run_completion_cleanup(&mut self.completion_diagnostics, &mut cleanup);
-                        let _ = self.ops.finalize_orphaned_completion(token);
+                        self.finalize_orphaned_completion_checked(
+                            token,
+                            "uring.flush_backlog.cancel_queued",
+                        );
                     }
                 }
                 BacklogAction::CancelKernel => {
@@ -403,7 +424,10 @@ impl<'a> UringDriver<'a> {
                 cleanup: CompletionCleanupGuard::default(),
             };
             self.push_completion_event(sidecar);
-            let _ = self.ops.finalize_waiting_completion(token);
+            self.finalize_waiting_completion_checked(
+                token,
+                "uring.complete_queued_submission_error",
+            );
         }
     }
 }

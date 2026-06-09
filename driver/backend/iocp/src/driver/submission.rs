@@ -226,11 +226,21 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         duration: Duration,
     ) -> DriverSubmitResult<IocpError> {
-        let user_data = token.index();
         let timeout = ctx.wheel.insert(token, duration);
-        if let Some((_, op_entry)) = ops.get_slot_and_entry_mut(user_data) {
-            op_entry.platform_data.timer_id = Some(timeout);
-            op_entry.platform_data.timer_deadline = Some(Instant::now() + duration);
+        if let Some(platform) = ops.platform_mut_token(token) {
+            platform.timer_id = Some(timeout);
+            platform.timer_deadline = Some(Instant::now() + duration);
+        } else {
+            ctx.wheel.cancel(timeout);
+            return DriverSubmitResult::failed(
+                IocpError::InvalidState
+                    .to_report()
+                    .push_ctx("scope", "iocp.driver.handle_timer_sub")
+                    .with_ctx("user_data", token.index())
+                    .with_ctx("generation", token.generation())
+                    .attach_note("timer submission target slot is not active"),
+                SubmitStatus::Void,
+            );
         }
         DriverSubmitResult::submitted(Poll::Pending)
     }

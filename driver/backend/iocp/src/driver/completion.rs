@@ -3,7 +3,7 @@ use std::time::Instant;
 use diagweave::prelude::*;
 use tracing::{debug, error};
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionEvent,
+    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionEvent, CompletionToken,
     DriverCompletionDiagnostics, OpToken, RawCompletion, RecordCompletionOutcome,
     RoutedSlotCompletion, record_completion_anomaly, record_lost_completion, route_user_completion,
     run_completion_cleanup,
@@ -34,25 +34,111 @@ impl<'a> IocpDriver<'a> {
 
         let mut expired = Vec::new();
         for &token in &timer_buffer {
-            let user_data = token.index();
-            let in_flight = matches!(
-                self.ops.checked_slot_view(token),
-                CheckedSlotView::Valid(SlotView::InFlightWaiting(_))
-                    | CheckedSlotView::Valid(SlotView::InFlightOrphaned(_))
-            );
-            if let Some(op) = self.ops.local.get_mut(user_data) {
-                if in_flight {
-                    if let Some(deadline) = op.entry.platform_data.timer_deadline
+            match self.ops.checked_slot_view(token) {
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+                    if let Some(deadline) = slot.platform().timer_deadline
                         && now < deadline
                     {
                         let remain = deadline.saturating_duration_since(now);
-                        op.entry.platform_data.timer_id = Some(self.timer.insert(token, remain));
+                        let timer_id = self.timer.insert(token, remain);
+                        slot.platform_mut().timer_id = Some(timer_id);
                         continue;
                     }
                     expired.push(token);
-                } else {
-                    op.entry.platform_data.timer_id = None;
-                    op.entry.platform_data.timer_deadline = None;
+                }
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+                    if let Some(deadline) = slot.platform().timer_deadline
+                        && now < deadline
+                    {
+                        let remain = deadline.saturating_duration_since(now);
+                        let timer_id = self.timer.insert(token, remain);
+                        slot.platform_mut().timer_id = Some(timer_id);
+                        continue;
+                    }
+                    expired.push(token);
+                }
+                CheckedSlotView::Valid(SlotView::Reserved(_)) => {
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly = CompletionAnomaly::backend_invariant_broken(
+                        raw.token,
+                        token.index(),
+                        token.generation(),
+                        veloq_driver_core::slot::SlotState::Reserved,
+                    )
+                    .with_raw_completion(raw);
+                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                }
+                CheckedSlotView::Missing {
+                    index,
+                    expected_generation,
+                } => {
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly =
+                        CompletionAnomaly::unknown_slot(raw.token, index, expected_generation)
+                            .with_raw_completion(raw);
+                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                }
+                CheckedSlotView::Empty(snapshot) => {
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly = CompletionAnomaly::non_active(
+                        raw.token,
+                        snapshot.index,
+                        token.generation(),
+                        snapshot.state,
+                    )
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                }
+                CheckedSlotView::Stale(snapshot) => {
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly = CompletionAnomaly::stale(
+                        raw.token,
+                        snapshot.index,
+                        token.generation(),
+                        snapshot.generation,
+                        snapshot.state,
+                    )
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                }
+                CheckedSlotView::Corrupt(snapshot) => {
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly = CompletionAnomaly::corrupt(
+                        raw.token,
+                        snapshot.index,
+                        snapshot.generation,
+                        snapshot.state,
+                    )
+                    .with_slot_snapshot(snapshot)
+                    .with_raw_completion(raw);
+                    self.emit_corrupt_completion(anomaly, "IOCP timer found corrupt slot");
                 }
             }
         }

@@ -12,8 +12,8 @@ pub use table::{
 };
 pub use types::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanup,
-    CompletionCleanupGuard, DriverCompletionDiagnostics, DriverCompletionDiagnosticsSnapshot,
-    RecordCompletionOutcome, RecordCompletionResult,
+    CompletionCleanupGuard, CompletionMutationOutcome, DriverCompletionDiagnostics,
+    DriverCompletionDiagnosticsSnapshot, RecordCompletionOutcome, RecordCompletionResult,
 };
 
 pub trait CompletionValue: Send {
@@ -322,7 +322,7 @@ pub fn route_user_completion<'a, Spec: slot::SlotSpec>(
         CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
             let snapshot = slot.snapshot();
             RoutedSlotCompletion::Corrupt(
-                CompletionAnomaly::corrupt(
+                CompletionAnomaly::backend_invariant_broken(
                     raw.token,
                     snapshot.index,
                     snapshot.generation,
@@ -358,15 +358,21 @@ pub fn route_user_completion<'a, Spec: slot::SlotSpec>(
             .with_raw_completion(raw),
         ),
         CheckedSlotView::Corrupt(snapshot) => RoutedSlotCompletion::Corrupt(
-            CompletionAnomaly::corrupt(
-                raw.token,
-                snapshot.index,
-                snapshot.generation,
-                snapshot.state,
-            )
-            .with_slot_snapshot(snapshot)
-            .with_raw_completion(raw),
+            corrupt_slot_anomaly(raw.token, snapshot)
+                .with_slot_snapshot(snapshot)
+                .with_raw_completion(raw),
         ),
+    }
+}
+
+#[inline]
+fn corrupt_slot_anomaly(token: CompletionToken, snapshot: slot::SlotSnapshot) -> CompletionAnomaly {
+    if !snapshot.has_op {
+        CompletionAnomaly::op_missing(token, snapshot.index, snapshot.generation)
+    } else if !snapshot.has_payload {
+        CompletionAnomaly::payload_missing(token, snapshot.index, snapshot.generation)
+    } else {
+        CompletionAnomaly::corrupt(token, snapshot.index, snapshot.generation, snapshot.state)
     }
 }
 
@@ -620,9 +626,13 @@ pub fn record_completion_anomaly(
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::UnknownControlToken
         | CompletionAnomalyReason::NonActiveSlot => diagnostics.inc_unknown_completion(),
-        CompletionAnomalyReason::StaleGeneration => diagnostics.inc_stale_completion(),
-        CompletionAnomalyReason::SlotCorruption => diagnostics.inc_slot_corruption(),
+        CompletionAnomalyReason::ControlCompletionUntracked
+        | CompletionAnomalyReason::BackendInvariantBroken => diagnostics.inc_internal_unknown(),
+        CompletionAnomalyReason::OpMissing | CompletionAnomalyReason::SlotCorruption => {
+            diagnostics.inc_slot_corruption()
+        }
         CompletionAnomalyReason::PayloadMissing => diagnostics.inc_payload_missing(),
+        CompletionAnomalyReason::StaleGeneration => diagnostics.inc_stale_completion(),
     }
 }
 

@@ -174,10 +174,29 @@ impl DriverCompletionDiagnostics {
 pub enum CompletionAnomalyReason {
     UnknownSlot,
     UnknownControlToken,
+    ControlCompletionUntracked,
     StaleGeneration,
     NonActiveSlot,
     SlotCorruption,
+    OpMissing,
     PayloadMissing,
+    BackendInvariantBroken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionMutationOutcome {
+    Applied,
+    Missing(CompletionAnomaly),
+    Stale(CompletionAnomaly),
+    NonActive(CompletionAnomaly),
+    UnknownControl(CompletionAnomaly),
+}
+
+impl CompletionMutationOutcome {
+    #[inline]
+    pub const fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +235,22 @@ impl CompletionAnomaly {
             flags: None,
             slot_snapshot: None,
             reason: CompletionAnomalyReason::UnknownControlToken,
+        }
+    }
+
+    #[inline]
+    pub fn control_completion_untracked(token: CompletionToken) -> Self {
+        Self {
+            token,
+            index: None,
+            expected_generation: None,
+            actual_generation: None,
+            state: None,
+            backend: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::ControlCompletionUntracked,
         }
     }
 
@@ -300,6 +335,22 @@ impl CompletionAnomaly {
     }
 
     #[inline]
+    pub fn op_missing(token: CompletionToken, index: usize, generation: u32) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: Some(generation),
+            state: None,
+            backend: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::OpMissing,
+        }
+    }
+
+    #[inline]
     pub fn payload_missing(token: CompletionToken, index: usize, generation: u32) -> Self {
         Self {
             token,
@@ -312,6 +363,27 @@ impl CompletionAnomaly {
             flags: None,
             slot_snapshot: None,
             reason: CompletionAnomalyReason::PayloadMissing,
+        }
+    }
+
+    #[inline]
+    pub fn backend_invariant_broken(
+        token: CompletionToken,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: Some(generation),
+            state: Some(state),
+            backend: None,
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::BackendInvariantBroken,
         }
     }
 

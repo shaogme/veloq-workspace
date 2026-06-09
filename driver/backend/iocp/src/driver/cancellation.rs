@@ -36,10 +36,15 @@ impl<'a> IocpDriver<'a> {
             completion_table: self.completion.table(),
         };
 
-        let timer_id = self
-            .ops
-            .get_mut(user_data)
-            .and_then(|op| op.platform_data.timer_id);
+        let timer_id = match self.ops.checked_slot_view(token) {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+                slot.platform_mut().timer_id.take()
+            }
+            CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+                slot.platform_mut().timer_id.take()
+            }
+            _ => None,
+        };
         if let Some(tid) = timer_id {
             self.timer.cancel(tid);
             if let Some(outcome) = Self::abort_slot_inner(
@@ -233,7 +238,6 @@ impl<'a> IocpDriver<'a> {
         emit_completion: bool,
         token: OpToken,
     ) -> Option<RecordCompletionOutcome> {
-        let user_data = token.index();
         let inflight = match ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(guard)) => {
                 let mut guard = guard.complete();
@@ -251,7 +255,7 @@ impl<'a> IocpDriver<'a> {
         let (payload, detail) = if let Some(data) = inflight {
             data
         } else {
-            ops.with_slot_storage_mut(user_data, |result, payload, _sidecar| {
+            ops.with_slot_storage_mut_token(token, |result, payload, _sidecar| {
                 (payload.take(), result.take())
             })
             .unwrap_or((None, None))

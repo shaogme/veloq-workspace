@@ -4,7 +4,6 @@ use crate::slot::{
     SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData, SlotSidecarData,
     SlotSpec, SlotState, SlotStorage, SlotTable,
 };
-use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 use veloq_shim::atomic::Ordering;
 
@@ -51,7 +50,7 @@ pub type LocalSlots<Spec> = Box<[LocalSlot<Spec>]>;
 
 pub struct OpRegistry<Spec: SlotSpec> {
     pub shared: Arc<SlotTableOf<Spec>>,
-    pub local: LocalSlots<Spec>,
+    pub(crate) local: LocalSlots<Spec>,
     local_free_head: usize,
     active_count: usize,
 }
@@ -160,24 +159,22 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         }
     }
 
-    pub fn get_mut(
-        &mut self,
-        user_data: usize,
-    ) -> Option<&mut OpEntry<RegistryPlatformData<Spec>>> {
+    fn get_mut(&mut self, user_data: usize) -> Option<&mut OpEntry<RegistryPlatformData<Spec>>> {
         self.local.get_mut(user_data).map(|v| &mut v.entry)
     }
 
-    pub fn get_mut_token(
+    pub fn platform_mut_token(
         &mut self,
         token: OpToken,
-    ) -> Option<&mut OpEntry<RegistryPlatformData<Spec>>> {
-        if !self.contains_token(token) {
+    ) -> Option<&mut RegistryPlatformData<Spec>> {
+        if !self.contains(token) {
             return None;
         }
         self.get_mut(token.index())
+            .map(|entry| &mut entry.platform_data)
     }
 
-    pub fn get_slot_and_entry_mut(
+    fn get_slot_and_entry_mut(
         &mut self,
         user_data: usize,
     ) -> Option<SlotEntryAndOpEntry<'_, Spec>> {
@@ -195,13 +192,13 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         &mut self,
         token: OpToken,
     ) -> Option<SlotEntryAndOpEntry<'_, Spec>> {
-        if !self.contains_token(token) {
+        if !self.contains(token) {
             return None;
         }
         self.get_slot_and_entry_mut(token.index())
     }
 
-    pub fn get_slot_entry_op_storage_and_entry_mut(
+    pub(crate) fn get_slot_entry_op_storage_and_entry_mut(
         &mut self,
         user_data: usize,
     ) -> Option<SlotEntryOpBundle<'_, Spec>> {
@@ -222,14 +219,14 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         &mut self,
         token: OpToken,
     ) -> Option<SlotEntryOpBundle<'_, Spec>> {
-        if !self.contains_token(token) {
+        if !self.contains(token) {
             return None;
         }
         self.get_slot_entry_op_storage_and_entry_mut(token.index())
     }
 
     #[inline]
-    pub fn with_slot_storage_mut<F, X>(&mut self, user_data: usize, f: F) -> Option<X>
+    pub(crate) fn with_slot_storage_mut<F, X>(&mut self, user_data: usize, f: F) -> Option<X>
     where
         F: FnOnce(
             &mut Option<DriverResult<RegistryCompletion<Spec>, RegistryError<Spec>>>,
@@ -251,13 +248,13 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             &mut RegistrySidecar<Spec>,
         ) -> X,
     {
-        if !self.contains_token(token) {
+        if !self.contains(token) {
             return None;
         }
         self.with_slot_storage_mut(token.index(), f)
     }
 
-    pub fn slot_storage_mut(&mut self, user_data: usize) -> Option<&mut SlotStorageOf<Spec>> {
+    fn slot_storage_mut(&mut self, user_data: usize) -> Option<&mut SlotStorageOf<Spec>> {
         if user_data < self.local.len() {
             Some(&mut self.local[user_data].storage)
         } else {
@@ -266,23 +263,34 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     }
 
     pub fn slot_storage_mut_token(&mut self, token: OpToken) -> Option<&mut SlotStorageOf<Spec>> {
-        if !self.contains_token(token) {
+        if !self.contains(token) {
             return None;
         }
         self.slot_storage_mut(token.index())
     }
 
-    pub fn contains(&self, user_data: usize) -> bool {
-        user_data < self.local.len()
-    }
-
-    pub fn contains_token(&self, token: OpToken) -> bool {
+    pub fn contains(&self, token: OpToken) -> bool {
         let (user_data, generation) = token.parts();
         let Some(slot) = self.shared.slots.get(user_data) else {
             return false;
         };
         let core = slot.load_core_state(Ordering::Acquire);
         core.generation() == generation && core.state() != SlotState::Idle
+    }
+
+    #[inline]
+    pub fn current_token_at_index(&self, index: usize) -> Option<OpToken> {
+        let slot = self.shared.slots.get(index)?;
+        let core = slot.load_core_state(Ordering::Acquire);
+        if core.state() == SlotState::Idle {
+            return None;
+        }
+        Some(OpToken::new(index, core.generation()))
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.local.len()
     }
 
     fn remove_index(&mut self, user_data: usize) -> OpEntry<RegistryPlatformData<Spec>> {
@@ -308,6 +316,14 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         }
 
         Some(self.remove_index(user_data))
+    }
+
+    #[inline]
+    pub fn finalize_token_checked(
+        &mut self,
+        token: OpToken,
+    ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
+        self.remove_token(token)
     }
 
     fn recycle_index(&mut self, user_data: usize, generation: u32) {
@@ -380,19 +396,5 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     #[inline]
     pub fn active_count(&self) -> usize {
         self.active_count
-    }
-}
-
-impl<Spec: SlotSpec> Index<usize> for OpRegistry<Spec> {
-    type Output = OpEntry<RegistryPlatformData<Spec>>;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.local[index].entry
-    }
-}
-
-impl<Spec: SlotSpec> IndexMut<usize> for OpRegistry<Spec> {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.local[index].entry
     }
 }

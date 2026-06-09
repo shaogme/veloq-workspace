@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use diagweave::prelude::*;
@@ -33,12 +32,7 @@ enum ShutdownOpKind {
 }
 
 fn current_token(ops: &IocpOpRegistry, user_data: usize) -> Option<OpToken> {
-    let generation = ops
-        .shared
-        .slots
-        .get(user_data)?
-        .generation(Ordering::Acquire);
-    Some(OpToken::new(user_data, generation))
+    ops.current_token_at_index(user_data)
 }
 
 pub(super) struct IocpRioRuntime<'a> {
@@ -168,7 +162,7 @@ impl<'a> IocpDriver<'a> {
 
         let mut in_flight = Vec::new();
         let mut pending = ShutdownPending::default();
-        for user_data in 0..self.ops.local.len() {
+        for user_data in 0..self.ops.capacity() {
             let Some(token) = current_token(&self.ops, user_data) else {
                 continue;
             };
@@ -243,7 +237,7 @@ impl<'a> IocpDriver<'a> {
 
     fn preserve_rio_payloads_for_fast_close(&mut self) {
         let mut rio_slots = Vec::new();
-        for user_data in 0..self.ops.local.len() {
+        for user_data in 0..self.ops.capacity() {
             let Some(token) = current_token(&self.ops, user_data) else {
                 continue;
             };
@@ -279,7 +273,7 @@ impl<'a> IocpDriver<'a> {
 
             if let Some(payload) = self
                 .ops
-                .with_slot_storage_mut(token.index(), |_result, payload, _sidecar| payload.take())
+                .with_slot_storage_mut_token(token, |_result, payload, _sidecar| payload.take())
                 .flatten()
             {
                 payloads.push(payload);

@@ -186,9 +186,9 @@ impl<'a> UringDriver<'a> {
                 };
                 if let Some(duration) = duration_opt {
                     let task_id = driver.wheel.insert(token, duration);
-                    if let Some(entry) = driver.ops.get_mut_token(token) {
-                        entry.platform_data.timer_id = Some(task_id);
-                        entry.platform_data.submission_state = UringSubmissionState::Timer;
+                    if let Some(platform) = driver.ops.platform_mut_token(token) {
+                        platform.timer_id = Some(task_id);
+                        platform.submission_state = UringSubmissionState::Timer;
                     }
                     let _ = sub_guard.persist();
                     trace!(user_data, ?duration, "Registered software timer");
@@ -345,7 +345,8 @@ impl<'a> UringDriver<'a> {
         let fixed_fd = match self.waker_registered_fd {
             Some(fd) => fd,
             None => {
-                let fd = self.waker_fd.fd.raw().as_fd();
+                let event_fd = self.waker_state.current();
+                let fd = event_fd.fd.raw().as_fd();
                 let raw = RawHandle::new(UringRawHandle::for_file(fd));
                 let mut fds = self.register_files_internal(vec![
                     veloq_driver_core::driver::RegisterFd::Borrowed(raw.borrow()),

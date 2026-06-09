@@ -194,8 +194,12 @@ pub trait Driver {
 
     fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Error, Self::Completion>;
 
-    fn register_completion_waker(&mut self, token: CompletionToken, waker: &Waker) {
-        self.completion_table().register_waker(token, waker);
+    fn register_completion_waker(
+        &mut self,
+        token: CompletionToken,
+        waker: &Waker,
+    ) -> CompletionMutationOutcome {
+        self.completion_table().register_waker(token, waker)
     }
 
     fn cancel_op(
@@ -347,11 +351,50 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     }
 }
 
-#[inline]
-pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
-    while let Some(request) = driver.try_recv_remote_cancel_request() {
-        let _ = driver.cancel_op(request);
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CancelDrainOutcome {
+    pub requests: u64,
+    pub submitted: u64,
+    pub queued: u64,
+    pub not_found: u64,
+    pub no_handle: u64,
+    pub already_complete: u64,
+}
+
+impl CancelDrainOutcome {
+    #[inline]
+    fn record(&mut self, outcome: CancelSubmitOutcome) {
+        self.requests = self.requests.saturating_add(1);
+        match outcome {
+            CancelSubmitOutcome::Submitted => {
+                self.submitted = self.submitted.saturating_add(1);
+            }
+            CancelSubmitOutcome::Queued => {
+                self.queued = self.queued.saturating_add(1);
+            }
+            CancelSubmitOutcome::NotFound => {
+                self.not_found = self.not_found.saturating_add(1);
+            }
+            CancelSubmitOutcome::NoHandle => {
+                self.no_handle = self.no_handle.saturating_add(1);
+            }
+            CancelSubmitOutcome::AlreadyComplete => {
+                self.already_complete = self.already_complete.saturating_add(1);
+            }
+        }
     }
+}
+
+#[inline]
+pub fn drain_cancel_requests<D: Driver>(
+    driver: &mut D,
+) -> DriverResult<CancelDrainOutcome, D::Error> {
+    let mut outcome = CancelDrainOutcome::default();
+    while let Some(request) = driver.try_recv_remote_cancel_request() {
+        let submit_outcome = driver.cancel_op(request)?;
+        outcome.record(submit_outcome);
+    }
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,8 +427,11 @@ pub enum SubmitStatus {
 
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks {
+    use crate::driver::DriverCompletionDiagnosticsSnapshot;
+
     pub trait DriverTestHooks {
         fn debug_chunk_register_attempts(&self) -> u64;
+        fn debug_completion_diagnostics(&self) -> DriverCompletionDiagnosticsSnapshot;
     }
 }
 
@@ -397,5 +443,11 @@ impl<'a, D: Driver + ?Sized + test_hooks::DriverTestHooks, P: ContextDriverProvi
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.provider
             .with_driver_ref(|d| d.debug_chunk_register_attempts())
+    }
+
+    #[inline]
+    fn debug_completion_diagnostics(&self) -> DriverCompletionDiagnosticsSnapshot {
+        self.provider
+            .with_driver_ref(|d| d.debug_completion_diagnostics())
     }
 }
