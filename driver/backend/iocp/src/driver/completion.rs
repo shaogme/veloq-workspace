@@ -214,7 +214,8 @@ impl<'a> IocpDriver<'a> {
         }
 
         for token in expired {
-            let event = UserCompletionEvent::from_parts(CompletionBackend::Iocp, token, 0, 0);
+            let event =
+                UserCompletionEvent::from_parts(CompletionBackend::Backend("iocp"), token, 0, 0);
             let _ = self.accept_synthetic_completion(
                 event,
                 SyntheticCompletionSource::Timer,
@@ -262,7 +263,7 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpResult<CompletionFlowOutcome> {
         self.accept_completion_ingress(
             CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
-                CompletionBackend::Iocp,
+                CompletionBackend::Backend("iocp"),
                 raw_token,
                 res,
                 flags,
@@ -403,8 +404,12 @@ fn complete_iocp_waiting_slot(
         CompletionCleanupGuard::default()
     };
     let (payload, detail) = guard.take_completion_data();
-    let event =
-        UserCompletionEvent::from_parts(CompletionBackend::Iocp, event.token(), completion_res, 0);
+    let event = UserCompletionEvent::from_parts(
+        CompletionBackend::Backend("iocp"),
+        event.token(),
+        completion_res,
+        0,
+    );
     if let Some(payload) = payload {
         let _ = guard.take_op();
         let _data = std::mem::take(guard.platform_mut());

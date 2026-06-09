@@ -349,7 +349,8 @@ impl<'a> UringDriver<'a> {
 
         let timer_buffer = std::mem::take(&mut self.timer_buffer);
         for token in timer_buffer {
-            let event = UserCompletionEvent::from_parts(CompletionBackend::Uring, token, 0, 0);
+            let event =
+                UserCompletionEvent::from_parts(CompletionBackend::Backend("uring"), token, 0, 0);
             let _ = self.accept_synthetic_completion(
                 event,
                 SyntheticCompletionSource::Timer,
@@ -398,7 +399,7 @@ impl<'a> UringDriver<'a> {
         for (raw_token, cqe_res, cqe_flags) in cqes {
             let outcome = self.accept_completion_ingress(
                 CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
-                    CompletionBackend::Uring,
+                    CompletionBackend::Backend("uring"),
                     raw_token,
                     cqe_res,
                     cqe_flags,
@@ -510,7 +511,7 @@ impl<'a> UringDriver<'a> {
             .backend()
             .inc_cancel_ack_enoent_active();
         let target_raw = RawCompletion::new(
-            CompletionBackend::Uring,
+            CompletionBackend::Backend("uring"),
             veloq_driver_core::driver::CompletionToken::user(request.target),
             raw.res,
             raw.flags,
@@ -568,7 +569,7 @@ fn complete_kernel_waiting_slot(
 
     CompletionHookOutcome::User {
         event: UserCompletionEvent::from_parts(
-            CompletionBackend::Uring,
+            CompletionBackend::Backend("uring"),
             token,
             res_code,
             raw.flags,
@@ -725,8 +726,12 @@ fn lost_waiting_slot_completion(
             effect: UringBackendEffect::None,
         };
     };
-    let event =
-        UserCompletionEvent::from_parts(CompletionBackend::Uring, token, raw.res, raw.flags);
+    let event = UserCompletionEvent::from_parts(
+        CompletionBackend::Backend("uring"),
+        token,
+        raw.res,
+        raw.flags,
+    );
     CompletionHookOutcome::Lost {
         event,
         loss_reason: CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot)
@@ -752,8 +757,12 @@ fn lost_completed_slot_completion(
             effect: UringBackendEffect::None,
         };
     };
-    let event =
-        UserCompletionEvent::from_parts(CompletionBackend::Uring, token, raw.res, raw.flags);
+    let event = UserCompletionEvent::from_parts(
+        CompletionBackend::Backend("uring"),
+        token,
+        raw.res,
+        raw.flags,
+    );
     let (payload, detail) = slot.take_completion_data();
     let _ = slot.take_op();
     drop(payload);
@@ -861,7 +870,12 @@ mod tests {
             &mut waker_armed,
             &is_waked,
         );
-        let raw = RawCompletion::new(CompletionBackend::Uring, CompletionToken::waker(0), 4, 0);
+        let raw = RawCompletion::new(
+            CompletionBackend::Backend("uring"),
+            CompletionToken::waker(0),
+            4,
+            0,
+        );
 
         let effect = hooks.handle_waker_control(raw);
 
@@ -888,7 +902,7 @@ mod tests {
         );
         let cancel_id = CancelCompletionId::new(7);
         let raw = RawCompletion::new(
-            CompletionBackend::Uring,
+            CompletionBackend::Backend("uring"),
             CompletionToken::cancel(cancel_id),
             0,
             0,

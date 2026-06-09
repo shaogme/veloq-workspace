@@ -247,7 +247,7 @@ impl<'a> IocpDriver<'a> {
 
                 let anomaly =
                     CompletionAnomaly::backend_context_unknown(CompletionToken::rio_wake(0))
-                        .with_backend(CompletionBackend::Iocp)
+                        .with_backend(CompletionBackend::Backend("iocp"))
                         .with_backend_context(key as u64)
                         .with_raw_result(res)
                         .with_flags(flags);
@@ -257,7 +257,7 @@ impl<'a> IocpDriver<'a> {
             IocpCompletionStatusKind::Unknown => {
                 let anomaly =
                     CompletionAnomaly::backend_context_unknown(CompletionToken::rio_wake(0))
-                        .with_backend(CompletionBackend::Iocp)
+                        .with_backend(CompletionBackend::Backend("iocp"))
                         .with_backend_context(key as u64)
                         .with_raw_result(res)
                         .with_flags(flags);
@@ -287,7 +287,7 @@ impl<'a> IocpDriver<'a> {
         }
 
         let envelope = CompletionEnvelope::from_sidecar_user_token(
-            CompletionBackend::Iocp,
+            CompletionBackend::Backend("iocp"),
             entry.token,
             completion_key as u64,
             res,
@@ -297,9 +297,9 @@ impl<'a> IocpDriver<'a> {
         let expected_key = raw.token.raw() as usize;
         if completion_key != 0 && completion_key != expected_key {
             let mismatch_raw = RawCompletion::new(
-                CompletionBackend::Iocp,
+                CompletionBackend::Backend("iocp"),
                 CompletionEnvelope::from_raw_parts(
-                    CompletionBackend::Iocp,
+                    CompletionBackend::Backend("iocp"),
                     completion_key as u64,
                     raw.res,
                     raw.flags,
@@ -357,7 +357,8 @@ fn classify_completion_status(
     } else if !success && key == 0 {
         IocpCompletionStatusKind::NullFailure
     } else if matches!(
-        CompletionEnvelope::from_raw_parts(CompletionBackend::Iocp, key as u64, 0, 0).identity,
+        CompletionEnvelope::from_raw_parts(CompletionBackend::Backend("iocp"), key as u64, 0, 0)
+            .identity,
         CompletionIdentity::Waker(_)
             | CompletionIdentity::Cancel(_)
             | CompletionIdentity::RioWake(_)

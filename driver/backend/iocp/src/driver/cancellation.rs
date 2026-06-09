@@ -103,7 +103,7 @@ impl<'a> IocpDriver<'a> {
                     | CheckedSlotView::Valid(_) => None,
                 };
                 let (reason, anomaly) = cancel_target_anomaly(
-                    CompletionBackend::Iocp,
+                    CompletionBackend::Backend("iocp"),
                     token,
                     -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
                     0,
@@ -129,7 +129,7 @@ impl<'a> IocpDriver<'a> {
 
     fn complete_local_cancel(&mut self, token: OpToken, mode: CancelMode) {
         let event = UserCompletionEvent::from_parts(
-            CompletionBackend::Iocp,
+            CompletionBackend::Backend("iocp"),
             token,
             -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
             0,
@@ -197,7 +197,7 @@ impl<'a> IocpDriver<'a> {
             .backend()
             .inc_cancel_ack_not_found_active();
         let raw = veloq_driver_core::driver::RawCompletion::new(
-            CompletionBackend::Iocp,
+            CompletionBackend::Backend("iocp"),
             CompletionToken::user(token),
             -(windows_sys::Win32::Foundation::ERROR_NOT_FOUND as i32),
             0,

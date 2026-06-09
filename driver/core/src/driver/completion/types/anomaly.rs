@@ -52,9 +52,7 @@ impl CompletionMutationOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionBackend {
     Core,
-    Uring,
-    Iocp,
-    Rio,
+    Backend(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +130,7 @@ impl CompletionAnomaly {
             expected_generation: None,
             actual_generation: None,
             state: None,
-            backend: Some(CompletionBackend::Rio),
+            backend: Some(CompletionBackend::Backend("rio")),
             backend_context: None,
             raw_result: None,
             flags: None,
@@ -149,7 +147,7 @@ impl CompletionAnomaly {
             expected_generation: Some(generation),
             actual_generation: None,
             state: None,
-            backend: Some(CompletionBackend::Rio),
+            backend: Some(CompletionBackend::Backend("rio")),
             backend_context: None,
             raw_result: None,
             flags: None,
@@ -171,7 +169,7 @@ impl CompletionAnomaly {
             expected_generation: Some(expected_generation),
             actual_generation: Some(actual_generation),
             state: None,
-            backend: Some(CompletionBackend::Rio),
+            backend: Some(CompletionBackend::Backend("rio")),
             backend_context: None,
             raw_result: None,
             flags: None,

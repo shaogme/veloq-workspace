@@ -87,8 +87,12 @@ impl<'a> UringDriver<'a> {
         self.completion_diagnostics
             .backend()
             .inc_cancel_local_completed();
-        let event =
-            UserCompletionEvent::from_parts(CompletionBackend::Uring, token, -libc::ECANCELED, 0);
+        let event = UserCompletionEvent::from_parts(
+            CompletionBackend::Backend("uring"),
+            token,
+            -libc::ECANCELED,
+            0,
+        );
         let _ = self.accept_synthetic_completion(
             event,
             SyntheticCompletionSource::Cancel,
@@ -167,7 +171,7 @@ impl<'a> UringDriver<'a> {
             | CheckedSlotView::Stale(_)
             | CheckedSlotView::Corrupt(_)) => {
                 let (reason, anomaly) = cancel_target_anomaly(
-                    CompletionBackend::Uring,
+                    CompletionBackend::Backend("uring"),
                     token,
                     -libc::ECANCELED,
                     0,
@@ -201,7 +205,7 @@ impl<'a> UringDriver<'a> {
                     | CheckedSlotView::Corrupt(_) => {
                         self.pending_cancellations.pop_front();
                         let (reason, anomaly) = cancel_target_anomaly(
-                            CompletionBackend::Uring,
+                            CompletionBackend::Backend("uring"),
                             request.target,
                             -libc::ECANCELED,
                             0,
@@ -324,7 +328,12 @@ impl<'a> UringDriver<'a> {
 
     fn complete_queued_submission_error(&mut self, token: OpToken, report: Report<UringError>) {
         let event_res = uring_report_to_event_res(&report);
-        let event = UserCompletionEvent::from_parts(CompletionBackend::Uring, token, event_res, 0);
+        let event = UserCompletionEvent::from_parts(
+            CompletionBackend::Backend("uring"),
+            token,
+            event_res,
+            0,
+        );
         let _ = self.accept_synthetic_completion(
             event,
             SyntheticCompletionSource::SubmissionFailure,

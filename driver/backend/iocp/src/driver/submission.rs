@@ -205,8 +205,12 @@ impl<'a> IocpDriver<'a> {
         if !BlockingBridge::submit(task) {
             let report = IocpError::Submission.report("iocp/driver", "thread pool overloaded");
             let event_res = iocp_fallback_event_res(IocpError::Submission);
-            let event =
-                UserCompletionEvent::from_parts(CompletionBackend::Iocp, token, event_res, 0);
+            let event = UserCompletionEvent::from_parts(
+                CompletionBackend::Backend("iocp"),
+                token,
+                event_res,
+                0,
+            );
             let mut hooks = SubmissionFailureHooks {
                 report: Some(report),
             };

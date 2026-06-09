@@ -195,7 +195,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         ingress: &Self::BackendIngress,
     ) -> CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect> {
         CompletionBackendIngressAction::RouteUser(UserCompletionEvent::from_parts(
-            CompletionBackend::Rio,
+            CompletionBackend::Backend("rio"),
             ingress.init.token,
             ingress.result.raw_res(),
             0,
@@ -236,7 +236,7 @@ fn complete_rio_waiting_slot(
     let completion_token = CompletionToken::user(token);
     let socket_key = init.socket_inflight.socket_key();
     let raw = RawCompletion::new(
-        CompletionBackend::Rio,
+        CompletionBackend::Backend("rio"),
         completion_token,
         result.raw_res(),
         0,
@@ -343,7 +343,8 @@ fn complete_rio_waiting_slot(
         .unwrap_or_default();
     let _ = guard.take_op();
     let (payload, detail) = guard.take_completion_data();
-    let event = UserCompletionEvent::from_parts(CompletionBackend::Rio, token, res_code, 0);
+    let event =
+        UserCompletionEvent::from_parts(CompletionBackend::Backend("rio"), token, res_code, 0);
     if let Some(payload) = payload {
         CompletionHookOutcome::User {
             event,
@@ -410,7 +411,7 @@ fn complete_rio_orphaned_slot(
 
 fn anomaly_with_rio_raw(anomaly: CompletionAnomaly, res: RioResultData) -> CompletionAnomaly {
     anomaly.with_raw_completion(RawCompletion::new(
-        CompletionBackend::Rio,
+        CompletionBackend::Backend("rio"),
         CompletionToken::rio_wake(0),
         res.raw_res(),
         0,
