@@ -154,7 +154,6 @@ pub enum CompletionIdentity {
 pub enum CompletionIdentitySource {
     UserToken,
     ControlToken,
-    BackendContext,
     SidecarTokenWithQueueKey { queue_key: u64 },
 }
 
@@ -233,23 +232,6 @@ impl CompletionEnvelope {
             raw: RawCompletion::new(backend, CompletionToken::user(token), res, flags),
             identity: CompletionIdentity::User(token),
             source: CompletionIdentitySource::SidecarTokenWithQueueKey { queue_key },
-        }
-    }
-
-    #[inline]
-    pub const fn backend_context(
-        backend: CompletionBackend,
-        raw_context: u64,
-        res: i32,
-        flags: u32,
-    ) -> Self {
-        Self {
-            raw: RawCompletion::new(backend, CompletionToken::rio_wake(0), res, flags),
-            identity: CompletionIdentity::BackendContext {
-                backend,
-                raw_context,
-            },
-            source: CompletionIdentitySource::BackendContext,
         }
     }
 }
