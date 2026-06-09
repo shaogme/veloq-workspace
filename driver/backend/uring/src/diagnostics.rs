@@ -5,6 +5,11 @@ use veloq_driver_core::driver::{CompletionAnomaly, DriverCompletionDiagnosticsBa
 #[derive(Debug, Default)]
 pub struct UringCompletionDiagnostics {
     cancel_submitted: AtomicU64,
+    cancel_queued: AtomicU64,
+    cancel_local_completed: AtomicU64,
+    cancel_target_missing: AtomicU64,
+    cancel_target_stale: AtomicU64,
+    cancel_target_corrupt: AtomicU64,
     cancel_ack_ok: AtomicU64,
     cancel_ack_not_found: AtomicU64,
     cancel_ack_error: AtomicU64,
@@ -17,6 +22,11 @@ pub struct UringCompletionDiagnostics {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct UringCompletionDiagnosticsSnapshot {
     pub cancel_submitted: u64,
+    pub cancel_queued: u64,
+    pub cancel_local_completed: u64,
+    pub cancel_target_missing: u64,
+    pub cancel_target_stale: u64,
+    pub cancel_target_corrupt: u64,
     pub cancel_ack_ok: u64,
     pub cancel_ack_not_found: u64,
     pub cancel_ack_error: u64,
@@ -40,6 +50,31 @@ impl UringCompletionDiagnostics {
     #[inline]
     pub(crate) fn inc_cancel_submitted(&self) {
         Self::inc(&self.cancel_submitted);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cancel_queued(&self) {
+        Self::inc(&self.cancel_queued);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cancel_local_completed(&self) {
+        Self::inc(&self.cancel_local_completed);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cancel_target_missing(&self) {
+        Self::inc(&self.cancel_target_missing);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cancel_target_stale(&self) {
+        Self::inc(&self.cancel_target_stale);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cancel_target_corrupt(&self) {
+        Self::inc(&self.cancel_target_corrupt);
     }
 
     #[inline]
@@ -85,6 +120,11 @@ impl DriverCompletionDiagnosticsBackend for UringCompletionDiagnostics {
     fn snapshot(&self) -> Self::Snapshot {
         UringCompletionDiagnosticsSnapshot {
             cancel_submitted: Self::load(&self.cancel_submitted),
+            cancel_queued: Self::load(&self.cancel_queued),
+            cancel_local_completed: Self::load(&self.cancel_local_completed),
+            cancel_target_missing: Self::load(&self.cancel_target_missing),
+            cancel_target_stale: Self::load(&self.cancel_target_stale),
+            cancel_target_corrupt: Self::load(&self.cancel_target_corrupt),
             cancel_ack_ok: Self::load(&self.cancel_ack_ok),
             cancel_ack_not_found: Self::load(&self.cancel_ack_not_found),
             cancel_ack_error: Self::load(&self.cancel_ack_error),

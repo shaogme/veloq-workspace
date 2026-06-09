@@ -8,7 +8,7 @@ use tracing::{debug, error, trace, warn};
 use crate::diagnostics::UringCompletionDiagnostics;
 use crate::driver::{PendingCancel, UringDriver};
 use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_event_res};
-use crate::op::{Slot, UringUserPayload};
+use crate::op::Slot;
 use veloq_driver_core::driver::{
     CancelCompletionId, CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
     CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
@@ -538,24 +538,17 @@ impl<'a> UringDriver<'a> {
 }
 
 fn complete_kernel_waiting_slot(
-    slot: Slot<'_, InFlightWaiting>,
+    mut slot: Slot<'_, InFlightWaiting>,
     token: OpToken,
     raw: RawCompletion,
 ) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
-    if slot.op.is_none() || slot.storage.payload.is_none() {
-        return lost_waiting_slot_completion(slot, raw);
-    }
-
-    let (final_res, cleanup) = {
-        let Some(payload) = slot.storage.payload.as_mut() else {
-            return lost_waiting_slot_completion(slot, raw);
-        };
-        let Some(op) = slot.op.as_mut() else {
-            return lost_waiting_slot_completion(slot, raw);
-        };
+    let (final_res, cleanup) = match slot.with_op_and_payload_mut(|op, payload| {
         let final_res = unsafe { (op.vtable.on_complete)(op, payload, raw.res) };
         let cleanup = op.completion_cleanup(raw.res);
         (final_res, cleanup)
+    }) {
+        Ok(result) => result,
+        Err(_) => return lost_waiting_slot_completion(slot, raw),
     };
 
     let mut completed = slot.complete();
@@ -637,9 +630,7 @@ fn complete_submission_failure_slot(
     let snapshot = slot.snapshot();
     let mut completed = slot.complete();
     let cleanup = completed
-        .op
-        .as_mut()
-        .map(|op| op.completion_cleanup(event_res))
+        .with_op_mut(|op| op.completion_cleanup(event_res))
         .unwrap_or_default();
     let _ = completed.take_op();
     let (payload, detail) = completed.take_completion_data();
@@ -667,20 +658,16 @@ fn complete_submission_failure_slot(
     }
 }
 
-fn complete_local_cancel_slot<S>(
-    slot: Slot<'_, S>,
+fn complete_local_cancel_slot(
+    slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     mode: CancelMode,
     orphaned: bool,
-) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect>
-where
-    S: veloq_driver_core::slot::SlotMarker,
-{
+) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
     let snapshot = slot.snapshot();
-    let cleanup = slot
-        .op
-        .as_mut()
-        .map(|op| {
+    let mut completed = slot.complete();
+    let cleanup = completed
+        .with_op_mut(|op| {
             if mode == CancelMode::Abandon || orphaned {
                 op.orphan_cleanup(event.res())
             } else {
@@ -688,12 +675,8 @@ where
             }
         })
         .unwrap_or_default();
-    let (payload, detail) = slot.storage.with_mut(
-        |result: &mut Option<UringDriverResult<usize>>,
-         payload: &mut Option<UringUserPayload>,
-         _sidecar| (payload.take(), result.take()),
-    );
-    let _ = slot.op.take();
+    let (payload, detail) = completed.take_completion_data();
+    let _ = completed.take_op();
 
     match (mode, payload) {
         (CancelMode::UserVisible, Some(payload)) => CompletionHookOutcome::User {
@@ -805,7 +788,7 @@ trait LostWaitingSlot {
 
 impl<'a> LostWaitingSlot for Slot<'a, InFlightWaiting> {
     fn finish_lost(
-        self,
+        mut self,
         res: i32,
     ) -> (
         veloq_driver_core::slot::SlotSnapshot,
@@ -813,14 +796,11 @@ impl<'a> LostWaitingSlot for Slot<'a, InFlightWaiting> {
     ) {
         let snapshot = self.snapshot();
         let cleanup = self
-            .op
-            .as_mut()
-            .map(|op| op.completion_cleanup(res))
+            .with_op_mut(|op| op.completion_cleanup(res))
             .unwrap_or_default();
-        let (payload, detail) = self
-            .storage
-            .with_mut(|result, payload, _sidecar| (payload.take(), result.take()));
-        let _ = self.op.take();
+        let mut completed = self.complete();
+        let (payload, detail) = completed.take_completion_data();
+        let _ = completed.take_op();
         drop(payload);
         drop(detail);
         (snapshot, cleanup)
@@ -830,9 +810,7 @@ impl<'a> LostWaitingSlot for Slot<'a, InFlightWaiting> {
 fn cleanup_orphaned_slot(slot: Slot<'_, InFlightOrphaned>, cqe_res: i32) -> CompletionCleanupGuard {
     let mut completed = slot.complete();
     let cleanup = completed
-        .op
-        .as_mut()
-        .map(|op| op.orphan_cleanup(cqe_res))
+        .with_op_mut(|op| op.orphan_cleanup(cqe_res))
         .unwrap_or_default();
     let (payload, detail) = completed.take_completion_data();
     let _ = completed.take_op();
@@ -846,5 +824,87 @@ pub(crate) fn driver_result_to_event_res(res: &UringDriverResult<usize>) -> i32 
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
         Err(e) => uring_report_to_event_res(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use veloq_driver_core::driver::CompletionToken;
+
+    fn test_hooks<'a>(
+        diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
+        pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
+        waker_armed: &'a mut bool,
+        is_waked: &'a AtomicBool,
+    ) -> UringCompletionHooks<'a> {
+        UringCompletionHooks::new(
+            diagnostics,
+            pending_cancel_cqes,
+            8,
+            waker_armed,
+            is_waked,
+            UringSyntheticCompletion::None,
+        )
+    }
+
+    #[test]
+    fn waker_control_records_unexpected_byte_count_as_error() {
+        let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
+        let mut pending_cancel_cqes = HashMap::new();
+        let mut waker_armed = true;
+        let is_waked = AtomicBool::new(true);
+        let mut hooks = test_hooks(
+            &diagnostics,
+            &mut pending_cancel_cqes,
+            &mut waker_armed,
+            &is_waked,
+        );
+        let raw = RawCompletion::new(CompletionBackend::Uring, CompletionToken::waker(0), 4, 0);
+
+        let effect = hooks.handle_waker_control(raw);
+
+        assert!(matches!(
+            effect,
+            UringBackendEffect::Waker {
+                should_rebuild: true
+            }
+        ));
+        assert_eq!(diagnostics.snapshot().backend.waker_error, 1);
+    }
+
+    #[test]
+    fn untracked_cancel_cqe_is_anomaly_not_user_completion() {
+        let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
+        let mut pending_cancel_cqes = HashMap::new();
+        let mut waker_armed = true;
+        let is_waked = AtomicBool::new(true);
+        let mut hooks = test_hooks(
+            &diagnostics,
+            &mut pending_cancel_cqes,
+            &mut waker_armed,
+            &is_waked,
+        );
+        let cancel_id = CancelCompletionId::new(7);
+        let raw = RawCompletion::new(
+            CompletionBackend::Uring,
+            CompletionToken::cancel(cancel_id),
+            0,
+            0,
+        );
+
+        let outcome = hooks.handle_cancel_control(cancel_id, raw);
+
+        assert!(matches!(
+            outcome,
+            CompletionHookOutcome::Anomaly {
+                anomaly: CompletionAnomaly {
+                    reason: veloq_driver_core::driver::CompletionAnomalyReason::ControlCompletionUntracked,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 }

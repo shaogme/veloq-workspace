@@ -81,9 +81,7 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for SubmissionFailureHooks 
         let snapshot = slot.snapshot();
         let mut guard = slot.complete();
         let cleanup = guard
-            .op
-            .as_mut()
-            .map(|op| {
+            .with_op_mut(|op| {
                 op.completion_cleanup(&Err(self.report.take().unwrap_or_else(|| {
                     IocpError::Submission
                         .to_report()
@@ -126,9 +124,7 @@ impl CompletionBackendHooks<crate::op::IocpSlotSpec> for SubmissionFailureHooks 
     ) -> CompletionHookOutcome<crate::op::IocpSlotSpec, Self::BackendEffect> {
         let mut guard = slot.complete();
         let cleanup = guard
-            .op
-            .as_mut()
-            .map(|op| op.orphan_cleanup(&Err(IocpError::Submission.to_report())))
+            .with_op_mut(|op| op.orphan_cleanup(&Err(IocpError::Submission.to_report())))
             .unwrap_or_default();
         let _ = guard.take_op();
         let _ = guard.take_completion_data();
@@ -192,23 +188,11 @@ impl<'a> IocpDriver<'a> {
             .map_err(|err| slot_access_report("iocp.driver.prep_op_slot.init_op", err))?;
 
         guard
-            .with_op_mut(|op_ref| {
+            .with_op_and_payload_mut(|op_ref, user_payload| {
                 op_ref.header.reset_for_token(token);
+                op_ref.bind_user_payload(user_payload)
             })
-            .map_err(|err| slot_access_report("iocp.driver.prep_op_slot.op_mut", err))?;
-
-        let user_payload = guard
-            .storage
-            .payload
-            .as_mut()
-            .ok_or(IocpError::InvalidState)
-            .attach_note("User payload missing in prep_op_slot")?;
-        let op_ref = guard
-            .op
-            .as_mut()
-            .ok_or(IocpError::InvalidState)
-            .attach_note("Op missing while binding user payload in prep_op_slot")?;
-        op_ref.bind_user_payload(user_payload)?;
+            .map_err(|err| slot_access_report("iocp.driver.prep_op_slot.op_payload", err))??;
 
         Ok(guard)
     }
@@ -334,18 +318,16 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         op: IocpOp,
     ) -> IocpDriverResult<IocpDriverResult<SubmissionResult>> {
-        let guard = Self::prep_op_slot(&mut self.ops, token, op)
+        let mut guard = Self::prep_op_slot(&mut self.ops, token, op)
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
 
-        let overlapped = guard.storage.with_mut(|_result, _payload, sidecar| {
-            &mut sidecar.inner as *mut crate::win32::Overlapped
-        });
+        let overlapped =
+            guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut crate::win32::Overlapped);
 
         let mut sub_guard = guard
             .start_submission_with(Some(|slot| {
-                slot.storage
-                    .with_mut(|_result, _payload, sidecar| sidecar.in_flight = false);
+                slot.with_sidecar_mut(|sidecar| sidecar.in_flight = false);
             }))
             .map_err(|err| slot_access_report("iocp.driver.call_op_submit.start", err))?;
         let close_fd = if let Some(slot) = sub_guard.slot.as_mut() {

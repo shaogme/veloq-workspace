@@ -5,8 +5,9 @@ use diagweave::prelude::*;
 use io_uring::opcode;
 use tracing::{debug, trace};
 use veloq_driver_core::driver::{
-    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, CompletionBackend,
-    CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
+    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
+    CompletionBackend, CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
+    cancel_target_anomaly,
 };
 
 use crate::op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt};
@@ -77,11 +78,15 @@ impl<'a> UringDriver<'a> {
             CancelSubmitOutcome::Submitted
         } else {
             self.pending_cancellations.push_back(request);
+            self.completion_diagnostics.backend().inc_cancel_queued();
             CancelSubmitOutcome::Queued
         }
     }
 
     fn complete_local_cancel(&mut self, token: OpToken, mode: CancelMode) {
+        self.completion_diagnostics
+            .backend()
+            .inc_cancel_local_completed();
         let event =
             UserCompletionEvent::from_parts(CompletionBackend::Uring, token, -libc::ECANCELED, 0);
         let _ = self.accept_synthetic_completion(
@@ -161,20 +166,23 @@ impl<'a> UringDriver<'a> {
             | CheckedSlotView::Empty(_)
             | CheckedSlotView::Stale(_)
             | CheckedSlotView::Corrupt(_)) => {
-                let stale = matches!(view, CheckedSlotView::Stale(_));
-                self.complete_local_cancel(token, request.mode);
-                if stale {
-                    debug!(user_data, generation, "cancel request is stale");
-                    CancelSubmitOutcome::TargetStale
-                } else {
-                    debug!(
-                        user_data,
-                        generation,
-                        token = CompletionToken::user(request.target).raw(),
-                        "cancel request did not match an active slot"
-                    );
-                    CancelSubmitOutcome::TargetMissing
-                }
+                let (reason, anomaly) = cancel_target_anomaly(
+                    CompletionBackend::Uring,
+                    token,
+                    -libc::ECANCELED,
+                    0,
+                    view,
+                );
+                self.record_cancel_target_gone(reason);
+                let _ = self.accept_completion_anomaly(anomaly);
+                debug!(
+                    user_data,
+                    generation,
+                    token = CompletionToken::user(request.target).raw(),
+                    reason = ?reason,
+                    "cancel request did not match an active uring slot"
+                );
+                CancelSubmitOutcome::TargetGone { reason }
             }
         }
     }
@@ -192,7 +200,15 @@ impl<'a> UringDriver<'a> {
                     | CheckedSlotView::Stale(_)
                     | CheckedSlotView::Corrupt(_) => {
                         self.pending_cancellations.pop_front();
-                        self.complete_local_cancel(request.target, request.mode);
+                        let (reason, anomaly) = cancel_target_anomaly(
+                            CompletionBackend::Uring,
+                            request.target,
+                            -libc::ECANCELED,
+                            0,
+                            self.ops.checked_slot_view(request.target),
+                        );
+                        self.record_cancel_target_gone(reason);
+                        let _ = self.accept_completion_anomaly(anomaly);
                         continue;
                     }
                 }
@@ -317,8 +333,25 @@ impl<'a> UringDriver<'a> {
             },
         );
     }
+
+    fn record_cancel_target_gone(&self, reason: CancelTargetGoneReason) {
+        match reason {
+            CancelTargetGoneReason::Missing => self
+                .completion_diagnostics
+                .backend()
+                .inc_cancel_target_missing(),
+            CancelTargetGoneReason::Stale => self
+                .completion_diagnostics
+                .backend()
+                .inc_cancel_target_stale(),
+            CancelTargetGoneReason::Corrupt => self
+                .completion_diagnostics
+                .backend()
+                .inc_cancel_target_corrupt(),
+        }
+    }
 }
 
 fn slot_has_op<'a, S: SlotState>(slot: Slot<'a, S>) -> bool {
-    slot.op.is_some()
+    slot.snapshot().has_op
 }

@@ -373,6 +373,8 @@ pub struct CancelDrainOutcome {
     pub completed_locally: u64,
     pub target_missing: u64,
     pub target_stale: u64,
+    pub target_corrupt: u64,
+    pub diagnostic_only: u64,
     pub no_backend_handle: u64,
 }
 
@@ -390,11 +392,19 @@ impl CancelDrainOutcome {
             CancelSubmitOutcome::CompletedLocally => {
                 self.completed_locally = self.completed_locally.saturating_add(1);
             }
-            CancelSubmitOutcome::TargetMissing => {
-                self.target_missing = self.target_missing.saturating_add(1);
-            }
-            CancelSubmitOutcome::TargetStale => {
-                self.target_stale = self.target_stale.saturating_add(1);
+            CancelSubmitOutcome::TargetGone { reason } => match reason {
+                CancelTargetGoneReason::Missing => {
+                    self.target_missing = self.target_missing.saturating_add(1);
+                }
+                CancelTargetGoneReason::Stale => {
+                    self.target_stale = self.target_stale.saturating_add(1);
+                }
+                CancelTargetGoneReason::Corrupt => {
+                    self.target_corrupt = self.target_corrupt.saturating_add(1);
+                }
+            },
+            CancelSubmitOutcome::DiagnosticOnly { anomaly: _ } => {
+                self.diagnostic_only = self.diagnostic_only.saturating_add(1);
             }
             CancelSubmitOutcome::NoBackendHandle => {
                 self.no_backend_handle = self.no_backend_handle.saturating_add(1);

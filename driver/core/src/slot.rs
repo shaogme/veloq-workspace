@@ -55,9 +55,9 @@ impl SlotMarker for InFlightOrphaned {}
 impl SlotMarker for Completed {}
 
 pub struct Slot<'a, State: SlotMarker, Spec: SlotSpec> {
-    pub entry: &'a SlotEntry<Spec>,
-    pub op: &'a mut Option<SlotOp<Spec>>,
-    pub storage: &'a mut SlotStorage<Spec>,
+    entry: &'a SlotEntry<Spec>,
+    op: &'a mut Option<SlotOp<Spec>>,
+    storage: &'a mut SlotStorage<Spec>,
     platform: &'a mut SlotPlatformData<Spec>,
     index: usize,
     _state: PhantomData<State>,
@@ -114,6 +114,38 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
             reason,
             snapshot: self.snapshot(),
         }
+    }
+
+    #[inline]
+    pub fn with_sidecar_mut<F, X>(&mut self, f: F) -> X
+    where
+        F: FnOnce(&mut SlotSidecarData<Spec>) -> X,
+    {
+        self.storage
+            .with_mut(|_result, _payload, sidecar| f(sidecar))
+    }
+
+    #[inline]
+    pub fn with_op_and_payload_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
+    where
+        F: FnOnce(&mut SlotOp<Spec>, &mut SlotPayload<Spec>) -> X,
+    {
+        if self.op.is_none() {
+            return Err(self.access_error(
+                SlotAccessAction::OpPayloadMut,
+                SlotAccessErrorReason::MissingOp,
+            ));
+        }
+        if self.storage.payload.is_none() {
+            return Err(self.access_error(
+                SlotAccessAction::OpPayloadMut,
+                SlotAccessErrorReason::MissingPayload,
+            ));
+        }
+        Ok(f(
+            self.op.as_mut().expect("checked Some above"),
+            self.storage.payload.as_mut().expect("checked Some above"),
+        ))
     }
 }
 
@@ -287,6 +319,19 @@ impl<'a, Spec: SlotSpec> Slot<'a, Completed, Spec> {
         })
     }
 
+    #[inline]
+    pub fn with_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
+    where
+        F: FnOnce(&mut SlotOp<Spec>) -> X,
+    {
+        if self.op.is_none() {
+            return Err(
+                self.access_error(SlotAccessAction::OpMut, SlotAccessErrorReason::MissingOp)
+            );
+        }
+        Ok(f(self.op.as_mut().expect("checked Some above")))
+    }
+
     pub fn take_completion_data(&mut self) -> SlotCompletionData<Spec> {
         self.storage
             .with_mut(|result, payload, _sidecar| (payload.take(), result.take()))
@@ -322,6 +367,19 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightOrphaned, Spec> {
 
     pub fn complete(self) -> Slot<'a, Completed, Spec> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
+    }
+
+    #[inline]
+    pub fn with_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
+    where
+        F: FnOnce(&mut SlotOp<Spec>) -> X,
+    {
+        if self.op.is_none() {
+            return Err(
+                self.access_error(SlotAccessAction::OpMut, SlotAccessErrorReason::MissingOp)
+            );
+        }
+        Ok(f(self.op.as_mut().expect("checked Some above")))
     }
 }
 
@@ -384,6 +442,7 @@ pub enum SlotAccessAction {
     InitOp,
     StartSubmission,
     OpMut,
+    OpPayloadMut,
     TakeOp,
     TakeCompletionData,
 }

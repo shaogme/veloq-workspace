@@ -176,10 +176,13 @@ impl<'a> IocpDriver<'a> {
                         Some(ShutdownOpKind::Iocp)
                     }
                 }
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
                     if slot.platform().timer_id.is_some() {
                         Some(ShutdownOpKind::Immediate)
-                    } else if slot.op.as_ref().map(Self::is_rio_op).unwrap_or(false) {
+                    } else if slot
+                        .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                        .unwrap_or(false)
+                    {
                         Some(ShutdownOpKind::Rio)
                     } else {
                         Some(ShutdownOpKind::Iocp)
@@ -240,9 +243,9 @@ impl<'a> IocpDriver<'a> {
                 CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => slot
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                     .unwrap_or(false),
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
-                    slot.op.as_ref().map(Self::is_rio_op).unwrap_or(false)
-                }
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => slot
+                    .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                    .unwrap_or(false),
                 _ => false,
             };
             if is_rio {
@@ -259,9 +262,7 @@ impl<'a> IocpDriver<'a> {
                 }
                 CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
                     slot.platform_mut().rio_cancel_requested = true;
-                    if let Some(iocp_op) = slot.op.as_mut() {
-                        iocp_op.unbind_user_payload();
-                    }
+                    let _ = slot.with_op_mut(|iocp_op| iocp_op.unbind_user_payload());
                 }
                 _ => {}
             }

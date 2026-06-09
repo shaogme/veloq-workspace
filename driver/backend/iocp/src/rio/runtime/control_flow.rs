@@ -266,9 +266,7 @@ fn complete_rio_waiting_slot(
             let mut guard = slot.complete();
             let completion = Err(report);
             let cleanup = guard
-                .op
-                .as_mut()
-                .map(|op| op.completion_cleanup(&completion))
+                .with_op_mut(|op| op.completion_cleanup(&completion))
                 .unwrap_or_default();
             let _ = guard.take_op();
             let _ = guard.take_completion_data();
@@ -341,9 +339,7 @@ fn complete_rio_waiting_slot(
     let snapshot = slot.snapshot();
     let mut guard = slot.complete();
     let cleanup = guard
-        .op
-        .as_mut()
-        .map(|op| op.completion_cleanup(&completion))
+        .with_op_mut(|op| op.completion_cleanup(&completion))
         .unwrap_or_default();
     let _ = guard.take_op();
     let (payload, detail) = guard.take_completion_data();
@@ -404,9 +400,7 @@ fn complete_rio_orphaned_slot(
             .attach_note("orphaned RIO completion returned os error")
     };
     let cleanup = guard
-        .op
-        .as_mut()
-        .map(|op| op.orphan_cleanup(&orphan_result))
+        .with_op_mut(|op| op.orphan_cleanup(&orphan_result))
         .unwrap_or_default();
     let _ = guard.take_op();
     let _ = guard.take_completion_data();

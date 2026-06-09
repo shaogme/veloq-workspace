@@ -236,9 +236,18 @@ pub enum CompletionIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionIdentitySource {
+    UserToken,
+    ControlToken,
+    BackendContext,
+    SidecarTokenWithQueueKey { queue_key: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompletionEnvelope {
     pub raw: RawCompletion,
     pub identity: CompletionIdentity,
+    pub source: CompletionIdentitySource,
 }
 
 impl CompletionEnvelope {
@@ -259,25 +268,57 @@ impl CompletionEnvelope {
 
     #[inline]
     pub fn from_raw(raw: RawCompletion) -> Self {
-        let identity = match raw.token.classify() {
-            CompletionTokenClass::User(token) => CompletionIdentity::User(token),
+        let (identity, source) = match raw.token.classify() {
+            CompletionTokenClass::User(token) => (
+                CompletionIdentity::User(token),
+                CompletionIdentitySource::UserToken,
+            ),
             CompletionTokenClass::Control {
                 kind: CompletionControlKind::Waker,
                 id,
-            } => CompletionIdentity::Waker(id),
+            } => (
+                CompletionIdentity::Waker(id),
+                CompletionIdentitySource::ControlToken,
+            ),
             CompletionTokenClass::Control {
                 kind: CompletionControlKind::Cancel,
                 id,
-            } => CompletionIdentity::Cancel(CancelCompletionId::new(id)),
+            } => (
+                CompletionIdentity::Cancel(CancelCompletionId::new(id)),
+                CompletionIdentitySource::ControlToken,
+            ),
             CompletionTokenClass::Control {
                 kind: CompletionControlKind::RioWake,
                 id,
-            } => CompletionIdentity::RioWake(id),
-            CompletionTokenClass::UnknownControl { kind, id } => {
-                CompletionIdentity::UnknownControl { kind, id }
-            }
+            } => (
+                CompletionIdentity::RioWake(id),
+                CompletionIdentitySource::ControlToken,
+            ),
+            CompletionTokenClass::UnknownControl { kind, id } => (
+                CompletionIdentity::UnknownControl { kind, id },
+                CompletionIdentitySource::ControlToken,
+            ),
         };
-        Self { raw, identity }
+        Self {
+            raw,
+            identity,
+            source,
+        }
+    }
+
+    #[inline]
+    pub fn from_sidecar_user_token(
+        backend: CompletionBackend,
+        token: OpToken,
+        queue_key: u64,
+        res: i32,
+        flags: u32,
+    ) -> Self {
+        Self {
+            raw: RawCompletion::new(backend, CompletionToken::user(token), res, flags),
+            identity: CompletionIdentity::User(token),
+            source: CompletionIdentitySource::SidecarTokenWithQueueKey { queue_key },
+        }
     }
 
     #[inline]
@@ -293,6 +334,7 @@ impl CompletionEnvelope {
                 backend,
                 raw_context,
             },
+            source: CompletionIdentitySource::BackendContext,
         }
     }
 }
@@ -755,9 +797,87 @@ pub enum CancelSubmitOutcome {
     Submitted,
     Queued,
     CompletedLocally,
-    TargetMissing,
-    TargetStale,
+    TargetGone { reason: CancelTargetGoneReason },
+    DiagnosticOnly { anomaly: CompletionAnomaly },
     NoBackendHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelTargetGoneReason {
+    Missing,
+    Stale,
+    Corrupt,
+}
+
+impl CancelSubmitOutcome {
+    #[inline]
+    pub const fn target_missing() -> Self {
+        Self::TargetGone {
+            reason: CancelTargetGoneReason::Missing,
+        }
+    }
+
+    #[inline]
+    pub const fn target_stale() -> Self {
+        Self::TargetGone {
+            reason: CancelTargetGoneReason::Stale,
+        }
+    }
+
+    #[inline]
+    pub const fn target_corrupt() -> Self {
+        Self::TargetGone {
+            reason: CancelTargetGoneReason::Corrupt,
+        }
+    }
+}
+
+#[inline]
+pub fn cancel_target_anomaly<'a, Spec: slot::SlotSpec>(
+    backend: CompletionBackend,
+    token: OpToken,
+    raw_res: i32,
+    flags: u32,
+    view: CheckedSlotView<'a, Spec>,
+) -> (CancelTargetGoneReason, CompletionAnomaly) {
+    let raw = RawCompletion::new(backend, CompletionToken::user(token), raw_res, flags);
+    let anomaly = match slot_view_anomaly(backend, token, raw, view) {
+        Ok(slot) => {
+            let snapshot = match slot {
+                SlotView::Reserved(slot) => slot.snapshot(),
+                SlotView::InFlightWaiting(slot) => slot.snapshot(),
+                SlotView::InFlightOrphaned(slot) => slot.snapshot(),
+            };
+            CompletionAnomaly::backend_invariant_broken(
+                raw.token,
+                snapshot.index,
+                snapshot.generation,
+                snapshot.state,
+            )
+            .with_slot_snapshot(snapshot)
+            .with_raw_completion(raw)
+        }
+        Err(anomaly) => anomaly,
+    };
+    let reason = match anomaly.reason {
+        CompletionAnomalyReason::StaleGeneration => CancelTargetGoneReason::Stale,
+        CompletionAnomalyReason::OpMissing
+        | CompletionAnomalyReason::PayloadMissing
+        | CompletionAnomalyReason::SlotCorruption
+        | CompletionAnomalyReason::BackendInvariantBroken => CancelTargetGoneReason::Corrupt,
+        CompletionAnomalyReason::UnknownSlot
+        | CompletionAnomalyReason::NonActiveSlot
+        | CompletionAnomalyReason::UnknownControlToken
+        | CompletionAnomalyReason::ControlCompletionUntracked
+        | CompletionAnomalyReason::RioMalformedContext
+        | CompletionAnomalyReason::RioMissingContext
+        | CompletionAnomalyReason::RioStaleContext
+        | CompletionAnomalyReason::CompletionKeyMismatch
+        | CompletionAnomalyReason::FinalizeFailed
+        | CompletionAnomalyReason::CancelAckTargetStillActive
+        | CompletionAnomalyReason::BackendContextUnknown => CancelTargetGoneReason::Missing,
+    };
+    (reason, anomaly)
 }
 
 pub struct CompletionPacket<UP, E, R = usize> {
@@ -929,6 +1049,7 @@ mod tests {
     use super::*;
     use crate::driver::PlatformOp;
     use crate::driver::registry::OpRegistry;
+    use crate::slot::SlotRegistryExt;
 
     #[test]
     fn op_token_try_new_rejects_control_index() {
@@ -991,6 +1112,22 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_completion_envelope_keeps_queue_key_as_source_only() {
+        let token = OpToken::from_registry_parts(3, 9).expect("test token");
+        let envelope =
+            CompletionEnvelope::from_sidecar_user_token(CompletionBackend::Iocp, token, 77, 11, 5);
+
+        assert_eq!(envelope.identity, CompletionIdentity::User(token));
+        assert_eq!(
+            envelope.source,
+            CompletionIdentitySource::SidecarTokenWithQueueKey { queue_key: 77 }
+        );
+        assert_eq!(envelope.raw.token, CompletionToken::user(token));
+        assert_eq!(envelope.raw.res, 11);
+        assert_eq!(envelope.raw.flags, 5);
+    }
+
+    #[test]
     fn unknown_completion_anomaly_preserves_backend_context() {
         let envelope = CompletionEnvelope::backend_context(CompletionBackend::Iocp, 0, -5, 0);
 
@@ -1003,6 +1140,24 @@ mod tests {
         assert_eq!(anomaly.backend, Some(CompletionBackend::Iocp));
         assert_eq!(anomaly.backend_context, Some(0));
         assert_eq!(anomaly.raw_result, Some(-5));
+    }
+
+    #[test]
+    fn cancel_target_anomaly_classifies_missing_target_without_user_completion() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let token = OpToken::from_registry_parts(4, 1).expect("test token");
+
+        let (reason, anomaly) = cancel_target_anomaly(
+            CompletionBackend::Core,
+            token,
+            -1,
+            0,
+            registry.checked_slot_view(token),
+        );
+
+        assert_eq!(reason, CancelTargetGoneReason::Missing);
+        assert_eq!(anomaly.reason, CompletionAnomalyReason::UnknownSlot);
+        assert_eq!(anomaly.token, CompletionToken::user(token));
     }
 
     struct DummyPlatformOp;

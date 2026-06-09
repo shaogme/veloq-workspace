@@ -5,9 +5,8 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use tracing::{debug, error};
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionControlKind, CompletionEnvelope,
-    CompletionToken, CompletionTokenClass, OpToken, RawCompletion, RemoteWaker,
-    SharedCompletionTable, UserCompletionEvent, drain_cancel_requests,
+    CompletionAnomaly, CompletionBackend, CompletionEnvelope, CompletionIdentity, CompletionToken,
+    OpToken, RawCompletion, RemoteWaker, SharedCompletionTable, drain_cancel_requests,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
@@ -201,6 +200,7 @@ impl<'a> IocpDriver<'a> {
         error_code: Option<u32>,
     ) -> IocpDriverResult<CompletionProgress> {
         let res = iocp_status_res(success, error_code, bytes);
+        let flags = iocp_status_flags(success, error_code);
         match classify_completion_status(key, overlapped, success) {
             IocpCompletionStatusKind::RioWake => {
                 let processed = {
@@ -226,13 +226,14 @@ impl<'a> IocpDriver<'a> {
                     ..CompletionProgress::default()
                 })
             }
-            IocpCompletionStatusKind::OverlappedUser => {
-                let event =
-                    self.resolve_overlapped_user_event(bytes, key, overlapped, success, res)?;
-                Ok(self.process_completion(event))
+            IocpCompletionStatusKind::OverlappedUser { queue_key } => {
+                let envelope = self.resolve_overlapped_user_envelope(
+                    bytes, queue_key, overlapped, success, res, flags,
+                )?;
+                Ok(self.process_completion_envelope(envelope)?)
             }
-            IocpCompletionStatusKind::Waker | IocpCompletionStatusKind::PostedToken => {
-                let flow = self.accept_raw_completion(key as u64, res, 0)?;
+            IocpCompletionStatusKind::ControlKey | IocpCompletionStatusKind::PostedToken => {
+                let flow = self.accept_raw_completion(key as u64, res, flags)?;
                 Ok(CompletionProgress::from_flow(flow, 1, 0))
             }
             IocpCompletionStatusKind::NullFailure => {
@@ -249,7 +250,7 @@ impl<'a> IocpDriver<'a> {
                         .with_backend(CompletionBackend::Iocp)
                         .with_backend_context(key as u64)
                         .with_raw_result(res)
-                        .with_flags(0);
+                        .with_flags(flags);
                 let flow = self.accept_completion_anomaly(anomaly)?;
                 Ok(CompletionProgress::from_flow(flow, 1, 0))
             }
@@ -259,21 +260,22 @@ impl<'a> IocpDriver<'a> {
                         .with_backend(CompletionBackend::Iocp)
                         .with_backend_context(key as u64)
                         .with_raw_result(res)
-                        .with_flags(0);
+                        .with_flags(flags);
                 let flow = self.accept_completion_anomaly(anomaly)?;
                 Ok(CompletionProgress::from_flow(flow, 1, 0))
             }
         }
     }
 
-    fn resolve_overlapped_user_event(
+    fn resolve_overlapped_user_envelope(
         &mut self,
         bytes: u32,
         completion_key: usize,
         overlapped: *mut crate::win32::Overlapped,
         success: bool,
         res: i32,
-    ) -> IocpResult<UserCompletionEvent> {
+        flags: u32,
+    ) -> IocpResult<CompletionEnvelope> {
         let entry = unsafe { &*(overlapped as *const crate::op::OverlappedEntry) };
         let idx = entry.token.index();
         if idx >= self.ops.capacity() {
@@ -284,12 +286,14 @@ impl<'a> IocpDriver<'a> {
             );
         }
 
-        let raw = RawCompletion::new(
+        let envelope = CompletionEnvelope::from_sidecar_user_token(
             CompletionBackend::Iocp,
-            CompletionToken::user(entry.token),
+            entry.token,
+            completion_key as u64,
             res,
-            0,
+            flags,
         );
+        let raw = envelope.raw;
         let expected_key = raw.token.raw() as usize;
         if completion_key != 0 && completion_key != expected_key {
             let mismatch_raw = RawCompletion::new(
@@ -326,20 +330,15 @@ impl<'a> IocpDriver<'a> {
             completion_key,
             success, bytes, "resolved overlapped IOCP completion"
         );
-        Ok(UserCompletionEvent::from_parts(
-            CompletionBackend::Iocp,
-            entry.token,
-            raw.res,
-            raw.flags,
-        ))
+        Ok(envelope)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IocpCompletionStatusKind {
     RioWake,
-    Waker,
-    OverlappedUser,
+    ControlKey,
+    OverlappedUser { queue_key: usize },
     PostedToken,
     NullFailure,
     Unknown,
@@ -358,20 +357,17 @@ fn classify_completion_status(
             IocpCompletionStatusKind::Unknown
         }
     } else if !overlapped.is_null() {
-        IocpCompletionStatusKind::OverlappedUser
+        IocpCompletionStatusKind::OverlappedUser { queue_key: key }
     } else if !success && key == 0 {
         IocpCompletionStatusKind::NullFailure
     } else if matches!(
-        CompletionEnvelope::from_raw_parts(CompletionBackend::Iocp, key as u64, 0, 0)
-            .raw
-            .token
-            .classify(),
-        CompletionTokenClass::Control {
-            kind: CompletionControlKind::Waker,
-            ..
-        }
+        CompletionEnvelope::from_raw_parts(CompletionBackend::Iocp, key as u64, 0, 0).identity,
+        CompletionIdentity::Waker(_)
+            | CompletionIdentity::Cancel(_)
+            | CompletionIdentity::RioWake(_)
+            | CompletionIdentity::UnknownControl { .. }
     ) {
-        IocpCompletionStatusKind::Waker
+        IocpCompletionStatusKind::ControlKey
     } else if key != 0 || success {
         IocpCompletionStatusKind::PostedToken
     } else {
@@ -394,6 +390,11 @@ fn iocp_status_res(success: bool, error_code: Option<u32>, bytes: u32) -> i32 {
     } else {
         -(error_code.unwrap_or(0).min(i32::MAX as u32) as i32)
     }
+}
+
+#[inline]
+fn iocp_status_flags(success: bool, error_code: Option<u32>) -> u32 {
+    (u32::from(success)) | (error_code.unwrap_or(0).min(u32::MAX >> 1) << 1)
 }
 
 fn completion_key_mismatch_anomaly(
@@ -468,7 +469,19 @@ mod tests {
                 ptr::null_mut(),
                 true,
             ),
-            IocpCompletionStatusKind::Waker
+            IocpCompletionStatusKind::ControlKey
+        );
+    }
+
+    #[test]
+    fn non_null_overlapped_keeps_queue_key_as_sidecar_context() {
+        assert_eq!(
+            classify_completion_status(0, ptr::dangling_mut(), true),
+            IocpCompletionStatusKind::OverlappedUser { queue_key: 0 }
+        );
+        assert_eq!(
+            classify_completion_status(123, ptr::dangling_mut(), true),
+            IocpCompletionStatusKind::OverlappedUser { queue_key: 123 }
         );
     }
 }

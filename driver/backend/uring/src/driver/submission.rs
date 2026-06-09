@@ -65,33 +65,25 @@ impl<'a> UringDriver<'a> {
                             "submission guard slot missing",
                         )
                     })?;
-                    let payload = slot.storage.payload.as_mut().ok_or_else(|| {
-                        UringError::InvalidState.report(
-                            "driver.submit_from_slot_raw",
-                            "submission guard payload missing",
-                        )
-                    })?;
-
-                    let op = slot.op.as_mut().ok_or_else(|| {
-                        UringError::InvalidState.report(
-                            "driver.submit_from_slot_raw",
-                            "slot in submission state missing op",
-                        )
-                    })?;
-                    let vtable = op.vtable;
-                    let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
-                    let completion_token = CompletionToken::user(token);
-                    let sqe = unsafe {
-                        (vtable.make_sqe)(
-                            op,
-                            payload,
-                            &mut *driver_ptr,
-                            SubmitTokenContext::new(token, completion_token),
-                        )
-                        .attach_note("driver.submit_from_slot_raw.make_sqe")?
-                        .user_data(completion_token.raw())
-                    };
-                    (count, sqe)
+                    slot.with_op_and_payload_mut(|op, payload| {
+                        let vtable = op.vtable;
+                        let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
+                        let completion_token = CompletionToken::user(token);
+                        let sqe = unsafe {
+                            (vtable.make_sqe)(
+                                op,
+                                payload,
+                                &mut *driver_ptr,
+                                SubmitTokenContext::new(token, completion_token),
+                            )
+                            .attach_note("driver.submit_from_slot_raw.make_sqe")?
+                            .user_data(completion_token.raw())
+                        };
+                        Ok::<_, Report<UringError>>((count, sqe))
+                    })
+                    .map_err(|err| {
+                        slot_access_report("driver.submit_from_slot_raw.op_payload", err)
+                    })??
                 };
 
                 for &chunk_id in chunks.iter().take(count) {
@@ -171,18 +163,13 @@ impl<'a> UringDriver<'a> {
                             "submission guard slot missing",
                         )
                     })?;
-                    let payload = slot.storage.payload.as_mut().ok_or_else(|| {
-                        UringError::InvalidState.report(
-                            "driver.submit_from_slot_raw.timer",
-                            "submission guard payload missing",
-                        )
-                    })?;
-                    let op = slot.op.as_mut().ok_or_else(|| {
-                        UringError::InvalidState
-                            .report("driver.submit_from_slot_raw.timer", "timer slot missing op")
-                    })?;
-                    let vtable = op.vtable;
-                    unsafe { (vtable.get_timeout)(op, payload) }
+                    slot.with_op_and_payload_mut(|op, payload| {
+                        let vtable = op.vtable;
+                        unsafe { (vtable.get_timeout)(op, payload) }
+                    })
+                    .map_err(|err| {
+                        slot_access_report("driver.submit_from_slot_raw.timer.op_payload", err)
+                    })?
                 };
                 if let Some(duration) = duration_opt {
                     let task_id = driver.wheel.insert(token, duration);
@@ -247,32 +234,25 @@ impl<'a> UringDriver<'a> {
         let mut chunks = [veloq_buf::heap::ChunkId::ZERO; 4];
         let (count, sqe) = {
             let driver_ptr = driver as *mut UringDriver;
-            let payload = slot.storage.payload.as_mut().ok_or_else(|| {
-                UringError::InvalidState.report(
-                    "driver.submit_queued_from_slot_raw",
-                    "queued submission payload missing",
-                )
-            })?;
-            let op = slot.op.as_mut().ok_or_else(|| {
-                UringError::InvalidState.report(
-                    "driver.submit_queued_from_slot_raw",
-                    "queued submission op missing",
-                )
-            })?;
-            let vtable = op.vtable;
-            let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
-            let completion_token = CompletionToken::user(token);
-            let sqe = unsafe {
-                (vtable.make_sqe)(
-                    op,
-                    payload,
-                    &mut *driver_ptr,
-                    SubmitTokenContext::new(token, completion_token),
-                )
-                .attach_note("driver.submit_queued_from_slot_raw.make_sqe")?
-                .user_data(completion_token.raw())
-            };
-            (count, sqe)
+            slot.with_op_and_payload_mut(|op, payload| {
+                let vtable = op.vtable;
+                let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
+                let completion_token = CompletionToken::user(token);
+                let sqe = unsafe {
+                    (vtable.make_sqe)(
+                        op,
+                        payload,
+                        &mut *driver_ptr,
+                        SubmitTokenContext::new(token, completion_token),
+                    )
+                    .attach_note("driver.submit_queued_from_slot_raw.make_sqe")?
+                    .user_data(completion_token.raw())
+                };
+                Ok::<_, Report<UringError>>((count, sqe))
+            })
+            .map_err(|err| {
+                slot_access_report("driver.submit_queued_from_slot_raw.op_payload", err)
+            })??
         };
 
         for &chunk_id in chunks.iter().take(count) {

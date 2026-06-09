@@ -224,14 +224,15 @@ impl<'a> IocpDriver<'a> {
         self.timer.restore_cleared_buffer(timer_buffer);
     }
 
-    pub(super) fn process_completion(&mut self, event: UserCompletionEvent) -> CompletionProgress {
-        let outcome = self
-            .accept_completion_ingress(
-                CompletionIngress::User(event),
-                IocpSyntheticCompletion::None,
-            )
-            .unwrap_or_default();
-        CompletionProgress::from_flow(outcome, 1, 0)
+    pub(super) fn process_completion_envelope(
+        &mut self,
+        envelope: CompletionEnvelope,
+    ) -> IocpResult<CompletionProgress> {
+        let outcome = self.accept_completion_ingress(
+            CompletionIngress::Kernel(envelope),
+            IocpSyntheticCompletion::None,
+        )?;
+        Ok(CompletionProgress::from_flow(outcome, 1, 0))
     }
 
     pub(crate) fn accept_synthetic_completion(
@@ -389,13 +390,18 @@ fn complete_iocp_waiting_slot(
         .as_ref()
         .map(io_result_to_event_res)
         .unwrap_or(event.res());
-    let cleanup = match (guard.op.as_mut(), io_detail.as_ref()) {
-        (Some(op), Some(io_result)) => op.completion_cleanup(io_result),
-        _ => CompletionCleanupGuard::default(),
+    let cleanup = if let Some(io_result) = io_detail.as_ref() {
+        guard
+            .with_op_mut(|op| {
+                let cleanup = op.completion_cleanup(io_result);
+                op.unbind_user_payload();
+                cleanup
+            })
+            .unwrap_or_default()
+    } else {
+        let _ = guard.with_op_mut(|op| op.unbind_user_payload());
+        CompletionCleanupGuard::default()
     };
-    if let Some(op) = guard.op.as_mut() {
-        op.unbind_user_payload();
-    }
     let (payload, detail) = guard.take_completion_data();
     let event =
         UserCompletionEvent::from_parts(CompletionBackend::Iocp, event.token(), completion_res, 0);
@@ -465,9 +471,7 @@ fn complete_cancel_waiting_slot(
     } else {
         let mut completed = slot.complete();
         let cleanup = completed
-            .op
-            .as_mut()
-            .map(|op| op.orphan_cleanup(&abort_result))
+            .with_op_mut(|op| op.orphan_cleanup(&abort_result))
             .unwrap_or_default();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
@@ -493,12 +497,13 @@ fn complete_iocp_orphaned_slot(
             std::io::Error::from_raw_os_error(-event_res),
         ))
     };
-    let cleanup = completed
-        .op
-        .as_mut()
-        .map(|op| op.orphan_cleanup(&io_result))
+    let (cleanup, socket_inflight) = completed
+        .with_op_mut(|op| {
+            let cleanup = op.orphan_cleanup(&io_result);
+            let socket_inflight = take_socket_inflight_from_op(op);
+            (cleanup, socket_inflight)
+        })
         .unwrap_or_default();
-    let socket_inflight = completed.op.as_mut().and_then(take_socket_inflight_from_op);
     let _ = completed.take_op();
     let _ = completed.take_completion_data();
     (cleanup, socket_inflight)
@@ -508,7 +513,9 @@ fn complete_iocp_orphaned_slot(
 fn take_socket_inflight_from_slot(
     slot: &mut Slot<'_, InFlightWaiting>,
 ) -> Option<SocketInflightToken> {
-    slot.op.as_mut().and_then(take_socket_inflight_from_op)
+    slot.with_op_mut(take_socket_inflight_from_op)
+        .ok()
+        .flatten()
 }
 
 #[inline]
