@@ -255,7 +255,7 @@ impl<'a> IocpDriver<'a> {
         let (payload, detail) = if let Some(data) = inflight {
             data
         } else {
-            ops.with_slot_storage_mut_token(token, |result, payload, _sidecar| {
+            ops.with_slot_storage_mut(token, |result, payload, _sidecar| {
                 (payload.take(), result.take())
             })
             .unwrap_or((None, None))
@@ -280,7 +280,7 @@ impl<'a> IocpDriver<'a> {
             None
         };
 
-        let _ = ops.remove_token(token);
+        let _ = ops.remove(token);
         outcome
     }
 }

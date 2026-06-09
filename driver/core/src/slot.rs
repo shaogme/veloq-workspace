@@ -402,7 +402,7 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
     fn checked_slot_view(&mut self, token: OpToken) -> CheckedSlotView<'_, Spec> {
         let (index, expected_generation) = token.parts();
         let Some((entry, op_entry, op, storage)) =
-            self.get_slot_entry_op_storage_and_entry_mut(index)
+            self.get_slot_entry_op_storage_and_entry_mut(token)
         else {
             return CheckedSlotView::Missing {
                 index,
@@ -505,7 +505,7 @@ mod tests {
 
         {
             registry
-                .with_slot_storage_mut(handle.index, |_result, payload, _sidecar| {
+                .with_slot_storage_mut(token, |_result, payload, _sidecar| {
                     *payload = Some(());
                 })
                 .expect("slot storage should exist");

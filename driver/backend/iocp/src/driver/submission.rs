@@ -151,7 +151,7 @@ impl<'a> IocpDriver<'a> {
                     completion_record(sidecar),
                 );
             }
-            let _ = ops.recycle_token(token, token.generation().wrapping_add(1));
+            let _ = ops.recycle(token, token.generation().wrapping_add(1));
             return Err(IocpError::Submission.report("iocp/driver", "thread pool overloaded"));
         }
         Ok(Poll::Pending)
@@ -227,7 +227,7 @@ impl<'a> IocpDriver<'a> {
         duration: Duration,
     ) -> DriverSubmitResult<IocpError> {
         let timeout = ctx.wheel.insert(token, duration);
-        if let Some(platform) = ops.platform_mut_token(token) {
+        if let Some(platform) = ops.platform_mut(token) {
             platform.timer_id = Some(timeout);
             platform.timer_deadline = Some(Instant::now() + duration);
         } else {

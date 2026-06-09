@@ -148,23 +148,19 @@ impl<'a> Driver for IocpDriver<'a> {
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP) {
         let _ = self
             .ops
-            .with_slot_storage_mut_token(token, |_result, payload_cell, _sidecar| {
+            .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| {
                 *payload_cell = Some(payload);
             });
     }
 
     fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP> {
         self.ops
-            .with_slot_storage_mut_token(token, |_result, payload_cell, _sidecar| {
-                payload_cell.take()
-            })
+            .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| payload_cell.take())
             .flatten()
     }
 
     fn release_op_slot_raw(&mut self, token: OpToken) {
-        let _ = self
-            .ops
-            .recycle_token(token, token.generation().wrapping_add(1));
+        let _ = self.ops.recycle(token, token.generation().wrapping_add(1));
     }
 
     fn submit_op_raw(

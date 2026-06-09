@@ -273,7 +273,7 @@ impl<'a> IocpDriver<'a> {
 
             if let Some(payload) = self
                 .ops
-                .with_slot_storage_mut_token(token, |_result, payload, _sidecar| payload.take())
+                .with_slot_storage_mut(token, |_result, payload, _sidecar| payload.take())
                 .flatten()
             {
                 payloads.push(payload);

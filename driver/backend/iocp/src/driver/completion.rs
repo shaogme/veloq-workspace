@@ -433,7 +433,7 @@ impl<'a> IocpDriver<'a> {
 
         let cleanup = self
             .ops
-            .get_slot_entry_op_storage_and_entry_mut_token(token)
+            .get_slot_entry_op_storage_and_entry_mut(token)
             .and_then(|(_, _, op, _)| {
                 let cleanup = op
                     .as_mut()
@@ -446,7 +446,7 @@ impl<'a> IocpDriver<'a> {
 
         let _ = self
             .ops
-            .with_slot_storage_mut_token(token, |result, payload, _sidecar| {
+            .with_slot_storage_mut(token, |result, payload, _sidecar| {
                 let _ = result.take();
                 let _ = payload.take();
             });

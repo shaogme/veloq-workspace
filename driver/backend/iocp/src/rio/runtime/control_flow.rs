@@ -289,7 +289,7 @@ impl<'a> RioCompletionRouter<'a> {
                         .set_error_code(5)
                         .attach_note("RIO completion found corrupt slot"));
                     let cleanup = ops
-                        .get_slot_entry_op_storage_and_entry_mut_token(op_token)
+                        .get_slot_entry_op_storage_and_entry_mut(op_token)
                         .and_then(|(_, _, op, _)| {
                             let cleanup = op
                                 .as_mut()
@@ -299,11 +299,10 @@ impl<'a> RioCompletionRouter<'a> {
                             Some(cleanup)
                         })
                         .unwrap_or_default();
-                    let _ =
-                        ops.with_slot_storage_mut_token(op_token, |result, payload, _sidecar| {
-                            let _ = result.take();
-                            let _ = payload.take();
-                        });
+                    let _ = ops.with_slot_storage_mut(op_token, |result, payload, _sidecar| {
+                        let _ = result.take();
+                        let _ = payload.take();
+                    });
                     let event = CompletionEvent {
                         token: raw.token,
                         res: -5,

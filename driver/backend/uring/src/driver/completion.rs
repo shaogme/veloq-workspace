@@ -503,18 +503,18 @@ impl<'a> UringDriver<'a> {
 
         let (payload, detail) = self
             .ops
-            .with_slot_storage_mut_token(
+            .with_slot_storage_mut(
                 OpToken::new(snapshot.index, snapshot.generation),
                 |result, payload, _sidecar| (payload.take(), result.take()),
             )
             .unwrap_or((None, None));
         let mut cleanup = CompletionCleanupGuard::default();
-        if let Some((_, _, op, _)) =
-            self.ops
-                .get_slot_entry_op_storage_and_entry_mut_token(OpToken::new(
-                    snapshot.index,
-                    snapshot.generation,
-                ))
+        if let Some((_, _, op, _)) = self
+            .ops
+            .get_slot_entry_op_storage_and_entry_mut(OpToken::new(
+                snapshot.index,
+                snapshot.generation,
+            ))
         {
             if let Some(op_ref) = op.as_mut() {
                 cleanup = unsafe { (op_ref.vtable.completion_cleanup)(op_ref, raw_res) };

@@ -24,7 +24,7 @@ fn active_table() -> (SharedCompletionTable<(), ()>, CompletionToken) {
     let handle = registry.alloc(()).expect("slot allocation failed").handle;
     let token = OpToken::new(handle.index, handle.generation);
     registry
-        .with_slot_storage_mut_token(token, |_result, payload, _sidecar| {
+        .with_slot_storage_mut(token, |_result, payload, _sidecar| {
             *payload = Some(());
         })
         .expect("slot storage should exist");

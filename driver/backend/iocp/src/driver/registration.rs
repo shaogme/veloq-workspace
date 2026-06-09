@@ -321,7 +321,7 @@ impl<'a> IocpDriver<'a> {
         };
         let socket_inflight = self
             .ops
-            .get_slot_entry_op_storage_and_entry_mut_token(token)
+            .get_slot_entry_op_storage_and_entry_mut(token)
             .and_then(|(_, _, op_opt, _)| {
                 let op = op_opt.as_mut()?;
                 let was_in_flight = op.header.in_flight;

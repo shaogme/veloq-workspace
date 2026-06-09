@@ -186,7 +186,7 @@ impl<'a> UringDriver<'a> {
                 };
                 if let Some(duration) = duration_opt {
                     let task_id = driver.wheel.insert(token, duration);
-                    if let Some(platform) = driver.ops.platform_mut_token(token) {
+                    if let Some(platform) = driver.ops.platform_mut(token) {
                         platform.timer_id = Some(task_id);
                         platform.submission_state = UringSubmissionState::Timer;
                     }
@@ -480,7 +480,7 @@ impl<'a> UringDriver<'a> {
             Err(e) => {
                 if let Some(op) = self
                     .ops
-                    .get_slot_entry_op_storage_and_entry_mut_token(token)
+                    .get_slot_entry_op_storage_and_entry_mut(token)
                     .and_then(|(_, _, op, _)| op.take())
                 {
                     *op_in = Some(op);
@@ -558,7 +558,7 @@ impl<'a> UringDriver<'a> {
             Err(e) => {
                 if let Some(op) = self
                     .ops
-                    .get_slot_entry_op_storage_and_entry_mut_token(token)
+                    .get_slot_entry_op_storage_and_entry_mut(token)
                     .and_then(|(_, _, op, _)| op.take())
                 {
                     *op_in = Some(op);
