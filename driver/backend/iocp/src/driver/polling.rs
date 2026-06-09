@@ -351,11 +351,7 @@ fn classify_completion_status(
     success: bool,
 ) -> IocpCompletionStatusKind {
     if key == RIO_EVENT_KEY {
-        if overlapped.is_null() {
-            IocpCompletionStatusKind::RioWake
-        } else {
-            IocpCompletionStatusKind::Unknown
-        }
+        IocpCompletionStatusKind::RioWake
     } else if !overlapped.is_null() {
         IocpCompletionStatusKind::OverlappedUser { queue_key: key }
     } else if !success && key == 0 {
@@ -470,6 +466,14 @@ mod tests {
                 true,
             ),
             IocpCompletionStatusKind::ControlKey
+        );
+    }
+
+    #[test]
+    fn rio_key_is_wake_even_with_notification_overlapped() {
+        assert_eq!(
+            classify_completion_status(RIO_EVENT_KEY, ptr::dangling_mut(), true),
+            IocpCompletionStatusKind::RioWake
         );
     }
 
