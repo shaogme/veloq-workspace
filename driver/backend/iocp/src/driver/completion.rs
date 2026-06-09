@@ -17,6 +17,7 @@ use crate::error::{IocpError, IocpResult};
 use crate::op::{IocpOp, IocpUserPayload, Slot};
 use crate::rio::SocketInflightToken;
 
+#[derive(Clone, Copy)]
 pub(super) struct EmitContext<'a> {
     pub(super) completion_table:
         &'a veloq_driver_core::driver::SharedCompletionTable<IocpUserPayload, IocpError>,
@@ -105,8 +106,12 @@ impl<'a> IocpDriver<'a> {
             }
         }
         let mut finished_timers = Vec::new();
+        let emit_ctx = EmitContext {
+            completion_table: self.completion.table(),
+        };
         for token in expired {
             if let Some(finish) = Self::finish_timer_op(
+                emit_ctx,
                 &mut self.ops,
                 &mut self.completion_diagnostics,
                 token,
@@ -138,6 +143,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     fn finish_timer_op(
+        ctx: EmitContext<'_>,
         ops: &mut IocpOpRegistry,
         diagnostics: &mut DriverCompletionDiagnostics,
         token: OpToken,
@@ -175,7 +181,18 @@ impl<'a> IocpDriver<'a> {
                         veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
                             .with_slot_snapshot(snapshot)
                             .with_raw_completion(raw);
-                    record_completion_anomaly(diagnostics, &anomaly);
+                    let _ = record_lost_completion(
+                        ctx.completion_table,
+                        diagnostics,
+                        UserCompletionEvent::from_parts(
+                            CompletionBackend::Iocp,
+                            token,
+                            raw.res,
+                            raw.flags,
+                        ),
+                        anomaly,
+                        cleanup,
+                    );
                     let _ = ops.finalize_corrupt_slot(snapshot);
                     None
                 }
@@ -222,13 +239,14 @@ impl<'a> IocpDriver<'a> {
                 let ctx = EmitContext {
                     completion_table: self.completion.table(),
                 };
-                let _ = Self::emit_event_from_slot(
+                let emit_outcome = Self::emit_event_from_slot(
                     ctx,
                     &mut self.completion_diagnostics,
                     token,
                     slot,
                     io_result,
                 );
+                let user_lost = matches!(emit_outcome, Some(RecordCompletionOutcome::RecordedLost));
                 if let Some(socket_inflight) = socket_inflight {
                     self.rio
                         .state_mut()
@@ -238,7 +256,8 @@ impl<'a> IocpDriver<'a> {
                 let _ = self.ops.finalize_waiting_completion(token);
                 CompletionProgress {
                     iocp: 1,
-                    user_completed: 1,
+                    user_completed: usize::from(!user_lost),
+                    user_lost: usize::from(user_lost),
                     ..CompletionProgress::default()
                 }
             }
@@ -374,6 +393,7 @@ impl<'a> IocpDriver<'a> {
         io_result: IocpResult<usize>,
     ) -> Option<RecordCompletionOutcome> {
         let mut sidecar_to_push = None;
+        let mut lost_outcome = None;
         {
             let completion_res = io_result_to_event_res(&io_result);
             let mut io_detail = Some(io_result);
@@ -419,11 +439,26 @@ impl<'a> IocpDriver<'a> {
                         veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
                             .with_slot_snapshot(snapshot)
                             .with_raw_completion(raw);
-                    record_completion_anomaly(diagnostics, &anomaly);
+                    lost_outcome = Some(record_lost_completion(
+                        ctx.completion_table,
+                        diagnostics,
+                        UserCompletionEvent::from_parts(
+                            CompletionBackend::Iocp,
+                            token,
+                            raw.res,
+                            raw.flags,
+                        ),
+                        anomaly,
+                        cleanup,
+                    ));
                     let _ = guard.take_op();
                     let _data = std::mem::take(guard.platform_mut());
                 }
             }
+        }
+
+        if let Some(outcome) = lost_outcome {
+            return Some(outcome);
         }
 
         if let Some(sidecar) = sidecar_to_push {
@@ -479,7 +514,13 @@ impl<'a> IocpDriver<'a> {
             .map(|(_, _, op, _)| {
                 let cleanup = op
                     .as_mut()
-                    .map(|op| op.completion_cleanup(&lost_result))
+                    .map(|op| {
+                        if snapshot.state == veloq_driver_core::slot::SlotState::InFlightOrphaned {
+                            op.orphan_cleanup(&lost_result)
+                        } else {
+                            op.completion_cleanup(&lost_result)
+                        }
+                    })
                     .unwrap_or_default();
                 let _ = op.take();
                 cleanup

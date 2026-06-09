@@ -54,7 +54,7 @@ impl<'a> IocpDriver<'a> {
                 emit_ctx,
                 &mut self.ops,
                 &mut self.completion_diagnostics,
-                request.mode == CancelMode::UserVisible,
+                request.mode,
                 token,
             ) {
                 let _ = outcome;
@@ -78,7 +78,7 @@ impl<'a> IocpDriver<'a> {
                     emit_ctx,
                     &mut self.ops,
                     &mut self.completion_diagnostics,
-                    request.mode == CancelMode::UserVisible,
+                    request.mode,
                     token,
                 ) {
                     let _ = outcome;
@@ -143,12 +143,11 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpResult<CancelSubmitOutcome> {
         match status {
             Ok(CancelPerformStatus::Submitted) | Ok(CancelPerformStatus::RioRequested) => {
-                self.completion_diagnostics.inc_cancel_submitted();
-                self.completion_diagnostics.inc_cancel_observed_ok();
+                self.completion_diagnostics.inc_cancel_request_submitted();
                 Ok(CancelSubmitOutcome::Submitted)
             }
             Ok(CancelPerformStatus::NotFound) => {
-                self.completion_diagnostics.inc_cancel_observed_not_found();
+                self.completion_diagnostics.inc_cancel_request_not_found();
                 debug!("CancelIoEx target was already complete or absent");
                 Ok(CancelSubmitOutcome::TargetMissing)
             }
@@ -156,7 +155,7 @@ impl<'a> IocpDriver<'a> {
                 Ok(CancelSubmitOutcome::NoBackendHandle)
             }
             Err(report) => {
-                self.completion_diagnostics.inc_cancel_observed_error();
+                self.completion_diagnostics.inc_cancel_request_error();
                 warn!(report = ?report, "CancelIoEx failed");
                 Err(report)
             }
@@ -256,9 +255,10 @@ impl<'a> IocpDriver<'a> {
         ctx: EmitContext<'_>,
         ops: &mut IocpOpRegistry,
         diagnostics: &mut veloq_driver_core::driver::DriverCompletionDiagnostics,
-        emit_completion: bool,
+        mode: CancelMode,
         token: OpToken,
     ) -> Option<RecordCompletionOutcome> {
+        let emit_completion = mode == CancelMode::UserVisible;
         let abort_result: IocpResult<usize> = Err(crate::error::IocpError::CompletionWait
             .to_report()
             .push_ctx("scope", "iocp.driver.abort_slot_inner")
@@ -274,10 +274,10 @@ impl<'a> IocpDriver<'a> {
                     .op
                     .as_mut()
                     .map(|op| {
-                        if emit_completion {
-                            op.completion_cleanup(&abort_result)
-                        } else {
+                        if mode == CancelMode::Abandon {
                             op.orphan_cleanup(&abort_result)
+                        } else {
+                            op.completion_cleanup(&abort_result)
                         }
                     })
                     .unwrap_or_default();
@@ -300,7 +300,13 @@ impl<'a> IocpDriver<'a> {
                 cleanup = guard
                     .op
                     .as_mut()
-                    .map(|op| op.completion_cleanup(&abort_result))
+                    .map(|op| {
+                        if mode == CancelMode::Abandon {
+                            op.orphan_cleanup(&abort_result)
+                        } else {
+                            op.completion_cleanup(&abort_result)
+                        }
+                    })
                     .unwrap_or_default();
                 let _ = guard.op.take();
                 Some(

@@ -13,10 +13,13 @@ struct DriverCompletionDiagnosticsInner {
     stale_completion: AtomicU64,
     slot_corruption: AtomicU64,
     payload_missing: AtomicU64,
-    cancel_submitted: AtomicU64,
-    cancel_ack_ok: AtomicU64,
-    cancel_ack_not_found: AtomicU64,
-    cancel_ack_error: AtomicU64,
+    cancel_request_submitted: AtomicU64,
+    cancel_request_not_found: AtomicU64,
+    cancel_request_error: AtomicU64,
+    uring_cancel_ack_ok: AtomicU64,
+    uring_cancel_ack_not_found: AtomicU64,
+    uring_cancel_ack_error: AtomicU64,
+    uring_cancel_ack_enoent_active: AtomicU64,
     waker_ok: AtomicU64,
     waker_error: AtomicU64,
     waker_rebuild: AtomicU64,
@@ -42,6 +45,13 @@ pub struct DriverCompletionDiagnosticsSnapshot {
     pub stale_completion: u64,
     pub slot_corruption: u64,
     pub payload_missing: u64,
+    pub cancel_request_submitted: u64,
+    pub cancel_request_not_found: u64,
+    pub cancel_request_error: u64,
+    pub uring_cancel_ack_ok: u64,
+    pub uring_cancel_ack_not_found: u64,
+    pub uring_cancel_ack_error: u64,
+    pub uring_cancel_ack_enoent_active: u64,
     pub cancel_submitted: u64,
     pub cancel_ack_ok: u64,
     pub cancel_ack_not_found: u64,
@@ -78,10 +88,17 @@ impl DriverCompletionDiagnostics {
             stale_completion: Self::load(&self.inner.stale_completion),
             slot_corruption: Self::load(&self.inner.slot_corruption),
             payload_missing: Self::load(&self.inner.payload_missing),
-            cancel_submitted: Self::load(&self.inner.cancel_submitted),
-            cancel_ack_ok: Self::load(&self.inner.cancel_ack_ok),
-            cancel_ack_not_found: Self::load(&self.inner.cancel_ack_not_found),
-            cancel_ack_error: Self::load(&self.inner.cancel_ack_error),
+            cancel_request_submitted: Self::load(&self.inner.cancel_request_submitted),
+            cancel_request_not_found: Self::load(&self.inner.cancel_request_not_found),
+            cancel_request_error: Self::load(&self.inner.cancel_request_error),
+            uring_cancel_ack_ok: Self::load(&self.inner.uring_cancel_ack_ok),
+            uring_cancel_ack_not_found: Self::load(&self.inner.uring_cancel_ack_not_found),
+            uring_cancel_ack_error: Self::load(&self.inner.uring_cancel_ack_error),
+            uring_cancel_ack_enoent_active: Self::load(&self.inner.uring_cancel_ack_enoent_active),
+            cancel_submitted: Self::load(&self.inner.cancel_request_submitted),
+            cancel_ack_ok: Self::load(&self.inner.uring_cancel_ack_ok),
+            cancel_ack_not_found: Self::load(&self.inner.uring_cancel_ack_not_found),
+            cancel_ack_error: Self::load(&self.inner.uring_cancel_ack_error),
             waker_ok: Self::load(&self.inner.waker_ok),
             waker_error: Self::load(&self.inner.waker_error),
             waker_rebuild: Self::load(&self.inner.waker_rebuild),
@@ -131,37 +148,72 @@ impl DriverCompletionDiagnostics {
 
     #[inline]
     pub fn inc_cancel_submitted(&self) {
-        Self::inc(&self.inner.cancel_submitted);
+        self.inc_cancel_request_submitted();
+    }
+
+    #[inline]
+    pub fn inc_cancel_request_submitted(&self) {
+        Self::inc(&self.inner.cancel_request_submitted);
+    }
+
+    #[inline]
+    pub fn inc_cancel_request_not_found(&self) {
+        Self::inc(&self.inner.cancel_request_not_found);
+    }
+
+    #[inline]
+    pub fn inc_cancel_request_error(&self) {
+        Self::inc(&self.inner.cancel_request_error);
     }
 
     #[inline]
     pub fn inc_cancel_ack_ok(&self) {
-        Self::inc(&self.inner.cancel_ack_ok);
+        self.inc_uring_cancel_ack_ok();
     }
 
     #[inline]
     pub fn inc_cancel_ack_not_found(&self) {
-        Self::inc(&self.inner.cancel_ack_not_found);
+        self.inc_uring_cancel_ack_not_found();
     }
 
     #[inline]
     pub fn inc_cancel_ack_error(&self) {
-        Self::inc(&self.inner.cancel_ack_error);
+        self.inc_uring_cancel_ack_error();
+    }
+
+    #[inline]
+    pub fn inc_uring_cancel_ack_ok(&self) {
+        Self::inc(&self.inner.uring_cancel_ack_ok);
+    }
+
+    #[inline]
+    pub fn inc_uring_cancel_ack_not_found(&self) {
+        Self::inc(&self.inner.uring_cancel_ack_not_found);
+    }
+
+    #[inline]
+    pub fn inc_uring_cancel_ack_error(&self) {
+        Self::inc(&self.inner.uring_cancel_ack_error);
+    }
+
+    #[inline]
+    pub fn inc_uring_cancel_ack_enoent_active(&self) {
+        Self::inc(&self.inner.uring_cancel_ack_enoent_active);
     }
 
     #[inline]
     pub fn inc_cancel_observed_ok(&self) {
-        self.inc_cancel_ack_ok();
+        self.inc_cancel_request_submitted();
     }
 
     #[inline]
     pub fn inc_cancel_observed_not_found(&self) {
-        self.inc_cancel_ack_not_found();
+        self.inc_cancel_request_not_found();
     }
 
     #[inline]
     pub fn inc_cancel_observed_error(&self) {
-        self.inc_cancel_ack_error();
+        self.inc_cancel_request_error();
     }
 
     #[inline]

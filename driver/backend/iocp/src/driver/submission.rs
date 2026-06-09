@@ -7,7 +7,7 @@ use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
     CompletionBackend, CompletionCleanupGuard, CompletionToken, DriverCompletionDiagnostics,
     DriverSubmitResult, OpToken, RawCompletion, SharedCompletionTable, SubmitStatus,
-    UserCompletionEvent, record_completion_anomaly,
+    UserCompletionEvent, record_lost_completion,
 };
 use veloq_driver_core::slot::{
     CheckedSlotView, Reserved, SlotAccessError, SlotRegistryExt, SlotView,
@@ -170,7 +170,18 @@ impl<'a> IocpDriver<'a> {
                         veloq_driver_core::driver::corrupt_slot_anomaly(raw.token, snapshot)
                             .with_slot_snapshot(snapshot)
                             .with_raw_completion(raw);
-                    record_completion_anomaly(ctx.diagnostics, &anomaly);
+                    let _ = record_lost_completion(
+                        ctx.completion_table,
+                        ctx.diagnostics,
+                        UserCompletionEvent::from_parts(
+                            CompletionBackend::Iocp,
+                            token,
+                            raw.res,
+                            raw.flags,
+                        ),
+                        anomaly,
+                        CompletionCleanupGuard::default(),
+                    );
                     let _ = ops.finalize_corrupt_slot(snapshot);
                 }
             }

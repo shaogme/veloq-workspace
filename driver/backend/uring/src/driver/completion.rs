@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use tracing::{debug, error, trace, warn};
 
-use crate::driver::UringDriver;
+use crate::driver::{PendingCancel, UringDriver};
 use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_event_res};
 use crate::op::{CheckedSlotView, Slot, SlotView, UringOpRegistryExt, UringUserPayload};
 use veloq_driver_core::driver::{
@@ -474,7 +474,7 @@ impl<'a> UringDriver<'a> {
 
         match raw.res {
             value if value >= 0 => {
-                self.completion_diagnostics.inc_cancel_ack_ok();
+                self.completion_diagnostics.inc_uring_cancel_ack_ok();
                 trace!(
                     cancel_id = cancel_id.raw(),
                     request = ?request,
@@ -484,32 +484,21 @@ impl<'a> UringDriver<'a> {
                 CancelAck::Ok
             }
             value if value == -libc::ENOENT => {
-                self.completion_diagnostics.inc_cancel_ack_not_found();
-                if let CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) =
-                    self.ops.checked_slot_view(request.target)
-                {
-                    let snapshot = slot.snapshot();
-                    let target_raw = RawCompletion::new(
-                        CompletionBackend::Uring,
-                        CompletionToken::user(request.target),
-                        raw.res,
-                        raw.flags,
-                    );
-                    let anomaly = CompletionAnomaly::backend_invariant_broken(
-                        target_raw.token,
-                        snapshot.index,
-                        snapshot.generation,
-                        snapshot.state,
-                    )
-                    .with_slot_snapshot(snapshot)
-                    .with_raw_completion(target_raw);
-                    record_completion_anomaly(&self.completion_diagnostics, &anomaly);
-                    debug!(
-                        cancel_id = cancel_id.raw(),
-                        request = ?request,
-                        user_data = snapshot.index,
-                        generation = snapshot.generation,
-                        "async cancel returned ENOENT while target is still orphaned"
+                self.completion_diagnostics.inc_uring_cancel_ack_not_found();
+                let active_target = match self.ops.checked_slot_view(request.target) {
+                    CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => Some((
+                        slot.snapshot(),
+                        "async cancel returned ENOENT while target is still waiting",
+                    )),
+                    CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => Some((
+                        slot.snapshot(),
+                        "async cancel returned ENOENT while target is still orphaned",
+                    )),
+                    _ => None,
+                };
+                if let Some((snapshot, message)) = active_target {
+                    self.record_cancel_enoent_with_active_target(
+                        cancel_id, request, raw, snapshot, message,
                     );
                 }
                 debug!(
@@ -520,7 +509,7 @@ impl<'a> UringDriver<'a> {
                 CancelAck::NotFound
             }
             value => {
-                self.completion_diagnostics.inc_cancel_ack_error();
+                self.completion_diagnostics.inc_uring_cancel_ack_error();
                 warn!(
                     cancel_id = cancel_id.raw(),
                     request = ?request,
@@ -533,10 +522,54 @@ impl<'a> UringDriver<'a> {
         }
     }
 
+    fn record_cancel_enoent_with_active_target(
+        &mut self,
+        cancel_id: CancelCompletionId,
+        request: PendingCancel,
+        raw: RawCompletion,
+        snapshot: veloq_driver_core::slot::SlotSnapshot,
+        message: &'static str,
+    ) {
+        self.completion_diagnostics
+            .inc_uring_cancel_ack_enoent_active();
+        let target_raw = RawCompletion::new(
+            CompletionBackend::Uring,
+            CompletionToken::user(request.target),
+            raw.res,
+            raw.flags,
+        );
+        let anomaly = CompletionAnomaly::backend_invariant_broken(
+            target_raw.token,
+            snapshot.index,
+            snapshot.generation,
+            snapshot.state,
+        )
+        .with_slot_snapshot(snapshot)
+        .with_raw_completion(target_raw);
+        record_completion_anomaly(&self.completion_diagnostics, &anomaly);
+        debug!(
+            cancel_id = cancel_id.raw(),
+            request = ?request,
+            user_data = snapshot.index,
+            generation = snapshot.generation,
+            state = ?snapshot.state,
+            note = message,
+            "async cancel returned ENOENT while target is still active"
+        );
+    }
+
     fn handle_waker_completion(&mut self, cqe_res: i32) -> UringResult<()> {
         let mut should_rebuild = false;
-        if cqe_res >= 0 {
+        if cqe_res == self.waker_buf.len() as i32 {
             self.completion_diagnostics.inc_waker_ok();
+        } else if cqe_res >= 0 {
+            self.completion_diagnostics.inc_waker_error();
+            warn!(
+                res = cqe_res,
+                expected = self.waker_buf.len(),
+                "eventfd waker read returned unexpected byte count"
+            );
+            should_rebuild = true;
         } else {
             self.completion_diagnostics.inc_waker_error();
             match -cqe_res {
@@ -596,7 +629,12 @@ impl<'a> UringDriver<'a> {
         let mut cleanup = CompletionCleanupGuard::default();
         if let Some((_, _, op, _)) = self.ops.active_slot_bundle_mut(token) {
             if let Some(op_ref) = op.as_mut() {
-                cleanup = unsafe { (op_ref.vtable.completion_cleanup)(op_ref, raw_res) };
+                cleanup = if snapshot.state == veloq_driver_core::slot::SlotState::InFlightOrphaned
+                {
+                    unsafe { (op_ref.vtable.orphan_cleanup)(op_ref, raw_res) }
+                } else {
+                    unsafe { (op_ref.vtable.completion_cleanup)(op_ref, raw_res) }
+                };
             }
             let _ = op.take();
         }

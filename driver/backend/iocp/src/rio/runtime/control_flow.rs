@@ -21,10 +21,10 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionPacket,
-    CompletionToken, DriverCompletionDiagnostics, RawCompletion, RoutedSlotCompletion,
-    SharedCompletionTable, UserCompletionEvent, record_completion_anomaly, record_lost_completion,
-    route_user_completion, run_completion_cleanup,
+    CompletionAnomaly, CompletionBackend, CompletionPacket, CompletionToken,
+    DriverCompletionDiagnostics, RawCompletion, RoutedSlotCompletion, SharedCompletionTable,
+    UserCompletionEvent, record_completion_anomaly, record_lost_completion, route_user_completion,
+    run_completion_cleanup,
 };
 use veloq_driver_core::slot::SlotRegistryExt;
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -193,6 +193,11 @@ impl<'a> RioCompletionRouter<'a> {
                     {
                         let snapshot = slot.snapshot();
                         let mut guard = slot.complete();
+                        let cleanup = guard
+                            .op
+                            .as_mut()
+                            .map(|op| op.completion_cleanup(&completion))
+                            .unwrap_or_default();
                         let _ = guard.take_op();
                         let (payload, detail) = guard.take_completion_data();
                         if let Some(payload) = payload {
@@ -210,7 +215,7 @@ impl<'a> RioCompletionRouter<'a> {
                                     event,
                                     payload,
                                     detail.or(Some(completion)),
-                                    CompletionCleanupGuard::default(),
+                                    cleanup,
                                 ),
                             );
                             let _ = outcome;
@@ -227,7 +232,13 @@ impl<'a> RioCompletionRouter<'a> {
                             )
                             .with_slot_snapshot(snapshot)
                             .with_raw_completion(raw);
-                            record_completion_anomaly(self.comp.diagnostics, &anomaly);
+                            let _ = record_lost_completion(
+                                self.comp.table,
+                                self.comp.diagnostics,
+                                event,
+                                anomaly,
+                                cleanup,
+                            );
                         }
                     }
                     let _ = ops.finalize_waiting_completion(op_token);
@@ -322,7 +333,15 @@ impl<'a> RioCompletionRouter<'a> {
                         .map(|(_, _, op, _)| {
                             let cleanup = op
                                 .as_mut()
-                                .map(|op| op.completion_cleanup(&lost_result))
+                                .map(|op| {
+                                    if snapshot.state
+                                        == veloq_driver_core::slot::SlotState::InFlightOrphaned
+                                    {
+                                        op.orphan_cleanup(&lost_result)
+                                    } else {
+                                        op.completion_cleanup(&lost_result)
+                                    }
+                                })
                                 .unwrap_or_default();
                             let _ = op.take();
                             cleanup

@@ -250,13 +250,6 @@ impl<Spec: SlotSpec> SlotData<Spec> {
         let mut data = self.completion_data.lock();
         f(&mut *data)
     }
-
-    #[inline]
-    pub(crate) fn clear_completion_record_data(&self) {
-        self.completion_with_record_data(|record| {
-            *record = CompletionData::Empty;
-        });
-    }
 }
 
 impl<Spec: SlotSpec> Default for SlotData<Spec> {

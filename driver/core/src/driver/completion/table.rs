@@ -7,7 +7,7 @@ use super::types::CompletionMutationOutcome;
 use super::{
     CompletionAnomaly, CompletionCleanupGuard, CompletionEvent, CompletionInput, CompletionPacket,
     CompletionRecord, CompletionToken, OpToken, RecordCompletionOutcome, RecordCompletionResult,
-    UserCompletionEvent,
+    UserCompletionEvent, run_completion_cleanup,
 };
 
 pub type SharedCompletionTable<UP, E, R = usize> = Arc<dyn CompletionAccess<UP, E, R>>;
@@ -47,6 +47,8 @@ pub trait CompletionAccess<UP, E, R = usize>: Send + Sync {
     fn register_waker(&self, token: OpToken, waker: &Waker) -> CompletionMutationOutcome;
 
     fn mark_waiting(&self, token: OpToken) -> CompletionMutationOutcome;
+
+    fn discard_ready_record(&self, token: OpToken) -> CompletionMutationOutcome;
 
     fn mark_orphaned(&self, token: OpToken) -> CompletionMutationOutcome;
 
@@ -151,6 +153,31 @@ fn recorded_mutation(
         diagnostics.record_anomaly(anomaly);
     }
     outcome
+}
+
+#[inline]
+fn run_discarded_record_cleanup<UP, E, R>(
+    diagnostics: &super::DriverCompletionDiagnostics,
+    record_data: slot::CompletionData<UP, E, R>,
+) {
+    match record_data {
+        slot::CompletionData::User {
+            payload,
+            detail,
+            mut cleanup,
+        } => {
+            drop(payload);
+            drop(detail);
+            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
+        }
+        slot::CompletionData::Lost {
+            anomaly: _,
+            mut cleanup,
+        } => {
+            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
+        }
+        slot::CompletionData::Empty => {}
+    }
 }
 
 impl<Spec, UP: Send, E: Send, R: Send> CompletionAccess<UP, E, R> for slot::SlotTable<Spec>
@@ -366,7 +393,8 @@ where
                 cleanup,
             }),
             slot::CompletionData::Lost { anomaly, cleanup } => {
-                drop(cleanup);
+                let mut cleanup = cleanup;
+                let _ = run_completion_cleanup(&self.diagnostics, &mut cleanup);
                 PollRecordResult::Unavailable(anomaly)
             }
             slot::CompletionData::Empty => {
@@ -475,6 +503,59 @@ where
     }
 
     #[inline]
+    fn discard_ready_record(&self, token: OpToken) -> CompletionMutationOutcome {
+        let (idx, generation) = token.parts();
+        if idx >= self.slots.len() {
+            return recorded_mutation(&self.diagnostics, mutation_missing(token));
+        }
+        let cell = &self.slots[idx];
+
+        loop {
+            let current = cell.load_core_state(Ordering::Acquire);
+            let state = current.state();
+            let cell_gen = current.generation();
+
+            match state {
+                slot::SlotState::InFlightReady if cell_gen == generation => {
+                    if cell
+                        .core_state
+                        .compare_exchange(
+                            current,
+                            current
+                                .with_state(slot::SlotState::Idle)
+                                .with_generation(generation.wrapping_add(1)),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.clear_ready_completion();
+                        let record_data = cell.completion_with_record_data(std::mem::take);
+                        run_discarded_record_cleanup(&self.diagnostics, record_data);
+                        return recorded_mutation(
+                            &self.diagnostics,
+                            CompletionMutationOutcome::Applied,
+                        );
+                    }
+                }
+                slot::SlotState::Finalizing => continue,
+                _ if cell_gen != generation => {
+                    return recorded_mutation(
+                        &self.diagnostics,
+                        mutation_generation_mismatch(token, idx, generation, cell_gen, state),
+                    );
+                }
+                _ => {
+                    return recorded_mutation(
+                        &self.diagnostics,
+                        mutation_non_active(token, idx, generation, state),
+                    );
+                }
+            }
+        }
+    }
+
+    #[inline]
     fn mark_orphaned(&self, token: OpToken) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
@@ -514,25 +595,7 @@ where
                     }
                 }
                 slot::SlotState::InFlightReady if cell_gen == generation => {
-                    if cell
-                        .core_state
-                        .compare_exchange(
-                            current,
-                            current
-                                .with_state(slot::SlotState::Idle)
-                                .with_generation(generation.wrapping_add(1)),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.clear_ready_completion();
-                        cell.clear_completion_record_data();
-                        return recorded_mutation(
-                            &self.diagnostics,
-                            CompletionMutationOutcome::Applied,
-                        );
-                    }
+                    return self.discard_ready_record(token);
                 }
                 slot::SlotState::Finalizing => continue,
                 _ if cell_gen != generation => {
@@ -571,9 +634,11 @@ where
 #[cfg(not(feature = "loom"))]
 mod tests {
     use super::*;
+    use crate::DriverCoreError;
     use crate::driver::OpToken;
     use crate::driver::PlatformOp;
-    use crate::driver::{CompletionAnomalyReason, CompletionBackend};
+    use crate::driver::{CompletionAnomalyReason, CompletionBackend, CompletionCleanup};
+    use diagweave::prelude::*;
 
     struct DummyPlatformOp;
 
@@ -838,5 +903,35 @@ mod tests {
         ));
         let snapshot = table.completion_diagnostics().snapshot();
         assert_eq!(snapshot.stale_completion, 1);
+    }
+
+    #[test]
+    fn ready_mark_orphaned_runs_cleanup_and_records_error() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        table.slots[0].reset(1);
+        table.slots[0].set_state(slot::SlotState::InFlightWaiting, Ordering::Release);
+        let token = test_token(0, 1);
+        let cleanup = CompletionCleanupGuard::new(CompletionCleanup::new(|| {
+            Err(DriverCoreError::Internal
+                .to_report()
+                .attach_note("test cleanup failure"))
+        }));
+
+        let outcome = table
+            .record_completion(CompletionPacket::user_with_cleanup(
+                test_event(token, 0),
+                (),
+                None,
+                cleanup,
+            ))
+            .into_outcome();
+        assert_eq!(outcome, RecordCompletionOutcome::RecordedUser);
+        assert_eq!(
+            table.mark_orphaned(token),
+            CompletionMutationOutcome::Applied
+        );
+
+        let snapshot = table.completion_diagnostics().snapshot();
+        assert_eq!(snapshot.orphan_cleanup_error, 1);
     }
 }
