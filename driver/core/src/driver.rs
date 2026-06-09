@@ -8,7 +8,7 @@ use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 
-pub mod completion;
+mod completion;
 pub mod registry;
 
 pub use completion::*;

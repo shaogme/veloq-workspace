@@ -258,6 +258,13 @@ impl CompletionFlowOutcome {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FinalizeAction {
+    Waiting(UserCompletionEvent),
+    Orphaned(UserCompletionEvent),
+    CorruptFromEvent,
+}
+
 pub trait CompletionFlowExt<Spec>
 where
     Spec: slot::SlotSpec,
@@ -424,14 +431,6 @@ where
         }
     }
 }
-
-#[derive(Clone, Copy)]
-enum FinalizeAction {
-    Waiting(UserCompletionEvent),
-    Orphaned(UserCompletionEvent),
-    CorruptFromEvent,
-}
-
 fn finish_hook_outcome<Spec, Hooks>(
     registry: &mut OpRegistry<Spec>,
     table: &SharedCompletionTable<Spec>,
