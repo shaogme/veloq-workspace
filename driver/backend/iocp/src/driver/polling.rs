@@ -330,6 +330,9 @@ impl<'a> IocpDriver<'a> {
                 0,
             );
             let expected_key = raw.token.raw() as usize;
+            // Handles are associated with this IOCP using completion key 0. The overlapped
+            // sidecar is the authoritative user token; a non-zero mismatched key is diagnostic
+            // only and must not override the sidecar token.
             if completion_key != 0 && completion_key != expected_key {
                 let mismatch_raw = RawCompletion::new(
                     CompletionBackend::Iocp,

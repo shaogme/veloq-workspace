@@ -6,8 +6,8 @@ pub(crate) mod net_udp;
 use core::convert::TryFrom;
 use diagweave::prelude::*;
 use veloq_driver_core::driver::{
-    CompletionRecord, CompletionToken, DriveMode, Driver, DriverSubmitResult, OpToken,
-    PollRecordResult, event_res_to_result,
+    CompletionRecord, DriveMode, Driver, DriverSubmitResult, OpToken, PollRecordResult,
+    event_res_to_result,
 };
 use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
 
@@ -59,7 +59,6 @@ where
         payload: payload_erased,
         mut detail,
         mut cleanup,
-        record_kind: _,
     } = record;
     let payload = T::try_payload_from_erased(payload_erased).expect("completion payload type");
     let res = detail
@@ -76,10 +75,8 @@ pub(crate) fn wait_completion_record(
     timeout: std::time::Duration,
 ) -> IocpResult<CompletionRecord<IocpUserPayload, IocpError>> {
     let start = std::time::Instant::now();
-    let token = CompletionToken::user(
-        OpToken::from_registry_parts(user_data, generation)
-            .expect("test token should be encodable"),
-    );
+    let token = OpToken::from_registry_parts(user_data, generation)
+        .expect("test token should be encodable");
     loop {
         if start.elapsed() > timeout {
             return IocpError::CompletionWait
@@ -92,22 +89,11 @@ pub(crate) fn wait_completion_record(
         let completion_table = driver.completion_table();
         match completion_table.try_take_record(token) {
             PollRecordResult::Ready(record) => return Ok(record),
-            PollRecordResult::ReadyLost(anomaly) => {
+            PollRecordResult::Unavailable(anomaly) => {
                 return IocpError::CompletionWait
                     .with_ctx("completion_token", anomaly.token.raw())
                     .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason))
-                    .attach_note("lost completion record");
-            }
-            PollRecordResult::Stale(anomaly) => {
-                return IocpError::CompletionWait
-                    .with_ctx("completion_token", anomaly.token.raw())
-                    .attach_note("stale completion record (generation mismatch)");
-            }
-            PollRecordResult::Lost(anomaly) => {
-                return IocpError::CompletionWait
-                    .with_ctx("completion_token", anomaly.token.raw())
-                    .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason))
-                    .attach_note("lost completion record");
+                    .attach_note("completion record unavailable");
             }
             PollRecordResult::Pending => {}
         }

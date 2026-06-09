@@ -137,14 +137,15 @@ impl<'a> IocpDriver<'a> {
                 let mut guard = slot.complete();
                 let _ = guard.take_op();
                 let (payload, detail) = guard.take_completion_data();
-                let sidecar = CompletionSidecar {
+                let payload = payload.expect("checked IOCP offload payload should remain present");
+                let sidecar = CompletionSidecar::new(
                     token,
-                    res: iocp_fallback_event_res(IocpError::Submission),
-                    flags: 0,
+                    iocp_fallback_event_res(IocpError::Submission),
+                    0,
                     payload,
                     detail,
-                    cleanup: CompletionCleanupGuard::default(),
-                };
+                    CompletionCleanupGuard::default(),
+                );
                 push_completion_shared(
                     ctx.completion_table,
                     ctx.diagnostics,

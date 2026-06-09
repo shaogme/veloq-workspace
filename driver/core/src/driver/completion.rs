@@ -547,66 +547,72 @@ pub enum CancelAck {
     Untracked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionRecordKind {
-    User,
-    Lost(CompletionAnomaly),
-}
-
-impl Default for CompletionRecordKind {
-    #[inline]
-    fn default() -> Self {
-        Self::User
-    }
-}
-
 pub struct CompletionSidecar<UP, E, R = usize> {
     pub token: OpToken,
     pub res: i32,
     pub flags: u32,
-    pub payload: Option<UP>,
+    pub payload: UP,
     pub detail: Option<DriverResult<R, E>>,
     pub cleanup: CompletionCleanupGuard,
 }
 
 pub struct CompletionPacket<UP, E, R = usize> {
+    pub token: OpToken,
     pub event: CompletionEvent,
-    pub payload: Option<UP>,
+    pub input: CompletionInput<UP, E, R>,
+}
+
+pub struct UserCompletion<UP, E, R = usize> {
+    pub payload: UP,
     pub detail: Option<DriverResult<R, E>>,
     pub cleanup: CompletionCleanupGuard,
-    pub record_kind: CompletionRecordKind,
+}
+
+pub struct CompletionLoss {
+    pub anomaly: CompletionAnomaly,
+    pub cleanup: CompletionCleanupGuard,
+}
+
+pub enum CompletionInput<UP, E, R = usize> {
+    User(UserCompletion<UP, E, R>),
+    Lost(CompletionLoss),
+}
+
+impl<UP, E, R> CompletionInput<UP, E, R> {
+    #[inline]
+    pub fn cleanup_mut(&mut self) -> &mut CompletionCleanupGuard {
+        match self {
+            Self::User(completion) => &mut completion.cleanup,
+            Self::Lost(loss) => &mut loss.cleanup,
+        }
+    }
+
+    #[inline]
+    pub fn anomaly(&self) -> Option<&CompletionAnomaly> {
+        match self {
+            Self::User(_) => None,
+            Self::Lost(loss) => Some(&loss.anomaly),
+        }
+    }
 }
 
 impl<UP, E, R> CompletionPacket<UP, E, R> {
     #[inline]
-    pub fn new(
+    pub fn user_event(
+        token: OpToken,
         event: CompletionEvent,
-        payload: Option<UP>,
-        detail: Option<DriverResult<R, E>>,
-    ) -> Self {
-        Self::with_cleanup(
-            event,
-            payload,
-            detail,
-            CompletionCleanupGuard::default(),
-            CompletionRecordKind::User,
-        )
-    }
-
-    #[inline]
-    pub fn with_cleanup(
-        event: CompletionEvent,
-        payload: Option<UP>,
+        payload: UP,
         detail: Option<DriverResult<R, E>>,
         cleanup: CompletionCleanupGuard,
-        record_kind: CompletionRecordKind,
     ) -> Self {
         Self {
+            token,
             event,
-            payload,
-            detail,
-            cleanup,
-            record_kind,
+            input: CompletionInput::User(UserCompletion {
+                payload,
+                detail,
+                cleanup,
+            }),
         }
     }
 
@@ -615,7 +621,7 @@ impl<UP, E, R> CompletionPacket<UP, E, R> {
         token: OpToken,
         res: i32,
         flags: u32,
-        payload: Option<UP>,
+        payload: UP,
         detail: Option<DriverResult<R, E>>,
     ) -> Self {
         Self::user_with_cleanup(
@@ -633,11 +639,12 @@ impl<UP, E, R> CompletionPacket<UP, E, R> {
         token: OpToken,
         res: i32,
         flags: u32,
-        payload: Option<UP>,
+        payload: UP,
         detail: Option<DriverResult<R, E>>,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
-        Self::with_cleanup(
+        Self::user_event(
+            token,
             CompletionEvent {
                 token: CompletionToken::user(token),
                 res,
@@ -646,36 +653,53 @@ impl<UP, E, R> CompletionPacket<UP, E, R> {
             payload,
             detail,
             cleanup,
-            CompletionRecordKind::User,
         )
     }
 
     #[inline]
     pub fn lost(
+        token: OpToken,
         event: CompletionEvent,
         anomaly: CompletionAnomaly,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
-        Self::with_cleanup(
+        Self {
+            token,
             event,
-            None,
-            None,
-            cleanup,
-            CompletionRecordKind::Lost(anomaly),
-        )
+            input: CompletionInput::Lost(CompletionLoss { anomaly, cleanup }),
+        }
     }
 }
 
-impl<UP, E, R> From<CompletionSidecar<UP, E, R>> for CompletionPacket<UP, E, R> {
+impl<UP, E, R> CompletionSidecar<UP, E, R> {
     #[inline]
-    fn from(sidecar: CompletionSidecar<UP, E, R>) -> Self {
-        Self::user_with_cleanup(
-            sidecar.token,
-            sidecar.res,
-            sidecar.flags,
-            sidecar.payload,
-            sidecar.detail,
-            sidecar.cleanup,
+    pub fn new(
+        token: OpToken,
+        res: i32,
+        flags: u32,
+        payload: UP,
+        detail: Option<DriverResult<R, E>>,
+        cleanup: CompletionCleanupGuard,
+    ) -> Self {
+        Self {
+            token,
+            res,
+            flags,
+            payload,
+            detail,
+            cleanup,
+        }
+    }
+
+    #[inline]
+    pub fn into_packet(self) -> CompletionPacket<UP, E, R> {
+        CompletionPacket::user_with_cleanup(
+            self.token,
+            self.res,
+            self.flags,
+            self.payload,
+            self.detail,
+            self.cleanup,
         )
     }
 }
@@ -703,7 +727,6 @@ pub struct CompletionRecord<UP, E, R = usize> {
     pub payload: UP,
     pub detail: Option<DriverResult<R, E>>,
     pub cleanup: CompletionCleanupGuard,
-    pub record_kind: CompletionRecordKind,
 }
 
 impl<UP, E, R> CompletionRecord<UP, E, R> {
@@ -718,7 +741,7 @@ fn run_rejected_cleanup<UP, E, R>(
     diagnostics: &mut DriverCompletionDiagnostics,
     mut packet: CompletionPacket<UP, E, R>,
 ) {
-    run_completion_cleanup(diagnostics, &mut packet.cleanup);
+    run_completion_cleanup(diagnostics, packet.input.cleanup_mut());
     drop(packet);
 }
 
@@ -768,6 +791,7 @@ where
 pub fn record_lost_completion<UP, E, R>(
     table: &SharedCompletionTable<UP, E, R>,
     diagnostics: &mut DriverCompletionDiagnostics,
+    token: OpToken,
     event: CompletionEvent,
     anomaly: CompletionAnomaly,
     cleanup: CompletionCleanupGuard,
@@ -780,18 +804,13 @@ where
     record_user_completion(
         table,
         diagnostics,
-        CompletionPacket::lost(event, anomaly, cleanup),
+        CompletionPacket::lost(token, event, anomaly, cleanup),
     )
 }
 
 #[inline]
 pub fn discard_internal_completion(diagnostics: &mut DriverCompletionDiagnostics) {
     diagnostics.inc_internal_unknown();
-}
-
-#[inline]
-pub(crate) fn decode_completion_token(token: CompletionToken) -> Option<(usize, u32)> {
-    token.op_token().map(OpToken::parts)
 }
 
 #[inline]

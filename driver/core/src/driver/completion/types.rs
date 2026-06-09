@@ -150,6 +150,21 @@ impl DriverCompletionDiagnostics {
     }
 
     #[inline]
+    pub fn inc_cancel_observed_ok(&self) {
+        self.inc_cancel_ack_ok();
+    }
+
+    #[inline]
+    pub fn inc_cancel_observed_not_found(&self) {
+        self.inc_cancel_ack_not_found();
+    }
+
+    #[inline]
+    pub fn inc_cancel_observed_error(&self) {
+        self.inc_cancel_ack_error();
+    }
+
+    #[inline]
     pub fn inc_waker_ok(&self) {
         Self::inc(&self.inner.waker_ok);
     }

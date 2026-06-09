@@ -196,7 +196,7 @@ pub trait Driver {
 
     fn register_completion_waker(
         &mut self,
-        token: CompletionToken,
+        token: OpToken,
         waker: &Waker,
     ) -> CompletionMutationOutcome {
         self.completion_table().register_waker(token, waker)

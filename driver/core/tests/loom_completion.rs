@@ -19,7 +19,7 @@ impl SlotSpec for DummySlotSpec {
     type Completion = usize;
 }
 
-fn active_table() -> (SharedCompletionTable<(), ()>, CompletionToken) {
+fn active_table() -> (SharedCompletionTable<(), ()>, OpToken) {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
     let handle = registry.alloc(()).expect("slot allocation failed").handle;
     let token = OpToken::from_registry_parts(handle.index, handle.generation)
@@ -40,7 +40,7 @@ fn active_table() -> (SharedCompletionTable<(), ()>, CompletionToken) {
         .expect("reserved slot should start submission")
         .persist();
     let table: SharedCompletionTable<(), ()> = registry.shared.clone();
-    (table, CompletionToken::user(token))
+    (table, token)
 }
 
 #[test]
@@ -51,15 +51,7 @@ fn test_completion_table_loom() {
         let table_cloned = table.clone();
         let producer = thread::spawn(move || {
             // Mock driver producing a completion
-            table_cloned.record_completion(CompletionPacket::new(
-                CompletionEvent {
-                    token,
-                    res: 0,
-                    flags: 0,
-                },
-                Some(()),
-                None,
-            ));
+            table_cloned.record_completion(CompletionPacket::user(token, 0, 0, (), None));
         });
 
         let table_cloned2 = table.clone();
@@ -67,11 +59,12 @@ fn test_completion_table_loom() {
             // Mock consumer: mark waiting, then either poll or drop
             table_cloned2.mark_waiting(token);
             match table_cloned2.try_take_record(token) {
-                PollRecordResult::Ready(record) => assert_eq!(record.event.token, token),
-                PollRecordResult::ReadyLost(_) => table_cloned2.mark_orphaned(token),
-                PollRecordResult::Pending
-                | PollRecordResult::Stale(_)
-                | PollRecordResult::Lost(_) => table_cloned2.mark_orphaned(token),
+                PollRecordResult::Ready(record) => {
+                    assert_eq!(record.event.token, CompletionToken::user(token))
+                }
+                PollRecordResult::Pending | PollRecordResult::Unavailable(_) => {
+                    table_cloned2.mark_orphaned(token);
+                }
             }
         });
 
@@ -87,15 +80,7 @@ fn test_detached_drop_race_loom() {
 
         let table_cloned = table.clone();
         let producer = thread::spawn(move || {
-            table_cloned.record_completion(CompletionPacket::new(
-                CompletionEvent {
-                    token,
-                    res: 42,
-                    flags: 0,
-                },
-                Some(()),
-                None,
-            ));
+            table_cloned.record_completion(CompletionPacket::user(token, 42, 0, (), None));
         });
 
         let table_cloned2 = table.clone();
@@ -118,30 +103,18 @@ fn test_fast_completion_then_waiting_take_loom() {
     loom::model(|| {
         let (table, token) = active_table();
 
-        table.record_completion(CompletionPacket::new(
-            CompletionEvent {
-                token,
-                res: 7,
-                flags: 0,
-            },
-            Some(()),
-            None,
-        ));
+        table.record_completion(CompletionPacket::user(token, 7, 0, (), None));
 
         table.mark_waiting(token);
         match table.try_take_record(token) {
             PollRecordResult::Ready(record) => {
-                assert_eq!(record.event.token, token);
+                assert_eq!(record.event.token, CompletionToken::user(token));
                 assert_eq!(record.event.res, 7);
             }
-            PollRecordResult::ReadyLost(anomaly) => {
-                panic!("unexpected lost completion: {anomaly:?}")
-            }
             PollRecordResult::Pending => panic!("expected ready after fast completion"),
-            PollRecordResult::Stale(anomaly) => {
-                panic!("unexpected stale in same generation: {anomaly:?}")
+            PollRecordResult::Unavailable(anomaly) => {
+                panic!("unexpected unavailable completion: {anomaly:?}")
             }
-            PollRecordResult::Lost(anomaly) => panic!("unexpected lost completion: {anomaly:?}"),
         }
 
         assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
@@ -153,25 +126,17 @@ fn test_stale_after_generation_advance_loom() {
     loom::model(|| {
         let (table, token_g1) = active_table();
 
-        table.record_completion(CompletionPacket::new(
-            CompletionEvent {
-                token: token_g1,
-                res: 1,
-                flags: 0,
-            },
-            Some(()),
-            None,
-        ));
+        table.record_completion(CompletionPacket::user(token_g1, 1, 0, (), None));
         table.mark_waiting(token_g1);
         let _ = table.try_take_record(token_g1);
 
         match table.try_take_record(token_g1) {
-            PollRecordResult::Stale(_) => {}
+            PollRecordResult::Unavailable(anomaly)
+                if anomaly.reason == CompletionAnomalyReason::StaleGeneration => {}
             PollRecordResult::Ready(_) => panic!("old generation must not become ready"),
-            PollRecordResult::ReadyLost(_) => panic!("old generation must not become ready"),
             PollRecordResult::Pending => panic!("old generation must be stale"),
-            PollRecordResult::Lost(anomaly) => {
-                panic!("old generation should be stale: {anomaly:?}")
+            PollRecordResult::Unavailable(anomaly) => {
+                panic!("old generation should be stale, got {anomaly:?}")
             }
         }
     });
@@ -182,15 +147,7 @@ fn test_ready_race_with_mark_orphaned_loom() {
     loom::model(|| {
         let (table, token) = active_table();
 
-        table.record_completion(CompletionPacket::new(
-            CompletionEvent {
-                token,
-                res: 3,
-                flags: 0,
-            },
-            Some(()),
-            None,
-        ));
+        table.record_completion(CompletionPacket::user(token, 3, 0, (), None));
 
         let t1 = table.clone();
         let consumer_take = thread::spawn(move || {
@@ -217,15 +174,7 @@ fn test_two_consumers_at_most_one_ready_loom() {
         let (table, token) = active_table();
         let ready_count = Arc::new(AtomicUsize::new(0));
 
-        table.record_completion(CompletionPacket::new(
-            CompletionEvent {
-                token,
-                res: 9,
-                flags: 0,
-            },
-            Some(()),
-            None,
-        ));
+        table.record_completion(CompletionPacket::user(token, 9, 0, (), None));
 
         let c1_table = table.clone();
         let c1_ready = ready_count.clone();

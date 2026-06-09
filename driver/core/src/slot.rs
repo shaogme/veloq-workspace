@@ -477,7 +477,7 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
 #[cfg(not(feature = "loom"))]
 mod tests {
     use super::*;
-    use crate::driver::{CompletionAccess, CompletionEvent, CompletionToken, PlatformOp};
+    use crate::driver::{CompletionAccess, CompletionToken, PlatformOp};
 
     struct DummyPlatformOp;
 
@@ -522,31 +522,17 @@ mod tests {
 
         registry
             .shared
-            .record_completion(crate::driver::CompletionPacket::new(
-                CompletionEvent {
-                    token: completion_token,
-                    res: 0,
-                    flags: 0,
-                },
-                Some(()),
-                None,
-            ));
+            .record_completion(crate::driver::CompletionPacket::user(token, 0, 0, (), None));
 
         assert!(matches!(
             registry.checked_slot_view(token),
             CheckedSlotView::Empty(_)
         ));
-        let record = match registry.shared.try_take_record(completion_token) {
+        let record = match registry.shared.try_take_record(token) {
             crate::driver::PollRecordResult::Ready(record) => record,
-            crate::driver::PollRecordResult::ReadyLost(anomaly) => {
-                panic!("completion should not be lost: {anomaly:?}")
-            }
             crate::driver::PollRecordResult::Pending => panic!("completion should be ready"),
-            crate::driver::PollRecordResult::Stale(anomaly) => {
-                panic!("completion should not be stale: {anomaly:?}")
-            }
-            crate::driver::PollRecordResult::Lost(anomaly) => {
-                panic!("completion should not be lost: {anomaly:?}")
+            crate::driver::PollRecordResult::Unavailable(anomaly) => {
+                panic!("completion should be available: {anomaly:?}")
             }
         };
         assert_eq!(record.event.token, completion_token);

@@ -1,6 +1,6 @@
 use super::{SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
 use crate::DriverResult;
-use crate::driver::{CompletionCleanupGuard, CompletionRecordKind};
+use crate::driver::{CompletionAnomaly, CompletionCleanupGuard};
 use bilge::prelude::*;
 use std::marker::PhantomData;
 use veloq_atomic_waker::AtomicWaker;
@@ -143,23 +143,19 @@ pub struct SlotData<Spec: SlotSpec> {
     marker: SlotMarker<Spec>,
 }
 
-#[derive(Debug)]
-pub(crate) struct CompletionData<UP, E, R = usize> {
-    pub payload: Option<UP>,
-    pub detail: Option<DriverResult<R, E>>,
-    pub cleanup: CompletionCleanupGuard,
-    pub record_kind: CompletionRecordKind,
-}
-
-impl<UP, E, R> Default for CompletionData<UP, E, R> {
-    fn default() -> Self {
-        Self {
-            payload: None,
-            detail: None,
-            cleanup: CompletionCleanupGuard::default(),
-            record_kind: CompletionRecordKind::User,
-        }
-    }
+#[derive(Debug, Default)]
+pub(crate) enum CompletionData<UP, E, R = usize> {
+    #[default]
+    Empty,
+    User {
+        payload: UP,
+        detail: Option<DriverResult<R, E>>,
+        cleanup: CompletionCleanupGuard,
+    },
+    Lost {
+        anomaly: CompletionAnomaly,
+        cleanup: CompletionCleanupGuard,
+    },
 }
 
 impl<Spec: SlotSpec> SlotData<Spec> {
@@ -248,29 +244,17 @@ impl<Spec: SlotSpec> SlotData<Spec> {
     pub(crate) fn completion_with_record_data<F, X>(&self, f: F) -> X
     where
         F: FnOnce(
-            &mut Option<SlotPayload<Spec>>,
-            &mut Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
-            &mut CompletionCleanupGuard,
-            &mut CompletionRecordKind,
+            &mut CompletionData<SlotPayload<Spec>, SlotError<Spec>, SlotCompletion<Spec>>,
         ) -> X,
     {
         let mut data = self.completion_data.lock();
-        let CompletionData {
-            payload,
-            detail,
-            cleanup,
-            record_kind,
-        } = &mut *data;
-        f(payload, detail, cleanup, record_kind)
+        f(&mut *data)
     }
 
     #[inline]
     pub(crate) fn clear_completion_record_data(&self) {
-        self.completion_with_record_data(|payload, detail, cleanup, record_kind| {
-            let _ = payload.take();
-            let _ = detail.take();
-            *cleanup = CompletionCleanupGuard::default();
-            *record_kind = CompletionRecordKind::User;
+        self.completion_with_record_data(|record| {
+            *record = CompletionData::Empty;
         });
     }
 }

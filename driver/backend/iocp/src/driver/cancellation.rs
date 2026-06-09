@@ -143,10 +143,11 @@ impl<'a> IocpDriver<'a> {
         match status {
             Ok(CancelPerformStatus::Submitted) | Ok(CancelPerformStatus::RioRequested) => {
                 self.completion_diagnostics.inc_cancel_submitted();
+                self.completion_diagnostics.inc_cancel_observed_ok();
                 Ok(CancelSubmitOutcome::Submitted)
             }
             Ok(CancelPerformStatus::NotFound) => {
-                self.completion_diagnostics.inc_cancel_ack_not_found();
+                self.completion_diagnostics.inc_cancel_observed_not_found();
                 debug!("CancelIoEx target was already complete or absent");
                 Ok(CancelSubmitOutcome::TargetMissing)
             }
@@ -154,7 +155,7 @@ impl<'a> IocpDriver<'a> {
                 Ok(CancelSubmitOutcome::NoBackendHandle)
             }
             Err(report) => {
-                self.completion_diagnostics.inc_cancel_ack_error();
+                self.completion_diagnostics.inc_cancel_observed_error();
                 warn!(report = ?report, "CancelIoEx failed");
                 Err(report)
             }
@@ -316,17 +317,18 @@ impl<'a> IocpDriver<'a> {
         };
 
         let outcome = if emit_completion {
+            let payload = payload.expect("aborted IOCP slot payload should remain present");
             Some(push_completion_shared(
                 ctx.completion_table,
                 diagnostics,
-                completion_record(CompletionSidecar {
+                completion_record(CompletionSidecar::new(
                     token,
-                    res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                    flags: 0,
+                    -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                    0,
                     payload,
                     detail,
                     cleanup,
-                }),
+                )),
             ))
         } else {
             drop(payload);

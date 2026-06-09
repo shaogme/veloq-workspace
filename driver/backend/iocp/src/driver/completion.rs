@@ -154,14 +154,16 @@ impl<'a> IocpDriver<'a> {
                     .unwrap_or_default();
                 let _ = guard.take_op();
                 let (payload_erased, detail) = guard.take_completion_data();
-                pending_events.push(CompletionSidecar {
+                let payload_erased =
+                    payload_erased.expect("checked IOCP timer payload should remain present");
+                pending_events.push(CompletionSidecar::new(
                     token,
-                    res: 0,
-                    flags: 0,
-                    payload: payload_erased,
+                    0,
+                    0,
+                    payload_erased,
                     detail,
                     cleanup,
-                });
+                ));
                 Some(TimerFinish::WaitingCompleted)
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
@@ -381,14 +383,15 @@ impl<'a> IocpDriver<'a> {
                     op.unbind_user_payload();
                 }
                 let (payload, detail) = guard.take_completion_data();
-                sidecar_to_push = Some(CompletionSidecar {
+                let payload = payload.expect("checked IOCP slot payload should remain present");
+                sidecar_to_push = Some(CompletionSidecar::new(
                     token,
-                    res: completion_res,
-                    flags: 0,
+                    completion_res,
+                    0,
                     payload,
-                    detail: detail.or_else(|| io_detail.take()),
+                    detail.or_else(|| io_detail.take()),
                     cleanup,
-                });
+                ));
                 let _ = guard.take_op();
                 let _data = std::mem::take(guard.platform_mut());
             }
@@ -467,6 +470,7 @@ impl<'a> IocpDriver<'a> {
         let _ = record_lost_completion(
             self.completion.table(),
             &mut self.completion_diagnostics,
+            token,
             event,
             anomaly,
             cleanup,

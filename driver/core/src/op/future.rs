@@ -218,7 +218,6 @@ where
         payload: payload_erased,
         detail,
         mut cleanup,
-        record_kind: _,
     } = record;
     let payload = match T::try_payload_from_erased(payload_erased) {
         Ok(payload) => payload,
@@ -236,7 +235,7 @@ where
 #[inline]
 pub(crate) fn poll_completion_table_once<T, O, UP, E, C>(
     table: &dyn crate::driver::CompletionAccess<UP, E, C>,
-    token: CompletionToken,
+    token: OpToken,
 ) -> Poll<OpResult<T::Output, E, T::Completion>>
 where
     UP: Send,
@@ -247,17 +246,7 @@ where
 {
     match table.try_take_record(token) {
         PollRecordResult::Ready(record) => completion_record_to_result::<T, O, UP, E, C>(record),
-        PollRecordResult::ReadyLost(anomaly) => {
-            Poll::Ready(OpResult::<T::Output, E, T::Completion>::ResourceLost(
-                completion_anomaly_error(anomaly),
-            ))
-        }
-        PollRecordResult::Stale(anomaly) => {
-            Poll::Ready(OpResult::<T::Output, E, T::Completion>::ResourceLost(
-                completion_anomaly_error(anomaly),
-            ))
-        }
-        PollRecordResult::Lost(anomaly) => {
+        PollRecordResult::Unavailable(anomaly) => {
             Poll::Ready(OpResult::<T::Output, E, T::Completion>::ResourceLost(
                 completion_anomaly_error(anomaly),
             ))
@@ -304,7 +293,7 @@ where
     fn drop(&mut self) {
         if let Some(token) = self.token {
             if let Some(table) = self.completion_table.as_ref() {
-                table.mark_orphaned(CompletionToken::user(token));
+                table.mark_orphaned(token);
             }
             if let Some(cancel_sender) = self.cancel_sender.as_ref() {
                 let _ = cancel_sender.send(CancelRequest::abandon(token));
@@ -345,15 +334,14 @@ where
         let token = this
             .token
             .expect("DetachedOp missing completion token but no immediate_failure");
-        let completion_token = CompletionToken::user(token);
         if let Poll::Ready(result) =
-            poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, completion_token)
+            poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, token)
         {
             return Poll::Ready(result);
         }
 
-        table.register_waker(completion_token, cx.waker());
-        poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, completion_token)
+        table.register_waker(token, cx.waker());
+        poll_completion_table_once::<T, O, T::ErasedPayload, E, C>(&**table, token)
     }
 }
 
@@ -468,13 +456,12 @@ where
                 }
                 Ok((token, result, fallback_payload)) => {
                     op.token = Some(token);
-                    let completion_token = CompletionToken::user(token);
                     match result {
                         DriverSubmitResult::Submitted(_) => {
                             op.state = LocalState::Submitted;
                             trace!(
                                 op = %std::any::type_name::<T>(),
-                                token = completion_token.raw(),
+                                token = CompletionToken::user(token).raw(),
                                 "LocalOp::poll: submitted"
                             );
                         }
@@ -509,7 +496,7 @@ where
                                 op.state = LocalState::Submitted;
                                 trace!(
                                     op = %std::any::type_name::<T>(),
-                                    token = completion_token.raw(),
+                                    token = CompletionToken::user(token).raw(),
                                     status = ?status,
                                     "LocalOp::poll: submitted in flight"
                                 );
@@ -524,7 +511,6 @@ where
             let token = op
                 .token
                 .expect("LocalOp submitted state missing completion token");
-            let completion_token = CompletionToken::user(token);
             let res =
                 op.provider.with_driver(|mut driver| {
                     let mut is_ready = false;
@@ -532,23 +518,22 @@ where
 
                     match poll_completion_table_once::<T, P::Op, P::UP, P::Error, P::Completion>(
                         &*driver.completion_table(),
-                        completion_token,
+                        token,
                     ) {
                         Poll::Ready(result) => {
                             is_ready = true;
                             ready_val = Some(result);
                         }
                         Poll::Pending => {
-                            driver.register_completion_waker(completion_token, cx.waker());
+                            driver.register_completion_waker(token, cx.waker());
                             match poll_completion_table_once::<
                                 T,
                                 P::Op,
                                 P::UP,
                                 P::Error,
                                 P::Completion,
-                            >(
-                                &*driver.completion_table(), completion_token
-                            ) {
+                            >(&*driver.completion_table(), token)
+                            {
                                 Poll::Ready(result) => {
                                     is_ready = true;
                                     ready_val = Some(result);
@@ -564,14 +549,14 @@ where
                 op.state = LocalState::Completed;
                 trace!(
                     op = %std::any::type_name::<T>(),
-                    token = completion_token.raw(),
+                    token = CompletionToken::user(token).raw(),
                     "LocalOp::poll: completion ready"
                 );
                 Poll::Ready(res.1.unwrap())
             } else {
                 trace!(
                     op = %std::any::type_name::<T>(),
-                    token = completion_token.raw(),
+                    token = CompletionToken::user(token).raw(),
                     "LocalOp::poll: completion pending"
                 );
                 Poll::Pending
@@ -597,9 +582,7 @@ where
             && let Some(token) = self.token
         {
             self.provider.with_driver(|mut driver| {
-                driver
-                    .completion_table()
-                    .mark_orphaned(CompletionToken::user(token));
+                driver.completion_table().mark_orphaned(token);
                 let _ = driver.cancel_op(CancelRequest::abandon(token));
             });
         }

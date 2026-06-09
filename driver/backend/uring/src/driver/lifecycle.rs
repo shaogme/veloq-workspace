@@ -126,14 +126,16 @@ impl<'a> UringDriver<'a> {
                     };
                     let _ = completed.take_op();
                     let (payload, detail) = completed.take_completion_data();
-                    let sidecar = CompletionSidecar::<UringUserPayload, UringError> {
+                    let payload =
+                        payload.expect("checked timer slot payload should remain present");
+                    let sidecar = CompletionSidecar::<UringUserPayload, UringError>::new(
                         token,
-                        res: -libc::ECANCELED,
-                        flags: 0,
+                        -libc::ECANCELED,
+                        0,
                         payload,
                         detail,
-                        cleanup: CompletionCleanupGuard::default(),
-                    };
+                        CompletionCleanupGuard::default(),
+                    );
                     self.wheel.cancel(tid);
                     if request.mode == CancelMode::UserVisible {
                         self.push_completion_event(sidecar);
@@ -420,14 +422,15 @@ impl<'a> UringDriver<'a> {
             let mut completed = slot.complete();
             let _ = completed.take_op();
             let (payload, detail) = completed.take_completion_data();
-            let sidecar = CompletionSidecar::<UringUserPayload, UringError> {
+            let payload = payload.expect("checked queued slot payload should remain present");
+            let sidecar = CompletionSidecar::<UringUserPayload, UringError>::new(
                 token,
-                res: event_res,
-                flags: 0,
+                event_res,
+                0,
                 payload,
-                detail: detail.or(Some(Err(report))),
-                cleanup: CompletionCleanupGuard::default(),
-            };
+                detail.or(Some(Err(report))),
+                CompletionCleanupGuard::default(),
+            );
             self.push_completion_event(sidecar);
             self.finalize_waiting_completion_checked(
                 token,
@@ -451,16 +454,17 @@ fn cancel_slot_immediate<'a, S: SlotState>(
          payload: &mut Option<UringUserPayload>,
          _sidecar| (payload.take(), result.take()),
     );
+    let payload = payload.expect("cancelled slot payload should remain present");
     let _ = slot.op.take();
 
-    CompletionSidecar::<UringUserPayload, UringError> {
+    CompletionSidecar::<UringUserPayload, UringError>::new(
         token,
-        res: -libc::ECANCELED,
-        flags: 0,
+        -libc::ECANCELED,
+        0,
         payload,
         detail,
         cleanup,
-    }
+    )
 }
 
 fn slot_has_op<'a, S: SlotState>(slot: Slot<'a, S>) -> bool {

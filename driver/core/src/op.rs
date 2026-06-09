@@ -1,6 +1,6 @@
 use tracing::trace;
 
-use crate::driver::{CompletionToken, Driver, DriverSubmitResult, PlatformOp, SubmitStatus};
+use crate::driver::{Driver, DriverSubmitResult, PlatformOp, SubmitStatus};
 use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
 use diagweave::prelude::*;
 
@@ -129,7 +129,7 @@ impl<T> Op<T> {
                 match slot.submit(&mut op_platform) {
                     DriverSubmitResult::Submitted(_) => {
                         let token = slot.persist().token();
-                        completion_table.mark_waiting(CompletionToken::user(token));
+                        completion_table.mark_waiting(token);
                         DetachedOp {
                             completion_table: Some(completion_table),
                             cancel_sender: Some(cancel_sender),
@@ -198,7 +198,7 @@ impl<T> Op<T> {
                             }
                             SubmitStatus::InFlight => {
                                 let token = slot.persist().token();
-                                completion_table.mark_waiting(CompletionToken::user(token));
+                                completion_table.mark_waiting(token);
                                 DetachedOp {
                                     completion_table: Some(completion_table),
                                     cancel_sender: Some(cancel_sender),

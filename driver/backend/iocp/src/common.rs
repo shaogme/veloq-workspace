@@ -75,7 +75,7 @@ pub(crate) fn io_result_to_event_res(res: &IocpResult<usize>) -> i32 {
 pub(crate) fn completion_record(
     sidecar: CompletionSidecar<IocpUserPayload, IocpError>,
 ) -> CompletionPacket<IocpUserPayload, IocpError> {
-    CompletionPacket::from(sidecar)
+    sidecar.into_packet()
 }
 
 #[inline]

@@ -21,10 +21,10 @@ use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionEvent, CompletionPacket, CompletionToken,
-    DriverCompletionDiagnostics, RawCompletion, RoutedSlotCompletion, SharedCompletionTable,
-    record_completion_anomaly, record_lost_completion, route_user_completion,
-    run_completion_cleanup,
+    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionEvent,
+    CompletionPacket, CompletionToken, DriverCompletionDiagnostics, RawCompletion,
+    RoutedSlotCompletion, SharedCompletionTable, record_completion_anomaly, record_lost_completion,
+    route_user_completion, run_completion_cleanup,
 };
 use veloq_driver_core::slot::SlotRegistryExt;
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -127,6 +127,7 @@ impl<'a> RioCompletionRouter<'a> {
                     let _ = record_lost_completion(
                         self.comp.table,
                         self.comp.diagnostics,
+                        op_token,
                         raw.event(),
                         anomaly,
                         cleanup,
@@ -192,6 +193,8 @@ impl<'a> RioCompletionRouter<'a> {
                         let mut guard = slot.complete();
                         let _ = guard.take_op();
                         let (payload, detail) = guard.take_completion_data();
+                        let payload =
+                            payload.expect("checked RIO slot payload should remain present");
                         let event = CompletionEvent {
                             token: completion_token,
                             res: res_code,
@@ -201,7 +204,13 @@ impl<'a> RioCompletionRouter<'a> {
                         let outcome = push_completion_shared(
                             self.comp.table,
                             self.comp.diagnostics,
-                            CompletionPacket::new(event, payload, detail.or(Some(completion))),
+                            CompletionPacket::user_event(
+                                op_token,
+                                event,
+                                payload,
+                                detail.or(Some(completion)),
+                                CompletionCleanupGuard::default(),
+                            ),
                         );
                         let _ = outcome;
                     }
@@ -315,6 +324,7 @@ impl<'a> RioCompletionRouter<'a> {
                     let _ = record_lost_completion(
                         self.comp.table,
                         self.comp.diagnostics,
+                        op_token,
                         event,
                         anomaly,
                         cleanup,
