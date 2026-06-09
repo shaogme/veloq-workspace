@@ -4,7 +4,7 @@ use diagweave::prelude::*;
 use tracing::{debug, error};
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanupGuard,
-    CompletionToken, DriverCompletionDiagnostics, OpToken, RawCompletion, RecordCompletionOutcome,
+    CompletionToken, OpToken, RawCompletion, RecordCompletionOutcome,
     RoutedSlotCompletion, UserCompletionEvent, record_completion_anomaly, record_lost_completion,
     route_user_completion, run_completion_cleanup, slot_view_anomaly,
 };
@@ -12,7 +12,7 @@ use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt,
 
 use crate::common::{completion_record, io_result_to_event_res, push_completion_shared};
 use crate::driver::polling::CompletionProgress;
-use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
+use crate::driver::{CompletionSidecar, IocpDriver, IocpDriverCompletionDiagnostics, IocpOpRegistry};
 use crate::error::{IocpError, IocpResult};
 use crate::op::{IocpOp, IocpUserPayload, Slot};
 use crate::rio::SocketInflightToken;
@@ -145,7 +145,7 @@ impl<'a> IocpDriver<'a> {
     fn finish_timer_op(
         ctx: EmitContext<'_>,
         ops: &mut IocpOpRegistry,
-        diagnostics: &mut DriverCompletionDiagnostics,
+        diagnostics: &mut IocpDriverCompletionDiagnostics,
         token: OpToken,
         pending_events: &mut Vec<CompletionSidecar>,
     ) -> Option<TimerFinish> {
@@ -387,7 +387,7 @@ impl<'a> IocpDriver<'a> {
 
     pub(super) fn emit_event_from_slot(
         ctx: EmitContext<'_>,
-        diagnostics: &mut DriverCompletionDiagnostics,
+        diagnostics: &mut IocpDriverCompletionDiagnostics,
         token: OpToken,
         guard: Slot<'_, InFlightWaiting>,
         io_result: IocpResult<usize>,

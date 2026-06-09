@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use tracing::trace;
 
+use crate::diagnostics::IocpCompletionDiagnostics;
 use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::OpEntry;
 use veloq_driver_core::driver::{
@@ -29,6 +30,8 @@ use crate::error::IocpError;
 use crate::op::{IocpOp, IocpOpPayload, IocpOpRegistry, IocpSlotSpec, IocpUserPayload};
 
 pub(crate) type IocpDriverResult<T> = CoreDriverResult<T, IocpError>;
+pub(crate) type IocpDriverCompletionDiagnostics =
+    DriverCompletionDiagnostics<IocpCompletionDiagnostics>;
 pub use crate::op::IocpOpState;
 
 // ============================================================================
@@ -44,7 +47,7 @@ pub struct IocpDriver<'a> {
     handles: registration::HandleRegistry,
     remote_cancel_sender: RemoteCancelSender,
     remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
-    completion_diagnostics: DriverCompletionDiagnostics,
+    completion_diagnostics: IocpDriverCompletionDiagnostics,
 
     // RIO Support (required)
     rio: lifecycle::IocpRioRuntime<'a>,
@@ -296,9 +299,4 @@ impl veloq_driver_core::driver::test_hooks::DriverTestHooks for IocpDriver<'_> {
             .chunk_register_attempts
     }
 
-    fn debug_completion_diagnostics(
-        &self,
-    ) -> veloq_driver_core::driver::DriverCompletionDiagnosticsSnapshot {
-        self.completion_diagnostics.snapshot()
-    }
 }

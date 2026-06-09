@@ -13,7 +13,8 @@ pub use table::{
 pub use types::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanup,
     CompletionCleanupGuard, CompletionMutationOutcome, DriverCompletionDiagnostics,
-    DriverCompletionDiagnosticsSnapshot, RecordCompletionOutcome, RecordCompletionResult,
+    DriverCompletionDiagnosticsBackend, DriverCompletionDiagnosticsSnapshot,
+    RecordCompletionOutcome, RecordCompletionResult,
 };
 
 pub trait CompletionValue: Send {
@@ -848,8 +849,8 @@ impl<UP, E, R> CompletionRecord<UP, E, R> {
 }
 
 #[inline]
-fn run_rejected_cleanup<UP, E, R>(
-    diagnostics: &DriverCompletionDiagnostics,
+fn run_rejected_cleanup<B, UP, E, R>(
+    diagnostics: &DriverCompletionDiagnostics<B>,
     mut packet: CompletionPacket<UP, E, R>,
 ) {
     run_completion_cleanup(diagnostics, packet.input.cleanup_mut());
@@ -857,8 +858,8 @@ fn run_rejected_cleanup<UP, E, R>(
 }
 
 #[inline]
-pub fn run_completion_cleanup(
-    diagnostics: &DriverCompletionDiagnostics,
+pub fn run_completion_cleanup<B>(
+    diagnostics: &DriverCompletionDiagnostics<B>,
     cleanup: &mut CompletionCleanupGuard,
 ) -> bool {
     match cleanup.run() {
@@ -871,17 +872,19 @@ pub fn run_completion_cleanup(
 }
 
 #[inline]
-pub fn record_completion_anomaly(
-    diagnostics: &DriverCompletionDiagnostics,
+pub fn record_completion_anomaly<B>(
+    diagnostics: &DriverCompletionDiagnostics<B>,
     anomaly: &CompletionAnomaly,
-) {
+) where
+    B: DriverCompletionDiagnosticsBackend,
+{
     diagnostics.record_anomaly(anomaly);
 }
 
 #[inline]
-pub fn record_user_completion<UP, E, R>(
+pub fn record_user_completion<B, UP, E, R>(
     table: &SharedCompletionTable<UP, E, R>,
-    diagnostics: &DriverCompletionDiagnostics,
+    diagnostics: &DriverCompletionDiagnostics<B>,
     packet: CompletionPacket<UP, E, R>,
 ) -> RecordCompletionOutcome
 where
@@ -899,9 +902,9 @@ where
 }
 
 #[inline]
-pub fn record_lost_completion<UP, E, R>(
+pub fn record_lost_completion<B, UP, E, R>(
     table: &SharedCompletionTable<UP, E, R>,
-    diagnostics: &DriverCompletionDiagnostics,
+    diagnostics: &DriverCompletionDiagnostics<B>,
     event: UserCompletionEvent,
     anomaly: CompletionAnomaly,
     cleanup: CompletionCleanupGuard,
@@ -919,7 +922,7 @@ where
 }
 
 #[inline]
-pub fn discard_internal_completion(diagnostics: &DriverCompletionDiagnostics) {
+pub fn discard_internal_completion<B>(diagnostics: &DriverCompletionDiagnostics<B>) {
     diagnostics.inc_internal_unknown();
 }
 

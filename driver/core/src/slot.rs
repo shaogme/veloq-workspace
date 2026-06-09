@@ -12,6 +12,7 @@ pub trait SlotSpec {
     type Sidecar: SlotSidecar;
     type Error;
     type Completion;
+    type CompletionDiagnostics: crate::driver::DriverCompletionDiagnosticsBackend;
 }
 
 pub type SlotOp<Spec> = <Spec as SlotSpec>::Op;
@@ -20,6 +21,7 @@ pub type SlotPlatformData<Spec> = <Spec as SlotSpec>::PlatformData;
 pub type SlotSidecarData<Spec> = <Spec as SlotSpec>::Sidecar;
 pub type SlotError<Spec> = <Spec as SlotSpec>::Error;
 pub type SlotCompletion<Spec> = <Spec as SlotSpec>::Completion;
+pub type SlotCompletionDiagnostics<Spec> = <Spec as SlotSpec>::CompletionDiagnostics;
 pub type SlotCompletionData<Spec> = (
     Option<SlotPayload<Spec>>,
     Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
@@ -512,6 +514,7 @@ mod tests {
         type Sidecar = ();
         type Error = ();
         type Completion = usize;
+        type CompletionDiagnostics = ();
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod common;
 mod config;
+mod diagnostics;
 mod driver;
 mod error;
 mod ext;
@@ -15,6 +16,9 @@ mod tests;
 pub use config::{
     BorrowedRawHandle, BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, OwnedRawHandle,
     RawHandle, RawHandleKind, RegisteredHandle, SocketKey,
+};
+pub use diagnostics::{
+    IocpCompletionDiagnostics, IocpCompletionDiagnosticsSnapshot, RioCompletionDiagnosticsSnapshot,
 };
 pub use driver::{CloseMode, IocpDriver, IocpOpState};
 pub use error::{IocpError, IocpResult};

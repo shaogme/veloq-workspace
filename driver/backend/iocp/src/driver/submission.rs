@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use veloq_blocking::BlockingTask;
 use veloq_driver_core::driver::{
-    CompletionBackend, CompletionCleanupGuard, CompletionToken, DriverCompletionDiagnostics,
-    DriverSubmitResult, OpToken, RawCompletion, SharedCompletionTable, SubmitStatus,
-    UserCompletionEvent, record_lost_completion,
+    CompletionBackend, CompletionCleanupGuard, CompletionToken, DriverSubmitResult, OpToken,
+    RawCompletion, SharedCompletionTable, SubmitStatus, UserCompletionEvent,
+    record_lost_completion,
 };
 use veloq_driver_core::slot::{
     CheckedSlotView, Reserved, SlotAccessError, SlotRegistryExt, SlotView,
@@ -15,7 +15,10 @@ use veloq_driver_core::slot::{
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::config::IoFd;
-use crate::driver::{CompletionSidecar, IocpDriver, IocpDriverResult, IocpOpRegistry};
+use crate::driver::{
+    CompletionSidecar, IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult,
+    IocpOpRegistry,
+};
 use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
 use crate::op::{
     BlockingCompletion, IocpOp, IocpOpPayload, IocpUserPayload, Slot, SubmissionResult,
@@ -26,7 +29,7 @@ pub(crate) struct SubmitContextInternal<'a> {
     port: Arc<crate::win32::IoCompletionPort>,
     wheel: &'a mut veloq_wheel::Wheel<OpToken>,
     completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
-    diagnostics: &'a mut DriverCompletionDiagnostics,
+    diagnostics: &'a mut IocpDriverCompletionDiagnostics,
 }
 
 impl<'a> SubmitContextInternal<'a> {
@@ -34,7 +37,7 @@ impl<'a> SubmitContextInternal<'a> {
         port: Arc<crate::win32::IoCompletionPort>,
         wheel: &'a mut veloq_wheel::Wheel<OpToken>,
         completion_table: &'a SharedCompletionTable<IocpUserPayload, IocpError>,
-        diagnostics: &'a mut DriverCompletionDiagnostics,
+        diagnostics: &'a mut IocpDriverCompletionDiagnostics,
     ) -> Self {
         Self {
             port,

@@ -63,20 +63,26 @@ pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
 
 #[inline]
-fn recorded_completion<UP, E, R>(
-    diagnostics: &super::DriverCompletionDiagnostics,
+fn recorded_completion<B, UP, E, R>(
+    diagnostics: &super::DriverCompletionDiagnostics<B>,
     outcome: RecordCompletionOutcome,
-) -> RecordCompletionResult<UP, E, R> {
+) -> RecordCompletionResult<UP, E, R>
+where
+    B: super::DriverCompletionDiagnosticsBackend,
+{
     diagnostics.record_completion_outcome(&outcome);
     RecordCompletionResult::Recorded(outcome)
 }
 
 #[inline]
-fn rejected_completion<UP, E, R>(
-    diagnostics: &super::DriverCompletionDiagnostics,
+fn rejected_completion<B, UP, E, R>(
+    diagnostics: &super::DriverCompletionDiagnostics<B>,
     outcome: RecordCompletionOutcome,
     packet: CompletionPacket<UP, E, R>,
-) -> RecordCompletionResult<UP, E, R> {
+) -> RecordCompletionResult<UP, E, R>
+where
+    B: super::DriverCompletionDiagnosticsBackend,
+{
     diagnostics.record_completion_outcome(&outcome);
     RecordCompletionResult::Rejected {
         outcome,
@@ -145,10 +151,13 @@ fn mutation_non_active(
 }
 
 #[inline]
-fn recorded_mutation(
-    diagnostics: &super::DriverCompletionDiagnostics,
+fn recorded_mutation<B>(
+    diagnostics: &super::DriverCompletionDiagnostics<B>,
     outcome: CompletionMutationOutcome,
-) -> CompletionMutationOutcome {
+) -> CompletionMutationOutcome
+where
+    B: super::DriverCompletionDiagnosticsBackend,
+{
     if let Some(anomaly) = outcome.anomaly() {
         diagnostics.record_anomaly(anomaly);
     }
@@ -156,8 +165,8 @@ fn recorded_mutation(
 }
 
 #[inline]
-fn run_discarded_record_cleanup<UP, E, R>(
-    diagnostics: &super::DriverCompletionDiagnostics,
+fn run_discarded_record_cleanup<B, UP, E, R>(
+    diagnostics: &super::DriverCompletionDiagnostics<B>,
     record_data: slot::CompletionData<UP, E, R>,
 ) {
     match record_data {
@@ -653,6 +662,7 @@ mod tests {
         type Sidecar = ();
         type Error = ();
         type Completion = usize;
+        type CompletionDiagnostics = ();
     }
 
     fn test_token(index: usize, generation: u32) -> OpToken {

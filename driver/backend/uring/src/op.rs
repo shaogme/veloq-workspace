@@ -1,6 +1,7 @@
 //! io_uring Platform-Specific Operation Definitions
 
 use crate::driver::{UringDriver, UringOpState};
+use crate::diagnostics::UringCompletionDiagnostics;
 use crate::error::{UringDriverResult as DriverResult, UringError};
 use io_uring::squeue;
 use std::time::Duration;
@@ -97,6 +98,7 @@ impl CoreSlotSpec for UringSlotSpec {
     type Sidecar = ();
     type Error = UringError;
     type Completion = usize;
+    type CompletionDiagnostics = UringCompletionDiagnostics;
 }
 
 pub(crate) type UringOpRegistry = CoreOpRegistry<UringSlotSpec>;

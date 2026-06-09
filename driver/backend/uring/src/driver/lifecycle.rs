@@ -67,7 +67,7 @@ impl<'a> UringDriver<'a> {
 
         if self.push_entry(cancel_sqe) {
             self.pending_cancel_cqes.insert(cancel_id, request);
-            self.completion_diagnostics.inc_cancel_submitted();
+            self.completion_diagnostics.backend().inc_cancel_submitted();
             trace!(
                 user_data,
                 generation,

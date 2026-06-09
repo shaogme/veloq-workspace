@@ -1,6 +1,7 @@
 //! Shutdown and deferred cleanup orchestration for `RioState`.
 
 use crate::config::SocketKey;
+use crate::driver::IocpDriverCompletionDiagnostics;
 use crate::rio::ActorKey;
 use crate::rio::RioState;
 use crate::rio::core::RioCompletionKind;
@@ -31,7 +32,7 @@ pub(crate) struct DeferredRioCleanup {
     outstanding_count: usize,
     next_request_id: u64,
     deferred_payloads: Vec<crate::op::IocpUserPayload>,
-    diagnostics: veloq_driver_core::driver::DriverCompletionDiagnostics,
+    diagnostics: IocpDriverCompletionDiagnostics,
 }
 
 // SAFETY: DeferredRioCleanup is transferred by ownership to a single reaper thread.

@@ -11,6 +11,7 @@ use tracing::{debug, trace};
 use crate::config::{
     BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig, UringRawHandle,
 };
+use crate::diagnostics::UringCompletionDiagnostics;
 use crate::error::{UringError, UringResult};
 use crate::op::{UringOp, UringUserPayload};
 use veloq_driver_core::DriverResult as CoreDriverResult;
@@ -124,7 +125,7 @@ pub struct UringDriver<'a> {
     pub(crate) pending_cancellations: VecDeque<PendingCancel>,
     pub(crate) pending_cancel_cqes: HashMap<CancelCompletionId, PendingCancel>,
     pub(crate) next_cancel_id: u16,
-    pub(crate) completion_diagnostics: DriverCompletionDiagnostics,
+    pub(crate) completion_diagnostics: DriverCompletionDiagnostics<UringCompletionDiagnostics>,
     pub(crate) completion_table: SharedCompletionTable<UringUserPayload, UringError>,
     pub(crate) remote_cancel_sender: RemoteCancelSender,
     pub(crate) remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
@@ -467,9 +468,4 @@ impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver<'_> 
         self.registration_stats.chunk_register_attempts
     }
 
-    fn debug_completion_diagnostics(
-        &self,
-    ) -> veloq_driver_core::driver::DriverCompletionDiagnosticsSnapshot {
-        self.completion_diagnostics.snapshot()
-    }
 }

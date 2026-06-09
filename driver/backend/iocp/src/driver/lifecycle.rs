@@ -3,9 +3,7 @@ use std::time::{Duration, Instant};
 use diagweave::prelude::*;
 use tracing::debug;
 use veloq_buf::BufferRegistrar;
-use veloq_driver_core::driver::{
-    CancelRequest, DriverCompletionDiagnostics, SharedCompletionTable,
-};
+use veloq_driver_core::driver::{CancelRequest, SharedCompletionTable};
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
 use crate::config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle};
@@ -16,7 +14,10 @@ use crate::rio::RioState;
 
 use super::polling::{CompletionPump, TimerEngine};
 use super::registration::HandleRegistry;
-use super::{CloseMode, IocpDriver, IocpDriverResult, IocpOpRegistry, PreInit};
+use super::{
+    CloseMode, IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
+    PreInit,
+};
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct ShutdownPending {
@@ -50,7 +51,7 @@ impl<'a> IocpRioRuntime<'a> {
         ext: &Extensions,
         registration_mode: BufferRegistrationMode,
         registrar: Box<dyn BufferRegistrar + 'a>,
-        diagnostics: DriverCompletionDiagnostics,
+        diagnostics: IocpDriverCompletionDiagnostics,
     ) -> IocpResult<Self> {
         let state = RioState::new(port, entries, ext, registration_mode, diagnostics)
             .with_ctx("entries", entries)

@@ -431,11 +431,8 @@ pub enum SubmitStatus {
 
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks {
-    use crate::driver::DriverCompletionDiagnosticsSnapshot;
-
     pub trait DriverTestHooks {
         fn debug_chunk_register_attempts(&self) -> u64;
-        fn debug_completion_diagnostics(&self) -> DriverCompletionDiagnosticsSnapshot;
     }
 }
 
@@ -447,11 +444,5 @@ impl<'a, D: Driver + ?Sized + test_hooks::DriverTestHooks, P: ContextDriverProvi
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.provider
             .with_driver_ref(|d| d.debug_chunk_register_attempts())
-    }
-
-    #[inline]
-    fn debug_completion_diagnostics(&self) -> DriverCompletionDiagnosticsSnapshot {
-        self.provider
-            .with_driver_ref(|d| d.debug_completion_diagnostics())
     }
 }

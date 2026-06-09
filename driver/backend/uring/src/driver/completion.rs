@@ -474,7 +474,7 @@ impl<'a> UringDriver<'a> {
 
         match raw.res {
             value if value >= 0 => {
-                self.completion_diagnostics.inc_uring_cancel_ack_ok();
+                self.completion_diagnostics.backend().inc_cancel_ack_ok();
                 trace!(
                     cancel_id = cancel_id.raw(),
                     request = ?request,
@@ -484,7 +484,9 @@ impl<'a> UringDriver<'a> {
                 CancelAck::Ok
             }
             value if value == -libc::ENOENT => {
-                self.completion_diagnostics.inc_uring_cancel_ack_not_found();
+                self.completion_diagnostics
+                    .backend()
+                    .inc_cancel_ack_not_found();
                 let active_target = match self.ops.checked_slot_view(request.target) {
                     CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => Some((
                         slot.snapshot(),
@@ -509,7 +511,7 @@ impl<'a> UringDriver<'a> {
                 CancelAck::NotFound
             }
             value => {
-                self.completion_diagnostics.inc_uring_cancel_ack_error();
+                self.completion_diagnostics.backend().inc_cancel_ack_error();
                 warn!(
                     cancel_id = cancel_id.raw(),
                     request = ?request,
@@ -531,7 +533,8 @@ impl<'a> UringDriver<'a> {
         message: &'static str,
     ) {
         self.completion_diagnostics
-            .inc_uring_cancel_ack_enoent_active();
+            .backend()
+            .inc_cancel_ack_enoent_active();
         let target_raw = RawCompletion::new(
             CompletionBackend::Uring,
             CompletionToken::user(request.target),
@@ -561,9 +564,9 @@ impl<'a> UringDriver<'a> {
     fn handle_waker_completion(&mut self, cqe_res: i32) -> UringResult<()> {
         let mut should_rebuild = false;
         if cqe_res == self.waker_buf.len() as i32 {
-            self.completion_diagnostics.inc_waker_ok();
+            self.completion_diagnostics.backend().inc_waker_ok();
         } else if cqe_res >= 0 {
-            self.completion_diagnostics.inc_waker_error();
+            self.completion_diagnostics.backend().inc_waker_error();
             warn!(
                 res = cqe_res,
                 expected = self.waker_buf.len(),
@@ -571,7 +574,7 @@ impl<'a> UringDriver<'a> {
             );
             should_rebuild = true;
         } else {
-            self.completion_diagnostics.inc_waker_error();
+            self.completion_diagnostics.backend().inc_waker_error();
             match -cqe_res {
                 libc::EAGAIN | libc::EINTR => {
                     debug!(res = cqe_res, "recoverable eventfd waker read completion");
@@ -585,13 +588,13 @@ impl<'a> UringDriver<'a> {
 
         self.waker_armed = false;
         if should_rebuild {
-            self.completion_diagnostics.inc_waker_rebuild();
+            self.completion_diagnostics.backend().inc_waker_rebuild();
             self.rebuild_waker_fd()
                 .attach_note("failed to rebuild eventfd waker")?;
         }
         self.is_waked.store(false, Ordering::Release);
         if let Err(e) = self.submit_waker() {
-            self.completion_diagnostics.inc_waker_rebuild();
+            self.completion_diagnostics.backend().inc_waker_rebuild();
             error!(report = ?e, "failed to resubmit waker");
             return Err(e);
         }

@@ -376,6 +376,7 @@ mod tests {
         type Sidecar = ();
         type Error = ();
         type Completion = usize;
+        type CompletionDiagnostics = ();
     }
 
     #[test]

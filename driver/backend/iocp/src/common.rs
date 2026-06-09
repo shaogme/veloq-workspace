@@ -6,6 +6,7 @@ use diagweave::prelude::*;
 use tracing::error;
 
 use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
+use crate::driver::IocpDriverCompletionDiagnostics;
 use crate::op::IocpUserPayload;
 use crate::win32::IoCompletionPort;
 use veloq_driver_core::driver::{
@@ -81,7 +82,7 @@ pub(crate) fn completion_record(
 #[inline]
 pub(crate) fn push_completion_shared(
     table: &SharedCompletionTable<IocpUserPayload, IocpError>,
-    diagnostics: &mut veloq_driver_core::driver::DriverCompletionDiagnostics,
+    diagnostics: &mut IocpDriverCompletionDiagnostics,
     packet: CompletionPacket<IocpUserPayload, IocpError>,
 ) -> RecordCompletionOutcome {
     let event = packet.completion_event();

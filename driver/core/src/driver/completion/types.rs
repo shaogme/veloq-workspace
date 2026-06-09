@@ -5,7 +5,7 @@ use std::sync::Arc;
 use veloq_shim::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default)]
-struct DriverCompletionDiagnosticsInner {
+struct DriverCompletionDiagnosticsInner<B = ()> {
     user_completed: AtomicU64,
     user_lost: AtomicU64,
     user_orphan_completed: AtomicU64,
@@ -13,31 +13,46 @@ struct DriverCompletionDiagnosticsInner {
     stale_completion: AtomicU64,
     slot_corruption: AtomicU64,
     payload_missing: AtomicU64,
-    cancel_request_submitted: AtomicU64,
-    cancel_request_not_found: AtomicU64,
-    cancel_request_error: AtomicU64,
-    uring_cancel_ack_ok: AtomicU64,
-    uring_cancel_ack_not_found: AtomicU64,
-    uring_cancel_ack_error: AtomicU64,
-    uring_cancel_ack_enoent_active: AtomicU64,
-    waker_ok: AtomicU64,
-    waker_error: AtomicU64,
-    waker_rebuild: AtomicU64,
     completion_rejected: AtomicU64,
     internal_unknown: AtomicU64,
-    rio_malformed_context: AtomicU64,
-    rio_missing_context: AtomicU64,
-    rio_stale_context: AtomicU64,
     orphan_cleanup_error: AtomicU64,
+    backend: B,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct DriverCompletionDiagnostics {
-    inner: Arc<DriverCompletionDiagnosticsInner>,
+pub trait DriverCompletionDiagnosticsBackend: Default + Send + Sync + 'static {
+    type Snapshot: Default;
+
+    fn snapshot(&self) -> Self::Snapshot;
+
+    #[inline]
+    fn record_backend_anomaly(&self, _anomaly: &CompletionAnomaly) -> bool {
+        false
+    }
+}
+
+impl DriverCompletionDiagnosticsBackend for () {
+    type Snapshot = ();
+
+    #[inline]
+    fn snapshot(&self) -> Self::Snapshot {}
+}
+
+#[derive(Debug, Default)]
+pub struct DriverCompletionDiagnostics<B = ()> {
+    inner: Arc<DriverCompletionDiagnosticsInner<B>>,
+}
+
+impl<B> Clone for DriverCompletionDiagnostics<B> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct DriverCompletionDiagnosticsSnapshot {
+pub struct DriverCompletionDiagnosticsSnapshot<B = ()> {
     pub user_completed: u64,
     pub user_lost: u64,
     pub user_orphan_completed: u64,
@@ -45,29 +60,13 @@ pub struct DriverCompletionDiagnosticsSnapshot {
     pub stale_completion: u64,
     pub slot_corruption: u64,
     pub payload_missing: u64,
-    pub cancel_request_submitted: u64,
-    pub cancel_request_not_found: u64,
-    pub cancel_request_error: u64,
-    pub uring_cancel_ack_ok: u64,
-    pub uring_cancel_ack_not_found: u64,
-    pub uring_cancel_ack_error: u64,
-    pub uring_cancel_ack_enoent_active: u64,
-    pub cancel_submitted: u64,
-    pub cancel_ack_ok: u64,
-    pub cancel_ack_not_found: u64,
-    pub cancel_ack_error: u64,
-    pub waker_ok: u64,
-    pub waker_error: u64,
-    pub waker_rebuild: u64,
     pub completion_rejected: u64,
     pub internal_unknown: u64,
-    pub rio_malformed_context: u64,
-    pub rio_missing_context: u64,
-    pub rio_stale_context: u64,
     pub orphan_cleanup_error: u64,
+    pub backend: B,
 }
 
-impl DriverCompletionDiagnostics {
+impl<B> DriverCompletionDiagnostics<B> {
     #[inline]
     fn load(counter: &AtomicU64) -> u64 {
         counter.load(Ordering::Relaxed)
@@ -79,36 +78,8 @@ impl DriverCompletionDiagnostics {
     }
 
     #[inline]
-    pub fn snapshot(&self) -> DriverCompletionDiagnosticsSnapshot {
-        DriverCompletionDiagnosticsSnapshot {
-            user_completed: Self::load(&self.inner.user_completed),
-            user_lost: Self::load(&self.inner.user_lost),
-            user_orphan_completed: Self::load(&self.inner.user_orphan_completed),
-            unknown_completion: Self::load(&self.inner.unknown_completion),
-            stale_completion: Self::load(&self.inner.stale_completion),
-            slot_corruption: Self::load(&self.inner.slot_corruption),
-            payload_missing: Self::load(&self.inner.payload_missing),
-            cancel_request_submitted: Self::load(&self.inner.cancel_request_submitted),
-            cancel_request_not_found: Self::load(&self.inner.cancel_request_not_found),
-            cancel_request_error: Self::load(&self.inner.cancel_request_error),
-            uring_cancel_ack_ok: Self::load(&self.inner.uring_cancel_ack_ok),
-            uring_cancel_ack_not_found: Self::load(&self.inner.uring_cancel_ack_not_found),
-            uring_cancel_ack_error: Self::load(&self.inner.uring_cancel_ack_error),
-            uring_cancel_ack_enoent_active: Self::load(&self.inner.uring_cancel_ack_enoent_active),
-            cancel_submitted: Self::load(&self.inner.cancel_request_submitted),
-            cancel_ack_ok: Self::load(&self.inner.uring_cancel_ack_ok),
-            cancel_ack_not_found: Self::load(&self.inner.uring_cancel_ack_not_found),
-            cancel_ack_error: Self::load(&self.inner.uring_cancel_ack_error),
-            waker_ok: Self::load(&self.inner.waker_ok),
-            waker_error: Self::load(&self.inner.waker_error),
-            waker_rebuild: Self::load(&self.inner.waker_rebuild),
-            completion_rejected: Self::load(&self.inner.completion_rejected),
-            internal_unknown: Self::load(&self.inner.internal_unknown),
-            rio_malformed_context: Self::load(&self.inner.rio_malformed_context),
-            rio_missing_context: Self::load(&self.inner.rio_missing_context),
-            rio_stale_context: Self::load(&self.inner.rio_stale_context),
-            orphan_cleanup_error: Self::load(&self.inner.orphan_cleanup_error),
-        }
+    pub fn backend(&self) -> &B {
+        &self.inner.backend
     }
 
     #[inline]
@@ -147,91 +118,6 @@ impl DriverCompletionDiagnostics {
     }
 
     #[inline]
-    pub fn inc_cancel_submitted(&self) {
-        self.inc_cancel_request_submitted();
-    }
-
-    #[inline]
-    pub fn inc_cancel_request_submitted(&self) {
-        Self::inc(&self.inner.cancel_request_submitted);
-    }
-
-    #[inline]
-    pub fn inc_cancel_request_not_found(&self) {
-        Self::inc(&self.inner.cancel_request_not_found);
-    }
-
-    #[inline]
-    pub fn inc_cancel_request_error(&self) {
-        Self::inc(&self.inner.cancel_request_error);
-    }
-
-    #[inline]
-    pub fn inc_cancel_ack_ok(&self) {
-        self.inc_uring_cancel_ack_ok();
-    }
-
-    #[inline]
-    pub fn inc_cancel_ack_not_found(&self) {
-        self.inc_uring_cancel_ack_not_found();
-    }
-
-    #[inline]
-    pub fn inc_cancel_ack_error(&self) {
-        self.inc_uring_cancel_ack_error();
-    }
-
-    #[inline]
-    pub fn inc_uring_cancel_ack_ok(&self) {
-        Self::inc(&self.inner.uring_cancel_ack_ok);
-    }
-
-    #[inline]
-    pub fn inc_uring_cancel_ack_not_found(&self) {
-        Self::inc(&self.inner.uring_cancel_ack_not_found);
-    }
-
-    #[inline]
-    pub fn inc_uring_cancel_ack_error(&self) {
-        Self::inc(&self.inner.uring_cancel_ack_error);
-    }
-
-    #[inline]
-    pub fn inc_uring_cancel_ack_enoent_active(&self) {
-        Self::inc(&self.inner.uring_cancel_ack_enoent_active);
-    }
-
-    #[inline]
-    pub fn inc_cancel_observed_ok(&self) {
-        self.inc_cancel_request_submitted();
-    }
-
-    #[inline]
-    pub fn inc_cancel_observed_not_found(&self) {
-        self.inc_cancel_request_not_found();
-    }
-
-    #[inline]
-    pub fn inc_cancel_observed_error(&self) {
-        self.inc_cancel_request_error();
-    }
-
-    #[inline]
-    pub fn inc_waker_ok(&self) {
-        Self::inc(&self.inner.waker_ok);
-    }
-
-    #[inline]
-    pub fn inc_waker_error(&self) {
-        Self::inc(&self.inner.waker_error);
-    }
-
-    #[inline]
-    pub fn inc_waker_rebuild(&self) {
-        Self::inc(&self.inner.waker_rebuild);
-    }
-
-    #[inline]
     pub fn inc_completion_rejected(&self) {
         Self::inc(&self.inner.completion_rejected);
     }
@@ -242,23 +128,30 @@ impl DriverCompletionDiagnostics {
     }
 
     #[inline]
-    pub fn inc_rio_malformed_context(&self) {
-        Self::inc(&self.inner.rio_malformed_context);
-    }
-
-    #[inline]
-    pub fn inc_rio_missing_context(&self) {
-        Self::inc(&self.inner.rio_missing_context);
-    }
-
-    #[inline]
-    pub fn inc_rio_stale_context(&self) {
-        Self::inc(&self.inner.rio_stale_context);
-    }
-
-    #[inline]
     pub fn inc_orphan_cleanup_error(&self) {
         Self::inc(&self.inner.orphan_cleanup_error);
+    }
+}
+
+impl<B> DriverCompletionDiagnostics<B>
+where
+    B: DriverCompletionDiagnosticsBackend,
+{
+    #[inline]
+    pub fn snapshot(&self) -> DriverCompletionDiagnosticsSnapshot<B::Snapshot> {
+        DriverCompletionDiagnosticsSnapshot {
+            user_completed: Self::load(&self.inner.user_completed),
+            user_lost: Self::load(&self.inner.user_lost),
+            user_orphan_completed: Self::load(&self.inner.user_orphan_completed),
+            unknown_completion: Self::load(&self.inner.unknown_completion),
+            stale_completion: Self::load(&self.inner.stale_completion),
+            slot_corruption: Self::load(&self.inner.slot_corruption),
+            payload_missing: Self::load(&self.inner.payload_missing),
+            completion_rejected: Self::load(&self.inner.completion_rejected),
+            internal_unknown: Self::load(&self.inner.internal_unknown),
+            orphan_cleanup_error: Self::load(&self.inner.orphan_cleanup_error),
+            backend: self.inner.backend.snapshot(),
+        }
     }
 }
 
@@ -736,18 +629,25 @@ impl<UP, E, R> RecordCompletionResult<UP, E, R> {
     }
 }
 
-impl DriverCompletionDiagnostics {
+impl<B> DriverCompletionDiagnostics<B>
+where
+    B: DriverCompletionDiagnosticsBackend,
+{
     #[inline]
     pub fn record_anomaly(&self, anomaly: &CompletionAnomaly) {
+        if self.inner.backend.record_backend_anomaly(anomaly) {
+            return;
+        }
+
         match anomaly.reason {
             CompletionAnomalyReason::UnknownSlot
             | CompletionAnomalyReason::UnknownControlToken
             | CompletionAnomalyReason::NonActiveSlot => self.inc_unknown_completion(),
             CompletionAnomalyReason::ControlCompletionUntracked
-            | CompletionAnomalyReason::BackendInvariantBroken => self.inc_internal_unknown(),
-            CompletionAnomalyReason::RioMalformedContext => self.inc_rio_malformed_context(),
-            CompletionAnomalyReason::RioMissingContext => self.inc_rio_missing_context(),
-            CompletionAnomalyReason::RioStaleContext => self.inc_rio_stale_context(),
+            | CompletionAnomalyReason::BackendInvariantBroken
+            | CompletionAnomalyReason::RioMalformedContext
+            | CompletionAnomalyReason::RioMissingContext
+            | CompletionAnomalyReason::RioStaleContext => self.inc_internal_unknown(),
             CompletionAnomalyReason::OpMissing | CompletionAnomalyReason::SlotCorruption => {
                 self.inc_slot_corruption()
             }

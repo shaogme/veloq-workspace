@@ -1,6 +1,6 @@
 use crate::driver::DriverCompletionDiagnostics;
 use crate::slot::core::SlotData;
-use crate::slot::{SlotCompletion, SlotError, SlotSpec};
+use crate::slot::{SlotCompletion, SlotCompletionDiagnostics, SlotError, SlotSpec};
 use crossbeam_utils::CachePadded;
 use veloq_shim::atomic::{AtomicUsize, Ordering};
 
@@ -11,7 +11,7 @@ pub struct SlotTable<Spec: SlotSpec> {
     pub slots: SlotEntries<Spec>,
     pub remote_free_head: AtomicUsize,
     ready_completion_count: AtomicUsize,
-    pub(crate) diagnostics: DriverCompletionDiagnostics,
+    pub(crate) diagnostics: DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
 }
 
 unsafe impl<Spec> Sync for SlotTable<Spec>
@@ -39,7 +39,9 @@ impl<Spec: SlotSpec> SlotTable<Spec> {
     }
 
     #[inline]
-    pub fn completion_diagnostics(&self) -> DriverCompletionDiagnostics {
+    pub fn completion_diagnostics(
+        &self,
+    ) -> DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>> {
         self.diagnostics.clone()
     }
 

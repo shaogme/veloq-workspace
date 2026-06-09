@@ -17,6 +17,7 @@ impl SlotSpec for DummySlotSpec {
     type Sidecar = ();
     type Error = ();
     type Completion = usize;
+    type CompletionDiagnostics = ();
 }
 
 fn active_table() -> (SharedCompletionTable<(), ()>, OpToken) {

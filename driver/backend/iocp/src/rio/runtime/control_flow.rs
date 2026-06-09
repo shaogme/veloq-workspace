@@ -3,6 +3,7 @@
 use crate::IoFd;
 use crate::common::push_completion_shared;
 use crate::config::{BorrowedRawHandle, SocketKey};
+use crate::driver::IocpDriverCompletionDiagnostics;
 use crate::error::IocpError;
 use crate::op::IocpOpRegistry;
 use crate::rio::core::registry::RioRegistry;
@@ -22,8 +23,8 @@ use rustc_hash::FxHashMap;
 use tracing::debug;
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionBackend, CompletionPacket, CompletionToken,
-    DriverCompletionDiagnostics, RawCompletion, RoutedSlotCompletion, SharedCompletionTable,
-    UserCompletionEvent, record_completion_anomaly, record_lost_completion, route_user_completion,
+    RawCompletion, RoutedSlotCompletion, SharedCompletionTable, UserCompletionEvent,
+    record_completion_anomaly, record_lost_completion, route_user_completion,
     run_completion_cleanup,
 };
 use veloq_driver_core::slot::SlotRegistryExt;
@@ -631,7 +632,7 @@ impl RioState {
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
-        diagnostics: &mut DriverCompletionDiagnostics,
+        diagnostics: &mut IocpDriverCompletionDiagnostics,
     ) -> RioResult<usize> {
         self.process_completions_internal(ops, ext, registrar, completion_table, diagnostics)
     }
@@ -642,7 +643,7 @@ impl RioState {
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
-        diagnostics: &mut DriverCompletionDiagnostics,
+        diagnostics: &mut IocpDriverCompletionDiagnostics,
     ) -> RioResult<usize> {
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
@@ -694,7 +695,7 @@ impl RioState {
         ext: &crate::ext::Extensions,
         registrar: &dyn veloq_buf::BufferRegistrar,
         completion_table: &SharedCompletionTable<crate::op::IocpUserPayload, IocpError>,
-        diagnostics: &mut DriverCompletionDiagnostics,
+        diagnostics: &mut IocpDriverCompletionDiagnostics,
     ) -> RioResult<()> {
         let deadline = std::time::Instant::now()
             .checked_add(timeout)

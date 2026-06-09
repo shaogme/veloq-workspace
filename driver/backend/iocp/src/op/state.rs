@@ -1,4 +1,5 @@
 use crate::IocpHandle;
+use crate::diagnostics::IocpCompletionDiagnostics;
 use crate::error::{IocpError, IocpResult};
 use crate::rio::SocketInflightToken;
 use crate::win32::{IoCompletionPort, Overlapped};
@@ -139,6 +140,7 @@ impl CoreSlotSpec for IocpSlotSpec {
     type Sidecar = OverlappedEntry;
     type Error = IocpError;
     type Completion = usize;
+    type CompletionDiagnostics = IocpCompletionDiagnostics;
 }
 
 pub(crate) type IocpOpRegistry = CoreOpRegistry<IocpSlotSpec>;

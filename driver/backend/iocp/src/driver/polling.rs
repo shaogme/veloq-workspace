@@ -283,10 +283,10 @@ impl<'a> IocpDriver<'a> {
 
     fn handle_waker_completion(&mut self, success: bool, error_code: Option<u32>) {
         if success {
-            self.completion_diagnostics.inc_waker_ok();
+            self.completion_diagnostics.backend().inc_waker_ok();
             self.completion.clear_notification();
         } else {
-            self.completion_diagnostics.inc_waker_error();
+            self.completion_diagnostics.backend().inc_waker_error();
             warn!(?error_code, "IOCP waker completion reported an error");
             self.completion.clear_notification();
         }

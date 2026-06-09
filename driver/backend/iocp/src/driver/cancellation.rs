@@ -10,7 +10,9 @@ use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
 use crate::common::{completion_record, push_completion_shared};
 use crate::driver::completion::EmitContext;
-use crate::driver::{CompletionSidecar, IocpDriver, IocpOpRegistry};
+use crate::driver::{
+    CompletionSidecar, IocpDriver, IocpDriverCompletionDiagnostics, IocpOpRegistry,
+};
 use crate::error::IocpResult;
 use crate::op;
 use crate::win32::CancelRequestResult;
@@ -59,7 +61,9 @@ impl<'a> IocpDriver<'a> {
             ) {
                 let _ = outcome;
             }
-            self.completion_diagnostics.inc_cancel_submitted();
+            self.completion_diagnostics
+                .backend()
+                .inc_cancel_completed_locally();
             return Ok(CancelSubmitOutcome::CompletedLocally);
         }
 
@@ -83,7 +87,9 @@ impl<'a> IocpDriver<'a> {
                 ) {
                     let _ = outcome;
                 }
-                self.completion_diagnostics.inc_cancel_submitted();
+                self.completion_diagnostics
+                    .backend()
+                    .inc_cancel_completed_locally();
                 Ok(CancelSubmitOutcome::CompletedLocally)
             }
             view @ (CheckedSlotView::Missing { .. }
@@ -143,11 +149,11 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpResult<CancelSubmitOutcome> {
         match status {
             Ok(CancelPerformStatus::Submitted) | Ok(CancelPerformStatus::RioRequested) => {
-                self.completion_diagnostics.inc_cancel_request_submitted();
+                self.completion_diagnostics.backend().inc_cancel_submitted();
                 Ok(CancelSubmitOutcome::Submitted)
             }
             Ok(CancelPerformStatus::NotFound) => {
-                self.completion_diagnostics.inc_cancel_request_not_found();
+                self.completion_diagnostics.backend().inc_cancel_not_found();
                 debug!("CancelIoEx target was already complete or absent");
                 Ok(CancelSubmitOutcome::TargetMissing)
             }
@@ -155,7 +161,7 @@ impl<'a> IocpDriver<'a> {
                 Ok(CancelSubmitOutcome::NoBackendHandle)
             }
             Err(report) => {
-                self.completion_diagnostics.inc_cancel_request_error();
+                self.completion_diagnostics.backend().inc_cancel_error();
                 warn!(report = ?report, "CancelIoEx failed");
                 Err(report)
             }
@@ -254,7 +260,7 @@ impl<'a> IocpDriver<'a> {
     fn abort_slot_inner(
         ctx: EmitContext<'_>,
         ops: &mut IocpOpRegistry,
-        diagnostics: &mut veloq_driver_core::driver::DriverCompletionDiagnostics,
+        diagnostics: &mut IocpDriverCompletionDiagnostics,
         mode: CancelMode,
         token: OpToken,
     ) -> Option<RecordCompletionOutcome> {
