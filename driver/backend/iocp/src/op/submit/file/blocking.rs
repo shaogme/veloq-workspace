@@ -28,8 +28,8 @@ fn make_blocking_completion(
     ctx: &SubmitContext<'_>,
     cleanup_success: Option<BlockingSuccessCleanup>,
 ) -> Arc<BlockingCompletion> {
-    let completion_key = ctx.completion_token.raw() as usize;
-    let completion = BlockingCompletion::new(ctx.port.clone(), completion_key, cleanup_success);
+    let completion =
+        BlockingCompletion::new(ctx.port.clone(), ctx.completion_token, cleanup_success);
     header.blocking_completion = Some(completion.clone());
     completion
 }

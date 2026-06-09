@@ -160,19 +160,15 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     }
 
     pub fn platform_mut(&mut self, token: OpToken) -> Option<&mut RegistryPlatformData<Spec>> {
-        if !self.contains(token) {
-            return None;
-        }
-        self.local
-            .get_mut(token.index())
-            .map(|local| &mut local.entry.platform_data)
+        self.active_slot_bundle_mut(token)
+            .map(|(_, entry, _, _)| &mut entry.platform_data)
     }
 
-    pub fn get_slot_and_entry_mut(
+    pub fn active_slot_and_entry_mut(
         &mut self,
         token: OpToken,
     ) -> Option<SlotEntryAndOpEntry<'_, Spec>> {
-        if !self.contains(token) {
+        if !self.is_current_active(token) {
             return None;
         }
 
@@ -182,18 +178,24 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         Some((slot, &mut local.entry))
     }
 
-    pub fn get_slot_entry_op_storage_and_entry_mut(
+    pub fn slot_bundle_by_index_mut(
         &mut self,
-        token: OpToken,
+        index: usize,
     ) -> Option<SlotEntryOpBundle<'_, Spec>> {
-        if !self.contains(token) {
-            return None;
-        }
-
-        let index = token.index();
         let slot = self.shared.slots.get(index)?;
         let local = self.local.get_mut(index)?;
         Some((slot, &mut local.entry, &mut local.op, &mut local.storage))
+    }
+
+    pub fn active_slot_bundle_mut(
+        &mut self,
+        token: OpToken,
+    ) -> Option<SlotEntryOpBundle<'_, Spec>> {
+        if !self.is_current_active(token) {
+            return None;
+        }
+
+        self.slot_bundle_by_index_mut(token.index())
     }
 
     #[inline]
@@ -205,7 +207,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             &mut RegistrySidecar<Spec>,
         ) -> X,
     {
-        if !self.contains(token) {
+        if !self.is_current_active(token) {
             return None;
         }
         self.local
@@ -214,7 +216,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     }
 
     pub fn slot_storage_mut(&mut self, token: OpToken) -> Option<&mut SlotStorageOf<Spec>> {
-        if !self.contains(token) {
+        if !self.is_current_active(token) {
             return None;
         }
         self.local
@@ -222,7 +224,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             .map(|local| &mut local.storage)
     }
 
-    pub fn contains(&self, token: OpToken) -> bool {
+    pub fn is_current_active(&self, token: OpToken) -> bool {
         let (user_data, generation) = token.parts();
         let Some(slot) = self.shared.slots.get(user_data) else {
             return false;

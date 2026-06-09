@@ -5,8 +5,8 @@ use crate::win32::{IoCompletionPort, Overlapped};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use veloq_driver_core::driver::OpToken;
 use veloq_driver_core::driver::registry::OpRegistry as CoreOpRegistry;
+use veloq_driver_core::driver::{CompletionToken, OpToken};
 use veloq_driver_core::slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec};
 
 use crate::op::{IocpOp, IocpUserPayload};
@@ -15,7 +15,7 @@ pub(crate) type BlockingSuccessCleanup = fn(usize);
 
 pub(crate) struct BlockingCompletion {
     port: Arc<IoCompletionPort>,
-    completion_key: usize,
+    completion_token: CompletionToken,
     result: Mutex<Option<IocpResult<usize>>>,
     cleanup_success: Option<BlockingSuccessCleanup>,
 }
@@ -23,12 +23,12 @@ pub(crate) struct BlockingCompletion {
 impl BlockingCompletion {
     pub(crate) fn new(
         port: Arc<IoCompletionPort>,
-        completion_key: usize,
+        completion_token: CompletionToken,
         cleanup_success: Option<BlockingSuccessCleanup>,
     ) -> Arc<Self> {
         Arc::new(Self {
             port,
-            completion_key,
+            completion_token,
             result: Mutex::new(None),
             cleanup_success,
         })
@@ -43,9 +43,9 @@ impl BlockingCompletion {
 
     pub(crate) fn complete(&self, result: io::Result<usize>) {
         self.store_result(result);
-        if let Err(report) = self.port.notify(self.completion_key) {
+        if let Err(report) = self.port.notify(self.completion_token) {
             tracing::error!(
-                completion_key = self.completion_key,
+                completion_token = self.completion_token.raw(),
                 report = ?report,
                 "failed to post blocking completion"
             );

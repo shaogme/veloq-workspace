@@ -7,8 +7,9 @@ use tracing::{debug, error, warn};
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionBackend, CompletionDispatch, CompletionToken, OpToken,
     RawCompletion, RemoteWaker, SharedCompletionTable, dispatch_raw_completion,
-    drain_cancel_requests, record_completion_anomaly,
+    drain_cancel_requests, record_completion_anomaly, slot_view_anomaly,
 };
+use veloq_driver_core::slot::SlotRegistryExt;
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 
@@ -219,7 +220,20 @@ impl<'a> IocpDriver<'a> {
                 self.process_completion(token, success, error_code, bytes);
                 Ok(CompletionProgress { iocp: 1, rio: 0 })
             }
-            CompletionDispatch::Cancel { raw, .. } | CompletionDispatch::Unknown { raw } => {
+            CompletionDispatch::Cancel { raw, .. } => {
+                let anomaly = CompletionAnomaly::control_completion_untracked(raw.token)
+                    .with_raw_completion(raw);
+                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                debug!(
+                    token = raw.token.raw(),
+                    key,
+                    success,
+                    ?error_code,
+                    "untracked IOCP control completion token"
+                );
+                Ok(CompletionProgress::default())
+            }
+            CompletionDispatch::Unknown { raw } => {
                 let anomaly = if let Some(token) = raw.token.op_token() {
                     CompletionAnomaly::unknown_slot(raw.token, token.index(), token.generation())
                         .with_raw_completion(raw)
@@ -251,7 +265,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     fn resolve_completion_kind(
-        &self,
+        &mut self,
         bytes: u32,
         overlapped: *mut crate::win32::Overlapped,
         success: bool,
@@ -293,6 +307,50 @@ impl<'a> IocpDriver<'a> {
                 iocp_status_res(success, error_code, bytes),
                 0,
             );
+            let expected_key = raw.token.raw() as usize;
+            if completion_key != 0 && completion_key != expected_key {
+                let mismatch_raw = RawCompletion::new(
+                    CompletionBackend::Iocp,
+                    CompletionToken::from_raw(completion_key as u64),
+                    raw.res,
+                    raw.flags,
+                );
+                let anomaly = match slot_view_anomaly(
+                    CompletionBackend::Iocp,
+                    entry.token,
+                    mismatch_raw,
+                    self.ops.checked_slot_view(entry.token),
+                ) {
+                    Ok(view) => {
+                        let snapshot = match view {
+                            veloq_driver_core::slot::SlotView::Reserved(slot) => slot.snapshot(),
+                            veloq_driver_core::slot::SlotView::InFlightWaiting(slot) => {
+                                slot.snapshot()
+                            }
+                            veloq_driver_core::slot::SlotView::InFlightOrphaned(slot) => {
+                                slot.snapshot()
+                            }
+                        };
+                        CompletionAnomaly::backend_invariant_broken(
+                            raw.token,
+                            snapshot.index,
+                            snapshot.generation,
+                            snapshot.state,
+                        )
+                        .with_slot_snapshot(snapshot)
+                        .with_raw_completion(mismatch_raw)
+                    }
+                    Err(anomaly) => anomaly,
+                };
+                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                debug!(
+                    expected_key,
+                    completion_key,
+                    sidecar_token = raw.token.raw(),
+                    reason = ?anomaly.reason,
+                    "IOCP completion key does not match overlapped sidecar token"
+                );
+            }
             return Ok(CompletionDispatch::User {
                 token: entry.token,
                 raw,

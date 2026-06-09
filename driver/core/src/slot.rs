@@ -401,9 +401,7 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
     #[inline]
     fn checked_slot_view(&mut self, token: OpToken) -> CheckedSlotView<'_, Spec> {
         let (index, expected_generation) = token.parts();
-        let Some((entry, op_entry, op, storage)) =
-            self.get_slot_entry_op_storage_and_entry_mut(token)
-        else {
+        let Some((entry, op_entry, op, storage)) = self.slot_bundle_by_index_mut(index) else {
             return CheckedSlotView::Missing {
                 index,
                 expected_generation,
@@ -552,5 +550,71 @@ mod tests {
         };
         assert_eq!(record.event.token, completion_token);
         assert_eq!(record.payload, ());
+    }
+
+    #[test]
+    fn checked_slot_view_reports_stale_generation() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let handle = registry.alloc(()).expect("slot allocation failed").handle;
+        let stale_token = OpToken::new(handle.index, handle.generation);
+        let _ = registry.remove(stale_token);
+        let fresh = registry
+            .alloc(())
+            .expect("slot should be reusable after removal")
+            .handle;
+        assert_eq!(fresh.index, stale_token.index());
+        assert_ne!(fresh.generation, stale_token.generation());
+
+        assert!(matches!(
+            registry.checked_slot_view(stale_token),
+            CheckedSlotView::Stale(snapshot)
+                if snapshot.index == stale_token.index()
+                    && snapshot.generation == fresh.generation
+        ));
+    }
+
+    #[test]
+    fn checked_slot_view_reports_idle_as_empty() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let handle = registry.alloc(()).expect("slot allocation failed").handle;
+        let token = OpToken::new(handle.index, handle.generation);
+
+        let _ = registry.remove(token);
+
+        assert!(matches!(
+            registry.checked_slot_view(token),
+            CheckedSlotView::Empty(snapshot)
+                if snapshot.index == token.index()
+                    && snapshot.generation == token.generation()
+                    && snapshot.state == SlotState::Idle
+        ));
+    }
+
+    #[test]
+    fn checked_slot_view_reports_missing_inflight_payload_as_corrupt() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let handle = registry.alloc(()).expect("slot allocation failed").handle;
+        let token = OpToken::new(handle.index, handle.generation);
+
+        let slot = match registry.checked_slot_view(token) {
+            CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot
+                .init_op_with(DummyPlatformOp, |_| {})
+                .expect("reserved slot should accept op"),
+            _ => panic!("reserved slot should be available"),
+        };
+        let _in_flight = slot
+            .start_submission_with(None)
+            .expect("reserved slot should start submission")
+            .persist();
+
+        assert!(matches!(
+            registry.checked_slot_view(token),
+            CheckedSlotView::Corrupt(snapshot)
+                if snapshot.index == token.index()
+                    && snapshot.generation == token.generation()
+                    && snapshot.state == SlotState::InFlightWaiting
+                    && snapshot.has_op
+                    && !snapshot.has_payload
+        ));
     }
 }

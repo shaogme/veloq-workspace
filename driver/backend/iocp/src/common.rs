@@ -105,8 +105,6 @@ pub(crate) fn push_completion_shared(
 // Waker
 // ============================================================================
 
-pub(crate) const IOCP_WAKEUP_COMPLETION_KEY: usize = CompletionToken::waker(0).raw() as usize;
-
 /// A waker that posts a completion status to the port to wake up the event loop.
 pub(crate) struct IocpWaker {
     pub(crate) port: Arc<IoCompletionPort>,
@@ -120,7 +118,7 @@ impl RemoteWaker<IocpError> for IocpWaker {
         }
         if !self.is_notified.swap(true, Ordering::AcqRel) {
             self.port
-                .notify(IOCP_WAKEUP_COMPLETION_KEY)
+                .notify(CompletionToken::waker(0))
                 .push_ctx("scope", "iocp/common")
                 .attach_note("failed to notify remote waker")?;
         }

@@ -356,9 +356,10 @@ pub struct CancelDrainOutcome {
     pub requests: u64,
     pub submitted: u64,
     pub queued: u64,
-    pub not_found: u64,
-    pub no_handle: u64,
-    pub already_complete: u64,
+    pub completed_locally: u64,
+    pub target_missing: u64,
+    pub target_stale: u64,
+    pub no_backend_handle: u64,
 }
 
 impl CancelDrainOutcome {
@@ -372,14 +373,17 @@ impl CancelDrainOutcome {
             CancelSubmitOutcome::Queued => {
                 self.queued = self.queued.saturating_add(1);
             }
-            CancelSubmitOutcome::NotFound => {
-                self.not_found = self.not_found.saturating_add(1);
+            CancelSubmitOutcome::CompletedLocally => {
+                self.completed_locally = self.completed_locally.saturating_add(1);
             }
-            CancelSubmitOutcome::NoHandle => {
-                self.no_handle = self.no_handle.saturating_add(1);
+            CancelSubmitOutcome::TargetMissing => {
+                self.target_missing = self.target_missing.saturating_add(1);
             }
-            CancelSubmitOutcome::AlreadyComplete => {
-                self.already_complete = self.already_complete.saturating_add(1);
+            CancelSubmitOutcome::TargetStale => {
+                self.target_stale = self.target_stale.saturating_add(1);
+            }
+            CancelSubmitOutcome::NoBackendHandle => {
+                self.no_backend_handle = self.no_backend_handle.saturating_add(1);
             }
         }
     }

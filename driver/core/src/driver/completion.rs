@@ -116,11 +116,25 @@ impl RawCompletion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionDispatch {
-    User { token: OpToken, raw: RawCompletion },
-    Waker { id: u16, raw: RawCompletion },
-    Cancel { id: u16, raw: RawCompletion },
-    RioWake { id: u16, raw: RawCompletion },
-    Unknown { raw: RawCompletion },
+    User {
+        token: OpToken,
+        raw: RawCompletion,
+    },
+    Waker {
+        id: u16,
+        raw: RawCompletion,
+    },
+    Cancel {
+        id: CancelCompletionId,
+        raw: RawCompletion,
+    },
+    RioWake {
+        id: u16,
+        raw: RawCompletion,
+    },
+    Unknown {
+        raw: RawCompletion,
+    },
 }
 
 pub enum RoutedSlotCompletion<'a, Spec: slot::SlotSpec> {
@@ -163,7 +177,10 @@ pub fn dispatch_raw_completion(
         CompletionTokenClass::Control {
             kind: CompletionControlKind::Cancel,
             id,
-        } => CompletionDispatch::Cancel { id, raw },
+        } => CompletionDispatch::Cancel {
+            id: CancelCompletionId::new(id),
+            raw,
+        },
         CompletionTokenClass::Control {
             kind: CompletionControlKind::RioWake,
             id,
@@ -236,6 +253,21 @@ impl OpToken {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CancelCompletionId(u16);
+
+impl CancelCompletionId {
+    #[inline]
+    pub const fn new(raw: u16) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompletionToken(u64);
 
 impl CompletionToken {
@@ -270,8 +302,8 @@ impl CompletionToken {
     }
 
     #[inline]
-    pub const fn cancel(id: u16) -> Self {
-        Self::internal(CompletionControlKind::Cancel, id)
+    pub const fn cancel(id: CancelCompletionId) -> Self {
+        Self::internal(CompletionControlKind::Cancel, id.raw())
     }
 
     #[inline]
@@ -311,15 +343,10 @@ pub fn route_user_completion<'a, Spec: slot::SlotSpec>(
     raw: RawCompletion,
     view: CheckedSlotView<'a, Spec>,
 ) -> RoutedSlotCompletion<'a, Spec> {
-    let (index, expected_generation) = token.parts();
-    match view {
-        CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
-            RoutedSlotCompletion::Waiting(slot)
-        }
-        CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
-            RoutedSlotCompletion::Orphaned(slot)
-        }
-        CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
+    match slot_view_anomaly(raw.backend, token, raw, view) {
+        Ok(SlotView::InFlightWaiting(slot)) => RoutedSlotCompletion::Waiting(slot),
+        Ok(SlotView::InFlightOrphaned(slot)) => RoutedSlotCompletion::Orphaned(slot),
+        Ok(SlotView::Reserved(slot)) => {
             let snapshot = slot.snapshot();
             RoutedSlotCompletion::Corrupt(
                 CompletionAnomaly::backend_invariant_broken(
@@ -332,41 +359,60 @@ pub fn route_user_completion<'a, Spec: slot::SlotSpec>(
                 .with_raw_completion(raw),
             )
         }
-        CheckedSlotView::Missing { .. } => RoutedSlotCompletion::Missing(
-            CompletionAnomaly::unknown_slot(raw.token, index, expected_generation)
-                .with_raw_completion(raw),
-        ),
-        CheckedSlotView::Empty(snapshot) => RoutedSlotCompletion::Empty(
-            CompletionAnomaly::non_active(
-                raw.token,
-                snapshot.index,
-                expected_generation,
-                snapshot.state,
-            )
-            .with_slot_snapshot(snapshot)
-            .with_raw_completion(raw),
-        ),
-        CheckedSlotView::Stale(snapshot) => RoutedSlotCompletion::Stale(
-            CompletionAnomaly::stale(
-                raw.token,
-                snapshot.index,
-                expected_generation,
-                snapshot.generation,
-                snapshot.state,
-            )
-            .with_slot_snapshot(snapshot)
-            .with_raw_completion(raw),
-        ),
-        CheckedSlotView::Corrupt(snapshot) => RoutedSlotCompletion::Corrupt(
-            corrupt_slot_anomaly(raw.token, snapshot)
-                .with_slot_snapshot(snapshot)
-                .with_raw_completion(raw),
-        ),
+        Err(anomaly) => match anomaly.reason {
+            CompletionAnomalyReason::UnknownSlot => RoutedSlotCompletion::Missing(anomaly),
+            CompletionAnomalyReason::NonActiveSlot => RoutedSlotCompletion::Empty(anomaly),
+            CompletionAnomalyReason::StaleGeneration => RoutedSlotCompletion::Stale(anomaly),
+            _ => RoutedSlotCompletion::Corrupt(anomaly),
+        },
     }
 }
 
 #[inline]
-fn corrupt_slot_anomaly(token: CompletionToken, snapshot: slot::SlotSnapshot) -> CompletionAnomaly {
+pub fn slot_view_anomaly<'a, Spec: slot::SlotSpec>(
+    backend: CompletionBackend,
+    token: OpToken,
+    raw: RawCompletion,
+    view: CheckedSlotView<'a, Spec>,
+) -> Result<SlotView<'a, Spec>, CompletionAnomaly> {
+    let raw = RawCompletion::new(backend, raw.token, raw.res, raw.flags);
+    let (index, expected_generation) = token.parts();
+    match view {
+        CheckedSlotView::Valid(slot) => Ok(slot),
+        CheckedSlotView::Missing { .. } => {
+            Err(
+                CompletionAnomaly::unknown_slot(raw.token, index, expected_generation)
+                    .with_raw_completion(raw),
+            )
+        }
+        CheckedSlotView::Empty(snapshot) => Err(CompletionAnomaly::non_active(
+            raw.token,
+            snapshot.index,
+            expected_generation,
+            snapshot.state,
+        )
+        .with_slot_snapshot(snapshot)
+        .with_raw_completion(raw)),
+        CheckedSlotView::Stale(snapshot) => Err(CompletionAnomaly::stale(
+            raw.token,
+            snapshot.index,
+            expected_generation,
+            snapshot.generation,
+            snapshot.state,
+        )
+        .with_slot_snapshot(snapshot)
+        .with_raw_completion(raw)),
+        CheckedSlotView::Corrupt(snapshot) => Err(corrupt_slot_anomaly(raw.token, snapshot)
+            .with_slot_snapshot(snapshot)
+            .with_raw_completion(raw)),
+    }
+}
+
+#[inline]
+pub fn corrupt_slot_anomaly(
+    token: CompletionToken,
+    snapshot: slot::SlotSnapshot,
+) -> CompletionAnomaly {
     if !snapshot.has_op {
         CompletionAnomaly::op_missing(token, snapshot.index, snapshot.generation)
     } else if !snapshot.has_payload {
@@ -423,9 +469,10 @@ impl CancelRequest {
 pub enum CancelSubmitOutcome {
     Submitted,
     Queued,
-    NotFound,
-    NoHandle,
-    AlreadyComplete,
+    CompletedLocally,
+    TargetMissing,
+    TargetStale,
+    NoBackendHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -628,6 +675,9 @@ pub fn record_completion_anomaly(
         | CompletionAnomalyReason::NonActiveSlot => diagnostics.inc_unknown_completion(),
         CompletionAnomalyReason::ControlCompletionUntracked
         | CompletionAnomalyReason::BackendInvariantBroken => diagnostics.inc_internal_unknown(),
+        CompletionAnomalyReason::RioMalformedContext => diagnostics.inc_rio_malformed_context(),
+        CompletionAnomalyReason::RioMissingContext => diagnostics.inc_rio_missing_context(),
+        CompletionAnomalyReason::RioStaleContext => diagnostics.inc_rio_stale_context(),
         CompletionAnomalyReason::OpMissing | CompletionAnomalyReason::SlotCorruption => {
             diagnostics.inc_slot_corruption()
         }

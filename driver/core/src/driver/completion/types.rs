@@ -175,6 +175,9 @@ pub enum CompletionAnomalyReason {
     UnknownSlot,
     UnknownControlToken,
     ControlCompletionUntracked,
+    RioMalformedContext,
+    RioMissingContext,
+    RioStaleContext,
     StaleGeneration,
     NonActiveSlot,
     SlotCorruption,
@@ -267,6 +270,59 @@ impl CompletionAnomaly {
             flags: None,
             slot_snapshot: None,
             reason: CompletionAnomalyReason::UnknownSlot,
+        }
+    }
+
+    #[inline]
+    pub fn rio_malformed_context(token: CompletionToken) -> Self {
+        Self {
+            token,
+            index: None,
+            expected_generation: None,
+            actual_generation: None,
+            state: None,
+            backend: Some(CompletionBackend::Rio),
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::RioMalformedContext,
+        }
+    }
+
+    #[inline]
+    pub fn rio_missing_context(token: CompletionToken, index: usize, generation: u32) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(generation),
+            actual_generation: None,
+            state: None,
+            backend: Some(CompletionBackend::Rio),
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::RioMissingContext,
+        }
+    }
+
+    #[inline]
+    pub fn rio_stale_context(
+        token: CompletionToken,
+        index: usize,
+        expected_generation: u32,
+        actual_generation: u32,
+    ) -> Self {
+        Self {
+            token,
+            index: Some(index),
+            expected_generation: Some(expected_generation),
+            actual_generation: Some(actual_generation),
+            state: None,
+            backend: Some(CompletionBackend::Rio),
+            raw_result: None,
+            flags: None,
+            slot_snapshot: None,
+            reason: CompletionAnomalyReason::RioStaleContext,
         }
     }
 

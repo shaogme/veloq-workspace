@@ -4,8 +4,9 @@ use diagweave::prelude::*;
 use io_uring::opcode;
 use tracing::{debug, error, trace};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, CompletionAnomaly, CompletionCleanupGuard,
-    CompletionSidecar, CompletionToken, OpToken, record_completion_anomaly, run_completion_cleanup,
+    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, CompletionAnomalyReason,
+    CompletionBackend, CompletionCleanupGuard, CompletionSidecar, CompletionToken, OpToken,
+    RawCompletion, record_completion_anomaly, run_completion_cleanup, slot_view_anomaly,
 };
 
 use crate::op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt, UringUserPayload};
@@ -32,20 +33,21 @@ impl UringOpState {
 }
 
 impl<'a> UringDriver<'a> {
-    fn next_cancel_completion_id(&mut self) -> u16 {
+    fn next_cancel_completion_id(&mut self) -> CancelCompletionId {
         loop {
             let id = self.next_cancel_id;
             self.next_cancel_id = self.next_cancel_id.wrapping_add(1);
             if self.next_cancel_id == 0 {
                 self.next_cancel_id = 1;
             }
+            let id = CancelCompletionId::new(id);
             if !self.pending_cancel_cqes.contains_key(&id) {
                 return id;
             }
         }
     }
 
-    fn try_submit_cancel_request(&mut self, request: PendingCancel) -> Option<u16> {
+    fn try_submit_cancel_request(&mut self, request: PendingCancel) -> Option<CancelCompletionId> {
         let (user_data, generation) = request.user_parts();
 
         let cancel_id = self.next_cancel_completion_id();
@@ -59,7 +61,7 @@ impl<'a> UringDriver<'a> {
             trace!(
                 user_data,
                 generation,
-                cancel_id,
+                cancel_id = cancel_id.raw(),
                 mode = ?request.mode,
                 "submitted async cancel"
             );
@@ -96,7 +98,7 @@ impl<'a> UringDriver<'a> {
                     token,
                     "uring.cancel_op_internal.reserved",
                 );
-                CancelSubmitOutcome::AlreadyComplete
+                CancelSubmitOutcome::CompletedLocally
             }
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                 if slot.platform().submission_state == UringSubmissionState::Queued {
@@ -113,7 +115,7 @@ impl<'a> UringDriver<'a> {
                         token,
                         "uring.cancel_op_internal.waiting_queued",
                     );
-                    return CancelSubmitOutcome::AlreadyComplete;
+                    return CancelSubmitOutcome::CompletedLocally;
                 }
 
                 if let Some(tid) = slot.platform_mut().timer_id {
@@ -144,7 +146,7 @@ impl<'a> UringDriver<'a> {
                         token,
                         "uring.cancel_op_internal.waiting_timer",
                     );
-                    return CancelSubmitOutcome::AlreadyComplete;
+                    return CancelSubmitOutcome::CompletedLocally;
                 }
 
                 if request.mode == CancelMode::Abandon {
@@ -164,7 +166,7 @@ impl<'a> UringDriver<'a> {
                         token,
                         "uring.cancel_op_internal.orphaned_queued",
                     );
-                    return CancelSubmitOutcome::AlreadyComplete;
+                    return CancelSubmitOutcome::CompletedLocally;
                 }
 
                 if let Some(tid) = slot.platform_mut().timer_id {
@@ -176,45 +178,67 @@ impl<'a> UringDriver<'a> {
                         token,
                         "uring.cancel_op_internal.orphaned_timer",
                     );
-                    return CancelSubmitOutcome::AlreadyComplete;
+                    return CancelSubmitOutcome::CompletedLocally;
                 }
 
                 self.submit_cancel_request(request)
             }
-            CheckedSlotView::Missing { .. } | CheckedSlotView::Empty(_) => {
-                self.completion_diagnostics.inc_unknown_completion();
-                debug!(
-                    user_data,
-                    generation,
-                    token = CompletionToken::user(request.target).raw(),
-                    "cancel request did not match an active slot"
+            view @ (CheckedSlotView::Missing { .. }
+            | CheckedSlotView::Empty(_)
+            | CheckedSlotView::Stale(_)
+            | CheckedSlotView::Corrupt(_)) => {
+                let raw = RawCompletion::new(
+                    CompletionBackend::Uring,
+                    CompletionToken::user(request.target),
+                    -libc::ECANCELED,
+                    0,
                 );
-                CancelSubmitOutcome::NotFound
-            }
-            CheckedSlotView::Stale(snapshot) => {
-                self.completion_diagnostics.inc_stale_completion();
-                debug!(
-                    user_data,
-                    generation,
-                    actual_generation = snapshot.generation,
-                    state = ?snapshot.state,
-                    "cancel request is stale"
-                );
-                CancelSubmitOutcome::NotFound
-            }
-            CheckedSlotView::Corrupt(snapshot) => {
-                self.completion_diagnostics.inc_slot_corruption();
-                error!(
-                    user_data,
-                    generation,
-                    actual_generation = snapshot.generation,
-                    state = ?snapshot.state,
-                    has_op = snapshot.has_op,
-                    has_payload = snapshot.has_payload,
-                    "cancel request found corrupt slot; recycling"
-                );
-                self.finalize_corrupt_slot_checked(snapshot, "uring.cancel_op_internal.corrupt");
-                CancelSubmitOutcome::NotFound
+                let anomaly = match slot_view_anomaly(CompletionBackend::Uring, token, raw, view) {
+                    Ok(_) => {
+                        return CancelSubmitOutcome::TargetMissing;
+                    }
+                    Err(anomaly) => anomaly,
+                };
+                record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                match anomaly.reason {
+                    CompletionAnomalyReason::StaleGeneration => {
+                        debug!(
+                            user_data,
+                            generation,
+                            actual_generation = anomaly.actual_generation,
+                            state = ?anomaly.state,
+                            "cancel request is stale"
+                        );
+                        CancelSubmitOutcome::TargetStale
+                    }
+                    CompletionAnomalyReason::OpMissing
+                    | CompletionAnomalyReason::PayloadMissing
+                    | CompletionAnomalyReason::SlotCorruption => {
+                        error!(
+                            user_data,
+                            generation,
+                            snapshot = ?anomaly.slot_snapshot,
+                            "cancel request found corrupt slot; recycling"
+                        );
+                        if let Some(snapshot) = anomaly.slot_snapshot {
+                            self.finalize_corrupt_slot_checked(
+                                snapshot,
+                                "uring.cancel_op_internal.corrupt",
+                            );
+                        }
+                        CancelSubmitOutcome::TargetMissing
+                    }
+                    _ => {
+                        debug!(
+                            user_data,
+                            generation,
+                            token = CompletionToken::user(request.target).raw(),
+                            reason = ?anomaly.reason,
+                            "cancel request did not match an active slot"
+                        );
+                        CancelSubmitOutcome::TargetMissing
+                    }
+                }
             }
         }
     }
@@ -227,58 +251,39 @@ impl<'a> UringDriver<'a> {
             if let Some(request) = self.pending_cancellations.front().copied() {
                 match self.ops.checked_slot_view(request.target) {
                     CheckedSlotView::Valid(_) => {}
-                    CheckedSlotView::Missing {
-                        index,
-                        expected_generation,
-                    } => {
+                    view @ (CheckedSlotView::Missing { .. }
+                    | CheckedSlotView::Empty(_)
+                    | CheckedSlotView::Stale(_)
+                    | CheckedSlotView::Corrupt(_)) => {
                         self.pending_cancellations.pop_front();
-                        let anomaly = CompletionAnomaly::unknown_slot(
+                        let raw = RawCompletion::new(
+                            CompletionBackend::Uring,
                             CompletionToken::user(request.target),
-                            index,
-                            expected_generation,
+                            -libc::ECANCELED,
+                            0,
                         );
+                        let anomaly = match slot_view_anomaly(
+                            CompletionBackend::Uring,
+                            request.target,
+                            raw,
+                            view,
+                        ) {
+                            Ok(_) => continue,
+                            Err(anomaly) => anomaly,
+                        };
                         record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                        continue;
-                    }
-                    CheckedSlotView::Empty(snapshot) => {
-                        self.pending_cancellations.pop_front();
-                        let anomaly = CompletionAnomaly::non_active(
-                            CompletionToken::user(request.target),
-                            snapshot.index,
-                            request.target.generation(),
-                            snapshot.state,
-                        )
-                        .with_slot_snapshot(snapshot);
-                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                        continue;
-                    }
-                    CheckedSlotView::Stale(snapshot) => {
-                        self.pending_cancellations.pop_front();
-                        let anomaly = CompletionAnomaly::stale(
-                            CompletionToken::user(request.target),
-                            snapshot.index,
-                            request.target.generation(),
-                            snapshot.generation,
-                            snapshot.state,
-                        )
-                        .with_slot_snapshot(snapshot);
-                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                        continue;
-                    }
-                    CheckedSlotView::Corrupt(snapshot) => {
-                        self.pending_cancellations.pop_front();
-                        let anomaly = CompletionAnomaly::corrupt(
-                            CompletionToken::user(request.target),
-                            snapshot.index,
-                            snapshot.generation,
-                            snapshot.state,
-                        )
-                        .with_slot_snapshot(snapshot);
-                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                        self.finalize_corrupt_slot_checked(
-                            snapshot,
-                            "uring.flush_cancellations.corrupt",
-                        );
+                        if matches!(
+                            anomaly.reason,
+                            CompletionAnomalyReason::OpMissing
+                                | CompletionAnomalyReason::PayloadMissing
+                                | CompletionAnomalyReason::SlotCorruption
+                        ) && let Some(snapshot) = anomaly.slot_snapshot
+                        {
+                            self.finalize_corrupt_slot_checked(
+                                snapshot,
+                                "uring.flush_cancellations.corrupt",
+                            );
+                        }
                         continue;
                     }
                 }
@@ -436,6 +441,11 @@ fn cancel_slot_immediate<'a, S: SlotState>(
     slot: Slot<'a, S>,
     token: OpToken,
 ) -> CompletionSidecar<UringUserPayload, UringError> {
+    let cleanup = slot
+        .op
+        .as_mut()
+        .map(|op| unsafe { (op.vtable.completion_cleanup)(op, -libc::ECANCELED) })
+        .unwrap_or_default();
     let (payload, detail) = slot.storage.with_mut(
         |result: &mut Option<UringDriverResult<usize>>,
          payload: &mut Option<UringUserPayload>,
@@ -449,7 +459,7 @@ fn cancel_slot_immediate<'a, S: SlotState>(
         flags: 0,
         payload,
         detail,
-        cleanup: CompletionCleanupGuard::default(),
+        cleanup,
     }
 }
 

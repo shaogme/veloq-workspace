@@ -201,8 +201,8 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         op_in: &mut Option<IocpOp>,
     ) -> DriverSubmitResult<IocpError> {
-        let completion_key = CompletionToken::user(token).raw() as usize;
-        if let Err(err) = ctx.port.notify(completion_key) {
+        let completion_token = CompletionToken::user(token);
+        if let Err(err) = ctx.port.notify(completion_token) {
             if let CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) =
                 ops.checked_slot_view(token)
             {
@@ -279,9 +279,11 @@ impl<'a> IocpDriver<'a> {
             );
 
             close_result.and_then(|(raw_handle, io_result)| {
-                let completion_key = CompletionToken::user(token).raw() as usize;
-                let completion =
-                    BlockingCompletion::new(self.completion.port_arc(), completion_key, None);
+                let completion = BlockingCompletion::new(
+                    self.completion.port_arc(),
+                    CompletionToken::user(token),
+                    None,
+                );
                 completion.store_result(io_result);
 
                 let slot = sub_guard.slot.as_mut().ok_or_else(|| {

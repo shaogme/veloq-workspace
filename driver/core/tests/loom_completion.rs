@@ -56,7 +56,7 @@ fn test_completion_table_loom() {
                     res: 0,
                     flags: 0,
                 },
-                None,
+                Some(()),
                 None,
             ));
         });
@@ -92,7 +92,7 @@ fn test_detached_drop_race_loom() {
                     res: 42,
                     flags: 0,
                 },
-                None,
+                Some(()),
                 None,
             ));
         });
@@ -123,7 +123,7 @@ fn test_fast_completion_then_waiting_take_loom() {
                 res: 7,
                 flags: 0,
             },
-            None,
+            Some(()),
             None,
         ));
 
@@ -158,7 +158,7 @@ fn test_stale_after_generation_advance_loom() {
                 res: 1,
                 flags: 0,
             },
-            None,
+            Some(()),
             None,
         ));
         table.mark_waiting(token_g1);
@@ -187,7 +187,7 @@ fn test_ready_race_with_mark_orphaned_loom() {
                 res: 3,
                 flags: 0,
             },
-            None,
+            Some(()),
             None,
         ));
 
@@ -222,7 +222,7 @@ fn test_two_consumers_at_most_one_ready_loom() {
                 res: 9,
                 flags: 0,
             },
-            None,
+            Some(()),
             None,
         ));
 

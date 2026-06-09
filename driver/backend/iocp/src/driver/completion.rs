@@ -3,10 +3,10 @@ use std::time::Instant;
 use diagweave::prelude::*;
 use tracing::{debug, error};
 use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackend, CompletionCleanupGuard, CompletionEvent, CompletionToken,
-    DriverCompletionDiagnostics, OpToken, RawCompletion, RecordCompletionOutcome,
-    RoutedSlotCompletion, record_completion_anomaly, record_lost_completion, route_user_completion,
-    run_completion_cleanup,
+    CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanupGuard,
+    CompletionEvent, CompletionToken, DriverCompletionDiagnostics, OpToken, RawCompletion,
+    RecordCompletionOutcome, RoutedSlotCompletion, record_completion_anomaly,
+    record_lost_completion, route_user_completion, run_completion_cleanup, slot_view_anomaly,
 };
 use veloq_driver_core::slot::{CheckedSlotView, InFlightWaiting, SlotRegistryExt, SlotView};
 
@@ -57,94 +57,60 @@ impl<'a> IocpDriver<'a> {
                     }
                     expired.push(token);
                 }
-                CheckedSlotView::Valid(SlotView::Reserved(_)) => {
+                CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                     let raw = RawCompletion::new(
                         CompletionBackend::Iocp,
                         CompletionToken::user(token),
                         0,
                         0,
                     );
+                    let snapshot = slot.snapshot();
                     let anomaly = CompletionAnomaly::backend_invariant_broken(
                         raw.token,
-                        token.index(),
-                        token.generation(),
-                        veloq_driver_core::slot::SlotState::Reserved,
-                    )
-                    .with_raw_completion(raw);
-                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                }
-                CheckedSlotView::Missing {
-                    index,
-                    expected_generation,
-                } => {
-                    let raw = RawCompletion::new(
-                        CompletionBackend::Iocp,
-                        CompletionToken::user(token),
-                        0,
-                        0,
-                    );
-                    let anomaly =
-                        CompletionAnomaly::unknown_slot(raw.token, index, expected_generation)
-                            .with_raw_completion(raw);
-                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                }
-                CheckedSlotView::Empty(snapshot) => {
-                    let raw = RawCompletion::new(
-                        CompletionBackend::Iocp,
-                        CompletionToken::user(token),
-                        0,
-                        0,
-                    );
-                    let anomaly = CompletionAnomaly::non_active(
-                        raw.token,
-                        snapshot.index,
-                        token.generation(),
-                        snapshot.state,
-                    )
-                    .with_slot_snapshot(snapshot)
-                    .with_raw_completion(raw);
-                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                }
-                CheckedSlotView::Stale(snapshot) => {
-                    let raw = RawCompletion::new(
-                        CompletionBackend::Iocp,
-                        CompletionToken::user(token),
-                        0,
-                        0,
-                    );
-                    let anomaly = CompletionAnomaly::stale(
-                        raw.token,
-                        snapshot.index,
-                        token.generation(),
-                        snapshot.generation,
-                        snapshot.state,
-                    )
-                    .with_slot_snapshot(snapshot)
-                    .with_raw_completion(raw);
-                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
-                }
-                CheckedSlotView::Corrupt(snapshot) => {
-                    let raw = RawCompletion::new(
-                        CompletionBackend::Iocp,
-                        CompletionToken::user(token),
-                        0,
-                        0,
-                    );
-                    let anomaly = CompletionAnomaly::corrupt(
-                        raw.token,
                         snapshot.index,
                         snapshot.generation,
                         snapshot.state,
                     )
                     .with_slot_snapshot(snapshot)
                     .with_raw_completion(raw);
-                    self.emit_corrupt_completion(anomaly, "IOCP timer found corrupt slot");
+                    record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                }
+                view @ (CheckedSlotView::Missing { .. }
+                | CheckedSlotView::Empty(_)
+                | CheckedSlotView::Stale(_)
+                | CheckedSlotView::Corrupt(_)) => {
+                    let raw = RawCompletion::new(
+                        CompletionBackend::Iocp,
+                        CompletionToken::user(token),
+                        0,
+                        0,
+                    );
+                    let anomaly = match slot_view_anomaly(CompletionBackend::Iocp, token, raw, view)
+                    {
+                        Ok(_) => continue,
+                        Err(anomaly) => anomaly,
+                    };
+                    if matches!(
+                        anomaly.reason,
+                        CompletionAnomalyReason::OpMissing
+                            | CompletionAnomalyReason::PayloadMissing
+                            | CompletionAnomalyReason::SlotCorruption
+                    ) {
+                        self.emit_corrupt_completion(anomaly, "IOCP timer found corrupt slot");
+                    } else {
+                        record_completion_anomaly(&mut self.completion_diagnostics, &anomaly);
+                    }
                 }
             }
         }
         let mut finished_timers = Vec::new();
         for token in expired {
-            if let Some(finish) = Self::finish_timer_op(&mut self.ops, token, &mut pending_events) {
+            if let Some(finish) = Self::finish_timer_op(
+                &mut self.ops,
+                &mut self.completion_diagnostics,
+                token,
+                &mut pending_events,
+            ) {
                 finished_timers.push((token, finish));
             }
         }
@@ -172,12 +138,19 @@ impl<'a> IocpDriver<'a> {
 
     fn finish_timer_op(
         ops: &mut IocpOpRegistry,
+        diagnostics: &mut DriverCompletionDiagnostics,
         token: OpToken,
         pending_events: &mut Vec<CompletionSidecar>,
     ) -> Option<TimerFinish> {
         match ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
                 let mut guard = slot.complete();
+                let io_result: IocpResult<usize> = Ok(0);
+                let cleanup = guard
+                    .op
+                    .as_mut()
+                    .map(|op| op.completion_cleanup(&io_result))
+                    .unwrap_or_default();
                 let _ = guard.take_op();
                 let (payload_erased, detail) = guard.take_completion_data();
                 pending_events.push(CompletionSidecar {
@@ -186,16 +159,23 @@ impl<'a> IocpDriver<'a> {
                     flags: 0,
                     payload: payload_erased,
                     detail,
-                    cleanup: CompletionCleanupGuard::default(),
+                    cleanup,
                 });
                 Some(TimerFinish::WaitingCompleted)
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => {
                 let mut guard = slot.complete();
+                let io_result: IocpResult<usize> = Ok(0);
+                let mut cleanup = guard
+                    .op
+                    .as_mut()
+                    .map(|op| op.completion_cleanup(&io_result))
+                    .unwrap_or_default();
                 let _ = guard.take_op();
                 let (payload_erased, detail) = guard.take_completion_data();
                 drop(payload_erased);
                 drop(detail);
+                let _ = run_completion_cleanup(diagnostics, &mut cleanup);
                 Some(TimerFinish::OrphanedDropped)
             }
             _ => None,
@@ -433,7 +413,7 @@ impl<'a> IocpDriver<'a> {
 
         let cleanup = self
             .ops
-            .get_slot_entry_op_storage_and_entry_mut(token)
+            .active_slot_bundle_mut(token)
             .and_then(|(_, _, op, _)| {
                 let cleanup = op
                     .as_mut()

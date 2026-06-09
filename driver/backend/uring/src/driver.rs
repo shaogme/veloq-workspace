@@ -16,9 +16,9 @@ use crate::op::{UringOp, UringUserPayload};
 use veloq_driver_core::DriverResult as CoreDriverResult;
 use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome, Driver,
-    DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
-    RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome,
+    Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 
 mod completion;
@@ -122,7 +122,7 @@ pub struct UringDriver<'a> {
     pub(crate) ops: UringOpRegistry,
     pub(crate) backlog: VecDeque<OpToken>,
     pub(crate) pending_cancellations: VecDeque<PendingCancel>,
-    pub(crate) pending_cancel_cqes: HashMap<u16, PendingCancel>,
+    pub(crate) pending_cancel_cqes: HashMap<CancelCompletionId, PendingCancel>,
     pub(crate) next_cancel_id: u16,
     pub(crate) completion_diagnostics: DriverCompletionDiagnostics,
     pub(crate) completion_table: SharedCompletionTable<UringUserPayload, UringError>,

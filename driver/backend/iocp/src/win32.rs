@@ -2,6 +2,7 @@ use std::io::Error as IoError;
 use std::ptr;
 
 use crate::error::{IocpError, IocpResult};
+use veloq_driver_core::driver::CompletionToken;
 use veloq_pod::{Pod, Zeroable, zeroed};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
@@ -353,10 +354,10 @@ impl IoCompletionPort {
         Ok(())
     }
 
-    /// Notifies the completion port with a user-defined completion key.
-    pub fn notify(&self, user_data: usize) -> IocpResult<()> {
+    /// Notifies the completion port with a typed completion token.
+    pub fn notify(&self, token: CompletionToken) -> IocpResult<()> {
         // SAFETY: Posting with a null overlapped is always safe.
-        unsafe { self.post(0, user_data, ptr::null_mut()) }
+        unsafe { self.post(0, token.raw() as usize, ptr::null_mut()) }
     }
 
     /// Cancels a pending I/O request.

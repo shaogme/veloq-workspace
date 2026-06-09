@@ -8,7 +8,9 @@ use crate::op::IocpOpRegistry;
 use crate::rio::core::registry::RioRegistry;
 use crate::rio::core::rio_result_to_event_res;
 use crate::rio::core::submit_ops::RioRq;
-use crate::rio::core::{RioCompletionKind, RioOpRequestInit, RioRequestContextDecode};
+use crate::rio::core::{
+    RioCompletionKind, RioOpRequestInit, RioRequestContextDecode, RioRequestContextId,
+};
 use crate::rio::error::{RioError, RioResult};
 use crate::rio::runtime::release_socket_inflight_token_from;
 use crate::rio::{
@@ -289,7 +291,7 @@ impl<'a> RioCompletionRouter<'a> {
                         .set_error_code(5)
                         .attach_note("RIO completion found corrupt slot"));
                     let cleanup = ops
-                        .get_slot_entry_op_storage_and_entry_mut(op_token)
+                        .active_slot_bundle_mut(op_token)
                         .and_then(|(_, _, op, _)| {
                             let cleanup = op
                                 .as_mut()
@@ -365,12 +367,10 @@ impl<'a> RioCompletionRouter<'a> {
         {
             RioRequestContextDecode::Valid(kind) => kind,
             RioRequestContextDecode::Malformed { raw } => {
-                self.comp.diagnostics.inc_rio_malformed_context();
-                self.record_unknown_request_context(raw, res, "malformed RIO request context");
+                self.record_malformed_request_context(raw, res);
                 return Ok(());
             }
             RioRequestContextDecode::Missing { id } => {
-                self.comp.diagnostics.inc_rio_missing_context();
                 debug!(
                     request_context = res.RequestContext,
                     context_index = id.index(),
@@ -379,18 +379,13 @@ impl<'a> RioCompletionRouter<'a> {
                     bytes = res.BytesTransferred,
                     "ignoring missing RIO request context"
                 );
-                self.record_unknown_request_context(
-                    res.RequestContext,
-                    res,
-                    "missing RIO request context",
-                );
+                self.record_missing_request_context(id, res);
                 return Ok(());
             }
             RioRequestContextDecode::Stale {
                 id,
                 actual_generation,
             } => {
-                self.comp.diagnostics.inc_rio_stale_context();
                 debug!(
                     request_context = res.RequestContext,
                     context_index = id.index(),
@@ -400,11 +395,7 @@ impl<'a> RioCompletionRouter<'a> {
                     bytes = res.BytesTransferred,
                     "ignoring stale RIO request context"
                 );
-                self.record_unknown_request_context(
-                    res.RequestContext,
-                    res,
-                    "stale RIO request context",
-                );
+                self.record_stale_request_context(id, actual_generation, res);
                 return Ok(());
             }
         };
@@ -416,25 +407,69 @@ impl<'a> RioCompletionRouter<'a> {
         }
     }
 
-    fn record_unknown_request_context(
-        &mut self,
-        request_context: u64,
-        res: &RIORESULT,
-        note: &'static str,
-    ) {
+    fn record_malformed_request_context(&mut self, request_context: u64, res: &RIORESULT) {
         let raw = RawCompletion::new(
             CompletionBackend::Rio,
             CompletionToken::from_raw(request_context),
             rio_raw_res(res),
             0,
         );
-        let anomaly = CompletionAnomaly::unknown_control(raw.token).with_raw_completion(raw);
+        let anomaly = CompletionAnomaly::rio_malformed_context(raw.token).with_raw_completion(raw);
         record_completion_anomaly(self.comp.diagnostics, &anomaly);
         debug!(
             request_context,
             status = res.Status,
             bytes = res.BytesTransferred,
-            note,
+            note = "malformed RIO request context",
+            "ignoring RIO request context"
+        );
+    }
+
+    fn record_missing_request_context(&mut self, id: RioRequestContextId, res: &RIORESULT) {
+        let raw = RawCompletion::new(
+            CompletionBackend::Rio,
+            CompletionToken::from_raw(res.RequestContext),
+            rio_raw_res(res),
+            0,
+        );
+        let anomaly =
+            CompletionAnomaly::rio_missing_context(raw.token, id.index(), id.generation())
+                .with_raw_completion(raw);
+        record_completion_anomaly(self.comp.diagnostics, &anomaly);
+        debug!(
+            request_context = res.RequestContext,
+            status = res.Status,
+            bytes = res.BytesTransferred,
+            note = "missing RIO request context",
+            "ignoring RIO request context"
+        );
+    }
+
+    fn record_stale_request_context(
+        &mut self,
+        id: RioRequestContextId,
+        actual_generation: u32,
+        res: &RIORESULT,
+    ) {
+        let raw = RawCompletion::new(
+            CompletionBackend::Rio,
+            CompletionToken::from_raw(res.RequestContext),
+            rio_raw_res(res),
+            0,
+        );
+        let anomaly = CompletionAnomaly::rio_stale_context(
+            raw.token,
+            id.index(),
+            id.generation(),
+            actual_generation,
+        )
+        .with_raw_completion(raw);
+        record_completion_anomaly(self.comp.diagnostics, &anomaly);
+        debug!(
+            request_context = res.RequestContext,
+            status = res.Status,
+            bytes = res.BytesTransferred,
+            note = "stale RIO request context",
             "ignoring RIO request context"
         );
     }

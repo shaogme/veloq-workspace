@@ -480,7 +480,7 @@ impl<'a> UringDriver<'a> {
             Err(e) => {
                 if let Some(op) = self
                     .ops
-                    .get_slot_entry_op_storage_and_entry_mut(token)
+                    .active_slot_bundle_mut(token)
                     .and_then(|(_, _, op, _)| op.take())
                 {
                     *op_in = Some(op);
@@ -558,7 +558,7 @@ impl<'a> UringDriver<'a> {
             Err(e) => {
                 if let Some(op) = self
                     .ops
-                    .get_slot_entry_op_storage_and_entry_mut(token)
+                    .active_slot_bundle_mut(token)
                     .and_then(|(_, _, op, _)| op.take())
                 {
                     *op_in = Some(op);

@@ -713,4 +713,102 @@ mod tests {
             PollRecordResult::ReadyLost(observed) if observed.reason == anomaly.reason
         ));
     }
+
+    #[test]
+    fn lost_completion_reports_stale_generation() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        table.slots[0].reset(2);
+        table.slots[0].set_state(slot::SlotState::InFlightWaiting, Ordering::Release);
+        let token = CompletionToken::user(OpToken::new(0, 1));
+        let anomaly = CompletionAnomaly::stale(token, 0, 1, 2, slot::SlotState::InFlightWaiting);
+
+        let outcome = table
+            .record_lost_completion(
+                CompletionEvent {
+                    token,
+                    res: -1,
+                    flags: 0,
+                },
+                anomaly,
+                CompletionCleanupGuard::default(),
+            )
+            .into_outcome();
+
+        assert!(matches!(outcome, RecordCompletionOutcome::Stale(_)));
+    }
+
+    #[test]
+    fn lost_completion_reports_empty_slot() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        let token = CompletionToken::user(OpToken::new(0, 0));
+        let anomaly = CompletionAnomaly::non_active(token, 0, 0, slot::SlotState::Idle);
+
+        let outcome = table
+            .record_lost_completion(
+                CompletionEvent {
+                    token,
+                    res: -1,
+                    flags: 0,
+                },
+                anomaly,
+                CompletionCleanupGuard::default(),
+            )
+            .into_outcome();
+
+        assert!(matches!(outcome, RecordCompletionOutcome::NonActive(_)));
+    }
+
+    #[test]
+    fn lost_completion_preserves_payload_missing_reason() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        table.slots[0].reset(1);
+        table.slots[0].set_state(slot::SlotState::Reserved, Ordering::Release);
+        let token = CompletionToken::user(OpToken::new(0, 1));
+        let anomaly = CompletionAnomaly::payload_missing(token, 0, 1);
+
+        let outcome = table
+            .record_lost_completion(
+                CompletionEvent {
+                    token,
+                    res: -1,
+                    flags: 0,
+                },
+                anomaly,
+                CompletionCleanupGuard::default(),
+            )
+            .into_outcome();
+
+        assert_eq!(outcome, RecordCompletionOutcome::Recorded);
+        assert!(matches!(
+            table.try_take_record(token),
+            PollRecordResult::ReadyLost(observed) if observed.reason == anomaly.reason
+        ));
+    }
+
+    #[test]
+    fn lost_completion_preserves_op_missing_reason() {
+        let table = slot::SlotTable::<DummySlotSpec>::new(1);
+        table.slots[0].reset(1);
+        table.slots[0].set_state(slot::SlotState::Reserved, Ordering::Release);
+        let token = CompletionToken::user(OpToken::new(0, 1));
+        let anomaly = CompletionAnomaly::op_missing(token, 0, 1);
+
+        let outcome = table
+            .record_lost_completion(
+                CompletionEvent {
+                    token,
+                    res: -1,
+                    flags: 0,
+                },
+                anomaly,
+                CompletionCleanupGuard::default(),
+            )
+            .into_outcome();
+
+        assert_eq!(outcome, RecordCompletionOutcome::Recorded);
+        assert!(matches!(
+            table.try_take_record(token),
+            PollRecordResult::ReadyLost(observed) if observed.reason == anomaly.reason
+        ));
+    }
 }

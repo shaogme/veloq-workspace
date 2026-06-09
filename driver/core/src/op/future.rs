@@ -153,6 +153,9 @@ where
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::UnknownControlToken
         | CompletionAnomalyReason::ControlCompletionUntracked
+        | CompletionAnomalyReason::RioMalformedContext
+        | CompletionAnomalyReason::RioMissingContext
+        | CompletionAnomalyReason::RioStaleContext
         | CompletionAnomalyReason::NonActiveSlot
         | CompletionAnomalyReason::SlotCorruption
         | CompletionAnomalyReason::OpMissing
