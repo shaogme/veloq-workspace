@@ -70,7 +70,7 @@ impl CompletionValue for usize {
 }
 
 use event::{dispatch_envelope, unknown_completion_anomaly};
-use packet::{record_completion_anomaly, run_completion_cleanup, run_rejected_cleanup};
+use packet::{run_completion_cleanup, run_rejected_cleanup};
 use routing::{
     finalize_corrupt_checked, finalize_orphaned_checked, finalize_waiting_checked,
     route_user_completion,

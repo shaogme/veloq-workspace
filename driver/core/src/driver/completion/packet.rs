@@ -3,7 +3,7 @@ use crate::slot;
 
 use super::{
     CompletionAnomaly, CompletionCleanupGuard, CompletionEvent, DriverCompletionDiagnostics,
-    DriverCompletionDiagnosticsBackend, OpToken, UserCompletionEvent,
+    OpToken, UserCompletionEvent,
 };
 
 pub struct CompletionPacket<Spec: slot::SlotSpec> {
@@ -140,14 +140,4 @@ pub(super) fn run_completion_cleanup<B>(
             false
         }
     }
-}
-
-#[inline]
-pub(super) fn record_completion_anomaly<B>(
-    diagnostics: &DriverCompletionDiagnostics<B>,
-    anomaly: &CompletionAnomaly,
-) where
-    B: DriverCompletionDiagnosticsBackend,
-{
-    diagnostics.record_anomaly(anomaly);
 }

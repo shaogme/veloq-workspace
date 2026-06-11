@@ -8,8 +8,8 @@ use super::{
     DriverCompletionDiagnosticsBackend, RawCompletion, RecordCompletionOutcome,
     RecordCompletionResult, RoutedSlotCompletion, SharedCompletionTable, UserCompletionEvent,
     dispatch_envelope, finalize_corrupt_checked, finalize_orphaned_checked,
-    finalize_waiting_checked, record_completion_anomaly, route_user_completion,
-    run_completion_cleanup, run_rejected_cleanup, unknown_completion_anomaly,
+    finalize_waiting_checked, route_user_completion, run_completion_cleanup, run_rejected_cleanup,
+    unknown_completion_anomaly,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -313,7 +313,7 @@ where
                 }
                 CompletionDispatch::Unknown { envelope } => {
                     let anomaly = unknown_completion_anomaly(envelope);
-                    record_completion_anomaly(diagnostics, &anomaly);
+                    diagnostics.record_anomaly(&anomaly);
                     CompletionFlowOutcome::anomaly()
                 }
             },
@@ -617,7 +617,7 @@ where
     Spec: slot::SlotSpec,
     slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
-    record_completion_anomaly(diagnostics, &anomaly);
+    diagnostics.record_anomaly(&anomaly);
     if should_finalize_corrupt_anomaly(&anomaly)
         && let Some(snapshot) = anomaly.slot_snapshot
     {

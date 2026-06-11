@@ -4,7 +4,6 @@ use crate::slot::{self, CheckedSlotView, SlotRegistryExt, SlotView};
 use super::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionToken,
     DriverCompletionDiagnostics, OpToken, RawCompletion, UserCompletionEvent,
-    record_completion_anomaly,
 };
 
 pub enum RoutedSlotCompletion<'a, Spec: slot::SlotSpec> {
@@ -100,7 +99,7 @@ where
         )
         .with_slot_snapshot(snapshot)
         .with_raw_completion(raw);
-        record_completion_anomaly(diagnostics, &anomaly);
+        diagnostics.record_anomaly(&anomaly);
         return FinalizeOutcome::Missing(anomaly);
     };
 
@@ -142,7 +141,7 @@ where
         }
         Err(anomaly) => anomaly,
     };
-    record_completion_anomaly(diagnostics, &anomaly);
+    diagnostics.record_anomaly(&anomaly);
     FinalizeOutcome::Missing(anomaly)
 }
 
