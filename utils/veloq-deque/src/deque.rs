@@ -1,7 +1,11 @@
-use std::cell::UnsafeCell;
-use std::num::NonZeroUsize;
-use std::ptr;
-use std::sync::atomic::{AtomicIsize, Ordering};
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::num::NonZeroUsize;
+use core::ptr;
+use veloq_shim::atomic::{AtomicIsize, Ordering, fence};
+use veloq_shim::cell::UnsafeCell;
 
 /// Chase-Lev Deque 的简化实现（固定大小版，配合全局 Injector 使用效率最高）
 /// 支持单生产者 (Push/Pop) 和多消费者 (Steal)。
@@ -34,12 +38,14 @@ impl<T: Copy> Deque<T> {
         let t = self.top.load(Ordering::Acquire);
 
         if b - t > self.mask {
-            // 队列已满，返回任务交由 Injector 处理
             return Err(item);
         }
 
         unsafe {
-            let slot = self.buffer.get_unchecked((b & self.mask) as usize).get();
+            let slot = self
+                .buffer
+                .get_unchecked((b & self.mask) as usize)
+                .get_mut();
             ptr::write(slot, Some(item));
         }
 
@@ -52,26 +58,22 @@ impl<T: Copy> Deque<T> {
         let b = self.bottom.load(Ordering::Relaxed) - 1;
         self.bottom.store(b, Ordering::Relaxed);
 
-        // 必须有内存屏障，确保 bottom 的修改对 Stealer 可见
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
 
         let t = self.top.load(Ordering::Relaxed);
 
         if t <= b {
-            // 队列非空
             let item = unsafe {
                 let slot = self.buffer.get_unchecked((b & self.mask) as usize).get();
                 ptr::read(slot)
             };
 
             if t == b {
-                // 竞争最后一个任务
                 if self
                     .top
                     .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
                     .is_err()
                 {
-                    // 窃取者赢了
                     self.bottom.store(b + 1, Ordering::Relaxed);
                     return None;
                 }
@@ -79,7 +81,6 @@ impl<T: Copy> Deque<T> {
             }
             item
         } else {
-            // 队列已空
             self.bottom.store(b + 1, Ordering::Relaxed);
             None
         }
@@ -89,13 +90,11 @@ impl<T: Copy> Deque<T> {
     pub fn steal(&self) -> Steal<T> {
         let t = self.top.load(Ordering::Acquire);
 
-        // 确保在读取 bottom 之前看到 top
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
 
         let b = self.bottom.load(Ordering::Acquire);
 
         if t < b {
-            // 队列非空
             let item = unsafe {
                 let slot = self.buffer.get_unchecked((t & self.mask) as usize).get();
                 ptr::read(slot)
@@ -119,17 +118,15 @@ impl<T: Copy> Deque<T> {
     }
 
     /// 由 Stealers 调用：批量窃取任务
-    pub fn steal_batch(&self, dest: &Deque<T>) -> Steal<T> {
+    pub fn steal_batch(&self, dest: &Deque<T>) -> Steal<BatchStealResult<T>> {
         let t = self.top.load(Ordering::Acquire);
 
-        // 确保在读取 bottom 之前看到 top
-        std::sync::atomic::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
 
         let b = self.bottom.load(Ordering::Acquire);
 
         if t < b {
             let n = b - t;
-            // 窃取一半任务，至少 1 个
             let num_to_steal = (n + 1) / 2;
 
             if self
@@ -141,18 +138,23 @@ impl<T: Copy> Deque<T> {
                     unsafe { self.buffer.get_unchecked((t & self.mask) as usize).get() };
                 let first_item = unsafe { ptr::read(first_slot) }.expect("Deque was not empty");
 
+                let mut overflow = Vec::new();
                 for i in 1..num_to_steal {
                     let slot = unsafe {
                         self.buffer
                             .get_unchecked(((t + i) & self.mask) as usize)
                             .get()
                     };
-                    if let Some(item) = unsafe { ptr::read(slot) } {
-                        // 压入窃取者的队列。因为窃取者是 dest 的 owner，所以安全。
-                        let _ = dest.push(item);
+                    if let Some(item) = (unsafe { ptr::read(slot) })
+                        && dest.push(item).is_err()
+                    {
+                        overflow.push(item);
                     }
                 }
-                return Steal::Success(first_item);
+                return Steal::Success(BatchStealResult {
+                    item: first_item,
+                    overflow,
+                });
             }
             return Steal::Retry;
         }
@@ -164,6 +166,11 @@ impl<T: Copy> Deque<T> {
         let t = self.top.load(Ordering::Relaxed);
         t >= b
     }
+}
+
+pub struct BatchStealResult<T> {
+    pub item: T,
+    pub overflow: Vec<T>,
 }
 
 pub enum Steal<T> {

@@ -1,0 +1,24 @@
+[package]
+name = "veloq-deque"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+veloq-shim = { workspace = true, features = ["alloc"] }
+
+[dev-dependencies]
+loom.workspace = true
+
+[features]
+loom = ["veloq-shim/loom"]
+
+[lints]
+workspace = true

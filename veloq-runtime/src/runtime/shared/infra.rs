@@ -13,7 +13,7 @@ use crate::scope::GenericScopeCompletion;
 use crate::task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef, TaskHeader};
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicOptionPtr, StateOptionPtr};
-use crate::utils::{Deque, FastRand, Steal};
+use crate::utils::{BatchStealResult, Deque, FastRand, Steal};
 
 pub(crate) struct WorkerQueue {
     pub(crate) remote_tx: Sender<SendTaskRef>,
@@ -274,7 +274,12 @@ impl TaskScheduler {
                         .deque
                         .steal_batch(&thief_worker.deque)
                     {
-                        Steal::Success(task) => return Some(task),
+                        Steal::Success(BatchStealResult { item, overflow }) => {
+                            for task in overflow {
+                                self.injector.push(task);
+                            }
+                            return Some(item);
+                        }
                         Steal::Retry => {
                             retry_steal = true;
                             break;
@@ -306,7 +311,12 @@ impl TaskScheduler {
                         .deque
                         .steal_batch(&thief_worker.deque)
                     {
-                        Steal::Success(task) => return Some(task),
+                        Steal::Success(BatchStealResult { item, overflow }) => {
+                            for task in overflow {
+                                self.injector.push(task);
+                            }
+                            return Some(item);
+                        }
                         Steal::Retry => {
                             retry_steal = true;
                             break;

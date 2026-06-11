@@ -2,7 +2,7 @@ use veloq_runtime::runtime::Runtime;
 use veloq_runtime::{task, task_local};
 
 fn main() {
-    let rt = Runtime::<_, (), _>::new();
+    let rt = Runtime::<(), _>::new();
     rt.block_on(async |ctx| {
         ctx.scope(async |s| {
             task_local!(t, async {

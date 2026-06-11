@@ -20,6 +20,7 @@ numaperf-topo = "0.1"
 veloq-atomic-waker.workspace = true
 veloq-intrusive-linklist.workspace = true
 veloq-tls.workspace = true
+veloq-deque.workspace = true
 
 diagweave.workspace = true
 

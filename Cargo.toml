@@ -17,6 +17,7 @@ members = [
     "utils/veloq-blocking",
     "utils/veloq-pod", 
     "utils/veloq-tls",
+    "utils/veloq-deque",
     "test-utils/xtest-runner"
 ]
 default-members = [
@@ -35,6 +36,7 @@ default-members = [
     "utils/veloq-blocking",
     "utils/veloq-pod",
     "utils/veloq-tls",
+    "utils/veloq-deque",
     "test-utils/xtest-runner"
 ]
 resolver = "3"
@@ -73,6 +75,7 @@ veloq-wheel = { path = "utils/veloq-wheel", version = "0.1.0" }
 veloq-blocking = { path = "utils/veloq-blocking", version = "0.1.0" }
 veloq-pod = { path = "utils/veloq-pod", version = "0.1.0" }
 veloq-tls = { path = "utils/veloq-tls", version = "0.1.0" }
+veloq-deque = { path = "utils/veloq-deque", version = "0.1.0" }
 
 # External Crates
 crossbeam-utils = { version = "0.8", default-features = false }

@@ -1415,6 +1415,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "veloq-deque"
+version = "0.1.0"
+dependencies = [
+ "loom",
+ "veloq-shim",
+]
+
+[[package]]
 name = "veloq-driver-core"
 version = "0.1.0"
 dependencies = [
@@ -1516,6 +1524,7 @@ dependencies = [
  "parking_lot",
  "trybuild",
  "veloq-atomic-waker",
+ "veloq-deque",
  "veloq-intrusive-linklist",
  "veloq-tls",
 ]
